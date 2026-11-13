@@ -19,6 +19,7 @@
 #include "data/sirius_row_range_reader_registry.hpp"
 #include "exec/config.hpp"
 #include "helper/type_conversions.hpp"
+#include "operator/merge/merge_pipeline_harness.hpp"
 #include "operator/merge/merge_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -70,9 +71,6 @@ namespace pl          = sirius::pipeline;
 
 constexpr std::size_t kMiB = std::size_t{1} << 20;
 constexpr std::size_t kGiB = std::size_t{1} << 30;
-
-/// Longest a merge may take before the test gives up on it (the done criterion is 30 s a test).
-constexpr std::chrono::seconds kWatchdog{20};
 
 /// Set while the calling thread is inside the MERGE_SORT's execute().
 thread_local bool t_in_merge_execute = false;
@@ -186,102 +184,9 @@ class observed_input_repository final : public shared_data_repository {
   std::vector<std::pair<std::uint64_t, std::size_t>> _pushed_back;
 };
 
-/// Pipeline sink with the materialized result collector's publication contract: one batch per
-/// positioned publication, every position at most once, and no mix of positioned and
-/// unpositioned results. Keeps the chunks by position.
-class ordered_collector final : public sirius_physical_operator {
- public:
-  ordered_collector()
-    : sirius_physical_operator(SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0)
-  {
-  }
-
-  sirius::OrderPreservationType output_order_preservation() const override
-  {
-    return sirius::OrderPreservationType::FIXED_ORDER;
-  }
-
-  bool is_sink() const override { return true; }
-
-  void sink(const operator_data& input, ::cuda::stream_ref) override
-  {
-    auto const& data    = dynamic_cast<const pipelineable_operator_data&>(input);
-    auto const& batches = data.get_data_batches();
-    if (batches.empty()) { return; }
-    auto const position = data.get_position();
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (position && batches.size() != 1) {
-      throw sirius::internal_exception("Positioned result requires one output batch");
-    }
-    if (_positioned && *_positioned != position.has_value()) {
-      throw sirius::internal_exception("Cannot mix positioned and unpositioned query results");
-    }
-    _positioned = position.has_value();
-    if (!position) {
-      throw sirius::internal_exception("MERGE_SORT published a result without a position");
-    }
-    if (!_chunks.emplace(*position, batches.front()).second) {
-      throw sirius::internal_exception("Duplicate query result position");
-    }
-    _arrival.push_back(*position);
-  }
-
-  /// The published chunks, by position.
-  [[nodiscard]] std::map<std::size_t, std::shared_ptr<data_batch>> chunks() const
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _chunks;
-  }
-
-  /// Positions in the order they were published.
-  [[nodiscard]] std::vector<std::size_t> arrival() const
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _arrival;
-  }
-
-  void clear()
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _chunks.clear();
-  }
-
- private:
-  mutable std::mutex _mutex;
-  std::optional<bool> _positioned;
-  std::map<std::size_t, std::shared_ptr<data_batch>> _chunks;
-  std::vector<std::size_t> _arrival;
-};
-
-/// The upstream SORT_PARTITION pipeline: already finished, so the FULL barrier is open.
-class finished_pipeline final : public pl::sirius_pipeline {
- public:
-  finished_pipeline() : sirius_pipeline{pl::pipeline_build_context{nullptr}} {}
-  [[nodiscard]] bool is_pipeline_finished() const override { return true; }
-};
-
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
-
-struct merge_harness;
-
-/// Task creator whose requests are served by the harness, the way a creation worker serves them:
-/// ask the operator for its hint, then turn every input it hands out into a real task.
-class pumping_task_creator final : public sirius::creator::task_creator {
- public:
-  pumping_task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
-                       sirius::memory::sirius_memory_reservation_manager& manager,
-                       merge_harness& harness)
-    : task_creator(lifecycle, sirius::creator::task_creator_config{}, manager), _harness(harness)
-  {
-  }
-
-  void schedule(sirius_physical_operator* request) override;
-
- private:
-  merge_harness& _harness;
-};
 
 struct harness_options {
   std::size_t num_partitions   = 1;
@@ -291,12 +196,8 @@ struct harness_options {
 };
 
 /**
- * @brief A MERGE_SORT as the source of a real pipeline whose sink is an ordered collector, with a
- * real task scheduler and GPU executor.
- *
- * Tasks are real gpu_pipeline_tasks: reserved, prepared, executed and published by the executor.
- * Only the task creator's queue is replaced, by a pump thread that does what a creation worker
- * does with each `schedule(op)` request.
+ * @brief A recording MERGE_SORT over (key BIGINT, payload BIGINT) in a merge_utils::merge_pipeline,
+ * with runs added per partition and per device.
  */
 struct merge_harness {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
@@ -306,19 +207,11 @@ struct merge_harness {
   std::vector<memory_space*> gpus;
   observed_input_repository input;
   std::unique_ptr<recording_merge_sort> merge;
-  ordered_collector collector;
-  std::shared_ptr<finished_pipeline> producer = std::make_shared<finished_pipeline>();
-  std::shared_ptr<pl::sirius_pipeline> pipeline;
-  std::shared_ptr<pl::completion_handler> completion = std::make_shared<pl::completion_handler>();
-  std::future<void> completion_result                = completion->get_awaitable();
-  std::shared_ptr<pl::sirius_pipeline_task_global_state> global;
-  sirius::exec::query_lifecycle_registry lifecycle;
-  std::unique_ptr<pl::task_scheduler> scheduler;
-  std::unique_ptr<pumping_task_creator> creator;
-
   /// Requests for the MERGE_SORT, and how many of them came from inside its own execute().
   std::atomic<std::size_t> requests{0};
   std::atomic<std::size_t> rearms_from_execute{0};
+  /// Declared last: it is torn down (and the input popped) before anything above.
+  std::unique_ptr<merge_utils::merge_pipeline> pipe;
 
   explicit merge_harness(harness_options options = {})
     : manager{initialize_memory_manager(options.num_gpus,
@@ -352,57 +245,20 @@ struct merge_harness {
                                                    std::move(orders),
                                                    duckdb::vector<std::size_t>{0, 1},
                                                    0);
-    merge->operator_id    = 1;
-    collector.operator_id = 2;
-
-    pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr});
-    pipeline->set_pipeline_id(7);
-    pl::sirius_pipeline_build_state state;
-    state.set_pipeline_source(*pipeline, *merge);
-    state.set_pipeline_operators(*pipeline, {*merge});
-    state.set_pipeline_sink(*pipeline, &collector, 1);
-    merge->set_pipeline(pipeline);
-    auto upstream          = std::make_unique<sirius_physical_operator::port>();
-    upstream->type         = MemoryBarrierType::FULL;
-    upstream->repo         = &input;
-    upstream->src_pipeline = producer;
-    upstream->residency    = merge->input_residency_policy("default");
-    merge->add_port("default", std::move(upstream));
-
-    global = std::make_shared<pl::sirius_pipeline_task_global_state>(
-      pipeline, sirius::test::make_test_telemetry_context());
-    global->set_completion_handler(completion);
-
-    sirius::exec::thread_pool_config config;
-    config.num_threads        = static_cast<int>(options.executor_threads);
-    config.thread_name_prefix = "merge-continuation";
-    lifecycle.open_query(pipeline->get_query_id());
-    scheduler = std::make_unique<pl::task_scheduler>(
-      lifecycle, config, *manager, sirius::test::make_test_telemetry_context());
-    creator = std::make_unique<pumping_task_creator>(lifecycle, *manager, *this);
-    creator->set_task_scheduler(*scheduler);
-    scheduler->set_task_creator(*creator);
-    pipeline->set_task_creator(creator.get());
-    scheduler->start();
-    _pump = std::thread([this] { pump(); });
-  }
-
-  ~merge_harness()
-  {
-    stop_pump();
-    if (!_retired) {
-      try {
-        sirius::test::retire_scheduler_query(
-          lifecycle, *scheduler, pipeline->get_query_id(), false, creator.get());
-      } catch (...) {
-      }
-    }
-    scheduler->stop();
-    // Task output buffers retain executor streams, so free them before the scheduler's stream pool.
-    collector.clear();
-    for (std::size_t partition = 0; partition < input.num_partitions(); ++partition) {
-      while (input.pop_next_data_batch(partition)) {}
-    }
+    pipe  = std::make_unique<merge_utils::merge_pipeline>(
+      *merge,
+      input,
+      *manager,
+      merge_utils::merge_pipeline_options{
+         .executor_threads   = options.executor_threads,
+         .thread_name_prefix = "merge-continuation",
+         .on_request =
+          [this] {
+            requests.fetch_add(1);
+            if (t_in_merge_execute) { rearms_from_execute.fetch_add(1); }
+          },
+         .describe =
+          [this] { return std::to_string(merge->records().size()) + " tasks executed, "; }});
   }
 
   /// Applies the sort_merge_* settings the way the plan generator does, from operator_params.
@@ -484,43 +340,8 @@ struct merge_harness {
     return batch->to_read_only().get_current_tier();
   }
 
-  /**
-   * @brief Hand the MERGE_SORT to the task creator, as the upstream pipeline does when it
-   * finishes, and wait under a watchdog until the pipeline has finished.
-   *
-   * Every later task exists only because the operator scheduled itself again.
-   */
-  void run()
-  {
-    creator->schedule(merge.get());
-    auto const deadline = std::chrono::steady_clock::now() + kWatchdog;
-    while (!pipeline->is_pipeline_finished() && !completion->has_error()) {
-      if (std::chrono::steady_clock::now() >= deadline) {
-        FAIL("the merge did not finish within the watchdog: "
-             << merge->records().size() << " tasks executed, " << pipeline->get_tasks_created()
-             << " created, " << pipeline->get_tasks_completed() << " completed, "
-             << input.total_size() << " batches left in the input repository");
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
-    }
-    if (completion->has_error()) {
-      std::string what = "unknown error";
-      if (completion_result.wait_for(std::chrono::seconds{5}) == std::future_status::ready) {
-        try {
-          completion_result.get();
-        } catch (const std::exception& e) {
-          what = e.what();
-        } catch (...) {
-        }
-      }
-      FAIL("a merge task failed: " << what);
-    }
-    REQUIRE(pipeline->get_tasks_created() == pipeline->get_tasks_completed());
-    stop_pump();
-    sirius::test::retire_scheduler_query(
-      lifecycle, *scheduler, pipeline->get_query_id(), true, creator.get());
-    _retired = true;
-  }
+  /// Runs the merge to its end; see merge_utils::merge_pipeline::run.
+  void run() { pipe->run(); }
 
   /// Requires that every input batch left the repository and was freed.
   void require_inputs_popped()
@@ -538,7 +359,7 @@ struct merge_harness {
   [[nodiscard]] host_rows collected(std::optional<std::size_t> partition = std::nullopt) const
   {
     host_rows rows;
-    for (auto const& [position, batch] : collector.chunks()) {
+    for (auto const& [position, batch] : pipe->collector.chunks()) {
       if (partition && merge::split_merge_chunk_position(position).first != *partition) {
         continue;
       }
@@ -556,88 +377,10 @@ struct merge_harness {
     return rows;
   }
 
-  // Called by pumping_task_creator::schedule, from any thread.
-  void request(sirius_physical_operator* node)
-  {
-    // The pipeline's consumers are notified through the same creator; only the MERGE_SORT has
-    // tasks to create here.
-    if (node != merge.get()) { return; }
-    requests.fetch_add(1);
-    if (t_in_merge_execute) { rearms_from_execute.fetch_add(1); }
-    {
-      std::lock_guard<std::mutex> lock(_pump_mutex);
-      ++_pending;
-    }
-    _pump_wake.notify_one();
-  }
-
  private:
-  void pump()
-  {
-    while (true) {
-      {
-        std::unique_lock<std::mutex> lock(_pump_mutex);
-        _pump_wake.wait(lock, [this] { return _pending > 0 || _stop; });
-        if (_stop) { return; }
-        --_pending;
-      }
-      try {
-        create_tasks();
-      } catch (...) {
-        completion->report_error(std::current_exception());
-      }
-    }
-  }
-
-  /// One creation worker's turn for the MERGE_SORT (task_creator::manager_loop).
-  void create_tasks()
-  {
-    auto const hint = merge->get_next_task_hint();
-    if (hint.has_value() && hint->hint == TaskCreationHint::READY) {
-      while (!merge->all_ports_empty()) {
-        auto task_lock = pipeline->get_task_creation_lock();
-        if (pipeline->is_pipeline_finished()) { break; }
-        auto data          = merge->get_next_task_input_data();
-        auto* pipelineable = dynamic_cast<pipelineable_operator_data*>(data.get());
-        if (!data || (pipelineable && pipelineable->get_data_batches().empty())) { break; }
-        auto const device = data->get_preferred_device_id();
-        auto local        = std::make_unique<pl::gpu_pipeline_task_local_state>(std::move(data));
-        local->set_preferred_device_id(device.value_or(0));
-        auto task = std::make_unique<pl::gpu_pipeline_task>(creator->get_next_task_id(),
-                                                            std::vector<shared_data_repository*>{},
-                                                            std::move(local),
-                                                            global);
-        task_lock.unlock();
-        scheduler->schedule(std::move(task));
-      }
-    }
-    pipeline->update_pipeline_status(false);
-  }
-
-  void stop_pump()
-  {
-    {
-      std::lock_guard<std::mutex> lock(_pump_mutex);
-      _stop = true;
-    }
-    _pump_wake.notify_one();
-    if (_pump.joinable()) { _pump.join(); }
-  }
-
   std::vector<std::pair<std::uint64_t, std::size_t>> _input_ids;
   std::vector<std::weak_ptr<data_batch>> _inputs;
-  std::mutex _pump_mutex;
-  std::condition_variable _pump_wake;
-  std::size_t _pending = 0;
-  bool _stop           = false;
-  bool _retired        = false;
-  std::thread _pump;
 };
-
-void pumping_task_creator::schedule(sirius_physical_operator* request)
-{
-  _harness.request(request);
-}
 
 /// windowed mode, 1024-row windows and 64 KiB output chunks: 4096 two-column rows a task.
 sirius::operator_params small_window_params()
@@ -729,7 +472,7 @@ TEST_CASE("windowed merge sort continues one partition through a chain of positi
 
   // Positions are unique (the collector rejects a duplicate) and were published in order, as
   // every task of the partition starts only after the previous one committed.
-  auto const arrival = test.collector.arrival();
+  auto const arrival = test.pipe->collector.arrival();
   REQUIRE(arrival.size() == records.size());
   for (std::size_t chunk = 0; chunk < arrival.size(); ++chunk) {
     REQUIRE(arrival[chunk] == merge::make_merge_chunk_position(0, chunk));
@@ -739,12 +482,12 @@ TEST_CASE("windowed merge sort continues one partition through a chain of positi
     REQUIRE(record.output_rows <= 4096);
   }
 
-  // The first task came from the request below run(); every other one from the operator
+  // The first task came from the request run() makes; every other one from the operator
   // scheduling itself when its task committed.
   REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
   REQUIRE(test.requests.load() == records.size());
-  REQUIRE(test.pipeline->get_tasks_completed() == records.size());
-  REQUIRE(test.pipeline->is_pipeline_finished());
+  REQUIRE(test.pipe->pipeline->get_tasks_completed() == records.size());
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
 
   REQUIRE(test.collected() == expected);
   REQUIRE(test.input.pushed_back().empty());
@@ -753,7 +496,8 @@ TEST_CASE("windowed merge sort continues one partition through a chain of positi
 
 TEST_CASE("windowed merge sort merges several partitions in parallel", "[merge_sort_continuation]")
 {
-  merge_harness test{{.num_partitions = 4, .executor_threads = 3}};
+  // More executor threads than partitions with runs, so two tasks of one partition could overlap.
+  merge_harness test{{.num_partitions = 4, .executor_threads = 4}};
   test.configure(small_window_params());
   // Partition 2 stays empty; the keys of partition p are all below those of partition p + 1.
   const std::vector<std::size_t> partitions{0, 1, 3};
@@ -787,7 +531,7 @@ TEST_CASE("windowed merge sort merges several partitions in parallel", "[merge_s
   }
 
   // Unique across partitions: one collected chunk per task, each at its own position.
-  auto const chunks = test.collector.chunks();
+  auto const chunks = test.pipe->collector.chunks();
   REQUIRE(chunks.size() == total_chunks);
   std::set<std::size_t> positions;
   for (auto const& record : records) {
@@ -797,7 +541,7 @@ TEST_CASE("windowed merge sort merges several partitions in parallel", "[merge_s
   }
   // Within a partition the chunks were published in order, whatever the other partitions did.
   std::map<std::size_t, std::size_t> last_chunk;
-  for (auto position : test.collector.arrival()) {
+  for (auto position : test.pipe->collector.arrival()) {
     auto const [partition, chunk] = merge::split_merge_chunk_position(position);
     auto const it                 = last_chunk.find(partition);
     REQUIRE(chunk == (it == last_chunk.end() ? 0 : it->second + 1));
@@ -807,9 +551,10 @@ TEST_CASE("windowed merge sort merges several partitions in parallel", "[merge_s
   // Read in position order, the partitions concatenate into the query's order.
   REQUIRE(test.collected() == expected_all);
   REQUIRE(sorted_by_key(expected_all));
-  // One partition never has two tasks, so the peak is bounded by the partitions with runs.
+  // One partition never has two tasks, so the peak is bounded by the partitions with runs, below
+  // the executor's four threads.
   REQUIRE(test.merge->peak_running() <= partitions.size());
-  REQUIRE(test.pipeline->is_pipeline_finished());
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
   test.require_inputs_popped();
 }
 
@@ -850,7 +595,7 @@ TEST_CASE("windowed merge sort with more runs than the fan-in cap merges in pass
   REQUIRE(intermediate_tasks >= 5);
   REQUIRE(final_tasks >= 3);
   REQUIRE(require_chunk_chain(records, partition) == final_tasks);
-  REQUIRE(test.collector.chunks().size() == final_tasks);
+  REQUIRE(test.pipe->collector.chunks().size() == final_tasks);
 
   // Each intermediate task wrote one batch of its run back into the partition it reads.
   auto const pushed_back = test.input.pushed_back();
@@ -862,7 +607,7 @@ TEST_CASE("windowed merge sort with more runs than the fan-in cap merges in pass
   }
 
   REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
-  REQUIRE(test.pipeline->is_pipeline_finished());
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
 
   // A pass reorders runs, so equal keys need not keep the run order.
   require_sorted_rows(test.collected(), expected);
@@ -904,7 +649,7 @@ TEST_CASE("windowed merge sort merges runs spread over the GPU and HOST tiers",
   REQUIRE(require_chunk_chain(records, 0) == records.size());
   REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
   REQUIRE(test.collected() == expected);
-  REQUIRE(test.pipeline->is_pipeline_finished());
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
   test.require_inputs_popped();
 }
 
@@ -1006,7 +751,7 @@ TEST_CASE("merge sort automatic mode routes by the one-shot share of the GPU",
     REQUIRE(records.front().position == merge::make_merge_chunk_position(1, 0));
     REQUIRE(test.rearms_from_execute.load() == 0);
     require_sorted_rows(test.collected(), concatenate(runs));
-    REQUIRE(test.pipeline->is_pipeline_finished());
+    REQUIRE(test.pipe->pipeline->is_pipeline_finished());
     test.require_inputs_popped();
   }
 
@@ -1030,7 +775,7 @@ TEST_CASE("merge sort automatic mode routes by the one-shot share of the GPU",
     REQUIRE(require_chunk_chain(records, 0) == records.size());
     REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
     REQUIRE(test.collected() == full_sort(concatenate(runs)));
-    REQUIRE(test.pipeline->is_pipeline_finished());
+    REQUIRE(test.pipe->pipeline->is_pipeline_finished());
     test.require_inputs_popped();
   }
 }
@@ -1068,11 +813,11 @@ TEST_CASE("windowed merge sort merges runs spread over two GPUs, one partition p
     REQUIRE(test.collected(partition) == full_sort(concatenate(runs[partition])));
   }
   REQUIRE(sorted_by_key(test.collected()));
-  REQUIRE(test.pipeline->is_pipeline_finished());
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
 
   // Partitions were merged on both devices, at the same time.
   std::map<int, std::size_t> tasks_per_device;
-  test.scheduler->visit_executors(
+  test.pipe->scheduler->visit_executors(
     [&](int device, const sirius::pipeline::gpu_pipeline_executor& executor) {
       tasks_per_device[device] = executor.get_metrics().tasks_executed;
     });
@@ -1083,11 +828,12 @@ TEST_CASE("windowed merge sort merges runs spread over two GPUs, one partition p
   }
   REQUIRE(test.merge->peak_running() >= 2);
 
-  // The runs on the other device were converted whole, once each; nothing was read by row range.
+  // The two runs of each partition on the other device were converted whole to the merging
+  // device, once each; nothing was read by row range.
   auto const counters = test.merge->counters();
   REQUIRE(counters.windowed_partitions == num_partitions);
   REQUIRE(counters.windowed_tasks == records.size());
-  REQUIRE(counters.rounds.fallback_conversions >= num_partitions);
-  REQUIRE(counters.rounds.fallback_conversions <= num_partitions * runs_per_part);
+  REQUIRE(counters.rounds.fallback_conversions == num_partitions * (runs_per_part / 3));
+  REQUIRE(counters.rounds.refill_rows == 0);
   test.require_inputs_popped();
 }

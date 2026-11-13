@@ -731,7 +731,8 @@ TEST_CASE("gather_kway copies the caller's read-back to the host", "[kway_gather
   }
   auto const windows = views_of(tables);
 
-  // An odd and an even number of entries: the counts share 64-bit words with them.
+  // Packed after the 10 columns' null counts into 64-bit words: 1 and 37 leave the last word half
+  // full, 4 fills it.
   auto const entries = GENERATE(std::size_t{1}, std::size_t{4}, std::size_t{37});
   std::vector<cudf::size_type> values(entries);
   for (auto& value : values) {

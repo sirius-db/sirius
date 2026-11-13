@@ -27,13 +27,17 @@ namespace sirius::op::merge::detail {
  * @brief Whole-batch fallback for a run batch the windowed merge cannot read by row range.
  *
  * For a batch whose representation has no row-range reader (or whose read threw
- * row_range_unsupported_error): convert it ONCE to the GPU tier in `gpu_space` through the
- * converter registry, under the batch's exclusive lock, and leave it in its repository.
+ * row_range_unsupported_error): convert it to an uncompressed GPU table in `gpu_space` through the
+ * converter registry, under the batch's exclusive lock, and leave it in its repository. Blocks
+ * until the batch's readers and other exclusive holders are done; the caller must hold no lock
+ * on @p batch.
  *
  * @param batch The run batch to convert in place.
  * @param gpu_space The GPU memory space of the merge task.
  * @param stream CUDA stream used for the conversion.
- * @return true if a conversion happened, false if it was already GPU-resident in `gpu_space`.
+ * @return true if a conversion happened, false if the batch already was an uncompressed table in
+ *         `gpu_space` (whoever held the exclusive lock before may have converted it).
+ * @throws std::invalid_argument if @p gpu_space is not a GPU space.
  */
 bool convert_run_batch_to_gpu(cucascade::data_batch& batch,
                               cucascade::memory::memory_space& gpu_space,

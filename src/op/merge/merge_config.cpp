@@ -19,8 +19,12 @@
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/merge/bounded_kway_merge.hpp"
+#include "op/merge/detail/kway_merge_detail.hpp"
+
+#include <cudf/types.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 
 namespace sirius::op::merge {
@@ -89,6 +93,9 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
     // The ceiling is applied last, so it wins when it is below the floor: memory comes first.
     window_rows = std::max<std::size_t>(std::min(std::max(fit, kWindowRowsFloor), ceiling), 1);
   }
+  // The merger and its window buffers address a window with cudf::size_type.
+  window_rows = std::min<std::size_t>(
+    window_rows, static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
 
   auto const output_target_bytes =
     settings.output_bytes != 0
@@ -160,20 +167,44 @@ std::size_t estimate_task_bytes(std::size_t k,
                                 std::size_t gpu_runs,
                                 std::size_t window_rows,
                                 std::size_t row_width,
-                                std::size_t key_row_width,
+                                std::size_t /*key_row_width*/,
                                 std::size_t output_target_bytes,
-                                std::size_t largest_fallback_run_bytes)
+                                std::size_t fallback_runs_bytes,
+                                std::size_t fetch_columns,
+                                std::size_t string_columns)
 {
   auto const buffered_runs = k - std::min(gpu_runs, k);
-  // Window buffers (two copies each) of the runs that are not sliced in place.
-  auto total =
-    saturating_mul(saturating_mul(2, buffered_runs), saturating_mul(window_rows, row_width));
-  // One window of gathered output rows plus its 8-byte gather-map entries.
-  total = saturating_add(total, saturating_mul(window_rows, saturating_add(row_width, 8)));
-  // Key columns of every run's window.
-  total = saturating_add(total, saturating_mul(saturating_mul(k, window_rows), key_row_width));
-  total = saturating_add(total, saturating_mul(2, output_target_bytes));
-  return saturating_add(total, largest_fallback_run_bytes);
+  auto const window_bytes  = saturating_mul(window_rows, row_width);
+
+  // One slot of a window buffer (see window_buffer's constructor): the rows, a validity mask per
+  // column and, per STRING column, 8-byte offsets and chars sized at (estimate + 1) * 1.25. The
+  // chars share of row_width is not known here, so the 25% slack is taken on the whole row.
+  auto slot = window_bytes;
+  slot      = saturating_add(slot, saturating_mul(fetch_columns, window_rows / 8 + 64));
+  if (string_columns != 0) {
+    auto const per_string =
+      saturating_add(saturating_mul(saturating_add(window_rows, 1), 8),    // offsets
+                     saturating_add(saturating_mul(window_rows, 2), 64));  // the + 1 and minimum
+    slot = saturating_add(slot, window_bytes / 4);
+    slot = saturating_add(slot, saturating_mul(string_columns, per_string));
+  }
+  // Two slots for each run that is not sliced in place.
+  auto total = saturating_mul(saturating_mul(2, buffered_runs), slot);
+
+  // The round outputs, up to the target plus one round, and their concatenation into one table.
+  total =
+    saturating_add(total, saturating_mul(2, saturating_add(output_target_bytes, window_bytes)));
+
+  // Scratch of one bounded merge: 8-byte gather-map entries per output row and, per tile boundary,
+  // its rank plus three 4-byte values per run (the co-rank and corank_split's two scratch values).
+  auto const boundaries =
+    saturating_add(window_rows / static_cast<std::size_t>(detail::kDefaultTileRows), 2);
+  total = saturating_add(total, saturating_mul(window_rows, 8));
+  total =
+    saturating_add(total, saturating_mul(boundaries, saturating_add(4, saturating_mul(12, k))));
+
+  // Every fallback run can hold one converted batch at once.
+  return saturating_add(total, fallback_runs_bytes);
 }
 
 std::size_t estimate_reader_state_bytes(std::size_t compressed_runs,
@@ -185,7 +216,8 @@ std::size_t estimate_reader_state_bytes(std::size_t compressed_runs,
   constexpr std::size_t chunk_slack_rows = 2048;
   // Two int64 scratch values per row: the run values and run lengths of a delta column.
   constexpr std::size_t scratch_bytes_per_row = 16;
-  // Offsets scratch of a str_split column.
+  // Offsets scratch of a str_split column: its decode cursor's int64 offsets chunks per window
+  // (see str_split_chunks.cu); keep the two in step.
   constexpr std::size_t string_scratch_bytes = std::size_t{2} << 20;
   auto const per_column =
     saturating_mul(scratch_bytes_per_row, saturating_add(window_rows, chunk_slack_rows));

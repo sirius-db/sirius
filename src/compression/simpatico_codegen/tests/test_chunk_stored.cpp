@@ -253,6 +253,7 @@ void check_string_span(device_leaf_access& access,
   check(access.requested_bytes(0, 0) == offsets_end - offsets_begin,
         what + "the span's offsets were not staged exactly once");
   check(access.host_requests().empty(), what + "a decode read payload bytes back to the host");
+  // The only state is one device cut record, whatever the span.
   check(decoder.state_bytes() <= 64, what + "the decoder's state grows with the span");
   check(access.requests_within(0,
                                1,
@@ -337,7 +338,8 @@ void test_string(cudf::size_type rows,
 
   // A destination whose chars are already full (dst_byte_offset == data_capacity is covered
   // above with budget 0); one past it must also give 0 rows, not a wrapped budget.
-  if (min_length > 0) {
+  // Null-free only: a null row 0 has length 0 and would fit the clamped budget of 0.
+  if (min_length > 0 && null_fraction == 0.0) {
     rmm::cuda_stream_view const stream = cudf::get_default_stream();
     auto chars                         = sentinel_buffer(64);
     auto dst_offsets                   = sentinel_buffer(64);
@@ -406,7 +408,7 @@ void test_string_wide_stored_offsets()
 }
 
 /// Stored offsets that start negative or decrease are reported as corrupt, wherever in the span
-/// they are, and the decoder still works on the rows before them.
+/// they are, and the decoder still works on the rows between them.
 void test_string_corrupt_offsets()
 {
   column_options options;

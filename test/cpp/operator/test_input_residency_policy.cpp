@@ -312,7 +312,7 @@ TEST_CASE("prepare of an input that does not materialize on the GPU races a down
     }
     REQUIRE(downgrade.wait_for(30s) == std::future_status::ready);
     REQUIRE_NOTHROW(downgrade.get());
-    REQUIRE(prepare_error == nullptr);
+    if (prepare_error) { REQUIRE_NOTHROW(std::rethrow_exception(prepare_error)); }
 
     // Whichever side won, the input holds a lock on the batch in the tier it ended up in.
     REQUIRE(input.get_data_batches().at(0) == batch);

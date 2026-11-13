@@ -2,12 +2,12 @@
 //
 // Stored (identity) chunk decoder: the plan `input -> identity` keeps the plain column.
 //   * Fixed width: one Identity leaf with a single "data" buffer of num_rows values, so a span is
-//     a device-to-device slice.
+//     one read of its bytes straight into the destination.
 //   * STRING: identity delegates to str_split, so the leaf is a StrSplit one with an "offsets"
 //     buffer (num_rows + 1 INT32 or INT64 values indexing "chars") and a "chars" buffer. A span
 //     stages its offsets; one device pass finds the rows whose chars fit the budget, writes
 //     their offsets rebased to the destination and records the cut, which the host reads back (a
-//     few bytes) to copy the chars slice.
+//     few bytes) to read the chars slice straight into the destination.
 
 #include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
@@ -57,17 +57,13 @@ class stored_fixed_decoder final : public chunk_decoder {
       throw std::invalid_argument("stored chunk decode: destination holds fewer than " +
                                   std::to_string(dst.dst_row_offset + span.take) + " rows");
     }
-    auto const* src = leaves.device_bytes(_data.leaf,
-                                          _data.buffer,
-                                          static_cast<std::uint64_t>(span.first_row()) * _width,
-                                          bytes,
-                                          stream);
-    throw_if_cuda_error(cudaMemcpyAsync(static_cast<std::byte*>(dst.data) + dst_begin,
-                                        src,
-                                        bytes,
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.value()),
-                        "stored chunk decode: copy of the values");
+    read_leaf_bytes(leaves,
+                    _data.leaf,
+                    _data.buffer,
+                    static_cast<std::uint64_t>(span.first_row()) * _width,
+                    bytes,
+                    static_cast<std::byte*>(dst.data) + dst_begin,
+                    stream);
     return span.take;
   }
 
@@ -158,7 +154,8 @@ class stored_string_decoder final : public chunk_decoder {
   {
     check_span(span, leaves.column().num_rows);
     if (span.take == 0) { return 0; }
-    if (dst.data == nullptr || dst.offsets == nullptr ||
+    // A destination without chars storage takes the rows whose chars are empty.
+    if ((dst.data == nullptr && dst.data_capacity != 0) || dst.offsets == nullptr ||
         (dst.offset_width != 4 && dst.offset_width != 8)) {
       throw std::invalid_argument("stored chunk decode: bad STRING destination");
     }
@@ -210,14 +207,13 @@ class stored_string_decoder final : public chunk_decoder {
 
     auto const chars_bytes = static_cast<std::uint64_t>(cut.end - cut.base);
     if (chars_bytes != 0) {
-      auto const* chars = leaves.device_bytes(
-        _chars.leaf, _chars.buffer, static_cast<std::uint64_t>(cut.base), chars_bytes, stream);
-      throw_if_cuda_error(cudaMemcpyAsync(static_cast<std::byte*>(dst.data) + dst.dst_byte_offset,
-                                          chars,
-                                          chars_bytes,
-                                          cudaMemcpyDeviceToDevice,
-                                          stream.value()),
-                          "stored chunk decode: copy of the chars");
+      read_leaf_bytes(leaves,
+                      _chars.leaf,
+                      _chars.buffer,
+                      static_cast<std::uint64_t>(cut.base),
+                      chars_bytes,
+                      static_cast<std::byte*>(dst.data) + dst.dst_byte_offset,
+                      stream);
     }
     return cut.fit;
   }

@@ -15,16 +15,23 @@
  */
 
 #include "catch.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/merge/merge_chunk_position.hpp"
 #include "op/merge/merge_config.hpp"
 #include "op/merge/windowed_merge_input.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "sirius/exception.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -54,6 +61,22 @@ merge_input_cursor make_cursor(std::vector<std::uint64_t> ids,
           .row   = row};
 }
 
+/// The source of a pipeline that only has to exist.
+class source_operator : public sirius::op::sirius_physical_operator {
+ public:
+  source_operator()
+    : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::MERGE_SORT,
+                               sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+                               0)
+  {
+  }
+
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::FIXED_ORDER;
+  }
+};
+
 std::vector<merge_input_cursor> make_cursors()
 {
   std::vector<merge_input_cursor> cursors;
@@ -69,10 +92,11 @@ windowed_merge_input make_input(window_config cfg)
     5, make_cursors(), false, 9, cfg, kRowWidth, kKeyRowWidth, kGpuRuns, kLargestFallback);
 }
 
-std::size_t expected_estimate(const window_config& cfg)
+/// @p unbuffered_runs: the runs charged no window buffer.
+std::size_t expected_estimate(const window_config& cfg, std::size_t unbuffered_runs = kGpuRuns)
 {
   return estimate_task_bytes(make_cursors().size(),
-                             kGpuRuns,
+                             unbuffered_runs,
                              cfg.window_rows,
                              kRowWidth,
                              kKeyRowWidth,
@@ -147,6 +171,67 @@ TEST_CASE("windowed_merge_input adds the reader state of its compressed runs to 
   REQUIRE(input.shrink_for_retry());
   REQUIRE(input.config().window_rows == 32768);
   REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()) + reader(32768));
+}
+
+TEST_CASE("windowed_merge_input leaves out the window buffers a kept merger holds",
+          "[windowed_merge_input]")
+{
+  const window_config cfg{.window_rows = 65536, .output_target_bytes = 64 * kMiB};
+  auto input = make_input(cfg);
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg));
+
+  input.set_kept_buffer_runs(1);
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg, kGpuRuns + 1));
+  REQUIRE(input.get_estimated_size_in_bytes() < expected_estimate(cfg));
+  REQUIRE(input.get_estimated_working_set_size_in_bytes() == input.get_estimated_size_in_bytes());
+
+  // More kept runs than the task has buffered ones charge no buffer, and nothing below that.
+  input.set_kept_buffer_runs(100);
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg, make_cursors().size()));
+
+  // The retry of a failed task builds a new merger: every buffer is charged again.
+  REQUIRE(input.shrink_for_retry());
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()));
+
+  SECTION("also when the sizes are at their floors")
+  {
+    auto at_floor =
+      make_input({.window_rows = kShrinkWindowRowsFloor, .output_target_bytes = kOutputBytesFloor});
+    at_floor.set_kept_buffer_runs(2);
+    REQUIRE(at_floor.get_estimated_size_in_bytes() < expected_estimate(at_floor.config()));
+    REQUIRE_FALSE(at_floor.shrink_for_retry());
+    REQUIRE(at_floor.get_estimated_size_in_bytes() == expected_estimate(at_floor.config()));
+  }
+}
+
+TEST_CASE("a windowed merge task reserves at least its working set when the history says less",
+          "[windowed_merge_input]")
+{
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
+  source_operator source;
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipeline, source);
+  build_state.add_pipeline_operator(*pipeline, source);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    pipeline, sirius::test::make_test_telemetry_context());
+
+  auto input = std::make_unique<windowed_merge_input>(
+    make_input({.window_rows = 65536, .output_target_bytes = 64 * kMiB}));
+  const auto working_set = input->get_estimated_working_set_size_in_bytes();
+  // An earlier task of the pipeline reused a kept merger's windows: its peak was a hundredth of
+  // its estimate.
+  global_state->get_memory_history().record({working_set, working_set / 100, working_set / 100});
+
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input)),
+    std::move(global_state));
+  const auto estimate = task->get_estimated_reservation_size_info(nullptr);
+  REQUIRE(estimate.had_history);
+  REQUIRE(estimate.peak_memory_estimate == working_set);
+  REQUIRE(estimate.reservation_size == working_set);
 }
 
 TEST_CASE("windowed_merge_input shrinks by halving down to both floors", "[windowed_merge_input]")

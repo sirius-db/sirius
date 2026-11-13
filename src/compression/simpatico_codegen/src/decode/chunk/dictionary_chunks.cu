@@ -12,15 +12,24 @@
 // Null rows: the column's validity is detached before the encoder sees it (strip_validity), so
 // cudf::dictionary::encode gives a null row the index of whatever string its slot holds - an
 // ordinary key, usually the empty one. A null row therefore decodes like any other row, which is
-// what the whole-table decode produces too. An index outside the keys (corrupt data) decodes as
-// an empty string.
+// what the whole-table decode produces too.
 //
 // The keys are read once, on the first decode: the offsets go to the host (to validate them and
-// to know the longest key) and are kept on the device as int64; the chars stay where the
-// leaf_access staged them.
+// to know the longest key), and both the offsets and the chars stay where the leaf_access staged
+// them, at their stored width, for the cursor's life.
+//
+// A call walks its rows in windows of at most kWindowChunks index chunks, so its scratch is
+// bounded however many rows it takes. The chars appended so far are carried from window to
+// window on the device; the host reads back one record per call, and the rows that fit a window
+// only when the longest key says they might not all fit.
+//
+// Corrupt data fails closed: bad key offsets on the first decode, an index chunk shorter than its
+// rows before anything is written, and an index outside the keys (which writes no chars) when
+// the call's record is read.
 
 #include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/utilities/traits.hpp>
 
@@ -45,35 +54,75 @@ namespace simpatico::chunk {
 
 namespace {
 
-// Length of the key row `i` of the span points at; 0 for an index outside the keys.
+/// Index chunks decoded per window; bounds the int64 scratch (2 MiB of indices, 2 MiB of ends).
+constexpr std::int64_t kWindowChunks = 256;
+
+/// What a call's device passes carry from window to window and report to the host.
+struct call_record {
+  std::int64_t chars;  ///< chars of the rows the windows before the current one appended
+  std::int64_t bad;    ///< nonzero once a row's index was outside the keys
+};
+
+/// The key offsets as stored: num_keys + 1 INT32 or INT64, at any address when !aligned (a leaf
+/// buffer can start at any payload offset).
+struct key_offsets {
+  std::uint8_t const* bytes{nullptr};
+  std::uint8_t width{4};
+  bool aligned{false};
+
+  __device__ __forceinline__ std::int64_t operator[](std::int64_t i) const
+  {
+    auto const* const at = bytes + i * width;
+    if (aligned) {
+      return width == 4 ? std::int64_t{*reinterpret_cast<std::int32_t const*>(at)}
+                        : *reinterpret_cast<std::int64_t const*>(at);
+    }
+    std::uint64_t v = 0;
+    for (std::uint8_t k = 0; k < width; ++k) {
+      v |= static_cast<std::uint64_t>(at[k]) << (8 * k);
+    }
+    return width == 4 ? std::int64_t{static_cast<std::int32_t>(v)} : static_cast<std::int64_t>(v);
+  }
+};
+
+// Length of the key row `i` of the window points at. An index outside the keys is corrupt data:
+// it is recorded and counts as an empty key, so nothing is read or written out of bounds.
 struct key_length_fn {
-  std::int64_t const* indices;  ///< first row of the span
-  std::int64_t const* key_offsets;
+  std::int64_t const* indices;  ///< first row of the window
+  key_offsets keys;
   std::int64_t num_keys;
+  call_record* record;
 
   __device__ std::int64_t operator()(std::int64_t i) const
   {
     auto const key = indices[i];
-    return key >= 0 && key < num_keys ? key_offsets[key + 1] - key_offsets[key] : 0;
+    if (key < 0 || key >= num_keys) {
+      record->bad = 1;
+      return 0;
+    }
+    return keys[key + 1] - keys[key];
   }
 };
 
 struct fits_fn {
+  call_record const* record;
   std::int64_t budget;
 
-  __device__ bool operator()(std::int64_t end) const { return end <= budget; }
+  __device__ bool operator()(std::int64_t end) const { return record->chars + end <= budget; }
 };
 
-// Writes offset i of the rows appended: base, then base + the chars of rows [0, i).
+// Writes offset i of the window's rows: base, then base + the chars of rows [0, i), where base
+// is where the windows before left the destination chars.
 struct write_offsets_fn {
-  std::int64_t const* ends;  ///< ends[i] = chars of rows [0, i]
+  std::int64_t const* ends;  ///< ends[i] = chars of rows [0, i] of the window
+  call_record const* record;
   void* dst;
   std::uint8_t dst_width;
-  std::int64_t base;
+  std::int64_t base;  ///< dst_byte_offset
 
   __device__ void operator()(std::int64_t i) const
   {
-    auto const value = base + (i == 0 ? 0 : ends[i - 1]);
+    auto const value = base + record->chars + (i == 0 ? 0 : ends[i - 1]);
     if (dst_width == 4) {
       static_cast<std::int32_t*>(dst)[i] = static_cast<std::int32_t>(value);
     } else {
@@ -82,11 +131,12 @@ struct write_offsets_fn {
   }
 };
 
-// Copies the key of row i to its place in the destination chars.
+// Copies the key of row i of the window to its place in the destination chars.
 struct gather_chars_fn {
-  std::int64_t const* indices;  ///< first row of the span
+  std::int64_t const* indices;  ///< first row of the window
   std::int64_t const* ends;
-  std::int64_t const* key_offsets;
+  call_record const* record;
+  key_offsets keys;
   std::int64_t num_keys;
   std::uint8_t const* key_chars;
   std::uint8_t* dst;  ///< destination chars at dst_byte_offset
@@ -95,13 +145,22 @@ struct gather_chars_fn {
   {
     auto const key = indices[i];
     if (key < 0 || key >= num_keys) { return; }
-    auto const begin  = key_offsets[key];
-    auto const length = key_offsets[key + 1] - begin;
-    auto* const out   = dst + (i == 0 ? 0 : ends[i - 1]);
+    auto const begin  = keys[key];
+    auto const length = keys[key + 1] - begin;
+    auto* const out   = dst + record->chars + (i == 0 ? 0 : ends[i - 1]);
     for (std::int64_t b = 0; b < length; ++b) {
       out[b] = key_chars[begin + b];
     }
   }
+};
+
+// Adds a window's chars to the record, for the next window.
+struct advance_fn {
+  std::int64_t const* ends;
+  std::int64_t rows;
+  call_record* record;
+
+  __device__ void operator()(std::int64_t) const { record->chars += ends[rows - 1]; }
 };
 
 /// Where the dictionary's buffers are, and the shape of its keys.
@@ -134,41 +193,22 @@ class dictionary_decoder final : public chunk_decoder {
         std::to_string(span.take) + ") are not within the column's " + std::to_string(num_rows));
     }
     if (span.take == 0) { return 0; }
-    if (dst.data == nullptr || dst.offsets == nullptr ||
+    // A destination with no chars capacity needs no chars buffer: it takes empty rows only.
+    if ((dst.data == nullptr && dst.data_capacity != 0) || dst.offsets == nullptr ||
         (dst.offset_width != 4 && dst.offset_width != 8)) {
       throw std::invalid_argument("dictionary chunk decode: bad STRING destination");
     }
-    load_keys(leaves, stream);
-    auto const mr = leaves.mr();
-
     // Only the chunks the rows touch, which may be fewer than the span offers.
-    auto const chunk_end =
-      std::min(span.chunk_end,
-               span.chunk_begin + (span.skip_head + span.take + kChunkRows - 1) / kChunkRows);
-    auto const chunks = chunk_end - span.chunk_begin;
-    if (chunks <= 0 || span.skip_head + span.take > chunks * kChunkRows) {
+    auto const chunk_begin = span.chunk_begin + span.skip_head / kChunkRows;
+    auto const skip        = span.skip_head % kChunkRows;
+    auto const chunks_end =
+      std::min(span.chunk_end, chunk_begin + (skip + span.take + kChunkRows - 1) / kChunkRows);
+    if (chunks_end <= chunk_begin || skip + span.take > (chunks_end - chunk_begin) * kChunkRows) {
       throw std::invalid_argument(
         "dictionary chunk decode: the span's chunks do not hold its rows");
     }
-    reserve(_indices,
-            static_cast<std::size_t>(chunks * kChunkRows) * sizeof(std::int64_t),
-            leaves,
-            stream);
-    auto* const chunk_indices = static_cast<std::int64_t*>(_indices.data());
-    unpack_bitpack_chunks(
-      leaves, *_indices_state, span.chunk_begin, chunk_end, chunk_indices, stream);
-    auto const* const indices     = chunk_indices + span.skip_head;
-    auto const* const key_offsets = static_cast<std::int64_t const*>(_key_offsets.data());
-
-    // ends[i] = chars of rows [0, i] of the span.
-    reserve(_ends, static_cast<std::size_t>(span.take) * sizeof(std::int64_t), leaves, stream);
-    auto* const ends = static_cast<std::int64_t*>(_ends.data());
-    thrust::transform_inclusive_scan(rmm::exec_policy_nosync(stream, mr),
-                                     thrust::counting_iterator<std::int64_t>{0},
-                                     thrust::counting_iterator<std::int64_t>{span.take},
-                                     ends,
-                                     key_length_fn{indices, key_offsets, _num_keys},
-                                     thrust::plus<std::int64_t>{});
+    load_keys(leaves, stream);
+    auto const mr = leaves.mr();
 
     // Chars budget: what is left of the destination, and what a 4-byte offset can address.
     std::uint64_t budget =
@@ -177,45 +217,99 @@ class dictionary_decoder final : public chunk_decoder {
       std::uint64_t const max_end = std::numeric_limits<std::int32_t>::max();
       budget = std::min(budget, max_end > dst.dst_byte_offset ? max_end - dst.dst_byte_offset : 0);
     }
-    // Rows that fit: all of them when even the longest key would, without asking the device;
-    // otherwise the ends within the budget (they do not decrease), which costs one sync.
-    auto rows = span.take;
-    if (static_cast<std::uint64_t>(span.take) * static_cast<std::uint64_t>(_max_key_length) >
-        budget) {
-      auto const signed_budget = static_cast<std::int64_t>(
-        std::min<std::uint64_t>(budget, std::numeric_limits<std::int64_t>::max()));
-      rows = static_cast<std::int64_t>(thrust::count_if(
-        rmm::exec_policy(stream, mr), ends, ends + span.take, fits_fn{signed_budget}));
-    }
-    if (rows == 0) { return 0; }
+    auto const signed_budget = static_cast<std::int64_t>(
+      std::min<std::uint64_t>(budget, std::numeric_limits<std::int64_t>::max()));
+
+    if (_record.size() == 0) { _record = rmm::device_buffer(sizeof(call_record), stream, mr); }
+    auto* const record = static_cast<call_record*>(_record.data());
+    throw_if_cuda_error(cudaMemsetAsync(record, 0, sizeof(call_record), stream.value()),
+                        "dictionary chunk decode: clearing the call record");
 
     auto* const dst_offsets = static_cast<std::byte*>(dst.offsets) +
                               static_cast<std::size_t>(dst.dst_row_offset) * dst.offset_width;
-    thrust::for_each_n(
-      rmm::exec_policy_nosync(stream, mr),
-      thrust::counting_iterator<std::int64_t>{0},
-      rows + 1,
-      write_offsets_fn{
-        ends, dst_offsets, dst.offset_width, static_cast<std::int64_t>(dst.dst_byte_offset)});
-    if (_max_key_length != 0) {
+    auto* const dst_chars = static_cast<std::uint8_t*>(dst.data) + dst.dst_byte_offset;
+    auto const base       = static_cast<std::int64_t>(dst.dst_byte_offset);
+
+    std::int64_t rows = 0;  // rows taken so far
+    while (rows < span.take) {
+      // Rows [rows, rows + window_rows) of the call: those left in chunks [begin, end).
+      auto const position    = skip + rows;
+      auto const begin       = chunk_begin + position / kChunkRows;
+      auto const end         = std::min(chunks_end, begin + kWindowChunks);
+      auto const head        = position % kChunkRows;
+      auto const window_rows = std::min(span.take - rows, (end - begin) * kChunkRows - head);
+
+      reserve(_indices,
+              static_cast<std::size_t>((end - begin) * kChunkRows) * sizeof(std::int64_t),
+              leaves,
+              stream);
+      auto* const chunk_indices = static_cast<std::int64_t*>(_indices.data());
+      unpack_bitpack_chunks(leaves, *_indices_state, begin, end, chunk_indices, stream);
+      // One index per row: a corrupt count below a chunk's rows would leave stale indices in the
+      // scratch. The counts are the node's, so the first window checks the whole call, before
+      // anything is written.
+      if (rows == 0) { require_bitpack_values(*_indices_state, chunk_begin, skip + span.take); }
+      auto const* const indices = chunk_indices + head;
+
+      // ends[i] = chars of rows [0, i] of the window.
+      reserve(_ends, static_cast<std::size_t>(window_rows) * sizeof(std::int64_t), leaves, stream);
+      auto* const ends = static_cast<std::int64_t*>(_ends.data());
+      thrust::transform_inclusive_scan(rmm::exec_policy_nosync(stream, mr),
+                                       thrust::counting_iterator<std::int64_t>{0},
+                                       thrust::counting_iterator<std::int64_t>{window_rows},
+                                       ends,
+                                       key_length_fn{indices, _keys, _num_keys, record},
+                                       thrust::plus<std::int64_t>{});
+
+      // Rows of the window that fit: all of them when even the longest key would, for every row
+      // so far, without asking the device; otherwise the ends within the budget (they do not
+      // decrease), which costs one sync.
+      auto fit = window_rows;
+      if (_max_key_length != 0 && static_cast<std::uint64_t>(rows + window_rows) >
+                                    budget / static_cast<std::uint64_t>(_max_key_length)) {
+        fit = static_cast<std::int64_t>(thrust::count_if(
+          rmm::exec_policy(stream, mr), ends, ends + window_rows, fits_fn{record, signed_budget}));
+      }
+      if (fit == 0) { break; }
+
+      // The window's first offset is the previous window's last: written again, the same.
       thrust::for_each_n(
         rmm::exec_policy_nosync(stream, mr),
         thrust::counting_iterator<std::int64_t>{0},
-        rows,
-        gather_chars_fn{indices,
-                        ends,
-                        key_offsets,
-                        _num_keys,
-                        _key_chars,
-                        static_cast<std::uint8_t*>(dst.data) + dst.dst_byte_offset});
+        fit + 1,
+        write_offsets_fn{ends,
+                         record,
+                         dst_offsets + static_cast<std::size_t>(rows) * dst.offset_width,
+                         dst.offset_width,
+                         base});
+      if (_max_key_length != 0) {
+        thrust::for_each_n(
+          rmm::exec_policy_nosync(stream, mr),
+          thrust::counting_iterator<std::int64_t>{0},
+          fit,
+          gather_chars_fn{indices, ends, record, _keys, _num_keys, _key_chars, dst_chars});
+      }
+      rows += fit;
+      if (fit != window_rows) { break; }
+      if (rows < span.take) {
+        thrust::for_each_n(rmm::exec_policy_nosync(stream, mr),
+                           thrust::counting_iterator<std::int64_t>{0},
+                           1,
+                           advance_fn{ends, window_rows, record});
+      }
+    }
+
+    call_record result{};
+    read_device_bytes_completed(&result, record, sizeof(call_record), stream);
+    if (result.bad != 0) {
+      throw std::runtime_error("dictionary chunk decode: an index is outside the keys");
     }
     return rows;
   }
 
   [[nodiscard]] std::size_t state_bytes() const noexcept override
   {
-    return _key_offsets.size() + _indices.size() + _ends.size() +
-           bitpack_state_bytes(*_indices_state);
+    return _indices.size() + _ends.size() + _record.size() + bitpack_state_bytes(*_indices_state);
   }
 
  private:
@@ -228,55 +322,54 @@ class dictionary_decoder final : public chunk_decoder {
     if (buffer.size() < bytes) { buffer = rmm::device_buffer(bytes, stream, leaves.mr()); }
   }
 
-  /// Reads the keys on the first call: offsets validated on the host and kept on the device as
-  /// int64, chars staged whole.
+  /// Reads the keys on the first call: the offsets are validated on the host, and offsets and
+  /// chars are staged whole, to stay with the leaf_access as long as the cursor lives.
   void load_keys(leaf_access& leaves, rmm::cuda_stream_view stream)
   {
     if (_keys_loaded) { return; }
     std::size_t const width = _loc.keys_offsets_width;
     auto const count        = static_cast<std::size_t>(_loc.keys_offsets_bytes / width);
+    if (count == 0) { throw std::runtime_error("dictionary chunk decode: no key offsets"); }
     std::vector<std::uint8_t> raw(count * width);
     leaves.host_bytes(
       _loc.keys_offsets.leaf, _loc.keys_offsets.buffer, 0, raw.size(), raw.data(), stream);
-
-    std::vector<std::int64_t> offsets(count);
-    for (std::size_t i = 0; i < count; ++i) {
+    auto const offset_at = [&](std::size_t i) {
+      std::int64_t wide = 0;
       if (width == 4) {
-        std::int32_t value;
-        std::memcpy(&value, raw.data() + i * width, sizeof(value));
-        offsets[i] = value;
+        std::int32_t narrow;
+        std::memcpy(&narrow, raw.data() + i * width, sizeof(narrow));
+        wide = narrow;
       } else {
-        std::memcpy(&offsets[i], raw.data() + i * width, sizeof(std::int64_t));
+        std::memcpy(&wide, raw.data() + i * width, sizeof(wide));
       }
-    }
+      return wide;
+    };
+
     std::int64_t max_length = 0;
-    if (offsets.front() < 0) {
-      throw std::runtime_error("dictionary chunk decode: negative key offset");
-    }
+    auto previous           = offset_at(0);
+    if (previous < 0) { throw std::runtime_error("dictionary chunk decode: negative key offset"); }
     for (std::size_t i = 1; i < count; ++i) {
-      if (offsets[i] < offsets[i - 1]) {
+      auto const offset = offset_at(i);
+      if (offset < previous) {
         throw std::runtime_error("dictionary chunk decode: decreasing key offsets");
       }
-      max_length = std::max(max_length, offsets[i] - offsets[i - 1]);
+      max_length = std::max(max_length, offset - previous);
+      previous   = offset;
     }
-    if (static_cast<std::uint64_t>(offsets.back()) > _loc.keys_chars_bytes) {
+    if (static_cast<std::uint64_t>(previous) > _loc.keys_chars_bytes) {
       throw std::runtime_error("dictionary chunk decode: key offsets exceed keys_chars");
     }
 
-    rmm::device_buffer device(count * sizeof(std::int64_t), stream, leaves.mr());
-    throw_if_cuda_error(
-      cudaMemcpyAsync(
-        device.data(), offsets.data(), device.size(), cudaMemcpyHostToDevice, stream.value()),
-      "dictionary chunk decode: key offsets upload");
-    // `offsets` dies with this scope: the copy must have run before it does. This is the first
-    // decode only, which has already waited for the stream to read the offsets.
-    stream.synchronize();
-
+    key_offsets keys;
+    keys.bytes = reinterpret_cast<std::uint8_t const*>(
+      leaves.device_bytes(_loc.keys_offsets.leaf, _loc.keys_offsets.buffer, 0, raw.size(), stream));
+    keys.width   = _loc.keys_offsets_width;
+    keys.aligned = reinterpret_cast<std::uintptr_t>(keys.bytes) % width == 0;
     if (_loc.keys_chars_bytes != 0) {
       _key_chars = reinterpret_cast<std::uint8_t const*>(leaves.device_bytes(
         _loc.keys_chars.leaf, _loc.keys_chars.buffer, 0, _loc.keys_chars_bytes, stream));
     }
-    _key_offsets    = std::move(device);
+    _keys           = keys;
     _num_keys       = static_cast<std::int64_t>(count) - 1;
     _max_key_length = max_length;
     _keys_loaded    = true;
@@ -286,13 +379,14 @@ class dictionary_decoder final : public chunk_decoder {
   std::unique_ptr<bitpack_state, void (*)(bitpack_state*)> _indices_state;
 
   bool _keys_loaded{false};
-  rmm::device_buffer _key_offsets;          ///< num_keys + 1 int64
+  key_offsets _keys;                        ///< staged by the leaf_access, which owns them
   std::uint8_t const* _key_chars{nullptr};  ///< staged by the leaf_access, which owns it
   std::int64_t _num_keys{0};
   std::int64_t _max_key_length{0};
 
-  rmm::device_buffer _indices;  ///< scratch: the span's chunks, unpacked
-  rmm::device_buffer _ends;     ///< scratch: inclusive scan of the span's key lengths
+  rmm::device_buffer _indices;  ///< scratch: one window's index chunks, unpacked
+  rmm::device_buffer _ends;     ///< scratch: inclusive scan of one window's key lengths
+  rmm::device_buffer _record;   ///< one call_record, allocated by the first decode
 };
 
 /// The terminal leaf holding output port `output` of node `node`: one buffer. Throws

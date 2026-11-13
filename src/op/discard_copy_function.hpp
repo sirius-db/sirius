@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,10 @@ inline constexpr const char* kDiscardCopyFormat = "sirius_discard";
 
 //! Bind data of the `sirius_discard` COPY format.
 struct discard_copy_bind_data : public duckdb::FunctionData {
-  //! `check_order` option: verify that the rows arrive in the query's ORDER BY order.
+  //! `check_order` option: on the GPU path, verify that rows arrive in the query's ORDER BY order.
+  //! Not an error where it cannot be checked: the CPU path, and a query whose root is not an
+  //! ORDER BY on output columns, return the count unverified and log a WARN. The discard sink's
+  //! `order_checked=1` (see `sirius_physical_discard_sink::finish`) is the proof that it ran.
   bool check_order{false};
   //! Column types of the query being copied.
   duckdb::vector<duckdb::LogicalType> types;
@@ -56,10 +59,12 @@ struct discard_copy_bind_data : public duckdb::FunctionData {
 };
 
 //! The DuckDB CopyFunction of the `sirius_discard` format. Its CPU body discards too, so
-//! `gpu_execution = false` works and gives the same count.
+//! `gpu_execution = false` works and gives the same count. The CPU body never checks the order:
+//! with `check_order true` it logs a WARN and returns the count unverified.
 duckdb::CopyFunction get_discard_copy_function();
 
-//! Registers the `sirius_discard` COPY format. Call once per DatabaseInstance.
+//! Registers the `sirius_discard` COPY format. Idempotent: another call on the same
+//! DatabaseInstance is a no-op.
 void register_discard_copy_function(duckdb::DatabaseInstance& instance);
 
 }  // namespace op

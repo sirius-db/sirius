@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Chunk-span decode of bitpack: the `bitpack` root decoder against the whole-column decode, the
-// byte ranges it requests, and unpack_bitpack_chunks on root and non-root bitpack nodes.
+// byte ranges it requests, unpack_bitpack_chunks on root and non-root bitpack nodes, a column of
+// no rows, and a chunk count corrupted to less than the chunk's rows.
 
 #include "chunk_test_utils.hpp"
 
@@ -282,7 +283,8 @@ void check_span(root_fixture& fx,
   }
 }
 
-/// The fixed spans of the spec plus seeded random ones.
+/// Fixed edge-case spans (whole column, first/last chunk, last row, boundaries) plus seeded
+/// random ones.
 void check_spans(root_fixture& fx, std::uint64_t seed, rmm::cuda_stream_view stream)
 {
   auto const rows = fx.rows();
@@ -592,11 +594,10 @@ int test_state_bytes_bounded(rmm::cuda_stream_view stream)
 
   auto state = chunk::make_bitpack_state(fx.loc);
   expect(chunk::bitpack_state_bytes(*state) == 0, "state bytes: a new state holds device bytes");
-  // Per chunk of a window: one first-word entry, and at most the chunk's packed words (an
-  // unaligned `packed` is realigned into scratch).
-  constexpr auto kWindowRows = static_cast<std::size_t>(kWindow * kChunkRows);
-  constexpr std::size_t kBound =
-    static_cast<std::size_t>(kWindow) * sizeof(std::int64_t) + kWindowRows * sizeof(std::int32_t);
+  // Per chunk of a window: one first-word entry. Nothing per row: the kernels read the packed
+  // words where they are staged, aligned or not.
+  constexpr auto kWindowRows   = static_cast<std::size_t>(kWindow * kChunkRows);
+  constexpr std::size_t kBound = static_cast<std::size_t>(kWindow) * sizeof(std::int64_t);
   rmm::device_buffer out(kWindowRows * sizeof(std::int64_t), stream);
   for (std::int64_t c0 = 0; c0 < kChunks; c0 += kWindow) {
     auto const c1 = std::min(c0 + kWindow, kChunks);
@@ -657,10 +658,8 @@ int test_dictionary_indices(rmm::cuda_stream_view stream)
   expect(indices.has_value(), "dictionary: no indices node");
   auto const loc = chunk::find_bitpack(column, *indices);
   expect(loc.has_value(), "dictionary: indices is not a bitpack leaf");
-  auto const type_id     = loc->value_type.id();
-  bool const is_unsigned = type_id == cudf::type_id::UINT8 || type_id == cudf::type_id::UINT16 ||
-                           type_id == cudf::type_id::UINT32 || type_id == cudf::type_id::UINT64;
-  auto const ref = host_reference(access, *loc, is_unsigned, stream);
+  bool const is_unsigned = cudf::is_unsigned(loc->value_type);
+  auto const ref         = host_reference(access, *loc, is_unsigned, stream);
   expect(ref.elem_size != 0 && ref.elem_size <= 8, "dictionary: unexpected index width");
   expect(ref.num_chunks() == 4, "dictionary: indices are chunked like the rows");
 
@@ -696,10 +695,8 @@ int test_nested_nodes(rmm::cuda_stream_view stream)
     for (std::uint32_t n = 1; n < column.nodes.size(); ++n) {
       auto const loc = chunk::find_bitpack(column, n);
       if (!loc.has_value()) { continue; }
-      auto const id          = loc->value_type.id();
-      bool const is_unsigned = id == cudf::type_id::UINT8 || id == cudf::type_id::UINT16 ||
-                               id == cudf::type_id::UINT32 || id == cudf::type_id::UINT64;
-      auto const ref = host_reference(access, *loc, is_unsigned, stream);
+      bool const is_unsigned = cudf::is_unsigned(loc->value_type);
+      auto const ref         = host_reference(access, *loc, is_unsigned, stream);
       if (ref.num_chunks() == 0 || ref.elem_size > 8) { continue; }
       check_primitive(access, *loc, ref, label + " node " + std::to_string(n), stream);
       ++nodes;
@@ -790,6 +787,99 @@ int test_factory_rejects(rmm::cuda_stream_view stream)
   return 1;
 }
 
+/// A column of no rows: the factory accepts it, and the only span it has decodes nothing and
+/// requests nothing.
+int test_zero_rows(rmm::cuda_stream_view stream)
+{
+  column_options options;
+  options.rows     = 0;
+  auto const input = make_random_column(cudf::type_id::INT32, options, stream);
+  auto const table = compress_column_with_plan(input->view(), kBitpackPlan, stream);
+  device_leaf_access access{table, 0, stream};
+  expect(access.column().num_rows == 0, "zero rows: the description has rows");
+  expect(chunk::classify_value_plan(access.column()) == chunk::value_plan::bitpack,
+         "zero rows: not classified as a bitpack plan");
+  auto decoder = chunk::make_bitpack_decoder(access.column());
+  expect(decoder != nullptr, "zero rows: the factory refused the column");
+
+  column_write_target dst;
+  expect(decoder->decode(access, {0, 0, 0, 0}, dst, stream) == 0, "zero rows: rows were decoded");
+  expect(access.requests().empty(), "zero rows: an empty decode requested bytes");
+  expect(decoder->state_bytes() == 0, "zero rows: an empty decode left device state");
+
+  auto state = chunk::make_bitpack_state(root_locator(access.column()));
+  chunk::unpack_bitpack_chunks(access, *state, 0, 0, nullptr, stream);
+  expect(access.requests().empty(), "zero rows: an empty unpack requested bytes");
+  return 1;
+}
+
+/// A chunk whose count is below its rows (corrupt) would leave rows unwritten: the root decoder
+/// reports it before writing, and still decodes the chunks before it.
+int test_short_chunk_count(rmm::cuda_stream_view stream)
+{
+  column_options options;
+  options.rows           = 4 * 1024 + 50;
+  options.seed           = 71;
+  auto const input       = make_random_column(cudf::type_id::INT32, options, stream);
+  auto const table       = compress_column_with_plan(input->view(), kBitpackPlan, stream);
+  auto const oracle      = full_decode(table, 0, stream);
+  auto const description = describe_from_table(table, 0, stream);
+  auto payload           = flatten_payload_host(table, 0, stream);
+  auto const loc         = root_locator(description);
+  auto const& counts =
+    description.leaves.at(loc.chunk_count.leaf).buffers.at(loc.chunk_count.buffer);
+  std::int32_t const short_count = 1000;
+  std::memcpy(payload.data() + counts.payload_offset + 1 * sizeof(std::int32_t),
+              &short_count,
+              sizeof(short_count));
+  rmm::device_buffer device(payload.size(), stream);
+  cuda_check(cudaMemcpyAsync(
+    device.data(), payload.data(), payload.size(), cudaMemcpyHostToDevice, stream.value()));
+  stream.synchronize();
+  device_leaf_access access{description, std::move(device)};
+  auto decoder = chunk::make_bitpack_decoder(access.column());
+
+  auto const bytes = static_cast<std::size_t>(options.rows) * sizeof(std::int32_t);
+  std::vector<std::uint8_t> const fill(bytes, kGuardByte);
+  rmm::device_buffer out(bytes, stream);
+  cuda_check(
+    cudaMemcpyAsync(out.data(), fill.data(), bytes, cudaMemcpyHostToDevice, stream.value()));
+  stream.synchronize();
+  column_write_target dst;
+  dst.data          = out.data();
+  dst.data_capacity = out.size();
+
+  // Corrupt data is a std::runtime_error that is not the "fall back" unsupported_chunk_decode.
+  auto const corrupt = [&](chunk::chunk_span const& span) {
+    try {
+      decoder->decode(access, span, dst, stream);
+    } catch (unsupported_chunk_decode const&) {
+      return false;
+    } catch (std::runtime_error const&) {
+      return true;
+    }
+    return false;
+  };
+  expect(corrupt({0, 5, 0, options.rows}), "short count: the whole column decoded");
+  expect(corrupt({1, 2, 1000, 24}), "short count: rows past the chunk's count decoded");
+  expect(corrupt({1, 2, 0, 1024}), "short count: the short chunk decoded whole");
+  stream.synchronize();
+  auto const after = read_device<std::uint8_t>(out.data(), bytes, stream);
+  expect(after == fill, "short count: a refused decode wrote rows");
+
+  // The rows the short chunk does hold, and the chunk before it, still decode.
+  expect(decoder->decode(access, {0, 2, 0, 1024 + 1000}, dst, stream) == 1024 + 1000,
+         "short count: the rows before the missing ones did not decode");
+  expect(compare_fixed_width_rows(oracle->view(), out.data(), 0, 0, 1024 + 1000, stream),
+         "short count: the rows before the missing ones differ from the full decode");
+
+  // A span whose chunks cannot hold its rows is the caller's error, not corrupt data.
+  expect(
+    throws<std::invalid_argument>([&] { decoder->decode(access, {0, 1, 1000, 100}, dst, stream); }),
+    "short count: a span past its chunks did not throw");
+  return 1;
+}
+
 }  // namespace
 
 int main()
@@ -813,6 +903,8 @@ int main()
     cases += test_nested_nodes(stream);
     cases += test_range_checks(stream);
     cases += test_factory_rejects(stream);
+    cases += test_zero_rows(stream);
+    cases += test_short_chunk_count(stream);
     std::printf("test_chunk_bitpack: PASS (%d cases)\n", cases);
     return 0;
   } catch (std::exception const& e) {

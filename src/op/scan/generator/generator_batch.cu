@@ -22,8 +22,8 @@
 // - uniform int64: `lo + mulhi64(hash, hi - lo + 1)` (the hash itself when the range is all of
 //   int64), which is overflow-free for any `lo <= hi`.
 // - zipf: round 0 of the rejection loop draws from salt VALUE_A and round r > 0 from salt
-//   `zipf_round_salt + r`, which no other stream uses. After `zipf_max_rounds` rejections the
-//   rank is 1.
+//   `zipf_round_salt + r`, which is above the salt of every suffix character of a VARCHAR
+//   shorter than 2^31 - 16 characters. After `zipf_max_rounds` rejections the rank is 1.
 // - double parameters that mean integers (bounds, start, step, D, N, cardinality) are rounded to
 //   the nearest int64 and saturate at its limits.
 //
@@ -58,7 +58,8 @@ namespace {
 /// probability of one round is well above 1/2, so the fallback is never reached in practice.
 constexpr std::uint32_t zipf_max_rounds = 64;
 
-/// Salt of zipf rejection round `r > 0` is `zipf_round_salt + r`: above every `STR_CHAR_BASE + i`.
+/// Salt of zipf rejection round `r > 0` is `zipf_round_salt + r`: above `STR_CHAR_BASE + i` for
+/// every suffix shorter than 2^31 - 16 characters.
 constexpr std::uint32_t zipf_round_salt = 0x80000000U;
 
 constexpr double two_pi = 6.283185307179586476925286766559;

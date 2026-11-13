@@ -20,11 +20,22 @@
 #include "compression/compressed_representation.hpp"
 #include "compression/simpatico_compressed_representation.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <cuda/stream>
+
 #include <api/chunk_decode.hpp>
 
 #include <memory>
 
 namespace sirius::compression {
+
+// Ownership, for the three sources below. A source owns a share of its batch's backing store
+// (device blob, pinned host blob, file). The store therefore outlives the batch's own
+// representation: when the batch is downgraded or dropped while a source is alive, the old
+// tier's memory stays allocated, outside any reservation, until the source is destroyed. Keep a
+// source (and anything that holds one, such as a compressed_reader_state) only while reading,
+// and drop it before waiting for memory the batch's tier is expected to give back.
 
 /**
  * @brief Payload source over a device-resident compressed batch.
@@ -38,15 +49,17 @@ namespace sirius::compression {
  * buffers belong to nobody.
  *
  * The source holds a clone() of the representation, which shares the device blob: it stays
- * readable after the batch changes tier or is dropped. The caller orders its reads against
+ * readable after the batch changes tier or is dropped, and the blob stays allocated for as long
+ * as the source lives (see the note on ownership below). The caller orders its reads against
  * writers of the batch (a read lock, or a recorded reader event).
  *
- * Rebuilds the batch's header from its table, on the default stream.
+ * Rebuilds the batch's header from its table; the device work that takes runs on @p stream.
  *
  * @throws std::invalid_argument if the batch has no table.
  */
 std::shared_ptr<simpatico::payload_source> make_payload_source(
-  const compressed_device_representation& representation);
+  const compressed_device_representation& representation,
+  ::cuda::stream_ref stream = cudf::get_default_stream());
 
 /**
  * @brief Payload source over a compressed batch held in pinned host blocks.
@@ -72,9 +85,9 @@ std::shared_ptr<simpatico::payload_source> make_payload_source(
 /**
  * @brief The parsed .hpln header of a compressed representation of any tier.
  *
- * Parses on every call (a device batch stores no header: it is rebuilt from the table, on the
- * default stream); the caller caches the result per call site (the row-range readers keep it in
- * their reader state).
+ * Parses on every call (a device batch stores no header: it is rebuilt from the table, with any
+ * device work on @p stream; the other tiers do not use the stream); the caller caches the result
+ * per call site (the row-range readers keep it in their reader state).
  *
  * The description of a device batch is specific to that batch on that tier: its payload offsets
  * are device-relative (buffer address minus the lowest buffer address) and payload_bytes is the
@@ -87,7 +100,8 @@ std::shared_ptr<simpatico::payload_source> make_payload_source(
  *         or is a device batch without a table.
  */
 std::shared_ptr<const simpatico::hpln_description> describe(
-  const simpatico_compressed_representation& representation);
+  const simpatico_compressed_representation& representation,
+  ::cuda::stream_ref stream = cudf::get_default_stream());
 
 /**
  * @brief A compressed batch's parsed header and the payload source it describes.

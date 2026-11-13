@@ -15,16 +15,22 @@
  */
 
 // Unit tests for the sort-merge sizing in merge_config: derived window rows, output chunk target,
-// one-shot fraction and fan-in, the route choice, pass planning and the task memory estimate.
-// GPU-free.
+// one-shot fraction and fan-in, the route choice, pass planning and the task memory estimate; and
+// for the packing of MERGE_SORT output positions in merge_chunk_position. GPU-free.
 
 #include "op/merge/bounded_kway_merge.hpp"
+#include "op/merge/merge_chunk_position.hpp"
 #include "op/merge/merge_config.hpp"
+#include "sirius/exception.hpp"
+
+#include <cudf/types.hpp>
 
 #include <catch.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 using sirius::sort_merge_mode;
@@ -35,11 +41,13 @@ using sirius::op::merge::estimate_task_bytes;
 using sirius::op::merge::kMaxKwayMergeInputs;
 using sirius::op::merge::kMinExplicitWindowRows;
 using sirius::op::merge::kWindowRowsFloor;
+using sirius::op::merge::make_merge_chunk_position;
 using sirius::op::merge::merge_route;
 using sirius::op::merge::merge_settings;
 using sirius::op::merge::plan_pass;
 using sirius::op::merge::route_inputs;
 using sirius::op::merge::run_summary;
+using sirius::op::merge::split_merge_chunk_position;
 
 namespace {
 
@@ -65,7 +73,7 @@ std::vector<run_summary> runs_of(std::vector<std::size_t> const& bytes)
 
 }  // namespace
 
-TEST_CASE("derive_merge_config matches the worked examples for k = 16, w = 32, T = 4",
+TEST_CASE("derive_merge_config sizes a 16-run merge of 32-byte rows at T = 4",
           "[merge_config][unit]")
 {
   struct row {
@@ -74,7 +82,7 @@ TEST_CASE("derive_merge_config matches the worked examples for k = 16, w = 32, T
     std::size_t output_bytes;
     double fraction;
   };
-  // n = B / (3 * k * w) with B = G / 2 / T.
+  // B = G / 2 / T; n = B / (3 * k * w); output = clamp(B / 16, 64 MiB, 1 GiB); fraction by total G.
   auto const r = GENERATE(row{24, 2.1e6, 192 * kMiB, 0.25},
                           row{80, 7.0e6, 640 * kMiB, 0.33},
                           row{128, 11.2e6, 1 * kGiB, 0.33});
@@ -207,6 +215,27 @@ TEST_CASE("derive_merge_config keeps explicit settings", "[merge_config][unit]")
   }
 }
 
+TEST_CASE("derive_merge_config keeps the window within the cudf row limit", "[merge_config][unit]")
+{
+  constexpr auto limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+
+  SECTION("derived: 2 runs of 1-byte rows on an 80 GiB device")
+  {
+    // Unclamped, the ceiling G / (16 * k * w) would give 2.7e9 rows.
+    auto const cfg = derive_merge_config(merge_settings{}, device(80 * kGiB, 1), 2, 1);
+    CHECK(cfg.window_rows == limit);
+  }
+
+  SECTION("explicit")
+  {
+    merge_settings settings;
+    settings.window_rows = 3'000'000'000;
+    CHECK(derive_merge_config(settings, device(24 * kGiB), 16, 32).window_rows == limit);
+    settings.window_rows = limit;
+    CHECK(derive_merge_config(settings, device(24 * kGiB), 16, 32).window_rows == limit);
+  }
+}
+
 TEST_CASE("choose_route follows the mode, the inputs and the one-shot threshold",
           "[merge_config][unit]")
 {
@@ -323,32 +352,101 @@ TEST_CASE("estimate_reader_state_bytes covers the decode scratch of compressed r
   CHECK(estimate_reader_state_bytes(runs, columns, strings, kMax) == kMax);
 }
 
-TEST_CASE("estimate_task_bytes sums windows, keys, output and the fallback run",
+TEST_CASE("estimate_task_bytes sums window buffers, output, merge scratch and fallback batches",
           "[merge_config][unit]")
 {
   constexpr std::size_t k = 16, g = 4, n = 100'000, w = 32, kw = 12;
   constexpr std::size_t out = 64 * kMiB, fallback = 10 * kMiB;
+  // The round outputs (target plus one round) and their concatenation; the gather map; a rank and
+  // three values per run at each of the n / 2048 + 2 tile boundaries; the fallback batches.
+  constexpr std::size_t fixed =
+    2 * (out + n * w) + n * 8 + (n / 2048 + 2) * (4 + 12 * k) + fallback;
 
-  SECTION("formula")
+  SECTION("fixed-width rows: two slots of n rows per buffered run")
   {
-    auto const expected = 2 * (k - g) * n * w + n * (w + 8) + k * n * kw + 2 * out + fallback;
-    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback) == expected);
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback) == 2 * (k - g) * n * w + fixed);
+  }
+
+  SECTION("every column adds a validity mask to each slot")
+  {
+    constexpr std::size_t columns = 5;
+    auto const slot               = n * w + columns * (n / 8 + 64);
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback, columns) ==
+          2 * (k - g) * slot + fixed);
+  }
+
+  SECTION("STRING columns add chars slack and offsets to each slot")
+  {
+    constexpr std::size_t columns = 5, strings = 2;
+    auto const slot =
+      n * w + columns * (n / 8 + 64) + n * w / 4 + strings * ((n + 1) * 8 + 2 * n + 64);
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback, columns, strings) ==
+          2 * (k - g) * slot + fixed);
+  }
+
+  SECTION("the key width does not change the estimate")
+  {
+    CHECK(estimate_task_bytes(k, g, n, w, 0, out, fallback) ==
+          estimate_task_bytes(k, g, n, w, 1000, out, fallback));
+  }
+
+  SECTION("the fallback bytes are added as given")
+  {
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, 3 * fallback) ==
+          estimate_task_bytes(k, g, n, w, kw, out, 0) + 3 * fallback);
   }
 
   SECTION("all runs on the GPU need no window buffers")
   {
-    auto const expected = n * (w + 8) + k * n * kw + 2 * out + fallback;
-    CHECK(estimate_task_bytes(k, k, n, w, kw, out, fallback) == expected);
+    CHECK(estimate_task_bytes(k, k, n, w, kw, out, fallback, 5, 2) == fixed);
     // More GPU runs than runs is clamped.
-    CHECK(estimate_task_bytes(k, k + 5, n, w, kw, out, fallback) == expected);
+    CHECK(estimate_task_bytes(k, k + 5, n, w, kw, out, fallback, 5, 2) == fixed);
   }
 
   SECTION("huge inputs saturate")
   {
-    CHECK(estimate_task_bytes(kMax, 0, kMax, kMax, kMax, kMax, kMax) == kMax);
+    CHECK(estimate_task_bytes(kMax, 0, kMax, kMax, kMax, kMax, kMax, kMax, kMax) == kMax);
     CHECK(estimate_task_bytes(k, g, kMax / 2, w, kw, out, fallback) == kMax);
     CHECK(estimate_task_bytes(k, g, n, w, kw, kMax, fallback) == kMax);
     CHECK(estimate_task_bytes(k, g, n, w, kw, out, kMax) == kMax);
-    CHECK(estimate_task_bytes(0, 0, 0, 0, 0, 0, 0) == 0);
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback, kMax, 1) == kMax);
+    CHECK(estimate_task_bytes(k, g, n, w, kw, out, fallback, 1, kMax) == kMax);
+    // Only the two tile boundaries of an empty merge remain.
+    CHECK(estimate_task_bytes(0, 0, 0, 0, 0, 0, 0) == 2 * 4);
+  }
+}
+
+TEST_CASE("make_merge_chunk_position packs partition and chunk and rejects values >= 2^32",
+          "[merge_chunk_position][unit]")
+{
+  constexpr std::size_t last = (std::size_t{1} << 32) - 1;
+
+  SECTION("round trip, up to the largest values")
+  {
+    CHECK(make_merge_chunk_position(0, 0) == 0);
+    CHECK(make_merge_chunk_position(3, 7) == ((std::size_t{3} << 32) | 7));
+    CHECK(split_merge_chunk_position(make_merge_chunk_position(3, 7)) ==
+          std::pair<std::size_t, std::size_t>{3, 7});
+    CHECK(make_merge_chunk_position(last, last) == kMax);
+    CHECK(split_merge_chunk_position(make_merge_chunk_position(last, last)) ==
+          std::pair<std::size_t, std::size_t>{last, last});
+    CHECK(split_merge_chunk_position(make_merge_chunk_position(0, last)) ==
+          std::pair<std::size_t, std::size_t>{0, last});
+    CHECK(split_merge_chunk_position(make_merge_chunk_position(last, 0)) ==
+          std::pair<std::size_t, std::size_t>{last, 0});
+  }
+
+  SECTION("positions order by partition, then by chunk")
+  {
+    CHECK(make_merge_chunk_position(1, 0) < make_merge_chunk_position(1, 1));
+    CHECK(make_merge_chunk_position(1, last) < make_merge_chunk_position(2, 0));
+    CHECK(make_merge_chunk_position(0, last) < make_merge_chunk_position(1, 0));
+  }
+
+  SECTION("a partition or chunk of 2^32 or more throws")
+  {
+    CHECK_THROWS_AS(make_merge_chunk_position(last + 1, 0), sirius::internal_exception);
+    CHECK_THROWS_AS(make_merge_chunk_position(0, last + 1), sirius::internal_exception);
+    CHECK_THROWS_AS(make_merge_chunk_position(kMax, kMax), sirius::internal_exception);
   }
 }

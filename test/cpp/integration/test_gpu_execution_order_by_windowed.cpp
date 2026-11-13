@@ -26,6 +26,7 @@
 #include <catch.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -79,21 +81,15 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
   ~OrderByWindowedFixture()
   {
     // Newest first, so a setting changed twice ends at the value it had before the fixture.
-    while (!restores.empty()) {
-      con->Query("SET " + restores.back().first + " = '" + restores.back().second + "';");
-      restores.pop_back();
+    while (!settings.empty()) {
+      settings.pop_back();
     }
   }
 
   /// Sets a setting until the fixture is destroyed, which restores the value it had before.
   void set(const std::string& name, const std::string& value)
   {
-    auto previous = con->Query("SELECT value FROM duckdb_settings() WHERE name = '" + name + "'");
-    REQUIRE(previous);
-    REQUIRE_FALSE(previous->HasError());
-    REQUIRE(previous->RowCount() == 1);
-    restores.emplace_back(name, previous->Collection().GetValue(0, 0).ToString());
-    run_ok("SET " + name + " = '" + value + "';");
+    settings.push_back(std::make_unique<sirius::test::scoped_sirius_setting>(*con, name, value));
   }
 
   /// Set by a case whose fan-in cap is below its run count: its windowed runs must take
@@ -286,7 +282,7 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
     FAIL("the results hold different rows");
   }
 
-  std::vector<std::pair<std::string, std::string>> restores;
+  std::vector<std::unique_ptr<sirius::test::scoped_sirius_setting>> settings;
 };
 
 const char* const kNullOrders[] = {
@@ -302,7 +298,7 @@ TEST_CASE_METHOD(OrderByWindowedFixture,
                  "windowed merge ORDER BY: single INTEGER and BIGINT key",
                  "[integration][gpu_execution][order_by_windowed]")
 {
-  // ki repeats (about 100k distinct values); kb is close to unique and spans the BIGINT range.
+  // ki repeats (about 100k distinct values); kb is close to unique, both signs, in [-2^62, 2^62).
   create_table("ow_int",
                "SELECT CASE WHEN i % 13 = 0 THEN NULL "
                "            ELSE CAST(hash(i) % 100003 AS INTEGER) - 50000 END AS ki, "

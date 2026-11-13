@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/log_test_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -79,11 +81,16 @@ enum class sort_check {
   none,    ///< the query has no merge sort, or the sort has no rows
 };
 
-/// The `[discard_sink] rows=… bytes=… order_violations=…` line of one COPY.
+/// The `[discard_sink] rows=… bytes=… order_violations=… order_checked=… ranges_checked=…` line
+/// of one COPY.
 struct sink_summary {
   std::uint64_t rows{0};
   std::uint64_t bytes{0};
   std::uint64_t order_violations{0};
+  /// 1 when the sink compared the order of its input, 0 when the check was off.
+  std::uint64_t order_checked{0};
+  /// How many tasks' key ranges the sink compared. 0 when no input carried a position.
+  std::uint64_t ranges_checked{0};
 };
 
 /// What one COPY on the GPU returned and logged.
@@ -93,6 +100,17 @@ struct discard_result {
   /// The planner logged that it left the order check off.
   bool order_check_disabled{false};
 };
+
+/// The order check of a merged ORDER BY compared key ranges. A windowed merge emits many chunks,
+/// so the sink compares more than one range; a one-shot merge may emit a partition as one chunk.
+void require_ranges_checked(const discard_result& copy, const std::string& mode)
+{
+  if (mode == "windowed") {
+    CHECK(copy.summary.ranges_checked > 1);
+  } else {
+    CHECK(copy.summary.ranges_checked >= 1);
+  }
+}
 
 /// Samples the device's allocated bytes from a thread and keeps the highest value seen above the
 /// level at construction. The adaptor's own peak is never reset, so it cannot compare two queries
@@ -155,21 +173,15 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
   ~CopyDiscardFixture()
   {
     // Newest first, so a setting changed twice ends at the value it had before the fixture.
-    while (!restores.empty()) {
-      con->Query("SET " + restores.back().first + " = '" + restores.back().second + "';");
-      restores.pop_back();
+    while (!settings.empty()) {
+      settings.pop_back();
     }
   }
 
   /// Sets a setting until the fixture is destroyed, which restores the value it had before.
   void set(const std::string& name, const std::string& value)
   {
-    auto previous = con->Query("SELECT value FROM duckdb_settings() WHERE name = '" + name + "'");
-    REQUIRE(previous);
-    REQUIRE_FALSE(previous->HasError());
-    REQUIRE(previous->RowCount() == 1);
-    restores.emplace_back(name, previous->Collection().GetValue(0, 0).ToString());
-    run_ok("SET " + name + " = '" + value + "';");
+    settings.push_back(std::make_unique<sirius::test::scoped_sirius_setting>(*con, name, value));
   }
 
   /// Creates and persists a table, so the GPU native scan reads it from disk.
@@ -226,7 +238,7 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
     sirius::op::sirius_physical_merge_sort::reset_process_counters();
     auto const before = sirius::test::get_transparent_execution_stats(*con);
     {
-      // DEBUG: the planner says at that level when it leaves the order check off.
+      // The planner logs at DEBUG when it leaves the order check off.
       sirius::test::scoped_recording_log_sink logs("debug");
       result  = con->Query(sql);
       records = logs.records();
@@ -264,8 +276,7 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
       if (record.message.rfind("sirius_discard: check_order disabled", 0) == 0) {
         out.order_check_disabled = true;
       }
-      // The sink declares the one count column it emits: the task-level schema diagnostic has
-      // nothing to say about its output.
+      // The sink declares its one count column: no schema-mismatch line may name it.
       if (record.message.find("DISCARD_SINK") != std::string::npos &&
           record.message.find("mismatch") != std::string::npos) {
         FAIL(record.message);
@@ -274,10 +285,13 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
       INFO(record.message);
       REQUIRE(std::sscanf(record.message.c_str(),
                           "[discard_sink] rows=%" SCNu64 " bytes=%" SCNu64
-                          " order_violations=%" SCNu64,
+                          " order_violations=%" SCNu64 " order_checked=%" SCNu64
+                          " ranges_checked=%" SCNu64,
                           &out.summary.rows,
                           &out.summary.bytes,
-                          &out.summary.order_violations) == 3);
+                          &out.summary.order_violations,
+                          &out.summary.order_checked,
+                          &out.summary.ranges_checked) == 5);
       summaries++;
     }
     // One sink per COPY, and its pipeline finished once.
@@ -326,7 +340,7 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
   std::string target;
 
  private:
-  std::vector<std::pair<std::string, std::string>> restores;
+  std::vector<std::unique_ptr<sirius::test::scoped_sirius_setting>> settings;
 };
 
 }  // namespace
@@ -356,6 +370,7 @@ TEST_CASE_METHOD(CopyDiscardFixture,
       auto const copy = copy_on_gpu(query, mode);
       CHECK(copy.count == expected);
       // No check was asked for.
+      CHECK(copy.summary.order_checked == 0);
       CHECK(copy.summary.order_violations == 0);
     }
   }
@@ -381,6 +396,10 @@ TEST_CASE_METHOD(CopyDiscardFixture,
       auto const copy = copy_on_gpu(query, mode, ", check_order true");
       CHECK(copy.count == kRows);
       CHECK_FALSE(copy.order_check_disabled);
+      // The check ran and compared key ranges: a sink whose inputs lost their positions would
+      // report no violation without comparing anything.
+      CHECK(copy.summary.order_checked == 1);
+      require_ranges_checked(copy, mode);
       CHECK(copy.summary.order_violations == 0);
     }
   }
@@ -391,6 +410,7 @@ TEST_CASE_METHOD(CopyDiscardFixture,
       copy_on_gpu("SELECT s FROM " + source + " ORDER BY k1, k2", mode, ", check_order true");
     CHECK(copy.count == kRows);
     CHECK(copy.order_check_disabled);
+    CHECK(copy.summary.order_checked == 0);
     CHECK(copy.summary.order_violations == 0);
   }
 }
@@ -429,6 +449,11 @@ TEST_CASE_METHOD(CopyDiscardFixture,
       CHECK(copy_on_gpu(c.query, mode, "", c.check).count == expected);
       auto const checked = copy_on_gpu(c.query, mode, ", check_order true", c.check);
       CHECK(checked.count == expected);
+      if (c.check == sort_check::merged) {
+        CHECK_FALSE(checked.order_check_disabled);
+        CHECK(checked.summary.order_checked == 1);
+        require_ranges_checked(checked, mode);
+      }
       CHECK(checked.summary.order_violations == 0);
     }
   }
@@ -569,7 +594,6 @@ TEST_CASE_METHOD(CopyDiscardFixture,
        << " bytes");
   // The COPY never held even half of its output on the device.
   CHECK(copy_peak < kOutputBytes / 2);
-  // And no more than the collector path, which waits for each chunk's copy to host memory. The
-  // margin covers the sampling and the scheduling differences between two runs.
-  CHECK(copy_peak <= select_peak + select_peak / 4);
+  // The collector path's peak is reported above for comparison only: two runs' sampled peaks
+  // differ with scheduling, so they are not asserted against each other.
 }

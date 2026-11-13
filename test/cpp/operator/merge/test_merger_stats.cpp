@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -61,85 +62,6 @@ using namespace sirius::test::merge_utils;
 namespace {
 
 namespace utils = sirius::test::operator_utils;
-
-bool has_gpu()
-{
-  int count = 0;
-  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
-
-template <typename Representation>
-bool holds(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
-}
-
-/// What a run's batches are turned into after they are built on the GPU.
-enum class placement { gpu, host, disk, compressed_device, compressed_host, compressed_disk };
-
-bool is_compressed(placement where)
-{
-  return where == placement::compressed_device || where == placement::compressed_host ||
-         where == placement::compressed_disk;
-}
-
-/// Moves the uncompressed GPU batch @p batch to the HOST or the DISK tier, uncompressed.
-void move_batch(tiers_fixture& fx, cucascade::data_batch& batch, placement where)
-{
-  auto mut = batch.to_mutable();
-  mut.convert_to<cucascade::host_data_representation>(
-    sirius::converter_registry::get(), fx.host, fx.stream);
-  fx.stream.synchronize();
-  if (where == placement::disk) {
-    mut.convert_to<cucascade::disk_data_representation>(
-      sirius::converter_registry::get(), fx.disk, fx.stream);
-    fx.stream.synchronize();
-  }
-}
-
-/// Spills the GPU batch @p batch compressed, as a downgrade does, and leaves it in @p where.
-void compress_batch(tiers_fixture& fx,
-                    const std::shared_ptr<cucascade::data_batch>& batch,
-                    placement where)
-{
-  scoped_spill_compression compression;
-  sirius::convertible_data_batch convertible(batch);
-  REQUIRE(convertible.convert({fx.host}, fx.stream_ref(), *fx.manager, true).has_value());
-  fx.stream.synchronize();
-  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
-  if (where == placement::compressed_host) { return; }
-
-  if (where == placement::compressed_disk) {
-    REQUIRE(convertible.convert({fx.disk}, fx.stream_ref(), *fx.manager, true).has_value());
-    fx.stream.synchronize();
-    REQUIRE(holds<sirius::compressed_disk_representation>(*batch));
-    return;
-  }
-
-  // The device tier: the compressed table rebuilt on the device from the pinned payload.
-  auto mut           = batch->to_mutable();
-  auto const& host   = mut.get_data()->cast<sirius::compressed_host_representation>();
-  auto const& blocks = host.payload();
-  auto blob          = std::make_shared<sirius::compressed_device_blob>();
-  std::string error;
-  simpatico::payload_fetch_fn fetch =
-    [&blocks](std::uint64_t offset, std::size_t size, void* dst, ::cuda::stream_ref stream) {
-      sirius::copy_pinned_blocks_to_device(blocks, offset, dst, size, stream);
-    };
-  blob->table = simpatico::read_compressed_table_from_memory(
-    host.header(), fetch, fx.stream_ref(), fx.mr(), &error);
-  REQUIRE(error.empty());
-  fx.stream.synchronize();
-  auto device = std::make_unique<sirius::compressed_device_representation>(
-    *fx.gpu,
-    std::move(blob),
-    host.column_names(),
-    host.get_size_in_bytes(),
-    host.get_uncompressed_data_size_in_bytes(),
-    host.num_rows());
-  mut.set_data(std::move(device));
-}
 
 merge::merge_key_spec ascending_key()
 {
@@ -172,7 +94,8 @@ const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT6
 constexpr std::size_t kRowBytes = 16;
 
 /// Sorted (key, id) runs, each placed whole in one tier and representation.
-/// Declared after the fixture: the batches must go before the memory manager does.
+/// Declare an instance after its tiers_fixture: the batches must be destroyed before the memory
+/// manager.
 struct placed_runs {
   tiers_fixture& fx;
   cucascade::shared_data_repository repository;
@@ -190,14 +113,10 @@ struct placed_runs {
       rows, static_cast<std::int64_t>(index) * 1'000'000, static_cast<std::uint32_t>(7 + index));
     runs.push_back(
       make_sorted_gpu_run(repository, *fx.gpu, table->view(), ascending_key(), num_batches));
-    // The batches were copied on the default stream; the converters run on the fixture's.
-    cudf::get_default_stream().sync();
+    std::optional<scoped_spill_compression> compression;
+    if (is_compressed(where)) { compression.emplace(); }
     for (auto const& batch : runs.back().batches) {
-      if (where == placement::host || where == placement::disk) {
-        move_batch(fx, *batch, where);
-      } else if (is_compressed(where)) {
-        compress_batch(fx, batch, where);
-      }
+      place_batch(fx, batch, where);
     }
     total_rows += rows;
   }
@@ -276,7 +195,7 @@ TEST_CASE("windowed_merger reads no refill bytes from GPU runs and bounds the ro
     CHECK(stats.round_rows_max == 1000);
   }
 
-  SECTION("no round: the bounds stay 0")
+  SECTION("a run() with no round reports bounds of 0 and leaves accumulated bounds unchanged")
   {
     runs.add(placement::gpu, 100);
     auto merger = runs.make_merger({.window_rows = kWindowRows, .output_target_bytes = kNoTarget});
@@ -441,7 +360,8 @@ TEST_CASE(
   CHECK(shared.runs_read_compressed == 2);
 }
 
-TEST_CASE("windowed_merger leaves the new counters untouched when run() throws", "[merger_stats]")
+TEST_CASE("windowed_merger leaves the refill and round counters untouched when run() throws",
+          "[merger_stats]")
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
   tiers_fixture fx;

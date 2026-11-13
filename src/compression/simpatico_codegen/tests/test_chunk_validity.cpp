@@ -206,7 +206,8 @@ void test_all_null()
         "all_null, no mask: unsupported");
 }
 
-// Nulls only in rows [2000, 2100) and at row 4999.
+// A destination without a null mask: write_validity accepts null-free ranges and throws
+// unsupported_chunk_decode for ranges with nulls. Nulls only in rows [2000, 2100) and at row 4999.
 void test_mask_absent()
 {
   std::vector<std::int64_t> values(static_cast<std::size_t>(kRows));
@@ -266,6 +267,59 @@ void test_mask_absent()
   check_span(column, access, 2100, 2900, 33);
 }
 
+// A stored mask with fewer bytes than the range needs (a truncated or corrupt sidecar) is rejected
+// with std::runtime_error before a mask byte is read or a destination bit written. A mask that
+// ends at the range's last byte, with no padding to a whole word, is read up to there.
+void test_short_mask()
+{
+  auto const column = random_column(0.3, 37);
+  device_leaf_access const whole{column.table, 0};
+  check(whole.column().validity == hpln_validity::mask, "short mask: the column stores a mask");
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+
+  auto truncated = [&](std::uint64_t validity_size) {
+    auto description          = whole.column();
+    description.validity_size = validity_size;
+    return std::make_unique<device_leaf_access>(std::move(description),
+                                                rmm::device_buffer{whole.payload(), stream});
+  };
+  struct range {
+    std::int64_t row_begin, rows;
+  };
+  for (auto const& [row_begin, rows] :
+       {range{0, 100}, range{31, 1000}, range{1024, 9}, range{5000, 3999}, range{kRows - 1, 1}}) {
+    auto const needed = static_cast<std::uint64_t>((row_begin + rows + 7) / 8);
+
+    for (std::uint64_t const size : {needed - 1, needed / 2, std::uint64_t{0}}) {
+      auto const access = truncated(size);
+      destination dst_mask(static_cast<std::size_t>(rows) / 32 + 3, 41);
+      column_write_target with_mask;
+      with_mask.null_mask      = dst_mask.mask();
+      with_mask.dst_row_offset = 5;
+      // With and without a destination mask: both read the stored one.
+      for (auto const& dst : {with_mask, column_write_target{}}) {
+        bool corrupt = false;
+        try {
+          chunk::write_validity(*access, row_begin, rows, dst, stream);
+        } catch (unsupported_chunk_decode const&) {
+        } catch (std::runtime_error const&) {
+          corrupt = true;
+        }
+        check(corrupt,
+              label("short mask: a truncated mask is not reported as corrupt", row_begin, rows, 5));
+      }
+      stream.synchronize();
+      check(access->validity_requests().empty(),
+            label("short mask: bytes of a truncated mask were requested", row_begin, rows, 5));
+      check(dst_mask.others_preserved(0, 0),
+            label("short mask: the destination was written", row_begin, rows, 5));
+    }
+
+    auto const access = truncated(needed);
+    check_span(column, *access, row_begin, rows, 5);
+  }
+}
+
 void test_edges()
 {
   auto const column = random_column(0.3, 31);
@@ -311,6 +365,7 @@ int main()
     test_all_valid();
     test_all_null();
     test_mask_absent();
+    test_short_mask();
     test_edges();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());

@@ -125,6 +125,13 @@ class staged_ranges {
   std::size_t _bytes_held{0};
 };
 
+/// True for a leaf whose buffers a cursor keeps staged for its whole life: a dictionary node's
+/// own leaf (the keys).
+bool is_kept_leaf(hpln_column_description const& column, hpln_leaf_description const& leaf)
+{
+  return leaf.node_index < column.nodes.size() && column.nodes[leaf.node_index].op == "dictionary";
+}
+
 /// leaf_access over a payload_source. A device-resident payload is served zero copy. Any other
 /// payload is staged on demand, only the bytes asked for.
 ///
@@ -146,8 +153,7 @@ class staged_leaf_access final : public leaf_access {
     auto const& col = this->column();
     _kept_leaf.reserve(col.leaves.size());
     for (auto const& leaf : col.leaves) {
-      _kept_leaf.push_back(leaf.node_index < col.nodes.size() &&
-                           col.nodes[leaf.node_index].op == "dictionary");
+      _kept_leaf.push_back(is_kept_leaf(col, leaf));
     }
   }
 
@@ -168,6 +174,44 @@ class staged_leaf_access final : public leaf_access {
     if (auto const* base = _payload->device_base()) { return base + begin; }
     if (size == 0) { return nullptr; }
     return ranges_of(leaf).stage(*_payload, begin, size, stream, _mr);
+  }
+
+  /// Bytes of a leaf buffer in place, for a device-resident payload; nullptr otherwise, and for
+  /// size == 0. Stages nothing.
+  [[nodiscard]] const std::byte* resident_bytes(std::size_t leaf,
+                                                std::size_t buffer,
+                                                std::uint64_t offset,
+                                                std::uint64_t size) const
+  {
+    auto const& range = buffer_range(leaf, buffer);
+    check_range(offset, size, range.size, "leaf buffer");
+    auto const* base = _payload->device_base();
+    return base != nullptr && size != 0 ? base + range.payload_offset + offset : nullptr;
+  }
+
+  /// Stream-ordered copy of leaf-buffer bytes to device memory at dst: device to device when the
+  /// payload is device resident or the bytes are already staged, otherwise read from the source
+  /// straight into dst. Stages nothing.
+  void read_bytes(std::size_t leaf,
+                  std::size_t buffer,
+                  std::uint64_t offset,
+                  std::uint64_t size,
+                  void* dst,
+                  rmm::cuda_stream_view stream)
+  {
+    auto const& range = buffer_range(leaf, buffer);
+    check_range(offset, size, range.size, "leaf buffer");
+    if (size == 0) { return; }
+    auto const begin = range.payload_offset + offset;
+
+    auto const* src = _payload->device_base();
+    src             = src != nullptr ? src + begin : ranges_of(leaf).find(begin, size);
+    if (src == nullptr) {
+      _payload->read_to_device(begin, size, dst, stream);
+      return;
+    }
+    throw_if_cuda_error(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, stream.value()),
+                        "chunk decode: copy of leaf bytes");
   }
 
   /// Copies from the staged bytes when they cover the request. Otherwise the bytes pass through a
@@ -314,6 +358,37 @@ void release_transient_staging(leaf_access& access)
   if (auto* staged = dynamic_cast<staged_leaf_access*>(&access)) { staged->release_transient(); }
 }
 
+const std::byte* unstaged_leaf_bytes(leaf_access& leaves,
+                                     std::size_t leaf,
+                                     std::size_t buffer,
+                                     std::uint64_t offset,
+                                     std::uint64_t size,
+                                     rmm::cuda_stream_view stream)
+{
+  if (auto const* staged = dynamic_cast<staged_leaf_access const*>(&leaves)) {
+    return staged->resident_bytes(leaf, buffer, offset, size);
+  }
+  return size != 0 ? leaves.device_bytes(leaf, buffer, offset, size, stream) : nullptr;
+}
+
+void read_leaf_bytes(leaf_access& leaves,
+                     std::size_t leaf,
+                     std::size_t buffer,
+                     std::uint64_t offset,
+                     std::uint64_t size,
+                     void* dst,
+                     rmm::cuda_stream_view stream)
+{
+  if (auto* staged = dynamic_cast<staged_leaf_access*>(&leaves)) {
+    staged->read_bytes(leaf, buffer, offset, size, dst, stream);
+    return;
+  }
+  if (size == 0) { return; }
+  auto const* src = leaves.device_bytes(leaf, buffer, offset, size, stream);
+  throw_if_cuda_error(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, stream.value()),
+                      "chunk decode: copy of leaf bytes");
+}
+
 value_plan classify_value_plan(hpln_column_description const& column)
 {
   auto const& nodes = column.nodes;
@@ -428,6 +503,18 @@ bool compressed_column_cursor::supported() const noexcept { return _impl->decode
 const hpln_column_description& compressed_column_cursor::column() const noexcept
 {
   return _impl->access.column();
+}
+
+std::size_t kept_staged_bytes_bound(hpln_column_description const& column) noexcept
+{
+  std::size_t bytes = 0;
+  for (auto const& leaf : column.leaves) {
+    if (!chunk::is_kept_leaf(column, leaf)) { continue; }
+    for (auto const& buffer : leaf.buffers) {
+      bytes += buffer.size;
+    }
+  }
+  return bytes;
 }
 
 std::size_t compressed_column_cursor::device_bytes_held() const noexcept

@@ -73,8 +73,10 @@ inline constexpr std::size_t kShrinkWindowRowsFloor = 1024;   // shrink_for_retr
  * @brief Resolve the settings against a device: derive every value left at 0.
  *
  * window_rows and output_target_bytes derive from the device's available GPU memory shared among
- * its concurrent tasks, one_shot_fraction from its total GPU memory, and fan_in is num_runs
- * capped by max_fan_in.
+ * its concurrent tasks, one_shot_fraction from its total GPU memory. fan_in is num_runs capped by
+ * max_fan_in, by kMaxKwayMergeInputs and by the floor-sized windows that fit the task budget (never
+ * below 2 unless num_runs is). An explicit window_rows below kMinExplicitWindowRows is raised to
+ * it, and window_rows, explicit or derived, never exceeds the cudf row limit (2^31 - 1).
  *
  * @param settings The user's sort_merge_* settings.
  * @param budget GPU memory of the device and the number of concurrent merge tasks on it.
@@ -102,6 +104,10 @@ struct route_inputs {
 
 /**
  * @brief Choose the merge path for one partition.
+ *
+ * Nested or late-materialized columns always take the one-shot path, whatever @p mode says. In
+ * automatic mode a partition with a batch off the GPU is windowed; otherwise it is windowed when
+ * its input plus output bytes exceed one_shot_fraction of gpu_total_bytes.
  *
  * @param mode The sort_merge_mode setting.
  * @param one_shot_fraction The derived auto threshold (derived_merge_config::one_shot_fraction).
@@ -133,7 +139,8 @@ struct pass_plan {
  * @brief Plan the next merge task of a partition under the fan-in cap.
  *
  * With at most fan_in runs the task merges all of them and is the final pass; otherwise it
- * merges a subset into an intermediate run.
+ * merges the fan_in smallest runs by bytes (ties to the lower index, indices returned ascending)
+ * into an intermediate run. A fan_in below 2 is treated as 2.
  *
  * @param runs The partition's current runs.
  * @param fan_in Most runs one task reads.
@@ -143,13 +150,27 @@ pass_plan plan_pass(std::span<const run_summary> runs, std::size_t fan_in);
 /**
  * @brief Estimate the GPU bytes one windowed merge task needs.
  *
+ * The sum of:
+ * - the window buffers of the runs that are not sliced in place: two slots per run, each of
+ *   window_rows rows, with the slack, offsets and validity masks window_buffer allocates;
+ * - the output: round outputs accumulate until they reach output_target_bytes, so up to the
+ *   target plus one round, and are then concatenated into one table of the same size;
+ * - the scratch of one bounded merge: its gather map and the co-ranks at the tile boundaries;
+ * - the batches converted whole to the GPU tier, which stay resident until the task ends.
+ *
+ * The merge compares keys through views of the windows, so the key columns cost nothing extra.
+ *
  * @param k Runs the task reads.
  * @param gpu_runs How many of them are GPU-resident (sliced, no window buffer).
  * @param window_rows n: maximum rows per input window.
  * @param row_width Estimated row width in bytes of the fetched columns.
- * @param key_row_width Estimated row width in bytes of the key columns.
+ * @param key_row_width Unused: no key column is copied. Kept until the callers stop passing it.
  * @param output_target_bytes Output chunk target of the task.
- * @param largest_fallback_run_bytes Largest run that may be converted whole to the GPU tier.
+ * @param fallback_runs_bytes Sum, over the runs that may be converted whole to the GPU tier (a
+ *        batch without a row-range reader), of each such run's largest batch. A task can hold one
+ *        converted batch per fallback run at once, so this is a sum, not the largest of them.
+ * @param fetch_columns Columns the task fetches (each has a validity mask per buffer slot).
+ * @param string_columns How many of them are STRING (chars slack and offsets per buffer slot).
  */
 std::size_t estimate_task_bytes(std::size_t k,
                                 std::size_t gpu_runs,
@@ -157,7 +178,9 @@ std::size_t estimate_task_bytes(std::size_t k,
                                 std::size_t row_width,
                                 std::size_t key_row_width,
                                 std::size_t output_target_bytes,
-                                std::size_t largest_fallback_run_bytes);
+                                std::size_t fallback_runs_bytes,
+                                std::size_t fetch_columns  = 0,
+                                std::size_t string_columns = 0);
 
 /**
  * @brief Estimate the GPU bytes the row-range readers of compressed runs keep between refills.

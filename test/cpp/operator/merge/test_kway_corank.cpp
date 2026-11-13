@@ -422,11 +422,13 @@ TEST_CASE("corank_split accepts no ranks and rejects mismatched spans", "[kway_c
   const cudf::device_span<const cudf::size_type> ranks_span(ranks.data(), ranks.size());
   const cudf::device_span<const uint8_t> truncated_span(truncated.data(), truncated.size());
 
-  // lengths must have k entries; out must have ranks * k entries.
+  // lengths must have k entries. corank_split sizes out from lengths (ranks * lengths.size()), so
+  // the 1-entry out matches the short lengths and only the lengths check can throw here.
   CHECK_THROWS_AS(
     corank_split(
       cmp, short_lengths, ranks_span, cudf::device_span<cudf::size_type>(out.data(), 1), stream),
     std::invalid_argument);
+  // out must have ranks * k entries.
   CHECK_THROWS_AS(
     corank_split(
       cmp, lengths_span, ranks_span, cudf::device_span<cudf::size_type>(out.data(), 1), stream),

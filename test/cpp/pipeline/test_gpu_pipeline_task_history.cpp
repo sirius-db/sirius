@@ -1080,8 +1080,7 @@ TEST_CASE(
 // Test: an input whose port opted out of GPU materialization runs through the task where it is.
 //
 // The task's bookkeeping around execute() (the per-operator data log, the output schema check)
-// must not assume a GPU table: casting a spilled input to one ended the query with
-// std::bad_cast.
+// must not assume a GPU table.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("gpu_pipeline_task runs an operator over a host batch left in its tier",

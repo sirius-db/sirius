@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include "sirius/exception.hpp"
 #include "utils/log_test_utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
@@ -127,6 +128,9 @@ TEST_CASE("sirius_physical_discard_sink counts rows and bytes and emits one coun
   CHECK(sink.rows_discarded() == 9);
   CHECK(sink.bytes_discarded() == 9 * sizeof(std::int64_t));
   CHECK(sink.order_violations() == 0);
+  // No order check was asked for, so no key range was compared.
+  CHECK_FALSE(sink.order_checked());
+  CHECK(sink.ranges_checked() == 0);
 
   // A task without batches emits nothing.
   pipelineable_operator_data empty(batch_vector{}, 3);
@@ -167,13 +171,18 @@ TEST_CASE("sirius_physical_discard_sink order check accepts sorted input",
           "[physical_discard_sink]")
 {
   auto sink = make_sink(duckdb::LogicalType::BIGINT, check_first_column());
+  CHECK(sink.order_checked());
+  CHECK(sink.ranges_checked() == 0);
   // Tasks finish in any order; the positions say where their rows belong.
   discard(sink, {int64_batch({20, 20, 30})}, 2);
   discard(sink, {int64_batch({1, 2, 3})}, 0);
   discard(sink, {int64_batch({3, 10}), int64_batch({}), int64_batch({10, 20})}, 1);
   CHECK(sink.order_violations() == 0);
+  // One range per batch that has rows: the empty batch has no keys to compare.
+  CHECK(sink.ranges_checked() == 4);
   sink.finish();
   CHECK(sink.order_violations() == 0);
+  CHECK(sink.ranges_checked() == 4);
   CHECK(sink.rows_discarded() == 10);
 }
 
@@ -210,7 +219,8 @@ TEST_CASE("sirius_physical_discard_sink order check counts batches out of order 
 
   auto const records = log.records();
   auto const summary = std::count_if(records.begin(), records.end(), [](auto const& record) {
-    return record.message == "[discard_sink] rows=6 bytes=48 order_violations=1";
+    return record.message ==
+           "[discard_sink] rows=6 bytes=48 order_violations=1 order_checked=1 ranges_checked=3";
   });
   CHECK(summary == 1);
 }
@@ -236,12 +246,16 @@ TEST_CASE("sirius_physical_discard_sink without order check ignores unsorted inp
   sink.finish();
   CHECK(sink.order_violations() == 0);
   CHECK(sink.rows_discarded() == 4);
+  CHECK_FALSE(sink.order_checked());
+  CHECK(sink.ranges_checked() == 0);
 
-  // `check_order` without key columns checks nothing either.
+  // `check_order` without key columns checks nothing either, and says so.
   auto keyless = make_sink(duckdb::LogicalType::BIGINT, {.check_order = true});
   discard(keyless, {int64_batch({3, 1, 2})}, 0);
   keyless.finish();
   CHECK(keyless.order_violations() == 0);
+  CHECK_FALSE(keyless.order_checked());
+  CHECK(keyless.ranges_checked() == 0);
 }
 
 TEST_CASE("sirius_physical_discard_sink order check honours descending keys",
@@ -390,13 +404,52 @@ TEST_CASE("sirius_physical_discard_sink rejects order options that do not match 
                             {.check_order  = true,
                              .key_columns  = {0},
                              .column_order = {cudf::order::ASCENDING, cudf::order::ASCENDING}}),
-                  std::invalid_argument);
+                  sirius::internal_exception);
   CHECK_THROWS_AS(
     make_sink(duckdb::LogicalType::BIGINT,
               {.check_order     = true,
                .key_columns     = {0},
                .null_precedence = {cudf::null_order::BEFORE, cudf::null_order::AFTER}}),
-    std::invalid_argument);
+    sirius::internal_exception);
+}
+
+TEST_CASE("sirius_physical_discard_sink order check refuses a key type it cannot compare",
+          "[physical_discard_sink]")
+{
+  // A STRUCT key: cudf can sort it, the comparison across batches cannot read it to the host.
+  auto struct_batch = [](const std::vector<std::int64_t>& values) {
+    auto& space      = *get_default_gpu_space();
+    auto const child = int64_batch(values);
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.push_back(std::make_unique<cudf::column>(sirius::get_cudf_table_view(*child).column(0),
+                                                      default_stream(),
+                                                      space.get_default_allocator()));
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_structs_column(static_cast<cudf::size_type>(values.size()),
+                                                std::move(children),
+                                                0,
+                                                {},
+                                                default_stream(),
+                                                space.get_default_allocator()));
+    return sirius::make_data_batch(
+      std::make_unique<cudf::table>(std::move(columns)), space, default_stream(), {});
+  };
+  auto const struct_type =
+    duckdb::LogicalType::STRUCT({{duckdb::Identifier("a"), duckdb::LogicalType::BIGINT}});
+
+  auto sink = make_sink(struct_type, check_first_column());
+  pipelineable_operator_data input(batch_vector{struct_batch({1, 2, 3})}, 0);
+  CHECK_THROWS_AS(sink.execute(input, default_stream()), sirius::not_implemented_exception);
+  // Nothing is recorded for the failed task.
+  CHECK(sink.rows_discarded() == 0);
+  CHECK(sink.bytes_discarded() == 0);
+  CHECK(sink.ranges_checked() == 0);
+  sink.finish();
+  CHECK(sink.order_violations() == 0);
+
+  // Without the order check the same batch is only counted.
+  auto counting = make_sink(struct_type);
+  CHECK(discard(counting, {struct_batch({1, 2, 3})}, 0) == 3);
 }
 
 TEST_CASE("sirius_physical_discard_sink counts a HOST batch without converting it",
@@ -539,7 +592,8 @@ TEST_CASE("sirius_physical_discard_sink logs its summary once even without an or
   sink.finish();
   auto const records = log.records();
   auto const summary = std::count_if(records.begin(), records.end(), [](auto const& record) {
-    return record.message == "[discard_sink] rows=4 bytes=32 order_violations=0";
+    return record.message ==
+           "[discard_sink] rows=4 bytes=32 order_violations=0 order_checked=0 ranges_checked=0";
   });
   CHECK(summary == 1);
 }
@@ -567,7 +621,7 @@ TEST_CASE(
 {
   auto const counting = make_sink(duckdb::LogicalType::BIGINT).input_residency_policy("default");
   CHECK_FALSE(counting.materialize_inputs_on_gpu);
-  // Spilled last: below the default (0) and the merge sort's inputs (100).
+  // Spilled last: below the default priority (0).
   CHECK(counting.downgrade_priority < 0);
 
   auto const checking =
@@ -747,11 +801,11 @@ std::size_t discard_concurrently(sirius_physical_discard_sink& sink,
   std::vector<std::thread> threads;
   for (auto const index : arrival) {
     threads.emplace_back([&, index] {
-      rmm::cuda_stream stream;
-      while (!go.load()) {
-        std::this_thread::yield();
-      }
       try {
+        rmm::cuda_stream stream;
+        while (!go.load()) {
+          std::this_thread::yield();
+        }
         pipelineable_operator_data input(batch_vector{slices[index]}, positions[index]);
         sink.execute(input, stream);
       } catch (...) {

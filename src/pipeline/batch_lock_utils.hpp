@@ -117,6 +117,8 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
 {
   if (!batch) { return std::nullopt; }
 
+  // A batch outside the requested space is converted on `stream` below, which allocates the new
+  // table on it: no rebind needed there.
   detail::try_rebind_stream(batch, requested_memory_space, stream);
 
   // Acquire a read-only lock
@@ -240,11 +242,11 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
 /**
  * @brief Read-lock a batch where it is, in whatever tier and memory space it currently has.
  *
- * For inputs the consumer reads itself (operator_data::materializes_on_gpu() == false): no
- * conversion and no cross-GPU clone. This is lock_and_prepare_batch's "already in the requested
- * space" path applied to any batch, so the batch-state handling is the same. The deallocation
- * stream is rebound only when the batch already sits in @p stream_memory_space; a batch on
- * another GPU must not be bound to a stream of this one.
+ * For inputs the consumer reads itself (pipelineable_operator_data::materializes_on_gpu() ==
+ * false): no conversion and no cross-GPU clone. This is lock_and_prepare_batch's "already in the
+ * requested space" path applied to any batch, so the batch-state handling is the same. The
+ * deallocation stream is rebound only when the batch already sits in @p stream_memory_space; a
+ * batch on another GPU must not be bound to a stream of this one.
  *
  * @param batch                The batch to lock.
  * @param stream_memory_space  Memory space @p stream belongs to; may be nullptr (no rebind).

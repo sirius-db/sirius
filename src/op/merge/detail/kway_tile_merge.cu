@@ -344,8 +344,6 @@ void tile_merge(const kway_key_comparator& cmp,
   tile_merge_impl(cmp, lengths, tile_coranks, target, tile_rows, out_input, out_row, 0, stream);
 }
 
-/// Test hook: tile_merge with a given number of sub-tiles per tile instead of the count chosen
-/// from the device (still capped as in tile_merge). Declared by the tile merge's unit test.
 void tile_merge_with_sub_tiles_for_test(const kway_key_comparator& cmp,
                                         cudf::device_span<const cudf::size_type> lengths,
                                         cudf::device_span<const cudf::size_type> tile_coranks,

@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright 2025, Sirius Contributors.
+# Copyright 2026, Sirius Contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bench_metrics  # noqa: E402
+import sort_merge_bench  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SPDLOG_PREFIX = "[2026-11-12 10:15:02.310] [info] [140213] "
@@ -70,6 +71,12 @@ class MergeSortStatsFormatTest(unittest.TestCase):
         self.assertEqual(len(stats), 1)
         self.assertEqual(stats[0].op, 100)
         self.assertEqual(stats[0].values, dict(zip(keys[1:], values[1:])))
+
+    def test_harness_columns_are_the_cpp_counters(self):
+        # MERGE_STATS_KEYS fixes the CSV column order and the markdown columns: a counter renamed
+        # in C++ would otherwise leave an empty column.
+        keys = re.findall(r"([A-Za-z_]+)=\{\}", self.fmt)
+        self.assertEqual(keys[1:], sort_merge_bench.MERGE_STATS_KEYS)
 
     def test_sum_of_two_rendered_lines(self):
         keys = re.findall(r"([A-Za-z_]+)=\{\}", self.fmt)
@@ -136,7 +143,8 @@ class OomRetryFormatTest(unittest.TestCase):
             window = task_source[match.end() : match.end() + 400]
             literal = re.search(r'"((?:[^"\\]|\\.)*)"', window)
             self.assertIsNotNone(literal, "oom_reschedule_exception without a message")
-            reasons.append(literal.group(1) + "std::bad_alloc")
+            # The literal alone: one of these messages is logged with nothing appended.
+            reasons.append(literal.group(1))
         self.assertGreater(len(reasons), 0)
         text = "".join(self._line(reason) for reason in reasons)
         self.assertEqual(bench_metrics.count_oom_retries(text), len(reasons))
@@ -147,14 +155,29 @@ class OomRetryFormatTest(unittest.TestCase):
 
 
 class DiscardSinkFormatTest(unittest.TestCase):
-    def test_documented_line_parses(self):
-        header = _read("src/op/sirius_physical_discard_sink.hpp")
-        documented = re.search(r'"(\[discard_sink\][^"]*)"', header).group(1)
-        line = documented.replace("…", "{}").format(10, 80, 0)
+    def setUp(self):
+        source = _read("src/op/sirius_physical_discard_sink.cpp")
+        self.fmt = _concatenated_literal(source, source.index('"[discard_sink]'))
+        self.keys = re.findall(r"([A-Za-z_]+)=\{\}", self.fmt)
+
+    def test_tag_matches_cpp(self):
+        self.assertTrue(self.fmt.startswith(bench_metrics.DISCARD_SINK_TAG + " "))
+
+    def test_rendered_line_parses_every_key(self):
+        self.assertEqual(self.keys[:3], ["rows", "bytes", "order_violations"])
+        values = list(range(10, 10 + len(self.keys)))
+        line = self.fmt.format(*values)
         self.assertEqual(
             bench_metrics.parse_discard_sink(SPDLOG_PREFIX + line + "\n"),
-            {"rows": 10, "bytes": 80, "order_violations": 0},
+            dict(zip(self.keys, values)),
         )
+
+    def test_fixture_has_the_keys_the_cpp_logs(self):
+        fixture = (
+            Path(__file__).resolve().parent / "fixtures" / "discard_sink.log"
+        ).read_text()
+        parsed = bench_metrics.parse_discard_sink(fixture)
+        self.assertEqual(list(parsed), self.keys)
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     CHECK(params.sort_merge_mode_setting == mode);
   }
 
-  SECTION("the mode help text says one_shot is slated for removal")
+  SECTION("the mode help text describes one_shot")
   {
     auto result =
       con.Query("SELECT description FROM duckdb_settings() WHERE name = 'sort_merge_mode'");
@@ -206,9 +206,7 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     REQUIRE(result->Collection().Count() == 1);
     auto const description = result->Collection().GetValue(0, 0).ToString();
     CHECK_THAT(description, Catch::Matchers::ContainsSubstring("one_shot"));
-    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("legacy concat-then-merge"));
-    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("A/B testing"));
-    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("slated for removal"));
+    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("concat-then-merge"));
   }
 }
 

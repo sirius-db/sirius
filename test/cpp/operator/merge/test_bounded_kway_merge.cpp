@@ -133,8 +133,8 @@ std::unique_ptr<cudf::column> string_column(const std::vector<std::string>& valu
 /// k sorted windows that are slices of one table, so most of them have a non-zero offset and a
 /// null mask that does not start on a word boundary.
 struct merge_case {
-  /// Column 0 is the window index; the others are the window columns. Sorted by (window, keys),
-  /// so it is also the concatenation of the windows in window order.
+  /// Owns the rows. Column 0 is the window index; the others are the window columns. Sorted by
+  /// (window, keys): the windows are consecutive slices of it.
   std::unique_ptr<cudf::table> all;
   std::vector<cudf::table_view> windows;
   std::vector<cudf::size_type> lengths;
@@ -247,74 +247,18 @@ std::vector<cudf::size_type> random_lengths(std::size_t k, cudf::size_type n, st
   return lengths;
 }
 
-/// What the spec's oracle says a call must return.
-struct oracle_result {
-  std::unique_ptr<cudf::table> sorted;  ///< all rows in merged order; column 0 is the window
-  std::int64_t target{0};
-  std::vector<cudf::size_type> consumed;
-
-  [[nodiscard]] cudf::table_view output() const
-  {
-    std::vector<cudf::size_type> window_cols(kWindowColumns);
-    std::iota(window_cols.begin(), window_cols.end(), 1);
-    return cudf::slice(sorted->view().select(window_cols),
-                       {0, static_cast<cudf::size_type>(target)})
-      .front();
-  }
-};
-
-/// The oracle: the windows concatenated in window order (that is `all`), stably sorted by the
-/// keys, which breaks ties by (window, row). target = min(max_rows, Σ len, position of the last
-/// row of every truncated window + 1), and 0 when a truncated window is empty.
-oracle_result run_oracle(const merge_case& input,
-                         const std::vector<std::uint8_t>& truncated,
-                         cudf::size_type max_rows)
+/// The oracle: merge_utils::reference_bounded_merge (cudf::merge of all rows with ties broken by
+/// (window, row), then the safe-target rule on the host) on the default stream.
+bounded_merge_result run_oracle(const merge_case& input,
+                                const std::vector<std::uint8_t>& truncated,
+                                cudf::size_type max_rows)
 {
-  oracle_result out;
-  std::vector<cudf::size_type> key_cols;
-  for (const auto key : input.keys.key_cols) {
-    key_cols.push_back(key + 1);
-  }
-  out.sorted = cudf::stable_sort_by_key(input.all->view(),
-                                        input.all->view().select(key_cols),
-                                        input.keys.column_order,
-                                        input.keys.null_precedence);
-  const auto source =
-    operator_utils::copy_column_to_host<std::int32_t>(out.sorted->view().column(0));
-
-  const auto k = input.lengths.size();
-  std::vector<std::int64_t> last_position(k, -1);
-  for (std::size_t pos = 0; pos < source.size(); ++pos) {
-    last_position[static_cast<std::size_t>(source[pos])] = static_cast<std::int64_t>(pos);
-  }
-  out.target = std::min<std::int64_t>(max_rows, input.total_rows());
-  for (std::size_t i = 0; i < k; ++i) {
-    if (truncated[i] != 0) { out.target = std::min(out.target, last_position[i] + 1); }
-  }
-  out.consumed.assign(k, 0);
-  for (std::int64_t pos = 0; pos < out.target; ++pos) {
-    ++out.consumed[static_cast<std::size_t>(source[static_cast<std::size_t>(pos)])];
-  }
-  return out;
-}
-
-/// merge_utils::tables_equal, with FLOAT64 columns compared by their bits so NaN equals NaN.
-bool tables_identical(const cudf::table_view& lhs, const cudf::table_view& rhs)
-{
-  if (lhs.num_columns() != rhs.num_columns()) { return false; }
-  const auto as_bits = [](const cudf::table_view& table) {
-    std::vector<cudf::column_view> columns;
-    for (const auto& column : table) {
-      columns.push_back(column.type().id() == cudf::type_id::FLOAT64
-                          ? cudf::bit_cast(column, cudf::data_type{cudf::type_id::INT64})
-                          : column);
-    }
-    return columns;
-  };
-  for (cudf::size_type c = 0; c < lhs.num_columns(); ++c) {
-    if (lhs.column(c).type() != rhs.column(c).type()) { return false; }
-  }
-  return merge_utils::tables_equal(cudf::table_view{as_bits(lhs)}, cudf::table_view{as_bits(rhs)});
+  return merge_utils::reference_bounded_merge(input.windows,
+                                              input.keys,
+                                              truncated,
+                                              max_rows,
+                                              cudf::get_default_stream(),
+                                              cudf::get_current_device_resource_ref());
 }
 
 bounded_merge_result run_merge(const merge_case& input,
@@ -338,7 +282,7 @@ cudf::size_type check_against_oracle(const merge_case& input,
   const auto expected = run_oracle(input, truncated, max_rows);
   const auto actual   = run_merge(input, truncated, max_rows);
   REQUIRE(actual.output != nullptr);
-  REQUIRE(actual.output->num_rows() == expected.target);
+  REQUIRE(actual.output->num_rows() == expected.output->num_rows());
   REQUIRE(actual.output->num_columns() == kWindowColumns);
   REQUIRE(actual.consumed == expected.consumed);
   for (std::size_t i = 0; i < input.lengths.size(); ++i) {
@@ -346,7 +290,7 @@ cudf::size_type check_against_oracle(const merge_case& input,
   }
   REQUIRE(std::accumulate(actual.consumed.begin(), actual.consumed.end(), std::int64_t{0}) ==
           actual.output->num_rows());
-  REQUIRE(tables_identical(actual.output->view(), expected.output()));
+  REQUIRE(merge_utils::tables_equal(actual.output->view(), expected.output->view()));
   return actual.output->num_rows();
 }
 
@@ -517,10 +461,10 @@ TEST_CASE("bounded_kway_merge stops at the safe rank of truncated windows", "[bo
 
           const auto expected = run_oracle(input, truncated, n);
           const auto actual   = run_merge(input, truncated, n);
-          REQUIRE(actual.output->num_rows() == expected.target);
+          REQUIRE(actual.output->num_rows() == expected.output->num_rows());
           REQUIRE(actual.consumed == expected.consumed);
-          REQUIRE(tables_identical(actual.output->view(), expected.output()));
-          reduced += expected.target < bound ? 1 : 0;
+          REQUIRE(merge_utils::tables_equal(actual.output->view(), expected.output->view()));
+          reduced += expected.output->num_rows() < bound ? 1 : 0;
 
           // Final: no unread row of a truncated run can order before an emitted row, because the
           // last emitted row is not after the last row of any truncated window.
@@ -634,6 +578,20 @@ TEST_CASE("bounded_kway_merge edge cases", "[bounded_kway_merge]")
     REQUIRE_THROWS_AS(call(mixed, input.keys, {0, 0}, 10), std::invalid_argument);
     mixed[1] = input.windows[1].select({0, 1, 2, 3, 0});
     REQUIRE_THROWS_AS(call(mixed, input.keys, {0, 0}, 10), std::invalid_argument);
+
+    // One window more than the fan-in limit throws even when the target is 0 (empty windows, or
+    // an empty truncated one) and no merge kernel would run; the limit itself is accepted.
+    const auto empty = make_case({0}, orders, 7);
+    std::vector<cudf::table_view> many(kMaxKwayMergeInputs + 1, empty.windows.front());
+    std::vector<std::uint8_t> flags(many.size(), 0);
+    REQUIRE_THROWS_AS(call(many, empty.keys, flags, 10), std::invalid_argument);
+    flags.front() = 1;
+    REQUIRE_THROWS_AS(call(many, empty.keys, flags, 10), std::invalid_argument);
+    many.assign(many.size(), input.windows.front());
+    REQUIRE_THROWS_AS(call(many, input.keys, flags, 10), std::invalid_argument);
+    many.pop_back();
+    flags.assign(many.size(), 0);
+    REQUIRE(call(many, input.keys, flags, 10).output->num_rows() == 10);
   }
 }
 
@@ -751,9 +709,9 @@ TEST_CASE("bounded_kway_merge runs on a non-default stream", "[bounded_kway_merg
   const auto actual = bounded_kway_merge(
     input.windows, input.keys, none, 3000, stream.view(), cudf::get_current_device_resource_ref());
   // The call returns after its last sync, so the output is ready without waiting on the stream.
-  REQUIRE(actual.output->num_rows() == expected.target);
+  REQUIRE(actual.output->num_rows() == expected.output->num_rows());
   REQUIRE(actual.consumed == expected.consumed);
-  REQUIRE(tables_identical(actual.output->view(), expected.output()));
+  REQUIRE(merge_utils::tables_equal(actual.output->view(), expected.output->view()));
 }
 
 TEST_CASE("bounded_kway_merge allocates in proportion to its output", "[bounded_kway_merge]")

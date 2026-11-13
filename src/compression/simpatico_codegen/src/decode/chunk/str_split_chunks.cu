@@ -21,8 +21,7 @@
 // and records the cut in a small device record. The host reads that record back (a few bytes)
 // to learn the cut, and stops at the first window the budget cuts; when the budget holds all
 // the column's chars nothing can be cut and the record is read once, after the last window.
-// The chars of all the rows taken are then decoded by one decode_ans_range straight into the
-// destination.
+// The chars of all the rows taken are then decoded by one decode_ans_range into the destination.
 
 #include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
@@ -45,7 +44,7 @@ namespace simpatico::chunk {
 
 namespace {
 
-/// Offsets chunks decoded per window; bounds the int64 scratch (2 MiB) and the host slice.
+/// Offsets chunks decoded per window; bounds the int64 scratch at 2 MiB.
 constexpr std::int64_t kWindowChunks = 256;
 
 /// What a call's device passes report to the host.
@@ -130,7 +129,8 @@ class str_split_decoder final : public chunk_decoder {
     if (first_row + span.take > span.chunk_end * kChunkRows) {
       throw std::invalid_argument("str_split chunk decode: the span's chunks do not hold its rows");
     }
-    if (dst.data == nullptr || dst.offsets == nullptr ||
+    // A destination without chars storage takes the rows whose chars are empty.
+    if ((dst.data == nullptr && dst.data_capacity != 0) || dst.offsets == nullptr ||
         (dst.offset_width != 4 && dst.offset_width != 8)) {
       throw std::invalid_argument("str_split chunk decode: bad STRING destination");
     }

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "compression/compression_test_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator/operator_test_utils.hpp"
 
@@ -35,24 +36,22 @@
 #include <compression/compressed_payload_sources.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/compressed_row_range_readers.hpp>
+#include <compression/compressed_scan.hpp>
 #include <compression/device_compressed_blob.hpp>
 #include <compression/spill_compression.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/row_range_read.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <data/sirius_row_range_reader_registry.hpp>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
@@ -62,8 +61,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -94,48 +91,11 @@ constexpr std::size_t kSmallStringNulls = 1;  // STRING, nullable -> stored
 constexpr std::size_t kSmallSorted      = 2;  // INT64 sorted -> delta
 constexpr std::size_t kSmallRows        = 3'000;
 
-bool has_gpu()
+using sirius::test::compression_utils::has_gpu;
+
+sirius::test::compression_utils::tiered_env& env()
 {
-  int count = 0;
-  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
-
-/// GPU, host and disk spaces, with the converters registered.
-struct reader_env {
-  fs::path dir =
-    fs::temp_directory_path() / ("sirius_compressed_readers_test_" + std::to_string(::getpid()));
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  cucascade::memory::memory_space* gpu  = nullptr;
-  cucascade::memory::memory_space* host = nullptr;
-  cucascade::memory::memory_space* disk = nullptr;
-  rmm::cuda_stream stream;
-
-  reader_env()
-  {
-    fs::create_directories(dir);
-    sirius::converter_registry::reset_for_testing();
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .track_reservation_per_stream(false)
-      .set_gpu_usage_limit(1ull << 30)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(1ull << 30)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .set_disk_mounting_point(0, 4ull << 30, dir.string());
-    mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    gpu  = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
-    host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
-    disk = const_cast<cucascade::memory::memory_space*>(
-      mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front());
-  }
-  ~reader_env() { fs::remove_all(dir); }
-};
-
-reader_env& env()
-{
-  static reader_env e;
+  static sirius::test::compression_utils::tiered_env e{"sirius_compressed_readers_test"};
   return e;
 }
 
@@ -376,13 +336,6 @@ struct compressed_source {
   std::vector<tier> tiers;
 };
 
-void move_to(std::shared_ptr<cucascade::data_batch> const& batch,
-             cucascade::memory::memory_space* space)
-{
-  sirius::convertible_data_batch convertible(batch);
-  REQUIRE(convertible.convert({space}, env().stream, *env().mgr, true).has_value());
-}
-
 std::shared_ptr<cucascade::data_batch> as_batch(
   std::unique_ptr<cucascade::idata_representation> representation)
 {
@@ -409,13 +362,13 @@ compressed_source make_compressed(source_data data)
   // Clones share the pinned blob and the file, so both outlive the batch's own moves.
   std::unique_ptr<cucascade::idata_representation> host_owner;
   std::unique_ptr<cucascade::idata_representation> disk_owner;
-  move_to(batch, env().host);
+  move_to(env(), batch, env().host);
   {
     auto ro = batch->to_read_only();
     REQUIRE(dynamic_cast<sirius::compressed_host_representation const*>(ro.get_data()) != nullptr);
     host_owner = ro.get_data()->clone(stream);
   }
-  move_to(batch, env().disk);
+  move_to(env(), batch, env().disk);
   {
     auto ro = batch->to_read_only();
     REQUIRE(dynamic_cast<sirius::compressed_disk_representation const*>(ro.get_data()) != nullptr);
@@ -424,25 +377,8 @@ compressed_source make_compressed(source_data data)
   sirius::compression::set_spill_compression_settings({});
 
   // The device tier: the table rebuilt on the device from the pinned payload.
-  auto const& host   = host_owner->cast<sirius::compressed_host_representation>();
-  auto const& blocks = host.payload();
-  auto blob          = std::make_shared<sirius::compressed_device_blob>();
-  std::string error;
-  simpatico::payload_fetch_fn fetch =
-    [&blocks](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
-      sirius::copy_pinned_blocks_to_device(blocks, off, dst, sz, s);
-    };
-  blob->table = simpatico::read_compressed_table_from_memory(
-    host.header(), fetch, stream, utils::get_resource_ref(*env().gpu), &error);
-  REQUIRE(error.empty());
-  stream.sync();
-  auto device = std::make_unique<sirius::compressed_device_representation>(
-    *env().gpu,
-    std::move(blob),
-    host.column_names(),
-    host.get_size_in_bytes(),
-    host.get_uncompressed_data_size_in_bytes(),
-    host.num_rows());
+  auto device = sirius::test::compression_utils::make_compressed_device(
+    host_owner->cast<sirius::compressed_host_representation>(), *env().gpu, stream);
 
   compressed_source out;
   out.data = std::move(data);
@@ -609,12 +545,15 @@ bool mask_bit(std::vector<std::uint8_t> const& mask, std::size_t bit)
 
 // ── Reading and checking ─────────────────────────────────────────────────────
 
-cucascade::row_range_result read_rows(tier const& t,
-                                      std::span<const std::size_t> columns,
-                                      std::size_t row_begin,
-                                      std::size_t max_rows,
-                                      std::vector<dst_column> const& dsts,
-                                      reader_state* state)
+/// Reads on @p stream, taking the read's device memory from @p scratch when given.
+cucascade::row_range_result read_rows_on(tier const& t,
+                                         std::span<const std::size_t> columns,
+                                         std::size_t row_begin,
+                                         std::size_t max_rows,
+                                         std::vector<dst_column> const& dsts,
+                                         ::cuda::stream_ref stream,
+                                         reader_state* state,
+                                         cucascade::memory::reservation* scratch = nullptr)
 {
   std::vector<cucascade::column_destination> dest;
   dest.reserve(dsts.size());
@@ -626,8 +565,18 @@ cucascade::row_range_result read_rows(tier const& t,
   request.row_begin = row_begin;
   request.max_rows  = max_rows;
   auto ro           = t.batch->to_read_only();
-  return cucascade::read_rows_into(
-    registry(), ro, request, dest, utils::default_stream(), nullptr, state);
+  return cucascade::read_rows_into(registry(), ro, request, dest, stream, scratch, state);
+}
+
+/// Reads on the default stream, the one the other helpers use.
+cucascade::row_range_result read_rows(tier const& t,
+                                      std::span<const std::size_t> columns,
+                                      std::size_t row_begin,
+                                      std::size_t max_rows,
+                                      std::vector<dst_column> const& dsts,
+                                      reader_state* state)
+{
+  return read_rows_on(t, columns, row_begin, max_rows, dsts, utils::default_stream(), state);
 }
 
 /// Reader-contract rule 1, from the oracle: the largest k every destination slot holds.
@@ -662,7 +611,8 @@ std::size_t expected_rows(source_data const& source,
 /**
  * @brief Check that @p d holds source rows [row_begin, row_begin + k) appended at its append
  * position, and that the bytes and bits before that position still hold the fill pattern. With
- * @p check_tail the same is required of everything after the written range.
+ * @p check_tail the same is required of the STRING buffers and mask bits after the written range;
+ * a fixed-width column's data past the range is always checked.
  */
 void verify_read(host_column const& src,
                  dst_column const& d,
@@ -746,7 +696,8 @@ void check_read(source_data const& source,
     CHECK(result.data_bytes_written[i] ==
           (src.is_string() ? src.chars_bytes(row_begin, k) : k * src.width));
     // When a later STRING column lowers k, the STRING columns decoded before it have already
-    // written past the final range (documented reader behaviour): check their prefix only.
+    // written past the final range (the exception to the reader contract stated on
+    // register_compressed_row_range_readers): check their prefix only.
     verify_read(src, dsts[i], row_begin, k, !src.is_string() || strings <= 1);
   }
 }
@@ -1370,27 +1321,6 @@ TEST_CASE("compressed readers keep, rebuild or do without the reader state",
   }
 }
 
-/// Reads on @p stream, bypassing the helpers that use the default stream.
-cucascade::row_range_result read_rows_on(tier const& t,
-                                         std::span<const std::size_t> columns,
-                                         std::size_t row_begin,
-                                         std::size_t max_rows,
-                                         std::vector<dst_column> const& dsts,
-                                         ::cuda::stream_ref stream,
-                                         reader_state* state)
-{
-  std::vector<cucascade::column_destination> dest;
-  for (auto const& d : dsts) {
-    dest.push_back(d.dest);
-  }
-  cucascade::row_range_request request;
-  request.columns   = columns;
-  request.row_begin = row_begin;
-  request.max_rows  = max_rows;
-  auto ro           = t.batch->to_read_only();
-  return cucascade::read_rows_into(registry(), ro, request, dest, stream, nullptr, state);
-}
-
 TEST_CASE("compressed readers follow the caller from one stream to another",
           "[compressed_row_range_readers]")
 {
@@ -1519,18 +1449,9 @@ TEST_CASE("compressed readers decode with a caller's scratch reservation",
     // Cursors are created on the first read with the scratch's resource and kept for the state.
     reader_state state;
     for (std::size_t row_begin : {std::size_t{0}, std::size_t{4095}, std::size_t{19500}}) {
-      auto dsts = roomy_dsts(main.data, columns, 1200, 5, 2);
-      std::vector<cucascade::column_destination> dest;
-      for (auto const& d : dsts) {
-        dest.push_back(d.dest);
-      }
-      cucascade::row_range_request request;
-      request.columns   = columns;
-      request.row_begin = row_begin;
-      request.max_rows  = 1200;
-      auto ro           = t.batch->to_read_only();
-      auto const result = cucascade::read_rows_into(
-        registry(), ro, request, dest, utils::default_stream(), scratch.get(), &state);
+      auto dsts         = roomy_dsts(main.data, columns, 1200, 5, 2);
+      auto const result = read_rows_on(
+        t, columns, row_begin, 1200, dsts, utils::default_stream(), &state, scratch.get());
       check_read(main.data, columns, dsts, row_begin, 1200, result);
     }
     state.reset();
@@ -1589,6 +1510,88 @@ TEST_CASE("compressed readers refuse a column projection of the stored chunk",
 
 namespace {
 
+/// Two views of the whole chunk of @p whole, with every column: one carrying @p visibility, one
+/// carrying @p scan. Only the filter makes them differ from the batch itself.
+template <typename Representation>
+void add_filtered_views(std::vector<tier>& views,
+                        tier const& whole,
+                        sirius::decode_visibility_mask const& visibility,
+                        std::shared_ptr<const sirius::decompression_pushdown_scan> const& scan)
+{
+  auto stream        = utils::default_stream();
+  auto ro            = whole.batch->to_read_only();
+  auto const& source = ro.get_data()->cast<Representation>();
+  {
+    auto view = source.clone(stream);
+    view->template cast<Representation>().set_visibility_mask(visibility);
+    views.push_back({whole.name + " with a visibility mask", as_batch(std::move(view))});
+  }
+  {
+    auto view = source.clone(stream);
+    view->template cast<Representation>().set_pushdown_scan(scan);
+    views.push_back({whole.name + " with a pushdown scan", as_batch(std::move(view))});
+  }
+}
+
+}  // namespace
+
+TEST_CASE("compressed readers refuse a filtered view of the stored chunk",
+          "[compressed_row_range_readers]")
+{
+  if (!has_gpu()) { return; }
+  auto const& main            = main_batch();
+  const std::size_t columns[] = {kRandom};
+
+  auto const mask_words = std::make_shared<std::uint32_t[]>((kMainRows + 31) / 32);
+  auto const visibility = sirius::decode_visibility_mask{mask_words, kMainRows};
+  auto const scan =
+    std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+
+  std::vector<tier> views;
+  add_filtered_views<sirius::compressed_device_representation>(
+    views, main.tiers[0], visibility, scan);
+  add_filtered_views<sirius::compressed_host_representation>(
+    views, main.tiers[1], visibility, scan);
+  REQUIRE(views.size() == 4);
+
+  for (auto const& view : views) {
+    INFO(view.name);
+    {
+      auto ro = view.batch->to_read_only();
+      REQUIRE(registry().has_reader(*ro.get_data()));
+    }
+    reader_state state;
+    auto dsts = roomy_dsts(main.data, columns, 100);
+    CHECK_THROWS_AS(read_rows(view, columns, 0, 100, dsts, &state),
+                    cucascade::row_range_unsupported_error);
+    CHECK_THROWS_AS(read_rows(view, columns, 0, 100, dsts, nullptr),
+                    cucascade::row_range_unsupported_error);
+    verify_read(main.data.columns[kRandom], dsts[0], 0, 0, true);
+  }
+
+  // A state built for the whole batch is not used for a filtered view of it, and still reads
+  // the whole batch afterwards.
+  for (std::size_t i = 0; i < 2; ++i) {
+    INFO(main.tiers[i].name);
+    reader_state state;
+    {
+      auto dsts = roomy_dsts(main.data, columns, 100);
+      read_and_check(main, main.tiers[i], columns, dsts, 0, 100, &state);
+    }
+    for (std::size_t v = 2 * i; v < 2 * i + 2; ++v) {
+      auto dsts = roomy_dsts(main.data, columns, 100);
+      CHECK_THROWS_AS(read_rows(views[v], columns, 0, 100, dsts, &state),
+                      cucascade::row_range_unsupported_error);
+    }
+    {
+      auto dsts = roomy_dsts(main.data, columns, 100);
+      read_and_check(main, main.tiers[i], columns, dsts, 300, 100, &state);
+    }
+  }
+}
+
+namespace {
+
 /// A GPU memory space whose allocator sits on a counting resource, so a test sees what the
 /// reservations of this space, and nothing else, allocate.
 struct counted_gpu_space {
@@ -1618,17 +1621,8 @@ void read_with_scratch(compressed_source const& source,
                        reader_state* state)
 {
   auto dsts = roomy_dsts(source.data, columns, max_rows, 5, 2);
-  std::vector<cucascade::column_destination> dest;
-  for (auto const& d : dsts) {
-    dest.push_back(d.dest);
-  }
-  cucascade::row_range_request request;
-  request.columns   = columns;
-  request.row_begin = row_begin;
-  request.max_rows  = max_rows;
-  auto ro           = t.batch->to_read_only();
-  auto const result = cucascade::read_rows_into(
-    registry(), ro, request, dest, utils::default_stream(), scratch, state);
+  auto const result =
+    read_rows_on(t, columns, row_begin, max_rows, dsts, utils::default_stream(), state, scratch);
   check_read(source.data, columns, dsts, row_begin, max_rows, result);
 }
 

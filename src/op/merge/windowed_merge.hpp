@@ -135,9 +135,9 @@ struct merge_round_stats {
 /**
  * @brief Add the counters of @p from to @p into.
  *
- * Every counter is summed, except round_rows_min / round_rows_max, which take the minimum and
- * the maximum of the two (a round_rows_min of 0 means "no round yet" and never wins).
- * That includes runs_read_compressed, which therefore counts a run once per call.
+ * Every counter is summed (runs_read_compressed too, so a run counts once per call), except
+ * round_rows_min / round_rows_max, which take the minimum and the maximum of the two (a
+ * round_rows_min of 0 means "no round yet" and never wins).
  */
 inline void accumulate(merge_round_stats& into, const merge_round_stats& from) noexcept
 {
@@ -167,6 +167,10 @@ using bounded_merge_fn = std::function<bounded_merge_result(std::span<const cudf
                                                             cudf::size_type,
                                                             rmm::cuda_stream_view,
                                                             rmm::device_async_resource_ref)>;
+
+/// Signature of detail::convert_run_batch_to_gpu; lets tests substitute the whole-batch fallback.
+using run_fallback_fn = std::function<bool(
+  cucascade::data_batch&, cucascade::memory::memory_space&, rmm::cuda_stream_view)>;
 
 /**
  * @brief Runs rounds of a bounded k-way merge over the runs of one partition, one task per run().
@@ -220,6 +224,8 @@ class windowed_merger {
    *        to it when they cannot be read by row range, and the readers allocate from its default
    *        allocator.
    * @param merge The bounded merge kernel (tests may substitute it).
+   * @param convert The whole-batch fallback; empty for detail::convert_run_batch_to_gpu (tests
+   *        may substitute it).
    */
   windowed_merger(std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> runs,
                   std::span<merge_input_cursor> cursors,
@@ -229,7 +235,8 @@ class windowed_merger {
                   window_config cfg,
                   const cucascade::row_range_reader_registry& readers,
                   cucascade::memory::memory_space& gpu_space,
-                  bounded_merge_fn merge = bounded_kway_merge);
+                  bounded_merge_fn merge  = bounded_kway_merge,
+                  run_fallback_fn convert = {});
 
   windowed_merger(windowed_merger&&) noexcept;
   windowed_merger& operator=(windowed_merger&&) noexcept;

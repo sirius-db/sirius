@@ -42,27 +42,15 @@
 #include <utility>
 #include <vector>
 
-namespace sirius::op::merge::detail {
-
-// Defined in kway_comparator.cu: out[i] = less(ia[i], ra[i], ib[i], rb[i]).
-void compare_pairs_for_test(const kway_key_comparator& cmp,
-                            cudf::device_span<const int32_t> ia,
-                            cudf::device_span<const cudf::size_type> ra,
-                            cudf::device_span<const int32_t> ib,
-                            cudf::device_span<const cudf::size_type> rb,
-                            cudf::device_span<uint8_t> out,
-                            rmm::cuda_stream_view stream);
-
-}  // namespace sirius::op::merge::detail
-
 using namespace sirius::op::merge::detail;
 
 namespace {
 
-enum class kind { int32, int64, float64, string, decimal64, timestamp };
+enum class kind { int32, int64, float64, string, decimal64, timestamp, decimal128, float32, bool8 };
 
 /// One key column of one window, on the host. `ints` holds the values of the integer-backed
-/// kinds (int32, int64, decimal64, timestamp).
+/// kinds (int32, int64, decimal64, timestamp, decimal128, bool8) and `doubles` those of both
+/// floating-point kinds.
 struct host_column {
   kind type{kind::int64};
   std::vector<int64_t> ints;
@@ -84,8 +72,19 @@ cudf::data_type cudf_type(kind type)
     case kind::string: return cudf::data_type{cudf::type_id::STRING};
     case kind::decimal64: return cudf::data_type{cudf::type_id::DECIMAL64, -2};
     case kind::timestamp: return cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
+    case kind::decimal128: return cudf::data_type{cudf::type_id::DECIMAL128, -2};
+    case kind::float32: return cudf::data_type{cudf::type_id::FLOAT32};
+    case kind::bool8: return cudf::data_type{cudf::type_id::BOOL8};
   }
   throw std::logic_error("unknown kind");
+}
+
+/// The DECIMAL128 value of host value @p v: v * (2^64 - 3). It grows with v, and neither 64-bit
+/// half orders the values on its own (0 and 1 share the high half; the low half of 2 is below
+/// that of 1).
+__int128 widen_decimal128(int64_t v)
+{
+  return static_cast<__int128>(v) * ((static_cast<__int128>(1) << 64) - 3);
 }
 
 template <typename T>
@@ -141,6 +140,24 @@ std::unique_ptr<cudf::column> make_column(const host_column& col)
     case kind::float64:
       return std::make_unique<cudf::column>(
         cudf_type(col.type), size, to_device_buffer(col.doubles), std::move(mask), null_count);
+    case kind::float32: {
+      std::vector<float> values(col.doubles.begin(), col.doubles.end());
+      return std::make_unique<cudf::column>(
+        cudf_type(col.type), size, to_device_buffer(values), std::move(mask), null_count);
+    }
+    case kind::decimal128: {
+      std::vector<__int128> values;
+      for (const auto v : col.ints) {
+        values.push_back(widen_decimal128(v));
+      }
+      return std::make_unique<cudf::column>(
+        cudf_type(col.type), size, to_device_buffer(values), std::move(mask), null_count);
+    }
+    case kind::bool8: {
+      std::vector<uint8_t> values(col.ints.begin(), col.ints.end());
+      return std::make_unique<cudf::column>(
+        cudf_type(col.type), size, to_device_buffer(values), std::move(mask), null_count);
+    }
     case kind::string: {
       std::vector<cudf::size_type> offsets(static_cast<std::size_t>(size) + 1, 0);
       std::vector<char> chars;
@@ -177,14 +194,23 @@ host_column random_column(kind type,
                           double null_probability,
                           std::mt19937& rng)
 {
-  static const std::vector<double> double_domain      = {-std::numeric_limits<double>::infinity(),
+  static const std::vector<double> double_domain = {-std::numeric_limits<double>::infinity(),
+                                                    -1.5,
+                                                    -0.0,
+                                                    0.0,
+                                                    2.25,
+                                                    1e300,
+                                                    std::numeric_limits<double>::infinity(),
+                                                    std::numeric_limits<double>::quiet_NaN()};
+  // Every value is a float, so the FLOAT32 column holds exactly what the host compares.
+  static const std::vector<double> float_domain       = {-std::numeric_limits<float>::infinity(),
                                                          -1.5,
                                                          -0.0,
                                                          0.0,
                                                          2.25,
-                                                         1e300,
-                                                         std::numeric_limits<double>::infinity(),
-                                                         std::numeric_limits<double>::quiet_NaN()};
+                                                         std::numeric_limits<float>::max(),
+                                                         std::numeric_limits<float>::infinity(),
+                                                         std::numeric_limits<float>::quiet_NaN()};
   static const std::vector<std::string> string_domain = {
     "", "a", "ab", "abc", "b", "ba", "B", "\xC3\xA9", "a longer string value", "a longer string"};
   static const std::vector<int64_t> int_domain = {
@@ -201,6 +227,9 @@ host_column random_column(kind type,
       case kind::decimal64:
       case kind::timestamp: col.ints.push_back(int_domain[rng() % int_domain.size()]); break;
       case kind::float64: col.doubles.push_back(double_domain[rng() % double_domain.size()]); break;
+      case kind::float32: col.doubles.push_back(float_domain[rng() % float_domain.size()]); break;
+      case kind::decimal128: col.ints.push_back(static_cast<int64_t>(rng() % 9) - 4); break;
+      case kind::bool8: col.ints.push_back(static_cast<int64_t>(rng() % 2)); break;
       case kind::string: col.strings.push_back(string_domain[rng() % string_domain.size()]); break;
     }
   }
@@ -215,6 +244,7 @@ int compare_values(const host_column& a,
                    cudf::size_type rb)
 {
   switch (a.type) {
+    case kind::float32:
     case kind::float64: {
       const double x = a.doubles[ra];
       const double y = b.doubles[rb];
@@ -373,7 +403,7 @@ std::vector<host_window> random_windows(const std::vector<kind>& types,
                                         const std::vector<cudf::size_type>& rows,
                                         std::mt19937& rng)
 {
-  // The middle window has no nulls.
+  // Every third window (i % 3 == 1) has no nulls.
   const std::vector<double> null_probability = {0.2, 0.0, 0.3};
   std::vector<host_window> windows;
   for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -399,8 +429,15 @@ host_column int64_column(const std::vector<int64_t>& values)
 
 TEST_CASE("kway comparator matches the host reference for single-column keys", "[kway_comparator]")
 {
-  const auto type = GENERATE(
-    kind::int64, kind::float64, kind::string, kind::decimal64, kind::timestamp, kind::int32);
+  const auto type       = GENERATE(kind::int64,
+                             kind::float64,
+                             kind::string,
+                             kind::decimal64,
+                             kind::timestamp,
+                             kind::int32,
+                             kind::decimal128,
+                             kind::float32,
+                             kind::bool8);
   const auto order      = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
   const auto null_order = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
 

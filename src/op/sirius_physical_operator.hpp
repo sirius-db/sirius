@@ -101,15 +101,17 @@ struct task_creation_hint {
 };
 
 /// How the task machinery treats batches arriving on one input port of an operator.
-/// Defaults reproduce today's behaviour exactly.
+/// Defaults keep a port's batches materialized on the GPU and its repository in the normal
+/// downgrade order.
 struct port_residency_policy {
   /// false: task inputs built from this port are NOT converted to the GPU by
   /// pipelineable_operator_data::prepare_for_processing (each batch is read-locked in its current
-  /// tier and memory space) and are NOT counted in bytes_to_materialize_input. The operator reads
-  /// them itself (e.g. through the cuCascade row-range readers).
+  /// tier and memory space) and are NOT counted by
+  /// gpu_pipeline_task::get_estimated_bytes_to_materialize_input. The operator reads them itself
+  /// (e.g. through the cuCascade row-range readers).
   bool materialize_inputs_on_gpu{true};
   /// Downgrade sweep order within one query: repositories with a higher value are spilled
-  /// earlier. 0 = today's order. Copied to the port's repository at wiring time.
+  /// earlier. 0 = no preference. Copied to the port's repository at wiring time.
   int32_t downgrade_priority{0};
 
   friend bool operator==(const port_residency_policy&, const port_residency_policy&) = default;
@@ -253,7 +255,7 @@ class operator_data {
   /// if it shrank; the retry then keeps the reservation floor it had before this OOM instead of
   /// raising it. A pipelineable input's read-only locks from prepare_for_processing() are
   /// released before the call, so an override may lock, spill or drop its batches; other holders
-  /// of a batch may still have it locked. Default: false (no change to today's behaviour).
+  /// of a batch may still have it locked. Default: false (the input never shrinks).
   virtual bool shrink_for_retry() { return false; }
 
  private:
@@ -399,7 +401,8 @@ class pipelineable_operator_data : public operator_data {
   }
 
   /// Default true. When false, prepare_for_processing locks each batch in its current tier
-  /// (no conversion, no cross-GPU clone) and the task's bytes_to_materialize_input skips it.
+  /// (no conversion, no cross-GPU clone) and the task's
+  /// get_estimated_bytes_to_materialize_input skips it.
   void set_materialize_on_gpu(bool v) noexcept { _materialize_on_gpu = v; }
   [[nodiscard]] bool materializes_on_gpu() const noexcept { return _materialize_on_gpu; }
 
@@ -731,7 +734,7 @@ class sirius_physical_operator {
     sirius_physical_operator const& producer) const;
 
   /// Override to opt an input port into on-demand residency and/or downgrade-first. Read once
-  /// per port, at materialize_repository_wiring. Default: {} (today's behaviour).
+  /// per port, at materialize_repository_wiring. Default: {} (materialize on the GPU, priority 0).
   [[nodiscard]] virtual port_residency_policy input_residency_policy(std::string_view port_id) const
   {
     return {};

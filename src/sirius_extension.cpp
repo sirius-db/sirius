@@ -3567,9 +3567,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "sort_merge_mode",
     "Merge path for sorted runs: 'auto' (windowed under memory pressure or when any input is not "
-    "on the GPU), 'windowed' (always the windowed k-way merge), or 'one_shot' (the legacy "
-    "concat-then-merge path, kept for A/B testing and slated for removal once the windowed path "
-    "is proven)",
+    "on the GPU), 'windowed' (always the windowed k-way merge), or 'one_shot' (the "
+    "concat-then-merge path)",
     LogicalType::VARCHAR,
     Value(std::string(sirius::to_string(operator_defaults.sort_merge_mode_setting))),
     SetSortMergeMode);

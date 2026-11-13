@@ -16,10 +16,10 @@
 
 #include "op/merge/windowed_merge_input.hpp"
 
+#include "memory/size_arithmetic.hpp"
 #include "op/merge/merge_config.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -47,7 +47,7 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
                                            std::size_t row_width,
                                            std::size_t key_row_width,
                                            std::size_t gpu_runs,
-                                           std::size_t largest_fallback_run_bytes,
+                                           std::size_t fallback_bytes,
                                            std::size_t compressed_runs,
                                            std::size_t fetch_columns,
                                            std::size_t string_columns)
@@ -59,7 +59,7 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
     _row_width(row_width),
     _key_row_width(key_row_width),
     _gpu_runs(gpu_runs),
-    _largest_fallback_run_bytes(largest_fallback_run_bytes),
+    _fallback_bytes(fallback_bytes),
     _compressed_runs(compressed_runs),
     _fetch_columns(fetch_columns),
     _string_columns(string_columns)
@@ -74,18 +74,18 @@ void windowed_merge_input::prepare_for_processing(
 
 std::size_t windowed_merge_input::get_estimated_size_in_bytes() const
 {
-  auto const task   = estimate_task_bytes(_cursors.size(),
-                                        _gpu_runs,
-                                        _cfg.window_rows,
-                                        _row_width,
-                                        _key_row_width,
-                                        _cfg.output_target_bytes,
-                                        _largest_fallback_run_bytes);
+  // A run whose window buffers the kept merger holds allocates none, like a run sliced in place.
+  auto const task =
+    estimate_task_bytes(_cursors.size(),
+                        sirius::memory::saturating_add(_gpu_runs, _kept_buffer_runs),
+                        _cfg.window_rows,
+                        _row_width,
+                        _key_row_width,
+                        _cfg.output_target_bytes,
+                        _fallback_bytes);
   auto const reader = estimate_reader_state_bytes(
     _compressed_runs, _fetch_columns, _string_columns, _cfg.window_rows);
-  return reader > std::numeric_limits<std::size_t>::max() - task
-           ? std::numeric_limits<std::size_t>::max()
-           : task + reader;
+  return sirius::memory::saturating_add(task, reader);
 }
 
 std::size_t windowed_merge_input::get_estimated_working_set_size_in_bytes() const
@@ -95,6 +95,7 @@ std::size_t windowed_merge_input::get_estimated_working_set_size_in_bytes() cons
 
 bool windowed_merge_input::shrink_for_retry()
 {
+  _kept_buffer_runs        = 0;
   const bool window_shrunk = halve_to_floor(_cfg.window_rows, kShrinkWindowRowsFloor);
   const bool output_shrunk =
     halve_to_floor(_cfg.output_target_bytes, kShrinkOutputTargetBytesFloor);
@@ -106,6 +107,11 @@ bool windowed_merge_input::shrink_for_retry()
 void windowed_merge_input::set_shrink_observer(std::function<void()> observer)
 {
   _shrink_observer = std::move(observer);
+}
+
+void windowed_merge_input::set_kept_buffer_runs(std::size_t runs) noexcept
+{
+  _kept_buffer_runs = runs;
 }
 
 std::size_t windowed_merge_input::partition() const noexcept { return _partition; }

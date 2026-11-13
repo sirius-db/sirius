@@ -36,8 +36,8 @@ namespace sirius::op::merge::detail {
 
 /**
  * @brief Thrown by window_buffer::refill when one source row does not fit a STRING slot, also
- * after the slots were grown once. The slots stay grown, so calling refill again keeps doubling
- * them; consuming the rows the window still holds makes room too.
+ * after the slot was grown once. The slot stays grown, so calling refill again keeps doubling
+ * it; consuming the rows the window still holds makes room too.
  */
 class window_row_too_large_error : public std::runtime_error {
  public:
@@ -54,7 +54,7 @@ class window_row_too_large_error : public std::runtime_error {
  * Successive calls may use different streams: work on a new stream is ordered after the work
  * enqueued before it, without blocking the host. The stream of the previous call must still be a
  * live stream then, and the stream of the last call when the window is destroyed. The memory
- * resource must outlive the window.
+ * resource must outlive the window. Only refill() can block the host (see there).
  */
 class window_buffer {
  public:
@@ -117,17 +117,22 @@ class window_buffer {
   /// Row capacity of each slot (window_rows).
   [[nodiscard]] std::size_t capacity_rows() const noexcept;
 
-  /// Device bytes allocated by both slots.
+  /// Device bytes the two slots hold now. After refill() grew the chars of the active slot, the
+  /// other slot has no chars until the next consume() that carries rows allocates them.
   [[nodiscard]] std::size_t device_bytes() const noexcept;
 
-  /// Times refill() grew the chars of the STRING slots since the window was built.
+  /// Times refill() grew the chars of the STRING columns since the window was built.
   [[nodiscard]] std::size_t chars_growths() const noexcept;
 
   /**
-   * @brief Drops the first @p consumed rows.
+   * @brief Drops the first @p consumed rows; the rest move to the front of the window.
    *
-   * Copies [consumed, size()) to the front of the other slot (unaligned null-mask shift, STRING
-   * chars copy + offset rebase) and makes it active.
+   * Invalidates view(). Enqueues the copy on @p stream without blocking the host; dropping every
+   * row touches no device memory. After a refill() that grew the STRING chars, the first call
+   * that keeps rows allocates the chars of the other slot from the window's memory resource (and
+   * can throw its out-of-memory error; the window then still holds its rows).
+   *
+   * @throws std::out_of_range if @p consumed exceeds size().
    */
   void consume(std::size_t consumed, rmm::cuda_stream_view stream);
 
@@ -137,8 +142,11 @@ class window_buffer {
    * Reads up to capacity_rows() - size() rows via cucascade::read_rows_into (caller holds the
    * read lock). Returns the reader result; fewer rows than asked for, with the source not
    * exhausted, means a STRING slot ran out of chars. If a single row does not fit a STRING slot,
-   * grows both slots' chars (doubling) and retries once. The reader does not report which column
-   * was short, so every STRING column grows.
+   * doubles the chars of the active slot and retries once. The reader does not report which
+   * column was short, so every STRING column grows; the growth is allocated from the window's
+   * memory resource, whose out-of-memory error propagates. Blocks the host after a consume() that
+   * kept rows of a window with STRING columns, until that consume() has run on the device (the
+   * chars end is read back); work enqueued after that consume() is not waited for.
    *
    * @param readers Row-range reader registry to dispatch through.
    * @param batch Read lock on the source batch, held by the caller for the duration of the call.

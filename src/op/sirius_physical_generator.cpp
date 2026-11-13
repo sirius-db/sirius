@@ -19,7 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/input_free_operator_data.hpp"
-#include "op/scan/generator/generator_detail.cuh"
+#include "op/scan/generator/generator_batch.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -170,11 +170,8 @@ std::unique_ptr<operator_data> sirius_physical_generator::execute(const operator
 //===----------------------------------------------------------------------===//
 std::size_t sirius_physical_generator::no_history_peak_memory_estimate(const input_stats&) const
 {
-  // Columns are generated one at a time, so the peak is the finished columns plus one column's
-  // temporaries: the draw buffers, and for VARCHAR the offsets and chars being built. 2x the
-  // batch covers that.
-  return sirius::memory::saturating_mul(
-    scan::generator::estimated_batch_bytes(_spec, _output_columns), 2);
+  // 2x the batch, plus the key and sizes scratch of a VARCHAR column.
+  return scan::generator::estimated_peak_batch_bytes(_spec, _output_columns);
 }
 
 std::optional<std::size_t> sirius_physical_generator::total_source_input_bytes() const

@@ -828,7 +828,7 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
 }
 
 // ---------------------------------------------------------------------------
-// Downgrade priority: order of the tier-1 repository sweep within one query
+// Downgrade priority: order of the tier-1 repository sweep
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1094,7 +1094,9 @@ TEST_CASE("tier-1 sweep tolerates downgrade priorities changing concurrently",
     REQUIRE(sweeps++ < 4 * num_repos);
     auto future = executor.request_free_memory(one_batch_bytes);
     REQUIRE(future.wait_until(deadline) == std::future_status::ready);
-    REQUIRE_NOTHROW(future.get());
+    size_t freed = 0;
+    REQUIRE_NOTHROW(freed = future.get());
+    REQUIRE(freed >= one_batch_bytes);
   }
 
   writer.request_stop();

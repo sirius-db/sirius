@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,49 +24,30 @@
 
 #include "catch.hpp"
 #include "op/discard_copy_function.hpp"
+#include "utils/log_test_utils.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 
 #include <duckdb.hpp>
 #include <duckdb/parser/parsed_data/copy_info.hpp>
-#include <stdlib.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
-#include <stdexcept>
 #include <string>
 
 namespace {
 
 namespace fs = std::filesystem;
 
-/// A fresh directory for COPY target paths, removed with everything in it at scope exit.
-struct scratch_dir {
-  fs::path path;
-
-  scratch_dir()
-  {
-    auto pattern = (fs::temp_directory_path() / "sirius_discard_copy_XXXXXX").string();
-    if (::mkdtemp(pattern.data()) == nullptr) {
-      throw std::runtime_error("mkdtemp failed for " + pattern);
-    }
-    path = pattern;
-  }
-  ~scratch_dir()
-  {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  scratch_dir(scratch_dir const&)            = delete;
-  scratch_dir& operator=(scratch_dir const&) = delete;
-
-  [[nodiscard]] std::size_t entry_count() const
-  {
-    return static_cast<std::size_t>(
-      std::distance(fs::directory_iterator(path), fs::directory_iterator()));
-  }
-};
+/// Number of entries directly inside @p dir.
+std::size_t entry_count(sirius::test::scratch_dir const& dir)
+{
+  return static_cast<std::size_t>(
+    std::distance(fs::directory_iterator(dir.path()), fs::directory_iterator()));
+}
 
 /// A DuckDB instance with the `sirius_discard` COPY format registered and GPU execution off.
 struct discard_db {
@@ -84,8 +65,8 @@ struct discard_db {
                                                std::string const& target,
                                                std::string const& options = "")
   {
-    return con.Query("COPY (" + query + ") TO '" + target + "' (FORMAT sirius_discard" + options +
-                     ")");
+    return con.Query("COPY (" + query + ") TO " + sirius::test::sql_literal(target) +
+                     " (FORMAT sirius_discard" + options + ")");
   }
 };
 
@@ -97,6 +78,28 @@ std::int64_t copied_rows(duckdb::QueryResult& result)
   REQUIRE(result.RowCount() == 1);
   REQUIRE(result.ColumnCount() == 1);
   return result.Collection().GetRows().GetValue(0, 0).GetValue<std::int64_t>();
+}
+
+/// WARN records saying that a requested `check_order` is not checked on the CPU path.
+std::size_t order_unchecked_warnings(sirius::test::scoped_recording_log_sink const& log)
+{
+  auto const records = log.records();
+  return static_cast<std::size_t>(
+    std::count_if(records.begin(), records.end(), [](auto const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.rfind("sirius_discard: check_order disabled, the COPY runs on the CPU",
+                                  0) == 0;
+    }));
+}
+
+/// `[discard_sink]` summary lines: the GPU sink's, which carry `order_checked=1` after a check.
+std::size_t discard_sink_summaries(sirius::test::scoped_recording_log_sink const& log)
+{
+  auto const records = log.records();
+  return static_cast<std::size_t>(
+    std::count_if(records.begin(), records.end(), [](auto const& record) {
+      return record.message.rfind("[discard_sink] ", 0) == 0;
+    }));
 }
 
 void require_binder_error(duckdb::QueryResult& result)
@@ -122,9 +125,9 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_with_options(
 
 TEST_CASE("sirius_discard returns the row count and creates no file", "[discard_copy_function]")
 {
-  scratch_dir dir;
+  sirius::test::scratch_dir dir("discard_copy");
   discard_db db;
-  auto const target = (dir.path / "x").string();
+  auto const target = dir.file("x");
 
   SECTION("a million rows")
   {
@@ -157,17 +160,17 @@ TEST_CASE("sirius_discard returns the row count and creates no file", "[discard_
   }
 
   CHECK_FALSE(fs::exists(target));
-  CHECK(dir.entry_count() == 0);
+  CHECK(entry_count(dir) == 0);
 }
 
 TEST_CASE("sirius_discard leaves an existing target alone", "[discard_copy_function]")
 {
-  scratch_dir dir;
+  sirius::test::scratch_dir dir("discard_copy");
   discard_db db;
 
   SECTION("an existing file keeps its contents")
   {
-    auto const target = dir.path / "existing";
+    auto const target = dir.path() / "existing";
     {
       std::ofstream out(target);
       out << "keep me";
@@ -178,35 +181,35 @@ TEST_CASE("sirius_discard leaves an existing target alone", "[discard_copy_funct
     std::ifstream in(target);
     std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     CHECK(contents == "keep me");
-    CHECK(dir.entry_count() == 1);
+    CHECK(entry_count(dir) == 1);
   }
   SECTION("an existing directory stays empty")
   {
-    auto result = db.copy("SELECT range FROM range(3000)", dir.path.string());
+    auto result = db.copy("SELECT range FROM range(3000)", dir.path().string());
     CHECK(copied_rows(*result) == 3000);
-    CHECK(dir.entry_count() == 0);
+    CHECK(entry_count(dir) == 0);
   }
   SECTION("/dev/null")
   {
     auto result = db.copy("SELECT range FROM range(3000)", "/dev/null");
     CHECK(copied_rows(*result) == 3000);
     CHECK(fs::is_character_file("/dev/null"));
-    CHECK(dir.entry_count() == 0);
+    CHECK(entry_count(dir) == 0);
   }
   SECTION("a path whose directory does not exist")
   {
-    auto const target = dir.path / "missing" / "x";
+    auto const target = dir.path() / "missing" / "x";
     auto result       = db.copy("SELECT range FROM range(3000)", target.string());
     CHECK(copied_rows(*result) == 3000);
-    CHECK(dir.entry_count() == 0);
+    CHECK(entry_count(dir) == 0);
   }
 }
 
 TEST_CASE("sirius_discard options", "[discard_copy_function]")
 {
-  scratch_dir dir;
+  sirius::test::scratch_dir dir("discard_copy");
   discard_db db;
-  auto const target = (dir.path / "x").string();
+  auto const target = dir.file("x");
   auto const query  = std::string("SELECT range FROM range(100) ORDER BY range");
 
   SECTION("check_order is accepted")
@@ -216,6 +219,27 @@ TEST_CASE("sirius_discard options", "[discard_copy_function]")
       INFO(options);
       auto result = db.copy(query, target, options);
       CHECK(copied_rows(*result) == 100);
+    }
+  }
+  SECTION("check_order on the CPU path is not checked, and a WARN says so")
+  {
+    // Out of order on purpose: the CPU body returns the count whatever the order, so the only
+    // sign that nothing was verified is the warning (and the missing [discard_sink] line).
+    auto const unordered = std::string("SELECT 99 - range AS k FROM range(100)");
+    for (auto const* options : {", check_order true", ", check_order", ", CHECK_ORDER 1"}) {
+      INFO(options);
+      sirius::test::scoped_recording_log_sink log("info");
+      auto result = db.copy(unordered, target, options);
+      CHECK(copied_rows(*result) == 100);
+      CHECK(order_unchecked_warnings(log) == 1);
+      CHECK(discard_sink_summaries(log) == 0);
+    }
+    for (auto const* options : {"", ", check_order false"}) {
+      INFO(options);
+      sirius::test::scoped_recording_log_sink log("info");
+      auto result = db.copy(unordered, target, options);
+      CHECK(copied_rows(*result) == 100);
+      CHECK(order_unchecked_warnings(log) == 0);
     }
   }
   SECTION("check_order must be a boolean")
@@ -247,7 +271,7 @@ TEST_CASE("sirius_discard options", "[discard_copy_function]")
     }
   }
 
-  CHECK(dir.entry_count() == 0);
+  CHECK(entry_count(dir) == 0);
 }
 
 TEST_CASE("sirius_discard bind data", "[discard_copy_function]")
@@ -308,25 +332,25 @@ TEST_CASE("sirius_discard function and registration", "[discard_copy_function]")
 
   SECTION("the Sirius extension registers the format")
   {
-    scratch_dir dir;
+    sirius::test::scratch_dir dir("discard_copy");
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE_FALSE(con.Query("SET gpu_execution = false")->HasError());
-    auto result = con.Query("COPY (SELECT range FROM range(77)) TO '" + (dir.path / "x").string() +
-                            "' (FORMAT sirius_discard)");
+    auto result = con.Query("COPY (SELECT range FROM range(77)) TO " + dir.file_literal("x") +
+                            " (FORMAT sirius_discard)");
     CHECK(copied_rows(*result) == 77);
-    CHECK(dir.entry_count() == 0);
+    CHECK(entry_count(dir) == 0);
   }
   SECTION("registering again is harmless")
   {
-    scratch_dir dir;
+    sirius::test::scratch_dir dir("discard_copy");
     discard_db db;
     REQUIRE_NOTHROW(sirius::op::register_discard_copy_function(*db.db.instance));
     REQUIRE_NOTHROW(sirius::op::register_discard_copy_function(*db.db.instance));
 
-    auto result = db.copy("SELECT range FROM range(1234)", (dir.path / "x").string());
+    auto result = db.copy("SELECT range FROM range(1234)", dir.file("x"));
     CHECK(copied_rows(*result) == 1234);
-    CHECK(dir.entry_count() == 0);
+    CHECK(entry_count(dir) == 0);
   }
   SECTION("COPY FROM is not supported")
   {

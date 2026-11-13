@@ -9,6 +9,7 @@
 #include "api/chunk_decode.hpp"
 #include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
+#include "chunk_test_utils.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/validity.hpp"
@@ -35,26 +36,12 @@
 
 namespace {
 
-// The spill plans, copied from src/compression/spill_compression.cpp.
-constexpr char const* kBitpackPlan =
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kDeltaBitpackPlan =
-  "input -> delta -> differences\n"
-  "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kDeltaRleBitpackPlan =
-  "input -> delta -> differences\n"
-  "delta.differences -> rle -> runs, values\n"
-  "delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-  "delta.differences.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kDictionaryPlan =
-  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
-  "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kStringSplitPlan =
-  "input -> str_split -> offsets, chars\n"
-  "str_split.chars -> ans\n"
-  "str_split.offsets -> delta -> differences\n"
-  "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-constexpr char const* kStoredPlan = "input -> identity\n";
+using simpatico::chunk_test::kBitpackPlan;
+using simpatico::chunk_test::kDeltaBitpackPlan;
+using simpatico::chunk_test::kDeltaRleBitpackPlan;
+using simpatico::chunk_test::kDictionaryPlan;
+using simpatico::chunk_test::kStoredPlan;
+using simpatico::chunk_test::kStringSplitPlan;
 
 void check(bool cond, std::string const& label, char const* what)
 {
@@ -531,8 +518,9 @@ void test_malformed_headers()
     }
   }
 
-  // Unknown validity kind: the record sits right after the first column's
-  // name (str16), dtype tag (u8), scale (i32) and num_rows (i64).
+  // Unknown validity kind: the record follows the magic (4), the version (u8), the column count
+  // (u16) and the first column's name (str16: u16 length + the 1 byte of "a"), dtype tag (u8),
+  // scale (i32) and num_rows (i64).
   {
     auto bad                 = s1.header;
     std::size_t const offset = 4 + 1 + 2 + (2 + 1) + 1 + 4 + 8;

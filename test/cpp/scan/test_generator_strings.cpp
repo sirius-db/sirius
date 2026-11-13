@@ -307,6 +307,7 @@ TEST_CASE("generator strings: masked rows are null", "[generator_strings]")
     all_set.valid.assign(args.keys.size(), true);
     const auto result = format_column(all_set);
     REQUIRE(result->null_count() == 0);
+    REQUIRE_FALSE(result->nullable());
     REQUIRE(to_host(result->view()) == all_valid);
   }
 }

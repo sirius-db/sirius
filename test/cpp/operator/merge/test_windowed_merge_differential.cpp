@@ -40,17 +40,14 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/row_range_read.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <data/sirius_row_range_reader_registry.hpp>
-#include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
-#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -75,78 +72,6 @@ constexpr std::size_t kUnlimitedOutput = std::numeric_limits<std::size_t>::max()
 
 /// Uniform in [0, n); plain modulo so a seed gives the same case on every platform.
 std::size_t pick(rng_t& rng, std::size_t n) { return static_cast<std::size_t>(rng() % n); }
-
-// ---------------------------------------------------------------------------
-// Memory spaces: GPU, HOST and DISK
-// ---------------------------------------------------------------------------
-
-/**
- * @brief A memory manager with a 256 MiB GPU space, a host space and a disk space in a temporary
- * directory, the registries the merger reads through, and the stream the merge runs on.
- *
- * tiered_memory_fixture has no DISK tier, so this mirrors it with a disk mounting point. Declare
- * it before anything that holds batches of its spaces.
- */
-struct differential_fixture {
-  std::filesystem::path spill_dir;
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu  = nullptr;
-  cucascade::memory::memory_space* host = nullptr;
-  cucascade::memory::memory_space* disk = nullptr;
-  rmm::cuda_stream stream;
-
-  differential_fixture()
-  {
-    sirius::converter_registry::reset_for_testing();
-    std::string tmp_template =
-      (std::filesystem::temp_directory_path() / "sirius_merge_differential_XXXXXX").string();
-    REQUIRE(mkdtemp(tmp_template.data()) != nullptr);
-    spill_dir = tmp_template;
-
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .set_gpu_usage_limit(std::size_t{256} << 20)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(std::size_t{1} << 30)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .set_disk_mounting_point(0, std::size_t{1} << 30, spill_dir.string());
-    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    // Left initialized: a live SiriusContext serves its readers from this registry.
-    if (!sirius::row_range_reader_registry::is_initialized()) {
-      sirius::row_range_reader_registry::initialize();
-    }
-    gpu  = space_of(Tier::GPU);
-    host = space_of(Tier::HOST);
-    disk = space_of(Tier::DISK);
-    REQUIRE(gpu != nullptr);
-    REQUIRE(host != nullptr);
-    REQUIRE(disk != nullptr);
-  }
-
-  ~differential_fixture()
-  {
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-    std::error_code ignored;
-    std::filesystem::remove_all(spill_dir, ignored);
-  }
-
-  [[nodiscard]] rmm::cuda_stream_view stream_view() const
-  {
-    return rmm::cuda_stream_view{stream.value()};
-  }
-
- private:
-  cucascade::memory::memory_space* space_of(Tier tier)
-  {
-    auto spaces = manager->get_memory_spaces_for_tier(tier);
-    return spaces.empty() ? nullptr : const_cast<cucascade::memory::memory_space*>(spaces[0]);
-  }
-};
 
 const char* tier_name(Tier tier)
 {
@@ -487,14 +412,14 @@ struct merge_outcome {
 
 /// The runs of one merge and everything that has to outlive the merger.
 struct merge_case {
-  differential_fixture& fx;
+  tiers_fixture& fx;
   case_layout layout;
   cucascade::shared_data_repository repository;
   std::vector<test_run> runs;
   std::vector<std::vector<Tier>> tiers;  ///< per run, per batch
   std::vector<merge_input_cursor> cursors;
 
-  merge_case(differential_fixture& fixture, case_layout case_layout)
+  merge_case(tiers_fixture& fixture, case_layout case_layout)
     : fx(fixture), layout(std::move(case_layout))
   {
   }
@@ -689,8 +614,8 @@ struct merge_case {
 struct random_options {
   std::size_t min_rows{1};     ///< rows per run, lower bound
   std::size_t max_rows{0};     ///< rows per run, upper bound; 0 picks 64, 2 500 or 20 000
-  std::size_t min_batches{1};  ///< batches per run
-  std::size_t max_batches{1};  ///< batches per run
+  std::size_t min_batches{1};  ///< batches per run, lower bound
+  std::size_t max_batches{1};  ///< batches per run, upper bound
   bool tier_per_batch{false};  ///< a tier per batch instead of one per run
   std::optional<std::size_t> output_target;
   std::optional<bool> fresh_merger_each_call;
@@ -727,7 +652,7 @@ Tier random_tier(rng_t& rng)
  *
  * @param description Set to the case's parameters before anything is run.
  */
-merge_outcome run_random_case(differential_fixture& fx,
+merge_outcome run_random_case(tiers_fixture& fx,
                               std::uint64_t seed,
                               const random_options& options,
                               std::string& description)
@@ -865,14 +790,15 @@ merge_outcome run_random_case(differential_fixture& fx,
   return merge.merge_and_check(cfg, fresh);
 }
 
-/// Run @p seeds through run_random_case; a case that throws fails and the next one still runs.
+/// Run @p seeds through run_random_case; a case that throws a std::exception fails and the next one
+/// still runs, but a failed REQUIRE inside a case ends the loop.
 template <typename Check>
 void run_random_cases(std::uint64_t first_seed,
                       std::uint64_t num_seeds,
                       const random_options& options,
                       Check&& check)
 {
-  differential_fixture fx;
+  tiers_fixture fx;
   for (auto seed = first_seed; seed < first_seed + num_seeds; ++seed) {
     std::string description;
     try {
@@ -909,7 +835,7 @@ struct keyed_runs {
   merge_case merge;
   std::int64_t next_id{0};
 
-  keyed_runs(differential_fixture& fx, case_layout layout) : merge(fx, std::move(layout)) {}
+  keyed_runs(tiers_fixture& fx, case_layout layout) : merge(fx, std::move(layout)) {}
 
   /// @p key_valid empty: no null keys. The payload of a row is @p payload(row).
   template <typename Payload>
@@ -969,7 +895,7 @@ TEST_CASE("windowed merge is exact when long STRING payloads truncate windows by
   // 150 KB, more than a whole 1024-row window was sized for.
   const auto window_rows = GENERATE(std::size_t{1024}, std::size_t{4096});
   CAPTURE(window_rows);
-  differential_fixture fx;
+  tiers_fixture fx;
   keyed_runs runs(fx, key_id_payload_layout());
   rng_t rng(20261112);
   constexpr std::size_t rows_per_run = 6000;
@@ -993,11 +919,12 @@ TEST_CASE("windowed merge is exact when long STRING payloads truncate windows by
   const auto outcome =
     runs.merge.merge_and_check({.window_rows = window_rows, .output_target_bytes = 1 << 20});
   CHECK(outcome.calls > 1);
-  // 24 000 spilled rows fit 6 windows of 4096 rows per run; byte-truncated refills need more.
+  // Untruncated, a 6,000-row run fills 2 windows of 4,096 rows or 6 of 1,024; byte-truncated
+  // refills need more rounds.
   CHECK(outcome.stats.rounds > 6);
   // The byte-limited path was taken: refills stopped short on chars. A 1024-row window is sized
-  // below the 150 KB rows, so its buffers also grew their STRING slots. Even so no row was
-  // carried twice.
+  // below the 150 KB rows, so its buffers also grew their STRING slots. Compaction still copied
+  // no more rows than the refills read.
   CHECK(outcome.stats.refill_truncated > 0);
   if (window_rows == 1024) { CHECK(outcome.stats.window_growths > 0); }
   CHECK(outcome.stats.compacted_rows <= outcome.stats.refill_rows);
@@ -1009,7 +936,7 @@ TEST_CASE("windowed merge is exact with long STRING keys", "[windowed_merge_diff
   // they are adjacent in the runs and differ only in their last bytes.
   const auto window_rows = GENERATE(std::size_t{1024}, std::size_t{4096});
   CAPTURE(window_rows);
-  differential_fixture fx;
+  tiers_fixture fx;
   case_layout layout;
   layout.types  = {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::STRING}};
   layout.keys   = {.key_cols        = {1},
@@ -1059,7 +986,7 @@ TEST_CASE("windowed merge handles batches of exactly, just under and just over a
           "[windowed_merge_differential]")
 {
   constexpr std::size_t n = 1024;
-  differential_fixture fx;
+  tiers_fixture fx;
   keyed_runs runs(fx, key_id_payload_layout());
   rng_t rng(5);
   const auto payload = [](std::size_t i) { return "row" + std::to_string(i % 101); };
@@ -1130,7 +1057,7 @@ TEST_CASE("windowed merge of an already sorted dataset", "[windowed_merge_differ
   constexpr std::size_t rows_per_run = 5000;
   const auto window_rows             = GENERATE(std::size_t{1024}, std::size_t{4096});
   const auto order                   = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
-  differential_fixture fx;
+  tiers_fixture fx;
 
   SECTION("runs are consecutive key ranges, in order")
   {
@@ -1171,7 +1098,7 @@ TEST_CASE("windowed merge of a reverse sorted dataset", "[windowed_merge_differe
   constexpr std::size_t rows_per_run = 5000;
   const auto window_rows             = GENERATE(std::size_t{1024}, std::size_t{4096});
   const auto order                   = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
-  differential_fixture fx;
+  tiers_fixture fx;
   keyed_runs runs(fx, key_id_payload_layout(order));
   for (std::size_t r = 0; r < num_runs; ++r) {
     const auto range = order == cudf::order::ASCENDING ? num_runs - 1 - r : r;
@@ -1190,7 +1117,7 @@ TEST_CASE("windowed merge of a dataset with a single distinct key", "[windowed_m
   const auto window_rows = GENERATE(std::size_t{1024}, std::size_t{4096});
   const bool null_key    = GENERATE(false, true);
   CAPTURE(window_rows, null_key);
-  differential_fixture fx;
+  tiers_fixture fx;
   keyed_runs runs(fx, key_id_payload_layout());
   const std::vector<std::size_t> run_rows{7000, 1, 4096, 1024, 9000, 3000, 2};
   for (std::size_t r = 0; r < run_rows.size(); ++r) {

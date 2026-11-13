@@ -1,7 +1,7 @@
 # Sort merge benchmark: `windowed` against `one_shot`
 
-A summary of the measurements taken on 2026-11-13 on the workstation `felipe-TRX50-AERO-D`
-(192.168.0.248) with `sort_merge_bench.py`. No number here comes from the development machine.
+A summary of the measurements taken on 2026-11-13 on a dedicated benchmark workstation (see Setup)
+with `sort_merge_bench.py`.
 The per-run result files (configs, SQL, CSVs, log tails) are not committed; rerun the harness to
 reproduce them ([README.md](README.md)).
 
@@ -15,6 +15,9 @@ reproduce them ([README.md](README.md)).
   faster, by 22–56 %.
 - **On data that fits the GPU** (32 GiB under an 80 GiB limit), `windowed` is 22–29 % slower than
   `one_shot` where `one_shot` finishes; `one_shot` ran out of memory on the other three datasets.
+- **Accepted regression:** the default `auto` mode takes the windowed route on that data too, so
+  a sort that fits the GPU is currently 22–29 % slower by default than `one_shot` (see
+  [Recommendation](#recommendation-one_shot-deprecation)).
 - **Recommendation:** deprecate `one_shot` now and remove it once the conditions in
   [Recommendation](#recommendation-one_shot-deprecation) hold; the speed gap on data that fits
   the GPU is the one not met yet.
@@ -28,8 +31,8 @@ reproduce them ([README.md](README.md)).
 |---|---|
 | Host | x86_64, AMD Ryzen Threadripper 7960X (48 threads), 125 GiB RAM, Ubuntu 24.04 |
 | GPU | One NVIDIA RTX PRO 6000 Blackwell, 97,887 MiB, driver 590.48.01, pinned with `--device 0` |
-| Disk | `/mnt/disk_2` (NVMe), 1,018 GiB free before the run |
-| Code | Commit `8290517a` plus the changes to `src/sirius_context.cpp` and `src/op/sirius_physical_discard_sink.hpp` that were committed later in `a9aaacb5`. The [follow-up measurements](#follow-up-measurements-after-the-integration) ran on the integrated code. Release build, `CUDAARCHS=120-real`. |
+| Disk | One NVMe drive for the spill directory, 1,018 GiB free before the run |
+| Code | This change, for this matrix and for the [follow-up measurements](#follow-up-measurements). Release build, `CUDAARCHS=120-real`. |
 | GPU limit | `sirius.memory.gpu.usage_limit_bytes = 100931731456` (94 GiB; 95 and 96 GiB are rejected as above the device's capacity) |
 | Host cap | `sirius.memory.host.capacity_bytes = 103079215104` (96 GiB) |
 | Data | `--scale 5`: 470 GiB per run, 8,000,000 rows per batch, seed 42 |
@@ -92,9 +95,9 @@ Uncompressed runs moved 489–977 GB to disk for 505 GB of input. The smallest r
 its pool at startup, so the column starts at about the limit plus 0.6 GiB. At this limit it sat
 at 97,250 MiB, the card's size, in every run.
 
-## Follow-up measurements after the integration
+## Follow-up measurements
 
-Same workstation and GPU, on the integrated code, spill compression off.
+Same workstation, GPU and code, spill compression off.
 
 **Data that fits the GPU: 32 GiB under an 80 GiB limit, three repeats** (wall seconds):
 
@@ -106,7 +109,8 @@ Same workstation and GPU, on the integrated code, spill compression off.
 | `few_distinct-strings` | oom ×3 | 14.17 / 14.20 / 14.18 | 14.17 / 14.16 / 14.16 | — |
 | `normal-multikey` | oom ×3 | 6.72 / 6.70 / 6.68 | 6.70 / 6.73 / 6.72 | — |
 
-`auto` took the windowed route almost everywhere and matched its times.
+`auto` took the windowed route almost everywhere and matched its times, including on
+`uniform-1key` and `zipf-1key`, where `one_shot` finishes and is faster.
 
 **Twice the GPU: 160 GiB under an 80 GiB limit, one repeat.** `windowed` and `auto` finished
 `uniform-1key` and `zipf-1key` in about a minute (54–67 s); `one_shot` ran out of memory on both
@@ -127,10 +131,24 @@ Why now: at 5× a whole GPU `one_shot` completed 0 of 10 runs; four failures are
 no memory setting changes; failing runs wrote terabytes to disk before failing; and the default
 `auto` already uses the windowed path under memory pressure.
 
+**Accepted regression in the default mode.** `sort_merge_mode` defaults to `auto`, and `auto`
+currently takes the windowed route on data that fits the GPU: it chooses windowed whenever any
+input of the merge is off the GPU, or the partition plus its output exceed the one-shot
+threshold (`choose_route` in `src/op/merge/merge_config.cpp`). Measured at 32 GiB under an
+80 GiB limit, that is 22–29 % slower than `one_shot` on the two datasets where `one_shot` finishes (3.48 s against 2.69 s on
+`uniform-1key`, 2.74 s against 2.24 s on `zipf-1key`). Before this change `MERGE_SORT` always
+took the one-shot merge, so sorts of that kind are slower by default than they were. This change
+accepts that: on the other three datasets `one_shot` ran out of memory at the same size, where
+`auto` finished. The follow-up that would close it is condition 1 below: let `auto` take the
+one-shot merge when the partition and its output fit the one-shot threshold even if some inputs
+are spilled, or make the windowed merge as fast there. `SET sort_merge_mode = 'one_shot'`
+restores the earlier behaviour for a query until then.
+
 Before removal:
 
 1. **`windowed` within 20 % of `one_shot` wherever `one_shot` completes.** Not met: 22–29 %
-   slower at 32 GiB. Close the gap, or let `auto` use an in-memory merge for data that fits.
+   slower at 32 GiB, which the default `auto` mode pays today (above). Close the gap, or let
+   `auto` use an in-memory merge for data that fits.
 2. **`auto` measured.** Done at two sizes; it follows the windowed route and its times.
 3. **Order check at scale.** Met at 40 GiB with the disk tier and intermediate passes, not at
    470 GiB.

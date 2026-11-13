@@ -24,10 +24,13 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -44,6 +47,7 @@ GIB = 1 << 30
 
 # A stand-in for `sys.executable`: invoked as `<fake> sort_merge_bench.py --_child <job>`.
 # BENCH_FAKE picks the outcome; BENCH_FAKE_LOG (a file) is copied into SIRIUS_LOG_DIR.
+# "hang" never reports; "ok_then_hang" reports and then does not exit (a stuck teardown).
 FAKE_CHILD = """#!{python}
 import json, os, sys, time
 job_path = sys.argv[3]
@@ -53,6 +57,7 @@ seen = {{k: os.environ.get(k) for k in (
     "SIRIUS_CONFIG_FILE", "SIRIUS_LOG_DIR", "SIRIUS_LOG_BACKEND", "SIRIUS_LOG_LEVEL",
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")}}
 seen["argv"] = sys.argv[1:]
+seen["pid"] = os.getpid()
 seen["cwd"] = os.getcwd()
 seen["config_exists"] = os.path.isfile(seen["SIRIUS_CONFIG_FILE"] or "")
 with open(os.path.join(os.path.dirname(job_path), "seen.json"), "w") as f:
@@ -63,7 +68,7 @@ if log_src:
         o.write(f.read())
 mode = os.environ.get("BENCH_FAKE", "ok")
 result = {{"status": "error", "error": "", "wall_s": 1.5, "load_s": 0.25}}
-if mode == "ok":
+if mode in ("ok", "ok_then_hang"):
     result["status"] = "ok"
     result["rows_counted"] = int(os.environ["BENCH_FAKE_ROWS"])
 elif mode == "oom":
@@ -76,6 +81,8 @@ elif mode == "hang":
     time.sleep(120)
 with open(job["result_path"], "w") as f:
     json.dump(result, f)
+if mode == "ok_then_hang":
+    time.sleep(120)
 sys.exit(0 if result["status"] == "ok" else 1)
 """
 
@@ -134,6 +141,12 @@ class Scratch(unittest.TestCase):
         path.write_text(text)
         return str(path)
 
+    def make_log_dir(self, text, name="sirius.log"):
+        log_dir = self.tmp / "log"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / name).write_text(text)
+        return str(log_dir)
+
 
 # -----------------------------------------------------------------------------
 # Datasets, sizing, SQL
@@ -141,7 +154,7 @@ class Scratch(unittest.TestCase):
 
 
 class DatasetTest(unittest.TestCase):
-    def test_five_datasets_in_the_proposal_order(self):
+    def test_five_datasets_in_order(self):
         self.assertEqual(
             list(smb.DATASETS),
             [
@@ -293,7 +306,10 @@ class HelperTest(unittest.TestCase):
 
     def test_bool_and_csv_lists(self):
         self.assertEqual(smb._csv_list(" a, ,b ,"), ["a", "b"])
+        # Duplicates would give two runs one name; the first occurrence keeps its place.
+        self.assertEqual(smb._csv_list("b,a,b, a ,c"), ["b", "a", "c"])
         self.assertEqual(smb._bool_list("True,false"), [True, False])
+        self.assertEqual(smb._bool_list("true,TRUE,false"), [True, False])
         with self.assertRaises(Exception):
             smb._bool_list("true,maybe")
 
@@ -388,7 +404,11 @@ class ConfigTest(Scratch):
         cfg["sirius"]["memory"]["host"]["downgrade_stop_fraction"] = 0.5
         self.assertEqual(smb.host_tier_bytes(cfg), 500)
         self.assertEqual(smb.disk_bytes_needed(400, cfg), 0)
-        self.assertEqual(smb.disk_bytes_needed(2500, cfg), int(2000 * 1.05))
+        # More than the spilled inputs alone: intermediate merge passes spill too.
+        self.assertGreater(smb.DISK_ESTIMATE_FACTOR, 1.05)
+        self.assertEqual(
+            smb.disk_bytes_needed(2500, cfg), int(2000 * smb.DISK_ESTIMATE_FACTOR)
+        )
         # Capacity is capped at the machine's RAM; a fraction applies to RAM.
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         huge = {"sirius": {"memory": {"host": {"capacity_bytes": ram * 10}}}}
@@ -455,6 +475,23 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.compression, [True])
         self.assertEqual((args.scale, args.device, args.repeat), (2.5, 1, 3))
         self.assertTrue(args.validate and args.dry_run)
+
+    def test_duplicate_items_make_one_run_each(self):
+        args = smb.parse_args(
+            [
+                "--gpu-limit-bytes=1000",
+                "--datasets=sequential,sequential",
+                "--modes=windowed,windowed,one_shot",
+                "--compression=true,true",
+            ]
+        )
+        self.assertEqual(args.datasets, ["sequential"])
+        self.assertEqual(args.modes, ["windowed", "one_shot"])
+        self.assertEqual(args.compression, [True])
+        runs, _ = smb.build_matrix(args, {}, "/out", "/spill/root")
+        names = [r["name"] for r in runs]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(set(names)), 2)
 
     def test_fractional_scale_and_all_three_modes(self):
         args = smb.parse_args(
@@ -662,27 +699,65 @@ class CheckResultTest(unittest.TestCase):
 
     def test_validate(self):
         base = {"rows": 10, "rows_counted": 10}
+        checked = {"order_violations": 0, "order_checked": 1, "ranges_checked": 2}
         self.assertEqual(smb.check_result(dict(base), True)[0], "error")
         self.assertEqual(
-            smb.check_result({**base, "discard_rows": 8, "order_violations": 0}, True)[
-                0
-            ],
+            smb.check_result({**base, **checked, "discard_rows": 8}, True)[0],
             "row_mismatch",
         )
         self.assertEqual(
-            smb.check_result({**base, "discard_rows": 10, "order_violations": 3}, True)[
-                0
-            ],
+            smb.check_result(
+                {**base, **checked, "discard_rows": 10, "order_violations": 3}, True
+            )[0],
             "order_violation",
         )
         self.assertEqual(
-            smb.check_result({**base, "discard_rows": 10, "order_violations": 0}, True),
+            smb.check_result({**base, **checked, "discard_rows": 10}, True),
             ("ok", ""),
         )
         # Without --validate the sink line is not required.
         self.assertEqual(
             smb.check_result({**base, "discard_rows": 3}, False), ("ok", "")
         )
+
+    def test_validate_requires_that_the_order_was_checked(self):
+        base = {"rows": 10, "rows_counted": 10, "discard_rows": 10}
+        unchecked = [
+            # A sink line without the keys: zero violations alone prove nothing.
+            {"order_violations": 0},
+            {"order_violations": 0, "order_checked": None, "ranges_checked": None},
+            # The planner turned check_order off.
+            {"order_violations": 0, "order_checked": 0, "ranges_checked": 0},
+            # Checking was on but nothing was compared.
+            {"order_violations": 0, "order_checked": 1, "ranges_checked": 0},
+            {"order_violations": 0, "order_checked": 1},
+            # Two sinks, one of them unchecked, whatever way they are combined.
+            {"order_violations": 0, "order_checked": 2, "ranges_checked": 4},
+        ]
+        for sink in unchecked:
+            with self.subTest(sink=sink):
+                status, err = smb.check_result({**base, **sink}, True)
+                self.assertEqual(status, "order_unchecked")
+                self.assertIn("--validate", err)
+        # An empty result has no ranges to compare.
+        empty = {"rows": 0, "rows_counted": 0, "discard_rows": 0}
+        self.assertEqual(
+            smb.check_result(
+                {
+                    **empty,
+                    "order_violations": 0,
+                    "order_checked": 1,
+                    "ranges_checked": 0,
+                },
+                True,
+            ),
+            ("ok", ""),
+        )
+        # Not required without --validate.
+        self.assertEqual(
+            smb.check_result({**base, "order_checked": 0}, False), ("ok", "")
+        )
+        self.assertNotIn("order_unchecked", smb.ONE_SHOT_EXPECTED)
 
 
 class ClassifyFailureTest(unittest.TestCase):
@@ -693,31 +768,38 @@ class ClassifyFailureTest(unittest.TestCase):
             "rmm out_of_memory",
             "query failed: OOM",
         ):
-            self.assertEqual(smb.classify_failure(err, ""), "oom", err)
-        self.assertEqual(smb.classify_failure("BinderException: nope", ""), "error")
+            self.assertEqual(smb.classify_failure(err, []), "oom", err)
+        self.assertEqual(smb.classify_failure("BinderException: nope", []), "error")
         # Words that merely contain "oom" are not OOM.
         self.assertEqual(
-            smb.classify_failure("no room in the bloom filter", ""), "error"
+            smb.classify_failure("no room in the bloom filter", []), "error"
         )
 
     def test_log_only_consulted_without_error_text(self):
-        log = "line\n" * 10 + "fatal: out of memory\n"
+        log = ["line"] * 10 + ["fatal: out of memory"]
         self.assertEqual(smb.classify_failure("", log), "oom")
         self.assertEqual(smb.classify_failure("Binder", log), "error")
-        old = "out of memory\n" + "x\n" * 60
+        old = ["out of memory"] + ["x"] * smb.OOM_TAIL_LINES
         self.assertEqual(smb.classify_failure("", old), "error")
-        self.assertEqual(smb.classify_failure("", ""), "error")
+        self.assertEqual(smb.classify_failure("", []), "error")
 
 
-class CollectMetricsTest(Scratch):
+class ScanRunLogTest(Scratch):
+    def scan(self, text, tail_lines=5, **kwargs):
+        return smb.scan_run_log(
+            self.make_log_dir(text), bench_metrics, tail_lines, **kwargs
+        )
+
     def test_fixture_log(self):
-        out = smb.collect_metrics(fixture_log(), bench_metrics)
+        out, tail, error = self.scan(fixture_log())
+        self.assertIsNone(error)
         # The discard-sink fixture carries one more merge_sort stats line (op 7 again).
         stats = bench_metrics.parse_merge_sort_stats(fixture_log())
         self.assertEqual(out["merge_sort_operators"], len(stats))
         for key, value in bench_metrics.sum_merge_sort_stats(stats).items():
             self.assertEqual(out[key], value, key)
         totals = bench_metrics.parse_downgrade_totals(fixture_log())
+        self.assertGreater(totals.requests, 0)
         self.assertEqual(out["spill_bytes_host"], totals.to_host_bytes)
         self.assertEqual(out["spill_bytes_disk"], totals.to_disk_bytes)
         self.assertEqual(out["spill_batches_host"], totals.to_host_batches)
@@ -729,26 +811,117 @@ class CollectMetricsTest(Scratch):
         self.assertEqual(out["discard_rows"], 1500300)
         self.assertEqual(out["discard_bytes"], 12002400)
         self.assertEqual(out["order_violations"], 0)
+        self.assertEqual(tail, fixture_log().splitlines()[-5:])
 
-    def test_empty_log(self):
-        out = smb.collect_metrics("", bench_metrics)
-        self.assertEqual(out["merge_sort_operators"], 0)
-        self.assertEqual(out["oom_retries"], 0)
-        self.assertEqual(out["spill_bytes_disk"], 0)
-        self.assertNotIn("discard_rows", out)
+    def test_a_log_read_in_many_pieces_gives_the_same_metrics(self):
+        text = fixture_log() * 3
+        whole = self.scan(text, tail_lines=7)
+        # A piece per line or two: every parser sees the log split at line boundaries.
+        with mock.patch.object(
+            smb.LogMetrics, "feed", autospec=True, side_effect=smb.LogMetrics.feed
+        ) as feed:
+            pieces = self.scan(text, tail_lines=7, chunk_bytes=1)
+        self.assertEqual(feed.call_count, len(text.splitlines()))
+        self.assertEqual(pieces, whole)
+        self.assertGreater(whole[0]["downgrade_requests"], 0)
+        self.assertGreater(whole[0]["oom_retries"], 0)
+        self.assertEqual(whole[0]["discard_rows"], 3 * 1500300)
 
-    def test_read_run_log_concatenates_sirius_files_by_mtime(self):
+    def test_discard_keys_come_from_whatever_the_parser_returns(self):
+        sink = {
+            "rows": 7,
+            "bytes": 56,
+            "order_violations": 0,
+            "order_checked": 1,
+            "ranges_checked": 3,
+        }
+        mod = fake_bench_metrics()
+        mod.parse_discard_sink = lambda text: dict(sink) if text else None
+        log_dir = self.make_log_dir("[discard_sink] anything\n")
+        out, _, error = smb.scan_run_log(log_dir, mod, 5)
+        self.assertIsNone(error)
+        self.assertEqual(out["discard_rows"], 7)
+        self.assertEqual(out["order_checked"], 1)
+        self.assertEqual(out["ranges_checked"], 3)
+        # A parser (or a sink line) without the new keys: recorded as not checked.
+        del sink["order_checked"], sink["ranges_checked"]
+        out, _, _ = smb.scan_run_log(log_dir, mod, 5)
+        self.assertIsNone(out["order_checked"])
+        self.assertIsNone(out["ranges_checked"])
+        self.assertEqual(
+            smb.check_result({**out, "rows": 7, "rows_counted": 7}, True)[0],
+            "order_unchecked",
+        )
+
+    def test_empty_and_missing_log(self):
+        for log_dir in (self.make_log_dir(""), str(self.tmp / "nope")):
+            out, tail, error = smb.scan_run_log(log_dir, bench_metrics, 5)
+            self.assertIsNone(error)
+            self.assertEqual(out["merge_sort_operators"], 0)
+            self.assertEqual(out["oom_retries"], 0)
+            self.assertEqual(out["spill_bytes_disk"], 0)
+            self.assertNotIn("discard_rows", out)
+            self.assertEqual(tail, [])
+
+    def test_a_parsing_failure_keeps_the_tail(self):
+        mod = fake_bench_metrics()
+        mod.count_oom_retries = mock.Mock(side_effect=ValueError("bad line"))
+        out, tail, error = smb.scan_run_log(self.make_log_dir("a\nb\n"), mod, 5)
+        self.assertEqual(out, {})
+        self.assertEqual(error, "ValueError: bad line")
+        self.assertEqual(tail, ["a", "b"])
+
+    def test_log_files_are_read_oldest_first_and_half_lines_dropped(self):
         log_dir = self.tmp / "log"
         log_dir.mkdir()
-        (log_dir / "sirius_b.log").write_text("second\n")
+        (log_dir / "sirius_b.log").write_text("second\nhalf a li")
         (log_dir / "sirius_a.log").write_text("first\n")
         (log_dir / "other.txt").write_text("ignored\n")
         os.utime(log_dir / "sirius_a.log", (1000, 1000))
         os.utime(log_dir / "sirius_b.log", (2000, 2000))
         self.assertEqual(
-            smb.read_run_log(str(log_dir), bench_metrics), "first\nsecond\n"
+            list(smb.iter_run_log_chunks(str(log_dir))), [["first\n"], ["second\n"]]
         )
-        self.assertEqual(smb.read_run_log(str(self.tmp / "nope"), bench_metrics), "")
+        _, tail, _ = smb.scan_run_log(str(log_dir), bench_metrics, 1)
+        self.assertEqual(tail, ["second"])
+        self.assertEqual(list(smb.iter_run_log_chunks(str(self.tmp / "nope"))), [])
+
+    def test_chunks_are_bounded(self):
+        log_dir = self.make_log_dir("".join(f"line {i:04d}\n" for i in range(100)))
+        chunks = list(smb.iter_run_log_chunks(log_dir, chunk_bytes=95))
+        self.assertEqual(sum(len(c) for c in chunks), 100)
+        self.assertEqual({len(c) for c in chunks}, {10})  # 10 bytes a line
+
+
+class SpillDirSamplerTest(Scratch):
+    def test_dir_bytes(self):
+        root = self.tmp / "spill"
+        self.assertEqual(smb._dir_bytes(str(root)), 0)  # missing
+        (root / "a" / "b").mkdir(parents=True)
+        (root / "x.bin").write_bytes(b"1" * 100)
+        (root / "a" / "b" / "y.bin").write_bytes(b"2" * 23)
+        self.assertEqual(smb._dir_bytes(str(root)), 123)
+
+    def test_peak_outlives_the_files(self):
+        root = self.tmp / "spill"
+        root.mkdir()
+        sampler = smb.SpillDirSampler(str(root), interval_s=0.01)
+        self.assertIsNone(sampler.stop())  # never started
+        (root / "run.bin").write_bytes(b"1" * 4096)
+        sampler.start()
+        deadline = time.monotonic() + 10
+        while not sampler._peak and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (root / "run.bin").unlink()
+        self.assertEqual(sampler.stop(), 4096)
+
+    def test_a_last_sample_is_taken_at_stop(self):
+        root = self.tmp / "spill"
+        root.mkdir()
+        sampler = smb.SpillDirSampler(str(root), interval_s=60)
+        sampler.start()
+        (root / "late.bin").write_bytes(b"1" * 10)
+        self.assertEqual(sampler.stop(), 10)
 
 
 # -----------------------------------------------------------------------------
@@ -919,6 +1092,7 @@ class ExecuteRunTest(Scratch):
         self.assertEqual(row["wall_s"], 1.5)
         self.assertEqual(row["load_s"], 0.25)
         self.assertEqual(row["peak_gpu_mib"], 1234)
+        self.assertEqual(row["peak_spill_disk_bytes"], 0)  # the fake spills nothing
         self.assertEqual(row["discard_rows"], 1500300)
         self.assertEqual(
             row["oom_retries"], bench_metrics.count_oom_retries(fixture_log())
@@ -930,6 +1104,7 @@ class ExecuteRunTest(Scratch):
         self.assertTrue(seen["config_exists"])
         self.assertEqual(seen["SIRIUS_LOG_DIR"], str(run_dir / "log"))
         self.assertEqual(seen["SIRIUS_LOG_BACKEND"], "spdlog")
+        self.assertEqual(seen["SIRIUS_LOG_LEVEL"], "info")
         # The GPU is pinned by the index nvidia-smi (the sampler) uses: PCI bus order.
         self.assertEqual(seen["CUDA_VISIBLE_DEVICES"], "3")
         self.assertEqual(seen["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
@@ -949,7 +1124,7 @@ class ExecuteRunTest(Scratch):
         self.assertEqual(json.loads((run_dir / "row.json").read_text())["status"], "ok")
         self.assertFalse(os.path.exists(run["spill_dir"]))
         self.assertFalse((run_dir / "log").exists())
-        # The names .gitignore does not hide, and no error file for an ok run (the fixture
+        # Child stdout avoids the git-ignored *output.txt name; no error file for an ok run (the fixture
         # log does hold warnings and an error).
         self.assertTrue((run_dir / "child_stdout.txt").is_file())
         self.assertFalse((run_dir / "child_output.txt").exists())
@@ -973,6 +1148,42 @@ class ExecuteRunTest(Scratch):
         row = self.execute(run, args, "ok", "nothing here\n")
         self.assertEqual(row["status"], "error")
         self.assertIn("discard_sink", row["error"])
+
+    def execute_with_sink(self, run, args, sink):
+        """An ok run whose log's discard-sink line parses to `sink`."""
+        mod = fake_bench_metrics()
+        mod.parse_discard_sink = lambda text: dict(sink) if text else None
+        with mock.patch(f"{__name__}.fake_bench_metrics", return_value=mod):
+            return self.execute(run, args, "ok", "[discard_sink] stand-in\n")
+
+    def test_validate_passes_when_the_sink_checked_the_order(self):
+        args, run = self.make_run(["--validate"])
+        sink = {
+            "rows": run["row"]["rows"],
+            "bytes": 1,
+            "order_violations": 0,
+            "order_checked": 1,
+            "ranges_checked": 4,
+        }
+        row = self.execute_with_sink(run, args, sink)
+        self.assertEqual((row["status"], row["error"]), ("ok", ""))
+        self.assertEqual((row["order_checked"], row["ranges_checked"]), (1, 4))
+
+    def test_validate_fails_when_the_order_check_did_not_run(self):
+        args, run = self.make_run(["--validate"])
+        rows = run["row"]["rows"]
+        for extra in (
+            {},  # a sink line without the keys
+            {"order_checked": 0, "ranges_checked": 0},  # the planner disabled it
+            {"order_checked": 1, "ranges_checked": 0},
+        ):
+            with self.subTest(extra=extra):
+                sink = {"rows": rows, "bytes": 1, "order_violations": 0, **extra}
+                row = self.execute_with_sink(run, args, sink)
+                self.assertEqual(row["status"], "order_unchecked")
+                self.assertIn("--validate", row["error"])
+                first = Path(run["run_dir"]) / "sirius_log_first_errors.txt"
+                self.assertTrue(first.is_file())
 
     def test_oom(self):
         args, run = self.make_run()
@@ -1047,6 +1258,37 @@ class ExecuteRunTest(Scratch):
         self.assertGreaterEqual(row["wall_s"], 1.0)
         self.assertFalse(os.path.exists(run["spill_dir"]))
 
+    def test_result_survives_a_teardown_that_hangs(self):
+        # The child reported `ok` and then never exited: killed after the grace
+        # period, not after --timeout-s, and the measurement is kept.
+        args, run = self.make_run(["--timeout-s=600"])
+        started = time.monotonic()
+        with mock.patch.object(smb, "TEARDOWN_GRACE_S", 0.3), mock.patch.object(
+            smb, "RESULT_POLL_S", 0.1
+        ):
+            row = self.execute(run, args, "ok_then_hang", fixture_log())
+        self.assertLess(time.monotonic() - started, 100)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["wall_s"], 1.5)
+        self.assertEqual(row["rows_counted"], 625000)
+        self.assertIn("did not exit within 0.3 s and was killed", row["error"])
+        seen = json.loads((Path(run["run_dir"]) / "seen.json").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(seen["pid"], 0)
+
+    def test_result_survives_a_timeout_during_teardown(self):
+        args, run = self.make_run(["--timeout-s=1"])
+        row = self.execute(run, args, "ok_then_hang")
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["wall_s"], 1.5)
+        self.assertIn("did not exit within --timeout-s 1.0", row["error"])
+        # The recorded result is still checked.
+        args, run = self.make_run(["--timeout-s=1"])
+        shutil.rmtree(run["run_dir"], ignore_errors=True)
+        row = self.execute(run, args, "ok_then_hang", BENCH_FAKE_ROWS="5")
+        self.assertEqual(row["status"], "row_mismatch")
+        self.assertIn("was killed", row["error"])
+
     def test_timeout_keeps_the_metrics_its_log_holds(self):
         # What a killed run has logged: spill and retry lines, no statistics, no sink line.
         text = (FIXTURES / "downgrade.log").read_text()
@@ -1100,8 +1342,11 @@ class RunChildTest(Scratch):
             import duckdb  # noqa: F401
         except ImportError:
             self.skipTest("duckdb Python package not installed")
-        # A built-in extension stands in for Sirius; the "COPY" returns one count row.
-        job, result_path = self.job("parquet", "SELECT 42", ["SET threads = 2"])
+        # A built-in extension stands in for Sirius; the query stands in for the COPY, whose one row
+        # is the count. It reads the setting back, so it is 42 only if the settings were executed.
+        job, result_path = self.job(
+            "parquet", "SELECT current_setting('threads') * 21", ["SET threads = 2"]
+        )
         self.assertEqual(smb.run_child(job), 0)
         result = json.loads(result_path.read_text())
         self.assertEqual(result["status"], "ok")
@@ -1241,6 +1486,17 @@ class MainTest(Scratch):
         self.assertEqual(rc, 1)
         self.assertIn("FAILED: sequential mode=auto compression=false", out)
 
+    def test_one_shot_wrong_result_fails_the_harness(self):
+        rc, out = self.run_main(
+            ["--datasets=sequential", "--modes=one_shot"], BENCH_FAKE_ROWS="5"
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("FAILED: sequential mode=one_shot", out)
+        self.assertEqual({r["status"] for r in self.read_csv()}, {"row_mismatch"})
+
+    def test_only_expected_one_shot_outcomes_are_exempt(self):
+        self.assertEqual(smb.ONE_SHOT_EXPECTED, {"oom", "error", "timeout", "crashed"})
+
     def test_one_shot_failure_is_not_a_harness_failure(self):
         rc, out = self.run_main(
             ["--datasets=sequential", "--modes=one_shot"], fake="oom"
@@ -1300,6 +1556,63 @@ class MainTest(Scratch):
             rc, _ = self.run_main(argv + ["--skip-disk-check"])
         self.assertEqual(rc, 0)
 
+    def test_sigterm_kills_the_child_and_cleans_up(self):
+        seen_path = (
+            self.tmp
+            / "out"
+            / "per_run"
+            / "sequential__windowed__uncompressed__r1"
+            / "seen.json"
+        )
+
+        def terminate_once_the_child_runs():
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                try:
+                    json.loads(seen_path.read_text())
+                    break
+                except (OSError, ValueError):
+                    time.sleep(0.02)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        for sig in smb.TERMINATION_SIGNALS:
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        before = {sig: signal.getsignal(sig) for sig in smb.TERMINATION_SIGNALS}
+        killer = threading.Thread(target=terminate_once_the_child_runs)
+        killer.start()
+        self.addCleanup(killer.join)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main(
+                [
+                    "--datasets=sequential",
+                    "--modes=windowed",
+                    "--compression=false",
+                    "--timeout-s=60",
+                ],
+                fake="hang",
+            )
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+        # The child (its own session, so the signal never reached it) is gone, and so is the spill.
+        pid = json.loads(seen_path.read_text())["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(list((self.tmp / "spill").iterdir()), [])
+        self.assertEqual(
+            {sig: signal.getsignal(sig) for sig in smb.TERMINATION_SIGNALS}, before
+        )
+
+    def test_sighup_is_handled_like_sigterm(self):
+        self.assertIn(signal.SIGHUP, smb.TERMINATION_SIGNALS)
+        self.assertIn(signal.SIGTERM, smb.TERMINATION_SIGNALS)
+        for sig in smb.TERMINATION_SIGNALS:
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        with self.assertRaises(SystemExit) as ctx:
+            smb._exit_on_signal(signal.SIGHUP, None)
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGHUP)
+        # A second signal must not interrupt the cleanup the first one started.
+        for sig in smb.TERMINATION_SIGNALS:
+            self.assertEqual(signal.getsignal(sig), signal.SIG_IGN)
+
     def test_missing_extension(self):
         argv = [
             "sort_merge_bench.py",
@@ -1345,14 +1658,14 @@ class DryRunCliTest(Scratch):
         self.assertEqual(out.count("SET sort_merge_mode = 'one_shot'"), 10)
         self.assertEqual(out.count("SET spill_compression = true"), 10)
         for name in smb.DATASETS:
-            self.assertIn(f"===== [", out)
+            self.assertIn(f"{name}__one_shot__uncompressed__r1 =====", out)
             self.assertIn(f"{name}__windowed__compressed__r1 =====", out)
         self.assertIn("Dry run: nothing was executed", out)
         # Nothing is created and no extension is needed.
         self.assertFalse(out_dir.exists())
         self.assertFalse(spill.exists())
 
-    def test_dry_run_of_the_fits_the_gpu_matrix(self):
+    def test_dry_run_of_a_matrix_that_fits_the_gpu(self):
         proc = subprocess.run(
             [
                 sys.executable,

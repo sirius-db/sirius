@@ -18,12 +18,12 @@
 
 // Internal to the generator: included by generator_batch.cu, generator_strings.cu and their
 // tests. The hash helpers define the generator's determinism; changing them changes every
-// generated value.
+// generated value. The public entry point, generate_batch, is declared in generator_batch.hpp.
 
+#include "op/scan/generator/generator_batch.hpp"
 #include "op/scan/generator/generator_spec.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -37,7 +37,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace sirius::op::scan::generator::detail {
 
@@ -146,27 +145,3 @@ std::unique_ptr<cudf::column> format_varchar(cudf::device_span<const std::int64_
                                              rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::scan::generator::detail
-
-namespace sirius::op::scan::generator {
-
-/// Generates batch `batch_index`: columns in spec order; INTEGER -> INT32, BIGINT -> INT64,
-/// DOUBLE -> FLOAT64, VARCHAR -> STRING via detail::format_varchar. Defined in
-/// generator_batch.cu.
-/// @throws std::out_of_range if batch_index >= spec.num_batches.
-std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
-                                            std::uint64_t batch_index,
-                                            rmm::cuda_stream_view stream,
-                                            rmm::device_async_resource_ref mr);
-
-/// Generates only `output_columns` of batch `batch_index`, in the order given. Each entry is an
-/// index into `spec.columns` and is also the column index the values are hashed with, so every
-/// output column is identical to that column of the full batch; the other columns are never
-/// drawn. Defined in generator_batch.cu.
-/// @throws std::out_of_range if batch_index >= spec.num_batches or an entry is not a spec column.
-std::unique_ptr<cudf::table> generate_batch(const generator_spec& spec,
-                                            const std::vector<std::size_t>& output_columns,
-                                            std::uint64_t batch_index,
-                                            rmm::cuda_stream_view stream,
-                                            rmm::device_async_resource_ref mr);
-
-}  // namespace sirius::op::scan::generator

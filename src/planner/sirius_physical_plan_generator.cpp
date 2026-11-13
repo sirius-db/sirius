@@ -2501,15 +2501,15 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 namespace {
 
 //! The order check of a discard sink placed on @p root: the ORDER BY keys as columns of @p root's
-//! output. The check is left off (and the reason logged) when @p root is not an ORDER BY, or a
-//! key is an expression or a column the ORDER BY does not output.
+//! output. The check is left off (and the reason logged at WARN, since the user asked for it)
+//! when @p root is not an ORDER BY, or a key is an expression or a column the ORDER BY does not
+//! output. The sink then reports `order_checked=0`.
 sirius::op::discard_sink_options discard_order_check(
   const sirius::op::sirius_physical_operator& root)
 {
   if (root.type != sirius::op::SiriusPhysicalOperatorType::ORDER_BY) {
-    SIRIUS_LOG_DEBUG(
-      "sirius_discard: check_order disabled, the query's root is {} and not ORDER BY",
-      sirius::op::SiriusPhysicalOperatorToString(root.type));
+    SIRIUS_LOG_WARN("sirius_discard: check_order disabled, the query's root is {} and not ORDER BY",
+                    sirius::op::SiriusPhysicalOperatorToString(root.type));
     return {};
   }
   auto const& order = root.Cast<sirius::op::sirius_physical_order>();
@@ -2526,7 +2526,7 @@ sirius::op::discard_sink_options discard_order_check(
       }
     }
     if (!output_column) {
-      SIRIUS_LOG_DEBUG(
+      SIRIUS_LOG_WARN(
         "sirius_discard: check_order disabled, ORDER BY key {} is not a column of the output",
         key.expression->ToString());
       return {};

@@ -246,21 +246,33 @@ memory by its windows, not by the partition.
 
 `windowed_merge_input` is not a `pipelineable_operator_data`: nothing is uploaded for it and its
 `bytes_to_materialize_input` is 0. Its `get_estimated_size_in_bytes()` is
-`merge::estimate_task_bytes()`, and `sirius_physical_merge_sort::no_history_peak_memory_estimate()`
-returns that same value for a `WINDOWED_MERGE` input, so the reservation and the memory-history
-basis are the task's window working set:
+`merge::estimate_task_bytes()` plus `merge::estimate_reader_state_bytes()`, and
+`sirius_physical_merge_sort::no_history_peak_memory_estimate()` returns that same value for a
+`WINDOWED_MERGE` input, so the reservation and the memory-history basis are the task's window
+working set:
 
 ```
-estimate_task_bytes = 2 × (k − g) × n × w     // two window-buffer slots per run that is not on the GPU
+estimate_task_bytes = 2 × (k − g) × n × w     // two window-buffer slots per run that is not sliced in place
                     + n × (w + 8)             // one round of gathered output rows + its gather map
                     + k × n × key_w           // key columns of every run's window
                     + 2 × output_target_bytes // accumulated rounds + the concatenated chunk
                     + largest fallback batch  // only when a batch has no row-range reader
+
+estimate_reader_state_bytes = c × (cols × 16 × (n + 2048)  // decode scratch per fetched column
+                                   + str_cols × 2 MiB)     // offsets scratch per STRING column
 ```
 
-`k` is the number of runs the task reads, `g` how many of them are entirely on the GPU tier (they
-are windowed in place), `n` is `window_rows`, `w` the estimated row width of the fetched columns and
-`key_w` that of the key columns. The arithmetic saturates. `n` and `output_target_bytes` are the
+`k` is the number of runs the task reads, `g` how many of them consist only of uncompressed GPU
+tables (they are windowed in place; a compressed batch on the GPU is read into a window buffer
+like a host or disk batch), `n` is `window_rows`, `w` the estimated row width of the fetched
+columns and `key_w` that of the key columns. `c` is the number of runs that hold a
+Simpatico-compressed batch, `cols` the number of fetched columns and `str_cols` how many of them
+are STRING: a compressed run is read through one decode cursor per fetched column, which keeps its
+scratch between refills. The dictionary keys a cursor also keeps depend on the data and are not
+estimated. The fallback term counts a batch whose representation has no registered reader, or a
+compressed batch whose header cannot be read. A compressed batch that its reader refuses only at
+read time (see [Row-Range Readers](#row-range-readers)) is converted too, but is not in the
+estimate. The arithmetic saturates. `n` and `output_target_bytes` are the
 task's current values, so the estimate drops after a
 [shrink](#shrink-before-retry). See [Sort Merge](configuration.md#sort-merge) for how `n` and the
 output target are derived.
@@ -290,8 +302,8 @@ The runs of a windowed partition stay in the operator's input repository for the
 ### Row-Range Readers
 
 `sirius::row_range_reader_registry` is the process-wide accessor of cuCascade's
-`row_range_reader_registry`, initialized with the builtin readers when the extension is loaded
-(`SiriusContext::row_range_readers()` returns the same registry). A reader appends rows
+`row_range_reader_registry`, initialized with cuCascade's builtin readers and the Simpatico
+compressed readers when the extension is loaded. A reader appends rows
 `[row_begin, row_begin + k)` of the requested columns of a batch to caller-owned device buffers,
 without materializing the batch on the GPU. The reader contract is in
 `cucascade/include/cucascade/data/row_range_read.hpp`.
@@ -301,11 +313,12 @@ without materializing the batch on the GPU. The reader contract is in
 | `gpu_table_representation` | yes (the source must be on the device of the stream) |
 | `host_data_representation` | yes |
 | `disk_data_representation` | yes, through the source memory space's I/O backend |
-| `host_data_packed_representation`, Simpatico-compressed representations | no |
+| `host_data_packed_representation` | no |
+| `compressed_device_representation`, `compressed_host_representation`, `compressed_disk_representation` (Simpatico) | yes, by chunk-span decode (`src/compression/compressed_row_range_readers.hpp`); a projection or filtered view, a device batch without a table, or a column plan that is not chunk-decodable throws `row_range_unsupported_error` |
 
 Readers serve fixed-width and STRING columns. LIST, STRUCT and DICTIONARY32 columns throw
-`row_range_unsupported_error`. A batch with no reader is converted once to the GPU by the merge
-(the convert-once fallback).
+`row_range_unsupported_error`. A batch with no reader, or whose reader throws that error, is
+converted once to the GPU by the merge (the convert-once fallback).
 
 **Per-refill locking.** The merger takes a read lock on a non-GPU batch only for the duration of
 one refill (`cucascade::read_rows_into`, which orders the stream after the batch's writer and

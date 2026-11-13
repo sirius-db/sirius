@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright 2025, Sirius Contributors.
+# Copyright 2026, Sirius Contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -20,7 +20,6 @@ prefix (timestamp, level, thread) does not matter. Lines that do not parse are i
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import threading
@@ -53,7 +52,11 @@ _OOM_REASON_RE = re.compile(
     r"\bOOM\b|out of memory|out_of_memory|bad_alloc", re.IGNORECASE
 )
 
-_DISCARD_SINK_KEYS = ("rows", "bytes", "order_violations")
+# src/op/sirius_physical_discard_sink.cpp logs "[discard_sink] rows={} bytes={} order_violations={}"
+# followed by further key=value tokens. A line needs these three; the others are read when present.
+_DISCARD_SINK_REQUIRED_KEYS = ("rows", "bytes", "order_violations")
+# 1 when the sink compared its output's order. Over several sinks it is 1 only if all of them did.
+_DISCARD_SINK_ORDER_CHECKED_KEY = "order_checked"
 
 # spdlog line: "[<timestamp>] [<level>] [<thread or file:line>] <message>". The levels kept by
 # first_problem_lines; spdlog's other names are trace, debug and info.
@@ -157,19 +160,28 @@ def count_oom_retries(log_text: str) -> int:
 
 
 def parse_discard_sink(log_text: str) -> dict[str, int] | None:
-    """Returns rows, bytes and order_violations of the '[discard_sink] ...' line.
+    """Returns every key=value of the '[discard_sink] rows=… bytes=… order_violations=… ...' line.
 
-    With several such lines (one per sink) the values are summed; None if there is none.
+    A line without rows, bytes or order_violations is ignored; keys after those three
+    (order_checked, ranges_checked) are returned when the line has them. With several such lines
+    (one per sink) the values are summed, except order_checked, which is 1 only if every line
+    says 1. None if there is no such line.
     """
     totals: dict[str, int] | None = None
     for remainder in _tagged_remainders(log_text, DISCARD_SINK_TAG):
         values = _parse_key_values(remainder)
-        if values is None or any(key not in values for key in _DISCARD_SINK_KEYS):
+        if values is None or any(
+            key not in values for key in _DISCARD_SINK_REQUIRED_KEYS
+        ):
             continue
         if totals is None:
-            totals = dict.fromkeys(_DISCARD_SINK_KEYS, 0)
-        for key in _DISCARD_SINK_KEYS:
-            totals[key] += values[key]
+            totals = values
+            continue
+        for key in totals.keys() | values.keys():
+            if key == _DISCARD_SINK_ORDER_CHECKED_KEY:
+                totals[key] = min(totals.get(key, 0), values.get(key, 0))
+            else:
+                totals[key] = totals.get(key, 0) + values.get(key, 0)
     return totals
 
 
@@ -209,94 +221,74 @@ def first_problem_lines(
     return kept
 
 
-class LogTail:
-    """Remembers a file offset; read_new() returns text appended since the last call (handles a missing file).
-
-    Only complete lines are returned: a trailing line still being written stays in the file for
-    the next call, so a parser never sees half a line. A file that shrank (truncated or replaced)
-    is read again from its start.
-    """
-
-    def __init__(self, path: str):
-        self._path = path
-        self._offset = 0
-
-    def read_new(self) -> str:
-        try:
-            with open(self._path, "rb") as log_file:
-                size = os.fstat(log_file.fileno()).st_size
-                if size < self._offset:
-                    self._offset = 0
-                log_file.seek(self._offset)
-                data = log_file.read()
-        except OSError:
-            return ""
-        end = data.rfind(b"\n") + 1
-        self._offset += end
-        return data[:end].decode("utf-8", errors="replace")
-
-
 class GpuMemorySampler:
-    """Background thread polling `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i <index>`
-    every interval_s; stop() returns the peak in MiB (None if nvidia-smi is unavailable).
+    """Keeps the highest `memory.used` printed by one long-lived
+    `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i <index> --loop-ms=<ms>`
+    process; stop() ends it and returns the peak in MiB (None if nvidia-smi is unavailable).
     """
 
-    def __init__(self, device_index: int, interval_s: float = 0.2):
+    def __init__(self, device_index: int, interval_s: float = 1.0):
         self._device_index = device_index
         self._interval_s = interval_s
         self._peak_mib: int | None = None
-        self._stop_event = threading.Event()
+        self._first_line = threading.Event()
+        self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._process is not None:
             return
         self._peak_mib = None
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="gpu-memory-sampler", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> int | None:
-        if self._thread is not None:
-            self._stop_event.set()
-            self._thread.join()
-            self._thread = None
-        return self._peak_mib
-
-    def _run(self) -> None:
-        while True:
-            used_mib = self._sample()
-            if used_mib is not None and (
-                self._peak_mib is None or used_mib > self._peak_mib
-            ):
-                self._peak_mib = used_mib
-            # Checked after the sample so that the last sample is taken at stop().
-            if self._stop_event.is_set():
-                return
-            self._stop_event.wait(self._interval_s)
-
-    def _sample(self) -> int | None:
+        self._first_line.clear()
         try:
-            result = subprocess.run(
+            self._process = subprocess.Popen(
                 [
                     "nvidia-smi",
                     "--query-gpu=memory.used",
                     "--format=csv,noheader,nounits",
                     "-i",
                     str(self._device_index),
+                    f"--loop-ms={max(1, round(self._interval_s * 1000))}",
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=10,
-                check=False,
             )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if result.returncode != 0:
-            return None
-        try:
-            return int(result.stdout.split()[0])
-        except (IndexError, ValueError):
-            return None
+        except OSError:
+            return
+        self._thread = threading.Thread(
+            target=self._read, args=(self._process.stdout,), name="gpu-memory-sampler"
+        )
+        self._thread.daemon = True
+        self._thread.start()
+
+    def stop(self) -> int | None:
+        if self._process is not None:
+            # nvidia-smi prints its first sample when it starts; wait for it so that a run
+            # shorter than the interval still has one.
+            self._first_line.wait(timeout=10)
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+            self._thread.join()
+            self._process.stdout.close()
+            self._process = None
+            self._thread = None
+        return self._peak_mib
+
+    def _read(self, stdout) -> None:
+        for line in stdout:
+            try:
+                used_mib = int(line.split()[0])
+            except (IndexError, ValueError):
+                used_mib = None
+            if used_mib is not None and (
+                self._peak_mib is None or used_mib > self._peak_mib
+            ):
+                self._peak_mib = used_mib
+            self._first_line.set()
+        # The process ended (or never printed): stop() must not wait for a sample.
+        self._first_line.set()

@@ -69,7 +69,9 @@ struct merge_sort_counters {
  *    when the partition has more runs than the fan-in cap, writes an intermediate run back into
  *    the partition) and schedules the operator again. The tasks of a chain share one merger,
  *    kept in the partition's state between them, so rows a task read into a window but did not
- *    emit are not read again by the next one.
+ *    emit are not read again by the next one. The window buffers of a kept merger stay
+ *    allocated between two tasks, outside any reservation; the next task's estimate leaves them
+ *    out, and on_finalize_operator() frees them.
  */
 class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
@@ -120,6 +122,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::string_view port_id) const override;
 
   /// A windowed task needs its window working set, which is already what its input reports.
+  /// With history, gpu_pipeline_task keeps the reservation at or above that working set.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -182,6 +185,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   /// Logs the statistics line if no task commit has: an operator with no input, or one whose
   /// pipeline finished before its last task committed (a LIMIT downstream), still logs one line.
+  /// Frees the mergers the partitions keep between tasks, and with them their window buffers; a
+  /// task that commits afterwards keeps none.
   void on_finalize_operator() override;
 
  private:
@@ -215,6 +220,11 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     ::cucascade::memory::memory_space* space{nullptr};
     merge::window_config config{};
     bool final_pass{true};
+    /// Per cursor, as of the last commit: the merger holds window buffers for the batch the run
+    /// is at. The run's last task was planned to read that batch through a window buffer and
+    /// did not finish it. Taken from the plan, not from the merger: a batch the task found
+    /// sliceable after all (converted whole to the GPU) is still counted.
+    std::vector<bool> holds_buffer;
     /// Declared last: destroyed before the cursors it refers to.
     std::optional<merge::windowed_merger> merger;
   };
@@ -228,6 +238,12 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     bool armed{false};
     /// Arming found a run locked by a tier move; a committing task makes it armable again.
     bool arm_deferred{false};
+    /// A thread is parsing the header of one of the partition's compressed batches, without
+    /// _drain_mutex, to learn the schema; it arms the partition when it has it.
+    bool header_parsing{false};
+    /// The header was parsed; header_schema is what it gave (null if it could not be parsed).
+    bool header_parsed{false};
+    std::optional<std::vector<cudf::data_type>> header_schema;
     merge::merge_route route{merge::merge_route::one_shot};
     /// Sizes of the partition's windowed tasks.
     merge::derived_merge_config config{};
@@ -237,6 +253,9 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::vector<std::size_t> column_widths;
     /// run_state::id of the runs the task in flight reads, in the order of its cursors.
     std::vector<std::uint64_t> task_runs;
+    /// Per run of task_runs: the task in flight was planned to read the batch the run is at
+    /// through a window buffer.
+    std::vector<bool> task_buffered;
     /// The intermediate run being written: its batches so far, in key order.
     run_state pending_run;
     /// The merger of the partition's task chain while no task holds it; null before the first
@@ -244,23 +263,82 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::unique_ptr<partition_merger> merger;
   };
 
+  /// The next windowed task of a partition, as planned under _drain_mutex. Sizing it reads the
+  /// batches (and, once per compressed batch, its header), which is done without the mutex.
+  struct windowed_task_plan {
+    std::size_t partition{0};
+    bool final_pass{true};
+    std::size_t first_chunk{0};
+    merge::window_config config{};
+    /// One cursor per run the task reads.
+    std::vector<merge::merge_input_cursor> cursors;
+    /// Per cursor: the batches of cursor.run and their decoded bytes.
+    std::vector<std::vector<std::shared_ptr<::cucascade::data_batch>>> batches;
+    std::vector<std::vector<std::size_t>> batch_bytes;
+    /// Per cursor: partition_merger::holds_buffer of the run in a kept merger this task
+    /// continues; false without one.
+    std::vector<bool> kept_buffer;
+    /// Device of the partition's kept merger, if it has one.
+    std::optional<int> kept_device;
+    /// Input column indices the task fetches, in fetch order.
+    std::vector<std::size_t> fetch_cols;
+    std::size_t row_width{0};       ///< estimated bytes per row of the fetched columns
+    std::size_t key_row_width{0};   ///< estimated bytes per row of the key columns
+    std::size_t string_columns{0};  ///< how many of the fetched columns are STRING
+  };
+
+  /// What a task's commit leaves to do once _drain_mutex is released.
+  struct commit_followup {
+    bool reschedule{false};
+    std::optional<merge_sort_counters> final_counters;
+  };
+
   /// First arm of a partition: sizes its batches, chooses the route and, on the windowed route,
   /// builds one cursor per batch. Returns the task input on the one-shot route, else null. Takes
-  /// no blocking batch lock: when a batch it must read is locked by a tier move, the partition
-  /// is left unarmed and @p busy is set to that batch.
-  std::unique_ptr<operator_data> arm_partition(std::size_t partition,
-                                               partition_merge_state& state,
-                                               ::cucascade::shared_data_repository& repo,
-                                               std::shared_ptr<::cucascade::data_batch>& busy);
+  /// no blocking batch lock and reads no batch header. When a batch it must read is locked by a
+  /// tier move, the partition is left unarmed and @p busy is set to that batch. When only the
+  /// header of a compressed batch names the schema and it is not parsed yet, the partition is
+  /// left unarmed and @p header_source is set to that batch's read lock: the caller parses it
+  /// without _drain_mutex, stores the result in the partition's state and arms again.
+  std::unique_ptr<operator_data> arm_partition(
+    std::size_t partition,
+    partition_merge_state& state,
+    ::cucascade::shared_data_repository& repo,
+    std::shared_ptr<::cucascade::data_batch>& busy,
+    std::optional<::cucascade::read_only_data_batch>& header_source);
 
   /// Pops every batch of @p partition into one merge task.
   std::unique_ptr<operator_data> make_one_shot_input(std::size_t partition,
                                                      ::cucascade::shared_data_repository& repo);
 
-  /// Plans the next windowed task of an armed partition and marks it in flight.
-  std::unique_ptr<operator_data> make_windowed_input(std::size_t partition,
-                                                     partition_merge_state& state,
-                                                     ::cucascade::shared_data_repository& repo);
+  /// Plans the next windowed task of an armed partition and marks it in flight. Needs
+  /// _drain_mutex.
+  windowed_task_plan plan_windowed_task(std::size_t partition,
+                                        partition_merge_state& state,
+                                        ::cucascade::shared_data_repository& repo);
+
+  /// Sizes a planned task and builds its input. Call without _drain_mutex: it reads the batches
+  /// and may read a compressed batch's header from disk. If it throws, the partition is no
+  /// longer in flight and the task can be planned again.
+  std::unique_ptr<operator_data> make_windowed_input(windowed_task_plan plan);
+
+  /// Whether the row-range reader of @p data can read every column of @p columns. True for a
+  /// batch that is not spill-compressed. For a compressed one the answer comes from its header,
+  /// parsed once per batch id (the plan of a batch does not depend on its tier).
+  [[nodiscard]] bool reads_by_row_range(std::uint64_t batch_id,
+                                        const ::cucascade::idata_representation& data,
+                                        const std::vector<std::size_t>& columns);
+
+  /// The part every task commit ends with: makes the partitions whose arming was deferred
+  /// armable again, decides whether the operator has to be scheduled again and claims the
+  /// statistics line when no work is left. Reschedules when a partition is armable and either
+  /// @p always_reschedule or some partition was deferred. Needs _drain_mutex.
+  [[nodiscard]] commit_followup finish_commit(::cucascade::shared_data_repository& repo,
+                                              bool always_reschedule);
+
+  /// Logs the statistics line and schedules the operator, as @p followup says. Call without
+  /// _drain_mutex.
+  void after_commit(const commit_followup& followup);
 
   std::unique_ptr<operator_data> execute_one_shot(const pipelineable_operator_data& input,
                                                   ::cuda::stream_ref stream);
@@ -298,6 +376,11 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::mutex _pushed_mutex;
   /// Sizes of the batches of partitions not armed yet, by batch id.
   std::unordered_map<std::uint64_t, batch_size> _pushed_sizes;
+  //! Guards _row_range_columns; taken after _drain_mutex when both are held.
+  std::mutex _row_range_mutex;
+  /// By id of a batch seen spill-compressed: per source column, whether its plan can be decoded
+  /// by row range (empty when the header could not be read). Erased when the batch is consumed.
+  std::unordered_map<std::uint64_t, std::vector<bool>> _row_range_columns;
   /// The GPU memory space last seen holding runs; sizes partitions with no GPU-resident run.
   ::cucascade::memory::memory_space* _gpu_space_hint{nullptr};
 };

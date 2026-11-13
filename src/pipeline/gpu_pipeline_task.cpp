@@ -938,6 +938,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       scan_input && target_space
         ? scan_input->get_estimated_working_set_size_in_bytes(target_space->get_device_id())
         : ls._input_data->get_estimated_working_set_size_in_bytes();
+  } else if (input_type == op::operator_data_type::WINDOWED_MERGE && ls._input_data) {
+    // A windowed merge input sizes the window buffers, merge scratch and output its task
+    // allocates.
+    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
   std::size_t num_batches = 0;
@@ -964,6 +968,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     // pipeline_memory_history may estimate below the current fresh batch's known decode working
     // set.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
+    }
+    // The history of a merge pipeline mixes tasks that reuse the windows of a kept merger (a low
+    // peak) with tasks that allocate them and with one-shot partitions, so its estimate may be
+    // below the working set this task's input knows it allocates.
+    if (input_type == op::operator_data_type::WINDOWED_MERGE) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
     // pipeline_memory_history keys estimates by input bytes, not carrier layout, so batches with

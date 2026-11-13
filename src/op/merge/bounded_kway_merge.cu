@@ -68,6 +68,10 @@ void validate(std::span<const cudf::table_view> windows,
       "bounded_kway_merge: column_order and null_precedence need one entry per key column");
   }
   if (max_rows < 0) { throw std::invalid_argument("bounded_kway_merge: max_rows is negative"); }
+  if (windows.size() > kMaxKwayMergeInputs) {
+    throw std::invalid_argument("bounded_kway_merge: more than " +
+                                std::to_string(kMaxKwayMergeInputs) + " windows");
+  }
 
   const auto& first = windows.front();
   for (const auto key : keys.key_cols) {

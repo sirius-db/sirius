@@ -451,7 +451,7 @@ void test_windows()
   check(check_span(column, offsets, 0, kRows, 4, 0, 0, total, what) == kRows,
         what + "the whole column did not fit");
   // One window of int64 offsets in the decoder and one in the offsets' delta state; the rest
-  // (the differences' packed-word scratch and metadata, the ANS state) is smaller than a third.
+  // (the differences' packed-word scratch and metadata, the ANS state) fits in one more window.
   auto const window_bytes =
     static_cast<std::size_t>(kWindowChunks * kChunkRows) * sizeof(std::int64_t);
   auto const held = column.decoder->state_bytes();
@@ -471,8 +471,8 @@ void test_windows()
     check_span(column, offsets, 0, rows, 8, 0, 0, static_cast<std::size_t>(offsets[rows]), what);
   }
 
-  // A budget that ends exactly at the first window's last row: the first window is taken whole,
-  // the second takes nothing, and the walk stops there.
+  // A budget that ends exactly at the first window's last row: the first window is taken whole;
+  // later rows fit only while they are empty, and the walk stops at the first that is not.
   auto const window_rows = kWindowChunks * kChunkRows - 1;  // rows whose end lies in window 0
   auto const at_boundary = check_span(
     column, offsets, 0, kRows, 4, 1, 7, static_cast<std::size_t>(offsets[window_rows]), what);

@@ -846,7 +846,7 @@ TEST_CASE("GPU pipeline executor keeps the pre-OOM floor while the input shrinks
   REQUIRE_FALSE(f.completion->has_error());
 
   // Attempts 0 and 1 OOM while the input can still shrink: the retry keeps the floor from before
-  // the OOM (0). Attempts 2 and 3 OOM with the input at its own floor: escalation as before.
+  // the OOM (0). Attempts 2 and 3 OOM with the input at its own floor, so the floor doubles.
   CHECK(probe->observed_floors() ==
         std::vector<std::size_t>{0, 0, 0, 2 * kReservationSize, 4 * kReservationSize});
   CHECK(probe->oom_count.load() == 4);
@@ -979,6 +979,7 @@ TEST_CASE("Retry reservation floor remembers its value from before the last OOM"
 
   // Attempt 0 OOMs and its input does not shrink: the retry inherits the raised floor.
   local_state_t attempt0(nullptr);
+  // max(2 x 256, 64 live + 1 MiB default request, 1 MiB) = 1 MiB + 64.
   attempt0.update_retry_reservation_floor_after_oom(256, 64, std::nullopt);
   auto const first_floor = attempt0.get_retry_reservation_floor();
   REQUIRE(first_floor == kMiB + 64);
@@ -987,6 +988,7 @@ TEST_CASE("Retry reservation floor remembers its value from before the last OOM"
   CHECK(attempt1.get_retry_reservation_floor() == first_floor);
 
   // Attempt 1 OOMs and its input shrinks: the retry gets the floor from before that raise.
+  // max(2 x first_floor, 2 MiB live + 3 MiB requested) = 5 MiB.
   attempt1.update_retry_reservation_floor_after_oom(
     first_floor, 2 * kMiB, std::optional<std::size_t>{3 * kMiB});
   REQUIRE(attempt1.get_retry_reservation_floor() == 5 * kMiB);

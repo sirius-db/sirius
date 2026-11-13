@@ -79,7 +79,8 @@ struct plan_test_generator : sirius::planner::sirius_physical_plan_generator {
   using sirius_physical_plan_generator::read_views;
   using sirius_physical_plan_generator::sirius_physical_plan_generator;
 
-  // The boundary create_plan(unique_ptr) stops at before lineage and scan lowering.
+  // Repeats create_plan(unique_ptr)'s type resolution and column binding, then stops before
+  // lineage and scan lowering.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_tree(duckdb::LogicalOperator& root)
   {
     root.ResolveOperatorTypes();
@@ -299,6 +300,7 @@ TEST_CASE("count(*) over sirius_generate generates one column for the row count"
     CHECK(source.output_columns() == std::vector<std::size_t>{2});
     REQUIRE(source.types.size() == 1);
     CHECK(source.types.front() == sirius::from_duckdb(duckdb::LogicalType::INTEGER));
+    REQUIRE(source.total_source_input_bytes().has_value());
     CHECK(*source.total_source_input_bytes() == kNumBatches * kRowsPerBatch * 4);
   }
 }

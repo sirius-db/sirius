@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,10 +43,11 @@ struct discard_sink_options {
   std::vector<cudf::null_order> null_precedence;
 };
 
-//! Streaming operator placed right after the query's root: for each input batch it records
-//! rows/bytes, optionally checks key order (within the batch, and across batches by their
-//! positions), drops the batch, and emits a one-row INT64 table holding the batch's row count.
-//! The planner sums those rows (an ungrouped SUM) to produce COPY's single count row.
+//! Streaming operator placed right after the query's root: for each task input it records the
+//! rows/bytes of its batches, optionally checks key order (within each batch, and across batches
+//! and tasks by their positions), drops the batches, and emits a one-row INT64 table holding
+//! their total row count. The planner sums those rows (an ungrouped SUM) to produce COPY's single
+//! count row.
 class sirius_physical_discard_sink : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DISCARD_SINK;
@@ -60,8 +61,9 @@ class sirius_physical_discard_sink : public sirius_physical_operator {
 
   std::string get_name() const override;
 
-  //! Drops the input batch and returns a `pipelineable_operator_data` holding one batch of one
-  //! INT64 column (the input's row count), carrying the input's position.
+  //! Drops the task's input batches and returns a `pipelineable_operator_data` holding one batch of
+  //! one INT64 column (their total row count), carrying the input's position; no batch when the
+  //! input had none.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
@@ -99,10 +101,16 @@ class sirius_physical_discard_sink : public sirius_physical_operator {
   [[nodiscard]] std::uint64_t bytes_discarded() const noexcept;
   //! Key-order violations found so far, within a batch and across batches.
   [[nodiscard]] std::uint64_t order_violations() const noexcept;
+  //! Whether this sink checks key order: `check_order` with at least one key column. False means
+  //! `order_violations()` is 0 because nothing was compared, not because the input was sorted.
+  [[nodiscard]] bool order_checked() const noexcept;
+  //! Key ranges the order check compared so far: one per non-empty input batch. 0 with
+  //! `order_checked()` means no rows reached the check.
+  [[nodiscard]] std::uint64_t ranges_checked() const noexcept;
 
-  //! Runs the cross-batch order check and logs
-  //! "[discard_sink] rows=… bytes=… order_violations=…" at INFO. The engine calls it when the
-  //! operator's pipeline finishes; a second call does nothing.
+  //! Runs the cross-batch order check and logs "[discard_sink] rows=… bytes=…
+  //! order_violations=… order_checked=<0|1> ranges_checked=…" at INFO. The engine calls it when
+  //! the operator's pipeline finishes; a second call does nothing.
   void finish();
 
  protected:
@@ -118,6 +126,7 @@ class sirius_physical_discard_sink : public sirius_physical_operator {
   std::atomic<std::uint64_t> _rows_discarded{0};
   std::atomic<std::uint64_t> _bytes_discarded{0};
   std::atomic<std::uint64_t> _order_violations{0};
+  std::atomic<std::uint64_t> _ranges_checked{0};
 };
 
 }  // namespace op

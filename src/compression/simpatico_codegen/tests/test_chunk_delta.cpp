@@ -307,7 +307,8 @@ void check_span(root_fixture& fx,
   }
 }
 
-/// The fixed spans of the spec plus `random_spans` seeded random ones.
+/// Fixed edge-case spans (whole column, first / last chunk and row, empty, mid-chunk, across a
+/// boundary) plus `random_spans` seeded random ones.
 void check_spans(root_fixture& fx,
                  std::uint64_t seed,
                  rmm::cuda_stream_view stream,
@@ -324,10 +325,10 @@ void check_spans(root_fixture& fx,
   spans.push_back({nc - 1, nc, rows - (nc - 1) * kChunkRows - 1, 1});  // last row
   spans.push_back({0, nc, 0, 1});                                      // first row
   spans.push_back({0, nc, 0, 0});                                      // nothing
-  if (rows >= 15) { spans.push_back({0, nc, 5, 10}); }                 // fewer chunks than given
-  if (nc >= 4) { spans.push_back({1, 4, 100, 1500}); }                 // mid-chunk start
-  if (nc >= 4) { spans.push_back({1, 3, 0, 2 * kChunkRows}); }         // whole inner chunks
-  if (nc >= 2) { spans.push_back({0, 2, kChunkRows - 1, 2}); }         // across a boundary
+  if (rows >= 15) { spans.push_back({0, nc, 5, 10}); }          // rows need fewer chunks than given
+  if (nc >= 4) { spans.push_back({1, 4, 100, 1500}); }          // mid-chunk start
+  if (nc >= 4) { spans.push_back({1, 3, 0, 2 * kChunkRows}); }  // whole inner chunks
+  if (nc >= 2) { spans.push_back({0, 2, kChunkRows - 1, 2}); }  // across a boundary
   if (nc >= 2) { spans.push_back({nc - 2, nc, 1000, end(nc) - (nc - 2) * kChunkRows - 1000}); }
   if (nc >= 3) { spans.push_back({0, nc, kChunkRows + 7, 20}); }  // skip_head past a chunk
 
@@ -452,7 +453,7 @@ cudf::data_type type_of(cudf::type_id id)
                                                                           : cudf::data_type{id};
 }
 
-/// Sorted, nearly sorted and run-heavy columns of the spec's types.
+/// Sorted, nearly sorted and run-heavy INT32, INT64, TIMESTAMP_MICROSECONDS and DECIMAL64 columns.
 int test_shapes(rmm::cuda_stream_view stream)
 {
   int cases          = 0;
@@ -706,7 +707,7 @@ int test_string_offsets(rmm::cuda_stream_view stream)
   return cases;
 }
 
-/// Chunk ranges outside the node are rejected before anything is requested or written.
+/// Chunk ranges outside the node are rejected before anything is requested.
 int test_range_checks(rmm::cuda_stream_view stream)
 {
   column_options options;
@@ -786,6 +787,35 @@ int test_factory_rejects(rmm::cuda_stream_view stream)
          "factory: the input node is not a delta");
   expect(throws<unsupported_chunk_decode>([&] { (void)chunk::make_delta_state(plain, 99); }),
          "factory: a missing node is not a delta");
+
+  // Malformed buffer sizes are corrupt metadata, not a layout the caller may fall back from: the
+  // factory throws a std::runtime_error that is not an unsupported_chunk_decode.
+  auto const shrink = [](hpln_column_description column, char const* buffer) {
+    for (auto& leaf : column.leaves) {
+      for (auto& range : leaf.buffers) {
+        if (range.name == buffer) {
+          expect(range.size > 0, "factory: the buffer to shrink is empty");
+          range.size -= 1;
+          return column;
+        }
+      }
+    }
+    throw std::runtime_error(std::string{"factory: no buffer named "} + buffer);
+  };
+  auto const corrupt = [](hpln_column_description const& column, bool with_rle) {
+    try {
+      (void)chunk::make_delta_decoder(column, with_rle);
+    } catch (unsupported_chunk_decode const&) {
+      return false;
+    } catch (std::runtime_error const&) {
+      return true;
+    }
+    return false;
+  };
+  expect(corrupt(shrink(plain, "delta_first"), false),
+         "factory: delta_first of one byte short is not a hard error");
+  expect(corrupt(shrink(rle, "rle_runs_offsets"), true),
+         "factory: rle_runs_offsets of one byte short is not a hard error");
   return 1;
 }
 
@@ -872,7 +902,7 @@ int test_many_chunks_primitive(rmm::cuda_stream_view stream)
                                    std::to_string(expected[element]));
         }
       }
-      // Several passes: each requests its own bitpack words, but never outside the range.
+      // Several passes: delta_first is requested only inside the range.
       auto const& first = fx.layout.first;
       expect(fx.access.requests_within(first.leaf,
                                        first.buffer,

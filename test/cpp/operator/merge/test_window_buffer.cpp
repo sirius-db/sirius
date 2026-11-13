@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "op/merge/detail/window_buffer.hpp"
+#include "operator/merge/merge_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column.hpp>
@@ -36,18 +37,15 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/row_range_read.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <data/sirius_row_range_reader_registry.hpp>
-#include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -354,6 +352,19 @@ TEST_CASE("window_buffer rejects nested types", "[window_buffer]")
     std::invalid_argument);
 }
 
+TEST_CASE("window_buffer rejects a window above the cudf row limit", "[window_buffer]")
+{
+  window_buffer_fixture fixture;
+  auto const mr = sirius::test::operator_utils::get_resource_ref(*fixture.memory.gpu0);
+  // The check comes before any allocation. The limit leaves room for the n+1 STRING offsets.
+  REQUIRE_THROWS_AS(window_buffer({cudf::data_type{cudf::type_id::INT64}},
+                                  std::numeric_limits<cudf::size_type>::max(),
+                                  0,
+                                  fixture.stream_view(),
+                                  mr),
+                    std::invalid_argument);
+}
+
 TEST_CASE("window_buffer starts empty with both slots allocated", "[window_buffer]")
 {
   window_buffer_fixture fixture;
@@ -362,6 +373,7 @@ TEST_CASE("window_buffer starts empty with both slots allocated", "[window_buffe
   REQUIRE(window.size() == 0);
   REQUIRE(window.capacity_rows() == 100);
   auto const mask_bytes = cudf::bitmask_allocation_size_bytes(100);
+  // Per column: data + null mask; a STRING adds chars at the estimate + 25% and n+1 int32 offsets.
   auto const per_slot = (100 * sizeof(int64_t) + mask_bytes) + (100 * sizeof(double) + mask_bytes) +
                         (100 * 16 * 5 / 4 + mask_bytes + 101 * sizeof(int32_t));
   REQUIRE(window.device_bytes() == 2 * per_slot);
@@ -476,7 +488,7 @@ TEST_CASE("window_buffer grows the chars slots for a row that does not fit", "[w
   rows.strings[5]  = std::string(1000, 'y');
   auto const batch = make_host_batch(fixture.memory, rows, fixture.stream);
 
-  // 8 rows of an estimated 4 bytes: the chars slot is 64 bytes.
+  // 8 rows of an estimated 4 bytes need 40 chars bytes; the slot is raised to the 64-byte minimum.
   auto window             = fixture.make_window(8, 4);
   auto const bytes_before = window.device_bytes();
 
@@ -487,30 +499,38 @@ TEST_CASE("window_buffer grows the chars slots for a row that does not fit", "[w
   REQUIRE(window.device_bytes() == bytes_before);
   REQUIRE(window.chars_growths() == 0);
 
-  // Row 3 alone does not fit behind the carried tail: both chars slots double, the tail survives.
+  // Row 3 alone does not fit behind the carried tail: the chars of the active slot double to 128
+  // bytes and the tail survives. The other slot's 64 chars bytes are freed until the next carry.
   window.consume(2, fixture.stream_view());
   result = fixture.refill(window, batch, 3);
   REQUIRE(result.rows_written == 2);
-  REQUIRE(window.device_bytes() == bytes_before + 2 * 64);
+  REQUIRE(window.device_bytes() == bytes_before - 2 * 64 + 128);
   REQUIRE(window_to_host(window, fixture.stream) == rows.slice(2, 5));
 
-  // Row 5 does not fit even after doubling once more.
+  // Row 5 does not fit even after doubling once more (256 bytes).
   window.consume(3, fixture.stream_view());
   REQUIRE(window.chars_growths() == 1);
   REQUIRE_THROWS_AS(fixture.refill(window, batch, 5),
                     sirius::op::merge::detail::window_row_too_large_error);
   REQUIRE(window.size() == 0);
-  REQUIRE(window.device_bytes() == bytes_before + 2 * 64 + 2 * 128);
+  REQUIRE(window.device_bytes() == bytes_before - 2 * 64 + 256);
   REQUIRE(window.chars_growths() == 2);
 
-  // The window stays usable: the slots have grown, so the retry fits the row.
+  // The window stays usable: each failed refill doubles the slot again, so the second retry
+  // (1024 bytes) fits the 1000-byte row.
   REQUIRE_THROWS_AS(fixture.refill(window, batch, 5),
                     sirius::op::merge::detail::window_row_too_large_error);
   result = fixture.refill(window, batch, 5);
   REQUIRE(result.rows_written == 3);
   REQUIRE(result.source_exhausted);
   REQUIRE(window.chars_growths() == 4);
+  REQUIRE(window.device_bytes() == bytes_before - 2 * 64 + 1024);
   REQUIRE(window_to_host(window, fixture.stream) == rows.slice(5, 8));
+
+  // The next carry allocates the chars of the other slot again, at the grown size.
+  window.consume(1, fixture.stream_view());
+  REQUIRE(window.device_bytes() == bytes_before - 2 * 64 + 2 * 1024);
+  REQUIRE(window_to_host(window, fixture.stream) == rows.slice(6, 8));
 }
 
 TEST_CASE("window_buffer matches a host model over 1000 consume/refill cycles", "[window_buffer]")
@@ -576,84 +596,47 @@ TEST_CASE("window_buffer reads a GPU-tier batch the same way", "[window_buffer]"
 
 TEST_CASE("window_buffer reads a DISK-tier batch the same way", "[window_buffer]")
 {
-  // The shared fixture has no disk space: build a manager with GPU, HOST and DISK tiers.
-  sirius::converter_registry::reset_for_testing();
-  std::string tmp_template =
-    (std::filesystem::temp_directory_path() / "sirius_window_buffer_XXXXXX").string();
-  REQUIRE(mkdtemp(tmp_template.data()) != nullptr);
-  std::filesystem::path const tmp_dir{tmp_template};
-
+  // The shared fixture has no disk space; this one has GPU, HOST and DISK tiers.
+  sirius::test::merge_utils::tiers_fixture fx;
+  auto const sv = fx.stream_view();
+  std::mt19937 rng(23);
+  auto const rows  = make_rows(500, 16, rng);
+  auto const batch = make_gpu_batch(*fx.gpu, rows, fx.stream);
   {
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .set_gpu_usage_limit(std::size_t{256} << 20)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(std::size_t{1} << 30)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .set_disk_mounting_point(0, std::size_t{1} << 30, tmp_dir.string());
-    auto manager =
-      std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    if (!sirius::row_range_reader_registry::is_initialized()) {
-      sirius::row_range_reader_registry::initialize();
-    }
-    auto* gpu_space  = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-    auto* disk_space = manager->get_memory_space(cucascade::memory::Tier::DISK, 0);
-    REQUIRE(gpu_space != nullptr);
-    REQUIRE(disk_space != nullptr);
-
-    rmm::cuda_stream stream;
-    rmm::cuda_stream_view const sv{stream.value()};
-    std::mt19937 rng(23);
-    auto const rows  = make_rows(500, 16, rng);
-    auto const batch = make_gpu_batch(*gpu_space, rows, stream);
-    {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::disk_data_representation>(
-        sirius::converter_registry::get(), disk_space, stream);
-    }
-    stream.synchronize();
-    REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
-
-    {
-      window_buffer window({cudf::data_type{cudf::type_id::INT64},
-                            cudf::data_type{cudf::type_id::FLOAT64},
-                            cudf::data_type{cudf::type_id::STRING}},
-                           100,
-                           16,
-                           sv,
-                           sirius::test::operator_utils::get_resource_ref(*gpu_space));
-      auto refill = [&](std::size_t row_begin) {
-        auto ro = batch->to_read_only();
-        return window.refill(sirius::row_range_reader_registry::get(),
-                             ro,
-                             fetch_cols,
-                             row_begin,
-                             nullptr,
-                             nullptr,
-                             sv);
-      };
-      std::size_t window_begin{0};
-      std::size_t read_end{0};
-      for (std::size_t consumed :
-           {std::size_t{0}, std::size_t{1}, std::size_t{31}, std::size_t{33}, std::size_t{64}}) {
-        CAPTURE(consumed);
-        window.consume(consumed, sv);
-        window_begin += consumed;
-        while (window.size() < window.capacity_rows() && read_end < rows.size()) {
-          auto const result = refill(read_end);
-          if (result.rows_written == 0) { break; }
-          read_end += result.rows_written;
-        }
-        REQUIRE(window_to_host(window, stream) == rows.slice(window_begin, read_end));
-      }
-      REQUIRE(read_end > 200);
-    }
-    manager->shutdown();
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::disk_data_representation>(
+      sirius::converter_registry::get(), fx.disk, fx.stream);
   }
-  sirius::converter_registry::shutdown();
-  std::filesystem::remove_all(tmp_dir);
+  fx.stream.synchronize();
+  REQUIRE(batch->to_read_only().get_memory_space()->get_tier() == cucascade::memory::Tier::DISK);
+
+  window_buffer window({cudf::data_type{cudf::type_id::INT64},
+                        cudf::data_type{cudf::type_id::FLOAT64},
+                        cudf::data_type{cudf::type_id::STRING}},
+                       100,
+                       16,
+                       sv,
+                       fx.mr());
+  auto refill = [&](std::size_t row_begin) {
+    auto ro = batch->to_read_only();
+    return window.refill(
+      sirius::row_range_reader_registry::get(), ro, fetch_cols, row_begin, nullptr, nullptr, sv);
+  };
+  std::size_t window_begin{0};
+  std::size_t read_end{0};
+  for (std::size_t consumed :
+       {std::size_t{0}, std::size_t{1}, std::size_t{31}, std::size_t{33}, std::size_t{64}}) {
+    CAPTURE(consumed);
+    window.consume(consumed, sv);
+    window_begin += consumed;
+    while (window.size() < window.capacity_rows() && read_end < rows.size()) {
+      auto const result = refill(read_end);
+      if (result.rows_written == 0) { break; }
+      read_end += result.rows_written;
+    }
+    REQUIRE(window_to_host(window, fx.stream) == rows.slice(window_begin, read_end));
+  }
+  REQUIRE(read_end > 200);
 }
 
 TEST_CASE("window_buffer propagates row_range_unsupported_error from the registry",

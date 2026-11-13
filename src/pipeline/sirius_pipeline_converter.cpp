@@ -231,8 +231,8 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
                   const std::shared_ptr<sirius_pipeline>& src,
                   const std::shared_ptr<sirius_pipeline>& dst) {
     auto const port_id = consumer.input_port_for(*source_op);
-    repository_wirings_.push_back(
-      {port_id, consumer.input_barrier_for(*source_op), source_op, src, dst});
+    auto const barrier = consumer.input_barrier_for(*source_op);
+    repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
   };
 
   for (auto& pipeline : scheduled_) {

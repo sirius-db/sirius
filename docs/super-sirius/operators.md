@@ -652,8 +652,8 @@ In `auto` and `windowed` mode these partitions take the one-shot route:
   nested and the partition has more runs than the fan-in cap, because an intermediate pass rewrites
   every column;
 - late materialization is installed on the operator (`has_late_materialization()`);
-- no batch exposes its column types (every batch is Simpatico-compressed), a batch has no row
-  count, the partition has zero rows, or a sort key is not a plain column reference.
+- no batch exposes its column types (for a compressed batch, its header cannot be parsed), a batch
+  has no row count, the partition has zero rows, or a sort key is not a plain column reference.
 
 A one-shot partition in these modes sets `set_materialize_on_gpu(true)` on its input, which
 overrides the port's residency policy for that task (see
@@ -791,8 +791,11 @@ at its 65,536-row floor, capped by `sort_merge_max_fan_in` and never below 2.
 A batch whose representation has no row-range reader, or whose read throws
 `row_range_unsupported_error`, is converted once to the GPU tier in the task's memory space
 (`detail::convert_run_batch_to_gpu()`), under the batch's exclusive lock. It stays in the
-repository and is then windowed as a GPU batch. Simpatico-compressed batches take this path. The
-task input adds the largest such batch to its memory estimate. If a downgrade moves the batch
+repository and is then windowed as a GPU batch. A Simpatico-compressed batch takes this path only
+when its reader refuses it (a projection, a filtered view, or a plan that cannot be decoded by
+chunk). The task input adds the largest batch without a reader to its memory estimate; a batch
+whose reader refuses it only at read time is not in the estimate (see
+[Window reservations](memory-management.md#window-reservations)). If a downgrade moves the batch
 again before the merger re-locks it, the merger retries, three attempts in all, then throws.
 
 #### Statistics line

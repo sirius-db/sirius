@@ -75,10 +75,11 @@ class sirius_physical_generator : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
+  /// estimated_peak_batch_bytes(spec, output_columns), whatever the stats say.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
-  /// Exact whole-query input basis, known at plan time.
+  /// Estimated whole-query input basis, known at plan time: num_batches * estimated_batch_bytes.
   [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
 
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override;

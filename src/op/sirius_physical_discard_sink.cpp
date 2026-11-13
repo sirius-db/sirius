@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,6 @@
 #include <map>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -226,7 +225,7 @@ sirius_physical_discard_sink::sirius_physical_discard_sink(
   auto const num_keys = _options.key_columns.size();
   if ((!_options.column_order.empty() && _options.column_order.size() != num_keys) ||
       (!_options.null_precedence.empty() && _options.null_precedence.size() != num_keys)) {
-    throw std::invalid_argument(
+    throw internal_exception(
       "sirius_physical_discard_sink: column_order and null_precedence must be empty or have one "
       "entry per key column");
   }
@@ -245,7 +244,7 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
     throw internal_exception(
       "sirius_physical_discard_sink::execute: expected pipelineable_operator_data");
   }
-  auto const check_order = _options.check_order && !_options.key_columns.empty();
+  auto const check_order = order_checked();
 
   // The read locks are the prepared ones when the task prepared its input; a batch that was not
   // prepared is locked in the tier it is in and counted from its metadata.
@@ -264,10 +263,13 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
   std::uint64_t rows       = 0;
   std::uint64_t bytes      = 0;
   std::uint64_t violations = 0;
+  std::uint64_t ranges     = 0;
   std::optional<key_range> range;
   for (auto const& batch : batches) {
     auto const* data = batch.get_data();
-    if (data == nullptr) { continue; }
+    if (data == nullptr) {
+      throw internal_exception("sirius_physical_discard_sink: input batch has no data");
+    }
     auto* space         = batch.get_memory_space();
     auto const on_gpu   = batch.get_current_tier() == ::cucascade::memory::Tier::GPU;
     auto const num_rows = representation_num_rows(*data);
@@ -284,6 +286,7 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
         "sirius_physical_discard_sink: the order check needs its input on the GPU");
     }
     auto const keys = get_cudf_table_view(batch).select(_options.key_columns);
+    ++ranges;
     if (!cudf::is_sorted(keys, _options.column_order, _options.null_precedence, stream)) {
       ++violations;
     }
@@ -325,6 +328,7 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
   _rows_discarded.fetch_add(rows);
   _bytes_discarded.fetch_add(bytes);
   if (violations != 0) { _order_violations.fetch_add(violations); }
+  if (ranges != 0) { _ranges_checked.fetch_add(ranges); }
   return std::make_unique<pipelineable_operator_data>(std::move(output), input->get_position());
 }
 
@@ -337,8 +341,7 @@ MemoryBarrierType sirius_physical_discard_sink::input_barrier_for(
 port_residency_policy sirius_physical_discard_sink::input_residency_policy(
   std::string_view /*port_id*/) const
 {
-  auto const check_order = _options.check_order && !_options.key_columns.empty();
-  return {.materialize_inputs_on_gpu = check_order, .downgrade_priority = -100};
+  return {.materialize_inputs_on_gpu = order_checked(), .downgrade_priority = -100};
 }
 
 std::unique_ptr<operator_data> sirius_physical_discard_sink::get_next_task_input_data()
@@ -381,6 +384,16 @@ std::uint64_t sirius_physical_discard_sink::order_violations() const noexcept
   return _order_violations.load();
 }
 
+bool sirius_physical_discard_sink::order_checked() const noexcept
+{
+  return _options.check_order && !_options.key_columns.empty();
+}
+
+std::uint64_t sirius_physical_discard_sink::ranges_checked() const noexcept
+{
+  return _ranges_checked.load();
+}
+
 void sirius_physical_discard_sink::finish()
 {
   std::lock_guard<std::mutex> guard(_state->mutex);
@@ -398,10 +411,13 @@ void sirius_physical_discard_sink::finish()
   if (violations != 0) { _order_violations.fetch_add(violations); }
   _state->ranges.clear();
 
-  SIRIUS_LOG_INFO("[discard_sink] rows={} bytes={} order_violations={}",
-                  _rows_discarded.load(),
-                  _bytes_discarded.load(),
-                  _order_violations.load());
+  SIRIUS_LOG_INFO(
+    "[discard_sink] rows={} bytes={} order_violations={} order_checked={} ranges_checked={}",
+    _rows_discarded.load(),
+    _bytes_discarded.load(),
+    _order_violations.load(),
+    order_checked() ? 1 : 0,
+    _ranges_checked.load());
 }
 
 }  // namespace op

@@ -21,6 +21,7 @@
 // test_generator_strings.cpp.
 
 #include "catch.hpp"
+#include "op/scan/generator/generator_batch.hpp"
 #include "op/scan/generator/generator_detail.cuh"
 
 #include <cudf/column/column_view.hpp>
@@ -32,6 +33,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda_runtime.h>
 
@@ -56,7 +58,7 @@ using namespace sirius::op::scan::generator;
 
 namespace {
 
-constexpr std::uint64_t million = 1U << 20;
+constexpr std::uint64_t million = 1'000'000;
 
 column_spec make_column(std::string name,
                         value_type type,
@@ -83,34 +85,47 @@ std::unique_ptr<cudf::table> generate(const generator_spec& spec, std::uint64_t 
     spec, batch_index, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 }
 
+/// The one device-to-host copy of this file: `count` elements read through `stream`, which is
+/// the only stream it synchronizes. Usable off the main thread: throws instead of asserting.
+template <typename T>
+std::vector<T> download(const void* device,
+                        std::size_t count,
+                        rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  std::vector<T> host(count);
+  if (count > 0 &&
+      ::cudaMemcpyAsync(
+        host.data(), device, count * sizeof(T), ::cudaMemcpyDeviceToHost, stream.value()) !=
+        cudaSuccess) {
+    throw std::runtime_error("cudaMemcpyAsync failed");
+  }
+  stream.synchronize();
+  return host;
+}
+
+/// The validity words of a column; empty when it has no null mask.
+std::vector<cudf::bitmask_type> mask_words(
+  cudf::column_view column, rmm::cuda_stream_view stream = cudf::get_default_stream())
+{
+  if (!column.nullable()) { return {}; }
+  return download<cudf::bitmask_type>(
+    column.null_mask(), (static_cast<std::size_t>(column.size()) + 31) / 32, stream);
+}
+
 /// Copies the values of a fixed-width column to the host (null rows included).
 template <typename T>
 std::vector<T> values(cudf::column_view column)
 {
   REQUIRE(cudf::size_of(column.type()) == sizeof(T));
-  std::vector<T> out(static_cast<std::size_t>(column.size()));
-  REQUIRE(::cudaDeviceSynchronize() == cudaSuccess);
-  if (!out.empty()) {
-    REQUIRE(::cudaMemcpy(
-              out.data(), column.data<T>(), out.size() * sizeof(T), ::cudaMemcpyDeviceToHost) ==
-            cudaSuccess);
-  }
-  return out;
+  return download<T>(column.data<T>(), static_cast<std::size_t>(column.size()));
 }
 
 /// Row validity on the host; empty when the column has no null mask.
 std::vector<bool> validity(cudf::column_view column)
 {
   if (!column.nullable()) { return {}; }
-  const auto rows = static_cast<std::size_t>(column.size());
-  std::vector<cudf::bitmask_type> words((rows + 31) / 32);
-  REQUIRE(::cudaDeviceSynchronize() == cudaSuccess);
-  if (!words.empty()) {
-    REQUIRE(::cudaMemcpy(words.data(),
-                         column.null_mask(),
-                         words.size() * sizeof(cudf::bitmask_type),
-                         ::cudaMemcpyDeviceToHost) == cudaSuccess);
-  }
+  const auto rows  = static_cast<std::size_t>(column.size());
+  const auto words = mask_words(column);
   std::vector<bool> out(rows);
   for (std::size_t i = 0; i < rows; ++i) {
     out[i] = ((words[i / 32] >> (i % 32)) & 1U) != 0;
@@ -171,16 +186,9 @@ table_image image_of(const cudf::table& table)
   table_image image;
   for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
     const auto column = table.view().column(i);
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(column.size()) *
-                                    cudf::size_of(column.type()));
-    REQUIRE(::cudaDeviceSynchronize() == cudaSuccess);
-    if (!bytes.empty()) {
-      REQUIRE(::cudaMemcpy(bytes.data(),
-                           column.data<std::uint8_t>(),
-                           bytes.size(),
-                           ::cudaMemcpyDeviceToHost) == cudaSuccess);
-    }
-    image.data.push_back(std::move(bytes));
+    image.data.push_back(download<std::uint8_t>(
+      column.data<std::uint8_t>(),
+      static_cast<std::size_t>(column.size()) * cudf::size_of(column.type())));
     image.valid.push_back(validity(column));
     image.null_counts.push_back(column.null_count());
   }
@@ -778,13 +786,8 @@ std::vector<std::string> strings_of(cudf::column_view column)
     offsets = values<std::int64_t>(strings.offsets());
   }
   REQUIRE(offsets.size() == rows + 1);
-  std::vector<char> chars(static_cast<std::size_t>(offsets[rows]));
-  if (!chars.empty()) {
-    REQUIRE(::cudaMemcpy(chars.data(),
-                         strings.chars_begin(cudf::get_default_stream()),
-                         chars.size(),
-                         ::cudaMemcpyDeviceToHost) == cudaSuccess);
-  }
+  const auto chars = download<char>(strings.chars_begin(cudf::get_default_stream()),
+                                    static_cast<std::size_t>(offsets[rows]));
   for (std::size_t i = 0; i < rows; ++i) {
     out[i] = std::string(chars.data() + offsets[i], chars.data() + offsets[i + 1]);
   }
@@ -958,7 +961,8 @@ TEST_CASE("generator: byte estimates cover VARCHAR keys wider than the drawn len
   // The first batches are shorter; the estimate is for the widest key of the whole table.
   REQUIRE(estimated_row_bytes(make_spec(spec.columns, rows, 1)) == 3 + 4);
 
-  // A key between the two lengths: the mean of max(L, 4) for L in [2, 5] is 4.25 (keys 0..5000).
+  // Keys 2..4997 have 4 digits and L is uniform in [2, 5]: the mean of max(L, 4) is 4.25, rounded
+  // up to 5.
   REQUIRE(estimated_row_bytes(make_spec(
             {make_column("s", value_type::varchar, sequential, 2, 5)}, 1000, 1)) == 5 + 4);
   // Sizes saturate instead of overflowing.
@@ -966,6 +970,39 @@ TEST_CASE("generator: byte estimates cover VARCHAR keys wider than the drawn len
                         std::numeric_limits<std::uint64_t>::max(),
                         2);
   REQUIRE(estimated_batch_bytes(huge) == std::numeric_limits<std::size_t>::max());
+}
+
+TEST_CASE("generator: the peak estimate covers the key and sizes scratch of a VARCHAR column",
+          "[generator_distributions]")
+{
+  using enum distribution;
+  constexpr std::uint64_t rows = 100'000;
+  // 1-character strings: the 8-byte key and the 4-byte size of a row outweigh its 5 output bytes.
+  const auto spec = make_spec({make_column("k", value_type::int64, uniform, 0, 1000),
+                               make_column("s", value_type::varchar, few_distinct, 1, 1, 0, 0.1)},
+                              rows);
+  REQUIRE(varchar_scratch_row_bytes(spec, {0}) == 0);
+  REQUIRE(varchar_scratch_row_bytes(spec, {1}) == 12);
+  REQUIRE(varchar_scratch_row_bytes(spec, {0, 1}) == 12);
+  REQUIRE(varchar_scratch_row_bytes(spec, {7}) == 0);
+  REQUIRE(estimated_row_bytes(spec, {1}) == 1 + 4 + 1);
+  REQUIRE(estimated_peak_batch_bytes(spec, {0}) == 2 * 8 * rows);
+  REQUIRE(estimated_peak_batch_bytes(spec, {1}) == (2 * 6 + 12) * rows);
+  REQUIRE(estimated_peak_batch_bytes(spec, {0, 1}) == (2 * 14 + 12) * rows);
+
+  // The measured peak of the VARCHAR column alone. cudf takes the sizes array (4 bytes per row)
+  // from the current device resource and not from `mr`, so it is added by hand.
+  rmm::mr::statistics_resource_adaptor counted{cudf::get_current_device_resource_ref()};
+  const auto table = generate_batch(spec, {1}, 0, cudf::get_default_stream(), counted);
+  const auto peak  = static_cast<std::size_t>(counted.get_bytes_counter().peak) + 4 * rows;
+  CAPTURE(peak);
+  REQUIRE(peak > 2 * estimated_batch_bytes(spec, {1}));  // what 2x the batch alone misses
+  REQUIRE(peak <= estimated_peak_batch_bytes(spec, {1}));
+
+  auto huge = make_spec({make_column("s", value_type::varchar, uniform, 1, 1)},
+                        std::numeric_limits<std::uint64_t>::max(),
+                        2);
+  REQUIRE(estimated_peak_batch_bytes(huge, {0}) == std::numeric_limits<std::size_t>::max());
 }
 
 TEST_CASE("generator: validation_error and generate_batch reject the same columns",
@@ -1001,6 +1038,11 @@ TEST_CASE("generator: validation_error and generate_batch reject the same column
     {make_column("f", value_type::float64, few_distinct, -3), false},
     // cardinality and null_fraction
     {make_column("u", value_type::int64, uniform, 0, 9, -1), false},
+    // a cardinality in (0, 1) would round to 0, which means no clamp
+    {make_column("u", value_type::int64, uniform, 0, 9, 0.25), false},
+    {make_column("s", value_type::varchar, sequential, 1, 2, 0.999), false},
+    {make_column("n", value_type::float64, normal, 0, 1, 0.5), false},
+    {make_column("u", value_type::int64, uniform, 0, 9, 1), true},
     {make_column("u", value_type::int64, uniform, 0, 9, 0, -0.1), false},
     {make_column("u", value_type::int64, uniform, 0, 9, 0, 1.5), false},
     // non-finite values, including in parameters the distribution does not read
@@ -1093,7 +1135,7 @@ TEST_CASE("generator: the hoisted hash keys give counter_hash", "[generator_dist
 namespace {
 
 /// Everything observable about a table of fixed-width and STRING columns, read through `stream`
-/// and synchronizing nothing else. Usable off the main thread: throws instead of asserting.
+/// and synchronizing nothing else. Usable off the main thread (see download).
 struct stream_image {
   std::vector<std::vector<std::uint8_t>> data;     // values, or the characters of a STRING column
   std::vector<std::vector<std::uint8_t>> offsets;  // STRING columns only
@@ -1101,20 +1143,6 @@ struct stream_image {
   std::vector<cudf::size_type> null_counts;
   friend bool operator==(const stream_image&, const stream_image&) = default;
 };
-
-template <typename T>
-std::vector<T> download(const void* device, std::size_t count, rmm::cuda_stream_view stream)
-{
-  std::vector<T> host(count);
-  if (count > 0 &&
-      ::cudaMemcpyAsync(
-        host.data(), device, count * sizeof(T), ::cudaMemcpyDeviceToHost, stream.value()) !=
-        cudaSuccess) {
-    throw std::runtime_error("cudaMemcpyAsync failed");
-  }
-  stream.synchronize();
-  return host;
-}
 
 stream_image image_of(const cudf::table& table, rmm::cuda_stream_view stream)
 {
@@ -1134,9 +1162,7 @@ stream_image image_of(const cudf::table& table, rmm::cuda_stream_view stream)
       image.data.push_back(download<std::uint8_t>(
         column.data<std::uint8_t>(), rows * cudf::size_of(column.type()), stream));
     }
-    image.masks.push_back(
-      column.nullable() ? download<cudf::bitmask_type>(column.null_mask(), (rows + 31) / 32, stream)
-                        : std::vector<cudf::bitmask_type>{});
+    image.masks.push_back(mask_words(column, stream));
     image.null_counts.push_back(column.null_count());
   }
   return image;
@@ -1172,7 +1198,9 @@ TEST_CASE("generator: batches generated concurrently on their own streams match 
     REQUIRE(expected[0].null_counts[c] > 0);
   }
 
-  // Each thread owns its stream and synchronizes nothing but that stream.
+  // Each thread owns its stream and synchronizes nothing but that stream. The streams are
+  // non-blocking: a blocking stream waits for the default stream too, which would serialize a
+  // kernel that generate_batch put on the default stream by mistake and hide it.
   std::array<stream_image, 2> actual;
   std::array<std::exception_ptr, 2> errors;
   {
@@ -1180,7 +1208,7 @@ TEST_CASE("generator: batches generated concurrently on their own streams match 
     for (std::uint64_t b = 0; b < 2; ++b) {
       threads[b] = std::thread([&, b] {
         try {
-          rmm::cuda_stream stream;
+          rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
           for (int repeat = 0; repeat < 4; ++repeat) {
             const auto table = generate_batch(spec, b, stream.view(), mr);
             stream.synchronize();

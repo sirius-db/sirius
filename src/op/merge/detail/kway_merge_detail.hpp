@@ -96,7 +96,8 @@ void corank_split(const kway_key_comparator& cmp,
 /**
  * @brief target = min(max_rows, r_safe, Σ lengths) as defined on bounded_kway_merge.
  *
- * Returns it on the host (syncs).
+ * Returns it on the host (syncs). A truncated window with no rows makes it 0: the caller must
+ * refill such a window before the round.
  *
  * @param cmp Comparator over the k key windows.
  * @param lengths Row count of each window (k entries).
@@ -154,7 +155,8 @@ struct gather_read_back {
  * its bit in the window's null mask is clear).
  *
  * Waits on the stream once to read back the null counts and STRING chars sizes of all columns,
- * and once more when there is a STRING column, whatever the number of columns and windows.
+ * and once more when there is a STRING column, whatever the number of columns and windows, plus
+ * once per STRING column whose chars reach the large-strings threshold (its offsets are rebuilt).
  * Everything queued on @p stream has run when it returns.
  *
  * @param windows The k windows; all share one schema.
@@ -170,5 +172,27 @@ std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windo
                                          rmm::cuda_stream_view stream,
                                          rmm::device_async_resource_ref mr,
                                          gather_read_back read_back = {});
+
+/// Test-only: out[i] = less(ia[i], ra[i], ib[i], rb[i]) of the comparator's device view. All
+/// spans have the same number of entries. Does not wait on the stream.
+void compare_pairs_for_test(const kway_key_comparator& cmp,
+                            cudf::device_span<const int32_t> ia,
+                            cudf::device_span<const cudf::size_type> ra,
+                            cudf::device_span<const int32_t> ib,
+                            cudf::device_span<const cudf::size_type> rb,
+                            cudf::device_span<uint8_t> out,
+                            rmm::cuda_stream_view stream);
+
+/// Test-only: tile_merge with @p sub_tiles sub-tiles per tile instead of the count chosen from
+/// the device (still capped as in tile_merge).
+void tile_merge_with_sub_tiles_for_test(const kway_key_comparator& cmp,
+                                        cudf::device_span<const cudf::size_type> lengths,
+                                        cudf::device_span<const cudf::size_type> tile_coranks,
+                                        cudf::size_type target,
+                                        cudf::size_type tile_rows,
+                                        cudf::device_span<std::int32_t> out_input,
+                                        cudf::device_span<cudf::size_type> out_row,
+                                        std::int32_t sub_tiles,
+                                        rmm::cuda_stream_view stream);
 
 }  // namespace sirius::op::merge::detail

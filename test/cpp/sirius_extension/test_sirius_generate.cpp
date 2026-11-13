@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
@@ -478,7 +479,16 @@ TEST_CASE_METHOD(GenerateFixture,
   {
     std::vector<std::thread> threads;
     for (std::size_t i = 0; i < num_connections; ++i) {
-      threads.emplace_back([&, i] { rows[i] = summed_row(*connections[i], query, errors[i]); });
+      // An exception that escapes a thread would terminate the whole test binary.
+      threads.emplace_back([&, i] {
+        try {
+          rows[i] = summed_row(*connections[i], query, errors[i]);
+        } catch (std::exception const& e) {
+          errors[i] = e.what();
+        } catch (...) {
+          errors[i] = "unknown exception";
+        }
+      });
     }
     for (auto& thread : threads) {
       thread.join();
@@ -562,7 +572,7 @@ TEST_CASE_METHOD(GenerateFixture,
   auto const stddev_d = std::sqrt(row[1].GetValue<double>() - mean_d * mean_d);
   CHECK(std::abs(stddev_d - 15.0) < 0.3);
   CHECK(std::abs(row[2].GetValue<double>() - (-20.0)) < 0.1);
-  // Eight sigma either side: far outside what 200,000 draws reach, but both tails are present.
+  // min and max lie past two sigma (both tails are present) and within eight (no outliers).
   CHECK(row[3].GetValue<std::int64_t>() > -60);
   CHECK(row[3].GetValue<std::int64_t>() < -30);
   CHECK(row[4].GetValue<std::int64_t>() < 20);
@@ -613,7 +623,7 @@ TEST_CASE_METHOD(GenerateFixture,
 
   auto groups = run_gpu("SELECT z, count(*) FROM " + source + " GROUP BY z");
   auto counts = values(*groups);
-  REQUIRE_FALSE(counts.empty());
+  REQUIRE(counts.size() >= 3);
   CHECK(counts.size() <= static_cast<std::size_t>(cardinality));
   std::sort(counts.begin(),
             counts.end(),

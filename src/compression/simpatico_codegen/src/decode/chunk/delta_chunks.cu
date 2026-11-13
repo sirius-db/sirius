@@ -17,11 +17,11 @@
 //                            the `runs` bitpack node holds the chunk's run lengths and chunk c of
 //                            the `values` node its run values, one per run; the lengths add up to
 //                            len - 1.
-
 //
 // The kernel reads delta_first and the per-chunk counts (the differences' chunk_count, or
 // rle_runs_offsets) from the staged payload bytes of the chunks it decodes, so a decode reads
-// nothing back to the host and keeps no per-chunk metadata of its own.
+// nothing back to the host itself; its bitpack children read their chunk metadata once, on the
+// first decode.
 
 #include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"

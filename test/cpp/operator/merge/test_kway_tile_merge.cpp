@@ -41,21 +41,6 @@
 #include <utility>
 #include <vector>
 
-namespace sirius::op::merge::detail {
-
-// Defined in kway_tile_merge.cu.
-void tile_merge_with_sub_tiles_for_test(const kway_key_comparator& cmp,
-                                        cudf::device_span<const cudf::size_type> lengths,
-                                        cudf::device_span<const cudf::size_type> tile_coranks,
-                                        cudf::size_type target,
-                                        cudf::size_type tile_rows,
-                                        cudf::device_span<std::int32_t> out_input,
-                                        cudf::device_span<cudf::size_type> out_row,
-                                        std::int32_t sub_tiles,
-                                        rmm::cuda_stream_view stream);
-
-}  // namespace sirius::op::merge::detail
-
 using namespace sirius::op::merge::detail;
 using namespace sirius::test;
 
@@ -307,7 +292,8 @@ TEST_CASE("tile merge matches the reference merged order", "[kway_tile_merge]")
     GENERATE(std::size_t{1}, std::size_t{2}, std::size_t{5}, std::size_t{64}, std::size_t{200});
   std::mt19937 rng(4200 + static_cast<unsigned>(k));
 
-  // About 6000 rows in total: several tiles of 2048 rows and hundreds of tiles of 7.
+  // Several thousand rows in total (more than 2048, checked below): several tiles of 2048 rows and
+  // hundreds of tiles of 7.
   const auto max_rows = static_cast<cudf::size_type>(2 * 6000 / k);
   auto lengths        = random_lengths(k, max_rows, rng);
   if (k > 5) {
@@ -425,6 +411,24 @@ TEST_CASE("tile merge handles one-row tiles and a tile larger than the target", 
   check_targets(data, {1, data.total_rows() + 100});
 }
 
+TEST_CASE("tile merge splits a tile only while the 16-bit selection counts fit",
+          "[kway_tile_merge]")
+{
+  // Every key is equal and input 1 is the wider one, so the first pivot of a sub-tile's selection
+  // is a row of input 1 and every row of input 0 inside the tile orders before it: the count kept
+  // for input 0 is its whole sub-range. A 65535-row tile is the largest that is split; a
+  // 65536-row tile and the single 140000-row tile, where that count is 66000, must not be.
+  std::mt19937 rng(65535);
+  const auto data = make_case(
+    int_windows({66000, 74000}, 1, 0.0, rng), {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  auto cmp = make_comparator(data);
+  REQUIRE(data.total_rows() == 140000);
+  for (const cudf::size_type tile_rows : {65535, 65536, 140000}) {
+    check_tile_merge(data, cmp, data.total_rows(), tile_rows, 4);
+    check_tile_merge(data, cmp, data.total_rows(), tile_rows);
+  }
+}
+
 TEST_CASE("tile merge ignores co-rank entries past the last boundary", "[kway_tile_merge]")
 {
   std::mt19937 rng(19);
@@ -502,8 +506,8 @@ TEST_CASE("tile merge rejects invalid arguments", "[kway_tile_merge]")
   std::mt19937 rng(9);
   auto stream = cudf::get_default_stream();
 
-  auto run = [&](const merge_case& data,
-                 const kway_key_comparator& cmp,
+  // Returns the two output buffers, out_input then out_row.
+  auto run = [&](const kway_key_comparator& cmp,
                  std::size_t num_lengths,
                  std::size_t num_coranks,
                  cudf::size_type target,
@@ -521,8 +525,7 @@ TEST_CASE("tile merge rejects invalid arguments", "[kway_tile_merge]")
                cudf::device_span<std::int32_t>(out_input.data(), out_input.size()),
                cudf::device_span<cudf::size_type>(out_row.data(), out_row.size()),
                stream);
-    stream.sync();
-    (void)data;
+    return std::pair{to_host(out_input), to_host(out_row)};
   };
 
   SECTION("sizes that do not match")
@@ -531,14 +534,17 @@ TEST_CASE("tile merge rejects invalid arguments", "[kway_tile_merge]")
       int_windows({20, 20}, 10, 0.0, rng), {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
     auto cmp = make_comparator(data);
     // 40 rows in tiles of 7: 6 tiles, 7 boundaries, 14 co-ranks. All-zero co-ranks are valid
-    // input sizes; the merge then emits nothing.
-    CHECK_NOTHROW(run(data, cmp, 2, 14, 40, 7, 40));
-    CHECK_THROWS_AS(run(data, cmp, 3, 14, 40, 7, 40), std::invalid_argument);
-    CHECK_THROWS_AS(run(data, cmp, 2, 13, 40, 7, 40), std::invalid_argument);
-    CHECK_THROWS_AS(run(data, cmp, 2, 14, 40, 7, 39), std::invalid_argument);
-    CHECK_THROWS_AS(run(data, cmp, 2, 14, 40, 0, 40), std::invalid_argument);
-    CHECK_THROWS_AS(run(data, cmp, 2, 14, 40, -1, 40), std::invalid_argument);
-    CHECK_THROWS_AS(run(data, cmp, 2, 14, -1, 7, 40), std::invalid_argument);
+    // input sizes but cover no row of any tile: the merge emits nothing instead of reading past
+    // the empty sub-ranges.
+    const auto [got_input, got_row] = run(cmp, 2, 14, 40, 7, 40);
+    CHECK(got_input == std::vector<std::int32_t>(40, kUntouched));
+    CHECK(got_row == std::vector<cudf::size_type>(40, kUntouched));
+    CHECK_THROWS_AS(run(cmp, 3, 14, 40, 7, 40), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, 2, 13, 40, 7, 40), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, 2, 14, 40, 7, 39), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, 2, 14, 40, 0, 40), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, 2, 14, 40, -1, 40), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, 2, 14, -1, 7, 40), std::invalid_argument);
   }
 
   SECTION("more inputs than the supported fan-in")
@@ -548,6 +554,6 @@ TEST_CASE("tile merge rejects invalid arguments", "[kway_tile_merge]")
                                     {cudf::order::ASCENDING},
                                     {cudf::null_order::AFTER});
     auto cmp            = make_comparator(data);
-    CHECK_THROWS_AS(run(data, cmp, k, 2 * k, 10, 2048, 10), std::invalid_argument);
+    CHECK_THROWS_AS(run(cmp, k, 2 * k, 10, 2048, 10), std::invalid_argument);
   }
 }

@@ -98,12 +98,6 @@ namespace utils = sirius::test::operator_utils;
 constexpr std::size_t kMiB = std::size_t{1} << 20;
 constexpr std::size_t kGiB = std::size_t{1} << 30;
 
-bool has_gpu()
-{
-  int count = 0;
-  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
-
 // ---------------------------------------------------------------------------
 // Memory: one GPU space with a software limit, a host space and a disk space
 // ---------------------------------------------------------------------------
@@ -169,13 +163,6 @@ struct fault_fixture {
 };
 
 Tier tier_of(cucascade::data_batch& batch) { return batch.to_read_only().get_current_tier(); }
-
-template <typename Representation>
-bool holds(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
-}
 
 /// Converts @p batch in place; blocks until no task holds a lock on it.
 template <typename Representation>
@@ -864,161 +851,250 @@ TEST_CASE("windowed merge follows a run across GPU, HOST and DISK between tasks"
 // 2. Downgrade during a merge
 // ---------------------------------------------------------------------------
 
-TEST_CASE("merge sort stays exact while the downgrade executor spills its runs",
-          "[merge_sort_faults]")
-{
-  if (!has_gpu()) { SKIP("No GPU available"); }
-  constexpr std::size_t num_partitions = 3;
-  constexpr std::size_t runs_per_part  = 4;
-  constexpr std::size_t rows_per_run   = 60000;
-  auto const query                     = sirius::make_query_id(1);
+namespace {
 
+/// What a downgrade race sets up: the merge's input, and the merge tasks that race the spills.
+struct race_settings {
+  std::size_t num_partitions = 3;
+  std::size_t runs_per_part  = 4;
+  std::size_t rows_per_run   = 60000;
+  merge::merge_settings merge;
+  std::size_t workers = 2;
+};
+
+/**
+ * @brief The windowed MERGE_SORT of @p Repository's runs on worker threads while the downgrade
+ * executor of the GPU space spills from another thread.
+ *
+ * The constructor builds the runs (and a bystander repository of another operator, registered
+ * first), wires the residency policy the way repository wiring does, and checks that a sweep
+ * before the merge takes the merge's runs, not the bystander's. run() races the merge with the
+ * spills and records what happened; a worker that throws records the error and stops the others.
+ */
+template <typename Repository>
+struct downgrade_race {
   fault_fixture fx;
   sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(query);
   sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(query);
-
-  // A repository of some other operator, registered first: with equal priorities the sweep
-  // would spill it before the merge's input.
-  auto bystander_owner = std::make_unique<cucascade::shared_data_repository>();
+  /// Owned by the query's repository manager.
+  Repository* repo = nullptr;
   std::vector<test_run> bystanders;
-  for (std::size_t i = 0; i < 4; ++i) {
-    bystanders.push_back(add_sorted_run(
-      *bystander_owner,
-      *fx.gpu,
-      random_rows(rows_per_run, 1000, 0, static_cast<std::uint32_t>(90 + i))->view()));
-  }
-  auto merge_owner = std::make_unique<cucascade::shared_data_repository>();
-  auto& repo       = *merge_owner;
-  repo.set_num_partitions(num_partitions);
-  std::vector<std::vector<test_run>> runs(num_partitions);
+  std::vector<std::vector<test_run>> runs;
+  std::unique_ptr<sirius_physical_merge_sort> op;
+  merge_output output;
   std::size_t run_bytes = 0;
-  for (std::size_t p = 0; p < num_partitions; ++p) {
-    for (std::size_t r = 0; r < runs_per_part; ++r) {
-      auto const index = p * runs_per_part + r;
-      runs[p].push_back(add_sorted_run(repo,
-                                       *fx.gpu,
-                                       random_rows(rows_per_run,
-                                                   20000,
-                                                   static_cast<std::int64_t>(index * rows_per_run),
-                                                   static_cast<std::uint32_t>(100 + index))
-                                         ->view(),
-                                       p));
-      run_bytes = sirius::get_batch_rows_and_bytes(*runs[p].back().batches[0]).bytes;
+
+  // What run() saw.
+  std::atomic<std::size_t> tasks_started{0};
+  std::atomic<std::size_t> tasks_done{0};
+  std::atomic<std::size_t> freed_during_merge{0};
+  std::atomic<std::size_t> requests_during_merge{0};
+  /// Intermediate runs the spiller found off the GPU, summed over its requests.
+  std::atomic<std::size_t> intermediate_off_gpu{0};
+  std::string error;
+
+  explicit downgrade_race(race_settings settings) : _settings(std::move(settings))
+  {
+    auto const query = sirius::make_query_id(1);
+    lifecycle.open_query(query);
+    auto& repo_mgr = *repo_registry.create_for_query(query);
+
+    // A repository of some other operator, registered first: with equal priorities the sweep
+    // would spill it before the merge's input.
+    auto bystander_owner = std::make_unique<cucascade::shared_data_repository>();
+    for (std::size_t i = 0; i < 4; ++i) {
+      bystanders.push_back(add_sorted_run(
+        *bystander_owner,
+        *fx.gpu,
+        random_rows(_settings.rows_per_run, 1000, 0, static_cast<std::uint32_t>(90 + i))->view()));
     }
+    auto merge_owner = std::make_unique<Repository>();
+    repo             = merge_owner.get();
+    repo->set_num_partitions(_settings.num_partitions);
+    runs.resize(_settings.num_partitions);
+    for (std::size_t p = 0; p < _settings.num_partitions; ++p) {
+      for (std::size_t r = 0; r < _settings.runs_per_part; ++r) {
+        auto const index = p * _settings.runs_per_part + r;
+        runs[p].push_back(
+          add_sorted_run(*repo,
+                         *fx.gpu,
+                         random_rows(_settings.rows_per_run,
+                                     20000,
+                                     static_cast<std::int64_t>(index * _settings.rows_per_run),
+                                     static_cast<std::uint32_t>(100 + index))
+                           ->view(),
+                         p));
+        run_bytes = sirius::get_batch_rows_and_bytes(*runs[p].back().batches[0]).bytes;
+      }
+    }
+
+    op = make_merge(*repo, _settings.merge);
+    // What repository wiring copies onto the input repository of a windowed sort.
+    auto const policy = op->input_residency_policy("default");
+    REQUIRE(policy.downgrade_priority == 100);
+    REQUIRE_FALSE(policy.materialize_inputs_on_gpu);
+    repo->set_downgrade_priority(policy.downgrade_priority);
+    repo_mgr.add_new_repository(1, "out", std::move(bystander_owner));
+    repo_mgr.add_new_repository(2, "default", std::move(merge_owner));
   }
 
-  auto op = make_merge(
-    repo,
-    {.mode = sirius::sort_merge_mode::windowed, .window_rows = 2048, .output_bytes = 256 * 1024});
-  // What repository wiring copies onto the input repository of a windowed sort.
-  auto const policy = op->input_residency_policy("default");
-  REQUIRE(policy.downgrade_priority == 100);
-  REQUIRE_FALSE(policy.materialize_inputs_on_gpu);
-  repo.set_downgrade_priority(policy.downgrade_priority);
-  repo_mgr.add_new_repository(1, "out", std::move(bystander_owner));
-  repo_mgr.add_new_repository(2, "default", std::move(merge_owner));
+  /// Runs every merge task while the downgrade executor spills; returns once the merge is done or
+  /// a worker failed.
+  void run()
+  {
+    sirius::exec::downgrade_executor_config config{
+      .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+      .monitor_period = std::chrono::milliseconds{0}};
+    sirius::parallel::downgrade_executor downgrader(
+      lifecycle,
+      config,
+      repo_registry,
+      cucascade::memory::memory_space_id(Tier::GPU, 0),
+      fx.gpu,
+      *fx.manager);
+    downgrader.start();
+    struct stop_downgrader {
+      sirius::parallel::downgrade_executor& downgrader;
+      ~stop_downgrader() { downgrader.stop(); }
+    } stop_at_exit{downgrader};
 
-  auto const count_on = [](const std::vector<test_run>& group, Tier tier) {
+    // Before the merge starts: the sweep takes the merge's runs, not the bystander's batches.
+    REQUIRE(downgrader.request_free_memory_and_wait(3 * run_bytes) > 0);
+    REQUIRE(merge_runs_off_gpu() >= 1);
+    REQUIRE(count_on(bystanders, Tier::GPU) == bystanders.size());
+
+    std::atomic<int> in_flight{0};
+    std::atomic<bool> failed{false};
+    std::atomic<bool> merge_done{false};
+    std::mutex error_mutex;
+    auto const fail = [&](std::string what) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (error.empty()) { error = std::move(what); }
+      failed.store(true);
+    };
+    auto const worker = [&] {
+      bool holding = false;  // whether this worker's in_flight count is taken
+      try {
+        rmm::cuda_stream stream;
+        ::cuda::stream_ref const stream_ref{stream.value()};
+        while (!failed.load()) {
+          in_flight.fetch_add(1);
+          holding    = true;
+          auto input = op->get_next_task_input_data();
+          if (!input) {
+            // Nothing to arm: either every partition has a task in flight, or the merge is done.
+            holding = false;
+            if (in_flight.fetch_sub(1) == 1) { break; }
+            std::this_thread::yield();
+            continue;
+          }
+          tasks_started.fetch_add(1);
+          input->prepare_for_processing(fx.gpu, stream_ref);
+          std::unique_ptr<operator_data> result;
+          {
+            struct in_execute {
+              in_execute() { t_in_merge_execute = true; }
+              ~in_execute() { t_in_merge_execute = false; }
+            } scope;
+            result = op->execute(*input, stream_ref);
+          }
+          if (!result) { throw std::runtime_error("a merge task returned no output"); }
+          output.add(*result);
+          tasks_done.fetch_add(1);
+          holding = false;
+          in_flight.fetch_sub(1);
+        }
+      } catch (const std::exception& e) {
+        fail(e.what());
+      } catch (...) {
+        fail("unknown error in a merge task");
+      }
+      // A failed task leaves its partition owned; release the count so no other worker spins on
+      // it forever.
+      if (holding) { in_flight.fetch_sub(1); }
+    };
+
+    // The downgrade requests race the merge tasks from here on.
+    std::thread spiller([&] {
+      try {
+        while (!merge_done.load()) {
+          auto const freed = downgrader.request_free_memory_and_wait(run_bytes);
+          if (tasks_started.load() > 0 && !merge_done.load()) {
+            freed_during_merge.fetch_add(freed);
+            requests_during_merge.fetch_add(1);
+          }
+          if constexpr (requires(Repository& r) { r.count_intermediate_off_gpu(); }) {
+            intermediate_off_gpu.fetch_add(repo->count_intermediate_off_gpu());
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      } catch (const std::exception& e) {
+        fail(std::string{"downgrade request failed: "} + e.what());
+      }
+    });
+    std::vector<std::thread> workers;
+    for (std::size_t i = 0; i < _settings.workers; ++i) {
+      workers.emplace_back(worker);
+    }
+    for (auto& thread : workers) {
+      thread.join();
+    }
+    merge_done.store(true);
+    spiller.join();
+  }
+
+  [[nodiscard]] static std::size_t count_on(const std::vector<test_run>& group, Tier tier)
+  {
     return static_cast<std::size_t>(std::count_if(
       group.begin(), group.end(), [tier](auto& run) { return tier_of(*run.batches[0]) == tier; }));
-  };
-  auto const merge_runs_off_gpu = [&] {
+  }
+
+  [[nodiscard]] std::size_t merge_runs_off_gpu() const
+  {
     std::size_t total = 0;
     for (auto const& group : runs) {
       total += group.size() - count_on(group, Tier::GPU);
     }
     return total;
-  };
+  }
 
-  sirius::exec::downgrade_executor_config config{
-    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
-    .monitor_period = std::chrono::milliseconds{0}};
-  sirius::parallel::downgrade_executor downgrader(lifecycle,
-                                                  config,
-                                                  repo_registry,
-                                                  cucascade::memory::memory_space_id(Tier::GPU, 0),
-                                                  fx.gpu,
-                                                  *fx.manager);
-  downgrader.start();
+ private:
+  race_settings _settings;
+};
 
-  // Before the merge starts: the sweep takes the merge's runs, not the bystander's batches.
-  REQUIRE(downgrader.request_free_memory_and_wait(3 * run_bytes) > 0);
-  REQUIRE(merge_runs_off_gpu() >= 1);
-  REQUIRE(count_on(bystanders, Tier::GPU) == bystanders.size());
+}  // namespace
 
-  merge_output output;
-  std::atomic<std::size_t> tasks_started{0};
-  std::atomic<std::size_t> tasks_done{0};
-  std::atomic<int> in_flight{0};
-  std::atomic<bool> merge_done{false};
-  std::mutex error_mutex;
-  std::string error;
-  auto const worker = [&] {
-    try {
-      rmm::cuda_stream stream;
-      ::cuda::stream_ref const stream_ref{stream.value()};
-      while (true) {
-        in_flight.fetch_add(1);
-        auto input = op->get_next_task_input_data();
-        if (!input) {
-          // Nothing to arm: either every partition has a task in flight, or the merge is done.
-          if (in_flight.fetch_sub(1) == 1) { break; }
-          std::this_thread::yield();
-          continue;
-        }
-        tasks_started.fetch_add(1);
-        input->prepare_for_processing(fx.gpu, stream_ref);
-        auto result = op->execute(*input, stream_ref);
-        output.add(*result);
-        tasks_done.fetch_add(1);
-        in_flight.fetch_sub(1);
-      }
-    } catch (const std::exception& e) {
-      std::lock_guard<std::mutex> lock(error_mutex);
-      error = e.what();
-    }
-  };
-
-  // The downgrade requests race the merge tasks from here on.
-  std::atomic<std::size_t> freed_during_merge{0};
-  std::atomic<std::size_t> requests_during_merge{0};
-  std::thread spiller([&] {
-    while (!merge_done.load()) {
-      auto const freed = downgrader.request_free_memory_and_wait(run_bytes);
-      if (tasks_started.load() > 0 && !merge_done.load()) {
-        freed_during_merge.fetch_add(freed);
-        requests_during_merge.fetch_add(1);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+TEST_CASE("merge sort stays exact while the downgrade executor spills its runs",
+          "[merge_sort_faults]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  constexpr std::size_t num_partitions = 3;
+  downgrade_race<cucascade::shared_data_repository> race({
+    .num_partitions = num_partitions,
+    .runs_per_part  = 4,
+    .rows_per_run   = 60000,
+    .merge          = {.mode         = sirius::sort_merge_mode::windowed,
+                       .window_rows  = 2048,
+                       .output_bytes = 256 * 1024},
+    .workers        = 2,
   });
-  std::vector<std::thread> workers;
-  for (int i = 0; i < 2; ++i) {
-    workers.emplace_back(worker);
-  }
-  for (auto& thread : workers) {
-    thread.join();
-  }
-  merge_done.store(true);
-  spiller.join();
-  downgrader.stop();
 
-  INFO("merge error: " << error);
-  REQUIRE(error.empty());
+  race.run();
+
+  INFO("merge error: " << race.error);
+  REQUIRE(race.error.empty());
   // Several tasks per partition, with downgrades landing between and during them.
-  CHECK(tasks_done.load() > num_partitions);
-  CHECK(requests_during_merge.load() > 0);
-  CHECK(freed_during_merge.load() > 0);
+  CHECK(race.tasks_done.load() > num_partitions);
+  CHECK(race.requests_during_merge.load() > 0);
+  CHECK(race.freed_during_merge.load() > 0);
   // Every run was read to its end and popped.
-  CHECK(repo.total_size() == 0);
-  REQUIRE_FALSE(op->get_next_task_input_data());
+  CHECK(race.repo->total_size() == 0);
+  REQUIRE_FALSE(race.op->get_next_task_input_data());
 
   for (std::size_t p = 0; p < num_partitions; ++p) {
     CAPTURE(p);
-    auto const expected = expected_full_sort(runs[p], ascending_key());
-    auto const merged   = output.partition_table(p);
+    auto const expected = expected_full_sort(race.runs[p], ascending_key());
+    auto const merged   = race.output.partition_table(p);
     REQUIRE(merged->num_rows() == expected->num_rows());
     REQUIRE(tables_equal(merged->view(), expected->view()));
   }
@@ -1079,175 +1155,46 @@ TEST_CASE("merge sort fan-in passes stay exact while the downgrade executor spil
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
   constexpr std::size_t num_partitions = 3;
-  constexpr std::size_t runs_per_part  = 6;
-  constexpr std::size_t rows_per_run   = 30000;
-  auto const query                     = sirius::make_query_id(1);
-
-  fault_fixture fx;
-  sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(query);
-  sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(query);
-
-  // A repository of some other operator, registered first: with equal priorities the sweep
-  // would spill it before the merge's input.
-  auto bystander_owner = std::make_unique<cucascade::shared_data_repository>();
-  std::vector<test_run> bystanders;
-  for (std::size_t i = 0; i < 4; ++i) {
-    bystanders.push_back(add_sorted_run(
-      *bystander_owner,
-      *fx.gpu,
-      random_rows(rows_per_run, 1000, 0, static_cast<std::uint32_t>(90 + i))->view()));
-  }
-  auto merge_owner = std::make_unique<intermediate_run_repository>();
-  auto& repo       = *merge_owner;
-  repo.set_num_partitions(num_partitions);
-  std::vector<std::vector<test_run>> runs(num_partitions);
-  std::size_t run_bytes = 0;
-  for (std::size_t p = 0; p < num_partitions; ++p) {
-    for (std::size_t r = 0; r < runs_per_part; ++r) {
-      auto const index = p * runs_per_part + r;
-      runs[p].push_back(add_sorted_run(repo,
-                                       *fx.gpu,
-                                       random_rows(rows_per_run,
-                                                   20000,
-                                                   static_cast<std::int64_t>(index * rows_per_run),
-                                                   static_cast<std::uint32_t>(100 + index))
-                                         ->view(),
-                                       p));
-      run_bytes = sirius::get_batch_rows_and_bytes(*runs[p].back().batches[0]).bytes;
-    }
-  }
-
-  auto op = make_merge(repo,
-                       {.mode         = sirius::sort_merge_mode::windowed,
-                        .window_rows  = 2048,
-                        .output_bytes = 256 * 1024,
-                        .max_fan_in   = 2});
-  // What repository wiring copies onto the input repository of a windowed sort.
-  auto const policy = op->input_residency_policy("default");
-  REQUIRE(policy.downgrade_priority == 100);
-  REQUIRE_FALSE(policy.materialize_inputs_on_gpu);
-  repo.set_downgrade_priority(policy.downgrade_priority);
-  repo_mgr.add_new_repository(1, "out", std::move(bystander_owner));
-  repo_mgr.add_new_repository(2, "default", std::move(merge_owner));
-
-  auto const count_on = [](const std::vector<test_run>& group, Tier tier) {
-    return static_cast<std::size_t>(std::count_if(
-      group.begin(), group.end(), [tier](auto& run) { return tier_of(*run.batches[0]) == tier; }));
-  };
-  auto const merge_runs_off_gpu = [&] {
-    std::size_t total = 0;
-    for (auto const& group : runs) {
-      total += group.size() - count_on(group, Tier::GPU);
-    }
-    return total;
-  };
-
-  sirius::exec::downgrade_executor_config config{
-    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
-    .monitor_period = std::chrono::milliseconds{0}};
-  sirius::parallel::downgrade_executor downgrader(lifecycle,
-                                                  config,
-                                                  repo_registry,
-                                                  cucascade::memory::memory_space_id(Tier::GPU, 0),
-                                                  fx.gpu,
-                                                  *fx.manager);
-  downgrader.start();
-
-  // Before the merge starts: the sweep takes the merge's runs, not the bystander's batches.
-  REQUIRE(downgrader.request_free_memory_and_wait(3 * run_bytes) > 0);
-  REQUIRE(merge_runs_off_gpu() >= 1);
-  REQUIRE(count_on(bystanders, Tier::GPU) == bystanders.size());
-
-  merge_output output;
-  std::atomic<std::size_t> tasks_started{0};
-  std::atomic<std::size_t> tasks_done{0};
-  std::atomic<int> in_flight{0};
-  std::atomic<bool> merge_done{false};
-  std::mutex error_mutex;
-  std::string error;
-  auto const worker = [&] {
-    try {
-      rmm::cuda_stream stream;
-      ::cuda::stream_ref const stream_ref{stream.value()};
-      while (true) {
-        in_flight.fetch_add(1);
-        auto input = op->get_next_task_input_data();
-        if (!input) {
-          // Nothing to arm: either every partition has a task in flight, or the merge is done.
-          if (in_flight.fetch_sub(1) == 1) { break; }
-          std::this_thread::yield();
-          continue;
-        }
-        tasks_started.fetch_add(1);
-        input->prepare_for_processing(fx.gpu, stream_ref);
-        t_in_merge_execute = true;
-        auto result        = op->execute(*input, stream_ref);
-        t_in_merge_execute = false;
-        output.add(*result);
-        tasks_done.fetch_add(1);
-        in_flight.fetch_sub(1);
-      }
-    } catch (const std::exception& e) {
-      std::lock_guard<std::mutex> lock(error_mutex);
-      error = e.what();
-    }
-  };
-
-  // The downgrade requests race the merge tasks from here on.
-  std::atomic<std::size_t> freed_during_merge{0};
-  std::atomic<std::size_t> requests_during_merge{0};
-  std::atomic<std::size_t> intermediate_off_gpu{0};
-  std::thread spiller([&] {
-    while (!merge_done.load()) {
-      auto const freed = downgrader.request_free_memory_and_wait(run_bytes);
-      if (tasks_started.load() > 0 && !merge_done.load()) {
-        freed_during_merge.fetch_add(freed);
-        requests_during_merge.fetch_add(1);
-      }
-      intermediate_off_gpu.fetch_add(repo.count_intermediate_off_gpu());
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+  downgrade_race<intermediate_run_repository> race({
+    .num_partitions = num_partitions,
+    .runs_per_part  = 6,
+    .rows_per_run   = 30000,
+    .merge          = {.mode         = sirius::sort_merge_mode::windowed,
+                       .window_rows  = 2048,
+                       .output_bytes = 256 * 1024,
+                       .max_fan_in   = 2},
+    .workers        = 3,
   });
-  std::vector<std::thread> workers;
-  for (int i = 0; i < 3; ++i) {
-    workers.emplace_back(worker);
-  }
-  for (auto& thread : workers) {
-    thread.join();
-  }
-  merge_done.store(true);
-  spiller.join();
-  downgrader.stop();
 
-  INFO("merge error: " << error);
-  REQUIRE(error.empty());
+  race.run();
+
+  INFO("merge error: " << race.error);
+  REQUIRE(race.error.empty());
   // Several tasks per partition, with downgrades landing between and during them.
-  CHECK(tasks_done.load() > num_partitions);
-  CHECK(requests_during_merge.load() > 0);
-  CHECK(freed_during_merge.load() > 0);
+  CHECK(race.tasks_done.load() > num_partitions);
+  CHECK(race.requests_during_merge.load() > 0);
+  CHECK(race.freed_during_merge.load() > 0);
   // Every run, the intermediate ones included, was read to its end and popped.
-  CHECK(repo.total_size() == 0);
-  REQUIRE_FALSE(op->get_next_task_input_data());
+  CHECK(race.repo->total_size() == 0);
+  REQUIRE_FALSE(race.op->get_next_task_input_data());
   // Six runs under a fan-in of two take four intermediate merges and then the final one, and
   // the sweep caught intermediate runs between the task that wrote them and the one that read
   // them.
-  auto const counters = op->counters();
+  auto const counters = race.op->counters();
   CHECK(counters.windowed_partitions == num_partitions);
   CHECK(counters.intermediate_tasks >= 4 * num_partitions);
-  CHECK(repo.intermediate_runs() >= 4 * num_partitions);
-  CHECK(intermediate_off_gpu.load() > 0);
+  CHECK(race.repo->intermediate_runs() >= 4 * num_partitions);
+  CHECK(race.intermediate_off_gpu.load() > 0);
 
   for (std::size_t p = 0; p < num_partitions; ++p) {
     CAPTURE(p);
     // A pass reorders runs, so rows with equal keys need not keep the run order: compare the
     // key order, and the rows as a set (ids are unique).
-    auto const merged = output.partition_table(p);
+    auto const merged = race.output.partition_table(p);
     auto const keys   = cudf::table_view{{merged->view().column(0)}};
     REQUIRE(cudf::is_sorted(keys, {cudf::order::ASCENDING}, {cudf::null_order::AFTER}));
     std::vector<cudf::table_view> inputs;
-    for (auto const& run : runs[p]) {
+    for (auto const& run : race.runs[p]) {
       inputs.push_back(run.rows->view());
     }
     auto const all      = cudf::concatenate(inputs);
@@ -1331,7 +1278,7 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   if (!has_gpu()) { SKIP("No GPU available"); }
   constexpr std::size_t window_rows  = 8192;
   constexpr std::size_t output_bytes = 32 * kMiB;
-  constexpr std::size_t rows_per_run = 650'000;  // 4 runs x 16 bytes: 41.6 MiB, two chunks
+  constexpr std::size_t rows_per_run = 650'000;  // 4 runs x 16 bytes: ~39.7 MiB, two chunks
   constexpr std::size_t round_bytes  = window_rows * 16;
   constexpr std::size_t free_room    = 4 * kMiB;
   constexpr std::size_t oom_attempts = 2;
@@ -1385,7 +1332,8 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   // The failed attempts emitted nothing: one chunk per completed task.
   REQUIRE(s.output.num_chunks() == 2);
   // The first attempt continued the kept merger, which its failure destroyed; each retry built
-  // its own, for its smaller windows, and only the one that completed was counted and kept.
+  // its own, for its smaller windows (both counted in mergers_built); only the attempt that
+  // completed counts as a windowed task and keeps its merger.
   auto const after_retries = s.op->counters();
   CHECK(after_retries.mergers_built == 1 + oom_attempts);
   CHECK(after_retries.windowed_tasks == 2);

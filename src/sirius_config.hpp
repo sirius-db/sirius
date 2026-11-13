@@ -83,6 +83,14 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
 /// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
 /// more runs is merged in passes.
+///
+/// The value trades two costs. A task's window budget is shared by the runs it reads, so a higher
+/// fan-in means fewer rows per window and more refills per run. A lower fan-in means more
+/// partitions need an intermediate pass, which rewrites their rows (and may spill them again).
+/// 64 is a conservative choice, not a tuned one: two passes cover 64 * 64 = 4096 runs. It is only
+/// an upper bound: op::merge::derive_merge_config lowers the fan-in further when the task budget
+/// cannot hold that many windows at the window-row floor, and clamps it to the kernel's limit
+/// (op::merge::kMaxKwayMergeInputs).
 inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 64;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
@@ -152,12 +160,11 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 
 }  // namespace config
 
-/// Merge path for MERGE_SORT. one_shot is the legacy concat-then-merge path, kept for A/B
-/// testing against the windowed path.
+/// Merge path for MERGE_SORT: the windowed k-way merge, or one_shot's concat-then-merge.
 enum class sort_merge_mode : uint8_t {
   automatic,  ///< "auto": windowed under memory pressure or when any input is not on the GPU
   windowed,   ///< "windowed": always the windowed k-way merge
-  one_shot,   ///< "one_shot": always the legacy concat-then-merge
+  one_shot,   ///< "one_shot": always concat-then-merge
 };
 
 /// Parse a sort_merge_mode setting value: "auto", "windowed" or "one_shot", case-insensitive.

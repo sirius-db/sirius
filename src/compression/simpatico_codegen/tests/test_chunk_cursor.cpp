@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // compressed_column_cursor / decompress_column_chunks: plan classification, payload staging,
-// span validation and decoder dispatch.
+// span validation, and decoding real spill-plan columns through the cursor.
 //
-// The descriptions are built by hand, so nothing here depends on a real encoder or decoder.
-// Values decoded through the cursor are checked by test_chunk_decode_equivalence.
+// Sections 1-3 use hand-built descriptions; sections 4-6 compress real columns with the spill
+// plans and decode windows through the cursor, comparing them with the full decode. Equivalence
+// across every plan and dtype is checked by test_chunk_decode_equivalence.
 
 #include "api/chunk_decode.hpp"
 #include "chunk_test_utils.hpp"
@@ -652,48 +653,7 @@ void test_span_validation()
   expect(source->reads.empty(), "span: rejected calls read no payload");
 }
 
-// ─── 4. Dispatch ────────────────────────────────────────────────────────────
-
-// Each spill plan must reach its own decoder factory. While a factory is still the placeholder
-// that throws std::logic_error("not implemented: <factory>"), the factory named by the error
-// proves the routing. Once the real factory has landed, the hand-built description here need not
-// satisfy it; decoding through the cursor is then checked by test_chunk_decode_equivalence.
-void expect_dispatch(hpln_column_description col, char const* factory)
-{
-  auto const stream = rmm::cuda_stream_default;
-  auto source       = std::make_shared<recording_source>(pattern_bytes(kPayloadSize));
-  try {
-    compressed_column_cursor cursor{
-      describe(std::move(col)), 0, source, stream, rmm::mr::get_current_device_resource_ref()};
-    std::printf("  %s: real decoder, supported=%d\n", factory, cursor.supported() ? 1 : 0);
-  } catch (std::logic_error const& e) {
-    std::string const what = e.what();
-    if (what.find("not implemented") == std::string::npos) {
-      std::printf("  %s: real decoder rejected the hand-built column: %s\n", factory, e.what());
-      return;
-    }
-    if (what.find(factory) == std::string::npos) {
-      throw std::runtime_error(std::string{"dispatch: expected "} + factory + ", got '" + what +
-                               "'");
-    }
-    std::printf("  %s: routed to the placeholder\n", factory);
-  } catch (std::runtime_error const& e) {
-    std::printf("  %s: real decoder rejected the hand-built column: %s\n", factory, e.what());
-  }
-  expect(source->reads.empty(), "dispatch: building a cursor reads no payload");
-}
-
-void test_dispatch()
-{
-  expect_dispatch(bitpack_column(), "make_bitpack_decoder");
-  expect_dispatch(delta_bitpack_column(), "make_delta_decoder");
-  expect_dispatch(delta_rle_bitpack_column(), "make_delta_decoder");
-  expect_dispatch(dictionary_column(), "make_dictionary_decoder");
-  expect_dispatch(str_split_column(), "make_str_split_decoder");
-  expect_dispatch(stored_column(), "make_stored_decoder");
-}
-
-// ─── 5. Real spill-plan graphs ──────────────────────────────────────────────
+// ─── 4. Real spill-plan graphs ──────────────────────────────────────────────
 
 // The hand-built graphs above mirror what the .hpln header holds; these compress real columns
 // with the spill plans and check that the classifier and the staging agree with what
@@ -813,15 +773,11 @@ void test_real_plan(real_case const& c)
   check(staged == chunk_test::payload_size(col), "real plan: buffers cover the payload, " + what);
   check(chunk::staged_bytes_held(*access) == staged, "real plan: bytes held, " + what);
 
-  // The cursor over the real description: routed to a factory, nothing read eagerly.
+  // The cursor over the real description: its decoder supports the column, nothing read eagerly.
   auto cursor_source = std::make_shared<recording_source>(payload);
-  try {
+  {
     compressed_column_cursor cursor{desc, 0, cursor_source, stream, mr};
-    std::printf("  %s: real decoder, supported=%d\n", c.what, cursor.supported() ? 1 : 0);
-  } catch (std::logic_error const& e) {
-    check(std::string{e.what()}.find("not implemented: make_") != std::string::npos,
-          "real plan: cursor of " + what + " failed with '" + e.what() + "'");
-    std::printf("  %s: routed to the placeholder (%s)\n", c.what, e.what());
+    check(cursor.supported(), "real plan: the cursor supports " + what);
   }
   check(cursor_source->reads.empty(), "real plan: building a cursor reads no payload, " + what);
 }
@@ -833,7 +789,7 @@ void test_real_plans()
   }
 }
 
-// ─── 6. Windowed reads through the cursor from a host payload ───────────────
+// ─── 5. Windowed reads through the cursor from a host payload ───────────────
 
 /// Device bytes a cursor over a stored column may hold between calls.
 constexpr std::size_t kStoredStateBytes = 64;
@@ -869,12 +825,9 @@ void test_windowed_read(real_case const& c)
   rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(rows), stream, mr};
   cuda_check(cudaMemsetAsync(mask.data(), 0, mask.size(), stream.value()));
 
-  try {
+  {
     compressed_column_cursor cursor{describe(col), 0, source, stream, mr};
-    if (!cursor.supported()) {
-      std::printf("  %s: windowed read skipped, the decoder refuses the column\n", c.what);
-      return;
-    }
+    check(cursor.supported(), "windowed read: the cursor supports " + what);
     cudf::size_type done   = 0;
     std::int64_t bytes_out = 0;
     for (cudf::size_type const end : {700, 1900, rows}) {
@@ -911,10 +864,6 @@ void test_windowed_read(real_case const& c)
     std::printf("  %s: three windows decoded from a host payload, %zu device bytes held\n",
                 c.what,
                 cursor.device_bytes_held());
-  } catch (std::logic_error const& e) {
-    check(std::string{e.what()}.find("not implemented") != std::string::npos,
-          "windowed read: " + what + " failed with '" + e.what() + "'");
-    std::printf("  %s: windowed read skipped (%s)\n", c.what, e.what());
   }
 }
 
@@ -925,7 +874,7 @@ void test_windowed_reads()
   }
 }
 
-// ─── 7. A long column leaves the cursor a window-sized footprint ────────────
+// ─── 6. A long column leaves the cursor a window-sized footprint ────────────
 
 constexpr cudf::size_type kWalkWindowChunks = 4;
 /// Device bytes a cursor may hold between calls for decoder scratch, per row of its windows.
@@ -1031,7 +980,6 @@ int main()
     test_kept_dictionary_keys();
     test_device_resident();
     test_span_validation();
-    test_dispatch();
     test_real_plans();
     test_windowed_reads();
     test_long_walk_footprint();

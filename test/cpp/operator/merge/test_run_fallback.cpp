@@ -17,6 +17,7 @@
 // The windowed merge's whole-batch fallback: a run batch that cannot be read by row range is
 // converted once, in place, to an uncompressed table in the merge task's GPU space.
 
+#include "operator/merge/merge_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -28,7 +29,6 @@
 
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
-#include <compression/spill_compression.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -50,6 +50,7 @@ namespace {
 
 namespace utils = sirius::test::operator_utils;
 using sirius::op::merge::detail::convert_run_batch_to_gpu;
+using sirius::test::merge_utils::scoped_spill_compression;
 
 constexpr std::size_t num_rows = 200'000;
 
@@ -60,18 +61,6 @@ bool has_gpu()
 }
 
 rmm::cuda_stream_view stream_view() { return rmm::cuda_stream_view{utils::default_stream().get()}; }
-
-/// Switches spill compression on for one test and off afterwards.
-struct scoped_spill_compression {
-  scoped_spill_compression()
-  {
-    sirius::compression::spill_compression_settings settings;
-    settings.enabled         = true;
-    settings.min_batch_bytes = 0;
-    sirius::compression::set_spill_compression_settings(settings);
-  }
-  ~scoped_spill_compression() { sirius::compression::set_spill_compression_settings({}); }
-};
 
 /// The host copy of a run batch's two columns.
 struct run_values {
@@ -146,7 +135,7 @@ run_values read_values(cucascade::data_batch& batch)
 
 TEST_CASE("run fallback: a packed host batch is converted in place to the GPU", "[run_fallback]")
 {
-  if (!has_gpu()) { return; }
+  if (!has_gpu()) { SKIP("No GPU available"); }
   utils::tiered_memory_fixture fx;
   REQUIRE(fx.setup());
   run_values expected;
@@ -176,7 +165,7 @@ TEST_CASE("run fallback: a packed host batch is converted in place to the GPU", 
 
 TEST_CASE("run fallback: a spill-compressed host batch is decoded to the GPU", "[run_fallback]")
 {
-  if (!has_gpu()) { return; }
+  if (!has_gpu()) { SKIP("No GPU available"); }
   utils::tiered_memory_fixture fx;
   REQUIRE(fx.setup());
   scoped_spill_compression compression;
@@ -204,7 +193,7 @@ TEST_CASE("run fallback: a spill-compressed host batch is decoded to the GPU", "
 
 TEST_CASE("run fallback: a batch already on the GPU is left alone", "[run_fallback]")
 {
-  if (!has_gpu()) { return; }
+  if (!has_gpu()) { SKIP("No GPU available"); }
   utils::tiered_memory_fixture fx;
   REQUIRE(fx.setup());
   run_values expected;
@@ -233,7 +222,7 @@ TEST_CASE("run fallback: a batch already on the GPU is left alone", "[run_fallba
 
 TEST_CASE("run fallback: the conversion waits for a reader of the batch", "[run_fallback]")
 {
-  if (!has_gpu()) { return; }
+  if (!has_gpu()) { SKIP("No GPU available"); }
   utils::tiered_memory_fixture fx;
   REQUIRE(fx.setup());
   run_values expected;
@@ -259,7 +248,7 @@ TEST_CASE("run fallback: the conversion waits for a reader of the batch", "[run_
 
 TEST_CASE("run fallback: the target must be a GPU space", "[run_fallback]")
 {
-  if (!has_gpu()) { return; }
+  if (!has_gpu()) { SKIP("No GPU available"); }
   utils::tiered_memory_fixture fx;
   REQUIRE(fx.setup());
   run_values expected;

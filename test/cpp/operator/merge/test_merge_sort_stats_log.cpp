@@ -184,7 +184,7 @@ struct stats_log_fixture {
   }
 };
 
-/// The merge-sort statistics lines among @p records, which must all be at INFO.
+/// The merge-sort statistics lines among the records of @p log, which must all be at INFO.
 std::vector<std::string> stats_lines(const sirius::test::scoped_recording_log_sink& log)
 {
   std::vector<std::string> lines;
@@ -405,7 +405,7 @@ TEST_CASE("one-shot merge sort logs one statistics line when its last task commi
 TEST_CASE("merge sort in automatic mode logs one line for one-shot and windowed partitions",
           "[merge_sort_stats_log]")
 {
-  // 0.0001 of the 8 GiB budget is about 860 KiB: the small partition merges one-shot, the large
+  // 0.0001 of the 8 GiB budget is about 840 KiB: the small partition merges one-shot, the large
   // one windowed.
   stats_log_fixture test({.mode                  = sirius::sort_merge_mode::automatic,
                           .window_rows           = 1024,
@@ -565,7 +565,7 @@ TEST_CASE("merge sort driven from four threads logs exactly one statistics line"
     std::size_t one_shot_partitions;
     std::size_t windowed_partitions;
   };
-  // Automatic: 0.0001 of the 8 GiB budget is about 860 KiB, so the small partitions merge
+  // Automatic: 0.0001 of the 8 GiB budget is about 840 KiB, so the small partitions merge
   // one-shot and the large ones windowed.
   auto const which = GENERATE(as<std::string>{}, "automatic", "windowed", "one_shot");
   auto const scen =

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
+#include "log/logging.hpp"
 
 #include <utility>
 
@@ -123,12 +124,19 @@ duckdb::unique_ptr<duckdb::FunctionData> discard_copy_bind(
 
 // The CPU body. DuckDB's COPY operator counts the rows it hands to the sink and returns that
 // count, so the callbacks below only have to drop the data. No state is kept and the file path
-// is ignored.
+// is ignored. The order is not checked here: the rows arrive on several threads and the ORDER BY
+// keys are not part of the bind data.
 duckdb::unique_ptr<duckdb::GlobalFunctionData> discard_copy_initialize_global(
   duckdb::ClientContext& /*context*/,
-  duckdb::FunctionData& /*bind_data*/,
+  duckdb::FunctionData& bind_data,
   const duckdb::string& /*file_path*/)
 {
+  // Runs once per COPY that DuckDB executes: gpu_execution off, or a fallback from the GPU.
+  if (bind_data.Cast<discard_copy_bind_data>().check_order) {
+    SIRIUS_LOG_WARN(
+      "sirius_discard: check_order disabled, the COPY runs on the CPU path, where the order is not "
+      "checked");
+  }
   return duckdb::make_uniq<duckdb::GlobalFunctionData>();
 }
 

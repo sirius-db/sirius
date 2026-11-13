@@ -15,6 +15,7 @@
  */
 
 #include "compression/simpatico_compressed_representation.hpp"
+#include "log/logging.hpp"
 #include "op/merge/detail/run_fallback.hpp"
 #include "op/merge/detail/window_buffer.hpp"
 #include "op/merge/windowed_merge.hpp"
@@ -168,21 +169,27 @@ struct round_windows {
   ~round_windows()
   {
     for (auto& run : runs) {
-      release_gpu(run);
+      // A destructor cannot report the failure. record_reader_event synchronizes the stream
+      // before it throws, so no read is left untracked.
+      try {
+        release_gpu(run);
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_WARN("windowed merge: recording the read of a GPU batch failed: {}", e.what());
+      } catch (...) {
+        SIRIUS_LOG_WARN("windowed merge: recording the read of a GPU batch failed");
+      }
     }
   }
 
   /// Drops the GPU read lock of @p run, ordering later writers after the work enqueued on stream.
-  void release_gpu(run_window& run) noexcept
+  /// The lock is dropped also when recording the read throws.
+  void release_gpu(run_window& run)
   {
     if (!run.gpu_lock) { return; }
-    try {
-      run.gpu_lock->record_reader_event(stream);
-    } catch (...) {
-      // record_reader_event synchronizes the stream before it throws, so no read is left untracked.
-    }
+    const auto lock = std::move(*run.gpu_lock);
     run.gpu_lock.reset();
     run.gpu_view = cudf::table_view{};
+    lock.record_reader_event(stream);
   }
 };
 
@@ -199,6 +206,7 @@ struct windowed_merger::impl {
   const cucascade::row_range_reader_registry* readers;
   cucascade::memory::memory_space* gpu_space;
   bounded_merge_fn merge;
+  run_fallback_fn convert;
   std::vector<std::size_t> string_cols;  // positions in fetch order of the STRING columns
   std::size_t fixed_row_bytes{0};        // bytes per row of the fixed-width fetched columns
   std::vector<buffered_run> buffered;    // one per run; kept across run() calls
@@ -287,6 +295,26 @@ struct windowed_merger::impl {
     run.window = slice_rows(run.gpu_view, begin, std::min(begin + cfg.window_rows, batch_rows));
   }
 
+  /// True when the rows buffered for @p run's current batch make this round's window: no copy
+  /// and no read. A window below the rows wanted is truncated.
+  [[nodiscard]] bool buffered_enough(const run_window& run, const buffered_run& held) const
+  {
+    const auto batch_rows = run.cursor.run.batch_rows[run.cursor.batch];
+    const auto wanted     = std::min(cfg.window_rows, batch_rows - run.cursor.row);
+    return held.available() >= std::min(wanted, held.low_water) ||
+           (held.refill_blocked && held.available() > 0);
+  }
+
+  /// Compact: carries the unread tail (less than half of the rows held) to the front, once.
+  static void compact(buffered_run& held, rmm::cuda_stream_view stream, merge_round_stats& stats)
+  {
+    if (held.start == 0) { return; }
+    held.view = cudf::table_view{};
+    held.buffer->consume(held.start, stream);
+    stats.compacted_rows += held.buffer->size();
+    held.start = 0;
+  }
+
   /// Sets run.window to at most window_rows rows of the run's current batch, from the cursor on.
   void fill_window(run_window& run,
                    std::size_t run_idx,
@@ -302,10 +330,7 @@ struct windowed_merger::impl {
     auto& held            = buffered[run_idx];
     const auto& batch     = runs[run_idx][run.cursor.batch];
     const auto batch_rows = run.cursor.run.batch_rows[run.cursor.batch];
-    const auto wanted     = std::min(cfg.window_rows, batch_rows - run.cursor.row);
-    // Enough rows are buffered: no copy and no read. A window below `wanted` is truncated.
-    if (held.available() >= std::min(wanted, held.low_water) ||
-        (held.refill_blocked && held.available() > 0)) {
+    if (buffered_enough(run, held)) {
       run.window = slice_rows(held.view, held.start, held.buffer->size());
       return;
     }
@@ -341,21 +366,17 @@ struct windowed_merger::impl {
               stream,
               mr);
           }
-          // Compact: carry the unread tail (less than half of the rows held) to the front, once.
+          compact(held, stream, stats);  // already done by run() for a buffer it kept
           held.view = cudf::table_view{};
-          held.buffer->consume(held.start, stream);
-          stats.compacted_rows += held.buffer->size();
-          held.start = 0;
           if (held.buffer->size() == 0) { held.buffer->set_null_free(null_free_columns(*data)); }
           const auto carried   = held.buffer->size();
           const auto requested = held.buffer->capacity_rows() - carried;
           try {
-            // window_buffer grows its STRING slots once per call and then reports a row that still
+            // window_buffer grows its STRING chars once per call and then reports a row that still
             // does not fit. With a tail in the buffer the tail is the window (truncated) and the
             // refill waits until it is consumed; an empty buffer is grown until the row fits.
             std::optional<cucascade::row_range_result> read;
             while (!read) {
-              const auto bytes_before   = held.buffer->device_bytes();
               const auto growths_before = held.buffer->chars_growths();
               try {
                 read = held.buffer->refill(*readers,
@@ -373,7 +394,8 @@ struct windowed_merger::impl {
                   ++stats.refill_truncated;
                   break;
                 }
-                if (held.buffer->device_bytes() <= bytes_before) { throw; }
+                // The chars cannot grow any further: the row will never fit.
+                if (held.buffer->chars_growths() == growths_before) { throw; }
               }
             }
             if (read) {
@@ -413,6 +435,21 @@ struct windowed_merger::impl {
                 run.cursor.batch,
                 batch_rows);
             }
+            // The buffer holds the rows of the batch from the cursor on. A reader that delivers
+            // rows past the cursor's row count, or ends before it, disagrees with the run: the
+            // cursor would cross into the next batch at the wrong row.
+            const auto buffered_end = run.cursor.row + held.buffer->size();
+            if (buffered_end > batch_rows ||
+                (read && read->source_exhausted && buffered_end != batch_rows)) {
+              throw sirius::internal_exception(
+                "windowed merge: batch {} of run {} was read up to row {}{}, its cursor expects {} "
+                "rows",
+                run.cursor.batch,
+                run_idx,
+                buffered_end,
+                read && read->source_exhausted ? " (its end)" : "",
+                batch_rows);
+            }
             held.view  = held.buffer->view();
             run.window = held.view;
             return;
@@ -423,9 +460,7 @@ struct windowed_merger::impl {
       }
       // No reader can serve this batch. The read lock is released: the conversion locks the batch
       // exclusively.
-      if (detail::convert_run_batch_to_gpu(*batch, *gpu_space, stream)) {
-        ++stats.fallback_conversions;
-      }
+      if (convert(*batch, *gpu_space, stream)) { ++stats.fallback_conversions; }
     }
     throw sirius::internal_exception(
       "windowed merge: batch {} of run {} could not be read or kept on the GPU after {} attempts",
@@ -448,7 +483,8 @@ struct windowed_merger::impl {
     if (!run.gpu_lock) { held.start += consumed; }  // no copy: the next window starts further in
     if (run.cursor.batch == batch_before) { return; }
     // The batch is finished. A window never spans batches, so every buffered row was consumed and
-    // the next batch refills into the empty buffer. A finished run gives its buffer back.
+    // the next batch refills into the empty buffer. A finished run gives its buffer back. A read
+    // that cannot be recorded fails the run().
     windows.release_gpu(run);
     if (run.cursor.exhausted()) {
       held.release();
@@ -471,12 +507,9 @@ struct windowed_merger::impl {
                                    rmm::device_async_resource_ref mr,
                                    merge_round_stats* stats)
   {
-    // The readers take their device memory from the resource of a scratch reservation: the
-    // temporaries of a refill and, for a compressed batch, the decode state kept in the run's
-    // reader state. An empty reservation of the task's GPU space names that space's allocator,
-    // which charges what is allocated on `stream` to the task, like the windows. It reserves no
-    // bytes and no reader draws on it; it lives for this call only, so that no reservation of
-    // the merger is left open between two tasks.
+    // An empty reservation of the task's GPU space: the readers allocate through its allocator,
+    // which charges allocations on `stream` to the task. Scoped to this call so that no
+    // reservation of the merger stays open between two tasks.
     const auto scratch = gpu_space->make_reservation_upto(0);
 
     // Everything below works on copies; the caller's cursors and stats change only on return.
@@ -524,6 +557,16 @@ struct windowed_merger::impl {
       active.clear();
       round_views.clear();
       truncated.clear();
+      // Compact every buffer this round refills before the first refill. A refill of a STRING
+      // window waits for its own compaction to run (window_buffer reads back the chars end), and
+      // only for the work enqueued before it: issued here, the compactions of all runs are
+      // behind one wait per round, and no refill waits for the read of the run before it.
+      for (std::size_t i = 0; i < windows.runs.size(); ++i) {
+        const auto& run = windows.runs[i];
+        auto& held      = buffered[i];
+        if (run.cursor.exhausted() || run.gpu_lock || !held.buffer) { continue; }
+        if (!buffered_enough(run, held)) { compact(held, stream, local); }
+      }
       // Every window is topped up before each merge, so no truncated window is ever empty.
       for (std::size_t i = 0; i < windows.runs.size(); ++i) {
         auto& run = windows.runs[i];
@@ -629,7 +672,8 @@ windowed_merger::windowed_merger(
   window_config cfg,
   const cucascade::row_range_reader_registry& readers,
   cucascade::memory::memory_space& gpu_space,
-  bounded_merge_fn merge)
+  bounded_merge_fn merge,
+  run_fallback_fn convert)
 {
   if (runs.size() != cursors.size()) {
     throw std::invalid_argument("windowed_merger: runs and cursors differ in size");
@@ -673,6 +717,7 @@ windowed_merger::windowed_merger(
   _impl->readers     = &readers;
   _impl->gpu_space   = &gpu_space;
   _impl->merge       = std::move(merge);
+  _impl->convert = convert ? std::move(convert) : run_fallback_fn{detail::convert_run_batch_to_gpu};
 }
 
 void windowed_merger::rebase_consumed()

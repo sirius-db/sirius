@@ -29,6 +29,7 @@
 #include "op/scan/scan_output_operator_data.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "operator/operator_test_utils.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
@@ -66,83 +67,7 @@ namespace {
 
 bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
 
-/// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
-struct batch_lock_utils_fixture {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu0  = nullptr;
-  cucascade::memory::memory_space* gpu1  = nullptr;  // null on single-GPU fixtures
-  cucascade::memory::memory_space* host0 = nullptr;
-
-  bool setup(int num_gpus)
-  {
-    sirius::converter_registry::reset_for_testing();
-    try {
-      cucascade::memory::reservation_manager_configurator builder;
-      builder.set_number_of_gpus(num_gpus)
-        .set_gpu_usage_limit(256ULL << 20)
-        .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
-        .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
-      auto space_configs = builder.build();
-      manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-        std::move(space_configs));
-    } catch (cucascade::cuda_error const&) {
-      throw;
-    } catch (const std::exception&) {
-      return false;
-    }
-    sirius::converter_registry::initialize();
-
-    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    if (gpu_spaces.size() < static_cast<std::size_t>(num_gpus)) { return false; }
-    gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-    if (num_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
-    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) { return false; }
-    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    return true;
-  }
-
-  ~batch_lock_utils_fixture()
-  {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-  }
-
-  /// Single INT64 column of random data, resident on `space`.
-  std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
-                                                        cucascade::memory::memory_space& space,
-                                                        ::cuda::stream_ref stream)
-  {
-    auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                            {cudf::data_type{cudf::type_id::INT64}},
-                                                            {std::make_pair(0, 1000000)},
-                                                            stream,
-                                                            space.get_default_allocator());
-    stream.sync();
-    return sirius::make_data_batch(
-      std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
-  }
-
-  /// GPU batch converted in place to the host representation (spilled-batch shape).
-  std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
-                                                         ::cuda::stream_ref stream)
-  {
-    auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
-    auto& registry = sirius::converter_registry::get();
-    {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
-    }
-    stream.sync();
-    return batch;
-  }
-};
+using sirius::test::operator_utils::tiered_memory_fixture;
 
 /// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
 /// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
@@ -213,18 +138,18 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-constexpr std::size_t kNumRows = 4096;
+constexpr std::size_t kNumRows = tiered_memory_fixture::default_num_rows;
 
 }  // namespace
 
 TEST_CASE("operator-data provenance retains original input order through preparation and moves",
           "[batch_lock_utils][dynamic_filter][task_input_provenance]")
 {
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(1));
   rmm::cuda_stream stream;
-  auto first  = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
-  auto second = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto first  = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
+  auto second = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
   std::vector<std::uint64_t> const expected{second->get_batch_id(), first->get_batch_id()};
   sirius::op::pipelineable_operator_data input({second, first});
   auto require_ids = [&expected](auto const& data) {
@@ -245,10 +170,10 @@ TEST_CASE("scan receipt identity survives real cross-GPU replacements",
           "[batch_lock_utils][multi_gpu][consumer_integration][scan_receipt]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
   auto const source_stream = f.gpu0->acquire_stream();
-  auto source              = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto source              = f.make_gpu_batch(*f.gpu0, source_stream, kNumRows);
   auto const original_id   = source->get_batch_id();
   auto channel             = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   class receipt_identity_filter final : public sirius::op::sirius_dynamic_filter {
@@ -282,10 +207,10 @@ TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM resch
           "[batch_lock_utils][mgpu][multi_gpu][dynamic_filter][task_input_provenance]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
   auto const source_stream = f.gpu0->acquire_stream();
-  auto source              = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto source              = f.make_gpu_batch(*f.gpu0, source_stream, kNumRows);
   auto const original_id   = source->get_batch_id();
   auto input               = std::make_unique<sirius::op::pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{source});
@@ -331,11 +256,11 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
   REQUIRE(batch != nullptr);
   const auto source_id = batch->get_batch_id();
   std::size_t source_bytes;
@@ -376,11 +301,11 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
 
   // Hold a shared lock on the source for the entire duration of the cross-GPU prepare —
   // modelling a probe task on another GPU sharing a build batch. The in-place convert_to
@@ -411,11 +336,11 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
 
 TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock_utils]")
 {
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(1));
 
   rmm::cuda_stream stream;
-  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch           = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
   const auto source_id = batch->get_batch_id();
   std::vector<int64_t> source_values;
   {
@@ -452,12 +377,12 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
 TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
           "[batch_lock_utils]")
 {
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(1));
 
   rmm::cuda_stream stream1;
   rmm::cuda_stream stream2;
-  auto batch = f.make_host_batch(kNumRows, stream1);
+  auto batch = f.make_host_batch(stream1);
 
   // Two consumers of the same spilled batch racing to the same GPU space exercise the
   // post-readonly_to_mutable re-dispatch: the exclusive-lock winner converts in place, the
@@ -530,7 +455,7 @@ std::vector<int32_t> expected_list_values(std::size_t num_lists)
 /// lock_or_prepare_batch — i.e. a GPU-resident batch that went through the H2D
 /// reconstruction (which promotes LIST offsets to INT64) and the move path's
 /// normalize_gpu_list_offsets fixup. Returned idle.
-std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock_utils_fixture& f,
+std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(tiered_memory_fixture& f,
                                                                       std::size_t num_lists,
                                                                       ::cuda::stream_ref stream)
 {
@@ -554,7 +479,7 @@ std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock
 
 TEST_CASE("host to GPU upgrade normalizes LIST offsets to INT32", "[batch_lock_utils]")
 {
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(1));
 
   rmm::cuda_stream stream;
@@ -574,7 +499,7 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets",
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
@@ -604,11 +529,11 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
 
   sirius::op::pipelineable_operator_data op_data(
     std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
@@ -641,11 +566,11 @@ TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target spa
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
   std::size_t uncompressed_bytes;
   {
     auto ro            = batch->to_read_only();
@@ -668,13 +593,13 @@ TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
           "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
   std::weak_ptr<cucascade::data_batch> source_weak;
   auto op_data = [&]() {
-    auto batch  = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+    auto batch  = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
     source_weak = batch;
     return std::make_unique<sirius::op::pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
@@ -698,11 +623,11 @@ TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
 TEST_CASE("cached scan on its assigned GPU reuses the pin without a copy",
           "[batch_lock_utils][cached_scan_placement]")
 {
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(1));
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, stream, kNumRows);
   auto input = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
   auto* scan = input.get();
   sirius::pipeline::gpu_pipeline_task_local_state state(std::move(input));
@@ -717,11 +642,11 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
           "[batch_lock_utils][cached_scan_placement][multi_gpu]")
 {
   if (skip_if_not_mgpu()) return;
-  batch_lock_utils_fixture f;
+  tiered_memory_fixture f;
   REQUIRE(f.setup(2));
   rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
   rmm::cuda_stream source_stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto batch = f.make_gpu_batch(*f.gpu0, source_stream, kNumRows);
   // Model another query reading the same pin throughout preparation.
   auto source = batch->to_read_only();
   auto values =

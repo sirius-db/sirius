@@ -166,7 +166,6 @@ kway_key_device_view device_view_of(const kway_key_comparator& cmp)
                               state.num_columns};
 }
 
-/// Test hook: out[i] = less(ia[i], ra[i], ib[i], rb[i]). Declared by the comparator's unit test.
 void compare_pairs_for_test(const kway_key_comparator& cmp,
                             cudf::device_span<const int32_t> ia,
                             cudf::device_span<const cudf::size_type> ra,

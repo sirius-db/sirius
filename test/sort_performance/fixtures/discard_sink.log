@@ -1,2 +1,2 @@
 [2026-11-12 10:18:00.000] [info] [140500] [merge_sort][stats] op=7 rounds=3 rows_out=1500300
-[2026-11-12 10:18:00.100] [info] [140500] [discard_sink] rows=1500300 bytes=12002400 order_violations=0
+[2026-11-12 10:18:00.100] [info] [140500] [discard_sink] rows=1500300 bytes=12002400 order_violations=0 order_checked=1 ranges_checked=12

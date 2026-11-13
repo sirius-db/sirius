@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,15 @@
  * @brief Planning of `COPY (query) TO … (FORMAT sirius_discard)`: the query's plan ends in
  *        DISCARD_SINK → ungrouped SUM of the per-batch counts → the result collector, the sink's
  *        input port streams (PIPELINE barrier), `check_order` carries the ORDER BY keys into the
- *        sink, and every other COPY format still declines to DuckDB.
+ *        sink or is turned off with a WARN, the planned MERGE_SORT gets its device-budget provider,
+ *        and every other COPY format still declines to DuckDB.
  */
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_discard_sink.hpp"
+#include "op/sirius_physical_merge_sort.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -33,6 +35,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -62,7 +65,8 @@ constexpr char const* kSource =
   "{name: 'k2', type: 'BIGINT', dist: 'uniform', p1: 0, p2: 1000, cardinality: 0, "
   "null_fraction: 0.0}])";
 
-/// The path is never opened by the discard format.
+/// COPY of @p query to sirius_discard; @p options is appended after the FORMAT name, so it starts
+/// with a comma (", check_order true"). The path is never opened.
 std::string discard_copy(std::string const& query, std::string const& options = "")
 {
   return "COPY (" + query + ") TO '/nonexistent/sirius_discard_plan' (FORMAT sirius_discard" +
@@ -146,7 +150,8 @@ sirius_physical_discard_sink& sink_of(sirius_physical_operator& root)
   }
 }
 
-/// Order violations the sink counts within one task holding @p batch.
+/// Order violations the sink counts within one task holding @p batch at sort position @p position;
+/// seams between tasks are checked only at finalize.
 std::uint64_t violations_in(sirius_physical_discard_sink& sink,
                             std::shared_ptr<cucascade::data_batch> batch,
                             std::size_t position)
@@ -155,6 +160,16 @@ std::uint64_t violations_in(sirius_physical_discard_sink& sink,
   sirius::op::pipelineable_operator_data input({std::move(batch)}, position);
   sink.execute(input, sirius::test::operator_utils::default_stream());
   return sink.order_violations() - before;
+}
+
+/// Whether the planner logged, at WARN, that a requested order check is not done.
+bool warned_order_unchecked(sirius::test::scoped_recording_log_sink const& log)
+{
+  auto const records = log.records();
+  return std::any_of(records.begin(), records.end(), [](auto const& record) {
+    return record.level == sirius::log::level::warn &&
+           record.message.rfind("sirius_discard: check_order disabled", 0) == 0;
+  });
 }
 
 const sirius::pipeline::sirius_pipeline* pipeline_starting_at(
@@ -223,6 +238,20 @@ TEST_CASE("sirius_discard COPY of an ORDER BY plans MERGE_SORT into a streaming 
     CHECK_FALSE(sink.is_source());
   }
 
+  SECTION("the MERGE_SORT sizes its windows from the context's device budget")
+  {
+    // Without the provider the operator falls back to a space hint and the default executor
+    // width, so the configured num_threads and the real GPU budget would never reach the sort.
+    auto physical = fixture.plan(sql);
+    REQUIRE(physical);
+    auto* node = physical.get();
+    while (node->type != T::MERGE_SORT) {
+      REQUIRE(node->children.size() == 1);
+      node = node->children.front().get();
+    }
+    CHECK(node->Cast<sirius::op::sirius_physical_merge_sort>().has_device_budget_provider());
+  }
+
   SECTION("the MERGE_SORT -> DISCARD_SINK port is a PIPELINE barrier")
   {
     CHECK(discard_input_barriers(fixture.con, sql, T::MERGE_SORT) ==
@@ -259,9 +288,12 @@ TEST_CASE("sirius_discard check_order carries the ORDER BY keys into the sink",
 
   SECTION("check_order true")
   {
+    sirius::test::scoped_recording_log_sink log("warn");
     auto physical = fixture.plan(discard_copy(query, ", check_order true"));
-    auto& sink    = sink_of(*physical);
+    CHECK_FALSE(warned_order_unchecked(log));
+    auto& sink = sink_of(*physical);
     CHECK(sink.options().check_order);
+    CHECK(sink.order_checked());
     CHECK(sink.options().key_columns == std::vector<cudf::size_type>{1, 0});
     CHECK(sink.options().column_order ==
           std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
@@ -272,12 +304,17 @@ TEST_CASE("sirius_discard check_order carries the ORDER BY keys into the sink",
     CHECK(violations_in(sink, fixture.batch({0, 1, 2}, {5, 9, 9}), 1) == 1);
     // k1 ties with k2 descending: the second key.
     CHECK(violations_in(sink, fixture.batch({2, 1, 0}, {9, 9, 5}), 2) == 1);
+    CHECK(sink.ranges_checked() == 3);
   }
 
   SECTION("check_order false")
   {
+    sirius::test::scoped_recording_log_sink log("warn");
     auto physical = fixture.plan(discard_copy(query, ", check_order false"));
+    // Not asked for, so nothing to warn about.
+    CHECK_FALSE(warned_order_unchecked(log));
     CHECK_FALSE(sink_of(*physical).options().check_order);
+    CHECK_FALSE(sink_of(*physical).order_checked());
     CHECK(violations_in(sink_of(*physical), fixture.batch({0, 1, 2}, {5, 9, 9}), 0) == 0);
   }
 
@@ -288,19 +325,25 @@ TEST_CASE("sirius_discard check_order carries the ORDER BY keys into the sink",
   }
 }
 
-TEST_CASE("sirius_discard check_order is off when the ORDER BY keys are not output columns",
-          "[planner][discard_copy_plan][shared_context]")
+TEST_CASE(
+  "sirius_discard check_order is off, with a WARN, when the ORDER BY keys are not output "
+  "columns",
+  "[planner][discard_copy_plan][shared_context]")
 {
   discard_copy_plan_fixture fixture;
   auto const from = std::string(" FROM ") + kSource;
   // Descending in both columns: a violation for any ascending key the sink might check.
   auto const descending = [&] { return fixture.batch({2, 1, 0}, {9, 5, 3}); };
+  // The user asked for the check: a plan that cannot do it says so, in the log and on the sink.
+  sirius::test::scoped_recording_log_sink log("warn");
 
   SECTION("control: a plain column key is checked")
   {
     auto physical =
       fixture.plan(discard_copy("SELECT k1, k2" + from + " ORDER BY k1", ", check_order true"));
     CHECK(violations_in(sink_of(*physical), descending(), 0) == 1);
+    CHECK(sink_of(*physical).order_checked());
+    CHECK_FALSE(warned_order_unchecked(log));
   }
 
   SECTION("expression key")
@@ -308,6 +351,9 @@ TEST_CASE("sirius_discard check_order is off when the ORDER BY keys are not outp
     auto physical = fixture.plan(
       discard_copy("SELECT k1, k2" + from + " ORDER BY k1 + k2", ", check_order true"));
     CHECK(violations_in(sink_of(*physical), descending(), 0) == 0);
+    CHECK_FALSE(sink_of(*physical).order_checked());
+    CHECK(sink_of(*physical).ranges_checked() == 0);
+    CHECK(warned_order_unchecked(log));
   }
 
   SECTION("key dropped from the output")
@@ -317,6 +363,8 @@ TEST_CASE("sirius_discard check_order is off when the ORDER BY keys are not outp
       discard_copy("SELECT k2, k2 + 1 AS k3" + from + " ORDER BY k1", ", check_order true"));
     REQUIRE(sink_of(*physical).children.front()->types.size() == 2);
     CHECK(violations_in(sink_of(*physical), descending(), 0) == 0);
+    CHECK_FALSE(sink_of(*physical).order_checked());
+    CHECK(warned_order_unchecked(log));
   }
 
   SECTION("ORDER BY with LIMIT: the root is not an ORDER BY")
@@ -324,6 +372,8 @@ TEST_CASE("sirius_discard check_order is off when the ORDER BY keys are not outp
     auto physical = fixture.plan(
       discard_copy("SELECT k1, k2" + from + " ORDER BY k1 LIMIT 10", ", check_order true"));
     CHECK(violations_in(sink_of(*physical), descending(), 0) == 0);
+    CHECK_FALSE(sink_of(*physical).order_checked());
+    CHECK(warned_order_unchecked(log));
   }
 }
 
@@ -347,8 +397,11 @@ TEST_CASE("sirius_discard COPY of a query without ORDER BY plans with the order 
   discard_copy_plan_fixture fixture;
   auto const sql = discard_copy(std::string("SELECT k1, k2 FROM ") + kSource, ", check_order true");
 
+  sirius::test::scoped_recording_log_sink log("warn");
   auto physical = fixture.plan(sql);
   REQUIRE(physical);
+  CHECK(warned_order_unchecked(log));
+  CHECK_FALSE(sink_of(*physical).order_checked());
   auto const chain = chain_of(*physical);
   REQUIRE(chain.size() >= 5);
   CHECK(std::vector<T>(chain.begin(), chain.begin() + 4) ==
@@ -357,15 +410,23 @@ TEST_CASE("sirius_discard COPY of a query without ORDER BY plans with the order 
   // Nothing to check against: unsorted input is not a violation.
   CHECK(violations_in(sink_of(*physical), fixture.batch({3, 1, 2}, {5, 9, 1}), 0) == 0);
 
-  // Whatever feeds the sink across pipelines streams into it.
+  // With no MERGE_SORT to end a pipeline below it, the sink is fused into its source's pipeline:
+  // no pipeline starts at it and no repository feeds it, so its input cannot wait behind a barrier.
   sirius::test::with_conversion_result(fixture.con, sql, [](auto const& result) {
-    auto const* discard = pipeline_starting_at(result.scheduled_pipelines, T::DISCARD_SINK);
-    if (discard == nullptr) { return; }  // the sink runs in its source's pipeline
-    for (auto const& wiring : result.repository_wirings) {
-      if (wiring.dest_pipeline.get() == discard) {
-        CHECK(wiring.barrier_type == MemoryBarrierType::PIPELINE);
+    CHECK(pipeline_starting_at(result.scheduled_pipelines, T::DISCARD_SINK) == nullptr);
+    std::vector<std::vector<T>> with_sink;
+    for (auto const& pipeline : result.scheduled_pipelines) {
+      std::vector<T> types;
+      for (auto const& op : pipeline->get_operators()) {
+        types.push_back(op.get().type);
+      }
+      if (std::find(types.begin(), types.end(), T::DISCARD_SINK) != types.end()) {
+        with_sink.push_back(std::move(types));
       }
     }
+    REQUIRE(with_sink.size() == 1);
+    CHECK(with_sink.front() ==
+          std::vector<T>{T::GENERATOR, T::DISCARD_SINK, T::UNGROUPED_AGGREGATE});
   });
 }
 

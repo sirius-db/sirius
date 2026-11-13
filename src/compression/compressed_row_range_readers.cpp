@@ -125,14 +125,21 @@ class tagged_payload_source final : public simpatico::payload_source {
     if (_event == nullptr) {
       CUCASCADE_ASSERT_CUDA_SUCCESS(cudaGetDevice(&_device));
       if (cudaEventCreateWithFlags(&_event, cudaEventDisableTiming) != cudaSuccess) {
-        // No event to wait on later: finish the work now.
+        // No event to wait on later: finish the work now. The failure is handled here, so it
+        // must not stay behind as the thread's last error for an unrelated check.
+        static_cast<void>(cudaGetLastError());
         _event = nullptr;
         CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream));
         return;
       }
     }
     _stream = stream;
-    CUCASCADE_ASSERT_CUDA_SUCCESS(cudaEventRecord(_event, stream));
+    if (cudaEventRecord(_event, stream) != cudaSuccess) {
+      // The event still marks an earlier read (or nothing), so a later wait on it would return
+      // before this read's work has run: finish the work now.
+      static_cast<void>(cudaGetLastError());
+      CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream));
+    }
   }
 
   /// Blocks until the device has run everything the reads so far enqueued.
@@ -207,6 +214,27 @@ const void* backing_store(const compressed_disk_representation& representation)
 {
   return &representation.path();
 }
+
+/// A device batch is read in place, so the decode kernels on @p stream dereference the batch's
+/// device pointers: without peer access that faults when the stream belongs to another GPU. The
+/// built-in GPU reader refuses such a read the same way (require_same_device in
+/// cucascade/src/cudf/row_range_reader_gpu.cpp), and the caller converts the batch instead.
+void require_same_device(const compressed_device_representation& representation,
+                         ::cuda::stream_ref stream)
+{
+  int stream_device = -1;
+  CUCASCADE_CUDA_TRY(cudaStreamGetDevice(stream.get(), &stream_device));
+  if (stream_device != representation.get_device_id()) {
+    throw row_range_unsupported_error(
+      "compressed row-range read: the compressed device batch lives on CUDA device " +
+      std::to_string(representation.get_device_id()) + " but the stream belongs to device " +
+      std::to_string(stream_device));
+  }
+}
+
+/// Host blocks and files are copied to the stream's device, whichever it is.
+void require_same_device(const compressed_host_representation&, ::cuda::stream_ref) {}
+void require_same_device(const compressed_disk_representation&, ::cuda::stream_ref) {}
 
 /// Records, when a read returns or throws, the end of what it enqueued on its stream.
 class read_recorder {
@@ -284,6 +312,7 @@ cucascade::row_range_result read_rows_compressed(
                                 " destinations for " + std::to_string(request.columns.size()) +
                                 " requested columns");
   }
+  require_same_device(*representation, stream);
   auto const num_rows = static_cast<std::size_t>(representation->num_rows());
   if (request.row_begin > num_rows) {
     throw std::out_of_range("compressed row-range read: row_begin " +
@@ -314,6 +343,12 @@ cucascade::row_range_result read_rows_compressed(
   // resource: it must still be alive, see compressed_reader_state). No device memory of the
   // state is then shared between two streams, every buffer is freed on the stream that last
   // used it, and nothing is ever allocated from the resource of an earlier call.
+  //
+  // A caller that takes a new stream per task (the windowed merger: one pool stream per merge
+  // task) therefore pays the wait and the rebuild of every cursor, prefix loads and dictionary
+  // keys included, on the first read of each task: the cursors are worth keeping only within
+  // one task. Carrying them over would take a cursor that can move its buffers to another
+  // stream, which simpatico::compressed_column_cursor does not offer.
   if (tagged.cursors_built_otherwise(stream.get(), mr)) {
     tagged.wait_for_reads();
     for (auto& cursor : state.cursors) {
@@ -385,7 +420,8 @@ cucascade::row_range_result read_rows_compressed(
       // Rule 1 for the mask slot: whole 32-bit words only, and a slot of more words than a row
       // count can address does not bound k. Keep in step with fit_rows
       // (cucascade/src/cudf/row_range_fit.cpp), which validate_request applies for the built-in
-      // readers.
+      // readers: both are private to cuCascade (src/cudf/row_range_detail.hpp), so they cannot
+      // be called from here.
       auto const mask_words = d.null_mask.capacity_bytes / sizeof(cudf::bitmask_type);
       auto const mask_rows  = mask_words > std::numeric_limits<std::size_t>::max() / 32
                                 ? std::numeric_limits<std::size_t>::max()
@@ -446,7 +482,8 @@ cucascade::row_range_result read_rows_compressed(
   // STRING columns first: only the decode knows how many rows of chars fit. A column that
   // delivers fewer rows lowers k for every column after it. The STRING columns before it have
   // then written past the final k, but their first k rows and k + 1 offsets are what a read of
-  // k rows writes, so they are not decoded again.
+  // k rows writes, so they are not decoded again (the exception to contract rules 3 and 4 that
+  // register_compressed_row_range_readers documents).
   for (auto& column : columns) {
     if (k == 0) { break; }
     if (column.is_string) { k = std::min(k, decode(column, k)); }

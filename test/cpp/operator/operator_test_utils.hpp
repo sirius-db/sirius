@@ -130,7 +130,8 @@ struct tiered_memory_fixture {
   cucascade::memory::memory_space* gpu1  = nullptr;  ///< Null unless set up with two GPUs.
   cucascade::memory::memory_space* host0 = nullptr;
 
-  /// Builds the manager; false if the memory spaces could not be created.
+  /// Builds the manager; false if the memory spaces could not be created. A CUDA error is rethrown
+  /// rather than reported as false, so a broken device fails the test instead of being skipped.
   bool setup(std::size_t n_gpus = 1)
   {
     try {

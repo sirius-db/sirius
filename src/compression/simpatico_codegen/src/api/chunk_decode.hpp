@@ -86,7 +86,10 @@ struct hpln_column_description {
 struct hpln_description {
   std::uint8_t version{0};
   std::vector<hpln_column_description> columns;
-  std::uint64_t payload_bytes{0};  ///< sum of all buffer sizes, validity masks included
+  /// Size of the payload region. For a parsed header: the sum of all buffer sizes, validity masks
+  /// included. For a relocated device-batch description: the extent from the lowest buffer to the
+  /// end of the last, gaps included.
+  std::uint64_t payload_bytes{0};
 };
 
 /// Parses a .hpln structural header (no payload bytes needed).
@@ -138,7 +141,9 @@ class unsupported_chunk_decode : public std::runtime_error {
 
 /// Per-(caller, batch, column) decode state: chunk-offset prefixes, dictionary keys, parsed ANS
 /// frame headers, grow-only scratch. Payload bytes staged for a decode call are freed when the
-/// call returns (dictionary keys excepted). Not thread-safe. One stream and one memory resource
+/// call returns (dictionary keys excepted; kept_staged_bytes_bound() bounds those). Stored values
+/// and chars are read straight into the destination and ANS chars pass through about 1 MiB at a
+/// time, so neither is staged whole. Not thread-safe. One stream and one memory resource
 /// for the cursor's life: its device buffers are allocated, used and freed on the stream of its
 /// decode calls, so a caller that changes stream (or resource) drops the cursor and builds a new
 /// one, as the Sirius row-range reader does.
@@ -147,7 +152,7 @@ class compressed_column_cursor {
   /// @param description Parsed header of the batch; shared with the caller.
   /// @param column      Index into description->columns.
   /// @param payload     Source of the batch's payload bytes.
-  /// @param stream      Stream any eager staging is enqueued on.
+  /// @param stream      Unused: nothing is staged at construction; decode calls take their own.
   /// @param mr          Allocates the staged bytes and the decoder state; must outlive the
   ///                    cursor.
   compressed_column_cursor(std::shared_ptr<const hpln_description> description,
@@ -192,5 +197,44 @@ cudf::size_type decompress_column_chunks(compressed_column_cursor& cursor,
                                          cudf::size_type take,
                                          column_write_target const& dst,
                                          rmm::cuda_stream_view stream);
+
+/// Most payload bytes a cursor over `column` keeps staged on the device for its whole life when
+/// the payload is not device resident: the buffers of its dictionary nodes' own leaves (the keys),
+/// staged by the first decode. A device-resident payload keeps none of them. Known from the
+/// header alone, so a caller can reserve for it before building the cursor; decoder state (see
+/// compressed_column_cursor::device_bytes_held) comes on top.
+[[nodiscard]] std::size_t kept_staged_bytes_bound(hpln_column_description const& column) noexcept;
+
+// ─── Direct leaf reads (for the chunk decoders; not part of the public API) ─
+
+namespace chunk {
+
+class leaf_access;
+
+/// Device pointer to bytes [offset, offset + size) of buffer `buffer` of leaf `leaf` when they
+/// are served without staging: in place for the cursor's access over a device-resident payload,
+/// and whatever device_bytes returns for any other leaf_access. nullptr when the cursor's access
+/// would have to stage them (the caller then reads what it needs with read_leaf_bytes), and for
+/// size == 0.
+const std::byte* unstaged_leaf_bytes(leaf_access& leaves,
+                                     std::size_t leaf,
+                                     std::size_t buffer,
+                                     std::uint64_t offset,
+                                     std::uint64_t size,
+                                     rmm::cuda_stream_view stream);
+
+/// Stream-ordered copy of bytes [offset, offset + size) of buffer `buffer` of leaf `leaf` into
+/// device memory at dst. The cursor's access reads them from its payload source straight into
+/// dst (device to device for a device-resident payload or bytes already staged), so no staging
+/// buffer is allocated; any other leaf_access copies from its device_bytes.
+void read_leaf_bytes(leaf_access& leaves,
+                     std::size_t leaf,
+                     std::size_t buffer,
+                     std::uint64_t offset,
+                     std::uint64_t size,
+                     void* dst,
+                     rmm::cuda_stream_view stream);
+
+}  // namespace chunk
 
 }  // namespace simpatico

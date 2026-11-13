@@ -2,7 +2,8 @@
 //
 // Tests for the partial ANS decode (chunk::make_ans_state / chunk::decode_ans_range): a byte
 // range of the str_split.chars leaf must decode to the same bytes as the whole-column decode
-// while fetching only the 64 KiB blocks that cover it (plus the frame header, once).
+// while fetching only the 64 KiB blocks that cover it (plus the frame header, once), with state
+// that stays one batch of blocks large, and rejecting a frame whose header is corrupt.
 //
 // Each test_* function throws std::runtime_error on failure; main() catches and
 // reports.
@@ -14,7 +15,13 @@
 
 #include <cuda/stream>
 
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -111,14 +118,14 @@ fixture make_fixture(column_options const& options)
   return f;
 }
 
-/// Decodes [begin, end) into a guarded device buffer (the destination starts `misalign` bytes
-/// past an allocation boundary) and checks the bytes, the guards and the request log.
-void decode_and_check(fixture& f,
-                      chunk::ans_state& state,
-                      std::uint64_t begin,
-                      std::uint64_t end,
-                      bool expect_header_read,
-                      std::size_t misalign = 0)
+/// Decodes [begin, end) through `leaves` into a guarded device buffer (the destination starts
+/// `misalign` bytes past an allocation boundary) and checks the bytes and the guards.
+void decode_guarded(fixture const& f,
+                    chunk::leaf_access& leaves,
+                    chunk::ans_state& state,
+                    std::uint64_t begin,
+                    std::uint64_t end,
+                    std::size_t misalign = 0)
 {
   rmm::cuda_stream_view const stream = cudf::get_default_stream();
   auto const label                   = "range " + range_label(begin, end) + ": ";
@@ -130,8 +137,7 @@ void decode_and_check(fixture& f,
     out.data(), guard.data(), guard.size(), cudaMemcpyHostToDevice, stream.value()));
   auto* const dst = static_cast<std::uint8_t*>(out.data()) + misalign + kGuard;
 
-  f.leaves->clear_requests();
-  chunk::decode_ans_range(*f.leaves, state, begin, end, dst, stream);
+  chunk::decode_ans_range(leaves, state, begin, end, dst, stream);
   auto const got = read_device<std::uint8_t>(out.data(), guard.size(), stream);
 
   auto const guards_ok = [&](std::size_t from, std::size_t count) {
@@ -145,6 +151,20 @@ void decode_and_check(fixture& f,
     check(std::memcmp(got.data() + misalign + kGuard, f.chars.data() + begin, bytes) == 0,
           label + "decoded bytes differ from the full decode");
   }
+}
+
+/// decode_guarded through the fixture's logging leaf_access, then checks the request log.
+void decode_and_check(fixture& f,
+                      chunk::ans_state& state,
+                      std::uint64_t begin,
+                      std::uint64_t end,
+                      bool expect_header_read,
+                      std::size_t misalign = 0)
+{
+  auto const label = "range " + range_label(begin, end) + ": ";
+  auto const bytes = static_cast<std::size_t>(end - begin);
+  f.leaves->clear_requests();
+  decode_guarded(f, *f.leaves, state, begin, end, misalign);
 
   // Request log.
   for (auto const& [leaf, buffer, offset, size] : f.leaves->requests()) {
@@ -268,7 +288,8 @@ void test_state_bytes()
   decode_and_check(f, *state, 7, 7, false);
   check(chunk::ans_state_bytes(*state) == 0, "state bytes: an empty decode allocated");
 
-  // Two partial blocks decode into scratch, and six blocks need their table entries.
+  // Two partial blocks decode into scratch, and each of the six blocks takes one u64 in each of
+  // the state's six nvCOMP tables (four inputs, actual sizes, statuses).
   std::uint64_t const begin = kBlock + 100;
   std::uint64_t const end   = 6 * kBlock + 100;
   decode_and_check(f, *state, begin, end, true);
@@ -283,6 +304,267 @@ void test_state_bytes()
   decode_and_check(f, *state, 3 * kBlock + 5, 4 * kBlock + 9, false);
   check(chunk::ans_state_bytes(*state) == held,
         "state bytes: decoding a smaller range changed the bytes held");
+}
+
+/// A payload that is not on the device: host bytes, every read recorded.
+class host_source final : public payload_source {
+ public:
+  explicit host_source(std::vector<std::uint8_t> bytes) : _bytes{std::move(bytes)} {}
+
+  void read_to_device(std::uint64_t offset,
+                      std::uint64_t size,
+                      void* dst,
+                      rmm::cuda_stream_view stream) override
+  {
+    check(offset + size <= _bytes.size(), "host_source: read past the payload");
+    reads.emplace_back(offset, size);
+    cuda_check(
+      cudaMemcpyAsync(dst, _bytes.data() + offset, size, cudaMemcpyHostToDevice, stream.value()));
+  }
+
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+
+ private:
+  std::vector<std::uint8_t> _bytes;
+};
+
+column_options many_blocks_column()
+{
+  column_options options;
+  options.rows       = 300'000;
+  options.seed       = 13;
+  options.min_length = 8;
+  options.max_length = 40;  // ~7 MiB of chars: over 100 blocks
+  return options;
+}
+
+/// A range of more blocks than one batch decodes (64, and 1 MiB of blocks that go through
+/// scratch): the batches join up, and the state stays one batch large however many blocks a
+/// misaligned destination sends through scratch.
+void test_many_blocks()
+{
+  constexpr std::uint64_t kBatchBlocks  = 64;
+  constexpr std::uint64_t kScratchBytes = std::uint64_t{1} << 20;
+
+  auto f                = make_fixture(many_blocks_column());
+  std::uint64_t const n = f.num_blocks();
+  std::uint64_t const t = f.total();
+  check(n > kBatchBlocks + 16, "many blocks: the column has " + std::to_string(n) + " blocks");
+  auto const state = chunk::make_ans_state(f.leaves->column(), f.ans);
+
+  // Aligned destination, whole blocks only: nothing goes through scratch, two batches.
+  decode_and_check(f, *state, 0, t, true);
+  auto const held_direct = chunk::ans_state_bytes(*state);
+  check(held_direct != 0 && held_direct < kScratchBytes,
+        "many blocks: a decode of whole blocks into an aligned destination holds " +
+          std::to_string(held_direct) + " bytes");
+
+  // Misaligned destinations: every block goes through scratch, 1 MiB of them at a time.
+  decode_and_check(f, *state, 0, t, false, 1);
+  decode_and_check(f, *state, 0, t, false, 9);
+  // Ragged ranges across the batch boundaries, into aligned and misaligned destinations.
+  decode_and_check(f, *state, kBlock / 2 + 3, (kBatchBlocks + 6) * kBlock + 11, false);
+  decode_and_check(f, *state, kBlock / 2 + 3, (kBatchBlocks + 6) * kBlock + 11, false, 5);
+  decode_and_check(f, *state, 2 * kBlock, (kBatchBlocks + 2) * kBlock, false);  // 64 whole blocks
+  decode_and_check(f, *state, 2 * kBlock, (kBatchBlocks + 3) * kBlock, false);  // 65
+  decode_and_check(f, *state, 15 * kBlock + 1, t - 1, false, 3);
+  auto const held = chunk::ans_state_bytes(*state);
+  check(held <= held_direct + kScratchBytes,
+        "many blocks: the state holds " + std::to_string(held) + " bytes after " +
+          std::to_string(t) + " bytes went through scratch, over the " +
+          std::to_string(held_direct + kScratchBytes) + " of one batch");
+}
+
+/// The same long range with compressed bytes that are not usable in place: at an odd device
+/// address, and in host memory behind the cursor's staging leaf_access. Each batch's compressed
+/// bytes are copied, or read from the source, into the state's bounded staging buffer; nothing is
+/// staged in the leaf_access.
+void test_many_blocks_staged()
+{
+  constexpr std::uint64_t kStagedBytes  = std::uint64_t{1} << 20;
+  constexpr std::uint64_t kScratchBytes = std::uint64_t{1} << 20;
+
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  auto f                             = make_fixture(many_blocks_column());
+  std::uint64_t const t              = f.total();
+  auto const largest_block = *std::max_element(f.block_sizes.begin(), f.block_sizes.end());
+  auto const& frame        = f.leaves->column().leaves[f.ans.leaf].buffers[0];
+
+  // What the state holds besides the staging buffer and the scratch: one batch of whole blocks
+  // decoded in place.
+  std::size_t held_direct = 0;
+  {
+    auto const state = chunk::make_ans_state(f.leaves->column(), f.ans);
+    decode_and_check(f, *state, 0, t, true);
+    held_direct = chunk::ans_state_bytes(*state);
+  }
+  auto const held_bound = held_direct + kScratchBytes + kStagedBytes + largest_block;
+  auto const check_held = [&](chunk::ans_state const& state, char const* what) {
+    auto const held = chunk::ans_state_bytes(state);
+    check(held <= held_bound,
+          std::string{what} + ": the state holds " + std::to_string(held) + " bytes, over the " +
+            std::to_string(held_bound) + " of one batch");
+  };
+
+  // Host payload behind the staging leaf_access.
+  {
+    auto description = std::make_shared<hpln_description>();
+    description->columns.push_back(f.leaves->column());
+    auto const source = std::make_shared<host_source>(
+      read_device<std::uint8_t>(f.leaves->payload().data(), f.leaves->payload().size(), stream));
+    auto const access = chunk::make_staged_leaf_access(
+      description, 0, source, rmm::mr::get_current_device_resource_ref());
+    auto const state = chunk::make_ans_state(access->column(), f.ans);
+
+    struct range {
+      std::uint64_t begin, end;
+      std::size_t misalign;
+    };
+    for (auto const& r : {range{0, t, 0},
+                          range{0, t, 7},
+                          range{kBlock + 5, 80 * kBlock + 9, 0},
+                          range{kBlock + 5, 80 * kBlock + 9, 2},
+                          range{100, 200, 0}}) {
+      source->reads.clear();
+      decode_guarded(f, *access, *state, r.begin, r.end, r.misalign);
+      auto const label = "host payload, range " + range_label(r.begin, r.end) + ": ";
+
+      // Reads: the frame header (first decode only), then the covering blocks batch by batch,
+      // in order, none larger than a batch.
+      std::uint64_t const first = r.begin / kBlock;
+      std::uint64_t const last  = (r.end - 1) / kBlock;
+      std::uint64_t const lo    = frame.payload_offset + f.block_offsets[first];
+      std::uint64_t const hi = frame.payload_offset + f.block_offsets[last] + f.block_sizes[last];
+      std::uint64_t at       = lo;
+      std::uint64_t block_reads = 0;
+      for (auto const& [offset, size] : source->reads) {
+        if (offset + size <= frame.payload_offset + f.header_bytes) { continue; }
+        check(offset >= at && offset - at < kFrameAlign && offset + size <= hi,
+              label + "a read of " + range_label(offset, offset + size) +
+                " does not continue the covering blocks at " + std::to_string(at));
+        check(size <= kStagedBytes + largest_block,
+              label + "one read of " + std::to_string(size) + " bytes is larger than a batch");
+        at = offset + size;
+        ++block_reads;
+      }
+      check(at == hi, label + "the reads stop short of the covering blocks");
+      if (hi - lo > 2 * (kStagedBytes + largest_block)) {
+        check(block_reads > 2, label + "a long range was not read in batches");
+      }
+      check(chunk::staged_bytes_held(*access) == 0, label + "the leaf_access staged bytes");
+      check_held(*state, "host payload");
+    }
+  }
+
+  // Device payload at an odd address.
+  {
+    std::uint64_t const shift = 3;
+    auto description          = f.leaves->column();
+    if (description.validity_size != 0) { description.validity_payload_offset += shift; }
+    for (auto& leaf : description.leaves) {
+      for (auto& buffer : leaf.buffers) {
+        buffer.payload_offset += shift;
+      }
+    }
+    auto const& source = f.leaves->payload();
+    rmm::device_buffer payload(source.size() + shift, stream);
+    cuda_check(cudaMemcpyAsync(static_cast<std::uint8_t*>(payload.data()) + shift,
+                               source.data(),
+                               source.size(),
+                               cudaMemcpyDeviceToDevice,
+                               stream.value()));
+    f.leaves         = std::make_unique<device_leaf_access>(description, std::move(payload));
+    auto const state = chunk::make_ans_state(f.leaves->column(), f.ans);
+    decode_and_check(f, *state, 0, t, true);
+    decode_and_check(f, *state, 0, t, false, 1);
+    decode_and_check(f, *state, 3 * kBlock + 17, 90 * kBlock + 1, false, 6);
+    check_held(*state, "misaligned payload");
+  }
+}
+
+/// A frame whose header does not describe the leaf (corrupt or truncated payload) is rejected
+/// with std::runtime_error by the first decode, before any compressed byte is fetched or any
+/// destination byte written.
+void test_corrupt_frames()
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  auto f                             = make_fixture(big_column());
+  std::uint64_t const n              = f.num_blocks();
+  auto const& good                   = f.leaves->column();
+  auto const frame_offset            = good.leaves[f.ans.leaf].buffers[0].payload_offset;
+  auto const frame_bytes             = good.leaves[f.ans.leaf].buffers[0].size;
+  auto const payload =
+    read_device<std::uint8_t>(f.leaves->payload().data(), f.leaves->payload().size(), stream);
+
+  struct corruption {
+    char const* name;
+    char const* message;                 ///< what the error must say
+    std::uint64_t poke_at;               ///< frame offset of a u64 to overwrite ...
+    std::optional<std::uint64_t> value;  ///< ... with this value, if any
+    std::uint64_t frame_size;            ///< size of the frame's leaf buffer in the description
+  };
+  std::uint64_t const size_table = 16;
+  corruption const cases[]       = {
+    {"zero block size", "block size", 8, 0, frame_bytes},
+    {"block size over nvCOMP's limit", "block size", 8, (std::uint64_t{1} << 25) + 1, frame_bytes},
+    {"one block too many", "block count", 0, n + 1, frame_bytes},
+    {"no blocks", "block count", 0, 0, frame_bytes},
+    {"doubled block size", "block count", 8, 2 * kBlock, frame_bytes},
+    {"frame shorter than its header", "shorter than its header", 0, std::nullopt, 15},
+    {"frame cut in the size table", "table past the end", 0, std::nullopt, size_table + 8 * n - 1},
+    {"frame cut in the last block",
+           "block past the end",
+           0,
+           std::nullopt,
+           f.block_offsets[n - 1] + f.block_sizes[n - 1] - 1},
+    {"first block as large as the frame",
+           "block past the end",
+           size_table,
+           frame_bytes,
+           frame_bytes},
+    {"huge last block",
+           "block past the end",
+           size_table + 8 * (n - 1),
+           ~std::uint64_t{0},
+           frame_bytes},
+  };
+
+  for (auto const& c : cases) {
+    auto const label = std::string{"corrupt frame ("} + c.name + "): ";
+    auto description = good;
+    description.leaves[f.ans.leaf].buffers[0].size = c.frame_size;
+    auto bytes                                     = payload;
+    if (c.value) { std::memcpy(bytes.data() + frame_offset + c.poke_at, &*c.value, 8); }
+    rmm::device_buffer device(bytes.data(), bytes.size(), stream);
+    stream.synchronize();
+    device_leaf_access leaves{description, std::move(device)};
+    auto const state = chunk::make_ans_state(leaves.column(), f.ans);
+
+    std::vector<std::uint8_t> const guard(4096, kGuardByte);
+    rmm::device_buffer out(guard.data(), guard.size(), stream);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      std::string message;
+      bool unsupported = false;
+      try {
+        chunk::decode_ans_range(leaves, *state, 10, 1000, out.data(), stream);
+      } catch (unsupported_chunk_decode const&) {
+        unsupported = true;
+      } catch (std::runtime_error const& e) {
+        message = e.what();
+      }
+      check(!unsupported, label + "reported as an unsupported plan, not a corrupt frame");
+      check(message.find(c.message) != std::string::npos,
+            label + "expected a runtime_error about '" + c.message + "', got '" + message + "'");
+    }
+    check(leaves.device_requests().empty(), label + "compressed bytes were fetched");
+    check(chunk::ans_state_bytes(*state) == 0, label + "the state allocated device bytes");
+    check(read_device<std::uint8_t>(out.data(), guard.size(), stream) == guard,
+          label + "the destination was written");
+  }
+
+  // The untouched frame still decodes through the same helpers.
+  auto const state = chunk::make_ans_state(good, f.ans);
+  decode_and_check(f, *state, 10, 1000, true);
 }
 
 void test_small_columns()
@@ -409,6 +691,9 @@ int main()
     {"fixed_ranges", test_fixed_ranges},
     {"random_ranges", test_random_ranges},
     {"state_bytes", test_state_bytes},
+    {"many_blocks", test_many_blocks},
+    {"many_blocks_staged", test_many_blocks_staged},
+    {"corrupt_frames", test_corrupt_frames},
     {"small_columns", test_small_columns},
     {"rejections", test_rejections},
     {"misaligned_payload", test_misaligned_payload},

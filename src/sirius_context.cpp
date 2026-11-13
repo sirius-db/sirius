@@ -1260,11 +1260,6 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
   return *memory_manager_;
 }
 
-cucascade::row_range_reader_registry& SiriusContext::row_range_readers()
-{
-  return sirius::row_range_reader_registry::get();
-}
-
 sirius::data::data_repository_manager_registry::manager_ptr
 SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
 {

@@ -26,6 +26,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/merge/merge_chunk_position.hpp"
@@ -37,10 +38,13 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
+#include <api/chunk_decode.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
@@ -192,9 +196,37 @@ std::optional<std::vector<cudf::data_type>> representation_column_types(
   return std::nullopt;
 }
 
-/// Whether the windowed merge can read @p data by row range; otherwise it converts the whole
-/// batch to the GPU tier. A compressed batch whose reader refuses it for its plan (known only
-/// from its header) still counts as readable.
+/// Per source column of a spill-compressed batch, whether its row-range reader can decode the
+/// column's plan; empty when the header cannot be read. Asks the same cursor the reader builds,
+/// which stages nothing when constructed. Parses the header: for a disk batch that reads the
+/// file, for a device batch it runs on the default stream.
+std::vector<bool> row_range_readable_columns(
+  const sirius::simpatico_compressed_representation& compressed)
+{
+  try {
+    auto const opened =
+      sirius::compression::open_compressed_payload(compressed, cudf::get_default_stream());
+    std::vector<bool> readable;
+    readable.reserve(opened.description->columns.size());
+    for (std::size_t column = 0; column < opened.description->columns.size(); ++column) {
+      const simpatico::compressed_column_cursor cursor(opened.description,
+                                                       column,
+                                                       opened.source,
+                                                       cudf::get_default_stream(),
+                                                       rmm::mr::get_current_device_resource_ref());
+      readable.push_back(cursor.supported());
+    }
+    return readable;
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN("merge_sort: cannot read the plans of a compressed batch from its header: {}",
+                    e.what());
+    return {};
+  }
+}
+
+/// Whether the windowed merge has a row-range reader for @p data; otherwise it converts the
+/// whole batch to the GPU tier. A compressed batch whose reader refuses it for its plan (known
+/// only from its header, see sirius_physical_merge_sort::reads_by_row_range) still counts.
 bool has_row_range_reader(const cucascade::idata_representation& data)
 {
   if (dynamic_cast<const sirius::simpatico_compressed_representation*>(&data) != nullptr &&
@@ -374,10 +406,17 @@ std::optional<merge_sort_counters> sirius_physical_merge_sort::claim_stats_line(
 void sirius_physical_merge_sort::on_finalize_operator()
 {
   std::optional<merge_sort_counters> final_counters;
+  std::vector<std::unique_ptr<partition_merger>> mergers;
   {
     std::lock_guard<std::mutex> lg(_drain_mutex);
     final_counters = claim_stats_line();
+    // The runs stay: a task created after this still merges them, with a merger of its own.
+    for (auto& [partition, state] : _partitions) {
+      if (state.merger) { mergers.push_back(std::move(state.merger)); }
+    }
   }
+  // Outside the mutex: frees the window buffers the partitions kept on the GPU.
+  mergers.clear();
   if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
 }
 
@@ -442,7 +481,8 @@ bool sirius_physical_merge_sort::has_armable_partition(::cucascade::shared_data_
   for (std::size_t p = 0; p < num_partitions; ++p) {
     auto const it = _partitions.find(p);
     if (it == _partitions.end() || !it->second.armed) {
-      if (it != _partitions.end() && (it->second.in_flight || it->second.arm_deferred)) {
+      if (it != _partitions.end() &&
+          (it->second.in_flight || it->second.arm_deferred || it->second.header_parsing)) {
         continue;
       }
       if (repo.size(p) > 0) { return true; }
@@ -472,6 +512,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   while (true) {
     // The first batch found locked by a tier move while its partition was being armed.
     std::shared_ptr<cucascade::data_batch> busy;
+    // The read lock of the compressed batch whose header names the schema of header_partition.
+    std::optional<cucascade::read_only_data_batch> header_source;
+    std::size_t header_partition = 0;
+    std::optional<windowed_task_plan> task;
     {
       std::lock_guard<std::mutex> lg(_drain_mutex);
       bool task_in_flight       = false;
@@ -488,8 +532,15 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
           continue;
         }
         if (!state.armed) {
+          // The thread that parses the partition's header arms it.
+          if (state.header_parsing) { continue; }
           std::shared_ptr<cucascade::data_batch> locked;
-          if (auto input = arm_partition(p, state, *repo, locked)) { return input; }
+          if (auto input = arm_partition(p, state, *repo, locked, header_source)) { return input; }
+          if (header_source.has_value()) {
+            state.header_parsing = true;
+            header_partition     = p;
+            break;
+          }
           if (locked) {
             state.arm_deferred = true;
             if (!busy) { busy = std::move(locked); }
@@ -497,13 +548,31 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
           }
         }
         if (state.runs.empty()) { continue; }
-        return make_windowed_input(p, state, *repo);
+        task = plan_windowed_task(p, state, *repo);
+        break;
       }
-      // A task in flight arms the deferred partitions again when it commits.
-      if (!busy || task_in_flight) { return nullptr; }
-      for (auto& [p, state] : _partitions) {
-        state.arm_deferred = false;
+      if (!task.has_value() && !header_source.has_value()) {
+        // A task in flight arms the deferred partitions again when it commits.
+        if (!busy || task_in_flight) { return nullptr; }
+        for (auto& [p, state] : _partitions) {
+          state.arm_deferred = false;
+        }
       }
+    }
+    // Sizing the task reads its batches: without the mutex.
+    if (task.has_value()) { return make_windowed_input(std::move(*task)); }
+    if (header_source.has_value()) {
+      // For a disk batch this reads the file's header, for a device batch it rebuilds the header
+      // on the default stream: without the mutex, which commits and the task hint wait on. The
+      // next round arms the partition from its batches as they are then, with this schema.
+      auto schema = compressed_column_types(*header_source->get_data());
+      header_source.reset();
+      std::lock_guard<std::mutex> lg(_drain_mutex);
+      auto& state          = _partitions.at(header_partition);
+      state.header_schema  = std::move(schema);
+      state.header_parsed  = true;
+      state.header_parsing = false;
+      continue;
     }
     // Nothing else would ask for this partition again: wait for the tier move to finish, without
     // the mutex, and arm again.
@@ -524,8 +593,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_one_shot_input(
   SIRIUS_LOG_DEBUG(
     "merge_sort: drained {} batches for partition {}", all_batches.size(), partition);
   if (all_batches.empty()) { return nullptr; }
-  // The one_shot mode keeps the position it always had; the other modes encode every partition
-  // the same way, so one-shot and windowed partitions of one query order consistently.
+  // The one_shot mode positions a partition's output by the partition index; the other modes
+  // encode every partition the same way, so one-shot and windowed partitions of one query order
+  // consistently.
   auto const position = _merge_settings.mode == sort_merge_mode::one_shot
                           ? partition
                           : merge::make_merge_chunk_position(partition, 0);
@@ -538,7 +608,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
   std::size_t partition,
   partition_merge_state& state,
   ::cucascade::shared_data_repository& repo,
-  std::shared_ptr<::cucascade::data_batch>& busy)
+  std::shared_ptr<::cucascade::data_batch>& busy,
+  std::optional<::cucascade::read_only_data_batch>& header_source)
 {
   state.route         = merge::merge_route::one_shot;
   auto const one_shot = [&]() {
@@ -601,7 +672,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
       }
       if (!schema.has_value() && data != nullptr) {
         schema = representation_column_types(*data);
-        // A compressed batch names its columns only in its header. It is parsed after the loop,
+        // A compressed batch names its columns only in its header. It is parsed by the caller,
         // for one batch, and only if no uncompressed batch has given the schema by then.
         if (auto const cost = schema.has_value() ? std::nullopt : compressed_schema_cost(*data);
             cost.has_value() && (!schema_source.has_value() || *cost < schema_source_cost)) {
@@ -621,7 +692,11 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     total_rows += size->rows.value_or(0);
   }
   if (!schema.has_value() && schema_source.has_value()) {
-    schema = compressed_column_types(*schema_source->get_data());
+    if (!state.header_parsed) {
+      header_source = std::move(schema_source);
+      return nullptr;
+    }
+    schema = state.header_schema;
   }
   schema_source.reset();
   // A locked batch that was never sized, or that may be the only one exposing the schema, has
@@ -667,7 +742,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
   }
 
   // The windowed route needs the schema, every batch's row count and plain column keys; a
-  // partition that lacks one of them, or has no rows at all, is merged as it always was.
+  // partition that lacks one of them, or has no rows at all, is merged one-shot.
   auto const num_columns = schema.has_value() ? schema->size() : std::size_t{0};
   bool supported         = schema.has_value() && rows_known && total_rows > 0;
   std::vector<std::size_t> key_columns;
@@ -752,7 +827,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
   return nullptr;
 }
 
-std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
+sirius_physical_merge_sort::windowed_task_plan sirius_physical_merge_sort::plan_windowed_task(
   std::size_t partition, partition_merge_state& state, ::cucascade::shared_data_repository& repo)
 {
   // An intermediate pass in progress keeps its runs until they are exhausted.
@@ -781,99 +856,231 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
     }
   }
 
-  std::vector<merge::merge_input_cursor> cursors;
-  cursors.reserve(selected.size());
-  std::unordered_map<int, std::size_t> device_bytes;
-  std::size_t gpu_runs                   = 0;
-  std::size_t largest_fallback_run_bytes = 0;
-  std::size_t compressed_runs            = 0;
+  windowed_task_plan task;
+  task.partition   = partition;
+  task.final_pass  = final_pass;
+  task.first_chunk = state.next_chunk;
+  task.config      = {.window_rows         = state.config.window_rows,
+                      .output_target_bytes = state.config.output_target_bytes};
+  // execute_windowed() continues the kept merger only for the same pass and window sizes.
+  auto const* kept = state.merger.get();
+  if (kept != nullptr && kept->space != nullptr) {
+    task.kept_device = kept->space->get_device_id();
+  }
+  auto const continues = kept != nullptr && kept->final_pass == final_pass &&
+                         kept->config.window_rows == task.config.window_rows &&
+                         kept->config.output_target_bytes == task.config.output_target_bytes;
+  task.cursors.reserve(selected.size());
+  task.batches.reserve(selected.size());
+  task.batch_bytes.reserve(selected.size());
+  task.kept_buffer.reserve(selected.size());
   for (auto i : selected) {
     auto const& run = state.runs[i];
-    cursors.push_back(run.cursor);
-    bool all_on_gpu     = true;
-    bool any_compressed = false;
-    for (std::size_t b = 0; b < run.cursor.run.batch_ids.size(); ++b) {
-      auto const id = run.cursor.run.batch_ids[b];
-      auto batch    = repo.get_data_batch_by_id(id, partition);
+    auto& batches   = task.batches.emplace_back();
+    batches.reserve(run.cursor.run.batch_ids.size());
+    for (auto id : run.cursor.run.batch_ids) {
+      auto batch = repo.get_data_batch_by_id(id, partition);
       if (!batch) {
         throw internal_exception(
           "merge_sort: batch {} of partition {} left the repository before it was merged",
           id,
           partition);
       }
-      // A batch that cannot be read-locked right now is being moved between tiers.
-      auto const ro    = batch->try_to_read_only();
-      auto const* data = ro.has_value() ? ro->get_data() : nullptr;
-      auto* space      = ro.has_value() ? ro->get_memory_space() : nullptr;
-      if (data != nullptr && space != nullptr &&
-          ro->get_current_tier() == cucascade::memory::Tier::GPU) {
-        device_bytes[space->get_device_id()] += run.batch_bytes[b];
-        // Only an uncompressed table is sliced in place; a compressed device batch is read into
-        // a window buffer like the batches of the other tiers.
-        if (dynamic_cast<const cucascade::gpu_table_representation*>(data) != nullptr) { continue; }
-      }
-      all_on_gpu = false;
-      if (data != nullptr && !has_row_range_reader(*data)) {
-        largest_fallback_run_bytes = std::max(largest_fallback_run_bytes, run.batch_bytes[b]);
-      }
-      any_compressed =
-        any_compressed || dynamic_cast<const simpatico_compressed_representation*>(data) != nullptr;
+      batches.push_back(std::move(batch));
     }
-    if (all_on_gpu) { ++gpu_runs; }
-    if (any_compressed) { ++compressed_runs; }
+    task.cursors.push_back(run.cursor);
+    task.batch_bytes.push_back(run.batch_bytes);
+    bool held = false;
+    if (continues) {
+      auto const it = std::find(kept->run_ids.begin(), kept->run_ids.end(), run.id);
+      auto const at = static_cast<std::size_t>(it - kept->run_ids.begin());
+      held          = at < kept->holds_buffer.size() && kept->holds_buffer[at];
+    }
+    task.kept_buffer.push_back(held);
   }
 
   auto const num_columns = state.column_types.size();
-  auto const plan =
+  auto plan =
     make_fetch_plan(input_key_spec(), output_columns(num_columns), num_columns, final_pass);
   std::vector<std::size_t> key_columns;
   key_columns.reserve(plan.keys.key_cols.size());
   for (auto key : plan.keys.key_cols) {
     key_columns.push_back(plan.fetch_cols[static_cast<std::size_t>(key)]);
   }
+  task.row_width      = sum_widths(state.column_widths, plan.fetch_cols);
+  task.key_row_width  = sum_widths(state.column_widths, key_columns);
+  task.string_columns = static_cast<std::size_t>(
+    std::count_if(plan.fetch_cols.begin(), plan.fetch_cols.end(), [&state](auto column) {
+      return state.column_types[column].id() == cudf::type_id::STRING;
+    }));
+  task.fetch_cols = std::move(plan.fetch_cols);
 
-  auto input = std::make_unique<merge::windowed_merge_input>(
-    partition,
-    std::move(cursors),
-    final_pass,
-    state.next_chunk,
-    merge::window_config{.window_rows         = state.config.window_rows,
-                         .output_target_bytes = state.config.output_target_bytes},
-    sum_widths(state.column_widths, plan.fetch_cols),
-    sum_widths(state.column_widths, key_columns),
-    gpu_runs,
-    largest_fallback_run_bytes,
-    compressed_runs,
-    plan.fetch_cols.size(),
-    static_cast<std::size_t>(
-      std::count_if(plan.fetch_cols.begin(), plan.fetch_cols.end(), [&state](auto column) {
-        return state.column_types[column].id() == cudf::type_id::STRING;
-      })));
+  state.task_runs.clear();
+  for (auto i : selected) {
+    state.task_runs.push_back(state.runs[i].id);
+  }
+  state.task_buffered.assign(selected.size(), false);
+  state.in_flight = true;
+  return task;
+}
+
+bool sirius_physical_merge_sort::reads_by_row_range(std::uint64_t batch_id,
+                                                    const ::cucascade::idata_representation& data,
+                                                    const std::vector<std::size_t>& columns)
+{
+  auto const* compressed = dynamic_cast<const simpatico_compressed_representation*>(&data);
+  if (compressed == nullptr) { return true; }
+  std::optional<std::vector<bool>> readable;
+  {
+    std::lock_guard<std::mutex> lg(_row_range_mutex);
+    if (auto const it = _row_range_columns.find(batch_id); it != _row_range_columns.end()) {
+      readable = it->second;
+    }
+  }
+  if (!readable.has_value()) {
+    readable = row_range_readable_columns(*compressed);
+    std::lock_guard<std::mutex> lg(_row_range_mutex);
+    _row_range_columns.insert_or_assign(batch_id, *readable);
+  }
+  return std::all_of(columns.begin(), columns.end(), [&readable](auto column) {
+    return column < readable->size() && (*readable)[column];
+  });
+}
+
+std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
+  windowed_task_plan plan)
+{
+  auto const partition = plan.partition;
+  auto const num_runs  = plan.cursors.size();
+  std::unordered_map<int, std::size_t> device_bytes;
+  std::size_t fallback_bytes   = 0;
+  std::size_t compressed_runs  = 0;
+  std::size_t kept_buffer_runs = 0;
+  // Per run: the batch it is at is read through a window buffer, as far as can be told now.
+  std::vector<bool> buffered(num_runs, false);
+  try {
+    for (std::size_t r = 0; r < num_runs; ++r) {
+      // The largest batch of the run that may be converted whole to the GPU tier. The converted
+      // batches of different runs are on the GPU at once, so the runs add up.
+      std::size_t run_fallback_bytes = 0;
+      bool any_compressed            = false;
+      for (std::size_t b = 0; b < plan.batches[r].size(); ++b) {
+        auto const& batch  = plan.batches[r][b];
+        auto const bytes   = plan.batch_bytes[r][b];
+        auto const current = b == plan.cursors[r].batch;
+        // A batch that cannot be read-locked right now is being moved between tiers. What it
+        // will be when the task reads it is not known: it may have no reader.
+        auto const ro    = batch->try_to_read_only();
+        auto const* data = ro.has_value() ? ro->get_data() : nullptr;
+        if (data == nullptr) {
+          run_fallback_bytes = std::max(run_fallback_bytes, bytes);
+          if (current) { buffered[r] = true; }
+          continue;
+        }
+        auto* space = ro->get_memory_space();
+        if (space != nullptr && ro->get_current_tier() == cucascade::memory::Tier::GPU) {
+          device_bytes[space->get_device_id()] += bytes;
+          // Only an uncompressed table is sliced in place; a compressed device batch is read
+          // into a window buffer like the batches of the other tiers.
+          if (dynamic_cast<const cucascade::gpu_table_representation*>(data) != nullptr) {
+            continue;
+          }
+        }
+        if (current) { buffered[r] = true; }
+        // No reader for the representation, or one that refuses this batch's plan: the merger
+        // decodes the whole batch to the GPU.
+        if (!has_row_range_reader(*data) ||
+            !reads_by_row_range(batch->get_batch_id(), *data, plan.fetch_cols)) {
+          run_fallback_bytes = std::max(run_fallback_bytes, bytes);
+        }
+        any_compressed = any_compressed ||
+                         dynamic_cast<const simpatico_compressed_representation*>(data) != nullptr;
+      }
+      fallback_bytes = sirius::memory::saturating_add(fallback_bytes, run_fallback_bytes);
+      if (any_compressed) { ++compressed_runs; }
+      if (plan.kept_buffer[r] && buffered[r]) { ++kept_buffer_runs; }
+    }
+  } catch (...) {
+    std::lock_guard<std::mutex> lg(_drain_mutex);
+    auto& state = _partitions.at(partition);
+    state.task_runs.clear();
+    state.task_buffered.clear();
+    state.in_flight = false;
+    throw;
+  }
+
+  // gpu_runs is 0: a run that is on the GPU now is charged its window buffers like any other.
+  // Its batches stay in the repository, which is spilled first (input_residency_policy), so by
+  // the time the task reads the run it may be on another tier.
+  auto input = std::make_unique<merge::windowed_merge_input>(partition,
+                                                             std::move(plan.cursors),
+                                                             plan.final_pass,
+                                                             plan.first_chunk,
+                                                             plan.config,
+                                                             plan.row_width,
+                                                             plan.key_row_width,
+                                                             0,
+                                                             fallback_bytes,
+                                                             compressed_runs,
+                                                             plan.fetch_cols.size(),
+                                                             plan.string_columns);
+  // The kept merger already holds these runs' window buffers, allocated by an earlier task of
+  // the partition: this task reuses them, so they are not reserved again.
+  input->set_kept_buffer_runs(kept_buffer_runs);
   // The input shrinks outside the operator, when the executor retries its task after an OOM.
   input->set_shrink_observer([this] {
     std::lock_guard<std::mutex> lg(_drain_mutex);
     count(_counters, [](merge_sort_counters& counters) { ++counters.shrinks; });
   });
-  if (!device_bytes.empty()) {
+  // On another device the kept merger, and every row it buffered, would be thrown away.
+  if (plan.kept_device.has_value()) {
+    input->set_preferred_device_id(*plan.kept_device);
+  } else if (!device_bytes.empty()) {
     input->set_preferred_device_id(
       std::max_element(device_bytes.begin(), device_bytes.end(), [](auto const& a, auto const& b) {
         return a.second < b.second;
       })->first);
   }
-  state.task_runs.clear();
-  for (auto i : selected) {
-    state.task_runs.push_back(state.runs[i].id);
+  {
+    std::lock_guard<std::mutex> lg(_drain_mutex);
+    _partitions.at(partition).task_buffered = std::move(buffered);
   }
-  state.in_flight = true;
   SIRIUS_LOG_DEBUG(
-    "merge_sort: partition {} windowed task: runs={} of {} final_pass={} chunk={} gpu_runs={}",
+    "merge_sort: partition {} windowed task: runs={} final_pass={} chunk={} kept_buffer_runs={} "
+    "fallback_bytes={}",
     partition,
-    state.task_runs.size(),
-    state.runs.size(),
-    final_pass,
-    state.next_chunk,
-    gpu_runs);
+    num_runs,
+    plan.final_pass,
+    plan.first_chunk,
+    kept_buffer_runs,
+    fallback_bytes);
   return input;
+}
+
+sirius_physical_merge_sort::commit_followup sirius_physical_merge_sort::finish_commit(
+  ::cucascade::shared_data_repository& repo, bool always_reschedule)
+{
+  // A partition whose arming met a locked run gets another attempt.
+  bool deferred = false;
+  for (auto& [partition, state] : _partitions) {
+    deferred           = deferred || state.arm_deferred;
+    state.arm_deferred = false;
+  }
+  commit_followup followup;
+  followup.reschedule = (always_reschedule || deferred) && has_armable_partition(repo);
+  if (no_work_left(_partitions, repo)) { followup.final_counters = claim_stats_line(); }
+  return followup;
+}
+
+void sirius_physical_merge_sort::after_commit(const commit_followup& followup)
+{
+  if (followup.final_counters.has_value()) { log_stats(operator_id, *followup.final_counters); }
+  // Nothing else asks this operator for its next task when one of its own tasks finishes.
+  if (followup.reschedule) {
+    if (auto pipeline = get_pipeline()) {
+      if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
+    }
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
@@ -889,8 +1096,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   // Commit: the partition's only task is done. An input that get_next_task_input_data() did not
   // make has no partition in flight and commits nothing.
   auto* repo = ports.empty() ? nullptr : ports.begin()->second->repo;
-  std::optional<merge_sort_counters> final_counters;
-  bool more_tasks = false;
+  commit_followup followup;
   if (auto const position = one_shot.get_position(); position.has_value() && repo != nullptr) {
     auto const partition = _merge_settings.mode == sort_merge_mode::one_shot
                              ? *position
@@ -900,22 +1106,14 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     if (it != _partitions.end() && it->second.in_flight &&
         it->second.route == merge::merge_route::one_shot) {
       it->second.in_flight = false;
-      // A partition whose arming met a locked run gets another attempt.
-      bool deferred = false;
-      for (auto& [p, other] : _partitions) {
-        deferred           = deferred || other.arm_deferred;
-        other.arm_deferred = false;
-      }
-      more_tasks = deferred && has_armable_partition(*repo);
-      if (no_work_left(_partitions, *repo)) { final_counters = claim_stats_line(); }
+      // This task was its partition's only one, and the task creator was offered the other
+      // partitions when it made this task: only a partition whose arming was deferred until a
+      // commit needs the operator scheduled again. That also keeps the one_shot mode's
+      // scheduling as it is without the windowed route.
+      followup = finish_commit(*repo, false);
     }
   }
-  if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
-  if (more_tasks) {
-    if (auto pipeline = get_pipeline()) {
-      if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
-    }
-  }
+  after_commit(followup);
   return output;
 }
 
@@ -1134,14 +1332,33 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
   // Commit: nothing from here on fails.
   std::vector<std::shared_ptr<cucascade::data_batch>> consumed_batches;
   consumed_batches.reserve(consumed_ids.size());
-  bool more_tasks = false;
-  std::optional<merge_sort_counters> final_counters;
+  commit_followup followup;
   {
     std::lock_guard<std::mutex> lg(_drain_mutex);
     auto& state = _partitions.at(partition);
     for (auto id : consumed_ids) {
       consumed_batches.push_back(repo->pop_data_batch_by_id(id, partition));
     }
+    {
+      std::lock_guard<std::mutex> row_range_lg(_row_range_mutex);
+      for (auto id : consumed_ids) {
+        _row_range_columns.erase(id);
+      }
+    }
+    // A run still at the batch it was planned to read through a window buffer has that buffer
+    // in the merger.
+    kept->holds_buffer.assign(cursors.size(), false);
+    for (std::size_t i = 0; i < cursors.size(); ++i) {
+      auto const it = std::find(state.task_runs.begin(), state.task_runs.end(), kept->run_ids[i]);
+      auto const at = static_cast<std::size_t>(it - state.task_runs.begin());
+      kept->holds_buffer[i] = at < state.task_buffered.size() && state.task_buffered[at] &&
+                              consumed_counts[i] == 0 && !cursors[i].exhausted();
+    }
+    // A task that shrank its windows after an OOM sets the sizes of the partition's later tasks:
+    // they continue its merger, and do not run out of memory at the unshrunk sizes again.
+    state.config.window_rows = std::min(state.config.window_rows, input.config().window_rows);
+    state.config.output_target_bytes =
+      std::min(state.config.output_target_bytes, input.config().output_target_bytes);
     for (std::size_t i = 0; i < cursors.size(); ++i) {
       auto const run =
         std::find_if(state.runs.begin(), state.runs.end(), [&](auto const& candidate) {
@@ -1172,21 +1389,21 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
       state.pending_run = {};
     }
     // The merger stays with the partition while the next task reads the same runs: until the
-    // partition is merged, or until the intermediate pass in progress ends.
-    if (final_pass ? !state.runs.empty() : pass_in_progress) { state.merger = std::move(kept); }
+    // partition is merged, or until the intermediate pass in progress ends. A finalized
+    // operator keeps none: nothing would free its window buffers before the operator goes.
+    if (!finalized.load() && (final_pass ? !state.runs.empty() : pass_in_progress)) {
+      state.merger = std::move(kept);
+    }
     count(_counters, [&](merge_sort_counters& counters) {
       ++counters.windowed_tasks;
       if (!final_pass) { ++counters.intermediate_tasks; }
       merge::accumulate(counters.rounds, stats);
     });
     state.task_runs.clear();
+    state.task_buffered.clear();
     state.in_flight = false;
-    // A partition whose arming met a locked run gets another attempt.
-    for (auto& [p, other] : _partitions) {
-      other.arm_deferred = false;
-    }
-    more_tasks = has_armable_partition(*repo);
-    if (no_work_left(_partitions, *repo)) { final_counters = claim_stats_line(); }
+    // The partition's next task, if it has one, is made only when the operator is scheduled.
+    followup = finish_commit(*repo, true);
   }
   // Outside the mutex: frees the windows of a merger the partition no longer needs.
   kept.reset();
@@ -1200,14 +1417,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     rows_out,
     stats.refill_rows,
     stats.fallback_conversions);
-  if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
-
-  // Nothing else asks this operator for its next task when one of its own tasks finishes.
-  if (more_tasks) {
-    if (auto pipeline = get_pipeline()) {
-      if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
-    }
-  }
+  after_commit(followup);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (final_pass && output_batch) {

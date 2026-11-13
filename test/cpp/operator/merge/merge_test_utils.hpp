@@ -17,6 +17,7 @@
 #pragma once
 
 #include "catch.hpp"
+#include "data/convertible_data_batch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "data/sirius_row_range_reader_registry.hpp"
@@ -44,9 +45,18 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda_runtime.h>
+
+#include <api/compressed_table_io.hpp>
+#include <compression/compressed_disk_representation.hpp>
+#include <compression/compressed_payload_sources.hpp>
+#include <compression/compressed_representation.hpp>
+#include <compression/device_compressed_blob.hpp>
 #include <compression/spill_compression.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
@@ -202,35 +212,52 @@ inline op::merge::bounded_merge_result reference_bounded_merge(
 // Column and table builders
 // ---------------------------------------------------------------------------
 
-/// A fixed-width column from host values; @p valids[i] == false makes row i NULL.
+/// A fixed-width column from host values; @p valids[i] == false makes row i NULL. With @p valids
+/// the column has a null mask even when no row is NULL. The mask is built on the host and
+/// uploaded at once, so this is cheap for millions of rows.
 template <typename T>
 inline std::unique_ptr<cudf::column> make_column(const std::vector<T>& values,
                                                  cudf::type_id type_id,
                                                  const std::vector<bool>& valids = {})
 {
+  if (!valids.empty() && valids.size() != values.size()) {
+    throw std::invalid_argument("make_column: one validity flag per value");
+  }
   auto stream     = cudf::get_default_stream();
   const auto size = static_cast<cudf::size_type>(values.size());
   auto col        = cudf::make_fixed_width_column(
-    cudf::data_type{type_id},
-    size,
-    valids.empty() ? cudf::mask_state::UNALLOCATED : cudf::mask_state::ALL_VALID,
-    stream);
+    cudf::data_type{type_id}, size, cudf::mask_state::UNALLOCATED, stream);
   if (size > 0) {
-    cudaMemcpy(col->mutable_view().data<T>(),
-               values.data(),
-               sizeof(T) * values.size(),
-               cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(col->mutable_view().data<T>(),
+                    values.data(),
+                    sizeof(T) * values.size(),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
   }
   if (!valids.empty()) {
-    auto view = col->mutable_view();
-    for (cudf::size_type i = 0; i < size; ++i) {
-      if (!valids[static_cast<std::size_t>(i)]) {
-        cudf::set_null_mask(view.null_mask(), i, i + 1, false, stream);
+    std::vector<cudf::bitmask_type> words(static_cast<std::size_t>(cudf::num_bitmask_words(size)),
+                                          0);
+    constexpr std::size_t word_bits = sizeof(cudf::bitmask_type) * 8;
+    cudf::size_type nulls           = 0;
+    for (std::size_t i = 0; i < valids.size(); ++i) {
+      if (valids[i]) {
+        words[i / word_bits] |= cudf::bitmask_type{1} << (i % word_bits);
+      } else {
+        ++nulls;
       }
     }
-    col->set_null_count(
-      static_cast<cudf::size_type>(std::count(valids.begin(), valids.end(), false)));
+    auto mask = cudf::create_null_mask(size, cudf::mask_state::UNINITIALIZED, stream);
+    if (!words.empty()) {
+      cudaMemcpyAsync(mask.data(),
+                      words.data(),
+                      words.size() * sizeof(cudf::bitmask_type),
+                      cudaMemcpyHostToDevice,
+                      stream.get());
+    }
+    col->set_null_mask(std::move(mask), nulls);
   }
+  // The host vectors may go away as soon as this returns.
+  stream.sync();
   return col;
 }
 
@@ -492,5 +519,108 @@ struct scoped_spill_compression {
   }
   ~scoped_spill_compression() { sirius::compression::set_spill_compression_settings({}); }
 };
+
+// ---------------------------------------------------------------------------
+// Batches in other tiers and representations
+// ---------------------------------------------------------------------------
+
+/// True when a CUDA device is visible.
+inline bool has_gpu()
+{
+  int count = 0;
+  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+}
+
+/// True when @p batch holds a @p Representation right now.
+template <typename Representation>
+inline bool holds(cucascade::data_batch& batch)
+{
+  auto ro = batch.to_read_only();
+  return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
+}
+
+/// What a batch built on the GPU is turned into: left as is, moved uncompressed, or spilled
+/// compressed (and, for compressed_device, rebuilt on the device).
+enum class placement { gpu, host, disk, compressed_device, compressed_host, compressed_disk };
+
+inline bool is_compressed(placement where)
+{
+  return where == placement::compressed_device || where == placement::compressed_host ||
+         where == placement::compressed_disk;
+}
+
+/**
+ * @brief Spills the GPU batch @p batch compressed, as a downgrade does, and leaves it in the
+ * compressed placement @p where.
+ *
+ * Spill compression must be on (scoped_spill_compression), or the spill is not compressed and the
+ * test fails.
+ */
+inline void compress_batch(tiers_fixture& fx,
+                           const std::shared_ptr<cucascade::data_batch>& batch,
+                           placement where)
+{
+  REQUIRE(is_compressed(where));
+  // The batch may have been built on the default stream; the converters run on the fixture's.
+  cudf::get_default_stream().sync();
+  sirius::convertible_data_batch convertible(batch);
+  REQUIRE(convertible.convert({fx.host}, fx.stream_ref(), *fx.manager, true).has_value());
+  fx.stream.synchronize();
+  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+  if (where == placement::compressed_host) { return; }
+
+  if (where == placement::compressed_disk) {
+    REQUIRE(convertible.convert({fx.disk}, fx.stream_ref(), *fx.manager, true).has_value());
+    fx.stream.synchronize();
+    REQUIRE(holds<sirius::compressed_disk_representation>(*batch));
+    return;
+  }
+
+  // The device tier: the compressed table rebuilt on the device from the pinned payload.
+  auto mut           = batch->to_mutable();
+  auto const& host   = mut.get_data()->cast<sirius::compressed_host_representation>();
+  auto const& blocks = host.payload();
+  auto blob          = std::make_shared<sirius::compressed_device_blob>();
+  std::string error;
+  simpatico::payload_fetch_fn fetch =
+    [&blocks](std::uint64_t offset, std::size_t size, void* dst, ::cuda::stream_ref stream) {
+      sirius::copy_pinned_blocks_to_device(blocks, offset, dst, size, stream);
+    };
+  blob->table = simpatico::read_compressed_table_from_memory(
+    host.header(), fetch, fx.stream_ref(), fx.mr(), &error);
+  REQUIRE(error.empty());
+  fx.stream.synchronize();
+  auto device = std::make_unique<sirius::compressed_device_representation>(
+    *fx.gpu,
+    std::move(blob),
+    host.column_names(),
+    host.get_size_in_bytes(),
+    host.get_uncompressed_data_size_in_bytes(),
+    host.num_rows());
+  mut.set_data(std::move(device));
+}
+
+/// Turns the GPU batch @p batch into @p where. A compressed placement needs spill compression on,
+/// as compress_batch does.
+inline void place_batch(tiers_fixture& fx,
+                        const std::shared_ptr<cucascade::data_batch>& batch,
+                        placement where)
+{
+  if (where == placement::gpu) { return; }
+  if (is_compressed(where)) {
+    compress_batch(fx, batch, where);
+    return;
+  }
+  cudf::get_default_stream().sync();
+  auto mut = batch->to_mutable();
+  mut.convert_to<cucascade::host_data_representation>(
+    sirius::converter_registry::get(), fx.host, fx.stream_ref());
+  fx.stream.synchronize();
+  if (where == placement::disk) {
+    mut.convert_to<cucascade::disk_data_representation>(
+      sirius::converter_registry::get(), fx.disk, fx.stream_ref());
+    fx.stream.synchronize();
+  }
+}
 
 }  // namespace sirius::test::merge_utils

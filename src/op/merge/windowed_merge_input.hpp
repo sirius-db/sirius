@@ -32,8 +32,9 @@ namespace sirius::op::merge {
  *
  * Carries CPU-only cursors into the runs of one partition instead of locked batches: the task
  * resolves and locks batches itself, window by window. Estimates are window-sized
- * (estimate_task_bytes), not partition-sized. Use operator_data::set_preferred_device_id for
- * locality.
+ * (estimate_task_bytes), not partition-sized, and leave out the window buffers a merger kept
+ * from the partition's previous task already holds (set_kept_buffer_runs). Use
+ * operator_data::set_preferred_device_id for locality.
  */
 class windowed_merge_input final : public operator_data {
  public:
@@ -45,8 +46,10 @@ class windowed_merge_input final : public operator_data {
    * @param cfg Window rows and output target of the task.
    * @param row_width Estimated row width in bytes of the fetched columns.
    * @param key_row_width Estimated row width in bytes of the key columns.
-   * @param gpu_runs How many of the runs are GPU-resident.
-   * @param largest_fallback_run_bytes Largest run that may be converted whole to the GPU tier.
+   * @param gpu_runs How many of the runs are sliced in place on the GPU and so need no window
+   *        buffer.
+   * @param fallback_bytes Sum, over the runs, of the largest batch of the run that may be
+   *        converted whole to the GPU tier.
    * @param compressed_runs How many of the runs hold a compressed batch (read through decode
    *        cursors that keep scratch between refills).
    * @param fetch_columns Columns the task fetches.
@@ -60,7 +63,7 @@ class windowed_merge_input final : public operator_data {
                        std::size_t row_width,
                        std::size_t key_row_width,
                        std::size_t gpu_runs,
-                       std::size_t largest_fallback_run_bytes,
+                       std::size_t fallback_bytes,
                        std::size_t compressed_runs = 0,
                        std::size_t fetch_columns   = 0,
                        std::size_t string_columns  = 0);
@@ -75,7 +78,7 @@ class windowed_merge_input final : public operator_data {
                               ::cuda::stream_ref stream) override;
 
   /// estimate_task_bytes(...) plus estimate_reader_state_bytes(...) of the task's current
-  /// window_config.
+  /// window_config. The runs of set_kept_buffer_runs() are charged no window buffer.
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   /// Same as get_estimated_size_in_bytes().
@@ -83,8 +86,14 @@ class windowed_merge_input final : public operator_data {
 
   /// Halves window_rows (floor kShrinkWindowRowsFloor) and output_target_bytes (floor 16 MiB);
   /// returns false when both are already at their floors. Calls the shrink observer when it
-  /// returns true.
+  /// returns true. Either way the kept buffer runs are reset to 0: the task that failed destroyed
+  /// the kept merger, so the retry allocates every window buffer.
   bool shrink_for_retry() override;
+
+  /// How many of the runs have their window buffers in the merger the partition kept from its
+  /// previous task: device memory that is already allocated, which this task reuses and does not
+  /// allocate. The estimates charge no window buffer for them. 0 until set.
+  void set_kept_buffer_runs(std::size_t runs) noexcept;
 
   /// Called, with no argument, each time shrink_for_retry() shrinks the task; the operator that
   /// made the input counts its shrinks through it. May be called from any thread.
@@ -117,10 +126,11 @@ class windowed_merge_input final : public operator_data {
   std::size_t _row_width;
   std::size_t _key_row_width;
   std::size_t _gpu_runs;
-  std::size_t _largest_fallback_run_bytes;
+  std::size_t _fallback_bytes;
   std::size_t _compressed_runs;
   std::size_t _fetch_columns;
   std::size_t _string_columns;
+  std::size_t _kept_buffer_runs{0};
   std::function<void()> _shrink_observer;
   cucascade::memory::memory_space* _gpu_memory_space = nullptr;
 };

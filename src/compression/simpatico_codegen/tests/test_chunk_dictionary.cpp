@@ -5,8 +5,10 @@
 // through make_dictionary_decoder and compared with a whole-column decode. Covers columns with
 // and without nulls, random spans, the chars byte budget (partial fit, nothing fits), destination
 // offsets of 4 and 8 bytes, appends at a non-zero row / byte offset, that the keys are read once
-// across many calls (state_bytes stable), and that only the index chunks of the span are
-// requested.
+// across many calls (state_bytes stable), that only the index chunks of the span are requested,
+// a call longer than one window of index chunks (bounded scratch), INT64 key offsets, a
+// destination without a chars buffer, a column of no rows, and corrupt payloads (key offsets,
+// an index outside the keys, an index chunk shorter than its rows).
 
 #include "chunk_test_utils.hpp"
 
@@ -16,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -94,13 +97,47 @@ chunk::buffer_ref output_leaf(hpln_column_description const& column,
   throw std::runtime_error("no leaf stores '" + output + "'");
 }
 
+/// Rewrites a column's description and host payload before a decoder sees them.
+using payload_edit = std::function<void(hpln_column_description&, std::vector<std::byte>&)>;
+
+/// A leaf_access over column 0 of `table` with `edit` applied to its description and payload.
+device_leaf_access edited_access(compressed_table const& table, payload_edit const& edit)
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  auto description                   = describe_from_table(table, 0);
+  auto payload                       = flatten_payload_host(table, 0);
+  if (edit) { edit(description, payload); }
+  rmm::device_buffer device(payload.size(), stream);
+  if (!payload.empty()) {
+    cuda_check(cudaMemcpyAsync(
+      device.data(), payload.data(), payload.size(), cudaMemcpyHostToDevice, stream.value()));
+  }
+  stream.synchronize();
+  return device_leaf_access{std::move(description), std::move(device)};
+}
+
+/// True if `action` reports corrupt data: a std::runtime_error that is not the "fall back"
+/// unsupported_chunk_decode.
+template <typename Action>
+bool reports_corrupt(Action&& action)
+{
+  try {
+    action();
+  } catch (unsupported_chunk_decode const&) {
+    return false;
+  } catch (std::runtime_error const&) {
+    return true;
+  }
+  return false;
+}
+
 /// One column compressed with the dictionary plan, its oracle, a decoder over its payload and
 /// where the plan's buffers are.
 struct dictionary_column {
-  explicit dictionary_column(std::unique_ptr<cudf::column> input)
+  explicit dictionary_column(std::unique_ptr<cudf::column> input, payload_edit const& edit = {})
     : table(compress_column_with_plan(input->view(), kDictionaryPlan)),
       oracle(full_decode(table, 0)),
-      access(table, 0),
+      access(edited_access(table, edit)),
       decoder(chunk::make_dictionary_decoder(access.column()))
   {
     auto const& column = access.column();
@@ -237,11 +274,18 @@ void check_span(dictionary_column& column,
     return;
   }
 
-  // The keys are read whole by the first decode and never again.
+  // The keys are read whole by the first decode and never again: the offsets to the host (to
+  // validate them) and to the device, the chars to the device.
   auto const& ko = column.keys_offsets;
   auto const& kc = column.keys_chars;
   if (first_call) {
-    check(access.requested_bytes(ko.leaf, ko.buffer) == column.range(ko).size &&
+    std::uint64_t host_offsets_bytes = 0;
+    for (auto const& [leaf, buffer, offset, size] : access.host_requests()) {
+      if (leaf == ko.leaf && buffer == ko.buffer) { host_offsets_bytes += size; }
+      check(leaf != kc.leaf || buffer != kc.buffer, what + "the key chars were read to the host");
+    }
+    check(host_offsets_bytes == column.range(ko).size &&
+            access.requested_bytes(ko.leaf, ko.buffer) == 2 * column.range(ko).size &&
             access.requested_bytes(kc.leaf, kc.buffer) == column.range(kc).size,
           what + "the first decode did not read the keys exactly once");
   } else {
@@ -320,8 +364,8 @@ void test_column(cudf::size_type rows,
              static_cast<std::size_t>(offsets[middle + 1] - offsets[middle]),
              true,
              what);
-  check(column.decoder->state_bytes() >= column.range(column.keys_offsets).size,
-        what + "the decoded keys are not counted in state_bytes");
+  // The keys stay with the leaf_access; the decoder's own state is its scratch.
+  check(column.decoder->state_bytes() > 0, what + "the decoder does not report its scratch");
 
   // The whole column next, so the decoder's scratch is as large as it will get.
   auto const everything = static_cast<std::size_t>(offsets.back());
@@ -384,7 +428,7 @@ void test_column(cudf::size_type rows,
   dst.offsets         = dst_offsets.data();
   dst.data_capacity   = 8;
   dst.dst_byte_offset = 9;
-  if (min_length > 0) {
+  if (offsets[1] > offsets[0]) {
     check(column.decoder->decode(column.access, span_of(0, 1), dst, stream) == 0,
           what + "a full destination took rows");
   }
@@ -499,6 +543,270 @@ void test_refusals()
   }
 }
 
+/// A call that takes more index chunks than one window: the rows are the oracle's whatever
+/// window they are in, a chars budget cuts in any window, and the decoder's scratch stays one
+/// window's, not the call's.
+void test_windows()
+{
+  constexpr std::int64_t kWindowChunks = 256;  // dictionary_chunks.cu
+  constexpr cudf::size_type kRows      = 600 * 1024 + 77;
+  dictionary_column column{make_strings(kRows, 40, 0.05, 0, 12)};
+  auto const offsets    = host_offsets(column.oracle->view());
+  auto const everything = static_cast<std::size_t>(offsets.back());
+  std::string const what{"windows: "};
+
+  check_span(column, offsets, 0, kRows, 8, 0, 0, everything, true, what);
+  check_span(column, offsets, 0, kRows, 4, 5, 9, everything + 100, false, what);
+  // Cuts in the first, a middle and the last window, and exactly at a window's end.
+  for (auto const cut_row : {std::int64_t{1000},
+                             kWindowChunks * kChunkRows,
+                             kWindowChunks * kChunkRows + 1,
+                             std::int64_t{400} * kChunkRows + 123,
+                             std::int64_t{kRows} - 3}) {
+    check_span(column,
+               offsets,
+               0,
+               kRows,
+               8,
+               2,
+               31,
+               static_cast<std::size_t>(offsets[static_cast<std::size_t>(cut_row)]),
+               false,
+               what);
+  }
+  // A span that starts inside a chunk and ends two windows later.
+  std::int64_t const first = 3 * kChunkRows + 1000;
+  std::int64_t const take  = 2 * kWindowChunks * kChunkRows + 500;
+  auto const need = static_cast<std::size_t>(offsets[static_cast<std::size_t>(first + take)] -
+                                             offsets[static_cast<std::size_t>(first)]);
+  check_span(column, offsets, first, take, 4, 1, 7, need, false, what);
+  check_span(column, offsets, first, take, 8, 0, 0, need / 2, false, what);
+
+  // One window of int64 indices and of int64 ends, the call record and the bitpack state's
+  // first-word entries: nothing sized by the 600 chunks the calls took.
+  auto const window_rows = static_cast<std::size_t>(kWindowChunks * kChunkRows);
+  auto const bound       = 2 * window_rows * sizeof(std::int64_t) + 64 +
+                     static_cast<std::size_t>(kWindowChunks) * sizeof(std::int64_t);
+  check(column.decoder->state_bytes() <= bound,
+        what + "the decoder holds " + std::to_string(column.decoder->state_bytes()) +
+          " bytes of state, more than one window's " + std::to_string(bound));
+}
+
+/// INT64 key offsets (the encoder writes INT32 for keys this small): the keys_offsets buffer is
+/// rewritten as INT64, at an address that is not 8-byte aligned.
+void test_wide_key_offsets()
+{
+  auto const widen = [](hpln_column_description& description, std::vector<std::byte>& payload) {
+    auto const root = description.nodes.at(0).edges.at(0).second;
+    auto const ko   = output_leaf(description, root, "keys_offsets");
+    auto& range     = description.leaves.at(ko.leaf).buffers.at(ko.buffer);
+    check(tag_to_dtype(range.type_tag).id() == cudf::type_id::INT32,
+          "wide key offsets: the encoder's key offsets are not INT32");
+    auto const count = static_cast<std::size_t>(range.size / 4);
+    // Appended after the payload, one byte past an 8-byte boundary.
+    auto const at = (payload.size() + 7) / 8 * 8 + 1;
+    std::vector<std::byte> wide(at + count * 8);
+    std::memcpy(wide.data(), payload.data(), payload.size());
+    for (std::size_t i = 0; i < count; ++i) {
+      std::int32_t narrow;
+      std::memcpy(&narrow, payload.data() + range.payload_offset + i * 4, sizeof(narrow));
+      std::int64_t const value = narrow;
+      std::memcpy(wide.data() + at + i * 8, &value, sizeof(value));
+    }
+    range.type_tag       = dtype_to_tag(cudf::data_type{cudf::type_id::INT64});
+    range.size           = count * 8;
+    range.payload_offset = at;
+    payload              = std::move(wide);
+  };
+  constexpr cudf::size_type kRows = 5000;
+  dictionary_column column{make_strings(kRows, 60, 0.1, 0, 30), widen};
+  check(tag_to_dtype(column.range(column.keys_offsets).type_tag).id() == cudf::type_id::INT64,
+        "wide key offsets: the decoder was not given INT64 key offsets");
+  auto const offsets    = host_offsets(column.oracle->view());
+  auto const everything = static_cast<std::size_t>(offsets.back());
+  std::string const what{"INT64 key offsets: "};
+  check_span(column, offsets, 1500, 1, 4, 0, 0, everything, true, what);
+  check_span(column, offsets, 0, kRows, 8, 3, 17, everything, false, what);
+  check_span(column, offsets, 0, kRows, 4, 0, 0, everything / 3, false, what);
+  check_span(column, offsets, 1023, 2050, 4, 2, 5, everything, false, what);
+  check_span(column, offsets, kRows - 1, 1, 8, 0, 0, everything, false, what);
+}
+
+/// A destination with no chars buffer and no chars capacity takes the empty rows that fit and
+/// copies no chars; a null chars buffer that claims capacity is refused.
+void test_no_chars_buffer()
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  auto dst_offsets                   = sentinel_buffer(2001 * 8);
+  column_write_target dst;
+  dst.data         = nullptr;
+  dst.offsets      = dst_offsets.data();
+  dst.offset_width = 8;
+
+  dictionary_column empties{make_strings(4500, 5, 0.0, 0, 0)};
+  check(empties.decoder->decode(empties.access, span_of(100, 2000), dst, stream) == 2000,
+        "no chars buffer: the empty rows were not taken");
+  auto const written = read_device<std::int64_t>(dst_offsets.data(), 2001);
+  check(std::all_of(written.begin(), written.end(), [](std::int64_t o) { return o == 0; }),
+        "no chars buffer: the offsets of empty rows are not 0");
+
+  dictionary_column strings{make_strings(4500, 5, 0.0, 3, 9)};
+  auto fresh  = sentinel_buffer(64);
+  dst.offsets = fresh.data();
+  check(strings.decoder->decode(strings.access, span_of(0, 5), dst, stream) == 0,
+        "no chars buffer: rows with chars were taken");
+  dst.data_capacity = 16;
+  check(throws<std::invalid_argument>(
+          [&] { strings.decoder->decode(strings.access, span_of(0, 5), dst, stream); }),
+        "no chars buffer: a null chars buffer with capacity did not throw");
+  stream.synchronize();
+  check(untouched(fresh, 0, 64), "no chars buffer: a refused decode wrote offsets");
+}
+
+/// A column of no rows: the factory accepts it, and the only span it has decodes nothing and
+/// requests nothing.
+void test_zero_rows()
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  auto const input                   = make_strings(0, 4, 0.0, 1, 8);
+  auto const table                   = compress_column_with_plan(input->view(), kDictionaryPlan);
+  device_leaf_access access{table, 0};
+  check(access.column().num_rows == 0, "zero rows: the description has rows");
+  check(chunk::classify_value_plan(access.column()) == chunk::value_plan::dictionary,
+        "zero rows: the plan is not classified as dictionary");
+  auto decoder = chunk::make_dictionary_decoder(access.column());
+  check(decoder != nullptr, "zero rows: the factory refused the column");
+  column_write_target dst;
+  check(decoder->decode(access, span_of(0, 0), dst, stream) == 0, "zero rows: rows were decoded");
+  check(access.requests().empty() && decoder->state_bytes() == 0,
+        "zero rows: an empty decode requested bytes or left state");
+  check(throws<std::invalid_argument>([&] { decoder->decode(access, span_of(0, 1), dst, stream); }),
+        "zero rows: a row of an empty column did not throw");
+}
+
+/// Corrupt payloads are reported (std::runtime_error, not unsupported_chunk_decode) and never
+/// decode as wrong rows: bad key offsets on the first decode, before anything is written; an
+/// index chunk shorter than its rows before anything is written; an index outside the keys.
+void test_corrupt_payloads()
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  constexpr cudf::size_type kRows    = 5000;
+  auto const make                    = [&] { return make_strings(kRows, 12, 0.0, 1, 16); };
+  auto chars                         = sentinel_buffer(256 * 1024);
+  auto dst_offsets                   = sentinel_buffer((kRows + 1) * 8);
+  column_write_target dst;
+  dst.data          = chars.data();
+  dst.data_capacity = chars.size();
+  dst.offsets       = dst_offsets.data();
+  dst.offset_width  = 8;
+  auto const clean  = [&] {
+    stream.synchronize();
+    return untouched(chars, 0, chars.size()) && untouched(dst_offsets, 0, dst_offsets.size());
+  };
+
+  // Key offsets: a negative first one, a decreasing pair, a last one past keys_chars.
+  auto const poke_key_offset = [](std::int64_t element, std::int32_t value) {
+    return [=](hpln_column_description& description, std::vector<std::byte>& payload) {
+      auto const root   = description.nodes.at(0).edges.at(0).second;
+      auto const ko     = output_leaf(description, root, "keys_offsets");
+      auto const& range = description.leaves.at(ko.leaf).buffers.at(ko.buffer);
+      auto const count  = static_cast<std::int64_t>(range.size / 4);
+      check(count >= 4, "corrupt: too few keys");
+      auto const at = static_cast<std::size_t>(element < 0 ? count + element : element);
+      std::memcpy(payload.data() + range.payload_offset + at * 4, &value, sizeof(value));
+    };
+  };
+  std::vector<std::pair<std::string, payload_edit>> const bad_offsets{
+    {"a negative first key offset", poke_key_offset(0, -1)},
+    {"decreasing key offsets", poke_key_offset(2, 0)},
+    {"a last key offset past keys_chars", poke_key_offset(-1, 1 << 30)}};
+  for (auto const& [name, edit] : bad_offsets) {
+    dictionary_column column{make(), edit};
+    check(
+      reports_corrupt([&] { column.decoder->decode(column.access, span_of(0, 10), dst, stream); }),
+      "corrupt: " + name + " was not reported");
+    check(
+      reports_corrupt([&] { column.decoder->decode(column.access, span_of(0, 10), dst, stream); }),
+      "corrupt: " + name + " was not reported by a second decode");
+    check(clean(), "corrupt: " + name + ": a refused decode wrote bytes");
+  }
+
+  // An index chunk whose count is below its rows: the rows past it would decode stale scratch.
+  {
+    dictionary_column column{
+      make(), [](hpln_column_description& description, std::vector<std::byte>& payload) {
+        auto const root = description.nodes.at(0).edges.at(0).second;
+        auto const node = chunk::find_child_node(description, root, "indices");
+        auto const loc  = chunk::find_bitpack(description, node.value()).value();
+        auto const& counts =
+          description.leaves.at(loc.chunk_count.leaf).buffers.at(loc.chunk_count.buffer);
+        std::int32_t const short_count = 1000;
+        std::memcpy(payload.data() + counts.payload_offset + 2 * 4, &short_count, 4);
+      }};
+    for (auto const& [first, take] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+           {0, kRows}, {2048, 1024}, {3047, 2}, {3050, 10}}) {
+      check(reports_corrupt(
+              [&] { column.decoder->decode(column.access, span_of(first, take), dst, stream); }),
+            "corrupt: a short index chunk was not reported for rows from " + std::to_string(first));
+    }
+    check(clean(), "corrupt: a short index chunk: a refused decode wrote bytes");
+    // The rows the chunk does hold, and the chunks before it, still decode.
+    check(column.decoder->decode(column.access, span_of(10, 3000), dst, stream) == 3000 &&
+            compare_string_rows(column.oracle->view(),
+                                dst.data,
+                                dst.offsets,
+                                8,
+                                0,
+                                0,
+                                10,
+                                3000,
+                                stream,
+                                {.null_rows_too = true}),
+          "corrupt: the rows before a short index chunk did not decode");
+  }
+
+  // An index outside the keys: chunk 2's minimum is raised past every key.
+  {
+    dictionary_column column{
+      make(), [](hpln_column_description& description, std::vector<std::byte>& payload) {
+        auto const root = description.nodes.at(0).edges.at(0).second;
+        auto const node = chunk::find_child_node(description, root, "indices");
+        auto const loc  = chunk::find_bitpack(description, node.value()).value();
+        auto const& mins =
+          description.leaves.at(loc.chunk_min.leaf).buffers.at(loc.chunk_min.buffer);
+        auto const& bits =
+          description.leaves.at(loc.chunk_bits.leaf).buffers.at(loc.chunk_bits.buffer);
+        auto const width = static_cast<std::size_t>(mins.size / bits.size);
+        std::memset(payload.data() + mins.payload_offset + 2 * width, 0x7F, width);
+      }};
+    check(column.decoder->decode(column.access, span_of(5, 2000), dst, stream) == 2000 &&
+            compare_string_rows(column.oracle->view(),
+                                dst.data,
+                                dst.offsets,
+                                8,
+                                0,
+                                0,
+                                5,
+                                2000,
+                                stream,
+                                {.null_rows_too = true}),
+          "corrupt: the rows before a bad index did not decode");
+    for (auto const& [first, take] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+           {0, kRows}, {2048, 1}, {3071, 1}, {2000, 100}}) {
+      check(reports_corrupt(
+              [&] { column.decoder->decode(column.access, span_of(first, take), dst, stream); }),
+            "corrupt: an index outside the keys was not reported for rows from " +
+              std::to_string(first));
+    }
+    // A chars budget that the bad rows do not fit still reports them.
+    dst.data_capacity = 4;
+    check(reports_corrupt(
+            [&] { column.decoder->decode(column.access, span_of(2040, 100), dst, stream); }),
+          "corrupt: an index outside the keys was not reported under a small budget");
+    stream.synchronize();
+  }
+}
+
 }  // namespace
 
 int main()
@@ -518,6 +826,11 @@ int main()
     test_column(4500, 5, 0.0, 0, 0);      // every value empty: all rows fit a budget of 0
     test_column(1, 1, 0.0, 5, 5);
     test_span_edges();
+    test_windows();
+    test_wide_key_offsets();
+    test_no_chars_buffer();
+    test_zero_rows();
+    test_corrupt_payloads();
     test_refusals();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());

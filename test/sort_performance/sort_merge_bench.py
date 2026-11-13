@@ -20,7 +20,9 @@ with its own Sirius config file. See README.md beside this script.
 """
 
 import argparse
+import collections
 import csv
+import dataclasses
 import json
 import os
 import re
@@ -29,6 +31,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -61,6 +64,27 @@ FIRST_ERRORS_FILE = "sirius_log_first_errors.txt"
 FIRST_ERRORS_LINES = 200
 # A sizing that misses --scale x limit by more than this fraction is reported.
 SIZING_TOLERANCE = 0.1
+# The run's log is parsed in pieces of about this many bytes, so a log of many
+# GiB is never held in memory.
+LOG_CHUNK_BYTES = 16 << 20
+# Lines at the end of the log searched for an out-of-memory message when the
+# run left no error text.
+OOM_TAIL_LINES = 50
+# Disk the pre-check asks for, as a multiple of the spilled inputs (the data
+# the host tier does not hold). Intermediate merge passes spill their output
+# while the inputs they have not consumed yet are still on disk, so the inputs
+# alone are not enough: whole-GPU runs at 5x the limit were expected to take
+# 600-650 GiB against about 420 GiB of spilled inputs. Each run's measured
+# peak is its `peak_spill_disk_bytes`; revise this factor from those.
+DISK_ESTIMATE_FACTOR = 1.5
+SPILL_SAMPLE_INTERVAL_S = 1.0
+# Once the child has written its result it gets this long to tear down and
+# exit before it is killed; the result is kept either way.
+TEARDOWN_GRACE_S = 300.0
+RESULT_POLL_S = 1.0
+# Signals that end the harness through its normal cleanup (kill the child,
+# remove the spill directories). SIGINT already does, as KeyboardInterrupt.
+TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
 # Bytes per row by column type, used to size a dataset. VARCHAR adds its mean
 # length (see row_width).
@@ -164,6 +188,7 @@ CSV_COLUMNS = [
     "load_s",
     "rows_counted",
     "peak_gpu_mib",
+    "peak_spill_disk_bytes",
     "spill_bytes_host",
     "spill_bytes_disk",
     "spill_batches_host",
@@ -173,10 +198,14 @@ CSV_COLUMNS = [
     "discard_rows",
     "discard_bytes",
     "order_violations",
+    "order_checked",
+    "ranges_checked",
 ]
 
 # Statuses a `one_shot` run may end in without the harness calling it a failure.
-ONE_SHOT_EXPECTED = {"ok", "oom", "error", "timeout", "crashed"}
+# A wrong or unverified result (`row_mismatch`, `order_violation`,
+# `order_unchecked`) and `refused` fail the harness in every mode.
+ONE_SHOT_EXPECTED = {"oom", "error", "timeout", "crashed"}
 
 _OOM_RE = re.compile(r"out[ _]of[ _]memory|bad_alloc|\boom\b|oom_", re.IGNORECASE)
 _BYTE_UNITS = {
@@ -201,10 +230,9 @@ _BYTE_UNITS = {
 }
 
 
-# `log`, `_load_yaml`, `_dump_yaml`, `_dig`, `_plant` and `_sql_literal` below
-# are copies of the functions of the same names in
-# test/tpch_performance/performance_test.py. The two copies must change
-# together.
+# `log`, `_dig` and `_plant` below are copies of the functions of the same names
+# in test/tpch_performance/performance_test.py; `_load_yaml`, `_dump_yaml` and
+# `_sql_literal` are adapted from them (`_dump_yaml` can also return text).
 
 
 def log(msg):
@@ -399,7 +427,10 @@ def derive_run_config(base, gpu_limit_bytes, spill_dir, compression, spill_min_b
 
 
 def host_tier_bytes(config):
-    """Bytes the host tier keeps before it evicts to disk, per the run's config."""
+    """Bytes the host tier keeps before it evicts to disk, per the run's config.
+
+    Unset fields fall back to Sirius's defaults (capacity_fraction 0.9,
+    downgrade_stop_fraction 0.8; docs/super-sirius/configuration.md)."""
     host = _dig(config, ["sirius", "memory", "host"]) or {}
     total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     capacity = _parse_bytes(host.get("capacity_bytes"))
@@ -412,8 +443,8 @@ def host_tier_bytes(config):
 
 
 def disk_bytes_needed(data_bytes, config):
-    """Disk the spilled inputs may take: what the host tier does not hold, plus 5%."""
-    return int(max(0, data_bytes - host_tier_bytes(config)) * 1.05)
+    """Disk a run may take: DISK_ESTIMATE_FACTOR x what the host tier does not hold."""
+    return int(max(0, data_bytes - host_tier_bytes(config)) * DISK_ESTIMATE_FACTOR)
 
 
 def _existing_ancestor(path):
@@ -495,39 +526,191 @@ def run_log_paths(log_dir):
     return paths
 
 
-def read_run_log(log_dir, bench_metrics):
-    """The text of every Sirius log file the run wrote."""
-    return "".join(bench_metrics.LogTail(p).read_new() for p in run_log_paths(log_dir))
+def iter_run_log_chunks(log_dir, chunk_bytes=LOG_CHUNK_BYTES):
+    """Yields the run's log, oldest file first, as lists of lines (each with its
+    newline) of about `chunk_bytes` in total.
+
+    A last line without a newline (the process died while writing it) is left
+    out, so a parser never sees half a line. Unreadable files are skipped.
+    """
+    for path in run_log_paths(log_dir):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as log_file:
+                while True:
+                    lines = log_file.readlines(chunk_bytes)
+                    if lines and not lines[-1].endswith("\n"):
+                        lines.pop()
+                    if not lines:
+                        break
+                    yield lines
+        except OSError:
+            continue
 
 
-def collect_metrics(log_text, bench_metrics):
-    """Flatten what bench_metrics reads from the run's log into result columns."""
+class LogMetrics:
+    """Adds up what bench_metrics reads from a run's log, one piece of text at a time."""
+
+    def __init__(self, bench_metrics):
+        self._bench_metrics = bench_metrics
+        self._stats = []  # one entry per MERGE_SORT operator
+        self._downgrade = bench_metrics.parse_downgrade_totals("")
+        self._oom_retries = 0
+        self._sink_lines = []  # one line per discard sink
+
+    def feed(self, text):
+        """Parse `text`, which must end at a line boundary."""
+        bm = self._bench_metrics
+        self._stats.extend(bm.parse_merge_sort_stats(text))
+        totals = bm.parse_downgrade_totals(text)
+        for field in dataclasses.fields(totals):
+            setattr(
+                self._downgrade,
+                field.name,
+                getattr(self._downgrade, field.name) + getattr(totals, field.name),
+            )
+        self._oom_retries += bm.count_oom_retries(text)
+        self._sink_lines.extend(
+            line for line in text.splitlines() if bm.DISCARD_SINK_TAG in line
+        )
+
+    def result(self):
+        """The result columns of everything fed so far."""
+        bm = self._bench_metrics
+        out = {"merge_sort_operators": len(self._stats)}
+        out.update(bm.sum_merge_sort_stats(self._stats))
+        out["spill_bytes_host"] = self._downgrade.to_host_bytes
+        out["spill_bytes_disk"] = self._downgrade.to_disk_bytes
+        out["spill_batches_host"] = self._downgrade.to_host_batches
+        out["spill_batches_disk"] = self._downgrade.to_disk_batches
+        out["downgrade_requests"] = self._downgrade.requests
+        out["oom_retries"] = self._oom_retries
+        # Parsed in one call so that combining several sinks stays bench_metrics's job.
+        sink = bm.parse_discard_sink("\n".join(self._sink_lines))
+        if sink is not None:
+            out["discard_rows"] = sink.get("rows")
+            out["discard_bytes"] = sink.get("bytes")
+            out["order_violations"] = sink.get("order_violations")
+            # Absent from a sink line that predates these keys: read as "not checked".
+            out["order_checked"] = sink.get("order_checked")
+            out["ranges_checked"] = sink.get("ranges_checked")
+        return out
+
+
+def scan_run_log(log_dir, bench_metrics, tail_lines, chunk_bytes=LOG_CHUNK_BYTES):
+    """One streaming pass over the run's log.
+
+    Returns (metrics, tail, error): the result columns read from the log, its
+    last `tail_lines` lines, and the text of a parsing failure (else None, and
+    then `metrics` is empty).
+    """
+    metrics = LogMetrics(bench_metrics)
+    tail = collections.deque(maxlen=tail_lines)
+    error = None
+    for lines in iter_run_log_chunks(log_dir, chunk_bytes):
+        tail.extend(lines)
+        if error is None:
+            try:
+                metrics.feed("".join(lines))
+            except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
+                error = f"{type(exc).__name__}: {exc}"
     out = {}
-    stats = bench_metrics.parse_merge_sort_stats(log_text)
-    out["merge_sort_operators"] = len(stats)
-    out.update(bench_metrics.sum_merge_sort_stats(stats))
-    totals = bench_metrics.parse_downgrade_totals(log_text)
-    out["spill_bytes_host"] = totals.to_host_bytes
-    out["spill_bytes_disk"] = totals.to_disk_bytes
-    out["spill_batches_host"] = totals.to_host_batches
-    out["spill_batches_disk"] = totals.to_disk_batches
-    out["downgrade_requests"] = totals.requests
-    out["oom_retries"] = bench_metrics.count_oom_retries(log_text)
-    sink = bench_metrics.parse_discard_sink(log_text)
-    if sink is not None:
-        out["discard_rows"] = sink.get("rows")
-        out["discard_bytes"] = sink.get("bytes")
-        out["order_violations"] = sink.get("order_violations")
-    return out
+    if error is None:
+        try:
+            out = metrics.result()
+        except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
+            error = f"{type(exc).__name__}: {exc}"
+    return out, [line.rstrip("\n") for line in tail], error
 
 
-def classify_failure(error_text, log_text):
+def classify_failure(error_text, log_tail):
     """`oom` when the error (or, failing that, the log's last lines) says so."""
     if _OOM_RE.search(error_text or ""):
         return "oom"
-    if not error_text and _OOM_RE.search("\n".join(log_text.splitlines()[-50:])):
+    if not error_text and _OOM_RE.search("\n".join(log_tail[-OOM_TAIL_LINES:])):
         return "oom"
     return "error"
+
+
+def _dir_bytes(path):
+    """Total size of the files under `path`; 0 if it does not exist."""
+    total = 0
+    pending = [path]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:  # removed while we looked
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+class SpillDirSampler:
+    """Background thread measuring the bytes under a run's spill directory every
+    interval_s; stop() returns the peak (None if it was never started)."""
+
+    def __init__(self, path, interval_s=SPILL_SAMPLE_INTERVAL_S):
+        self._path = path
+        self._interval_s = interval_s
+        self._peak = None
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="spill-dir-sampler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread.join()
+            self._thread = None
+        return self._peak
+
+    def _run(self):
+        while True:
+            self._peak = max(self._peak or 0, _dir_bytes(self._path))
+            # Checked after the sample so that the last sample is taken at stop().
+            if self._stop_event.is_set():
+                return
+            self._stop_event.wait(self._interval_s)
+
+
+def _wait_for_child(proc, result_path, timeout_s):
+    """Wait for the child to exit. Returns None when it did, else why it has to
+    be killed: "timeout" (--timeout-s passed) or "teardown" (it wrote its
+    result but did not exit within TEARDOWN_GRACE_S)."""
+    now = time.monotonic()
+    deadline = now + timeout_s if timeout_s > 0 else None
+    teardown_deadline = None
+    while True:
+        wait = RESULT_POLL_S
+        for limit in (deadline, teardown_deadline):
+            if limit is not None:
+                wait = min(wait, max(0.0, limit - now))
+        try:
+            proc.wait(timeout=wait)
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        if teardown_deadline is None and os.path.isfile(result_path):
+            teardown_deadline = now + TEARDOWN_GRACE_S
+        if teardown_deadline is not None and now >= teardown_deadline:
+            return "teardown"
+        if deadline is not None and now >= deadline:
+            return "timeout"
 
 
 def execute_run(run, args, bench_metrics):
@@ -566,7 +749,8 @@ def execute_run(run, args, bench_metrics):
     env["CUDA_VISIBLE_DEVICES"] = str(args.device)
 
     sampler = bench_metrics.GpuMemorySampler(args.device)
-    timed_out = False
+    disk_sampler = SpillDirSampler(run["spill_dir"])
+    killed = None
     started = time.perf_counter()
     try:
         with open(os.path.join(run_dir, CHILD_STDOUT_FILE), "w") as child_out:
@@ -578,55 +762,71 @@ def execute_run(run, args, bench_metrics):
                 cwd=REPO_ROOT,
                 start_new_session=True,
             )
-            sampler.start()
             try:
-                proc.wait(timeout=args.timeout_s if args.timeout_s > 0 else None)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_group(proc)
+                sampler.start()
+                disk_sampler.start()
+                killed = _wait_for_child(proc, result_path, args.timeout_s)
+                if killed:
+                    _kill_group(proc)
             except BaseException:
                 _kill_group(proc)
                 raise
             finally:
                 row["peak_gpu_mib"] = sampler.stop()
+                row["peak_spill_disk_bytes"] = disk_sampler.stop()
         elapsed = time.perf_counter() - started
 
         result = {}
         if os.path.isfile(result_path):
             with open(result_path) as f:
                 result = json.load(f)
-        log_text = read_run_log(log_dir, bench_metrics)
-        try:
-            row.update(collect_metrics(log_text, bench_metrics))
-        except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
-            log(f"  WARNING: could not parse the run's log: {exc}")
-            row["metrics_error"] = f"{type(exc).__name__}: {exc}"
+        metrics, log_tail, metrics_error = scan_run_log(
+            log_dir, bench_metrics, max(args.log_tail_lines, OOM_TAIL_LINES)
+        )
+        row.update(metrics)
+        if metrics_error:
+            log(f"  WARNING: could not parse the run's log: {metrics_error}")
+            row["metrics_error"] = metrics_error
 
         row["wall_s"] = result.get("wall_s")
         row["load_s"] = result.get("load_s")
         row["rows_counted"] = result.get("rows_counted")
         error = result.get("error", "")
-        if timed_out:
+        # A result the child recorded stands even when the process then had to
+        # be killed: the measurement was complete before teardown hung.
+        if killed == "timeout" and result.get("status") != "ok":
             row["status"] = "timeout"
             row["wall_s"] = row["wall_s"] or elapsed
             error = f"killed after --timeout-s {args.timeout_s}" + (
                 f"; {error}" if error else ""
             )
-        elif result.get("status") == "ok":
-            row["status"], error = check_result(row, args.validate)
         elif result:
-            row["status"] = classify_failure(error, log_text)
+            if result.get("status") == "ok":
+                row["status"], error = check_result(row, args.validate)
+            else:
+                row["status"] = classify_failure(error, log_tail)
+            if killed:
+                limit = (
+                    f"--timeout-s {args.timeout_s}"
+                    if killed == "timeout"
+                    else f"{TEARDOWN_GRACE_S:g} s"
+                )
+                note = (
+                    "the result was recorded, but the process did not exit "
+                    f"within {limit} and was killed"
+                )
+                error = f"{error}; {note}" if error else note
         else:
             # No result file: the process died before it could report (a signal,
             # the kernel's OOM killer, an abort inside the engine).
             row["status"] = "crashed"
             row["wall_s"] = elapsed
             error = f"process exited with code {proc.returncode} and no result"
-            if classify_failure("", log_text) == "oom":
+            if classify_failure("", log_tail) == "oom":
                 error += "; the log's last lines mention out of memory"
         row["error"] = " ".join(error.split())[:2000]
 
-        tail = log_text.splitlines()[-args.log_tail_lines :]
+        tail = log_tail[-args.log_tail_lines :]
         with open(os.path.join(run_dir, LOG_TAIL_FILE), "w") as f:
             f.write("\n".join(tail) + ("\n" if tail else ""))
         if row["status"] != "ok":
@@ -662,6 +862,20 @@ def check_result(row, validate):
             return (
                 "order_violation",
                 f"discard sink found {row['order_violations']} order violations",
+            )
+        # Zero violations means nothing unless the sink says it compared the
+        # rows: the planner can turn `check_order` off without failing the query.
+        if row.get("order_checked") != 1:
+            return (
+                "order_unchecked",
+                "--validate: the discard sink did not check the order "
+                f"(order_checked={row.get('order_checked')})",
+            )
+        if row["rows"] > 0 and not row.get("ranges_checked"):
+            return (
+                "order_unchecked",
+                "--validate: the discard sink compared no row ranges "
+                f"(ranges_checked={row.get('ranges_checked')})",
             )
     return "ok", ""
 
@@ -779,7 +993,9 @@ def write_markdown(rows, path, args, sizings):
 
 
 def _csv_list(text):
-    return [item.strip() for item in text.split(",") if item.strip()]
+    """Comma-separated items, in order, without duplicates: a repeated item
+    would give two runs the same name and run directory."""
+    return list(dict.fromkeys(item.strip() for item in text.split(",") if item.strip()))
 
 
 def _bool_list(text):
@@ -790,7 +1006,7 @@ def _bool_list(text):
                 f"expected true/false values, got {item!r}"
             )
         out.append(item.lower() == "true")
-    return out
+    return list(dict.fromkeys(out))
 
 
 def parse_args(argv=None):
@@ -863,8 +1079,9 @@ def parse_args(argv=None):
     p.add_argument(
         "--validate",
         action="store_true",
-        help="Add `check_order true` to the discard sink and require its row count "
-        "and zero order violations",
+        help="Add `check_order true` to the discard sink and require its row count, "
+        "zero order violations and its confirmation that the order was checked "
+        "(else the run's status is `order_unchecked`)",
     )
     p.add_argument(
         "--dry-run",
@@ -1029,6 +1246,14 @@ def print_dry_run(runs):
         print(";\n".join(run["settings"] + [run["sql"]]) + ";")
 
 
+def _exit_on_signal(signum, _frame):
+    """Turn a termination signal into SystemExit so `except`/`finally` cleanup runs."""
+    # Further ones are ignored so that the cleanup is not itself interrupted.
+    for sig in TERMINATION_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    sys.exit(128 + signum)
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--_child":
         sys.exit(run_child(sys.argv[2]))
@@ -1077,6 +1302,12 @@ def main():
     csv_path = os.path.join(out_dir, "results.csv")
     md_path = os.path.join(out_dir, "results.md")
     rows = []
+    # The child runs in its own session, so a signal that ends this process
+    # does not reach it: without these handlers it would keep the GPU and the
+    # spill directory.
+    previous_handlers = {
+        sig: signal.signal(sig, _exit_on_signal) for sig in TERMINATION_SIGNALS
+    }
     try:
         for i, run in enumerate(runs, 1):
             log(f"--- [{i}/{len(runs)}] {run['name']} ---")
@@ -1109,6 +1340,8 @@ def main():
             write_markdown(rows, md_path, args, sizings)
     finally:
         shutil.rmtree(spill_root, ignore_errors=True)
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
     failed = [
         r

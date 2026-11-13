@@ -71,7 +71,8 @@ struct chunk_span {
 };
 
 /// Decoder of one column's value plan. Stateful across calls (prefixes, keys, ANS headers).
-/// Writes values / offsets / chars only — never validity. Returns rows written.
+/// Writes values / offsets / chars only — never validity. Returns rows written: span.take, or
+/// for STRING fewer when dst's chars (or 4-byte offsets) run out, 0 if not even one row fits.
 class chunk_decoder {
  public:
   virtual ~chunk_decoder() = default;
@@ -187,9 +188,10 @@ struct bitpack_locator {
 // ─── Shared primitives ──────────────────────────────────────────────────────
 
 /// Bitpack primitive: unpacks chunks [chunk_begin, chunk_end) of a bitpack node to int64
-/// values (chunk_min + unpacked), writing (chunk_end - chunk_begin) * kChunkRows (last chunk
-/// shorter) values at out (device). Caches the host prefix of chunk byte offsets in `state`
-/// (create with make_bitpack_state; reuse across calls).
+/// values (chunk_min + unpacked) at out (device): one kChunkRows-slot block per chunk, chunk
+/// c's values at out + (c - chunk_begin) * kChunkRows; slots past a chunk's count are unwritten.
+/// Caches the node's chunk counts and packed-word prefix on the host in `state` (create with
+/// make_bitpack_state; reuse across calls).
 struct bitpack_state;
 std::unique_ptr<bitpack_state, void (*)(bitpack_state*)> make_bitpack_state(
   bitpack_locator const& locator);
@@ -201,9 +203,16 @@ void unpack_bitpack_chunks(leaf_access& leaves,
                            rmm::cuda_stream_view stream);
 /// Device bytes `state` holds between calls.
 [[nodiscard]] std::size_t bitpack_state_bytes(bitpack_state const& state) noexcept;
+/// For a node that holds one value per row: throws std::runtime_error unless each of the first
+/// `positions` slots of the blocks of the chunks from chunk_begin on has a value, i.e. no chunk's
+/// count is short of the slots asked of it. Call after unpack_bitpack_chunks covered the chunks.
+void require_bitpack_values(bitpack_state const& state,
+                            std::int64_t chunk_begin,
+                            std::int64_t positions);
 
 /// Delta primitive: decodes chunks [chunk_begin, chunk_end) of a delta(->rle)->bitpack subtree
-/// rooted at `delta_node` to int64 values at out (device).
+/// rooted at `delta_node` to int64 values at out (device): one kChunkRows-slot block per chunk;
+/// slots past a chunk's length are left unwritten.
 struct delta_state;
 std::unique_ptr<delta_state, void (*)(delta_state*)> make_delta_state(
   hpln_column_description const& column, std::uint32_t delta_node);
@@ -217,7 +226,7 @@ void decode_delta_chunks(leaf_access& leaves,
 [[nodiscard]] std::size_t delta_state_bytes(delta_state const& state) noexcept;
 
 /// ANS primitive: writes uncompressed bytes [byte_begin, byte_end) of the ANS leaf buffer `ans`
-/// to dst (device), decoding only the 64 KiB blocks that cover the range.
+/// to dst (device), decoding only the frame's blocks that cover the range.
 struct ans_state;
 std::unique_ptr<ans_state, void (*)(ans_state*)> make_ans_state(
   hpln_column_description const& column, buffer_ref ans);

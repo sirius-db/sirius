@@ -20,38 +20,40 @@ A summary of the measured results and the `one_shot` deprecation recommendation 
 [RESULTS.md](RESULTS.md). Result directories are not committed: write them under the default
 `output/` or under `results/`, both git-ignored.
 
-## Where to run it
+## How to run it
 
-Run it on the workstation, never on the development machine: no number taken there is reported.
-From the worktree root, `.ai-helper/workstation.sh` syncs the code, builds it and runs the command
-inside the workstation's pixi environment while holding the workstation lock, so nothing else
-uses the GPUs during the benchmark.
+Run it from the repository root on a machine with an NVIDIA GPU, after `pixi run make` has built
+the extension. Nothing else should use that GPU during a run, and the spill directory needs a
+fast disk with room for the data (see [Disk](#disk)). `$BENCH` below stands for a directory on
+that disk.
 
 ```bash
-# Print the matrix, each run's config and SQL; runs nothing (works anywhere)
+# Print the matrix, each run's config and SQL; runs nothing (needs no GPU)
 pixi run python -B test/sort_performance/sort_merge_bench.py --gpu-limit-bytes 4294967296 --dry-run
 
 # Smoke run: the whole matrix, validated, at 3x a 4 GiB limit (about 12 GiB per dataset)
-.ai-helper/workstation.sh python test/sort_performance/sort_merge_bench.py \
+pixi run python -B test/sort_performance/sort_merge_bench.py \
   --gpu-limit-bytes 4294967296 --scale 3 --device 0 --validate \
-  --out-dir /mnt/disk_2/sort_merge_bench/smoke
+  --out-dir $BENCH/smoke
 
 # One run of the whole-GPU matrix: 5x a 94 GiB limit with a 96 GiB host cap (see Sizing)
-.ai-helper/workstation.sh python test/sort_performance/sort_merge_bench.py \
+pixi run python -B test/sort_performance/sort_merge_bench.py \
   --gpu-limit-bytes 100931731456 --scale 5 --device 0 \
-  --base-config /mnt/disk_2/sort_merge_bench/whole-gpu-5x/base_config.yml \
+  --base-config $BENCH/whole-gpu-5x/base_config.yml \
   --datasets uniform-1key --compression false --modes windowed --timeout-s 10800 \
-  --spill-dir /mnt/disk_2/sirius_spill \
-  --out-dir /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__windowed
+  --spill-dir $BENCH/spill \
+  --out-dir $BENCH/whole-gpu-5x/cells/uniform-1key__comp-false__windowed
 
 # Data that fits the GPU (half the limit), all three modes, three repeats per cell
-.ai-helper/workstation.sh python test/sort_performance/sort_merge_bench.py \
+pixi run python -B test/sort_performance/sort_merge_bench.py \
   --gpu-limit-bytes <limit> --scale 0.5 --modes one_shot,windowed,auto --repeat 3 \
-  --out-dir /mnt/disk_2/sort_merge_bench/fits-gpu
+  --out-dir $BENCH/fits-gpu
 ```
 
-- **Pass `--out-dir` outside the mirror.** The default is `test/sort_performance/output/<timestamp>`
-  inside the checkout, and the next `workstation.sh` sync deletes what the worktree does not have.
+- **Output.** Without `--out-dir` the results go to `test/sort_performance/output/<timestamp>`
+  (git-ignored). If you run the benchmark on another machine through a wrapper of your own that
+  syncs the checkout there, pass an `--out-dir` outside the synced tree so that the next sync
+  does not delete the results.
 - **One GPU.** `--device` is an `nvidia-smi` index. Each run gets `CUDA_VISIBLE_DEVICES=<device>`
   with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the GPU the run uses is the one whose memory is sampled
   (CUDA's default order is fastest first, which need not be `nvidia-smi`'s). A full matrix
@@ -79,10 +81,10 @@ matrix; lower `--rows-per-batch` to get closer.
 
 ### The whole-GPU matrix
 
-The owner's decision of 2026-11-13 for the A/B is the **whole GPU with data at 5× the limit**:
+The A/B in [RESULTS.md](RESULTS.md) uses the **whole GPU with data at 5× the limit**:
 
 - **GPU limit 94 GiB** (`--gpu-limit-bytes 100931731456`). It is the largest limit found to
-  start on the workstation's 97,887 MiB card: 95 GiB and 96 GiB are rejected with
+  start on a 97,887 MiB card: 95 GiB and 96 GiB are rejected with
   `sirius.memory.gpu.usage_limit_bytes exceeds the capacity of GPU 0`. The limit must not exceed
   the capacity Sirius computes for the device, which is below `nvidia-smi`'s total.
 - **`--scale 5`**: about 470 GiB of data per run.
@@ -96,8 +98,8 @@ The owner's decision of 2026-11-13 for the A/B is the **whole GPU with data at 5
   ```
 
   Without it the host capacity defaults to 0.9 of RAM. A run with that default filled the
-  workstation's RAM (the process grew to 113 GiB), the machine swapped, and the run was stopped
-  unfinished.
+  125 GiB of RAM of the machine it was measured on (the process grew to 113 GiB), the machine
+  swapped, and the run was stopped unfinished.
 - **One cell at a time, as a pair**: the `windowed` run, then the `one_shot` run of the same
   dataset and compression setting, each its own harness invocation.
 
@@ -110,8 +112,9 @@ recorded as `refused` and not started; `--skip-disk-check` overrides that.
 
 That estimate covers the spilled inputs only. Intermediate merge passes spill their output
 again: an uncompressed windowed run of the whole-GPU matrix moved up to 977 GB to disk over its
-duration (how much the disk held at one time was not sampled). Check `df -h /mnt/disk_2` before
-each run. Each run spills under `<spill-dir>/sort_bench_<timestamp>/<run>` and that directory is
+duration (how much the disk held at one time was not sampled). Check the free space of the
+spill disk (`df -h`) before each run. Each run spills under
+`<spill-dir>/sort_bench_<timestamp>/<run>` and that directory is
 deleted when the run ends. A script that runs several invocations should also remove leftover
 `sort_bench_*` directories before each run.
 
@@ -128,7 +131,7 @@ sirius:
 
 ## Duration
 
-Measured on the workstation ([RESULTS.md](RESULTS.md)). A run's time is dominated by spill I/O.
+Measured on the machine described in [RESULTS.md](RESULTS.md). A run's time is dominated by spill I/O.
 
 - **Whole-GPU matrix** (470 GiB per run): a `windowed` run took 404–999 s, and the 20 runs took
   5 h 32 min.
@@ -169,7 +172,8 @@ For each cell of dataset × mode × compression × repeat the harness:
    `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER=PCI_BUS_ID` set. It opens one DuckDB
    connection, loads the extension, runs `SET gpu_execution = true`, `SET sort_merge_mode`,
    `SET spill_compression`, and times the `COPY`.
-3. Samples the GPU's used memory with `nvidia-smi` while the process runs.
+3. Samples the GPU's used memory once a second, with one `nvidia-smi --loop-ms` process that
+   lives as long as the run.
 4. Reads the run's `sirius.log` for the merge statistics, the spill totals, the OOM retries and
    the discard sink's line, then deletes the spill directory.
 
@@ -272,7 +276,7 @@ for t in test/sort_performance/test_*.py; do pixi run python -B "$t"; done
 - `test_sort_merge_bench.py` and `test_bench_metrics.py` test the harness and the parsers.
   `test_bench_metrics_source_formats.py` checks the parsers against the log format strings in the
   C++ sources.
-- `-B` stops Python from writing `test/sort_performance/__pycache__/`, which git does not ignore.
+- `-B` keeps Python from writing `test/sort_performance/__pycache__/` (git-ignored) into the checkout.
 - pytest is not in the pixi environment; the files run under `unittest`. Run each file as a
   script: `python -m unittest test.sort_performance...` does not work, because the standard
   library's `test` package shadows the repository's `test/` directory.

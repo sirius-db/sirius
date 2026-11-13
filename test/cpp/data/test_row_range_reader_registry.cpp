@@ -16,8 +16,6 @@
 
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
-#include "sirius_context.hpp"
-#include "utils/sirius_test_env.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -42,7 +40,6 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_row_range_reader_registry.hpp>
-#include <duckdb/main/connection.hpp>
 
 #include <array>
 #include <atomic>
@@ -50,6 +47,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -58,7 +56,7 @@
 namespace {
 
 /// Starts and ends a test with no registry, then restores the registry for the rest of the process
-/// if one was installed before (a live SiriusContext serves row_range_readers() from it).
+/// if one was installed before (a live SiriusContext initialized it, and MERGE_SORT reads it).
 struct registry_reset_guard {
   bool was_initialized = sirius::row_range_reader_registry::is_initialized();
 
@@ -156,12 +154,12 @@ TEST_CASE("row_range_reader_registry accessors race with initialize and shutdown
 {
   registry_reset_guard guard;
 
-  std::atomic<bool> stop{false};
   std::atomic<std::size_t> hits{0};
-  std::vector<std::thread> readers;
+  // jthread: a failing REQUIRE below unwinds through the vector, which stops and joins the readers.
+  std::vector<std::jthread> readers;
   for (int t = 0; t < 4; ++t) {
-    readers.emplace_back([&] {
-      while (!stop.load(std::memory_order_relaxed)) {
+    readers.emplace_back([&hits](std::stop_token st) {
+      while (!st.stop_requested()) {
         // The address only: the registry may be shut down right after get() returns.
         try {
           if (&sirius::row_range_reader_registry::get() != nullptr) { ++hits; }
@@ -183,8 +181,8 @@ TEST_CASE("row_range_reader_registry accessors race with initialize and shutdown
   while (hits.load() == 0) {
     std::this_thread::yield();
   }
-  stop = true;
   for (auto& reader : readers) {
+    reader.request_stop();
     reader.join();
   }
   REQUIRE(sirius::row_range_reader_registry::is_initialized());
@@ -299,21 +297,4 @@ TEST_CASE("row_range_reader_registry reads rows of a GPU batch",
   }
 
   batch.reset();
-}
-
-TEST_CASE("SiriusContext::row_range_readers returns the process-wide registry",
-          "[row_range_reader_registry][shared_context]")
-{
-  REQUIRE(sirius::test::g_shared_env != nullptr);
-  REQUIRE(sirius::test::g_shared_env->is_active());
-  auto con = sirius::test::g_shared_env->make_connection();
-  auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(ctx);
-  REQUIRE(ctx->is_initialized());
-
-  // Other tests may have shut the process-wide registry down since the context started.
-  if (!sirius::row_range_reader_registry::is_initialized()) {
-    sirius::row_range_reader_registry::initialize();
-  }
-  REQUIRE(&ctx->row_range_readers() == &sirius::row_range_reader_registry::get());
 }

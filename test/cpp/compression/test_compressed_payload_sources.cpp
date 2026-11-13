@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "compression/compression_test_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "operator/operator_test_utils.hpp"
 
@@ -35,11 +36,11 @@
 #include <compression/spill_compression.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_file_format.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -62,48 +63,12 @@ using sirius::compression::describe;
 using sirius::compression::make_payload_source;
 using sirius::compression::open_compressed_payload;
 
-bool has_gpu()
+using sirius::test::compression_utils::has_gpu;
+using sirius::test::compression_utils::make_compressed_device;
+
+sirius::test::compression_utils::tiered_env& env()
 {
-  int count = 0;
-  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
-
-/// GPU, host and disk spaces, with the converters registered.
-struct source_env {
-  fs::path dir =
-    fs::temp_directory_path() / ("sirius_payload_sources_test_" + std::to_string(::getpid()));
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  cucascade::memory::memory_space* gpu  = nullptr;
-  cucascade::memory::memory_space* host = nullptr;
-  cucascade::memory::memory_space* disk = nullptr;
-  rmm::cuda_stream stream;
-
-  source_env()
-  {
-    fs::create_directories(dir);
-    sirius::converter_registry::reset_for_testing();
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .track_reservation_per_stream(false)
-      .set_gpu_usage_limit(1ull << 30)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(1ull << 30)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .set_disk_mounting_point(0, 4ull << 30, dir.string());
-    mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    gpu  = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
-    host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
-    disk = const_cast<cucascade::memory::memory_space*>(
-      mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front());
-  }
-  ~source_env() { fs::remove_all(dir); }
-};
-
-source_env& env()
-{
-  static source_env e;
+  static sirius::test::compression_utils::tiered_env e{"sirius_payload_sources_test"};
   return e;
 }
 
@@ -145,9 +110,8 @@ std::unique_ptr<cudf::column> numeric_column(cudf::type_id type,
 
 /// Sorted keys, 20-bit random values (over a megabyte once bit-packed, so the pinned payload
 /// spans several blocks), nullable small values and a low-cardinality string column.
-std::unique_ptr<cudf::table> source_table()
+std::unique_ptr<cudf::table> source_table(std::size_t rows = 1'200'000)
 {
-  constexpr std::size_t rows = 1'200'000;
   std::mt19937 rng(20261112);
   std::vector<std::int64_t> keys(rows);
   std::vector<std::int32_t> noise(rows);
@@ -185,14 +149,9 @@ struct compressed_tiers {
   }
 };
 
-void move_to(std::shared_ptr<cucascade::data_batch> const& batch,
-             cucascade::memory::memory_space* space)
-{
-  sirius::convertible_data_batch convertible(batch);
-  REQUIRE(convertible.convert({space}, env().stream, *env().mgr, true).has_value());
-}
-
-compressed_tiers make_tiers()
+/// The tiers of @p table. Each owner is the only owner of its pinned blob or file: the batch
+/// that produced them has moved on or is gone when this returns.
+compressed_tiers make_tiers(std::unique_ptr<cudf::table> table = source_table())
 {
   sirius::compression::spill_compression_settings settings;
   settings.enabled                 = true;
@@ -202,18 +161,18 @@ compressed_tiers make_tiers()
 
   auto stream = utils::default_stream();
   auto batch  = sirius::make_data_batch(
-    source_table(), *env().gpu, stream, sirius::telemetry::batch_telemetry_info{});
+    std::move(table), *env().gpu, stream, sirius::telemetry::batch_telemetry_info{});
   batch->to_mutable().get_data()->record_writer_event(stream);
 
   compressed_tiers tiers;
   // Clones share the pinned blob and the file, so both outlive the batch's own moves.
-  move_to(batch, env().host);
+  move_to(env(), batch, env().host);
   {
     auto ro = batch->to_read_only();
     REQUIRE(dynamic_cast<sirius::compressed_host_representation const*>(ro.get_data()) != nullptr);
     tiers.host_owner = ro.get_data()->clone(stream);
   }
-  move_to(batch, env().disk);
+  move_to(env(), batch, env().disk);
   {
     auto ro = batch->to_read_only();
     REQUIRE(dynamic_cast<sirius::compressed_disk_representation const*>(ro.get_data()) != nullptr);
@@ -233,23 +192,7 @@ compressed_tiers make_tiers()
   }
 
   // The device tier: the table rebuilt on the device from the pinned payload.
-  auto blob = std::make_shared<sirius::compressed_device_blob>();
-  std::string error;
-  simpatico::payload_fetch_fn fetch =
-    [&blocks](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
-      sirius::copy_pinned_blocks_to_device(blocks, off, dst, sz, s);
-    };
-  blob->table = simpatico::read_compressed_table_from_memory(
-    host.header(), fetch, stream, utils::get_resource_ref(*env().gpu), &error);
-  REQUIRE(error.empty());
-  stream.sync();
-  tiers.device = std::make_unique<sirius::compressed_device_representation>(
-    *env().gpu,
-    std::move(blob),
-    host.column_names(),
-    bytes,
-    host.get_uncompressed_data_size_in_bytes(),
-    host.num_rows());
+  tiers.device = make_compressed_device(host, *env().gpu, stream);
   return tiers;
 }
 
@@ -279,12 +222,18 @@ std::vector<std::byte> read_range(simpatico::payload_source& source,
   return {host.begin() + 1, host.end() - 1};
 }
 
-std::vector<std::byte> expected_range(std::uint64_t offset, std::uint64_t size)
+std::vector<std::byte> expected_range(std::vector<std::byte> const& payload,
+                                      std::uint64_t offset,
+                                      std::uint64_t size)
 {
-  auto const& payload = tiers().payload;
   REQUIRE(offset + size <= payload.size());
   return {payload.begin() + static_cast<std::ptrdiff_t>(offset),
           payload.begin() + static_cast<std::ptrdiff_t>(offset + size)};
+}
+
+std::vector<std::byte> expected_range(std::uint64_t offset, std::uint64_t size)
+{
+  return expected_range(tiers().payload, offset, size);
 }
 
 /// Ranges at the payload's ends, around every multiple of @p boundary, and at random.
@@ -420,24 +369,49 @@ TEST_CASE("compressed payload sources: a disk source keeps its file",
           "[compressed_payload_sources]")
 {
   if (!has_gpu()) { return; }
-  // A second owner of the file, dropped while the source is still in use.
-  auto owner       = tiers().disk().clone(utils::default_stream());
-  auto const& disk = owner->cast<sirius::compressed_disk_representation>();
-  auto const path  = disk.path();
-  auto source      = make_payload_source(disk);
-  owner.reset();
+  // A batch of its own: nothing but `fresh.disk_owner`, and then the source, owns the file.
+  auto fresh       = make_tiers(source_table(60'000));
+  auto const path  = fresh.disk().path();
+  auto const bytes = fresh.payload.size();
+  REQUIRE(bytes > 10'000);
+  auto source = make_payload_source(fresh.disk());
+  REQUIRE(fs::exists(path));
+  fresh.disk_owner.reset();
+  // The source is the last owner: the file is there for as long as the source is.
   CHECK(fs::exists(path));
-  CHECK(read_range(*source, 100, 9000) == expected_range(100, 9000));
+  CHECK(read_range(*source, 100, 9000) == expected_range(fresh.payload, 100, 9000));
+  CHECK(read_range(*source, 0, bytes) == fresh.payload);
+  source.reset();
+  CHECK_FALSE(fs::exists(path));
 }
 
 TEST_CASE("compressed payload sources: a host source keeps its pinned payload",
           "[compressed_payload_sources]")
 {
   if (!has_gpu()) { return; }
-  auto owner  = tiers().host().clone(utils::default_stream());
-  auto source = make_payload_source(owner->cast<sirius::compressed_host_representation>());
-  owner.reset();
-  CHECK(read_range(*source, 100, 9000) == expected_range(100, 9000));
+  auto* const pool =
+    env().host->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  REQUIRE(pool != nullptr);
+  // Blocks handed out: the pool may grow, so its free count alone says nothing.
+  auto const in_use        = [pool] { return pool->get_total_blocks() - pool->get_free_blocks(); };
+  auto const before_blocks = in_use();
+  {
+    // A batch of its own: nothing but `fresh.host_owner`, and then the source, owns the blob.
+    auto fresh       = make_tiers(source_table(60'000));
+    auto const bytes = fresh.payload.size();
+    REQUIRE(bytes > 10'000);
+    auto const with_blob = in_use();
+    REQUIRE(with_blob > before_blocks);
+    auto source = make_payload_source(fresh.host());
+    fresh.host_owner.reset();
+    // The source is the last owner: the pinned blocks are not back in the pool.
+    CHECK(in_use() == with_blob);
+    CHECK(read_range(*source, 100, 9000) == expected_range(fresh.payload, 100, 9000));
+    CHECK(read_range(*source, 0, bytes) == fresh.payload);
+    source.reset();
+    CHECK(in_use() == before_blocks);
+  }
+  CHECK(in_use() == before_blocks);
 }
 
 TEST_CASE("compressed payload sources: describe agrees across the three tiers",

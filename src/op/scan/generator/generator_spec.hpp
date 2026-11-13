@@ -39,9 +39,10 @@
 //   sequential       start    step (0 => 1)  start + step * g                 same
 //   sequential_desc  start    step (0 => 1)  start - step * g                 same
 //
-// - cardinality > 0 for uniform / normal / sequential*: int64 draws become
+// - cardinality >= 1 for uniform / normal / sequential*: int64 draws become
 //   `lo' + ((v - lo') mod C + C) mod C` with `lo' = p1` for uniform and sequential*, `lo' = 0` for
 //   normal; ignored for DOUBLE. For few_distinct it is ignored (D governs); for zipf it is N.
+//   0 means no clamp; a value in (0, 1) is rejected, since it would round to "no clamp".
 // - INTEGER columns: the int64 draw is narrowed with wrap-around (`static_cast<int32_t>`).
 // - Nulls: a row is null iff `to_unit(counter_hash(..., NULL_FLAG)) < null_fraction`.
 //   `null_fraction == 0` means no null mask at all.
@@ -117,7 +118,7 @@ struct column_spec {
   distribution dist{distribution::uniform};
   double p1{0};
   double p2{0};
-  double cardinality{0};    // 0 = no clamp
+  double cardinality{0};    // 0 = no clamp, otherwise >= 1
   double null_fraction{0};  // [0, 1]
   friend bool operator==(const column_spec&, const column_spec&) = default;
 };
@@ -144,6 +145,10 @@ struct generator_spec {
     return "null_fraction must be in [0, 1]";
   }
   if (column.cardinality < 0) { return "cardinality must not be negative"; }
+  // The kernels round the cardinality to an integer, and 0 means no clamp.
+  if (column.cardinality > 0 && column.cardinality < 1) {
+    return "cardinality must be 0 (no clamp) or >= 1";
+  }
   switch (column.dist) {
     case distribution::uniform:
       if (column.p1 > column.p2) { return "uniform requires p1 (low) <= p2 (high)"; }
@@ -227,7 +232,7 @@ struct generator_spec {
   return digits;
 }
 
-/// Bytes per row used for reservations when only `output_columns` (indices into `spec.columns`,
+/// Bytes per row of the generated batch when only `output_columns` (indices into `spec.columns`,
 /// see generate_batch) are produced: the sum of the fixed widths (4 / 8 / 8), plus the expected
 /// length and one 4-byte offset for each VARCHAR column, plus `ceil(columns_with_nulls / 8)` for
 /// the null masks. Indices outside the spec count as nothing. Never returns 0 for a non-empty
@@ -310,6 +315,35 @@ struct generator_spec {
 [[nodiscard]] inline std::size_t estimated_batch_bytes(const generator_spec& spec)
 {
   return estimated_batch_bytes(spec, all_columns(spec));
+}
+
+/// Bytes per row that generate_batch holds while it formats a VARCHAR column and that are not
+/// part of the batch: the 8-byte int64 key and the 4-byte size of each row. Columns are formatted
+/// one at a time, so this is 12 when any of `output_columns` is VARCHAR and 0 otherwise.
+[[nodiscard]] inline std::size_t varchar_scratch_row_bytes(
+  const generator_spec& spec, const std::vector<std::size_t>& output_columns) noexcept
+{
+  for (const auto index : output_columns) {
+    if (index < spec.columns.size() && spec.columns[index].type == value_type::varchar) {
+      return 8 + 4;
+    }
+  }
+  return 0;
+}
+
+/// Peak device bytes of one generate_batch call, for reservations: twice the batch, plus the
+/// VARCHAR scratch. Columns are generated one at a time, so the peak is the finished columns
+/// plus one column's temporaries; 2x the batch covers the draw buffers and a column's offsets
+/// and chars, but not the key and sizes of a short VARCHAR column, which can exceed the column
+/// itself. Saturates at the largest std::size_t.
+[[nodiscard]] inline std::size_t estimated_peak_batch_bytes(
+  const generator_spec& spec, const std::vector<std::size_t>& output_columns) noexcept
+{
+  using sirius::memory::saturating_add;
+  using sirius::memory::saturating_mul;
+  return saturating_add(saturating_mul(estimated_batch_bytes(spec, output_columns), 2),
+                        saturating_mul(static_cast<std::size_t>(spec.rows_per_batch),
+                                       varchar_scratch_row_bytes(spec, output_columns)));
 }
 
 }  // namespace sirius::op::scan::generator

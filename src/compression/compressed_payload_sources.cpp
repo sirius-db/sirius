@@ -17,6 +17,7 @@
 #include "compression/compressed_payload_sources.hpp"
 
 #include "compression/device_compressed_blob.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -219,11 +220,18 @@ void copy_host_bytes_to_device(std::unique_ptr<std::vector<std::byte>> bytes,
 {
   CUCASCADE_CUDA_TRY(
     cudaMemcpyAsync(dst, bytes->data(), bytes->size(), cudaMemcpyHostToDevice, stream.value()));
-  if (cudaLaunchHostFunc(stream.value(), free_host_bytes, bytes.get()) == cudaSuccess) {
+  auto const status = cudaLaunchHostFunc(stream.value(), free_host_bytes, bytes.get());
+  if (status == cudaSuccess) {
     static_cast<void>(bytes.release());
     return;
   }
-  // No host function: wait for the copy, then `bytes` goes with this scope.
+  // No host function: wait for the copy, then `bytes` goes with this scope. The failure is
+  // handled here, so it must not stay behind as the thread's last error for an unrelated check.
+  static_cast<void>(cudaGetLastError());
+  SIRIUS_LOG_DEBUG(
+    "[compressed_payload_sources] cudaLaunchHostFunc failed ({}); waiting for the "
+    "copy instead",
+    cudaGetErrorString(status));
   CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.value()));
 }
 
@@ -277,10 +285,10 @@ std::shared_ptr<const simpatico::hpln_description> describe_disk(
 }  // namespace
 
 std::shared_ptr<simpatico::payload_source> make_payload_source(
-  const compressed_device_representation& representation)
+  const compressed_device_representation& representation, ::cuda::stream_ref stream)
 {
-  return std::make_shared<device_payload_source>(
-    representation, device_layout(representation, cudf::get_default_stream()));
+  return std::make_shared<device_payload_source>(representation,
+                                                 device_layout(representation, stream));
 }
 
 std::shared_ptr<simpatico::payload_source> make_payload_source(
@@ -296,7 +304,7 @@ std::shared_ptr<simpatico::payload_source> make_payload_source(
 }
 
 std::shared_ptr<const simpatico::hpln_description> describe(
-  const simpatico_compressed_representation& representation)
+  const simpatico_compressed_representation& representation, ::cuda::stream_ref stream)
 {
   if (auto const* host = dynamic_cast<const compressed_host_representation*>(&representation)) {
     return parse_header(host->header());
@@ -305,7 +313,7 @@ std::shared_ptr<const simpatico::hpln_description> describe(
     return describe_disk(*disk);
   }
   if (auto const* device = dynamic_cast<const compressed_device_representation*>(&representation)) {
-    return describe_device(device_layout(*device, cudf::get_default_stream()));
+    return describe_device(device_layout(*device, stream));
   }
   throw std::invalid_argument(
     "[compressed_payload_sources] describe: not a compressed device, host or disk batch");

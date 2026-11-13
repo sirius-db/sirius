@@ -491,7 +491,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // The materialize flag covers the whole task input, so the input skips GPU materialization only
   // if every port that contributed a batch opted out (port::residency.materialize_inputs_on_gpu ==
   // false). One contributing port that wants its batches on the GPU makes the whole input
-  // materialize, as it does today. Ports that contributed nothing have no say.
+  // materialize. Ports that contributed nothing have no say.
   bool materialize_on_gpu = false;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop

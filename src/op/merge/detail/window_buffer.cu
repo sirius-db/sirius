@@ -35,7 +35,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -44,9 +46,9 @@ namespace sirius::op::merge::detail {
 
 namespace {
 
-constexpr std::size_t max_int32_chars  = std::numeric_limits<int32_t>::max();
-constexpr std::size_t min_chars_bytes  = 64;
-constexpr std::size_t chars_copy_chunk = 16;
+constexpr std::size_t max_int32_chars = std::numeric_limits<int32_t>::max();
+/// Smallest chars allocation of a STRING slot, so a 0-byte estimate still has room to grow.
+constexpr std::size_t min_chars_bytes = 64;
 
 /// Device functor: word `j` of a mask whose bit 0 is bit `begin_bit` of `src`.
 struct shift_mask_word {
@@ -74,8 +76,9 @@ struct rebase_offset {
   __device__ Offset operator()(Offset offset) const { return offset - *base; }
 };
 
-/// Device functor: copies chunk `i` of the chars of rows [begin_row, end_row) to the front of
-/// `dst`. The byte range is read from the offsets on the device, so the host needs no sync.
+/// Device functor: copies byte `i` of the chars of rows [begin_row, end_row) to the front of
+/// `dst`. The byte range is read from the offsets on the device, so the host needs no sync. One
+/// byte per thread: neighbouring threads touch neighbouring bytes.
 template <typename Offset>
 struct copy_tail_chars {
   const char* src;
@@ -88,11 +91,7 @@ struct copy_tail_chars {
   {
     auto const first = static_cast<std::size_t>(offsets[begin_row]);
     auto const count = static_cast<std::size_t>(offsets[end_row]) - first;
-    auto const begin = i * chars_copy_chunk;
-    auto const end   = begin + chars_copy_chunk < count ? begin + chars_copy_chunk : count;
-    for (auto b = begin; b < end; ++b) {
-      dst[b] = src[first + b];
-    }
+    if (i < count) { dst[i] = src[first + i]; }
   }
 };
 
@@ -123,28 +122,76 @@ std::size_t chars_capacity(std::size_t rows, std::size_t est_bytes_per_row)
   return sirius::memory::saturating_add(bytes, bytes / 4);
 }
 
-/// Pinned host memory for one device read-back, from cuDF's pinned resource (a pool: taking and
-/// returning it does not synchronize the device). Allocation and release are ordered on a stream.
-class pinned_read_back {
+/// Pinned host memory the chars ends are read back into, from cuDF's pinned resource (a pool:
+/// taking and returning it does not synchronize the device), with the event that marks the last
+/// read-back enqueued. The host only reads the memory, and only after that event has completed.
+class chars_end_read_back {
  public:
-  pinned_read_back(std::size_t count, ::cuda::stream_ref stream)
+  chars_end_read_back(std::size_t count, ::cuda::stream_ref stream)
     : _mr(cudf::get_pinned_memory_resource()),
-      _stream(stream),
       _bytes(count * sizeof(int64_t)),
       _data(_mr.allocate(stream, _bytes, alignof(int64_t)))
   {
+    auto const status = cudaEventCreateWithFlags(&_event, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+      _mr.deallocate(stream, _data, _bytes, alignof(int64_t));
+      CUCASCADE_CUDA_TRY(status);
+    }
   }
-  ~pinned_read_back() { _mr.deallocate(_stream, _data, _bytes, alignof(int64_t)); }
-  pinned_read_back(const pinned_read_back&)            = delete;
-  pinned_read_back& operator=(const pinned_read_back&) = delete;
+  chars_end_read_back(const chars_end_read_back&)            = delete;
+  chars_end_read_back& operator=(const chars_end_read_back&) = delete;
 
-  [[nodiscard]] int64_t* data() const noexcept { return static_cast<int64_t*>(_data); }
+  /// Waits for a read-back still in flight (it writes the memory), then returns the memory.
+  void release(::cuda::stream_ref stream) noexcept
+  {
+    if (_pending) { (void)cudaEventSynchronize(_event); }
+    (void)cudaEventDestroy(_event);
+    _mr.deallocate(stream, _data, _bytes, alignof(int64_t));
+  }
+
+  /// Enqueues the read-back of the @p width-byte offset at @p offset into entry @p i.
+  [[nodiscard]] cudaError_t enqueue(std::size_t i,
+                                    const void* offset,
+                                    std::size_t width,
+                                    cudaStream_t stream) noexcept
+  {
+    _pending = true;
+    return cudaMemcpyAsync(
+      static_cast<int64_t*>(_data) + i, offset, width, cudaMemcpyDeviceToHost, stream);
+  }
+
+  /// Marks the end of the read-backs enqueued on @p stream so far.
+  [[nodiscard]] cudaError_t mark(cudaStream_t stream) noexcept
+  {
+    return cudaEventRecord(_event, stream);
+  }
+
+  /// Blocks the host until the read-backs before the last mark() have run. Work enqueued after
+  /// that mark is not waited for.
+  void wait()
+  {
+    CUCASCADE_CUDA_TRY(cudaEventSynchronize(_event));
+    _pending = false;
+  }
+
+  /// Entry @p i, a @p width-byte offset (4 or 8). Valid after wait().
+  [[nodiscard]] std::size_t value(std::size_t i, std::size_t width) const noexcept
+  {
+    auto const* entry = static_cast<const int64_t*>(_data) + i;
+    if (width == sizeof(int32_t)) {
+      int32_t narrow{};
+      std::memcpy(&narrow, entry, sizeof(narrow));
+      return static_cast<std::size_t>(narrow);
+    }
+    return static_cast<std::size_t>(*entry);
+  }
 
  private:
   rmm::host_device_async_resource_ref _mr;
-  ::cuda::stream_ref _stream;
   std::size_t _bytes;
   void* _data;
+  cudaEvent_t _event{nullptr};
+  bool _pending{false};
 };
 
 template <typename Offset>
@@ -161,10 +208,9 @@ void carry_string_tail(const column_slot& src,
                     src_offsets + size + 1,
                     static_cast<Offset*>(dst.offsets.data()),
                     rebase_offset<Offset>{src_offsets + consumed});
-  auto const chunks = (chars_bound + chars_copy_chunk - 1) / chars_copy_chunk;
   thrust::for_each_n(rmm::exec_policy_nosync(stream),
                      thrust::counting_iterator<std::size_t>(0),
-                     chunks,
+                     chars_bound,
                      copy_tail_chars<Offset>{static_cast<const char*>(src.data.data()),
                                              static_cast<char*>(dst.data.data()),
                                              src_offsets,
@@ -185,10 +231,18 @@ struct window_buffer::impl {
   /// Columns the caller declared free of NULLs (set_null_free); view() gives them no mask.
   std::vector<bool> null_free;
   std::size_t growths{0};
+  /// Where consume() reads the chars ends back to; set only when a column is a STRING.
+  std::optional<chars_end_read_back> read_back;
 
   impl(std::size_t capacity_rows, rmm::device_async_resource_ref resource, cudaStream_t stream)
     : capacity(capacity_rows), mr(resource), last_stream(stream)
   {
+  }
+  impl(const impl&)            = delete;
+  impl& operator=(const impl&) = delete;
+  ~impl()
+  {
+    if (read_back) { read_back->release(::cuda::stream_ref{last_stream}); }
   }
 
   /// Orders work about to be enqueued on @p stream after the previous work on the slots, without
@@ -215,35 +269,20 @@ struct window_buffer::impl {
     }
   }
 
-  /// Reads back the chars end of the STRING columns whose end only the device knows: the copies
-  /// land in one pinned buffer and the stream is synchronized once.
-  void resolve_chars_ends(cudaStream_t stream)
+  /// Sets the chars end of the STRING columns whose end only the device knows, from the
+  /// read-back the last partial consume() enqueued. Blocks the host until that consume() has
+  /// run on the device, not for work enqueued after it.
+  void resolve_chars_ends()
   {
     auto const pending = std::any_of(columns.begin(), columns.end(), [](auto const& col) {
       return col.is_string() && !col.chars_end_exact;
     });
     if (!pending) { return; }
-    pinned_read_back const read_back(columns.size(), ::cuda::stream_ref{stream});
-    auto* const ends = read_back.data();
-    auto status      = cudaSuccess;
-    for (std::size_t i = 0; i < columns.size() && status == cudaSuccess; ++i) {
-      auto const& col = columns[i];
-      if (!col.is_string() || col.chars_end_exact) { continue; }
-      auto const* last_offset = static_cast<const std::uint8_t*>(col.slots[active].offsets.data()) +
-                                size * col.offset_width;
-      // Little-endian: an int32 offset fills the low half of the zeroed int64.
-      ends[i] = 0;
-      status =
-        cudaMemcpyAsync(&ends[i], last_offset, col.offset_width, cudaMemcpyDeviceToHost, stream);
-    }
-    // Also after a failed copy: the pinned buffer must not be released under a copy in flight.
-    auto const sync_status = cudaStreamSynchronize(stream);
-    CUCASCADE_CUDA_TRY(status);
-    CUCASCADE_CUDA_TRY(sync_status);
+    read_back->wait();
     for (std::size_t i = 0; i < columns.size(); ++i) {
       auto& col = columns[i];
       if (!col.is_string() || col.chars_end_exact) { continue; }
-      col.chars_end       = static_cast<std::size_t>(ends[i]);
+      col.chars_end       = read_back->value(i, col.offset_width);
       col.chars_end_exact = true;
     }
   }
@@ -268,39 +307,43 @@ struct window_buffer::impl {
     return dst;
   }
 
-  /// Doubles the chars of every STRING column in both slots, keeping the active slot's bytes.
-  /// The reader reports neither the column that was short nor the bytes it needed, so the
-  /// columns cannot be grown one by one. Returns false if no column could grow.
+  /// Doubles the chars of every STRING column in the active slot, keeping its bytes. The reader
+  /// reports neither the column that was short nor the bytes it needed, so the columns cannot be
+  /// grown one by one. The chars of the other slot hold nothing: they are freed before the new
+  /// ones are allocated, and consume() allocates them again at the new size when it next carries
+  /// a tail. Returns false if no column could grow.
   bool grow_chars(::cuda::stream_ref stream)
   {
-    std::vector<std::array<rmm::device_buffer, 2>> grown(columns.size());
+    std::vector<std::size_t> new_bytes(columns.size(), 0);
     bool any = false;
     for (std::size_t i = 0; i < columns.size(); ++i) {
       auto& col = columns[i];
       if (!col.is_string()) { continue; }
       auto const old_bytes = col.slots[active].data.size();
-      auto new_bytes       = std::max(2 * old_bytes, min_chars_bytes);
-      if (col.offset_width == sizeof(int32_t)) { new_bytes = std::min(new_bytes, max_int32_chars); }
-      if (new_bytes <= old_bytes) { continue; }
-      for (auto& buffer : grown[i]) {
-        buffer = rmm::device_buffer(new_bytes, stream, mr);
-      }
+      auto bytes           = std::max(2 * old_bytes, min_chars_bytes);
+      if (col.offset_width == sizeof(int32_t)) { bytes = std::min(bytes, max_int32_chars); }
+      if (bytes <= old_bytes) { continue; }
+      new_bytes[i]               = bytes;
+      col.slots[1 - active].data = rmm::device_buffer{};
+      any                        = true;
+    }
+    if (!any) { return false; }
+    std::vector<rmm::device_buffer> grown(columns.size());
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      if (new_bytes[i] == 0) { continue; }
+      auto const& col = columns[i];
+      grown[i]        = rmm::device_buffer(new_bytes[i], stream, mr);
       if (col.chars_end > 0) {
-        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(grown[i][active].data(),
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(grown[i].data(),
                                            col.slots[active].data.data(),
                                            col.chars_end,
                                            cudaMemcpyDeviceToDevice,
                                            stream.get()));
       }
-      any = true;
     }
-    if (!any) { return false; }
-    // The old chars are freed below; the copies out of them must have run by then.
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    // The old chars are freed on `stream` (their stream since order_after_last), after the copies.
     for (std::size_t i = 0; i < columns.size(); ++i) {
-      if (grown[i][0].size() == 0) { continue; }
-      columns[i].slots[0].data = std::move(grown[i][0]);
-      columns[i].slots[1].data = std::move(grown[i][1]);
+      if (new_bytes[i] != 0) { columns[i].slots[active].data = std::move(grown[i]); }
     }
     ++growths;
     return true;
@@ -368,6 +411,9 @@ window_buffer::window_buffer(std::vector<cudf::data_type> fetch_types,
       slot.offsets = rmm::device_buffer(offsets_bytes, sref, mr);
     }
   }
+  auto const has_string = std::any_of(
+    state->columns.begin(), state->columns.end(), [](auto const& col) { return col.is_string(); });
+  if (has_string) { state->read_back.emplace(state->columns.size(), sref); }
   _impl = std::move(state);
 }
 
@@ -463,16 +509,23 @@ void window_buffer::consume(std::size_t consumed, rmm::cuda_stream_view stream)
     static_cast<std::size_t>(cudf::num_bitmask_words(static_cast<cudf::size_type>(state.size)));
   auto const dst_words =
     static_cast<std::size_t>(cudf::num_bitmask_words(static_cast<cudf::size_type>(tail)));
-  for (auto& col : state.columns) {
+  // The window's state changes only once everything is enqueued: if a call below throws, the
+  // rows are still those of the active slot.
+  bool carried_chars = false;
+  for (std::size_t i = 0; i < state.columns.size(); ++i) {
+    auto& col       = state.columns[i];
     auto const& src = col.slots[state.active];
     auto& dst       = col.slots[1 - state.active];
-    thrust::transform(
-      rmm::exec_policy_nosync(sref),
-      thrust::counting_iterator<std::size_t>(0),
-      thrust::counting_iterator<std::size_t>(dst_words),
-      static_cast<cudf::bitmask_type*>(dst.mask.data()),
-      shift_mask_word{
-        static_cast<const cudf::bitmask_type*>(src.mask.data()), consumed, src_words});
+    // A column declared null-free exposes no mask (view()), so its mask is not carried.
+    if (!state.null_free[i]) {
+      thrust::transform(
+        rmm::exec_policy_nosync(sref),
+        thrust::counting_iterator<std::size_t>(0),
+        thrust::counting_iterator<std::size_t>(dst_words),
+        static_cast<cudf::bitmask_type*>(dst.mask.data()),
+        shift_mask_word{
+          static_cast<const cudf::bitmask_type*>(src.mask.data()), consumed, src_words});
+    }
     if (!col.is_string()) {
       CUCASCADE_CUDA_TRY(
         cudaMemcpyAsync(dst.data.data(),
@@ -480,12 +533,30 @@ void window_buffer::consume(std::size_t consumed, rmm::cuda_stream_view stream)
                         tail * col.width,
                         cudaMemcpyDeviceToDevice,
                         stream.value()));
-    } else if (col.offset_width == sizeof(int32_t)) {
+      continue;
+    }
+    // The chars of this slot were freed if refill() grew the other one since the last carry.
+    if (dst.data.size() < src.data.size()) {
+      dst.data = rmm::device_buffer(src.data.size(), sref, state.mr);
+    }
+    if (col.offset_width == sizeof(int32_t)) {
       carry_string_tail<int32_t>(src, dst, consumed, state.size, col.chars_end, sref);
-      col.chars_end_exact = false;
     } else {
       carry_string_tail<int64_t>(src, dst, consumed, state.size, col.chars_end, sref);
-      col.chars_end_exact = false;
+    }
+    // The chars end of the tail is its last rebased offset, known only on the device: the next
+    // refill() reads it from pinned memory, so nothing blocks here.
+    CUCASCADE_CUDA_TRY(state.read_back->enqueue(
+      i,
+      static_cast<const std::uint8_t*>(dst.offsets.data()) + tail * col.offset_width,
+      col.offset_width,
+      stream.value()));
+    carried_chars = true;
+  }
+  if (carried_chars) {
+    CUCASCADE_CUDA_TRY(state.read_back->mark(stream.value()));
+    for (auto& col : state.columns) {
+      if (col.is_string()) { col.chars_end_exact = false; }
     }
   }
   state.active = 1 - state.active;
@@ -507,7 +578,7 @@ cucascade::row_range_result window_buffer::refill(
   }
   auto const sref = ::cuda::stream_ref{stream.value()};
   state.order_after_last(stream.value());
-  state.resolve_chars_ends(stream.value());
+  state.resolve_chars_ends();
 
   cucascade::row_range_request request;
   request.columns   = fetch_cols;

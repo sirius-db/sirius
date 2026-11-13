@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright 2025, Sirius Contributors.
+# Copyright 2026, Sirius Contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -146,8 +146,25 @@ class DiscardSinkTest(unittest.TestCase):
     def test_parses_line(self):
         self.assertEqual(
             bench_metrics.parse_discard_sink(read_fixture("discard_sink.log")),
-            {"rows": 1500300, "bytes": 12002400, "order_violations": 0},
+            {
+                "rows": 1500300,
+                "bytes": 12002400,
+                "order_violations": 0,
+                "order_checked": 1,
+                "ranges_checked": 12,
+            },
         )
+
+    def test_line_without_the_trailing_keys_still_parses(self):
+        text = "[info] [discard_sink] rows=10 bytes=80 order_violations=0\n"
+        self.assertEqual(
+            bench_metrics.parse_discard_sink(text),
+            {"rows": 10, "bytes": 80, "order_violations": 0},
+        )
+
+    def test_unknown_trailing_key_is_kept(self):
+        text = "[discard_sink] rows=1 bytes=8 order_violations=0 future_key=5\n"
+        self.assertEqual(bench_metrics.parse_discard_sink(text)["future_key"], 5)
 
     def test_missing_line(self):
         self.assertIsNone(
@@ -159,6 +176,11 @@ class DiscardSinkTest(unittest.TestCase):
             bench_metrics.parse_discard_sink("[discard_sink] rows=1 bytes=many\n")
         )
         self.assertIsNone(bench_metrics.parse_discard_sink("[discard_sink] rows=1\n"))
+        self.assertIsNone(
+            bench_metrics.parse_discard_sink(
+                "[discard_sink] rows=1 bytes=8 order_checked=1 ranges_checked=2\n"
+            )
+        )
 
     def test_several_sinks_are_summed(self):
         text = (
@@ -169,6 +191,26 @@ class DiscardSinkTest(unittest.TestCase):
             bench_metrics.parse_discard_sink(text),
             {"rows": 15, "bytes": 120, "order_violations": 3},
         )
+
+    def test_several_sinks_order_checked_only_if_all_checked(self):
+        checked = "[discard_sink] rows=10 bytes=80 order_violations=0 order_checked=1 ranges_checked=4\n"
+        unchecked = "[discard_sink] rows=5 bytes=40 order_violations=0 order_checked=0 ranges_checked=0\n"
+        older = "[discard_sink] rows=5 bytes=40 order_violations=0\n"
+        self.assertEqual(
+            bench_metrics.parse_discard_sink(checked + checked),
+            {
+                "rows": 20,
+                "bytes": 160,
+                "order_violations": 0,
+                "order_checked": 1,
+                "ranges_checked": 8,
+            },
+        )
+        for text in (checked + unchecked, unchecked + checked, older + checked):
+            totals = bench_metrics.parse_discard_sink(text)
+            self.assertEqual(totals["order_checked"], 0, text)
+            self.assertEqual(totals["ranges_checked"], 4, text)
+            self.assertEqual(totals["rows"], 15, text)
 
 
 class FirstProblemLinesTest(unittest.TestCase):
@@ -249,56 +291,6 @@ class FirstProblemLinesTest(unittest.TestCase):
         self.assertEqual(bench_metrics.first_problem_lines([]), [])
 
 
-class LogTailTest(unittest.TestCase):
-    def setUp(self):
-        self._dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._dir.cleanup)
-        self.path = os.path.join(self._dir.name, "sirius.log")
-
-    def _append(self, text: str) -> None:
-        with open(self.path, "a") as log_file:
-            log_file.write(text)
-
-    def test_missing_file_then_appends(self):
-        tail = bench_metrics.LogTail(self.path)
-        self.assertEqual(tail.read_new(), "")
-        self._append("line 1\nline 2\n")
-        self.assertEqual(tail.read_new(), "line 1\nline 2\n")
-        self.assertEqual(tail.read_new(), "")
-        self._append("line 3\n")
-        self.assertEqual(tail.read_new(), "line 3\n")
-
-    def test_partial_line_is_held_until_complete(self):
-        tail = bench_metrics.LogTail(self.path)
-        self._append("line 1\n[merge_sort][stats] op=1 rou")
-        self.assertEqual(tail.read_new(), "line 1\n")
-        self.assertEqual(tail.read_new(), "")
-        self._append("nds=3\n")
-        text = tail.read_new()
-        self.assertEqual(text, "[merge_sort][stats] op=1 rounds=3\n")
-        self.assertEqual(
-            bench_metrics.parse_merge_sort_stats(text),
-            [bench_metrics.MergeSortStats(op=1, values={"rounds": 3})],
-        )
-
-    def test_truncation_restarts_from_the_beginning(self):
-        tail = bench_metrics.LogTail(self.path)
-        self._append("a long first run line\nand another\n")
-        self.assertEqual(tail.read_new(), "a long first run line\nand another\n")
-        with open(self.path, "w") as log_file:
-            log_file.write("new run\n")
-        self.assertEqual(tail.read_new(), "new run\n")
-        self._append("more\n")
-        self.assertEqual(tail.read_new(), "more\n")
-
-    def test_file_removed_after_reading(self):
-        tail = bench_metrics.LogTail(self.path)
-        self._append("line 1\n")
-        self.assertEqual(tail.read_new(), "line 1\n")
-        os.remove(self.path)
-        self.assertEqual(tail.read_new(), "")
-
-
 class GpuMemorySamplerTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -307,11 +299,18 @@ class GpuMemorySamplerTest(unittest.TestCase):
         os.mkdir(self.bin_dir)
         self.args_file = os.path.join(self._dir.name, "args")
         self.count_file = os.path.join(self._dir.name, "count")
+        self.launch_file = os.path.join(self._dir.name, "launches")
+        self.pid_file = os.path.join(self._dir.name, "pid")
 
     def _install_fake_nvidia_smi(self, body: str) -> None:
+        # Records every launch and its pid, then runs `body`.
         path = os.path.join(self.bin_dir, "nvidia-smi")
         with open(path, "w") as script:
-            script.write("#!/bin/sh\n" + body)
+            script.write(
+                "#!/bin/sh\n"
+                f'printf x >> "{self.launch_file}"\n'
+                f'echo $$ > "{self.pid_file}"\n' + body
+            )
         os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
 
     def _with_path(self, path: str):
@@ -329,54 +328,95 @@ class GpuMemorySamplerTest(unittest.TestCase):
             except FileNotFoundError:
                 pass
             time.sleep(0.01)
-        self.fail(f"the fake nvidia-smi was not called {count} times")
+        self.fail(f"the fake nvidia-smi did not print {count} samples")
 
-    def test_peak_of_the_samples(self):
-        # Prints 100, 5000, 300, then 200 for every later call: the peak is in the middle.
+    def _launches(self) -> int:
+        with open(self.launch_file) as launch_file:
+            return len(launch_file.read())
+
+    def test_peak_of_the_samples_from_one_process(self):
+        # One process printing 100, 5000, 300, then 200 until it is stopped: the peak is in the
+        # middle.
         self._install_fake_nvidia_smi(
             f'echo "$*" > "{self.args_file}"\n'
-            f'printf x >> "{self.count_file}"\n'
-            f'n=$(wc -c < "{self.count_file}")\n'
-            'case "$n" in\n'
-            "  1) echo 100 ;;\n"
-            "  2) echo 5000 ;;\n"
-            "  3) echo 300 ;;\n"
-            "  *) echo 200 ;;\n"
-            "esac\n"
+            "for v in 100 5000 300; do\n"
+            f'  echo "$v"; printf x >> "{self.count_file}"\n'
+            "done\n"
+            "while :; do\n"
+            f'  echo 200; printf x >> "{self.count_file}"; sleep 0.01\n'
+            "done\n"
         )
         self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
         sampler = bench_metrics.GpuMemorySampler(device_index=1, interval_s=0.01)
         sampler.start()
-        self._wait_for_samples(4)
+        sampler.start()  # a second start does not launch a second process
+        self._wait_for_samples(6)
         self.assertEqual(sampler.stop(), 5000)
+        self.assertEqual(self._launches(), 1)
         with open(self.args_file) as args_file:
             self.assertEqual(
                 args_file.read().strip(),
-                "--query-gpu=memory.used --format=csv,noheader,nounits -i 1",
+                "--query-gpu=memory.used --format=csv,noheader,nounits -i 1 --loop-ms=10",
             )
 
-    def test_short_run_still_gets_a_sample(self):
+    def test_default_interval_is_one_second(self):
         self._install_fake_nvidia_smi(
-            f'printf x >> "{self.count_file}"\necho " 4321"\n'
+            f'echo "$*" > "{self.args_file}"\necho 7\nexec sleep 60\n'
         )
+        self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
+        sampler = bench_metrics.GpuMemorySampler(device_index=0)
+        sampler.start()
+        self.assertEqual(sampler.stop(), 7)
+        with open(self.args_file) as args_file:
+            self.assertTrue(args_file.read().strip().endswith(" --loop-ms=1000"))
+
+    def test_short_run_still_gets_a_sample_and_stop_ends_the_process(self):
+        self._install_fake_nvidia_smi('sleep 0.2\necho " 4321"\nexec sleep 60\n')
         self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
         sampler = bench_metrics.GpuMemorySampler(device_index=0, interval_s=60)
         sampler.start()
+        started = time.monotonic()
         self.assertEqual(sampler.stop(), 4321)
+        self.assertLess(time.monotonic() - started, 30)
+        with open(self.pid_file) as pid_file:
+            pid = int(pid_file.read())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(sampler.stop(), 4321)  # a second stop changes nothing
+
+    def test_restart_forgets_the_previous_peak(self):
+        self._install_fake_nvidia_smi(
+            f'n=$(wc -c < "{self.launch_file}")\n'
+            'if [ "$n" -eq 1 ]; then echo 900; else echo 50; fi\n'
+            "exec sleep 60\n"
+        )
+        self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
+        sampler = bench_metrics.GpuMemorySampler(device_index=0)
+        sampler.start()
+        self.assertEqual(sampler.stop(), 900)
+        sampler.start()
+        self.assertEqual(sampler.stop(), 50)
+        self.assertEqual(self._launches(), 2)
 
     def test_nvidia_smi_unavailable(self):
         self._with_path(self.bin_dir)  # empty directory: no nvidia-smi anywhere on PATH
         sampler = bench_metrics.GpuMemorySampler(device_index=0, interval_s=0.01)
         sampler.start()
-        time.sleep(0.05)
         self.assertIsNone(sampler.stop())
 
-    def test_nvidia_smi_failing_or_printing_garbage(self):
+    def test_nvidia_smi_failing(self):
+        self._install_fake_nvidia_smi('echo "No devices were found"\nexit 6\n')
+        self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
+        sampler = bench_metrics.GpuMemorySampler(device_index=0, interval_s=0.01)
+        sampler.start()
+        self.assertIsNone(sampler.stop())
+        self.assertEqual(self._launches(), 1)
+
+    def test_nvidia_smi_printing_garbage(self):
         self._install_fake_nvidia_smi(
-            f'printf x >> "{self.count_file}"\n'
-            f'n=$(wc -c < "{self.count_file}")\n'
-            'if [ "$n" -eq 1 ]; then echo "No devices were found"; exit 6; fi\n'
-            'echo "[N/A]"\n'
+            "while :; do\n"
+            f'  echo "[N/A]"; printf x >> "{self.count_file}"; sleep 0.01\n'
+            "done\n"
         )
         self._with_path(self.bin_dir + os.pathsep + os.environ["PATH"])
         sampler = bench_metrics.GpuMemorySampler(device_index=0, interval_s=0.01)

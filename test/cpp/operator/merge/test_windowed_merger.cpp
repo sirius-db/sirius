@@ -18,6 +18,7 @@
 #include "compression/compressed_representation.hpp"
 #include "compression/device_compressed_blob.hpp"
 #include "op/merge/bounded_kway_merge.hpp"
+#include "op/merge/detail/run_fallback.hpp"
 #include "op/merge/windowed_merge.hpp"
 #include "operator/merge/merge_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
@@ -28,6 +29,7 @@
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/data/row_range_read.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <data/sirius_row_range_reader_registry.hpp>
@@ -38,6 +40,7 @@
 #include <functional>
 #include <limits>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -697,7 +700,7 @@ TEST_CASE("windowed_merger rejects a batch whose rows differ from its run", "[wi
 namespace {
 
 /// Runs whose batches live in the HOST tier, so the merger reads them through window buffers.
-/// Declared first: the batches must go before the memory manager does.
+/// `memory` is declared first, so the batches are destroyed before the memory manager.
 struct host_merge_fixture {
   sirius::test::operator_utils::tiered_memory_fixture memory;
   cucascade::shared_data_repository repository;
@@ -1408,4 +1411,206 @@ TEST_CASE("windowed_merger converts a compressed device batch instead of slicing
     CHECK(dynamic_cast<const cucascade::gpu_table_representation*>(lock.get_data()) != nullptr);
   }
   CHECK(f.all_batches_unlocked());
+}
+
+// ---------------------------------------------------------------------------
+// A batch that changes tier under the merger; the whole-batch fallback
+// ---------------------------------------------------------------------------
+
+TEST_CASE("windowed_merger follows a batch that changes tier while its rows are buffered",
+          "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  tiers_fixture fx;  // first: the batches are destroyed before the memory manager
+  cucascade::shared_data_repository repository;
+  std::vector<test_run> runs;
+  const auto stream = fx.stream_view();
+  const std::size_t run_rows[]{2000, 1800, 1600};
+  for (std::size_t i = 0; i < 3; ++i) {
+    const auto first_id = static_cast<std::int64_t>(10000 * i);
+    runs.push_back(make_sorted_gpu_run(
+      repository,
+      *fx.gpu,
+      random_rows(run_rows[i], 100000, first_id, 401 + static_cast<std::uint32_t>(i))->view(),
+      keys));
+    cudf::get_default_stream().sync();
+    auto mut = runs.back().batches[0]->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), fx.host, fx.stream);
+    fx.stream.synchronize();
+  }
+  auto expected = expected_full_sort(runs, keys);
+  auto cursors  = make_cursors(runs);
+
+  // One round per run(): after the first, every run has rows of its HOST batch in its buffer.
+  windowed_merger merger(run_batches(runs),
+                         cursors,
+                         kTwoCols,
+                         kTwoInt64,
+                         keys,
+                         {.window_rows = 256, .output_target_bytes = 1},
+                         sirius::row_range_reader_registry::get(),
+                         *fx.gpu,
+                         reference_bounded_merge);
+  merge_round_stats stats;
+  std::vector<std::unique_ptr<cudf::table>> chunks;
+  chunks.push_back(merger.run(stream, fx.mr(), &stats));
+  REQUIRE(stats.rounds == 1);
+  REQUIRE(stats.refill_rows == 3 * 256);
+  REQUIRE(stats.refill_bytes_host == 3 * 256 * 16);
+  REQUIRE(chunks.back()->num_rows() < 3 * 256);
+  REQUIRE_FALSE(all_exhausted(cursors));
+
+  // What a downgrade (run 0: HOST -> DISK) and another task's upgrade (run 1: HOST -> GPU) do
+  // between two tasks of the merge. Run 2 stays on the HOST tier.
+  stream.synchronize();
+  {
+    auto mut = runs[0].batches[0]->to_mutable();
+    mut.convert_to<cucascade::disk_data_representation>(
+      sirius::converter_registry::get(), fx.disk, fx.stream);
+    fx.stream.synchronize();
+    REQUIRE(mut.get_current_tier() == cucascade::memory::Tier::DISK);
+  }
+  {
+    auto mut = runs[1].batches[0]->to_mutable();
+    mut.convert_to<cucascade::gpu_table_representation>(
+      sirius::converter_registry::get(), fx.gpu, fx.stream);
+    fx.stream.synchronize();
+    REQUIRE(mut.get_current_tier() == cucascade::memory::Tier::GPU);
+  }
+
+  std::vector<cudf::table_view> views{chunks.back()->view()};
+  while (!all_exhausted(cursors)) {
+    REQUIRE(chunks.size() < 100000);
+    chunks.push_back(merger.run(stream, fx.mr(), &stats));
+    views.push_back(chunks.back()->view());
+  }
+  auto merged = cudf::concatenate(views, stream, fx.mr());
+  stream.synchronize();
+  CHECK(tables_equal(merged->view(), expected->view()));
+  CHECK(stats.rows_out == 2000 + 1800 + 1600);
+  // Run 0 keeps the rows it had buffered and reads the rest from DISK: every row once. Run 1
+  // drops its buffer (the 256 rows of the first refill) and is sliced on the GPU from its cursor
+  // on. Run 2 is read from HOST throughout.
+  CHECK(stats.refill_rows == 2000 + 256 + 1600);
+  CHECK(stats.refill_bytes_host == (256 + 256 + 1600) * 16);
+  CHECK(stats.refill_bytes_disk == (2000 - 256) * 16);
+  CHECK(stats.fallback_conversions == 0);
+}
+
+TEST_CASE("windowed_merger converts a batch again when it left the GPU before its window",
+          "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  host_merge_fixture f;
+  f.add_host_run(random_rows(900, 100000, 0, 411)->view(), keys);
+  f.add_host_run(random_rows(700, 100000, 10000, 412)->view(), keys);
+  auto expected = expected_full_sort(f.runs, keys);
+  f.cursors     = make_cursors(f.runs);
+
+  // No reader: every batch takes the whole-batch fallback. The first conversion of each batch is
+  // undone before the merger locks the batch again, as a downgrade that wins that race does.
+  cucascade::row_range_reader_registry no_readers;
+  std::set<std::uint64_t> lost;
+  int calls            = 0;
+  auto losing_the_race = [&](cucascade::data_batch& batch,
+                             cucascade::memory::memory_space& gpu_space,
+                             rmm::cuda_stream_view stream) {
+    ++calls;
+    const auto converted =
+      sirius::op::merge::detail::convert_run_batch_to_gpu(batch, gpu_space, stream);
+    if (lost.insert(batch.get_batch_id()).second) {
+      auto mut = batch.to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(
+        sirius::converter_registry::get(), f.memory.host0, stream);
+      stream.synchronize();
+    }
+    return converted;
+  };
+  windowed_merger merger(run_batches(f.runs),
+                         f.cursors,
+                         kTwoCols,
+                         kTwoInt64,
+                         keys,
+                         {.window_rows = 256, .output_target_bytes = kUnlimitedOutput},
+                         no_readers,
+                         *f.memory.gpu0,
+                         reference_bounded_merge,
+                         losing_the_race);
+  merge_round_stats stats;
+  auto merged = merger.run(f.stream, f.mr(), &stats);
+  f.stream.synchronize();
+  CHECK(tables_equal(merged->view(), expected->view()));
+  CHECK(all_exhausted(f.cursors));
+  CHECK(calls == 4);
+  CHECK(stats.fallback_conversions == 4);
+  CHECK(stats.refill_rows == 0);
+}
+
+TEST_CASE("windowed_merger gives up on a batch that never stays on the GPU", "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  host_merge_fixture f;
+  f.add_host_run(random_rows(900, 100000, 0, 421)->view(), keys);
+  f.add_host_run(random_rows(700, 100000, 10000, 422)->view(), keys);
+  auto expected = expected_full_sort(f.runs, keys);
+  f.cursors     = make_cursors(f.runs);
+
+  // No reader, and a fallback that never leaves the batch on the GPU.
+  cucascade::row_range_reader_registry no_readers;
+  int calls           = 0;
+  bool convert        = false;
+  auto never_resident = [&](cucascade::data_batch& batch,
+                            cucascade::memory::memory_space& gpu_space,
+                            rmm::cuda_stream_view stream) {
+    ++calls;
+    return convert && sirius::op::merge::detail::convert_run_batch_to_gpu(batch, gpu_space, stream);
+  };
+  windowed_merger merger(run_batches(f.runs),
+                         f.cursors,
+                         kTwoCols,
+                         kTwoInt64,
+                         keys,
+                         {.window_rows = 256, .output_target_bytes = kUnlimitedOutput},
+                         no_readers,
+                         *f.memory.gpu0,
+                         reference_bounded_merge,
+                         never_resident);
+  merge_round_stats stats;
+  REQUIRE_THROWS_WITH(merger.run(f.stream, f.mr(), &stats),
+                      Catch::Matchers::ContainsSubstring("after 3 attempts"));
+  // One conversion per attempt on the first run's batch, then the run() fails: nothing is
+  // committed.
+  CHECK(calls == 3);
+  for (const auto& cursor : f.cursors) {
+    CHECK(cursor.batch == 0);
+    CHECK(cursor.row == 0);
+  }
+  CHECK(stats.rounds == 0);
+  CHECK(stats.fallback_conversions == 0);
+
+  // The same merger replays from the unchanged cursors once the conversion works.
+  convert     = true;
+  auto merged = merger.run(f.stream, f.mr(), &stats);
+  f.stream.synchronize();
+  CHECK(tables_equal(merged->view(), expected->view()));
+  CHECK(stats.fallback_conversions == 2);
+}
+
+TEST_CASE("windowed_merger rejects a HOST batch whose rows differ from its run",
+          "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  // The only batch of the run holds 200 rows; windows of 64 rows are read through its reader.
+  const auto claimed = GENERATE(std::size_t{150}, std::size_t{250});
+  CAPTURE(claimed);
+  host_merge_fixture f;
+  f.add_host_run(random_rows(200, 100, 0, 431)->view(), keys);
+  f.cursors                      = make_cursors(f.runs);
+  f.cursors[0].run.batch_rows[0] = claimed;
+  auto merger = f.make_merger(keys, {.window_rows = 64, .output_target_bytes = kUnlimitedOutput});
+  // 150: the third refill delivers rows past the cursor's count. 250: the reader ends at row 200.
+  CHECK_THROWS_AS(merger.run(f.stream, f.mr()), sirius::internal_exception);
+  CHECK(f.cursors[0].batch == 0);
+  CHECK(f.cursors[0].row == 0);
 }
