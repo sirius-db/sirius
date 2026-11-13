@@ -82,6 +82,31 @@ void collect(QueryNode& node, references& refs)
     });
 }
 
+/// The gateway function that @p sql calls by name, or empty: an identifier with such a name,
+/// quoted or not, that an opening parenthesis follows. A check on the tokens, so it also finds
+/// the name of a table or a column there; for the statements that references_of() does not walk.
+std::string gateway_call_in(std::string const& sql)
+{
+  auto const tokens = Parser::Tokenize(sql);
+  for (idx_t i = 0; i < tokens.size(); ++i) {
+    if (tokens[i].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER) { continue; }
+    auto next = i + 1;
+    while (next < tokens.size() &&
+           tokens[next].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+      ++next;
+    }
+    if (next == tokens.size() || sql[tokens[next].start] != '(') { continue; }
+    auto name = sql.substr(tokens[i].start, tokens[i + 1].start - tokens[i].start);
+    StringUtil::Trim(name);
+    if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+      name = name.substr(1, name.size() - 2);
+    }
+    name = StringUtil::Lower(name);
+    if (is_gateway_name(name)) { return name; }
+  }
+  return {};
+}
+
 references references_of(SQLStatement& stmt)
 {
   references refs;
@@ -125,11 +150,24 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
       throw InvalidInputException("%s can only be set on the gateway's console", name);
     }
   }
+  // The walk covers CALL and SELECT. Any other statement, and a tree the iterator cannot walk,
+  // goes to the ranks, which have the quack_* and sirius_rank_* functions: a CREATE TABLE AS, an
+  // INSERT, a COPY, a view or a macro must not carry a call there.
+  bool walked =
+    stmt.type == StatementType::CALL_STATEMENT || stmt.type == StatementType::SELECT_STATEMENT;
   references refs;
   try {
     refs = references_of(stmt);
   } catch (NotImplementedException&) {
-    // A tree the iterator cannot walk goes to the ranks, which have no gateway functions.
+    walked = false;
+  }
+  if (!walked) {
+    if (auto const name = gateway_call_in(stmt.query); !name.empty()) {
+      throw InvalidInputException(client_may_call(name, allow_join)
+                                    ? "%s can only be called in a SELECT or a CALL"
+                                    : "%s can only be called on the gateway's console",
+                                  name);
+    }
     return false;
   }
   bool local = false;
