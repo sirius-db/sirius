@@ -795,6 +795,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
     }
     info->projected_types.push_back(t);
+    info->dictionary_projected.push_back(scan_op.carries_source_dictionary(k));
   }
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
@@ -878,6 +879,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
     info->physical_contract.host_export_available = scan.host_export_available;
     info->bound_types      = info->physical_contract.view->identity->bound_types;
     info->semantic_columns = scan.read_views->entry(scan.contract_id).eligibility.semantic_columns;
+    for (std::size_t output_idx = 0; output_idx < scan.types.size(); ++output_idx) {
+      if (scan.carries_source_dictionary(output_idx)) {
+        info->dictionary_outputs.push_back(output_idx);
+      }
+    }
   }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
@@ -2009,13 +2015,16 @@ void insert_gpu_pipeline_operators_recursive(
   }
 }
 
-/// Whether this plan should carry narrow carriers: the connection's setting says so and the
-/// Sirius runtime that holds the plan sidecar is registered on the context.
-bool compressed_materialization_active(duckdb::ClientContext& context)
+/// Whether scans of this plan may install physical sidecars, which the compressed-schema passes
+/// then propagate: a setting that installs them (compressed materialization for numeric carriers,
+/// the dictionary carrier for strings) is on, and the Sirius runtime that holds the plan sidecar is
+/// registered on the context.
+bool physical_sidecars_enabled(duckdb::ClientContext& context)
 {
   if (!context.registered_state) { return false; }
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return state != nullptr && duckdb::compressed_materialization_enabled(context);
+  return state != nullptr && (duckdb::compressed_materialization_enabled(context) ||
+                              duckdb::dictionary_carrier_enabled(context));
 }
 
 }  // namespace
@@ -2450,7 +2459,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   }
 
   plan = fold_adjacent_projections(std::move(plan));
-  if (compressed_materialization_active(context)) {
+  if (physical_sidecars_enabled(context)) {
     auto const retracted = apply_compressed_schema_passes(plan);
     if (retracted > 0) {
       auto sirius_ctx = context.registered_state

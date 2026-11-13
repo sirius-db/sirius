@@ -348,7 +348,10 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       // case marks boundary restores anyway.
       auto& scan = op.Cast<sirius::op::sirius_physical_table_scan>();
       carried_columns map(op.types.size());
-      if (!scan.sidecar_from_gpu_tier_pin || !op.has_physical_overrides()) { return map; }
+      if ((!scan.sidecar_from_gpu_tier_pin && !scan.sidecar_from_source_dictionaries) ||
+          !op.has_physical_overrides()) {
+        return map;
+      }
       auto const native    = native_physical_schema(op);
       auto const& physical = op.get_physical_types();
       D_ASSERT(native.size() == physical.size());

@@ -338,7 +338,7 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 3. For up to 8 groups, `group_ids_kernel` writes a one-byte group id per row and `aggregate_columns_kernel<MaxGroups>` aggregates one column at a time with per-thread register accumulators and predicated adds (no atomics), followed by 128-bit warp and block reductions. 9 to 64 groups use per-warp shared-memory accumulators instead.
 4. Per-block totals are combined into DECIMAL128 sums and INT64 counts, and the keys are gathered from the representative rows.
 
-It applies only to one or two non-null one-character STRING keys, at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
+It applies only to one or two non-null keys that are one-character STRINGs or [dictionary carriers](#dictionary-carrier) of at most 256 keys (whose codes stand in for the character), at most 64 groups, and SUM, COUNT or COUNT(*) over non-null DECIMAL64 or INT64 columns whose values are small enough for 64-bit partial sums (checked per row). Anything else returns `nullptr` and the cuDF path runs unchanged.
 
 **Code path:**
 - `src/cuda/low_cardinality_groupby.cu` — kernels and host orchestration
@@ -572,6 +572,29 @@ result materialization restore native carriers.
 - `src/compression/simpatico_codegen/src/decode/jit/renderer.cpp` — `out_dtype` rendering
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
+
+### Dictionary Carrier
+
+**Motivation:** Many group-by keys are low-cardinality strings that the source already stores as a dictionary: a Simpatico `dictionary` pin, a dictionary-encoded Parquet column, or a DuckDB `DICT_FSST` segment. Decoding them to a cuDF STRING column materializes every row's bytes, and the grouped aggregate then hashes those bytes (or dictionary-encodes them again for long keys).
+
+**Mechanism:** The planner marks such a VARCHAR scan output as a DICTIONARY32 carrier (keys plus INT32 codes) in the compressed-materialization sidecar. A column the scan filters on is never carried. The source then produces the dictionary directly:
+- **Simpatico pin** (GPU tier): the decode returns the keys and codes of the column's `dictionary` plan instead of gathering strings.
+- **Parquet**: a column is a candidate when every chunk of the first file's footer is dictionary-encoded and the dictionary is at most 256 KB (`parquet_dictionary_string_columns()`). Only scans without table filters qualify, since a reader row filter makes cuDF skip its page-level dictionary transcode and hash-encode every string column instead. The read sets `enable_output_dict_columns`, and non-carried columns the reader returned as dictionaries are decoded back. A run-time reader filter (for example a dynamic join filter) leaves the read on strings, and the scan encodes only the carried columns.
+- **DuckDB native**: a VARCHAR column qualifies when its catalog distinct-count estimate is at most 65,536. `gpu_decode_strings_dictionary_column()` stacks the entries of every `DICT_FSST` segment (FSST-compressed ones are predecoded once), deduplicates them with one `cudf::dictionary::encode`, and maps each row's segment-local index to its merged code. A column with an `FSST_ONLY` segment or another codec decodes to strings, which the scan then encodes.
+
+The grouped aggregate groups on the codes and rewraps the output codes with the carrier's keys. COUNT requests over a carrier read its codes, since cuDF's hash group-by rejects dictionary value columns and would send the whole batch down the sort path. The low-cardinality kernel keys on the codes of a dictionary with at most 256 keys. Anything else that reads the column (expressions, join keys, results) restores it to STRING through `cast_through_rep`.
+
+**Code path:**
+- `src/planner/sirius_plan_get.cpp` — `scan_physical_schema()` (pins), `source_dictionary_columns()` / `source_dictionary_schema()` (Parquet, DuckDB native)
+- `src/transparent/parquet_footer_statistics.cpp` — `parquet_dictionary_string_columns()`
+- `src/op/scan/parquet_scan_core.cpp` — `enable_output_dict_columns`, `decode_uncarried_dictionaries()`
+- `src/cuda/scan/gpu_decode_strings.cu`, `src/cuda/scan/strings/dict_fsst.cu` — native dictionary decode
+- `src/op/aggregate/gpu_aggregate_impl.cpp`, `src/cuda/low_cardinality_groupby.cu` — grouping on codes
+
+**Config:** `enable_dictionary_carrier` (default: `false`), independent of `enable_compressed_materialization`. See [Configuration](configuration.md#scan). On a GB300:
+- TPC-H SF1000, GPU-pinned: q1 253 ms → 225 ms, q4 unchanged.
+- TPC-H SF1000, Parquet: q12 −5%, q14 −4%, the suite −0.9%. The other scans with candidates are filtered and stay on strings.
+- TPC-H SF10, DuckDB native: q1 −17%, q4 −5%. Unfiltered group-bys on low-cardinality strings run 22–38% faster.
 
 ### Late Materialization
 

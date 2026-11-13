@@ -170,7 +170,10 @@ The residency gate decides what can be narrow; `apply_tier_narrowing_policy` —
 HOST-tier serve pays a host→GPU upload per batch that
 narrowing always shrinks, so host-tier-backed sidecars are never touched: only scans stamped
 `sidecar_from_gpu_tier_pin` at sidecar install time seed the analysis, making unpinned,
-pinned-native, and host-tier scans structurally invisible to the pass. A GPU-tier serve has no
+pinned-native, and host-tier scans structurally invisible to the pass. The one unpinned exception
+is a fresh Parquet or DuckDB-native scan stamped `sidecar_from_source_dictionaries`, whose only
+targets are [dictionary carriers](optimizations.md#dictionary-carrier); it has no upload term
+either, so it is judged the same way. A GPU-tier serve has no
 upload term, so each narrow column must justify itself through the plan.
 
 The pass walks the physical tree bottom-up with the same traversal and per-operator column maps
