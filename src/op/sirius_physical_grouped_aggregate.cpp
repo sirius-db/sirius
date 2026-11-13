@@ -173,6 +173,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   auto const carried = carried_inputs(aggregate_slots);
+  std::vector<bool> keep_dictionary_keys(group_idx.size());
+  for (std::size_t key = 0; key < group_idx.size() && key < get_physical_types().size(); ++key) {
+    keep_dictionary_keys[key] = get_physical_types()[key].id() == cudf::type_id::DICTIONARY32;
+  }
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
@@ -207,7 +211,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_input_max_abs,
                                                               cudf_aggregate_is_wide_integer_sum,
                                                               split_wide_sums,
-                                                              &num_groups);
+                                                              &num_groups,
+                                                              keep_dictionary_keys);
     _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }

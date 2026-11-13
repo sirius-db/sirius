@@ -631,6 +631,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
+| `enable_dictionary_carrier` | false | Keep VARCHAR columns whose GPU-tier pin is dictionary-encoded as DICTIONARY32 carriers past the scan, so grouped aggregates group on the codes. Needs `enable_compressed_materialization`. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
@@ -845,6 +846,7 @@ Evaluators retain their own policy values rather than reading mutable global def
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+| `enable_dictionary_carrier` | false | Keep dictionary-pinned VARCHAR columns as DICTIONARY32 (keys plus codes) until a grouped aggregate or another native boundary. |
 | `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
 
 DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
@@ -894,6 +896,16 @@ restoration boundaries, and cache-reservation behavior.
 
 ```sql
 SET enable_compressed_materialization = false;
+```
+
+`enable_dictionary_carrier` (also accepted under `sirius.operator_params`) extends this to strings.
+A VARCHAR column qualifies when its GPU-tier pin uses a Simpatico `dictionary` plan in every chunk
+and the scan does not filter on it. The decode then returns the keys and INT32 codes instead of the
+strings, and a grouped aggregate groups on the codes; anything else that reads the column decodes
+it first. At TPC-H SF1000 it takes q1 from 253 ms to 230 ms and leaves the other queries unchanged.
+
+```sql
+SET enable_dictionary_carrier = true;
 ```
 
 ### Pipeline / Operator

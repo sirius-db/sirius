@@ -714,8 +714,15 @@ decompress_result decompress_chunk(
   if (!out.table) {
     // The plain decode below applies no join filter.
     out.outcome.membership_skipped = requested_membership_probes(request) > 0;
-    out.table = predicates.empty() ? simpatico::decompress(chunk, selected, lanes, mr)
-                                   : simpatico::decompress(chunk, selected, predicates, lanes, mr);
+    // Only a DICTIONARY32 entry changes a plain decode; widening targets apply to compacted ones.
+    std::vector<std::optional<cudf::data_type>> dictionary_outputs;
+    for (std::size_t i = 0; i < request.output_types.size() && i < selected.size(); ++i) {
+      if (request.output_types[i] && request.output_types[i]->id() == cudf::type_id::DICTIONARY32) {
+        dictionary_outputs.resize(selected.size());
+        dictionary_outputs[i] = request.output_types[i];
+      }
+    }
+    out.table = simpatico::decompress(chunk, selected, predicates, dictionary_outputs, lanes, mr);
   }
   // An active equality directive yields BOOL8 on every path — the filtered decode and the plain
   // rerun alike — so the substituted positions are exactly the active entries the decoded table

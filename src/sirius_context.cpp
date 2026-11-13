@@ -1727,6 +1727,15 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
+bool dictionary_carrier_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_dictionary_carrier", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return sirius::operator_params{}.enable_dictionary_carrier;
+}
+
 void print_cpu_fallback_banner()
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;

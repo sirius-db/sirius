@@ -79,6 +79,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::reference const& alt
       return get_or_create_restored_reference(alt.column_index, native, mode);
     }
   }
+  if (source.type().id() == cudf::type_id::DICTIONARY32 && logical.id() == type_id::VARCHAR) {
+    return get_or_create_restored_reference(
+      alt.column_index, cudf::data_type{cudf::type_id::STRING}, mode);
+  }
 
   if (mode == evaluation_mode::AST) {
     auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(alt.column_index);

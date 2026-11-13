@@ -220,6 +220,51 @@ void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
   derive_projection_sidecar(op, child_schema, native);
 }
 
+// The native boundary of a grouped aggregate whose partial layout no sidecar describes, except
+// that a DICTIONARY32 group key read by nothing else enters unrestored: grouping on its codes is
+// equality on its values, and the aggregate decodes it on the grouped output, which it emits
+// native.
+void admit_dictionary_group_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
+{
+  auto const& aggregate   = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  auto const child_schema = output_physical_schema(*slot->children[0]);
+  auto const in_range     = [&](int idx) {
+    return idx >= 0 && static_cast<std::size_t>(idx) < child_schema.size();
+  };
+  std::unordered_set<std::size_t> read_by_values;
+  auto const read = [&](int idx) {
+    if (in_range(idx)) { read_by_values.insert(static_cast<std::size_t>(idx)); }
+  };
+  // COUNT_ALL carries a placeholder input index and COUNT_VALID reads only the validity mask.
+  for (std::size_t i = 0; i < aggregate.cudf_aggregates.size(); ++i) {
+    if (aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_ALL ||
+        aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_VALID) {
+      continue;
+    }
+    if (i < aggregate.cudf_aggregate_idx.size()) { read(aggregate.cudf_aggregate_idx[i]); }
+    if (i < aggregate.cudf_aggregate_struct_col_indices.size()) {
+      for (auto const idx : aggregate.cudf_aggregate_struct_col_indices[i]) {
+        read(idx);
+      }
+    }
+  }
+  for (auto const idx : sirius::op::carried_inputs(aggregate.aggregate_slots)) {
+    read(idx);
+  }
+  std::unordered_set<std::size_t> dictionary_keys;
+  for (auto const idx : aggregate.group_idx) {
+    if (in_range(idx) &&
+        child_schema[static_cast<std::size_t>(idx)].id() == cudf::type_id::DICTIONARY32 &&
+        !read_by_values.contains(static_cast<std::size_t>(idx))) {
+      dictionary_keys.insert(static_cast<std::size_t>(idx));
+    }
+  }
+  restore_columns_matching(slot->children[0], [&](std::size_t column_idx) {
+    return !dictionary_keys.contains(column_idx);
+  });
+  slot->set_physical_types({});
+}
+
 // Return whether @p op is a projection consisting solely of bare column references. Such a
 // projection forwards column views without materializing a batch, so a narrow carrier crossing
 // it saves no bandwidth.
@@ -420,12 +465,13 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       if (aggregate.has_grouping_sets()) { break; }
       // Only a plain slot keeps the partial batch in the declared `types` shape a sidecar describes
       // and reads its input through cudf_aggregate_idx; any other slot kind keeps the native
-      // boundary.
-      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
-      // Grouping functions append output columns the operator does not compute through group_idx /
-      // aggregate_slots; the arity check rejects that shape along with any other layout drift.
-      if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
-        break;
+      // boundary. Grouping functions append output columns the operator does not compute through
+      // group_idx / aggregate_slots; the arity check rejects that shape along with any other layout
+      // drift.
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots) ||
+          slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
+        admit_dictionary_group_keys(slot);
+        return;
       }
       auto const child_width = slot->children[0]->types.size();
       bool consistent        = true;

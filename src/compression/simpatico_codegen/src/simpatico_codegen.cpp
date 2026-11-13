@@ -269,11 +269,20 @@ compressed_table compress_columns_parallel(cudf::table_view table,
 
 // Every table facade submits the same typed requests to one session. Streams and the explicit
 // allocator are borrowed by the session.
-std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
-                                                  std::span<std::size_t const> selected,
-                                                  std::span<decode_predicate const> predicates,
-                                                  std::span<const ::cuda::stream_ref> streams,
-                                                  rmm::device_async_resource_ref mr)
+bool wants_dictionary_output(std::span<const std::optional<cudf::data_type>> output_types,
+                             std::size_t slot)
+{
+  return slot < output_types.size() && output_types[slot].has_value() &&
+         output_types[slot]->id() == cudf::type_id::DICTIONARY32;
+}
+
+std::unique_ptr<cudf::table> decode_table_columns(
+  compressed_table const& table,
+  std::span<std::size_t const> selected,
+  std::span<decode_predicate const> predicates,
+  std::span<const ::cuda::stream_ref> streams,
+  rmm::device_async_resource_ref mr,
+  std::span<const std::optional<cudf::data_type>> output_types = {})
 {
   for (auto index : selected) {
     if (index >= table.columns.size()) throw plan_error("selected column index out of range");
@@ -282,7 +291,10 @@ std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
   decode_session session{streams, mr};
   for (std::size_t i = 0; i < selected.size(); ++i) {
     auto const& column = table.columns[selected[i]];
-    column_decode_request request{std::cref(*column.plan_tree), value_result{column.dtype}, {}};
+    column_decode_request request{
+      std::cref(*column.plan_tree),
+      value_result{column.dtype, wants_dictionary_output(output_types, i)},
+      {}};
     if (!predicates.empty() && predicates[i].active()) {
       request.result = predicate_result{predicates[i], {}};
     }
@@ -891,9 +903,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       if (selection.route == sc::decode_route::full || selection.enumerate_by_index)
         wait_for_indices(wave2.next_stream());
       decoded_positions.push_back(i);
-      wave2.append(column_decode_request{std::cref(*column.plan_tree),
-                                         value_result{column.dtype},
-                                         validated_selection(*column.plan_tree, selection)});
+      wave2.append(column_decode_request{
+        std::cref(*column.plan_tree),
+        value_result{column.dtype, wants_dictionary_output(request.output_types, i)},
+        validated_selection(*column.plan_tree, selection)});
     }
     auto decoded = wave2.finish();
     for (std::size_t i = 0; i < decoded.size(); ++i)
@@ -1215,6 +1228,23 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   return decode_table_columns(table, selected_columns, predicates, streams, mr);
 }
 
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  std::span<const std::optional<cudf::data_type>> output_types,
+  std::span<const ::cuda::stream_ref> streams,
+  rmm::device_async_resource_ref mr)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,typed,streams]"};
+  if ((!predicates.empty() && predicates.size() != selected_columns.size()) ||
+      (!output_types.empty() && output_types.size() != selected_columns.size())) {
+    throw plan_error(
+      "decompress: predicates and output_types must be empty or match selected_columns");
+  }
+  return decode_table_columns(table, selected_columns, predicates, streams, mr, output_types);
+}
+
 std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
@@ -1267,9 +1297,10 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
     for (auto const& b : request.bool8_filters) {
       if (b.column < predicates.size()) predicates[b.column].equals_any = b.equals_any;
     }
-    return decode_table_columns(table, selected_columns, predicates, streams, mr);
+    return decode_table_columns(
+      table, selected_columns, predicates, streams, mr, request.output_types);
   }
-  return decode_table_columns(table, selected_columns, {}, streams, mr);
+  return decode_table_columns(table, selected_columns, {}, streams, mr, request.output_types);
 }
 
 std::unique_ptr<cudf::table> decompress_scan_filter(

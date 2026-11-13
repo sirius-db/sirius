@@ -1123,6 +1123,10 @@ bool like_swar_fastpath_enabled(ClientContext& context);
 /// `sirius.operator_params` entry is what a connection inherits until it sets its own.
 bool compressed_materialization_enabled(ClientContext& context);
 
+/// \brief Read the per-session `enable_dictionary_carrier` setting, resolved per connection like
+/// `enable_compressed_materialization`.
+bool dictionary_carrier_enabled(ClientContext& context);
+
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so

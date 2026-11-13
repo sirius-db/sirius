@@ -349,6 +349,20 @@ std::unique_ptr<cudf::table> decompress(
   std::span<const ::cuda::stream_ref> streams,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
+/// Decompress a column subset across borrowed streams, honoring per-slot output types.
+///
+/// @p output_types is parallel to @p selected_columns or empty. A DICTIONARY32 entry returns a
+/// column whose value root is a string `dictionary` as that DICTIONARY32 column (keys plus codes)
+/// rather than gathering its keys; other entries, and other plans, decode as usual. @p predicates
+/// is parallel to @p selected_columns or empty, and an active predicate takes precedence.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  std::span<const std::optional<cudf::data_type>> output_types,
+  std::span<const ::cuda::stream_ref> streams,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
 /// Decompress a column subset with the scan's row filter applied, across borrowed streams.
 std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,

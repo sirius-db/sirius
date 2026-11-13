@@ -472,6 +472,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("enable_dictionary_carrier", opt.enable_dictionary_carrier);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
   r.optional("enable_delim_aggregate_reuse", opt.enable_delim_aggregate_reuse);
   r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);

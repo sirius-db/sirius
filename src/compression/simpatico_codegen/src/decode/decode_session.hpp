@@ -37,6 +37,9 @@ struct mask_destination {
 struct value_result {
   /// Restore this logical type without converting bytes when the fixed-width sizes match.
   std::optional<cudf::data_type> stored_type;
+  /// Return a plan whose value root is a string `dictionary` as its DICTIONARY32 column (keys plus
+  /// codes) instead of gathering the keys; every other plan decodes as usual.
+  bool dictionary_output = false;
 };
 struct predicate_result {
   decode_predicate predicate;

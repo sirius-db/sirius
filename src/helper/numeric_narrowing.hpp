@@ -218,6 +218,16 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
 [[nodiscard]] bool can_restore_to(cudf::data_type source, cudf::data_type target);
 
 /**
+ * @brief Checks whether @p carrier is the DICTIONARY32 carrier of a @p native STRING column
+ *
+ * A dictionary carrier holds the same values as keys plus codes, so `cast_through_rep` restores it
+ * with a decode and narrows to it with an encode. It shares no family with the numeric carriers,
+ * so `can_narrow_to` and `can_restore_to` reject the pair.
+ */
+[[nodiscard]] bool is_dictionary_carrier_of(cudf::data_type carrier,
+                                            cudf::data_type native) noexcept;
+
+/**
  * @brief Checks whether exact bounds are representable by a numeric carrier
  *
  * The bounds must be ordered, match @p target's signed, unsigned, or fixed-point domain, and fit

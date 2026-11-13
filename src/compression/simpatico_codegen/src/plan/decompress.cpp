@@ -123,7 +123,8 @@ class DecodeWalk {
   DecodeWalk(PlanTree const& tree,
              decode_frame& frame,
              decode_predicate const* pred,
-             decode_selection const* sel);
+             decode_selection const* sel,
+             bool dictionary_output = false);
   // Materialize `consumer` and return the decoded `value` it consumes, for a fused region to bind.
   cudf::column const* bind(NodeId consumer, ValueId value);
   std::unique_ptr<cudf::column> run();
@@ -156,6 +157,13 @@ class DecodeWalk {
   /// full; the precomputed @c sel_target pins the exact consumer.
   [[nodiscard]] bool selection_applies_to(NodeId nid) const;
 
+  /// The encoded dictionary column of @p rep when the caller asked for dictionary output and
+  /// @p nid produces the column's final value; null otherwise. @p owned lets the column move out
+  /// of a representation the walk reconstructed; a plan-owned one is copied.
+  std::unique_ptr<cudf::column> dictionary_output_of(compressed_representation& rep,
+                                                     NodeId nid,
+                                                     bool owned);
+
   PlanTree const& tree;
   decode_frame& frame;
   /// Borrowed; null when the caller wants the column itself.
@@ -164,6 +172,8 @@ class DecodeWalk {
   decode_selection const* sel = nullptr;
   /// The one NodeId selection_applies_to accepts; tree.nodes.size() = none.
   NodeId sel_target;
+  /// Return a string dictionary root as its DICTIONARY32 column instead of gathering its keys.
+  bool dictionary_output = false;
   /// Set once a rep has answered `pred`, so run() knows not to compare again.
   bool predicate_resolved = false;
   // A present entry holding no column was consumed; requesting it again is an error.
@@ -784,7 +794,8 @@ void DecodeWalk::materialize(NodeId nid)
     return;
   }
   if (node.rep) {
-    store(key, decode_leaf(*node.rep, nid));
+    auto dictionary = dictionary_output_of(*node.rep, nid, /*owned=*/false);
+    store(key, dictionary ? std::move(dictionary) : decode_leaf(*node.rep, nid));
     return;
   }
   std::vector<std::string> names;
@@ -809,19 +820,36 @@ void DecodeWalk::materialize(NodeId nid)
       channels.push_back(std::move(terminal_entry(value, *channel->second)));
     }
   }
-  auto const rep = reconstruct_decode_representation(node, names, std::move(channels), frame);
-  store(key, decode_leaf(*rep, nid));
+  auto rep        = reconstruct_decode_representation(node, names, std::move(channels), frame);
+  auto dictionary = dictionary_output_of(*rep, nid, /*owned=*/true);
+  store(key, dictionary ? std::move(dictionary) : decode_leaf(*rep, nid));
+}
+
+std::unique_ptr<cudf::column> DecodeWalk::dictionary_output_of(compressed_representation& rep,
+                                                               NodeId nid,
+                                                               bool owned)
+{
+  if (!dictionary_output || pred != nullptr) { return nullptr; }
+  auto const& sources = tree.nodes[nid].input_sources;
+  if (sources.empty() || !(sources.front() == ValueId{0, 0})) { return nullptr; }
+  auto* const dictionary = dynamic_cast<dictionary_compressed_representation*>(&rep);
+  if (dictionary == nullptr || !dictionary->dict_column) { return nullptr; }
+  if (owned) { return std::move(dictionary->dict_column); }
+  return std::make_unique<cudf::column>(
+    dictionary->dict_column->view(), frame.stream(), frame.mr());
 }
 
 DecodeWalk::DecodeWalk(PlanTree const& tree,
                        decode_frame& frame,
                        decode_predicate const* pred,
-                       decode_selection const* sel)
+                       decode_selection const* sel,
+                       bool dictionary_output)
   : tree(tree),
     frame(frame),
     pred(pred && pred->active() ? pred : nullptr),
     sel(sel && sel->active() ? sel : nullptr),
-    sel_target(static_cast<NodeId>(tree.nodes.size()))
+    sel_target(static_cast<NodeId>(tree.nodes.size())),
+    dictionary_output(dictionary_output)
 {
   for (auto const& node : tree.nodes)
     for (auto const& source : node.input_sources)
@@ -1212,14 +1240,17 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
           &request.source)) {
     return standalone->get().decompress(frame);
   }
-  auto const& tree = std::get<std::reference_wrapper<PlanTree const>>(request.source).get();
-  namespace sc     = sirius::codegen;
-  DecodeWalk walk{tree, frame, pred, selection};
+  auto const& tree   = std::get<std::reference_wrapper<PlanTree const>>(request.source).get();
+  namespace sc       = sirius::codegen;
+  auto const* values = std::get_if<value_result>(&request.result);
+  bool const dictionary_output = values != nullptr && values->dictionary_output;
+  DecodeWalk walk{tree, frame, pred, selection, dictionary_output};
   std::unique_ptr<cudf::column> output;
   if (selection && selection->route == sc::decode_route::str_split) {
     output = decode_str_split_selected(tree, *selection, walk, frame);
   } else {
-    if (selection && selection->route == sc::decode_route::dict_codes && !predicate) {
+    if (selection && selection->route == sc::decode_route::dict_codes && !predicate &&
+        !dictionary_output) {
       output = try_dict_gather_fast_path(tree, *selection, walk, frame);
     }
     if (!output && selection && !selection->compacted()) {
