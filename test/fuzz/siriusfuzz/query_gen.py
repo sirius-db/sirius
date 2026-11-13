@@ -1462,9 +1462,7 @@ class QueryGenerator:
             if partition_candidates and rng.random() < (0.9 if fact_tables else 0.7)
             else []
         )
-        order_cols = [
-            c for c in cols if numeric(c) or partitionable(c) or c.kind == "int"
-        ]
+        order_cols = [c for c in cols if numeric(c) or partitionable(c)]
         first = rng.choice(order_cols)
         order = [OrderItem(first, desc=rng.random() < 0.5)]
         choices = [
