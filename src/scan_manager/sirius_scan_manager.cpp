@@ -1522,7 +1522,7 @@ void sirius_scan_manager::prepare_for_query(
   // Open/validate all bound provider transactions before any scan can hold a native
   // checkpoint key. A later provider must not start its backend behind a forced checkpoint
   // waiting on an earlier scan's key. Keep this pass before cache matching as well.
-  auto check_preflight = [&] {
+  auto check_running = [&] {
     if (completion) {
       if (auto error = completion->terminal_error()) { std::rethrow_exception(error); }
     }
@@ -1533,6 +1533,11 @@ void sirius_scan_manager::prepare_for_query(
       }
       throw duckdb::InterruptException();
     }
+    if (_query_lifecycle.state(query_id) == exec::query_lifecycle_state::quiescing)
+      throw duckdb::InterruptException();
+  };
+  auto check_preflight = [&] {
+    check_running();
     if (checkpoint_key_count(query_id) != 0) {
       throw std::logic_error("provider preflight requires an attempt without checkpoint keys");
     }
@@ -1821,8 +1826,11 @@ void sirius_scan_manager::prepare_for_query(
     }
   }
   if (!state->pending_mvcc_mask_jobs.empty()) {
-    run_mvcc_mask_jobs(
-      state->pending_mvcc_mask_jobs, *state->dispatcher, _reservation_manager, *_topology_index);
+    run_mvcc_mask_jobs(state->pending_mvcc_mask_jobs,
+                       *state->dispatcher,
+                       _reservation_manager,
+                       *_topology_index,
+                       check_running);
   }
   if (mvcc_mask_cache_enabled()) {
     // Only writer-free builds whose snapshot covers every existing commit qualify.
@@ -1855,7 +1863,8 @@ void sirius_scan_manager::prepare_for_query(
                           *state->dispatcher,
                           _reservation_manager,
                           *_topology_index,
-                          delta_gpu_ids);
+                          delta_gpu_ids,
+                          check_running);
   }
 
   // Provider handoff, deferred to behind the mask run so ownership is a
@@ -2772,18 +2781,29 @@ bool sirius_scan_manager::holds_any_checkpoint_key() const noexcept
 
 void sirius_scan_manager::start() {}
 
-void sirius_scan_manager::stop()
+void sirius_scan_manager::stop_workers()
 {
-  // Every query's scan work must be off the pool before the pool stops: a sequencer parked on
-  // a dequeue that will never be satisfied would otherwise never return.
-  // Requires the runtime owner to prevent new queries and finish preparation construction.
-  // Concurrent prepare/stop is outside this manager shutdown contract.
-  reset_all();
+  // Runtime admission must be closed before taking this snapshot. Retain providers while the
+  // caller checks GPU completion; host worker retirement alone is insufficient.
+  std::vector<std::shared_ptr<query_scan_manager_state>> states;
+  {
+    std::lock_guard lock(_query_states_mutex);
+    for (auto const& [id, state] : _query_states)
+      states.push_back(state);
+  }
+  for (auto const& state : states)
+    state->drain();
   _coordinators.stop();
-  _native_readers.stop();  // Every accepted reader has closed and returned its lease.
+  _native_readers.stop();
   _thread_pool.stop();
   // Before any ioctx is released: the sampler polls the uring ioctx's reactors.
   if (_uring_gauges_sampler) { _uring_gauges_sampler->stop(); }
+}
+
+void sirius_scan_manager::stop()
+{
+  stop_workers();
+  reset_all();
 }
 
 namespace {

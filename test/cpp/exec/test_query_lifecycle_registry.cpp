@@ -15,9 +15,14 @@
  */
 
 #include "catch.hpp"
+#include "duckdb/common/exception.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "memory/host_reservation.hpp"
 #include "query_id.hpp"
+
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -669,4 +674,139 @@ TEST_CASE("first fatal runtime cause survives query retirement without retaining
   registry.close(id);
   CHECK(registry.diagnostics().front().error == "earlier query-local failure");
   CHECK(registry.runtime_failure_message() == cause);
+}
+
+TEST_CASE("unjoined GPU work closes admission without releasing query resources",
+          "[query_lifecycle_gate][device_health][unsafe_completion]")
+{
+  query_lifecycle_registry registry;
+  auto first  = make_query_id(1);
+  auto second = make_query_id(2);
+  registry.open_query(first);
+  registry.open_query(second);
+  auto work               = registry.try_begin_submission(first);
+  auto resource           = std::make_shared<int>(42);
+  std::weak_ptr<int> weak = resource;
+  registry.retain_resources(first, std::move(resource));
+  auto error = std::make_exception_ptr(sirius::unjoined_gpu_work{});
+  REQUIRE(registry.report_failure(error, first));
+  REQUIRE(registry.runtime_failed());
+  REQUIRE(registry.unsafe_completion());
+  REQUIRE_FALSE(registry.runtime_failure_message().empty());
+  REQUIRE_FALSE(registry.accepts_work(first));
+  REQUIRE_FALSE(registry.accepts_work(second));
+  REQUIRE_THROWS_AS(registry.open_query(make_query_id(3)),
+                    query_lifecycle_registry::runtime_unavailable_error);
+  work.finish();
+  registry.wait_for_work(first);
+  // Host workers draining does not prove that their submitted GPU work completed.
+  REQUIRE_THROWS_AS(registry.release_resources(first), sirius::unjoined_gpu_work);
+  REQUIRE_THROWS_AS(registry.close(first), sirius::unjoined_gpu_work);
+  REQUIRE_FALSE(weak.expired());
+  REQUIRE(registry.size() == 2);
+  // Final shutdown still releases in the established order after workers stop.
+  REQUIRE_NOTHROW(registry.clear());
+  REQUIRE(weak.expired());
+  REQUIRE(registry.unsafe_completion());
+}
+
+TEST_CASE("a retained HOST reservation cannot strand another query after a fatal completion",
+          "[unsafe_completion][query_lifecycle_gate]")
+{
+  using namespace std::chrono_literals;
+  namespace ccm = cucascade::memory;
+  ccm::host_memory_space_config config;
+  config.memory_capacity            = config.block_size;
+  config.reservation_limit_fraction = 1.0;
+  config.initial_number_pools       = 0;
+  ccm::memory_reservation_manager manager({config});
+  auto* host = manager.get_memory_space(ccm::Tier::HOST, config.numa_id);
+  REQUIRE(host);
+  auto held = host->make_reservation_or_null(host->get_max_memory());
+  REQUIRE(held);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  using admission_type = sirius::exec::query_admission;
+  admission_type admission;
+  admission.configure(2);
+  auto owner_permit = admission.acquire(admission_type::access::query, [] {});
+  auto const owner  = sirius::make_query_id(1);
+  auto const waiter = sirius::make_query_id(2);
+  lifecycle.open_query(owner);
+  lifecycle.open_query(waiter);
+  std::promise<void> retrying;
+  auto waiting = retrying.get_future();
+  auto task    = std::async(std::launch::async, [&] {
+    auto permit       = admission.acquire(admission_type::access::query, [] {});
+    auto lease        = lifecycle.try_acquire_work(waiter);
+    unsigned attempts = 0;
+    return sirius::memory::reserve_host_memory(
+      manager, ccm::any_memory_space_in_tier_with_preference(ccm::Tier::HOST), 4096, [&] {
+        if (++attempts == 2) retrying.set_value();  // first attempt found no capacity
+        if (!lifecycle.accepts_work(waiter)) throw duckdb::InterruptException();
+      });
+  });
+  CHECK(waiting.wait_for(5s) == std::future_status::ready);
+  CHECK(lifecycle.report_failure(std::make_exception_ptr(sirius::unjoined_gpu_work{}), owner));
+  admission.close();
+  owner_permit.reset();
+  auto const status = task.wait_for(5s);
+  if (status != std::future_status::ready) held.reset();  // unblock a regressed worker
+  CHECK(status == std::future_status::ready);
+  CHECK_THROWS_AS(task.get(), duckdb::InterruptException);
+  admission.wait_until_idle();
+  CHECK(lifecycle.activity(waiter).work == 0);
+  REQUIRE(held);
+  CHECK(host->get_total_reserved_memory() == held->size());
+}
+
+TEST_CASE("HOST staging makes progress when allocations outlive their reservations",
+          "[query_lifecycle_gate]")
+{
+  namespace ccm = cucascade::memory;
+  ccm::host_memory_space_config config;
+  config.memory_capacity            = 2 * config.block_size;
+  config.reservation_limit_fraction = 0.5;
+  config.pool_size                  = 2;
+  config.initial_number_pools       = 0;
+  ccm::memory_reservation_manager manager({config});
+  auto* space = manager.get_memory_space(ccm::Tier::HOST, config.numa_id);
+  REQUIRE(space);
+  auto* resource = space->get_memory_resource_as<ccm::fixed_size_host_memory_resource>();
+  REQUIRE(resource);
+  auto first = resource->allocate_multiple_blocks(config.block_size);
+  REQUIRE(space->get_active_reservation_count() == 0);
+  unsigned attempts = 0;
+  auto reservation  = sirius::memory::reserve_host_memory(
+    manager,
+    ccm::any_memory_space_in_tier_with_preference(ccm::Tier::HOST),
+    config.block_size,
+    [&] {
+      if (++attempts > 1) throw std::runtime_error("idle HOST reservation stalled");
+    });
+  REQUIRE(reservation);
+  CHECK(reservation->size() == 0);
+  REQUIRE_NOTHROW(resource->allocate_multiple_blocks(config.block_size, reservation.get()));
+}
+
+TEST_CASE("unconfirmed completion preserves CUDA status and earlier diagnostics",
+          "[query_lifecycle_gate][unsafe_completion]")
+{
+  bool const earlier_error = GENERATE(false, true);
+  query_lifecycle_registry registry;
+  auto id = make_query_id(1);
+  registry.open_query(id);
+  auto point =
+    earlier_error ? sirius::gpu_completion_point::failure : sirius::gpu_completion_point::execute;
+  auto result = sirius::observe_gpu_completion(cudaErrorIllegalAddress, point);
+  REQUIRE_FALSE(result);
+  if (earlier_error)
+    result.error.remember_prior_error(
+      std::make_exception_ptr(std::runtime_error("operator failed")));
+  REQUIRE(registry.report_failure(std::make_exception_ptr(result.error), id));
+  auto message = registry.runtime_failure_message();
+  CHECK(message.find("cudaErrorIllegalAddress") != std::string::npos);
+  CHECK(message.find(sirius::completion_point_name(point)) != std::string::npos);
+  if (earlier_error) CHECK(message.find("operator failed") != std::string::npos);
+  registry.report_failure(std::make_exception_ptr(sirius::unjoined_gpu_work{}), id);
+  CHECK(registry.runtime_failure_message() == message);
 }
