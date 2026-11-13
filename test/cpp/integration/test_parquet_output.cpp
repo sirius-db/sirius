@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_parquet_sink.hpp"
 #include "output/parquet_writer.hpp"
 #include "sirius/exception.hpp"
 #include "utils/gpu_execution_fixture.hpp"
@@ -988,4 +989,16 @@ TEST_CASE("Empty nested COPY avoids an excluded ambient GPU and restores the cal
   REQUIRE_THROWS(sirius::output::write_empty_parquet(spec, root.path / "missing/part.parquet", 1));
   REQUIRE(excluded_allocations.load() == 0);
   REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
+}
+
+TEST_CASE("Parquet execute requires delivery metadata before creating output",
+          "[parquet_export_gpu][delivery_metadata]")
+{
+  export_directory root;
+  sirius::output::parquet_export_spec spec;
+  spec.directory = root.path / "missing-metadata";
+  sirius::op::sirius_physical_parquet_sink sink({}, std::move(spec));
+  sirius::op::pipelineable_operator_data input;
+  REQUIRE_THROWS_AS(sink.execute(input, cudf::get_default_stream()), sirius::internal_exception);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "missing-metadata"));
 }

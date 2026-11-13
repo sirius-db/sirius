@@ -90,7 +90,7 @@ void parquet_session::remove_part_locked(std::filesystem::path const& path) noex
   if (it == owned_files_.end()) return;
   if (::unlink(path.c_str()) == 0 || errno == ENOENT) owned_files_.erase(it);
 }
-void parquet_session::write(input_id const& id,
+void parquet_session::write(input_id id,
                             std::optional<std::size_t> position,
                             std::vector<std::uint64_t> const& rows,
                             write_part const& writer)
