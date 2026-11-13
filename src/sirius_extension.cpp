@@ -90,6 +90,7 @@ extern "C" int cudaProfilerStop();
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "op/partition/config.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -2962,6 +2963,25 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetBuildFoldPolicy(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const policy = parameter.IsNull()
+                        ? std::nullopt
+                        : sirius::op::parse_build_fold_policy(StringValue::Get(parameter));
+  if (!policy) {
+    std::string valid;
+    for (auto const& [named, spelling] : sirius::op::build_fold_policy_names) {
+      if (!valid.empty()) { valid += ", "; }
+      valid += spelling;
+    }
+    throw InvalidInputException(
+      "Invalid build_fold_policy %s. Valid values: %s", parameter.ToSQLString(), valid);
+  }
+  auto* params              = get_operator_params(context, scope);
+  params->build_fold_policy = *policy;
+  SIRIUS_LOG_DEBUG("Updated config BUILD_FOLD_POLICY to {}", sirius::op::to_string(*policy));
+}
+
 static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                    = get_operator_params(context, scope);
@@ -3453,6 +3473,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::DOUBLE,
                     Value::DOUBLE(operator_defaults.dense_count_join_memory_fraction),
                     SetDenseCountJoinMemoryFraction);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "build_fold_policy",
+                    "rule deciding whether a single-partition STANDARD or MIXED_JOIN build "
+                    "folds into one batch: legacy_filter_coupled, never, or bounded",
+                    LogicalType::VARCHAR,
+                    Value(std::string(sirius::op::to_string(operator_defaults.build_fold_policy))),
+                    SetBuildFoldPolicy);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

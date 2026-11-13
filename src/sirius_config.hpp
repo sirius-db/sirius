@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "op/partition/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -65,10 +66,6 @@ constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
-
-/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
-/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
-constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -194,6 +191,10 @@ struct operator_params {
   /// available memory. Defaults to 8x batch size; 0 disables BUILD_PROBE including MARK.
   // SET/RESET overrides are connection-local and captured in the query options snapshot.
   uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
+
+  /// Engine-owned rule deciding whether a single-partition STANDARD or MIXED_JOIN build folds into
+  /// one batch (`op::decide_build_fold`). Test hooks select another rule for ablation.
+  op::build_fold_policy build_fold_policy = op::build_fold_policy::legacy_filter_coupled;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is

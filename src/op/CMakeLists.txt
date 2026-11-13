@@ -10,6 +10,7 @@ target_sources(
           partition/gpu_partition_impl.cpp
           partition/partition_exchange.cpp
           partition/consumer_partition_policy.cpp
+          partition/build_fold.cpp
           dynamic_filter/hash_join_partition_observer.cpp
           result/host_table_chunk_reader.cpp
           scan/cached_ranges.cpp

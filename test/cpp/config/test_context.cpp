@@ -194,6 +194,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "build_fold_policy") == 0);
+    REQUIRE(con.Query("SET build_fold_policy = 'bounded'")->HasError());
     REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
@@ -261,6 +263,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 0);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 0);
+    REQUIRE(setting_count(con, "build_fold_policy") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -286,6 +289,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     REQUIRE(setting_count(con, "cross_join_task_bytes") == 1);
     REQUIRE(setting_count(con, "enable_decimal_sum_stats_bound") == 1);
+    REQUIRE(setting_count(con, "build_fold_policy") == 1);
     duckdb::Value native_enabled;
     auto native_setting =
       con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
@@ -368,6 +372,37 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET enable_decimal_sum_stats_bound");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+    auto const& params = duckdb::session_operator_params(*con.context);
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
+    for (auto const* policy : {"never", "bounded", "legacy_filter_coupled"}) {
+      result = con.Query(std::string("SET build_fold_policy = '") + policy + "'");
+      REQUIRE(result != nullptr);
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(params.build_fold_policy == sirius::op::parse_build_fold_policy(policy));
+    }
+    result = con.Query("SET build_fold_policy = 'sometimes'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(),
+                 Catch::Matchers::ContainsSubstring("legacy_filter_coupled, never, bounded"));
+    // NULL is a user error, not an internal one that would invalidate the database.
+    result = con.Query("SET build_fold_policy = NULL");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::INVALID_INPUT);
+    CHECK_THAT(result->GetError(),
+               Catch::Matchers::ContainsSubstring("legacy_filter_coupled, never, bounded"));
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
+    result = con.Query("SELECT 1");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET build_fold_policy = 'bounded'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET build_fold_policy");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
   }
 }
 
