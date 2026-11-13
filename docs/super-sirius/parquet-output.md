@@ -19,6 +19,24 @@ nonempty directory trees are rejected. If the destination is absent, its parent
 must already exist. Relative local paths are resolved at planning time.
 Remote destinations are not supported by the GPU writer.
 
+When DuckDB's `enable_external_access` is false, the DuckDB frontend checks the
+destination and requires an `allowed_directories` prefix covering its generated
+parts before accepting GPU export. `allowed_paths` uses exact matches; `*` does
+not authorize generated filenames. For a narrowly scoped destination, configure
+both settings before disabling external access:
+
+```sql
+SET allowed_paths = ['/tmp/output_dir'];
+SET allowed_directories = ['/tmp/output_dir'];
+SET enable_external_access = false;
+```
+
+The exact path covers DuckDB's destination check, and the directory prefix covers
+its parts. A parent-directory grant can cover both. With only exact-file grants,
+Sirius declines GPU planning and uses the existing fallback policy; DuckDB checks
+each actual output filename if it runs the statement on CPU. No DuckDB permission
+objects enter the Sirius output operator.
+
 ## Options and fallback
 
 The initial option allowlist is `FORMAT PARQUET`, `PER_THREAD_OUTPUT true`, and

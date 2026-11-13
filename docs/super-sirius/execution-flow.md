@@ -146,10 +146,10 @@ The GPU executor's manager loop:
 4. **Reserve memory** — acquires GPU memory reservation from `memory_space`
 5. **Dispatch to worker thread** — on the thread pool with a CUDA stream:
    - Lock input batches and convert to GPU if needed (`lock_or_prepare_batch`)
-   - `compute_task()`: iterate **all** operators in the pipeline (source through sink), calling `execute()` on each
+   - `compute_task()`: iterate **all** operators in the pipeline (source through sink), calling `execute_with_context()` on each (the default delegates to `execute()`; COPY requires the context for retry identity)
    - `publish_output()`: call the sink's `sink()` method to push results to downstream ports
    - On OOM: catch `oom_reschedule_exception`, retry up to 10 times with 5ms backoff
-   - On success: check if query is complete (RESULT_COLLECTOR sink + pipeline finished)
+   - On success: check if query is complete (`is_query_terminal()` sink + pipeline finished: RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE)
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`
 
