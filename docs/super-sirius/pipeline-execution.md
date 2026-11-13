@@ -17,7 +17,7 @@ operators[0] --> operators[1] --> ... --> operators[N-1]
 - `sink` is an alias for the last operator — it also has a `sink()` method called after the execute loop
 - `operators` contains **all** operators, including source and sink (unlike DuckDB where source/sink are separate from the operators list)
 
-Each operator's `execute()` method is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
+Each operator's `execute_with_context()` entry point is called in sequence by `compute_task()`; by default it delegates to `execute()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
 
 Pipelines are connected through **ports** on operators. When a sink pushes output into ports, a **task creator** monitors data availability and creates `gpu_pipeline_task` objects. These tasks are scheduled on the `gpu_pipeline_executor`, which manages GPU memory, CUDA streams, and a thread pool.
 
@@ -43,10 +43,22 @@ See [Operators](operators.md) for the complete operator reference.
 
 After pipeline finalization, `source` and `sink` are simply aliases for the first and last operator in the `operators` list. During execution:
 
-- `execute(input_data, stream)` — called on **every** operator in the pipeline by `compute_task()`
+- `execute_with_context(input_data, stream, context)` — called on **every** operator in the pipeline by `compute_task()`; ordinary operators delegate to `execute(input_data, stream)`
 - `sink(output_data, stream)` — called on the **last** operator by `publish_output()` to push results to downstream ports
 
 See [Operators](operators.md) for the complete operator reference.
+
+### Logical execution identity
+
+The GPU task invokes operators through `execute_with_context()`, whose default
+implementation delegates to `execute()`. Its Sirius-owned context distinguishes
+the current attempt ID from `(query ID, original task ID)`. Rescheduling assigns a
+new attempt ID while retaining the original task ID, including an original ID of
+zero. Side-effecting operators such as Parquet COPY use the logical identity for
+retry accounting. Two tasks may consume the same shared physical batch and must
+still count as two deliveries. Context is passed per invocation; it is not stored
+on shared operators or used as row-order metadata. Physical batch identity,
+scan receipts, and row-preserving replacement contracts are unaffected.
 
 ### Ports
 

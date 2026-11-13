@@ -24,6 +24,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "operator_execution_context.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 
@@ -734,6 +735,15 @@ class sirius_physical_operator {
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
+  // Task-aware entry point. Ordinary operators retain the existing execute API;
+  // side-effecting operators can use retry-stable logical work identity.
+  virtual std::unique_ptr<operator_data> execute_with_context(
+    operator_data const& input_data,
+    ::cuda::stream_ref stream,
+    operator_execution_context const& /*context*/)
+  {
+    return execute(input_data, stream);
+  }
 
  public:
   // Source interface

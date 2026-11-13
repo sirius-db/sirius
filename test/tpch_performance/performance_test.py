@@ -19,6 +19,7 @@ import glob
 import json
 import math
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from decimal import Decimal
 from urllib.parse import urlsplit
 
 import duckdb
+from parquet_output import copy_statements, export_metadata, compare_exports
 from queries import (
     queries_for_scale_factor,
     scale_factor_metadata_value,
@@ -913,6 +915,38 @@ def _run_one(
         profile_path = os.path.join(
             _query_dir(benchmark_dir, name, qnum), f"profile_iter{it}.json"
         )
+    if getattr(writer, "result_format", "rows") == "parquet":
+        directory = os.path.join(
+            _query_dir(benchmark_dir, name, qnum), f"parquet_iter{it}"
+        )
+        if os.path.lexists(directory):
+            raise RuntimeError(f"Export directory already exists: {directory}")
+        setup, copy_sql, cleanup = copy_statements(
+            con, query_texts[f"q{qnum}"], directory, writer.parquet_compression
+        )
+        with open(directory + ".sql", "w") as saved_sql:
+            saved_sql.write(copy_sql + "\n")
+        for statement in setup:
+            con.execute(statement)
+        try:
+            if use_gpu:
+                # Never label a CPU fallback as a GPU Parquet benchmark.
+                con.execute("SET enable_duckdb_fallback = false")
+            elapsed, rows = time_query(
+                con, qnum, copy_sql, use_gpu, profile_path=profile_path
+            )
+        finally:
+            for statement in cleanup:
+                con.execute(statement)
+        # Readback is outside query/export timing and must use the CPU reader.
+        if use_gpu:
+            con.execute("SET gpu_execution = false")
+        metadata = export_metadata(
+            con, directory, rows, writer.parquet_compression, require_gpu=use_gpu
+        )
+        log(f"  Parquet output: {metadata}")
+        writer.record(name, qnum, it, elapsed)
+        return
     elapsed, rows = time_query(
         con, qnum, query_texts[f"q{qnum}"], use_gpu, profile_path=profile_path
     )
@@ -1112,8 +1146,37 @@ RUNNERS = {
 }
 
 
+def _precmd_export_path(qdir, iteration):
+    directory = Path(qdir).absolute() / f"parquet_iter{iteration}"
+    if os.path.lexists(directory):
+        raise RuntimeError(f"Export directory already exists: {directory}")
+    return directory
+
+
+def _inspect_precmd_exports(qdir, iterations, compression):
+    # All subprocess/capture timing has ended. Read only local Parquet footers.
+    with duckdb.connect() as con:
+        for iteration in range(iterations):
+            export_metadata(
+                con,
+                Path(qdir) / f"parquet_iter{iteration}",
+                None,
+                compression,
+                require_gpu=True,
+            )
+
+
 def _build_precmd_temp_sql(
-    qnum, query_sql, source, iterations, pin, qdir, precmd, data_source="parquet"
+    qnum,
+    query_sql,
+    source,
+    iterations,
+    pin,
+    qdir,
+    precmd,
+    data_source="parquet",
+    result_format="rows",
+    parquet_compression="snappy",
 ):
     """Write the DuckDB SQL script for one external pre-command invocation.
 
@@ -1160,11 +1223,32 @@ def _build_precmd_temp_sql(
     if precmd == "nsys":
         parts.append("CALL profiler_start();")
     query_sql = query_sql.rstrip().rstrip(";") + ";"
-    for i in range(1, iterations + 1):
-        parts.append(query_sql)
-        parts.append(
-            f"INSERT INTO _timings VALUES ({i + 1}, 'iter_{i}', current_timestamp);"
-        )
+    if result_format == "parquet":
+        with duckdb.connect() as parser:
+            for i in range(1, iterations + 1):
+                directory = _precmd_export_path(qdir, i - 1)
+                setup, copy_sql, cleanup = copy_statements(
+                    parser, query_sql, directory, parquet_compression
+                )
+                Path(str(directory) + ".sql").write_text(copy_sql + "\n")
+                parts.extend(setup)
+                parts.extend(
+                    ["SET gpu_execution = true;", "SET enable_duckdb_fallback = false;"]
+                )
+                parts.append(
+                    f"INSERT INTO _timings VALUES ({2*i}, 'iter_start_{i}', current_timestamp);"
+                )
+                parts.append(copy_sql)
+                parts.append(
+                    f"INSERT INTO _timings VALUES ({2*i+1}, 'iter_{i}', current_timestamp);"
+                )
+                parts.extend(cleanup)
+    else:
+        for i in range(1, iterations + 1):
+            parts.append(query_sql)
+            parts.append(
+                f"INSERT INTO _timings VALUES ({i + 1}, 'iter_{i}', current_timestamp);"
+            )
 
     if precmd == "nsys":
         parts.append("CALL profiler_stop();")
@@ -1182,7 +1266,7 @@ def _build_precmd_temp_sql(
             extract(epoch FROM (ts - LAG(ts) OVER (ORDER BY seq))) AS runtime_s
         FROM _timings
     )
-    WHERE seq > 0
+    WHERE seq > 0 AND step NOT LIKE 'iter_start_%'
     ORDER BY seq
 ) TO '{timing_path}' (FORMAT CSV, HEADER);"""
     )
@@ -1193,7 +1277,16 @@ def _build_precmd_temp_sql(
     return sql_path
 
 
-def _run_nsys_s3_child(source, qnum, iterations, pin, qdir, query_sql):
+def _run_nsys_s3_child(
+    source,
+    qnum,
+    iterations,
+    pin,
+    qdir,
+    query_sql,
+    result_format="rows",
+    parquet_compression="snappy",
+):
     """Profile S3 in Python so credentials can be bound, never written to SQL files."""
     s3_input = S3Input(source)
     con = open_connection(source, gpu_execution=True, s3_input=s3_input)
@@ -1205,10 +1298,25 @@ def _run_nsys_s3_child(source, qnum, iterations, pin, qdir, query_sql):
         runtimes = []
         con.execute("CALL profiler_start();")
         try:
-            for _ in range(iterations):
-                start = time.perf_counter()
-                con.execute(query_sql).fetchall()
-                runtimes.append(time.perf_counter() - start)
+            for iteration in range(iterations):
+                timed_sql, cleanup = query_sql, []
+                if result_format == "parquet":
+                    directory = _precmd_export_path(qdir, iteration)
+                    setup, timed_sql, cleanup = copy_statements(
+                        con, query_sql, directory, parquet_compression
+                    )
+                    Path(str(directory) + ".sql").write_text(timed_sql + "\n")
+                    for statement in setup:
+                        con.execute(statement)
+                    con.execute("SET gpu_execution = true")
+                    con.execute("SET enable_duckdb_fallback = false")
+                try:
+                    start = time.perf_counter()
+                    con.execute(timed_sql).fetchall()
+                    runtimes.append(time.perf_counter() - start)
+                finally:
+                    for statement in cleanup:
+                        con.execute(statement)
         finally:
             con.execute("CALL profiler_stop();")
         with open(os.path.join(qdir, "timings.csv"), "w", newline="") as f:
@@ -1278,6 +1386,8 @@ def run_nsys_profile(
                 qdir,
                 "nsys",
                 data_source,
+                getattr(writer, "result_format", "rows"),
+                getattr(writer, "parquet_compression", "snappy"),
             )
         nsys_output = os.path.join(qdir, "nsys")
         stdout_path = os.path.join(qdir, "nsys_stdout.txt")
@@ -1378,6 +1488,9 @@ def run_nsys_profile(
                 writer.record("sirius", qnum, it, float("nan"))
             continue
 
+        if getattr(writer, "result_format", "rows") == "parquet":
+            _inspect_precmd_exports(qdir, iterations, writer.parquet_compression)
+
         # Parse the DuckDB-emitted timings.csv (rows: views, iter_1, iter_2, ...).
         # The 'views' row is skipped; subsequent rows map to iter=0,1,...
         timing_path = os.path.join(qdir, "timings.csv")
@@ -1453,6 +1566,8 @@ def run_gdb(
             qdir,
             "gdb",
             data_source,
+            getattr(writer, "result_format", "rows"),
+            getattr(writer, "parquet_compression", "snappy"),
         )
         stdout_path = os.path.join(qdir, "gdb_stdout.txt")
 
@@ -1510,6 +1625,9 @@ def run_gdb(
             for it in range(iterations):
                 writer.record("sirius", qnum, it, float("nan"))
             continue
+
+        if getattr(writer, "result_format", "rows") == "parquet":
+            _inspect_precmd_exports(qdir, iterations, writer.parquet_compression)
 
         timing_path = os.path.join(qdir, "timings.csv")
         if not os.path.isfile(timing_path):
@@ -1750,6 +1868,17 @@ def validate(sirius_dir, duckdb_dir, queries):
 def parse_args():
     p = argparse.ArgumentParser(description="Run TPC-H performance tests")
     p.add_argument(
+        "--result-format",
+        choices=("rows", "parquet"),
+        default=os.environ.get("TPCH_RESULT_FORMAT", "rows"),
+        help="Export full results with COPY to per-iteration Parquet directories",
+    )
+    p.add_argument(
+        "--parquet-compression",
+        default=os.environ.get("TPCH_PARQUET_COMPRESSION", "snappy"),
+        help="Explicit common export codec for both engines",
+    )
+    p.add_argument(
         "--input",
         type=str,
         required=True,
@@ -1862,10 +1991,10 @@ def parse_args():
         "--validation",
         action="store_true",
         help=(
-            "After timing, validate that GPU and CPU produce matching results "
-            "by comparing the saved <engine>/q<N>/result.txt files. Byte-exact "
-            f"match first, then abs_tol={VALIDATION_ABS_TOL} on float columns "
-            "(strict equality elsewhere). Requires --engine both."
+            "After timing, compare GPU and CPU results. Row output compares result.txt "
+            f"exactly first, then abs_tol={VALIDATION_ABS_TOL} on float columns. "
+            "Parquet output requires matching schemas and exact row multisets. "
+            "Requires --engine both."
         ),
     )
     p.add_argument(
@@ -2004,7 +2133,16 @@ def main():
         )
         global PIN_COMPRESSION_PLAN_DIR
         PIN_COMPRESSION_PLAN_DIR = compression_plan_dir or None
-        _run_nsys_s3_child(source, int(qnum), int(iterations), pin, qdir, query_sql)
+        _run_nsys_s3_child(
+            source,
+            int(qnum),
+            int(iterations),
+            pin,
+            qdir,
+            query_sql,
+            os.environ.get("TPCH_RESULT_FORMAT", "rows"),
+            os.environ.get("TPCH_PARQUET_COMPRESSION", "snappy"),
+        )
         return
 
     args = parse_args()
@@ -2039,6 +2177,12 @@ def main():
     queries = parse_query_spec(args.queries)
     engine_modes = resolve_engine_modes(args.engine)
     output_root = args.output or DEFAULT_OUTPUT_ROOT
+    os.environ["TPCH_RESULT_FORMAT"] = args.result_format
+    os.environ["TPCH_PARQUET_COMPRESSION"] = args.parquet_compression
+    if args.result_format == "parquet" and args.duckdb_results:
+        raise SystemExit(
+            "--duckdb-results reuse is currently supported for text results only"
+        )
 
     if args.pin != "none" and args.engine == "cpu":
         raise SystemExit("--pin is Sirius-only; cannot be combined with --engine cpu")
@@ -2173,6 +2317,19 @@ def main():
         duckdb_results_source=duckdb_results_dir,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
+    with open(os.path.join(benchmark_dir, "result_mode.json"), "w") as result_mode:
+        json.dump(
+            {
+                "format": args.result_format,
+                "parquet_compression": args.parquet_compression,
+                "timing": (
+                    "query_and_export" if args.result_format == "parquet" else "query"
+                ),
+                "gpu_fallback_allowed": args.result_format != "parquet",
+            },
+            result_mode,
+            indent=2,
+        )
 
     # Set before any connection opens: Sirius reads SIRIUS_CONFIG_FILE at LOAD.
     if not cache_overrides:
@@ -2190,6 +2347,9 @@ def main():
 
     log(f"Source:        {source}")
     log(f"Data source:   {args.data_source}")
+    log(
+        f"Result format: {args.result_format}; Parquet codec: {args.parquet_compression}"
+    )
     log(f"Profile:       {profile_label}")
     log(f"Mode:          {args.mode or '(unset)'}")
     log(f"Iterations:    {args.iterations}")
@@ -2210,6 +2370,8 @@ def main():
     drop_os_cache(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = RuntimeCsv(csv.writer(f), len(queries))
+        writer.result_format = args.result_format
+        writer.parquet_compression = args.parquet_compression
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
         f.flush()
         if precmd == "nsys":
@@ -2270,9 +2432,23 @@ def main():
         duckdb_dir_for_validation = duckdb_results_dir or os.path.join(
             benchmark_dir, "duckdb"
         )
-        results = validate(
-            os.path.join(benchmark_dir, "sirius"), duckdb_dir_for_validation, queries
-        )
+        if args.result_format == "parquet":
+            results = {}
+            for qnum in queries:
+                try:
+                    compare_exports(
+                        os.path.join(benchmark_dir, "sirius", f"q{qnum}"),
+                        os.path.join(duckdb_dir_for_validation, f"q{qnum}"),
+                    )
+                    results[qnum] = {"status": "success"}
+                except Exception as exc:
+                    results[qnum] = {"status": "validation", "detail": str(exc)}
+        else:
+            results = validate(
+                os.path.join(benchmark_dir, "sirius"),
+                duckdb_dir_for_validation,
+                queries,
+            )
         validation_csv = os.path.join(benchmark_dir, "validation.csv")
         with open(validation_csv, "w", newline="") as f:
             csv_writer = csv.writer(f)

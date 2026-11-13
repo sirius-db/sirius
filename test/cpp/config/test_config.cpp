@@ -891,3 +891,17 @@ TEST_CASE("multi-partition dynamic-filter byte budgets reject zero and negative 
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("Parquet output configuration validates codec and unknown options without hardware",
+          "[config_opt][parquet_export_config]")
+{
+  auto defaults = parsed_sirius_config::from_node(YAML::Load("sirius: {}"));
+  CHECK(defaults.parquet_output_compression() == output::parquet_compression::snappy);
+  auto configured =
+    parsed_sirius_config::from_node(YAML::Load("sirius: {output: {parquet: {compression: zstd}}}"));
+  CHECK(configured.parquet_output_compression() == output::parquet_compression::zstd);
+  REQUIRE_THROWS(parsed_sirius_config::from_node(
+    YAML::Load("sirius: {output: {parquet: {compression: imaginary}}}")));
+  REQUIRE_THROWS(
+    parsed_sirius_config::from_node(YAML::Load("sirius: {output: {parquet: {file_size: 10}}}")));
+}

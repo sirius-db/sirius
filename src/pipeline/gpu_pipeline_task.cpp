@@ -263,11 +263,12 @@ std::unique_ptr<op::operator_data> run_one_operator(
   const op::operator_data& operator_input_data,
   ::cuda::stream_ref stream,
   const sirius_pipeline* pipeline,
-  uint64_t task_id,
+  operator_execution_context const& execution_context,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator,
   cucascade::memory::memory_space const* host_staging_space)
 {
+  auto const task_id = execution_context.attempt_id;
   log_operator_data(op, operator_input_data, pipeline, task_id, "executing on");
 
   auto nvtx_label = std::format(
@@ -281,7 +282,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   try {
     materialized = materialize_deferred_input(op, operator_input_data, stream, host_staging_space);
     auto const& effective_input = materialized ? *materialized : operator_input_data;
-    operator_output_data        = op.execute(effective_input, stream);
+    operator_output_data = op.execute_with_context(effective_input, stream, execution_context);
   } catch (const std::exception& ex) {
     // Both the original input and any restored deferred input are still alive here. Quiesce the
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
@@ -455,6 +456,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
   if (not pipeline) { throw std::invalid_argument("task global state has null pipeline"); }
+  operator_execution_context const execution_context{
+    value_of(pipeline->get_query_id()), get_task_id(), local_state.original_task_id};
   auto operators   = pipeline->get_operators();
   auto start_index = local_state._start_operator_index;
 
@@ -525,7 +528,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         *operator_input_output_data,
         stream,
         pipeline,
-        _task_id,
+        execution_context,
         operators.size(),
         _allocator,
         _global_state->cast<gpu_pipeline_task_global_state>().get_host_staging_space());

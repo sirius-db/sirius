@@ -2531,8 +2531,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalTopN>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE:
-      throw duckdb::NotImplementedException("Copy to file not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
+      plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
       plan = create_plan(op.Cast<duckdb::LogicalDummyScan>());

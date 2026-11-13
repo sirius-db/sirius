@@ -1801,7 +1801,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     statement_type =
       prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
   }
-  if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
+  if (statement_type != StatementType::SELECT_STATEMENT &&
+      statement_type != StatementType::COPY_STATEMENT) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -1917,12 +1920,13 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // directly and consumes it; we then re-plan from `unbound_statement` for
     // the actual execution path. PhysicalSiriusExecution falls back to
     // re-planning per execute when its `logical_plan_` is null.
-    auto planner = conn_state
-                     ? std::make_unique<sirius::planner::sirius_physical_plan_generator>(
+    auto planner                = conn_state
+                                    ? std::make_unique<sirius::planner::sirius_physical_plan_generator>(
                          context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
-                     : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
+                                    : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
+    planner->copy_statement_sql = current_query_sql;
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
@@ -1977,9 +1981,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // PreparedStatementData. On a runtime GPU failure PhysicalSiriusExecution runs
     // it on a private Executor in the same transaction. It's collector-free here —
     // exactly what GetResultCollector expects at execute time.
-    auto cpu_fallback   = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
-    cpu_fallback->types = prepared.types;
-    cpu_fallback->names = prepared.names;
+    auto cpu_fallback           = make_shared_ptr<PreparedStatementData>(statement_type);
+    cpu_fallback->types         = prepared.types;
+    cpu_fallback->names         = prepared.names;
     cpu_fallback->properties    = prepared.properties;
     cpu_fallback->physical_plan = std::move(prepared.physical_plan);
 
@@ -2062,9 +2066,11 @@ RebindQueryInfo SiriusContext::OnRebindPreparedStatement(ClientContext& context,
   // Bind parameter values before GPU planning, including values whose types match
   // the cached CPU plan and therefore do not trigger DuckDB's own rebind.
   Value enabled;
-  if (prepared.statement_type == StatementType::SELECT_STATEMENT && !prepared.value_map.empty() &&
-      is_initialized_ && context.TryGetCurrentSetting("gpu_execution", enabled) &&
-      !enabled.IsNull() && enabled.GetValue<bool>()) {
+  if ((prepared.statement_type == StatementType::SELECT_STATEMENT ||
+       prepared.statement_type == StatementType::COPY_STATEMENT) &&
+      !prepared.value_map.empty() && is_initialized_ &&
+      context.TryGetCurrentSetting("gpu_execution", enabled) && !enabled.IsNull() &&
+      enabled.GetValue<bool>()) {
     return RebindQueryInfo::ATTEMPT_TO_REBIND;
   }
   // Only Sirius-backed statements need an extra rebind to recheck GPU eligibility
