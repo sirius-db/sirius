@@ -56,6 +56,7 @@ struct merge_sort_counters {
   std::size_t intermediate_tasks{0};   ///< of those, the tasks that wrote an intermediate run
   std::size_t mergers_built{0};        ///< windowed mergers constructed
   merge::merge_round_stats rounds;     ///< merge counters summed over the committed tasks
+  std::size_t shrinks{0};  ///< windowed inputs that shrank their window for an OOM retry
 };
 
 /**

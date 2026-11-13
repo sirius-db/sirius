@@ -113,6 +113,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
+    test/cpp/integration/test_gpu_execution_copy_discard.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
@@ -260,6 +261,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_gpu_values.cpp
     test/cpp/operator/test_output_order.cpp
     test/cpp/operator/test_physical_limit.cpp
+    test/cpp/operator/test_physical_discard_sink.cpp
     test/cpp/operator/test_physical_mark_join.cpp
     test/cpp/operator/test_physical_single_join.cpp
     test/cpp/operator/test_physical_mixed_filter_join.cpp
@@ -279,6 +281,8 @@ set(TEST_SOURCES
     test/cpp/operator/merge/test_merge_sort_continuation.cpp
     test/cpp/operator/merge/test_merge_sort_faults.cpp
     test/cpp/operator/merge/test_windowed_merge_compressed.cpp
+    test/cpp/operator/merge/test_merger_stats.cpp
+    test/cpp/operator/merge/test_merge_sort_stats_log.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
@@ -313,6 +317,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
+    test/cpp/planner/test_discard_copy_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
     test/cpp/planner/test_join_implied_filters.cpp
@@ -402,6 +407,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sirius_extension/test_sirius_generate.cpp
+    test/cpp/sirius_extension/test_discard_copy_function.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp

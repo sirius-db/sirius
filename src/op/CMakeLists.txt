@@ -12,6 +12,7 @@ target_sources(
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           merge/merge_config.cpp
+          merge/merge_sort_stats_log.cpp
           merge/windowed_merge_input.cpp
           merge/detail/run_fallback.cpp
           merge/bounded_kway_merge.cu
@@ -21,6 +22,7 @@ target_sources(
           merge/detail/kway_tile_merge.cu
           merge/detail/kway_gather.cu
           merge/detail/window_buffer.cu
+          discard_copy_function.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
           partition/partition_exchange.cpp
@@ -103,6 +105,7 @@ target_sources(
           sirius_physical_partition.cpp
           sirius_physical_partition_consumer_operator.cpp
           sirius_physical_passthrough_sink.cpp
+          sirius_physical_discard_sink.cpp
           sirius_physical_projection.cpp
           sirius_physical_replicate.cpp
           sirius_physical_result_collector.cpp

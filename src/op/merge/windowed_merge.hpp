@@ -120,7 +120,42 @@ struct merge_round_stats {
   std::size_t window_growths{0};        ///< times a window buffer grew its STRING slots
   std::size_t compacted_rows{0};        ///< buffered rows copied to the front before a refill
   std::size_t fallback_conversions{0};  ///< batches converted whole to the GPU tier
+  std::size_t refill_bytes_host{0};     ///< of refill_bytes, read from HOST (uncompressed) runs
+  std::size_t refill_bytes_disk{0};     ///< of refill_bytes, read from DISK (uncompressed) runs
+  /// Of refill_bytes, read from compressed runs (device, host or disk).
+  std::size_t refill_bytes_compressed{0};
+  /// Runs whose window was filled from a compressed batch at least once.
+  std::size_t runs_read_compressed{0};
+  std::size_t round_rows_min{0};  ///< smallest rows emitted by one round (0 = no round yet)
+  std::size_t round_rows_max{0};  ///< largest rows emitted by one round
 };
+
+/**
+ * @brief Add the counters of @p from to @p into.
+ *
+ * Every counter is summed, except round_rows_min / round_rows_max, which take the minimum and
+ * the maximum of the two (a round_rows_min of 0 means "no round yet" and never wins).
+ */
+inline void accumulate(merge_round_stats& into, const merge_round_stats& from) noexcept
+{
+  into.rounds += from.rounds;
+  into.rows_out += from.rows_out;
+  into.refill_rows += from.refill_rows;
+  into.refill_bytes += from.refill_bytes;
+  into.refill_truncated += from.refill_truncated;
+  into.window_growths += from.window_growths;
+  into.compacted_rows += from.compacted_rows;
+  into.fallback_conversions += from.fallback_conversions;
+  into.refill_bytes_host += from.refill_bytes_host;
+  into.refill_bytes_disk += from.refill_bytes_disk;
+  into.refill_bytes_compressed += from.refill_bytes_compressed;
+  into.runs_read_compressed += from.runs_read_compressed;
+  if (from.round_rows_min != 0 &&
+      (into.round_rows_min == 0 || from.round_rows_min < into.round_rows_min)) {
+    into.round_rows_min = from.round_rows_min;
+  }
+  if (from.round_rows_max > into.round_rows_max) { into.round_rows_max = from.round_rows_max; }
+}
 
 /// Signature of bounded_kway_merge; lets tests substitute the merge kernel.
 using bounded_merge_fn = std::function<bounded_merge_result(std::span<const cudf::table_view>,

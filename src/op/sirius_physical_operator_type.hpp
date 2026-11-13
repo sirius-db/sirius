@@ -141,6 +141,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   PARTITION,
   CONCAT,
   PASSTHROUGH_SINK,
+  DISCARD_SINK,
   MERGE_SORT,
   MERGE_GROUP_BY,
   MERGE_TOP_N,
