@@ -136,16 +136,13 @@ void exchange_service::abort(distributed_query_id query, std::string const& what
 
 bool exchange_service::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
-  {
-    std::lock_guard lock{_mutex};
-    if (!_transport) { return true; }
-  }
-  return _transport->wait_sent(query, timeout);
+  auto const running = running_transport();
+  return !running || running->wait_sent(query, timeout);
 }
 
 void exchange_service::shutdown()
 {
-  std::unique_ptr<transport> stopped;
+  std::shared_ptr<transport> stopped;
   {
     std::lock_guard lock{_mutex};
     if (!_error) {
@@ -157,8 +154,9 @@ void exchange_service::shutdown()
     _held.clear();
     _receivers.clear();
   }
-  // Outside the lock: the engine thread calls back into this service until it is joined.
-  stopped.reset();
+  // Outside the lock: the engine thread calls back into this service until it is joined. A
+  // sender still inside the transport wakes, and holds it until it returns.
+  if (stopped) { stopped->stop(); }
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)
@@ -197,6 +195,7 @@ void exchange_service::send(stream_id stream,
                             rank_t to,
                             std::shared_ptr<cucascade::data_batch> batch)
 {
+  std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
     if (_error) { std::rethrow_exception(_error); }
@@ -205,8 +204,9 @@ void exchange_service::send(stream_id stream,
     if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
       std::rethrow_exception(it->second);
     }
+    running = _transport;
   }
-  _transport->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch));
   // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
   // fails like one that started after the abort.
   std::lock_guard lock{_mutex};
@@ -219,7 +219,13 @@ void exchange_service::send(stream_id stream,
 void exchange_service::close(stream_id stream, rank_t to)
 {
   throw_if_failed();
-  _transport->close(stream, to);
+  if (auto const running = running_transport()) { running->close(stream, to); }
+}
+
+std::shared_ptr<transport> exchange_service::running_transport()
+{
+  std::lock_guard lock{_mutex};
+  return _transport;
 }
 
 void exchange_service::throw_if_failed()
