@@ -110,6 +110,8 @@ class preparation_coordinator {
   void before_submission_for_testing(std::function<void()>);
   void before_publication_for_testing(std::function<void()>);
   void before_control_wait_for_testing(std::function<void()>);
+  // Runs outside the gate, before each bounded control/retirement turn.
+  void before_control_step_for_testing(std::function<void()>);
   void fail_next_batch_enqueue_for_testing();
   void after_publication_for_testing(
     std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)>);

@@ -1139,3 +1139,19 @@ The query dispatcher alternates pending metadata and coalescing work when both a
 Running metadata I/O is not preempted: a domain whose workers are all blocked on reads can
 still delay coalescing. No worker waits for another job in the pool. Trace logs report
 coalescing queue and execution duration; storage/concurrency qualification must check both.
+
+Thread counts are separate budgets. `scan_manager.num_threads` counts only the shared
+metadata/coalescing workers. Asynchronous Parquet/Iceberg attempts additionally use the
+manager's `preparation.coordinator_workers` control pool (one worker by default, started
+lazily). Setting that value to zero instead starts one coordinator thread per asynchronous
+or reader attempt. Native reads use their own `preparation.native_reader_workers` pool
+(two workers by default, started lazily). Each uring or REST reactor is another worker;
+reactor counts are per IO context. These workers are additional to pipeline, task-creator
+and downgrade threads. The automatic metadata-worker sizing formula reserves the default
+pipeline, task-creator, downgrade and uring workers; it is not a total process thread cap
+and does not subtract coordinator, native-reader or additional IO-context workers.
+
+Completed coalescing operations are consumed in rotating source order, with at most one
+completion per control turn. This prevents a repeatedly ready first source from bypassing
+later ready sources. Shared admission can still delay work before an idle domain worker
+receives it; class alternation and rotating consumption provide no wall-clock latency bound.

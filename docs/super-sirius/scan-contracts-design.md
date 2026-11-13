@@ -303,9 +303,16 @@ the existing admission gate. A pending operation reserves that source's next emi
 Partial-batch deadlines schedule work rather than directly invoking the coalescer. Cancellation
 closes publication immediately; running operations finish before the dispatcher reports drain.
 Queued operations may be discarded. Source close and cleanup occur only after dispatcher drain,
-so input metadata and coalescer dependencies outlive all accepted work. A coalescer exception
-reaches the existing query failure path. Cancellation does not preempt an in-progress library call.
+so input metadata and coalescer dependencies outlive all accepted work. Workers report coalescer
+exceptions outside the publication gate before completing their dispatcher work, including when
+normal EOS has closed the gate and no controller will consume the result. Routed pool-submission
+failures likewise reach query completion before pending work is discarded or final dispatcher
+drain is observable. The first query error wins. Cancellation does not preempt an in-progress
+library call.
 
 Workers have permanent NUMA-domain assignments. Sources retain their selected domain for both
 metadata and coalescing, and the dispatcher fairly selects the two work classes without executing
-callbacks on the submitting coordinator. See configuration for CPU allowance and fallback rules.
+callbacks on the submitting coordinator. Completed operations are consumed in rotating source
+order, at most one per control turn; a repeatedly ready source cannot continually bypass another
+ready completion. These policies do not preempt running reads or bound shared admission delay.
+See configuration for CPU allowance, fallback rules and separate worker-thread budgets.

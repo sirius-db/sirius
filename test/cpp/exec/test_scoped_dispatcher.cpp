@@ -369,3 +369,74 @@ TEST_CASE("coalescing bypasses metadata backlog without starving metadata", "[sc
   for (size_t i = 0; i < order.size(); ++i)
     CHECK(order[i] == (i % 2 ? 'm' : 'c'));
 }
+
+TEST_CASE("routed handoff reports its original failure before disposal and final drain",
+          "[scoped_dispatcher][review_regression]")
+{
+  using namespace sirius::exec;
+  bool coalescing = GENERATE(false, true);
+  auto allowed    = thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  static_thread_pool pool(1, "handoff_failure", {}, nullptr, {{allowed.front()}});
+  scoped_dispatcher dispatcher(pool, 1);
+  std::promise<void> entered, release, reporting, release_report, notification;
+  auto released      = release.get_future();
+  auto reported      = reporting.get_future();
+  auto finish_report = release_report.get_future();
+  auto notified      = notification.get_future();
+  std::exception_ptr original;
+  unsigned disposed = 0, executed = 0, reports = 0;
+  bool pending_saw_original = false, reentered = false;
+  dispatcher.set_submission_error_callback([&](auto error) {
+    original = error;
+    ++reports;
+    // Error delivery may stop the dispatcher and dispose other accepted work.
+    // Reentering here must be safe, and the original error must already be saved.
+    dispatcher.request_stop();
+    reentered = true;
+    reporting.set_value();
+    finish_report.wait();
+  });
+  dispatcher.set_stop_drain_callback([&] {
+    dispatcher.wait_for_all();
+    notification.set_value();
+  });
+  dispatcher.enqueue(
+    [&] {
+      entered.set_value();
+      released.wait();
+      pool.stop();
+    },
+    0);
+  entered.get_future().wait();
+  for (int i = 0; i < 2; ++i) {
+    auto capture = std::shared_ptr<int>(new int(i), [&](int* value) {
+      if (*value == 1) pending_saw_original = bool(original);
+      delete value;
+      ++disposed;
+      // Capture destruction can reenter both the pool and dispatcher.
+      pool.stop();
+      dispatcher.enqueue([] {});
+    });
+    dispatcher.enqueue([&, capture = std::move(capture)] { ++executed; }, 0, coalescing);
+  }
+  release.set_value();
+  auto const report_status = reported.wait_for(std::chrono::seconds(2));
+  // Always release a held callback before an assertion can leave this scope.
+  auto drain               = std::async(std::launch::async, [&] { dispatcher.wait_for_all(); });
+  auto drain_status        = drain.wait_for(std::chrono::milliseconds(20));
+  auto notification_status = notified.wait_for(std::chrono::milliseconds(0));
+  release_report.set_value();
+  drain.get();
+  REQUIRE(report_status == std::future_status::ready);
+  CHECK(drain_status == std::future_status::timeout);
+  CHECK(notification_status == std::future_status::timeout);
+  REQUIRE(notified.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  REQUIRE(original);
+  CHECK_THROWS_WITH(std::rethrow_exception(original), "thread pool is stopped");
+  CHECK(reports == 1);
+  CHECK(pending_saw_original);
+  CHECK(reentered);
+  CHECK(disposed == 2);
+  CHECK(executed == 0);
+}
