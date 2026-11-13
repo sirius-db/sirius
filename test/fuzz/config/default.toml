@@ -77,6 +77,7 @@ try = false
 [features.casts]
 enabled = true
 temporal_numeric = false  # declined in translate_cast
+float_to_int = false      # 83b0c0ed: FLOAT -> BIGINT rounds negative half values differently
 to_varchar = false        # runs on the GPU, but number formatting differs from DuckDB (mismatches)
 targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
 

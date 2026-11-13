@@ -80,6 +80,23 @@ def run_batch(cfg, n, seed):
     return ok, errors, qg.stats
 
 
+class Phase2cQuarantine(unittest.TestCase):
+    def test_float_to_integer_cast_is_gap_only(self):
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.query_gen import Scope, ScopeTable
+
+        for enabled in (False, True):
+            cfg = load_config(None, [f"features.casts.float_to_int={str(enabled).lower()}"])
+            dg = DataGenerator(cfg, random.Random(7))
+            ds = dg.generate(7)
+            qg = QueryGenerator(cfg, ds, random.Random(7), dg)
+            qg.cast_targets = [st.BIGINT]
+            scope = Scope([ScopeTable("t", [ColumnRef("t", "f", st.FLOAT)])])
+            casts = [qg._gen_cast("int", scope, 0) for _ in range(200)]
+            seen_float = any(c.child.kind == "float" for c in casts)
+            self.assertEqual(seen_float, enabled)
+
+
 class Phase2bShapes(unittest.TestCase):
     def generated(self, overrides, count=1200):
         cfg = load_config(None, overrides)

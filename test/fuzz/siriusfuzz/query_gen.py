@@ -1173,6 +1173,9 @@ class QueryGenerator:
             "bool": ["int"],
         }
         src_kinds = list(sources.get(kind, []))
+        if kind == "int" and not self.f.casts.float_to_int:
+            # 83b0c0ed: one-expression FLOAT -> BIGINT differs on negative half values.
+            src_kinds.remove("float")
         if self.f.casts.temporal_numeric and kind in ("int", "float"):
             src_kinds += ["date", "timestamp"]
         if self.f.expressions.try_ and kind in ("int", "float", "decimal"):

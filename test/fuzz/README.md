@@ -184,6 +184,8 @@ grouping, and window keys. `features.float_exact_keys` restores those shapes in 
 the known last-bit rounding issue stays measurable. `EXCEPT ALL` and `INTERSECT ALL` exclude
 floating-point keys because Sirius does not admit those keys for the `ALL` forms.
 
+**Phase 2c cast quarantine.** `features.casts.float_to_int` is off by default and on in gaps mode. A one-expression `CAST(FLOAT AS BIGINT)` check differs at negative half values (signature `83b0c0ed`), so default runs do not emit those casts.
+
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
 otherwise the configuration's `sirius.configs` applies (by default the integration YAML and
 `config/partition16k.yaml`, whose 16 KiB budgets split the small fuzz tables into several hash

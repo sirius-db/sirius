@@ -150,6 +150,7 @@ class Expressions:
 class Casts:
     enabled: bool = True
     temporal_numeric: bool = gap_switch(False)
+    float_to_int: bool = gap_switch(False)  # 83b0c0ed: FLOAT -> BIGINT rounds differently
     to_varchar: bool = False  # runs on the GPU; number formatting differs (mismatches)
     targets: list[str] = field(
         default_factory=lambda: ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
