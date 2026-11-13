@@ -461,3 +461,36 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   CHECK(runtime->get_config().get_operator_params().max_build_probe_resident_bytes ==
         default_budget);
 }
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "build fold policy reaches the planned hash join and stays connection-local",
+                 "[config][query_options][build_fold][isolated_context]")
+{
+  Connection other(*db);
+  auto execute = [](Connection& connection, const char* sql) {
+    auto result = connection.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto planned_policy = [](Connection& connection) {
+    auto plan = generate_sirius_plan(
+      connection, "SELECT l.val, r.other FROM big_left l JOIN small_right r ON l.id = r.rid");
+    REQUIRE(plan);
+    auto* join = find_hash_join(plan.get());
+    REQUIRE(join);
+    return join->build_fold_policy;
+  };
+  using sirius::op::build_fold_policy;
+
+  CHECK(planned_policy(*con) == build_fold_policy::legacy_filter_coupled);
+  execute(*con, "SET build_fold_policy = 'never'");
+  CHECK(planned_policy(*con) == build_fold_policy::never);
+  CHECK(planned_policy(other) == build_fold_policy::legacy_filter_coupled);
+  execute(other, "SET build_fold_policy = 'bounded'");
+  CHECK(planned_policy(other) == build_fold_policy::bounded);
+  CHECK(planned_policy(*con) == build_fold_policy::never);
+  execute(*con, "RESET build_fold_policy");
+  CHECK(planned_policy(*con) == build_fold_policy::legacy_filter_coupled);
+  execute(other, "RESET build_fold_policy");
+}

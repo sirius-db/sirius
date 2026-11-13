@@ -97,6 +97,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   join->mark_join_build_switch_ratio   = params.mark_join_build_switch_ratio;
   join->runtime_distinct_build_probe   = params.enable_runtime_distinct_build_probe;
   join->max_build_probe_resident_bytes = params.max_build_probe_resident_bytes;
+  join->build_fold_policy              = params.build_fold_policy;
   return join;
 }
 

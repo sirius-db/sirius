@@ -16,8 +16,10 @@
 
 #include "op/partition/consumer_partition_policy.hpp"
 
+#include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/hash_join_partition_observer.hpp"
+#include "op/partition/build_fold.hpp"
 #include "op/partition/partition_exchange.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
@@ -28,6 +30,7 @@
 #include "sirius/exception.hpp"
 
 #include <algorithm>
+#include <string>
 
 namespace sirius::op {
 namespace {
@@ -43,6 +46,26 @@ void install_placement(sirius_physical_partition_consumer_operator& consumer,
     }
   }
   consumer.set_placement(std::make_shared<partition_placement const>(strategy.placement));
+}
+
+/// One `[build_fold]` line per decision, so measurements can be attributed to each join's fold.
+void log_build_fold(sirius_physical_hash_join const& join,
+                    build_fold_inputs const& inputs,
+                    bool publishes_filters,
+                    bool fold)
+{
+  SIRIUS_LOG_DEBUG(
+    "[build_fold] v=1 sig={:016x} join={} policy={} mode={} rows={} resident_bytes={} "
+    "concat_batch_bytes={} publishes_filters={} fold={}",
+    join.dynamic_filter_signature,
+    join.get_operator_id(),
+    to_string(join.build_fold_policy),
+    inputs.mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN" : "STANDARD",
+    inputs.rows ? std::to_string(*inputs.rows) : std::string{"-"},
+    inputs.resident_bytes,
+    inputs.concat_batch_bytes,
+    publishes_filters,
+    fold);
 }
 
 std::vector<partition_layout> hash_layouts(
@@ -81,13 +104,21 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
       if (strategy.build_probe) {
         if (!build_concat) { throw std::logic_error("BUILD_PROBE requires a bound build CONCAT"); }
         build_concat->set_concat_all(true);
-      } else if (!empty && in.is_build_side && strategy.num_partitions == 1 &&
-                 join.publishes_dynamic_filters() &&
-                 in.resident_bytes.value_or(in.total_bytes) < join.max_build_probe_resident_bytes &&
-                 in.measured_rows &&
-                 *in.measured_rows <=
-                   static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max())) {
-        if (build_concat) { build_concat->set_concat_all(true); }
+      } else if (build_concat != nullptr && !empty && in.is_build_side &&
+                 strategy.num_partitions == 1) {
+        build_fold_inputs const inputs{.rows           = in.measured_rows,
+                                       .resident_bytes = in.resident_bytes.value_or(in.total_bytes),
+                                       .concat_batch_bytes = build_concat->concat_batch_bytes(),
+                                       .num_gpus           = join.num_gpus(),
+                                       .mode               = join.join_mode()};
+        bool const publishes_filters = join.publishes_dynamic_filters();
+        bool const fold =
+          decide_build_fold(inputs,
+                            {.max_resident_bytes = join.max_build_probe_resident_bytes},
+                            join.build_fold_policy,
+                            publishes_filters);
+        log_build_fold(join, inputs, publishes_filters, fold);
+        if (fold) { build_concat->set_concat_all(true); }
       }
       install_placement(join, strategy);
       if (strategy.broadcast) {
