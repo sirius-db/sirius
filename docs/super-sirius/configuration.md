@@ -502,7 +502,7 @@ so staging is proportional to the device work in flight.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_connections` | int (**1..4096**) | 64 | Keep-alive connections per reactor (one in-flight request each), not a process-wide cap. Past the point where the link is full, more connections only split the bandwidth into thinner streams; add reactors (`rest_n_reactors`) instead. |
-| `conn_max_age_s` | int (seconds, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the per-bucket rate limit of the query-start warm-up (60 s when `0`). `0` = no idle cutoff. |
+| `conn_max_age_s` | int (seconds, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the window in which the query-start warm-up skips a repeat of the bucket it warmed last (60 s when `0`). `0` = no idle cutoff. |
 | `upkeep_http1` | bool | false | Send idle upkeep: while a reactor is idle, one zero-key `ListObjectsV2` per established connection every `upkeep_interval_ms`, staggered across the interval, so the endpoint does not idle-close the pool. Off by default, as libcurl's upkeep is a no-op on HTTP/1.1. |
 | `upkeep_interval_ms` | int (ms, **>= 0**) | 15000 | Upkeep period; only acts with `upkeep_http1`. `0` disables upkeep. |
 | `connect_timeout_ms` | int (ms, **> 0**) | 3000 | Bound of one connection's TCP connect plus TLS handshake (curl's `CONNECTTIMEOUT`). |
@@ -519,10 +519,12 @@ so staging is proportional to the device work in flight.
 At query start Sirius warms the REST pool of each bucket the query reads: every reactor
 sends one zero-key `ListObjectsV2` (`list-type=2&max-keys=0`) per idle connection slot,
 each on a fresh connection, so TCP, TLS and HTTP are validated and the pool is hot before
-the reads arrive. Warm-up runs at most once per `conn_max_age_s` per bucket; its
-failures are logged at debug level and never fail a read. Nothing else is sent while
-idle unless `upkeep_http1` is on, and nothing reconnects en masse (not after warm-up,
-not at a query's end, not on a DNS refresh).
+the reads arrive. The suppression remembers only the last bucket warmed per REST context
+(one per resolved object-store configuration, so buckets that share credentials and endpoint
+share it): a repeat of that bucket within `conn_max_age_s` is skipped, but alternating buckets
+A, B, A warms A again. Warm-up failures are logged at debug level and never fail a read.
+Nothing else is sent while idle unless `upkeep_http1` is on, and nothing reconnects en masse
+(not after warm-up, not at a query's end, not on a DNS refresh).
 
 `min_mtu` exists for jumbo-frame networks, where some connections of a pool may
 negotiate small TCP segments, which costs per-byte decryption time. Right after the TCP
