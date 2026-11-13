@@ -31,8 +31,8 @@ TEST_CASE("Parquet parts are visible before export completion", "[parquet_export
   temporary_directory root;
   auto target = root.path / "result";
   parquet_session session({.directory = target});
-  session.write({1}, 42, {3, 4}, writer);
-  session.write({2}, 2, {5}, writer);
+  session.write({0, 1}, 42, {3, 4}, writer);
+  session.write({0, 2}, 2, {5}, writer);
   REQUIRE(std::filesystem::is_directory(target));
   REQUIRE(std::distance(std::filesystem::directory_iterator(target),
                         std::filesystem::directory_iterator{}) == 3);
@@ -49,14 +49,14 @@ TEST_CASE("Parquet retries neither retain partial parts nor duplicate committed 
 {
   temporary_directory root;
   parquet_session session({.directory = root.path / "result"});
-  REQUIRE_THROWS(session.write({1}, 7, {2, 3}, [](auto i, auto const& path) {
+  REQUIRE_THROWS(session.write({0, 1}, 7, {2, 3}, [](auto i, auto const& path) {
     writer(i, path);
     if (i == 1) throw std::runtime_error("encoder failed");
   }));
   REQUIRE(std::filesystem::is_empty(root.path / "result"));
-  session.write({1}, 7, {2, 3}, writer);
-  session.write({1}, 7, {2, 3}, writer);
-  REQUIRE_THROWS(session.write({1}, 7, {2}, writer));
+  session.write({0, 1}, 7, {2, 3}, writer);
+  session.write({0, 1}, 7, {2, 3}, writer);
+  REQUIRE_THROWS(session.write({0, 1}, 7, {2}, writer));
   auto result = session.finish(writer);
   REQUIRE(result.rows == 5);
   REQUIRE(result.files == 2);
@@ -67,9 +67,9 @@ TEST_CASE("Parquet ordering mode ignores empty inputs and rejects mixed or dupli
   temporary_directory root;
   parquet_session session({.directory = root.path / "result"});
   session.write({}, std::nullopt, {}, writer);
-  session.write({1}, 9, {2}, writer);
-  REQUIRE_THROWS(session.write({2}, std::nullopt, {2}, writer));
-  REQUIRE_THROWS(session.write({2}, 9, {2}, writer));
+  session.write({0, 1}, 9, {2}, writer);
+  REQUIRE_THROWS(session.write({0, 2}, std::nullopt, {2}, writer));
+  REQUIRE_THROWS(session.write({0, 2}, 9, {2}, writer));
   session.abort();
   REQUIRE(std::filesystem::is_empty(root.path));
 }
@@ -79,7 +79,7 @@ TEST_CASE("Parquet cleanup preserves files created by another writer during exec
   temporary_directory root;
   auto target = root.path / "result";
   parquet_session session({.directory = target});
-  session.write({1}, std::nullopt, {2}, writer);
+  session.write({0, 1}, std::nullopt, {2}, writer);
   auto foreign = target / "another-writer.txt";
   std::ofstream(foreign) << "preserve";
   session.abort();
@@ -93,7 +93,7 @@ TEST_CASE("Concurrent unordered Parquet producers get unique parts", "[parquet_e
   parquet_session session({.directory = root.path / "result"});
   std::vector<std::thread> producers;
   for (std::uint64_t i = 0; i < 32; ++i)
-    producers.emplace_back([&, i] { session.write({i}, std::nullopt, {1, 1}, writer); });
+    producers.emplace_back([&, i] { session.write({0, i}, std::nullopt, {1, 1}, writer); });
   for (auto& t : producers)
     t.join();
   auto result = session.finish(writer);
@@ -115,7 +115,7 @@ TEST_CASE("Failed Parquet completion preparation cleans up already visible parts
   temporary_directory root;
   auto target = root.path / "result";
   parquet_session session({.directory = target});
-  session.write({1}, std::nullopt, {1}, writer);
+  session.write({0, 1}, std::nullopt, {1}, writer);
   REQUIRE_THROWS(session.finish(writer, [](auto const&) { throw std::bad_alloc(); }));
   REQUIRE_FALSE(std::filesystem::is_empty(target));
   session.abort();
@@ -138,7 +138,7 @@ TEST_CASE("Parquet export accepts an existing directory tree without files",
   std::filesystem::create_directories(target / "empty-subdirectory");
   {
     parquet_session session({.directory = target});
-    session.write({1}, std::nullopt, {2}, writer);
+    session.write({0, 1}, std::nullopt, {2}, writer);
     REQUIRE(session.finish(writer).rows == 2);
   }
   REQUIRE(std::filesystem::is_directory(target / "empty-subdirectory"));
@@ -152,8 +152,8 @@ TEST_CASE("Parquet abort preserves preexisting empty directories", "[parquet_exp
   std::filesystem::create_directories(target / "empty-subdirectory");
   {
     parquet_session session({.directory = target});
-    session.write({1}, std::nullopt, {2}, writer);
-    REQUIRE_THROWS(session.write({2}, std::nullopt, {2}, [](auto i, auto const& path) {
+    session.write({0, 1}, std::nullopt, {2}, writer);
+    REQUIRE_THROWS(session.write({0, 2}, std::nullopt, {2}, [](auto i, auto const& path) {
       writer(i, path);
       throw std::runtime_error("encoder failed");
     }));
@@ -174,7 +174,7 @@ TEST_CASE("Parquet rejects existing files including files in nested directories"
   std::ofstream(original) << "preserve";
   {
     parquet_session session({.directory = target});
-    REQUIRE_THROWS(session.write({1}, std::nullopt, {2}, writer));
+    REQUIRE_THROWS(session.write({0, 1}, std::nullopt, {2}, writer));
   }
   std::ifstream in(original);
   std::string value;
@@ -189,7 +189,7 @@ TEST_CASE("A Parquet filename collision preserves the competing file and cleans 
   auto target  = root.path / "result";
   auto foreign = target / "part-00000000000000000001.parquet";
   parquet_session session({.directory = target});
-  REQUIRE_THROWS(session.write({1}, std::nullopt, {1, 1}, [&](auto i, auto const& path) {
+  REQUIRE_THROWS(session.write({0, 1}, std::nullopt, {1, 1}, [&](auto i, auto const& path) {
     writer(i, path);
     if (i == 0) std::ofstream(foreign) << "competing-writer";
   }));
@@ -232,4 +232,44 @@ TEST_CASE("Parquet rejects file and symlink destinations without modifying them"
   }
   REQUIRE(std::filesystem::file_size(target) == 8);
   REQUIRE(std::filesystem::is_symlink(link));
+}
+
+TEST_CASE("Parquet retry identity follows the original task including task zero",
+          "[parquet_export][cpu]")
+{
+  temporary_directory root;
+  parquet_session session({.directory = root.path / "result"});
+  sirius::operator_execution_context first{7, 0};
+  sirius::operator_execution_context retry{7, 91, 0};
+  REQUIRE(first.logical_task == retry.logical_task);
+  REQUIRE(first.attempt_id != retry.attempt_id);
+  REQUIRE_THROWS(session.write(first.logical_task, 12, {3, 4}, [](auto i, auto const& path) {
+    writer(i, path);
+    if (i == 1) throw std::runtime_error("writer failed after one part");
+  }));
+  REQUIRE(std::filesystem::is_empty(root.path / "result"));
+  session.write(retry.logical_task, 12, {3, 4}, writer);
+  session.write(first.logical_task, 12, {3, 4}, [](auto, auto const&) {
+    FAIL("committed logical task must not be written again");
+  });
+  auto result = session.finish(writer);
+  REQUIRE(result.rows == 7);
+  REQUIRE(result.files == 2);
+}
+
+TEST_CASE("Distinct logical tasks with identical layouts are separate Parquet deliveries",
+          "[parquet_export][cpu]")
+{
+  temporary_directory root;
+  parquet_session session({.directory = root.path / "result"});
+  sirius::operator_execution_context a{7, 1};
+  sirius::operator_execution_context b{7, 2};
+  sirius::operator_execution_context other_query{8, 1};
+  REQUIRE(a.logical_task != b.logical_task);
+  REQUIRE(a.logical_task != other_query.logical_task);
+  session.write(a.logical_task, std::nullopt, {1}, writer);
+  session.write(b.logical_task, std::nullopt, {1}, writer);
+  auto result = session.finish(writer);
+  REQUIRE(result.rows == 2);
+  REQUIRE(result.files == 2);
 }

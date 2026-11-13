@@ -446,3 +446,60 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE_FALSE(next->HasError());
   REQUIRE(next->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 100);
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet export preserves repeated CTE occurrences through UNION ALL",
+                 "[parquet_export_gpu][integration][parquet_cte_multiplicity]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_cte_repeat(k VARCHAR, n INTEGER)");
+  run_ok("INSERT INTO export_cte_repeat VALUES ('42',42),('42',42),('7',7)");
+  run_ok("CHECKPOINT");
+  unsigned sequence = 0;
+  auto check_export = [&](std::string const& sql) {
+    auto target = root.path / ("cte_" + std::to_string(sequence++));
+    run_ok("SET gpu_execution=false");
+    auto cpu = con->Query(sql);
+    REQUIRE_FALSE(cpu->HasError());
+    auto expected = sirius::test::collect_rows(*cpu);
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto copied = con->Query("COPY (" + sql + ") TO " + quote(target) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    if (copied->HasError()) UNSCOPED_INFO(copied->GetError());
+    REQUIRE_FALSE(copied->HasError());
+    REQUIRE(copied->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() ==
+            static_cast<int64_t>(expected.size()));
+    run_ok("SET gpu_execution=false");
+    auto actual = con->Query("SELECT * FROM read_parquet(" + quote(target / "*.parquet") + ")");
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE(sirius::test::collect_rows(*actual) == expected);
+  };
+  for (bool compressed : {true, false}) {
+    run_ok(std::string("SET enable_compressed_materialization=") + (compressed ? "true" : "false"));
+    for (auto const* column : {"k", "n"}) {
+      for (unsigned arms : {2U, 3U}) {
+        std::string sql = std::string("WITH c AS MATERIALIZED (SELECT ") + column +
+                          " FROM export_cte_repeat) SELECT * FROM c";
+        for (unsigned arm = 1; arm < arms; ++arm)
+          sql += " UNION ALL SELECT * FROM c";
+        check_export(sql);
+      }
+    }
+  }
+  run_ok("SET sirius_test_gpu_task_retry_backoff_ms=0");
+  run_ok("SET sirius_test_inject_gpu_task_oom=2");
+  check_export("SELECT k FROM export_cte_repeat");
+  run_ok("SET sirius_test_inject_gpu_task_oom=0");
+  check_export(
+    "WITH a AS MATERIALIZED (SELECT k FROM export_cte_repeat), "
+    "b AS MATERIALIZED (SELECT * FROM a UNION ALL SELECT * FROM a) "
+    "SELECT * FROM b UNION ALL SELECT * FROM b");
+  check_export(
+    "WITH c AS MATERIALIZED (SELECT k FROM export_cte_repeat) "
+    "SELECT * FROM c UNION ALL SELECT * FROM c ORDER BY k DESC");
+  check_export(
+    "WITH c AS MATERIALIZED (SELECT k FROM export_cte_repeat WHERE false) "
+    "SELECT * FROM c UNION ALL SELECT * FROM c");
+}

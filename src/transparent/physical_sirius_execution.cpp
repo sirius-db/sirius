@@ -444,20 +444,20 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // Preserve cancellation classification before the side-effecting COPY guard.
       if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
-      // File export is side-effecting. Never replay it after a runtime failure,
-      // even when no rows have yet been returned to the client.
-      if (cpu_fallback_prepared_ &&
-          cpu_fallback_prepared_->statement_type == duckdb::StatementType::COPY_STATEMENT) {
-        throw duckdb::ExecutorException("Sirius Parquet export failed (CPU replay disabled): " +
-                                        gpu_msg);
-      }
-
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU
       // fallback either way, so propagate as-is).
       if (runtime_unavailable_error && (source_policy_.reads_sirius_owned_s3() ||
                                         sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
+      }
+
+      // File export is side-effecting. Never replay it after a runtime failure,
+      // even when no rows have yet been returned to the client.
+      if (cpu_fallback_prepared_ &&
+          cpu_fallback_prepared_->statement_type == duckdb::StatementType::COPY_STATEMENT) {
+        throw duckdb::ExecutorException("Sirius Parquet export failed (CPU replay disabled): " +
+                                        gpu_msg);
       }
 
       try {
