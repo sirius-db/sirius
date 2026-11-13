@@ -160,8 +160,10 @@ std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view codes,
 /// `[keys..., aggregates..., carried...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for
 /// the parameters.
 ///
-/// A STRING key whose batch is dictionary-encoded is grouped on its INT32 codes, and its result
-/// column is decoded back to STRING.
+/// A STRING key whose batch is dictionary-encoded is grouped on its INT32 codes. Without
+/// @p encoded_keys, its result column is decoded back to STRING. With @p encoded_keys, the result
+/// column holds the codes, and `(*encoded_keys)[i]` owns the DICTIONARY32 column whose keys are the
+/// strings of key `i` (null for a key that is not encoded); see decode_key_codes().
 std::unique_ptr<cudf::table> grouped_aggregate_table(
   cudf::table_view input_table,
   const std::vector<int>& group_idx,
@@ -174,7 +176,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
   const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
   bool split_wide_integer_sums                                             = false,
-  bool enable_low_cardinality_groupby                                      = true)
+  bool enable_low_cardinality_groupby                                      = true,
+  std::vector<std::unique_ptr<cudf::column>>* encoded_keys                 = nullptr)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -615,8 +618,10 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // Decode dictionary-encoded group key columns back to STRING
   for (size_t i = 0; i < group_idx.size(); i++) {
     if (encoded_key_strings[i]) {
-      output_cols[i] =
-        decode_key_codes(output_cols[i]->view(), *encoded_key_strings[i], stream, mr);
+      if (!encoded_keys) {
+        output_cols[i] =
+          decode_key_codes(output_cols[i]->view(), *encoded_key_strings[i], stream, mr);
+      }
     } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
@@ -691,6 +696,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     }
   }
 
+  if (encoded_keys) { *encoded_keys = std::move(encoded_key_owners); }
   return std::make_unique<cudf::table>(std::move(output_cols));
 }
 
@@ -761,15 +767,25 @@ std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
 
 /// Expand the partial aggregate @p partial, grouped by all @p num_keys keys, into one block of
 /// rows per grouping set. See `gpu_aggregate_impl::local_grouping_sets_aggregate()`.
+///
+/// @p encoded_keys is empty, or has one entry per key: the DICTIONARY32 column of a key that
+/// @p partial holds as INT32 codes (see grouped_aggregate_table()), or null. Such keys are
+/// re-aggregated on their codes and decoded to STRING only in the output.
 std::unique_ptr<cudf::table> expand_grouping_sets(
   cudf::table_view partial,
   std::size_t num_keys,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<std::set<std::size_t>>& grouping_sets,
   const std::vector<std::vector<std::size_t>>& grouping_functions,
+  const std::vector<std::unique_ptr<cudf::column>>& encoded_keys,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  std::vector<std::optional<cudf::column_view>> key_strings(num_keys);
+  for (std::size_t k = 0; k < encoded_keys.size() && k < num_keys; ++k) {
+    if (encoded_keys[k]) { key_strings[k] = cudf::dictionary_column_view(*encoded_keys[k]).keys(); }
+  }
+
   std::vector<cudf::size_type> aggregate_col_ids(aggregates.size());
   std::iota(aggregate_col_ids.begin(), aggregate_col_ids.end(), static_cast<int>(num_keys));
   auto const partial_aggregates = partial.select(aggregate_col_ids);
@@ -878,6 +894,15 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
     result_cols.insert(result_cols.end(), values.begin(), values.end());
     results[set_idx] = cudf::table_view(result_cols);
 
+    // The output holds the strings of encoded keys; `results` keeps their codes.
+    for (std::size_t k = 0; k < num_keys; ++k) {
+      if (!key_strings[k]) { continue; }
+      auto strings = set.contains(k) ? decode_key_codes(keys[k], *key_strings[k], stream, mr)
+                                     : make_null_column(*key_strings[k], num_rows, stream, mr);
+      keys[k]      = strings->view();
+      owner.push_back(std::move(strings));
+    }
+
     std::vector<cudf::column_view> cols;
     cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
     cols.assign(keys.begin(), keys.end());
@@ -952,6 +977,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
   const std::vector<bool>& aggregate_is_wide_integer_sum,
   bool enable_low_cardinality_groupby)
 {
+  // Encoded STRING keys stay as codes through every re-aggregation, decoded once per set.
+  std::vector<std::unique_ptr<cudf::column>> encoded_keys;
   auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
                                          group_idx,
                                          aggregates,
@@ -963,12 +990,14 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          aggregate_input_max_abs,
                                          aggregate_is_wide_integer_sum,
                                          false,
-                                         enable_low_cardinality_groupby);
+                                         enable_low_cardinality_groupby,
+                                         &encoded_keys);
   auto output_table = expand_grouping_sets(partial->view(),
                                            group_idx.size(),
                                            aggregates,
                                            grouping_sets,
                                            grouping_functions,
+                                           encoded_keys,
                                            stream,
                                            memory_space.get_default_allocator());
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
