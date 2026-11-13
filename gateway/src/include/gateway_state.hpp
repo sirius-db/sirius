@@ -243,6 +243,9 @@ class gateway_state {
   uint64_t query_id_         = 0;
   uint64_t running_query_id_ = 0;
   std::vector<std::string> ddl_log_;
+  /// ddl_log_ was read from the state directory and no replay of it has finished: its entries
+  /// may fail for reasons outside the log, and are then skipped rather than fatal.
+  bool saved_log_pending_ = false;
 };
 
 /// Fills @p options from the `sirius_gateway_*` settings of @p context.
