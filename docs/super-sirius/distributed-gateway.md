@@ -149,6 +149,8 @@ is. One that has joined is sent `sirius_gateway_rank_exit_sql` (by default
 `CALL sirius_rank_exit()`), and the gateway waits up to 10 minutes for the launcher to start a
 new one. An empty `sirius_gateway_rank_joined_sql` counts every process as joined. So a rank's
 first join uses the process that registered, and each later join restarts it.
+`sirius_rank_exit` is refused in a process that has not joined, so it cannot end a Sirius that
+runs alone.
 `sirius_rank_exit` replies, shuts the exchange down (freeing its port and shared-memory mirrors)
 and exits with code 0; a watchdog ends it with code 1 if that hangs.
 

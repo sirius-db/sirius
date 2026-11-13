@@ -84,6 +84,12 @@ unique_ptr<FunctionData> exit_bind(ClientContext&,
                                    vector<LogicalType>& types,
                                    vector<Identifier>& names)
 {
+  // The function exists in every Sirius process. Only one that joined an exchange has a reason
+  // to restart, so no client can end a process that runs alone.
+  if (!exchange_joined.load()) {
+    throw InvalidInputException(
+      "sirius_rank_exit: this process has not joined an exchange, so it does not restart");
+  }
   types = {LogicalType::BIGINT, LogicalType::BOOLEAN};
   names = {"pid", "exiting"};
   return make_uniq<one_row>();
