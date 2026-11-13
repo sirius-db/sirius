@@ -175,7 +175,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
 }
 
 /// Put a deferred bundle's values back, just before the operator that reads
-/// them runs (env gate: SIRIUS_EXP_LATE_MAT, via the directive being installed).
+/// them runs (query setting: enable_late_materialization, via the directive being installed).
 ///
 /// Null means "use the input as it is": this operator carries no consuming half,
 /// or the batches are not the ones the directive was installed for. A port can

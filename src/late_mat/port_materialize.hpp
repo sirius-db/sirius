@@ -17,7 +17,7 @@
 #pragma once
 
 // The far end of a deferral: turn the rowid back into columns (env gate:
-// SIRIUS_EXP_LATE_MAT).
+// enable_late_materialization).
 //
 // The scan replaced a bundle of columns with one UINT64 pin-order rowid and
 // INT8 placeholders, and everything in between carried them as ordinary data.

@@ -2871,7 +2871,6 @@ int main()
     // cuDF intentionally retains its default pinned pool until process exit.
     // Keep this fixture's pinned allocations individually freed and leak-checkable.
     // The scan-filter policy reads its gate once.
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", 1);
     setenv("LIBCUDF_PINNED_POOL_SIZE", "0", 1);
     setenv("LIBCUDF_PINNED_POOL_MAX_SIZE", "0", 1);
     expect(cudf::config_default_pinned_memory_resource({.pool_size = 0}),

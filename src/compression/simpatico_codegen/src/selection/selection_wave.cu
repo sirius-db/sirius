@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // selection_wave.cu — device helpers for the row-selection wave
-// (SIRIUS_EXP_FUSED_SCAN_FILTER). Four pieces, all mask-shaped (1 bit/row,
+// (enable_fused_scan_filter). Four pieces, all mask-shaped (1 bit/row,
 // 32 uint32 words per 1024-row chunk, tail bits zero):
 //
 //   * combine_masks_and : AND k per-column ballot masks into one batch mask.

@@ -1931,11 +1931,7 @@ TEST_CASE("transactional steal serves decode-row-filtered splits but refuses pre
 TEST_CASE("a compressed split decoded with a join filter keeps the drop and the steal",
           "[cached_serving][transactional_steal]")
 {
-  namespace fsf = sirius::test::fused_scan_filter;
-  if (!sirius::decompression_pushdown_enabled()) {
-    WARN("filtered-decode env gate off in this process; skipping");
-    return;
-  }
+  namespace fsf                   = sirius::test::fused_scan_filter;
   auto& e                         = env();
   ::cuda::stream_ref const stream = e.stream();
   using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
@@ -2334,7 +2330,7 @@ TEST_CASE("a dynamic-filter consumer reserves decode headroom only when it can a
   split.consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
     channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
   auto const expected =
-    sirius::decompression_pushdown_enabled() ? batch_bytes + batch_bytes / 4 : batch_bytes;
+    split.enable_fused_scan_filter ? batch_bytes + batch_bytes / 4 : batch_bytes;
   REQUIRE(split.get_estimated_working_set_size_in_bytes() == expected);
 }
 
@@ -2442,8 +2438,8 @@ TEST_CASE("a resident split reserves the cached gather only when it can reach th
   REQUIRE(batch_bytes > 0);
   // Without the checkpoint, the decode envelope applies when pushdown can attach probes; otherwise
   // the zero-copy view estimate stands.
-  auto const decode_probes = sirius::decompression_pushdown_enabled() && split.consumer &&
-                             !split.consumer->decode_bindings().empty();
+  auto const decode_probes =
+    split.enable_fused_scan_filter && split.consumer && !split.consumer->decode_bindings().empty();
   auto const ordinary = decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
         (reaches_checkpoint ? 2 * batch_bytes : ordinary));
@@ -2591,8 +2587,8 @@ TEST_CASE(
   auto& split = dynamic_cast<scan_operator_input&>(*handed);
   REQUIRE(split.cached_view_possible);
   split.needs_carrier_conversion = converting;
-  auto const decode_probes       = sirius::decompression_pushdown_enabled() && split.consumer &&
-                             !split.consumer->decode_bindings().empty();
+  auto const decode_probes =
+    split.enable_fused_scan_filter && split.consumer && !split.consumer->decode_bindings().empty();
   auto const ordinary = [&] {
     auto const batch_bytes = split.get_estimated_size_in_bytes();
     return decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
@@ -2660,7 +2656,7 @@ TEST_CASE("a statically filtered compressed split keeps its compaction forecast 
     batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) *
                                                sirius::decompression_pushdown_max_selectivity());
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
-        (sirius::decompression_pushdown_enabled() ? forecast : 2 * batch_bytes));
+        (split.enable_fused_scan_filter ? forecast : 2 * batch_bytes));
 }
 
 TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",

@@ -143,10 +143,6 @@ TEST_CASE("filtered-decode membership probe consumes the static range mask as a 
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior);  // another mask source exists, so the probe must run mask-aware
@@ -186,10 +182,6 @@ TEST_CASE("filtered-decode membership probe stays prior-free without another sou
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK_FALSE(saw_prior);  // membership-only requests keep the concurrent, prior-free path
@@ -223,10 +215,6 @@ TEST_CASE("a declining membership probe leaves the range's survivors",
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   // The declined probe is the identity of the AND, so the range alone selects.
   REQUIRE(result.applied);
@@ -264,10 +252,6 @@ TEST_CASE("a declining membership probe alone falls back to the plain decode",
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (!sirius::codegen::decompression_pushdown_enabled()) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   // With no source left to select by, the decode gives up and returns every row.
   REQUIRE_FALSE(result.applied);
@@ -309,10 +293,6 @@ TEST_CASE("filtered-decode membership probe takes a keep mask alone as its prior
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(result.keep_mask_applied);
@@ -354,10 +334,6 @@ TEST_CASE("a membership cascade folds each probe's survivors into the next probe
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior_a);
@@ -394,10 +370,6 @@ TEST_CASE("filtered-decode membership probe on an all-dead prior stays mask-awar
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   // The probe must still run mask-aware (it precedes the survivor count), with every row dead in
   // its prior.
@@ -438,10 +410,6 @@ TEST_CASE("filtered-decode membership probe reads an INT8-carrier key chunk",
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior);
@@ -527,10 +495,6 @@ TEST_CASE("filtered-decode membership probe consumes a nullable probe column",
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   REQUIRE(shape_ok);
@@ -582,10 +546,6 @@ TEST_CASE("filtered-decode membership probe reads a DATE stored as an INT16 carr
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior);
@@ -632,10 +592,6 @@ TEST_CASE("filtered-decode membership probe reads a DECIMAL32-carrier key chunk"
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior);
@@ -734,10 +690,6 @@ TEST_CASE("filtered-decode membership probe fingerprints a dictionary-encoded ST
   std::vector<std::size_t> const selected{0, 1};
   sirius::codegen::scan_filter_result result;
   auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
-  if (gate_stayed_off(result)) {
-    WARN("filtered-decode env gate off in this process; skipping membership coverage");
-    return;
-  }
 
   REQUIRE(result.applied);
   CHECK(saw_prior);

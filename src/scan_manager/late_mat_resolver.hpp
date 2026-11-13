@@ -17,7 +17,7 @@
 #pragma once
 
 // Reading a pinned entry the way the late materializer needs it (env gate:
-// SIRIUS_EXP_LATE_MAT).
+// enable_late_materialization).
 //
 // This is the only code on either side of the seam that knows how a pinned
 // entry stores its chunks — device columns per name for a plain GPU pin, or

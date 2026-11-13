@@ -38,8 +38,10 @@
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -308,7 +310,7 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution FIRST preserves carried columns beside low-cardinality SUM",
                  "[integration][gpu_execution][distinct][aggregate][lowcard_groupby]")
 {
-  // Also run with SIRIUS_EXP_LOWCARD_GROUPBY=1: the specialized SUM kernel cannot emit FIRSTs.
+  // The default-on specialized SUM kernel cannot emit FIRSTs.
   run_ok("CREATE TABLE first_lowcard (k VARCHAR NOT NULL, v BIGINT NOT NULL);");
   run_ok("INSERT INTO first_lowcard VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40);");
   run_ok("CHECKPOINT;");
@@ -317,6 +319,28 @@ TEST_CASE_METHOD(DistinctFixture,
     "FROM first_lowcard GROUP BY k) WHERE a + b <> 100 OR "
     "(k = 'A' AND s <> 30) OR (k = 'B' AND s <> 70)");
   compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM first_lowcard GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "low-cardinality aggregation agrees with cuDF across SQL policy changes",
+                 "[integration][gpu_execution][lowcard_groupby][optimization_settings]")
+{
+  run_ok("CREATE TABLE policy_lowcard (k VARCHAR NOT NULL, v BIGINT NOT NULL)");
+  run_ok(
+    "INSERT INTO policy_lowcard SELECT CASE WHEN range % 2 = 0 THEN 'A' ELSE 'B' END, "
+    "range::BIGINT FROM range(4096)");
+  run_ok("CHECKPOINT");
+  for (bool const enabled : {true, false, true}) {
+    sirius::test::scoped_sirius_setting policy(*con, "enable_low_cardinality_groupby", enabled);
+    sirius::test::scoped_recording_log_sink logs("debug");
+    compare_gpu_vs_cpu("SELECT k, sum(v), count(*) FROM policy_lowcard GROUP BY k");
+    auto const records     = logs.records();
+    bool const specialized = std::any_of(records.begin(), records.end(), [](auto const& record) {
+      return record.message.find("local_grouped_agg: low-cardinality path") != std::string::npos;
+    });
+    REQUIRE(specialized == enabled);
+    compare_gpu_vs_cpu("SELECT k, sum(v), count(*) FROM policy_lowcard GROUP BY ROLLUP(k)");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFixture,

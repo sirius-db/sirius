@@ -44,12 +44,10 @@
 #include <rmm/error.hpp>
 
 #include <algorithm>
-#include <cstdlib>
 #include <new>
 #include <numeric>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_set>
 
 namespace sirius {
@@ -139,17 +137,6 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
 
 namespace {
 
-/// Whether batches with a handful of groups use the low-cardinality kernel
-/// (SIRIUS_EXP_LOWCARD_GROUPBY=1).
-bool lowcard_groupby_enabled()
-{
-  static bool const enabled = [] {
-    char const* value = std::getenv("SIRIUS_EXP_LOWCARD_GROUPBY");
-    return value != nullptr && std::string_view{value} == "1";
-  }();
-  return enabled;
-}
-
 /// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
 /// `[keys..., aggregates..., carried...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for
 /// the parameters.
@@ -164,7 +151,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   cucascade::memory::memory_space& memory_space,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
   const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
-  bool split_wide_integer_sums                                             = false)
+  bool split_wide_integer_sums                                             = false,
+  bool enable_low_cardinality_groupby                                      = true)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -202,14 +190,14 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     return deduped;
   }
 
-  // Experimental (SIRIUS_EXP_LOWCARD_GROUPBY=1): batches with a handful of groups, such as TPC-H
+  // With enable_low_cardinality_groupby: batches with a handful of groups, such as TPC-H
   // Q1, use a dedicated kernel instead of cuDF's hash group-by. It returns nullptr when the batch
   // does not qualify, and the general path below runs unchanged.
   bool const any_struct_aggregate =
     std::any_of(aggregate_struct_col_indices.begin(),
                 aggregate_struct_col_indices.end(),
                 [](std::vector<int> const& struct_cols) { return !struct_cols.empty(); });
-  if (carried_idx.empty() && lowcard_groupby_enabled() && !any_struct_aggregate) {
+  if (carried_idx.empty() && enable_low_cardinality_groupby && !any_struct_aggregate) {
     if (auto result = try_low_cardinality_groupby(
           input_table, group_idx, aggregates, aggregate_idx, stream, mr)) {
       SIRIUS_LOG_DEBUG("local_grouped_agg: low-cardinality path rows={} groups={}",
@@ -873,7 +861,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
   const std::vector<bool>& aggregate_is_wide_integer_sum,
   bool split_wide_integer_sums,
-  cudf::size_type* num_groups)
+  cudf::size_type* num_groups,
+  bool enable_low_cardinality_groupby)
 {
   auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
                                               group_idx,
@@ -885,7 +874,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               memory_space,
                                               aggregate_input_max_abs,
                                               aggregate_is_wide_integer_sum,
-                                              split_wide_integer_sums);
+                                              split_wide_integer_sums,
+                                              enable_low_cardinality_groupby);
   if (num_groups != nullptr) { *num_groups = output_table->num_rows(); }
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
@@ -902,7 +892,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
-  const std::vector<bool>& aggregate_is_wide_integer_sum)
+  const std::vector<bool>& aggregate_is_wide_integer_sum,
+  bool enable_low_cardinality_groupby)
 {
   auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
                                          group_idx,
@@ -913,7 +904,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          stream,
                                          memory_space,
                                          aggregate_input_max_abs,
-                                         aggregate_is_wide_integer_sum);
+                                         aggregate_is_wide_integer_sum,
+                                         false,
+                                         enable_low_cardinality_groupby);
   auto output_table = expand_grouping_sets(partial->view(),
                                            group_idx.size(),
                                            aggregates,

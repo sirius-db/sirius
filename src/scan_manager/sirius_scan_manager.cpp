@@ -41,6 +41,7 @@
 #include "planner/query.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -255,7 +256,7 @@ struct cached_databatch_provider : public databatch_provider {
   /// ids would then address rows the batch no longer holds.
   void prepare_origin_annotation()
   {
-    if (!late_mat::late_mat_enabled()) { return; }
+    // Origins are pin metadata; query-local policy controls whether a ride is installed.
     // A scan that is not stamped looks exactly like one that is stamped and
     // never used, so each refusal says which one it was.
     auto const decline = [](char const* why) {
@@ -370,7 +371,7 @@ struct cached_databatch_provider : public databatch_provider {
       auto projected = compressed->select_columns(_column_indices);
       // The host payload's plans become available after reconstruction. Attach only to
       // this query's projection; the converter narrows the request against those plans.
-      if (!_pushdown_req.empty()) {
+      if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter) {
         projected->set_pushdown_scan(
           std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req));
       }
@@ -411,7 +412,7 @@ struct cached_databatch_provider : public databatch_provider {
         // dropping stays on for a masked chunk: the mask attached below is ANDed into the
         // same selection, so the compacted rows are the visible ones.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
-        if (!_pushdown_req.empty()) {
+        if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter) {
           auto const scan =
             std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices);
@@ -857,7 +858,7 @@ std::optional<std::string> admit_group_key_extension(
 }
 
 /// Complete and install one pinned scan's deferral, or leave the plan alone and
-/// say why (env gate: SIRIUS_EXP_LATE_MAT).
+/// say why (query setting: enable_late_materialization).
 ///
 /// The plan side weighs the ride; only here is it known whether this scan's rows
 /// are ADDRESSABLE — a pin-order id means something exactly when a served batch
@@ -892,7 +893,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
                                               bool serves_whole_chunks,
                                               std::size_t gpu_space_count)
 {
-  if (!late_mat::late_mat_enabled()) { return {}; }
+  if (!scan_op.operator_options().enable_late_materialization) { return {}; }
   // An uninstalled deferral looks exactly like one that installed and did
   // nothing, so every refusal says which it was.
   auto const decline = [&scan_op](std::string_view why) {
@@ -1237,10 +1238,11 @@ struct installed_ride {
 void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
                              std::vector<installed_ride> const& rides)
 {
-  if (!late_mat::late_mat_enabled() || candidates.empty()) { return; }
+  if (candidates.empty()) { return; }
 
   for (auto const& candidate : candidates) {
-    auto& scan_op      = *candidate.scan;
+    auto& scan_op = *candidate.scan;
+    if (!scan_op.operator_options().enable_late_materialization) { continue; }
     auto const& entry  = *candidate.entry;
     auto const decline = [&scan_op](std::string_view why) {
       SIRIUS_LOG_INFO(
@@ -1877,7 +1879,8 @@ void sirius_scan_manager::prepare_for_query(
   // order, `nation` is listed before `customer`, and its 16 B/row ride would otherwise shut out
   // customer's 96 B/row one. Ties keep the listed order. Only the visiting order changes; every
   // scan is still visited exactly once.
-  if (late_mat::late_mat_enabled() && cached_assignments.size() > 1) {
+  if (cached_assignments.size() > 1 &&
+      cached_assignments.front().op->operator_options().enable_late_materialization) {
     std::vector<std::pair<std::int64_t, std::size_t>> saving_and_index;
     saving_and_index.reserve(cached_assignments.size());
     for (std::size_t index = 0; index < cached_assignments.size(); ++index) {
@@ -1974,7 +1977,9 @@ void sirius_scan_manager::prepare_for_query(
     auto const& ingestible = assignment.op->get_ingestible();
     auto pushdown_req      = sirius::op::build_pushdown_request(
       ingestible.filter_analysis(), slot_map, ingestible.output_prefix_width());
-    if (!sirius::decompression_pushdown_enabled()) {
+    pushdown_req.enable_fused_scan_filter =
+      assignment.op->operator_options().enable_fused_scan_filter;
+    if (!assignment.op->operator_options().enable_fused_scan_filter) {
       // Answering an equality off a dictionary is independent of the gate; row
       // dropping is not, so give it up when the gate is off.
       auto const unfiltered =
@@ -2008,7 +2013,7 @@ void sirius_scan_manager::prepare_for_query(
     auto& assignment = cached_assignments[i];
     auto& inputs     = provider_inputs_by_assignment[i];
     auto consumer    = assignment.op->decode_consumer();
-    if (sirius::decompression_pushdown_enabled()) {
+    if (assignment.op->operator_options().enable_fused_scan_filter) {
       if (assignment.op->consumer() && !consumer) {
         SIRIUS_LOG_INFO(
           "[late-mat] operator {}: dynamic decode attachments withheld — deferral addresses whole "
@@ -3476,7 +3481,8 @@ void sirius_scan_manager::publish_pinned_entry(const std::string& name, pinned_e
 {
   // Caller holds the registry lock. Allocate all fallible metadata before publication.
   auto generation = std::make_shared<pinned_entry>(std::move(entry));
-  if (late_mat::late_mat_enabled()) {
+  // Pins can be shared by connections with different query policies. Always retain the handle.
+  {
     auto handle = std::make_shared<late_mat::pin_entry_handle>(
       name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
     handle->set_entry(generation);

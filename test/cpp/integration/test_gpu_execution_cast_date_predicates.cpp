@@ -42,7 +42,6 @@ namespace {
 struct fused_gate_armer {
   fused_gate_armer()
   {
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/0);
     // The fused decode hands compaction back to the ordinary decode + residual
     // filter once a range keeps more than 35% (10% on the full route) of a
     // chunk's rows. These tables are a handful of rows on purpose, so nearly

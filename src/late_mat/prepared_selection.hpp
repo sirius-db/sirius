@@ -17,7 +17,7 @@
 #pragma once
 
 // Turning one selection into per-batch work, at most once (env gate:
-// SIRIUS_EXP_LATE_MAT).
+// enable_late_materialization).
 //
 // A deferred selection is resolved against SEVERAL columns of the same origin
 // table — that is the point of deferring, since the rows survive the join once

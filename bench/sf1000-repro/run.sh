@@ -12,13 +12,10 @@ PLANS="${PLANS:-$HERE/plans}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 NAME="${NAME:-sf1000_repro}"
 
-# Late materialization (group-by-rowid ride) and fused decode-time filtering. Both off by
-# default; both are worth real suite time here and are safe to leave on for a repro run.
+# Late materialization, fused decode-time filtering and low-cardinality group-by default on.
+# Override them in CFG under sirius.operator_params when comparing policies.
 # The ride's uniqueness proof comes from the pin itself (pin_table_prove_unique_keys, on by default).
 # See docs/super-sirius/late-materialization.md.
-export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
-export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 [ -d "$DATA" ] || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
 
@@ -52,9 +49,7 @@ echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "config    : $CFG"
-echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT"
-echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
-echo "lowcard gb: SIRIUS_EXP_LOWCARD_GROUPBY=$SIRIUS_EXP_LOWCARD_GROUPBY"
+echo "optimizations: enabled by default; CFG may override"
 echo
 
 cd "$REPO"

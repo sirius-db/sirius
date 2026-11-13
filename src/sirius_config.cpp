@@ -425,6 +425,9 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
+  r.optional("enable_late_materialization", opt.enable_late_materialization);
+  r.optional("enable_fused_scan_filter", opt.enable_fused_scan_filter);
+  r.optional("enable_low_cardinality_groupby", opt.enable_low_cardinality_groupby);
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   if (opt.scan_task_batch_size == 0) {
     throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");

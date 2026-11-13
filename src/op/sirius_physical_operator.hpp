@@ -47,6 +47,7 @@
 namespace sirius {
 
 class like_multiliteral_cache;
+struct operator_params;
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -587,6 +588,7 @@ class sirius_physical_operator {
 
   /// The owning pipeline supplies query policy; standalone operators use fixed defaults.
   [[nodiscard]] expression_query_policy expression_policy() const noexcept;
+  [[nodiscard]] const sirius::operator_params& operator_options() const noexcept;
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
@@ -655,8 +657,8 @@ class sirius_physical_operator {
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   //! The late-materialization half this operator carries, if any. Both are empty on every
-  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
-  //! at query prepare, before any task runs, and only read from then on.
+  //! operator unless `enable_late_materialization` is on AND the pair installed; they are written
+  //! once, at query prepare, before any task runs, and only read from then on.
   //!
   //! A scan carries the producing half (stop emitting these positions' values) and its port
   //! carries the consuming half (put them back). Stamped only by

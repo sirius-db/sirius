@@ -414,7 +414,7 @@ TEMPLATE_TEST_CASE("cached provider histories remain local to each chunk through
     {},
     consumer);
   auto first          = provider->get_next_batch();
-  auto const attached = sirius::decompression_pushdown_enabled() ? std::size_t{1} : std::size_t{0};
+  auto const attached = std::size_t{1};
   REQUIRE(first.decode_attached.size() == attached);
   REQUIRE(first.mvcc_keep_mask.words == mask.words);
   {
@@ -789,8 +789,7 @@ TEMPLATE_TEST_CASE(
     }
     train_for_decode(*consumer, *filter);
     REQUIRE_THROWS_AS(split.prepare_for_processing(space, stream), std::bad_alloc);
-    auto const attached =
-      sirius::decompression_pushdown_enabled() ? std::size_t{1} : std::size_t{0};
+    auto const attached = std::size_t{1};
     REQUIRE(split.decode_attached.size() == attached);
     {
       auto mutable_batch = batch->to_mutable();
@@ -960,9 +959,6 @@ TEST_CASE("decode probe shaping rejects a selection step outside the decoded slo
 TEST_CASE("a deferring scan decodes whole compressed chunks and its endpoint filters them",
           "[late_mat][dynamic_filter][consumer_integration][decode_history][.late_mat_fused]")
 {
-  if (!sirius::late_mat::late_mat_enabled() || !sirius::decompression_pushdown_enabled()) {
-    SKIP("needs SIRIUS_EXP_LATE_MAT=1 and SIRIUS_EXP_FUSED_SCAN_FILTER=1 in the environment");
-  }
   constexpr cudf::size_type kRows = 1024;
   auto* space                     = sirius::test::operator_utils::get_default_gpu_space();
   rmm::cuda_stream stream;

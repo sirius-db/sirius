@@ -16,7 +16,7 @@
 
 #pragma once
 
-// What a deferral IS, as a pair of instructions (env gate: SIRIUS_EXP_LATE_MAT).
+// What a deferral IS, as a pair of instructions (query setting: enable_late_materialization).
 //
 // A deferral is two edits to a plan, and they are only ever meaningful
 // together: the producing scan stops emitting some columns' values, and the

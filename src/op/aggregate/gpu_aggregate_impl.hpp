@@ -101,6 +101,7 @@ class gpu_aggregate_impl {
    *        split is faster with few groups and slower with very many (see
    *        sirius_physical_grouped_aggregate::split_wide_sum_max_groups).
    * @param[out] num_groups If not null, receives the number of groups in the output.
+   * @param enable_low_cardinality_groupby Query policy for the specialized aggregation kernel.
    *
    * @return The output data batch: the group keys, one column per aggregate, then the carried
    * columns.
@@ -118,7 +119,8 @@ class gpu_aggregate_impl {
     const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
     const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
     bool split_wide_integer_sums                                             = false,
-    cudf::size_type* num_groups                                              = nullptr);
+    cudf::size_type* num_groups                                              = nullptr,
+    bool enable_low_cardinality_groupby                                      = true);
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.
@@ -173,7 +175,8 @@ class gpu_aggregate_impl {
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info                    = {},
     const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
-    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {});
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+    bool enable_low_cardinality_groupby                                      = true);
 };
 
 }  // namespace op

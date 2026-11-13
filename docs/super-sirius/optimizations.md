@@ -253,7 +253,7 @@ It applies only to one or two non-null one-character STRING keys, at most 64 gro
 - `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
 
-**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+**Config:** `enable_low_cardinality_groupby` (SQL or YAML, enabled by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
 
 ### Distinct Hash Join (PR #558)
 
@@ -508,7 +508,7 @@ distinctness proof.
 - `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
-**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+**Config:** `enable_late_materialization` controls the feature (SQL or YAML, enabled by default);
 The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
 that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
 floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`

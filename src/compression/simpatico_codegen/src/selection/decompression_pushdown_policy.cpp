@@ -29,12 +29,6 @@ double env_fraction(char const* name, double fallback)
 
 }  // namespace
 
-bool decompression_pushdown_enabled()
-{
-  static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_FILTER");
-  return enabled;
-}
-
 bool decompression_pushdown_diag_enabled()
 {
   static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_DIAG");

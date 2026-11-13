@@ -152,6 +152,11 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
+  /// Connection-local optimization policy, snapshotted before query execution.
+  bool enable_late_materialization    = true;
+  bool enable_fused_scan_filter       = true;
+  bool enable_low_cardinality_groupby = true;
+
   /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 

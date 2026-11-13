@@ -16,7 +16,7 @@
 
 #pragma once
 
-// Late-materialization origin tracking (env gate: SIRIUS_EXP_LATE_MAT).
+// Late-materialization origin tracking (query setting: enable_late_materialization).
 //
 // A deferred column is described by WHERE it came from — a pinned entry and a
 // column position (@ref column_origin) — and WHICH of its rows are still live
@@ -47,7 +47,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -58,20 +57,6 @@ struct pinned_entry;  // scan_manager/sirius_scan_manager.hpp
 }  // namespace sirius::scan_manager
 
 namespace sirius::late_mat {
-
-/// Env gate for late materialization: set and not "0" means on.
-///
-/// This is the ONLY reader, and every translation unit must come through it.
-/// The fused scan-filter gate ended up with two readers that disagreed in a
-/// corner, and a gate whose on/off semantics can fork is worse than no gate.
-inline bool late_mat_enabled()
-{
-  static bool const enabled = []() {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT");
-    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
-  }();
-  return enabled;
-}
 
 /// Pin generation. 0 is never a live generation — it is the invalidated, "no
 /// origin" value — so a zero-initialized column_origin fails closed.

@@ -149,6 +149,54 @@ TEST_CASE("like_swar_fastpath is isolated between connections",
   REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
 }
 
+TEST_CASE("optimization switches default on and remain connection-local query snapshots",
+          "[sirius][config][optimization_settings][isolated_context]")
+{
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const normal_settings{"SIRIUS_ENABLE_TEST_OPTIONS", "0"};
+  // Retired environment gates must not override either the default or a session SET.
+  sirius::util::env_guard const old_late{"SIRIUS_EXP_LATE_MAT", "0"};
+  sirius::util::env_guard const old_fused{"SIRIUS_EXP_FUSED_SCAN_FILTER", "0"};
+  sirius::util::env_guard const old_groupby{"SIRIUS_EXP_LOWCARD_GROUPBY", "0"};
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection a(db), b(db);
+  using params = sirius::operator_params;
+  std::array const settings{
+    std::pair{"enable_late_materialization", &params::enable_late_materialization},
+    std::pair{"enable_fused_scan_filter", &params::enable_fused_scan_filter},
+    std::pair{"enable_low_cardinality_groupby", &params::enable_low_cardinality_groupby}};
+  for (auto const& [name, member] : settings) {
+    CAPTURE(name);
+    auto const before = duckdb::query_operator_options(*a.context);
+    REQUIRE(before.get()->*member);
+    auto result = a.Query("SELECT current_setting('" + std::string(name) + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->Collection().GetValue(0, 0).GetValue<bool>());
+    REQUIRE_FALSE(a.Query("SET " + std::string(name) + " = false")->HasError());
+    REQUIRE_FALSE(duckdb::query_operator_options(*a.context).get()->*member);
+    REQUIRE(duckdb::query_operator_options(*b.context).get()->*member);
+    REQUIRE(before.get()->*member);
+    REQUIRE(a.Query("SET GLOBAL " + std::string(name) + " = false")->HasError());
+    REQUIRE_FALSE(a.Query("RESET " + std::string(name))->HasError());
+    REQUIRE(duckdb::query_operator_options(*a.context).get()->*member);
+  }
+}
+
+TEST_CASE("YAML accepts optimization policy overrides before hardware resolution",
+          "[sirius][config][optimization_settings]")
+{
+  auto const config = sirius::parsed_sirius_config::from_node(YAML::Load(R"(
+sirius:
+  operator_params:
+    enable_late_materialization: false
+    enable_fused_scan_filter: false
+    enable_low_cardinality_groupby: false
+)"));
+  REQUIRE_FALSE(config.get_operator_params().enable_late_materialization);
+  REQUIRE_FALSE(config.get_operator_params().enable_fused_scan_filter);
+  REQUIRE_FALSE(config.get_operator_params().enable_low_cardinality_groupby);
+}
+
 TEST_CASE("Test-only settings require explicit process opt-in",
           "[sirius][config][test-settings][isolated_context]")
 {
@@ -1544,6 +1592,20 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
   REQUIRE(settings->Collection().GetValue(22, 0).GetValue<uint64_t>() == 9 * mib);
+  for (auto const* name : {"enable_late_materialization",
+                           "enable_fused_scan_filter",
+                           "enable_low_cardinality_groupby"}) {
+    CAPTURE(name);
+    auto check = [&] {
+      auto value = con.Query("SELECT current_setting('" + std::string(name) + "')");
+      REQUIRE_FALSE(value->HasError());
+      REQUIRE_FALSE(value->Collection().GetValue(0, 0).GetValue<bool>());
+    };
+    check();
+    REQUIRE_FALSE(con.Query("SET " + std::string(name) + " = true")->HasError());
+    REQUIRE_FALSE(con.Query("RESET " + std::string(name))->HasError());
+    check();
+  }
   auto require_resident_budget = [&](uint64_t value) {
     auto result = con.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
     REQUIRE(result != nullptr);
