@@ -129,6 +129,7 @@ inline op::merge::bounded_merge_result reference_bounded_merge(
   std::vector<std::int32_t> source;  // window of each merged row
   if (!tagged.empty()) {
     merged = cudf::merge(tagged, key_cols, column_order, null_precedence, stream);
+    stream.synchronize();  // the host copy below runs on the default stream
     source = operator_utils::copy_column_to_host<std::int32_t>(merged->view().column(num_cols));
   }
 

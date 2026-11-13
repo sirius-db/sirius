@@ -28,13 +28,21 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/cudf/host_table.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/disk_table.hpp>
 
 #include <algorithm>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <typeindex>
 #include <typeinfo>
 #include <utility>
@@ -47,8 +55,18 @@ namespace {
 /// the whole-batch fallback, and then the batch is converted again.
 constexpr int kMaxWindowAttempts = 3;
 
-/// Device bytes of an owned column, including its null mask and children.
-std::size_t column_bytes(const cudf::column_view& col, rmm::cuda_stream_view stream)
+void check_cuda(cudaError_t status, const char* what)
+{
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string("windowed merge: ") + what + ": " +
+                             cudaGetErrorString(status));
+  }
+}
+
+/// Device bytes of an owned column without the chars of its STRING columns, which only the device
+/// knows: those columns are appended to @p strings instead.
+std::size_t column_bytes_without_chars(const cudf::column_view& col,
+                                       std::vector<cudf::column_view>& strings)
 {
   std::size_t bytes = col.nullable() ? cudf::bitmask_allocation_size_bytes(col.size()) : 0;
   if (cudf::is_fixed_width(col.type())) {
@@ -56,23 +74,200 @@ std::size_t column_bytes(const cudf::column_view& col, rmm::cuda_stream_view str
   }
   if (col.type().id() == cudf::type_id::STRING) {
     if (col.size() == 0) { return bytes; }
-    return bytes + static_cast<std::size_t>(cudf::strings_column_view(col).chars_size(stream)) +
-           (static_cast<std::size_t>(col.size()) + 1) * sizeof(cudf::size_type);
+    strings.push_back(col);
+    return bytes + (static_cast<std::size_t>(col.size()) + 1) * sizeof(cudf::size_type);
   }
   for (cudf::size_type i = 0; i < col.num_children(); ++i) {
-    bytes += column_bytes(col.child(i), stream);
+    bytes += column_bytes_without_chars(col.child(i), strings);
   }
   return bytes;
 }
 
-std::size_t table_bytes(const cudf::table_view& table, rmm::cuda_stream_view stream)
-{
-  std::size_t bytes = 0;
-  for (const auto& col : table) {
-    bytes += column_bytes(col, stream);
+/**
+ * @brief Output bytes of each round, for the output target, without a stream sync per round.
+ *
+ * Everything but the STRING chars follows from the row count. The chars bytes of a round's output
+ * are read back asynchronously into pinned memory (add_round) and counted one round later
+ * (settle), by when the next bounded merge has synchronized the stream anyway. Until then the
+ * round counts with the chars per row of the round before it (pending_estimate).
+ */
+class output_bytes_tracker {
+ public:
+  output_bytes_tracker()                                       = default;
+  output_bytes_tracker(const output_bytes_tracker&)            = delete;
+  output_bytes_tracker& operator=(const output_bytes_tracker&) = delete;
+
+  ~output_bytes_tracker()
+  {
+    settle_noexcept();
+    if (_event != nullptr) { cudaEventDestroy(_event); }
+    if (_ends != nullptr) { cudaFreeHost(_ends); }
   }
-  return bytes;
+
+  /// Chars bytes of the last added round, exact. Blocks only if the stream has not run the
+  /// read-back yet.
+  std::size_t settle()
+  {
+    if (!_pending) { return 0; }
+    if (cudaEventQuery(_event) != cudaSuccess) {
+      check_cuda(cudaEventSynchronize(_event), "waiting for the output size");
+    }
+    _pending          = false;
+    std::size_t chars = 0;
+    for (std::size_t i = 0; i < _pending_cols; ++i) {
+      chars += static_cast<std::size_t>(_ends[i]);
+    }
+    _chars_per_row = static_cast<double>(chars) / static_cast<double>(_pending_rows);
+    return chars;
+  }
+
+  /// settle() for destructors: the read-back must not outlive the output table or this object.
+  void settle_noexcept() noexcept
+  {
+    if (!_pending) { return; }
+    cudaEventSynchronize(_event);
+    _pending = false;
+  }
+
+  /// Bytes of @p table without its chars; enqueues the read-back of the chars bytes on @p stream.
+  /// @p table must stay alive until the next settle().
+  std::size_t add_round(const cudf::table_view& table, rmm::cuda_stream_view stream)
+  {
+    _strings.clear();
+    std::size_t bytes = 0;
+    for (const auto& col : table) {
+      bytes += column_bytes_without_chars(col, _strings);
+    }
+    if (_strings.empty()) { return bytes; }
+
+    if (_strings.size() > _capacity) {
+      if (_ends != nullptr) { check_cuda(cudaFreeHost(_ends), "freeing pinned memory"); }
+      _ends     = nullptr;
+      _capacity = 0;
+      void* ptr = nullptr;
+      check_cuda(cudaMallocHost(&ptr, _strings.size() * sizeof(std::int64_t)),
+                 "allocating pinned memory");
+      _ends     = static_cast<std::int64_t*>(ptr);
+      _capacity = _strings.size();
+    }
+    if (_event == nullptr) {
+      check_cuda(cudaEventCreateWithFlags(&_event, cudaEventDisableTiming), "creating an event");
+    }
+    for (std::size_t i = 0; i < _strings.size(); ++i) {
+      // The table owns its columns, so the first offset is 0 and the last one is the chars size.
+      // Little-endian: an int32 offset fills the low half of the zeroed int64.
+      const auto offsets = cudf::strings_column_view(_strings[i]).offsets();
+      const auto width   = cudf::size_of(offsets.type());
+      const auto* last =
+        offsets.head<std::uint8_t>() +
+        static_cast<std::size_t>(_strings[i].offset() + _strings[i].size()) * width;
+      _ends[i] = 0;
+      check_cuda(cudaMemcpyAsync(&_ends[i], last, width, cudaMemcpyDeviceToHost, stream.value()),
+                 "reading the output size");
+    }
+    _pending      = true;
+    _pending_cols = _strings.size();
+    _pending_rows = static_cast<std::size_t>(table.num_rows());
+    // From here on the read-back is in flight: record its end even if that takes a sync.
+    if (cudaEventRecord(_event, stream.value()) != cudaSuccess) {
+      cudaStreamSynchronize(stream.value());
+      check_cuda(cudaEventRecord(_event, stream.value()), "recording an event");
+    }
+    return bytes;
+  }
+
+  /// Estimated chars bytes of the round whose read-back is still in flight.
+  [[nodiscard]] std::size_t pending_estimate() const noexcept
+  {
+    return _pending ? static_cast<std::size_t>(_chars_per_row * static_cast<double>(_pending_rows))
+                    : 0;
+  }
+
+ private:
+  std::int64_t* _ends{nullptr};  // pinned, one slot per STRING column
+  std::size_t _capacity{0};
+  cudaEvent_t _event{nullptr};
+  bool _pending{false};
+  std::size_t _pending_cols{0};
+  std::size_t _pending_rows{0};
+  double _chars_per_row{0};
+  std::vector<cudf::column_view> _strings;  // scratch
+};
+
+/**
+ * @brief Rows [begin, begin + rows) of @p col as a view, without touching the device.
+ *
+ * Unlike cudf::slice this does not count the nulls of the range (a device read per nullable
+ * column): the null count of the view is an UPPER BOUND, exact only when it is 0. The windows
+ * only reach the bounded merge, which reads the masks and never the counts.
+ */
+cudf::column_view slice_column(const cudf::column_view& col,
+                               cudf::size_type begin,
+                               cudf::size_type rows)
+{
+  const auto null_count = col.nullable() ? std::min(col.null_count(), rows) : 0;
+  return cudf::column_view(col.type(),
+                           rows,
+                           col.head(),
+                           col.null_mask(),
+                           null_count,
+                           col.offset() + begin,
+                           std::vector<cudf::column_view>(col.child_begin(), col.child_end()));
 }
+
+cudf::table_view slice_rows(const cudf::table_view& table, std::size_t begin, std::size_t end)
+{
+  std::vector<cudf::column_view> columns;
+  columns.reserve(static_cast<std::size_t>(table.num_columns()));
+  for (const auto& col : table) {
+    columns.push_back(slice_column(
+      col, static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end - begin)));
+  }
+  return cudf::table_view{columns};
+}
+
+/// Chars bytes of top-level column @p col of a host or disk table, if its metadata records them.
+std::optional<std::size_t> string_chars_bytes(
+  const std::vector<cucascade::memory::column_metadata>& columns, std::size_t col)
+{
+  if (col >= columns.size() || !columns[col].has_data) { return std::nullopt; }
+  return columns[col].data_size;
+}
+
+/**
+ * @brief The window buffer of one run on a non-GPU tier. Lives as long as the merger, so a later
+ * run() continues with the rows an earlier one read but did not emit.
+ *
+ * The unread rows are rows [start, buffer->size()) of the buffer; row `start` is source row `row`
+ * of batch `batch` of the run. Consuming only moves `start`: the tail is copied to the front of
+ * the buffer (window_buffer::consume) only right before a refill.
+ */
+struct buffered_run {
+  std::unique_ptr<detail::window_buffer> buffer;
+  cudf::table_view view;  // buffer->view(), taken after the last refill
+  std::size_t start{0};
+  std::size_t batch{0};
+  std::size_t row{0};
+  bool refill_blocked{false};  // the next row does not fit behind the tail: consume the tail first
+  std::unique_ptr<cucascade::row_range_reader_state> reader_state;
+  std::optional<std::type_index> reader_type;
+
+  [[nodiscard]] std::size_t available() const noexcept
+  {
+    return buffer ? buffer->size() - start : 0;
+  }
+
+  /// Forgets the buffered rows and the reader state; keeps the allocation.
+  void clear_rows(rmm::cuda_stream_view stream)
+  {
+    if (buffer && buffer->size() > 0) { buffer->consume(buffer->size(), stream); }
+    start          = 0;
+    refill_blocked = false;
+    view           = cudf::table_view{};
+    reader_state.reset();
+    reader_type.reset();
+  }
+};
 
 /// The window state of one run during a run() call.
 struct run_window {
@@ -81,12 +276,6 @@ struct run_window {
   // GPU tier: the read lock of the current batch, kept until the batch is finished or run() ends.
   std::optional<cucascade::read_only_data_batch> gpu_lock;
   cudf::table_view gpu_view;  // the fetched columns of the locked batch
-
-  // Other tiers: the buffered rows are rows [cursor.row, cursor.row + buffer->size()) of the
-  // current batch.
-  std::unique_ptr<detail::window_buffer> buffer;
-  std::unique_ptr<cucascade::row_range_reader_state> reader_state;
-  std::optional<std::type_index> reader_type;
 
   cudf::table_view window;  // this round's window
 };
@@ -138,7 +327,43 @@ struct windowed_merger::impl {
   const cucascade::row_range_reader_registry* readers;
   cucascade::memory::memory_space* gpu_space;
   bounded_merge_fn merge;
-  bool has_strings{false};
+  std::vector<std::size_t> string_cols;  // positions in fetch order of the STRING columns
+  std::size_t fixed_row_bytes{0};        // bytes per row of the fixed-width fetched columns
+  std::vector<buffered_run> buffered;    // one per run; kept across run() calls
+  output_bytes_tracker output_tracker;
+
+  /// Rows a window may drop to before its buffer is compacted and refilled. Refilling only then
+  /// copies every buffered row at most once and reads at least half a window per refill.
+  [[nodiscard]] std::size_t low_water_rows() const noexcept
+  {
+    return std::max<std::size_t>(1, cfg.window_rows / 2);
+  }
+
+  /// Estimated chars bytes per row of one fetched STRING column of @p data: the average over the
+  /// fetched STRING columns, from the column metadata of host and disk tables, else from the row
+  /// width of the whole batch. window_buffer grows its chars when a column needs more.
+  [[nodiscard]] std::size_t estimate_string_bytes_per_row(
+    const cucascade::idata_representation& data, std::size_t batch_rows) const
+  {
+    if (string_cols.empty() || batch_rows == 0) { return 0; }
+    const std::vector<cucascade::memory::column_metadata>* columns = nullptr;
+    if (const auto* host = dynamic_cast<const cucascade::host_data_representation*>(&data)) {
+      if (host->get_host_table()) { columns = &host->get_host_table()->columns; }
+    } else if (const auto* disk = dynamic_cast<const cucascade::disk_data_representation*>(&data)) {
+      columns = &disk->get_disk_table().columns;
+    }
+    std::optional<std::size_t> chars =
+      columns != nullptr ? std::optional<std::size_t>{0} : std::nullopt;
+    for (std::size_t i = 0; chars && i < string_cols.size(); ++i) {
+      const auto bytes = string_chars_bytes(*columns, fetch_cols[string_cols[i]]);
+      chars            = bytes ? std::optional<std::size_t>{*chars + *bytes} : std::nullopt;
+    }
+    if (!chars) {
+      const auto row_bytes = data.get_uncompressed_data_size_in_bytes() / batch_rows;
+      chars = (row_bytes > fixed_row_bytes ? row_bytes - fixed_row_bytes : 0) * batch_rows;
+    }
+    return *chars / (batch_rows * string_cols.size()) + 1;
+  }
 
   [[nodiscard]] bool gpu_resident(const cucascade::read_only_data_batch& lock) const
   {
@@ -165,16 +390,11 @@ struct windowed_merger::impl {
     run.gpu_lock.emplace(std::move(lock));
   }
 
-  void slice_gpu_window(run_window& run, rmm::cuda_stream_view stream) const
+  void slice_gpu_window(run_window& run) const
   {
     const auto batch_rows = run.cursor.run.batch_rows[run.cursor.batch];
     const auto begin      = run.cursor.row;
-    const auto end        = std::min(begin + cfg.window_rows, batch_rows);
-    run.window =
-      cudf::slice(run.gpu_view,
-                  {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end)},
-                  stream)
-        .front();
+    run.window = slice_rows(run.gpu_view, begin, std::min(begin + cfg.window_rows, batch_rows));
   }
 
   /// Sets run.window to at most window_rows rows of the run's current batch, from the cursor on.
@@ -185,14 +405,17 @@ struct windowed_merger::impl {
                    merge_round_stats& stats)
   {
     if (run.gpu_lock) {
-      slice_gpu_window(run, stream);
+      slice_gpu_window(run);
       return;
     }
+    auto& held            = buffered[run_idx];
     const auto& batch     = runs[run_idx][run.cursor.batch];
     const auto batch_rows = run.cursor.run.batch_rows[run.cursor.batch];
     const auto wanted     = std::min(cfg.window_rows, batch_rows - run.cursor.row);
-    if (run.buffer && run.buffer->size() >= wanted) {
-      run.window = run.buffer->view();
+    // Enough rows are buffered: no copy and no read. A window below `wanted` is truncated.
+    if (held.available() >= std::min(wanted, low_water_rows()) ||
+        (held.refill_blocked && held.available() > 0)) {
+      run.window = slice_rows(held.view, held.start, held.buffer->size());
       return;
     }
 
@@ -208,40 +431,62 @@ struct windowed_merger::impl {
         if (gpu_resident(lock)) {
           // The slice restarts at the cursor, so rows buffered while the batch was on another tier
           // are dropped.
-          if (run.buffer && run.buffer->size() > 0) {
-            run.buffer->consume(run.buffer->size(), stream);
-          }
-          run.reader_state.reset();
-          run.reader_type.reset();
+          held.clear_rows(stream);
           use_gpu_batch(run, run_idx, std::move(lock));
-          slice_gpu_window(run, stream);
+          slice_gpu_window(run);
           return;
         }
         if (readers->has_reader(*data)) {
           const std::type_index type{typeid(*data)};
-          if (run.reader_type != type) {
-            run.reader_state.reset();
-            run.reader_type = type;
+          if (held.reader_type != type) {
+            held.reader_state.reset();
+            held.reader_type = type;
           }
-          if (!run.buffer) {
-            const auto est_string_bytes_per_row =
-              has_strings ? (data->get_uncompressed_data_size_in_bytes() / batch_rows) + 1 : 0;
-            run.buffer = std::make_unique<detail::window_buffer>(
-              fetch_types, cfg.window_rows, est_string_bytes_per_row, stream, mr);
+          if (!held.buffer) {
+            held.buffer = std::make_unique<detail::window_buffer>(
+              fetch_types,
+              cfg.window_rows,
+              estimate_string_bytes_per_row(*data, batch_rows),
+              stream,
+              mr);
           }
+          // Compact: carry the unread tail (less than half a window) to the front, once.
+          held.view = cudf::table_view{};
+          held.buffer->consume(held.start, stream);
+          held.start = 0;
           try {
-            const auto read = run.buffer->refill(*readers,
-                                                 lock,
-                                                 fetch_cols,
-                                                 run.cursor.row + run.buffer->size(),
-                                                 &run.reader_state,
-                                                 nullptr,
-                                                 stream);
-            stats.refill_rows += read.rows_written;
-            for (const auto bytes : read.data_bytes_written) {
-              stats.refill_bytes += bytes;
+            // window_buffer grows its STRING slots once per call and then reports a row that still
+            // does not fit as a plain std::runtime_error. With a tail in the buffer the tail is
+            // the window (truncated) and the refill waits until it is consumed; an empty buffer is
+            // grown until the row fits.
+            std::optional<cucascade::row_range_result> read;
+            while (!read) {
+              const auto bytes_before = held.buffer->device_bytes();
+              try {
+                read = held.buffer->refill(*readers,
+                                           lock,
+                                           fetch_cols,
+                                           run.cursor.row + held.buffer->size(),
+                                           &held.reader_state,
+                                           nullptr,
+                                           stream);
+              } catch (const std::runtime_error& error) {
+                if (typeid(error) != typeid(std::runtime_error)) { throw; }
+                if (held.buffer->size() > 0) {
+                  held.refill_blocked = true;
+                  break;
+                }
+                if (held.buffer->device_bytes() <= bytes_before) { throw; }
+              }
             }
-            if (run.buffer->size() == 0) {
+            if (read) {
+              held.refill_blocked = false;
+              stats.refill_rows += read->rows_written;
+              for (const auto bytes : read->data_bytes_written) {
+                stats.refill_bytes += bytes;
+              }
+            }
+            if (held.buffer->size() == 0) {
               throw sirius::internal_exception(
                 "windowed merge: refill of run {} read no rows at row {} of batch {} ({} rows)",
                 run_idx,
@@ -249,7 +494,8 @@ struct windowed_merger::impl {
                 run.cursor.batch,
                 batch_rows);
             }
-            run.window = run.buffer->view();
+            held.view  = held.buffer->view();
+            run.window = held.view;
             return;
           } catch (const cucascade::row_range_unsupported_error&) {
             // Falls through to the whole-batch conversion below.
@@ -271,20 +517,21 @@ struct windowed_merger::impl {
 
   /// Moves @p run past the first @p consumed rows of its window.
   void advance(run_window& run,
+               std::size_t run_idx,
                round_windows& windows,
                std::size_t consumed,
-               rmm::cuda_stream_view stream) const
+               rmm::cuda_stream_view stream)
   {
     if (consumed == 0) { return; }
     const auto batch_before = run.cursor.batch;
     run.cursor.advance(consumed);
-    if (!run.gpu_lock) { run.buffer->consume(consumed, stream); }
+    auto& held = buffered[run_idx];
+    if (!run.gpu_lock) { held.start += consumed; }  // no copy: the next window starts further in
     if (run.cursor.batch == batch_before) { return; }
-    // The batch is finished. A window never spans batches, so a buffer is empty here and the next
-    // batch refills into it.
+    // The batch is finished. A window never spans batches, so every buffered row was consumed and
+    // the next batch refills into the empty buffer.
     windows.release_gpu(run);
-    run.reader_state.reset();
-    run.reader_type.reset();
+    held.clear_rows(stream);
   }
 
   [[nodiscard]] std::unique_ptr<cudf::table> empty_output() const
@@ -304,9 +551,30 @@ struct windowed_merger::impl {
     // Everything below works on copies; the caller's cursors and stats change only on return.
     round_windows windows(runs.size(), stream);
     for (std::size_t i = 0; i < runs.size(); ++i) {
-      windows.runs[i].cursor = cursors[i];
-      windows.runs[i].cursor.advance(0);  // normalize: never rest at the end of a batch
+      auto& cursor = windows.runs[i].cursor;
+      cursor       = cursors[i];
+      cursor.advance(0);  // normalize: never rest at the end of a batch
+      // Rows buffered by an earlier run() are reused only if the cursor is still where it left it.
+      auto& held = buffered[i];
+      if (held.available() > 0 && (held.batch != cursor.batch || held.row != cursor.row)) {
+        held.clear_rows(stream);
+      }
     }
+    // The buffers move ahead of the caller's cursors during the rounds. Unless run() commits, they
+    // are dropped (which also frees their memory for a retry) and the replay reads them again.
+    struct buffer_rollback {
+      std::vector<buffered_run>& buffered;
+      output_bytes_tracker& tracker;
+      bool committed{false};
+      ~buffer_rollback()
+      {
+        tracker.settle_noexcept();
+        if (committed) { return; }
+        for (auto& held : buffered) {
+          held = buffered_run{};
+        }
+      }
+    } rollback{buffered, output_tracker};
 
     merge_round_stats local;
     std::vector<std::unique_ptr<cudf::table>> outputs;
@@ -367,15 +635,22 @@ struct windowed_merger::impl {
       // The output owns its rows, so the windows may be released or overwritten from here on.
       round_views.clear();
       for (std::size_t w = 0; w < active.size(); ++w) {
-        advance(
-          windows.runs[active[w]], windows, static_cast<std::size_t>(merged.consumed[w]), stream);
+        advance(windows.runs[active[w]],
+                active[w],
+                windows,
+                static_cast<std::size_t>(merged.consumed[w]),
+                stream);
       }
 
       local.rows_out += out_rows;
-      output_bytes += table_bytes(merged.output->view(), stream);
+      // The merge synchronized the stream, so the chars bytes of the round before are in.
+      output_bytes += output_tracker.settle();
+      output_bytes += output_tracker.add_round(merged.output->view(), stream);
       outputs.push_back(std::move(merged.output));
-      if (output_bytes >= cfg.output_target_bytes) { break; }
+      if (output_bytes + output_tracker.pending_estimate() >= cfg.output_target_bytes) { break; }
     }
+    // The last round's read-back reads its output table: let it finish before the table goes.
+    output_tracker.settle();
 
     std::unique_ptr<cudf::table> result;
     if (outputs.empty()) {
@@ -393,9 +668,12 @@ struct windowed_merger::impl {
 
     // Commit: nothing below throws.
     for (std::size_t i = 0; i < runs.size(); ++i) {
-      cursors[i].batch = windows.runs[i].cursor.batch;
-      cursors[i].row   = windows.runs[i].cursor.row;
+      cursors[i].batch  = windows.runs[i].cursor.batch;
+      cursors[i].row    = windows.runs[i].cursor.row;
+      buffered[i].batch = cursors[i].batch;
+      buffered[i].row   = cursors[i].row;
     }
+    rollback.committed = true;
     if (stats != nullptr) {
       stats->rounds += local.rounds;
       stats->rows_out += local.rows_out;
@@ -443,9 +721,14 @@ windowed_merger::windowed_merger(
 
   _impl              = std::make_unique<impl>();
   _impl->select_cols = std::vector<cudf::size_type>(fetch_cols.begin(), fetch_cols.end());
-  _impl->has_strings = std::any_of(fetch_types.begin(), fetch_types.end(), [](const auto& type) {
-    return type.id() == cudf::type_id::STRING;
-  });
+  for (std::size_t i = 0; i < fetch_types.size(); ++i) {
+    if (fetch_types[i].id() == cudf::type_id::STRING) {
+      _impl->string_cols.push_back(i);
+    } else if (cudf::is_fixed_width(fetch_types[i])) {
+      _impl->fixed_row_bytes += cudf::size_of(fetch_types[i]);
+    }
+  }
+  _impl->buffered.resize(runs.size());
   _impl->runs        = std::move(runs);
   _impl->cursors     = cursors;
   _impl->fetch_cols  = std::move(fetch_cols);

@@ -20,7 +20,12 @@
 #include "operator/operator_test_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <rmm/cuda_stream.hpp>
+
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/row_range_read.hpp>
+#include <data/sirius_converter_registry.hpp>
+#include <data/sirius_row_range_reader_registry.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -110,6 +115,9 @@ struct merge_fixture {
   /// True when every batch can be locked exclusively, i.e. no read lock is left behind.
   bool all_batches_unlocked() const
   {
+    // try_to_mutable also fails while a reader event is outstanding: let the stream drain, so
+    // only a read lock that is still held makes this false.
+    stream.synchronize();
     for (const auto& run : runs) {
       for (const auto& batch : run.batches) {
         if (!batch->try_to_mutable().has_value()) { return false; }
@@ -675,4 +683,206 @@ TEST_CASE("windowed_merger rejects a batch whose rows differ from its run", "[wi
   CHECK(f.cursors[0].row == 0);
   CHECK(f.cursors[1].row == 0);
   CHECK(f.all_batches_unlocked());
+}
+
+// ---------------------------------------------------------------------------
+// HOST-tier runs: window buffers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Runs whose batches live in the HOST tier, so the merger reads them through window buffers.
+/// Declared first: the batches must go before the memory manager does.
+struct host_merge_fixture {
+  sirius::test::operator_utils::tiered_memory_fixture memory;
+  cucascade::shared_data_repository repository;
+  std::vector<test_run> runs;
+  std::vector<merge_input_cursor> cursors;
+  rmm::cuda_stream owned_stream;  // the converters need a real stream, not the default one
+  rmm::cuda_stream_view stream{owned_stream.value()};
+
+  host_merge_fixture()
+  {
+    REQUIRE(memory.setup());
+    if (!sirius::row_range_reader_registry::is_initialized()) {
+      sirius::row_range_reader_registry::initialize();
+    }
+  }
+
+  rmm::device_async_resource_ref mr() { return get_resource_ref(*memory.gpu0); }
+
+  void add_host_run(const cudf::table_view& unsorted,
+                    const merge_key_spec& keys,
+                    std::size_t num_batches = 1)
+  {
+    runs.push_back(make_sorted_gpu_run(repository, *memory.gpu0, unsorted, keys, num_batches));
+    // The batches were copied on the default stream; the converter runs on this one.
+    cudf::get_default_stream().sync();
+    for (const auto& batch : runs.back().batches) {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(
+        sirius::converter_registry::get(), memory.host0, stream);
+      stream.synchronize();
+      REQUIRE(mut.get_current_tier() == cucascade::memory::Tier::HOST);
+    }
+  }
+
+  windowed_merger make_merger(const merge_key_spec& keys,
+                              window_config cfg,
+                              bounded_merge_fn merge              = reference_bounded_merge,
+                              std::vector<std::size_t> fetch_cols = kTwoCols,
+                              std::vector<cudf::data_type> types  = kTwoInt64)
+  {
+    if (cursors.empty()) { cursors = make_cursors(runs); }
+    return windowed_merger(run_batches(runs),
+                           cursors,
+                           std::move(fetch_cols),
+                           std::move(types),
+                           keys,
+                           cfg,
+                           sirius::row_range_reader_registry::get(),
+                           *memory.gpu0,
+                           std::move(merge));
+  }
+};
+
+}  // namespace
+
+TEST_CASE("windowed_merger reads every HOST row once across run() calls", "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  host_merge_fixture f;
+  f.add_host_run(random_rows(2000, 100000, 0, 201)->view(), keys, 2);
+  f.add_host_run(random_rows(1500, 100000, 10000, 202)->view(), keys);
+  f.add_host_run(random_rows(1700, 100000, 20000, 203)->view(), keys, 3);
+  auto expected = expected_full_sort(f.runs, keys);
+
+  // One round per run(): the windows are kept by the merger from one call to the next.
+  std::size_t rounds        = 0;
+  std::size_t short_windows = 0;
+  auto counting_merge       = [&](std::span<const cudf::table_view> windows,
+                            const merge_key_spec& key_spec,
+                            std::span<const std::uint8_t> truncated,
+                            cudf::size_type max_rows,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr) {
+    ++rounds;
+    for (std::size_t w = 0; w < windows.size(); ++w) {
+      REQUIRE(windows[w].num_rows() > 0);
+      REQUIRE(windows[w].num_rows() <= 512);
+      // A window below half the window size is only passed when its batch has no more rows.
+      if (windows[w].num_rows() < 256) { ++short_windows; }
+    }
+    return reference_bounded_merge(windows, key_spec, truncated, max_rows, stream, mr);
+  };
+  auto merger = f.make_merger(keys, {.window_rows = 512, .output_target_bytes = 1}, counting_merge);
+  merge_round_stats stats;
+  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
+
+  CHECK(collected.chunks.size() == rounds);
+  CHECK(tables_equal(collected.table->view(), expected->view()));
+  CHECK(all_exhausted(f.cursors));
+  CHECK(stats.rows_out == 5200);
+  // No row is read twice, neither between rounds nor between run() calls.
+  CHECK(stats.refill_rows == 5200);
+  CHECK(stats.refill_bytes == 5200 * 16);
+  CHECK(stats.fallback_conversions == 0);
+  // Short windows only appear at the end of the 6 batches, never every round.
+  CHECK(short_windows < rounds);
+}
+
+TEST_CASE("windowed_merger drops its HOST windows when a run() fails or the cursors move",
+          "[windowed_merger]")
+{
+  const auto keys = ascending_key();
+  host_merge_fixture f;
+  f.add_host_run(random_rows(1800, 1000, 0, 211)->view(), keys, 2);
+  f.add_host_run(random_rows(1300, 1000, 10000, 212)->view(), keys);
+  auto expected = expected_full_sort(f.runs, keys);
+
+  int calls          = 0;
+  int fail_at        = 3;
+  auto failing_merge = [&](std::span<const cudf::table_view> windows,
+                           const merge_key_spec& key_spec,
+                           std::span<const std::uint8_t> truncated,
+                           cudf::size_type max_rows,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr) {
+    if (++calls == fail_at) { throw std::runtime_error("injected merge failure"); }
+    return reference_bounded_merge(windows, key_spec, truncated, max_rows, stream, mr);
+  };
+  // 300-row rounds of 16-byte rows: each run() is two rounds.
+  auto merger =
+    f.make_merger(keys, {.window_rows = 300, .output_target_bytes = 9000}, failing_merge);
+  merge_round_stats stats;
+
+  auto first             = merger.run(f.stream, f.mr(), &stats);
+  const auto first_rows  = first->num_rows();
+  const auto after_first = f.cursors;
+
+  // The second run() fails in its first round: the cursors stay where the first run() left them
+  // and the replay continues exactly, although the buffers had moved on.
+  REQUIRE_THROWS_WITH(merger.run(f.stream, f.mr(), &stats), "injected merge failure");
+  for (std::size_t i = 0; i < f.cursors.size(); ++i) {
+    CHECK(f.cursors[i].batch == after_first[i].batch);
+    CHECK(f.cursors[i].row == after_first[i].row);
+  }
+  auto second = merger.run(f.stream, f.mr(), &stats);
+  std::vector<cudf::table_view> head{first->view(), second->view()};
+  auto head_table = cudf::concatenate(head);
+  CHECK(tables_equal(head_table->view(),
+                     cudf::slice(expected->view(), {0, first_rows + second->num_rows()}).front()));
+
+  // The caller rewinds the cursors: the merger must not serve the rows it had buffered for the
+  // old positions.
+  for (auto& cursor : f.cursors) {
+    cursor.batch = 0;
+    cursor.row   = 0;
+  }
+  fail_at        = -1;
+  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
+  CHECK(tables_equal(collected.table->view(), expected->view()));
+  CHECK(all_exhausted(f.cursors));
+}
+
+TEST_CASE("windowed_merger merges HOST runs with several STRING columns", "[windowed_merger]")
+{
+  // (STRING key, STRING long payload, INT64 id): the two STRING columns differ a lot in width.
+  const merge_key_spec keys{.key_cols        = {0, 2},
+                            .column_order    = {cudf::order::ASCENDING, cudf::order::ASCENDING},
+                            .null_precedence = {cudf::null_order::AFTER, cudf::null_order::AFTER}};
+  const std::vector<std::size_t> fetch_cols{0, 1, 2};
+  const std::vector<cudf::data_type> fetch_types{cudf::data_type{cudf::type_id::STRING},
+                                                 cudf::data_type{cudf::type_id::STRING},
+                                                 cudf::data_type{cudf::type_id::INT64}};
+  host_merge_fixture f;
+  std::mt19937 gen(221);
+  std::int64_t next_id = 0;
+  for (const std::size_t rows : {900UL, 1400UL, 600UL}) {
+    std::vector<std::string> key_values(rows);
+    std::vector<std::string> payload(rows);
+    std::vector<std::int64_t> ids(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+      key_values[i] = "k" + std::to_string(gen() % 40);
+      payload[i]    = std::string(gen() % 200, 'p') + std::to_string(next_id);
+      ids[i]        = next_id++;
+    }
+    auto table = make_table(make_string_column(key_values),
+                            make_string_column(payload),
+                            make_column(ids, cudf::type_id::INT64));
+    f.add_host_run(table->view(), keys, 2);
+  }
+
+  auto merger = f.make_merger(keys,
+                              {.window_rows = 128, .output_target_bytes = 30000},
+                              reference_bounded_merge,
+                              fetch_cols,
+                              fetch_types);
+  merge_round_stats stats;
+  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
+  CHECK(collected.chunks.size() > 1);
+  auto expected = expected_full_sort(f.runs, keys);
+  CHECK(tables_equal(collected.table->view(), expected->view()));
+  CHECK(stats.rows_out == 2900);
+  CHECK(stats.refill_rows == 2900);
 }
