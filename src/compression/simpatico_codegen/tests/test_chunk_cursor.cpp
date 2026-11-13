@@ -38,6 +38,7 @@ std::unique_ptr<leaf_access> make_staged_leaf_access(
   std::shared_ptr<payload_source> payload,
   rmm::device_async_resource_ref mr);
 std::size_t staged_bytes_held(leaf_access const& access);
+void release_transient_staging(leaf_access& access);
 }  // namespace simpatico::chunk
 
 namespace {
@@ -452,7 +453,7 @@ void test_staging()
   expect(holds(around, 2900, 300), "staging: surrounding request bytes");
   expect(get(3000, 100) == around + 100, "staging: the containing range now serves the request");
 
-  // Host copies stage through the same intervals.
+  // Host copies use the staged bytes when they cover the request, and stage nothing otherwise.
   std::vector<std::uint8_t> host(100);
   access->host_bytes(0, 0, 3000, 100, host.data(), stream);
   expect(reads.size() == 6, "staging: host copy of staged bytes reads nothing");
@@ -462,6 +463,8 @@ void test_staging()
   expect(reads.size() == 7 && reads[6] == read{3600, 10}, "staging: host copy reads what it needs");
   expect(std::equal(host.begin(), host.begin() + 10, payload.begin() + kBufferOffset + 3500),
          "staging: host copy bytes of an unstaged range");
+  expect(chunk::staged_bytes_held(*access) == 1000 + 1000 + 100 + 500 + 1000 + 300,
+         "staging: a host copy stages nothing");
 
   // Validity mask.
   auto const* mask = access->validity_bytes(8, 32, stream);
@@ -474,7 +477,7 @@ void test_staging()
   expect(holds(first, 0, 1000) && holds(second, 500, 1000) && holds(far, 3000, 100),
          "staging: earlier pointers stay valid");
 
-  expect(chunk::staged_bytes_held(*access) == 1000 + 1000 + 100 + 500 + 1000 + 300 + 10 + 32,
+  expect(chunk::staged_bytes_held(*access) == 1000 + 1000 + 100 + 500 + 1000 + 300 + 32,
          "staging: bytes held is the sum of the staged requests");
 
   // Requests outside the buffer, the mask or the column's leaves.
@@ -488,6 +491,52 @@ void test_staging()
          "staging: unknown buffer");
   expect(reads.size() == 8, "staging: rejected requests read nothing");
   expect(access->column().validity_size == kValiditySize, "staging: column()");
+
+  // What decompress_column_chunks does when a call returns: everything staged is freed, and the
+  // next request for the same bytes reads them again.
+  chunk::release_transient_staging(*access);
+  expect(chunk::staged_bytes_held(*access) == 0, "release: nothing is held afterwards");
+  auto const* again = get(0, 1000);
+  expect(reads.size() == 9 && reads[8] == read{100, 1000}, "release: freed bytes are read again");
+  expect(holds(again, 0, 1000), "release: bytes staged after a release");
+  access->validity_bytes(8, 32, stream);
+  expect(reads.size() == 10 && reads[9] == read{5008, 32}, "release: the mask is read again");
+  expect(chunk::staged_bytes_held(*access) == 1000 + 32, "release: only the new requests are held");
+}
+
+// The buffers of a dictionary node's own leaves (the keys) outlive a release: the dictionary
+// decoder points into them for its whole life. Everything else of the column is freed.
+void test_kept_dictionary_keys()
+{
+  auto const stream  = rmm::cuda_stream_default;
+  auto const payload = pattern_bytes(kPayloadSize);
+  auto source        = std::make_shared<recording_source>(payload);
+  auto const desc    = describe(dictionary_column());
+  auto const& col    = desc->columns[0];
+  auto access =
+    chunk::make_staged_leaf_access(desc, 0, source, rmm::mr::get_current_device_resource_ref());
+  auto& reads = source->reads;
+
+  // Leaves 0 and 1 are keys_offsets and keys_chars of the dictionary node; leaf 2 is the
+  // bitpacked indices, whose buffer 3 is `packed`.
+  auto const& keys_chars = col.leaves[1].buffers[0];
+  auto const& packed     = col.leaves[2].buffers[3];
+  auto const* keys       = access->device_bytes(1, 0, 0, keys_chars.size, stream);
+  access->device_bytes(2, 3, 0, packed.size, stream);
+  access->validity_bytes(0, 0, stream);
+  expect(reads.size() == 2, "kept keys: two buffers read");
+  expect(chunk::staged_bytes_held(*access) == keys_chars.size + packed.size,
+         "kept keys: both buffers held during the call");
+
+  chunk::release_transient_staging(*access);
+  expect(chunk::staged_bytes_held(*access) == keys_chars.size, "kept keys: only the keys remain");
+  expect(access->device_bytes(1, 0, 0, keys_chars.size, stream) == keys,
+         "kept keys: the same staged bytes serve the keys");
+  expect(device_equals(keys, payload, keys_chars.payload_offset, keys_chars.size, stream),
+         "kept keys: bytes after a release");
+  expect(reads.size() == 2, "kept keys: the keys are not read again");
+  access->device_bytes(2, 3, 0, packed.size, stream);
+  expect(reads.size() == 3, "kept keys: the indices are read again");
 }
 
 void test_device_resident()
@@ -795,6 +844,94 @@ void test_real_plans()
   }
 }
 
+// ─── 6. Windowed reads through the cursor from a host payload ───────────────
+
+// A column read in three successive windows through one cursor whose payload is not on the
+// device: every window decodes to the oracle's rows although the bytes staged for the window
+// before it were freed, and a decoder without state leaves the cursor holding nothing.
+void test_windowed_read(real_case const& c)
+{
+  rmm::cuda_stream_view const stream{cudf::get_default_stream()};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  auto const input  = chunk_test::make_random_column(c.type, c.options, stream);
+  auto const table  = chunk_test::compress_column_with_plan(input->view(), c.plan, stream, mr);
+  auto const col    = chunk_test::describe_from_table(table, 0, stream);
+  auto const oracle = chunk_test::full_decode(table, 0, stream, mr);
+  std::string const what{c.what};
+  auto check = [&](bool cond, std::string const& msg) { expect(cond, msg.c_str()); };
+
+  auto const host = chunk_test::flatten_payload_host(table, 0, stream);
+  std::vector<std::uint8_t> payload(host.size());
+  std::transform(host.begin(), host.end(), payload.begin(), [](std::byte b) {
+    return static_cast<std::uint8_t>(b);
+  });
+  auto source = std::make_shared<recording_source>(payload);
+
+  bool const is_string  = c.type == cudf::type_id::STRING;
+  auto const rows       = static_cast<cudf::size_type>(col.num_rows);
+  auto const data_bytes = is_string ? static_cast<std::size_t>(rows) * 64
+                                    : static_cast<std::size_t>(rows) * cudf::size_of(col.dtype);
+  rmm::device_buffer data{data_bytes, stream, mr};
+  rmm::device_buffer offsets{(static_cast<std::size_t>(rows) + 1) * 8, stream, mr};
+  rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(rows), stream, mr};
+  cuda_check(cudaMemsetAsync(mask.data(), 0, mask.size(), stream.value()));
+
+  try {
+    compressed_column_cursor cursor{describe(col), 0, source, stream, mr};
+    if (!cursor.supported()) {
+      std::printf("  %s: windowed read skipped, the decoder refuses the column\n", c.what);
+      return;
+    }
+    cudf::size_type done   = 0;
+    std::int64_t bytes_out = 0;
+    for (cudf::size_type const end : {700, 1900, rows}) {
+      column_write_target dst;
+      dst.data            = data.data();
+      dst.data_capacity   = data.size();
+      dst.null_mask       = static_cast<cudf::bitmask_type*>(mask.data());
+      dst.offsets         = is_string ? offsets.data() : nullptr;
+      dst.offset_width    = 8;
+      dst.dst_row_offset  = done;
+      dst.dst_byte_offset = static_cast<std::size_t>(bytes_out);
+
+      auto const take    = end - done;
+      auto const written = decompress_column_chunks(
+        cursor, done / 1024, (end + 1023) / 1024, done % 1024, take, dst, stream);
+      check(written == take, "windowed read: rows written, " + what);
+      check(chunk_test::compare_rows(oracle->view(), dst, done, take, stream),
+            "windowed read: rows [" + std::to_string(done) + ", " + std::to_string(end) + ") of " +
+              what);
+      if (c.expected == value_plan::stored) {
+        check(cursor.device_bytes_held() == 0,
+              "windowed read: nothing held between calls, " + what);
+      }
+      done = end;
+      if (is_string) {
+        stream.synchronize();
+        cuda_check(cudaMemcpy(&bytes_out,
+                              static_cast<std::byte*>(offsets.data()) + std::size_t{8} * done,
+                              sizeof(bytes_out),
+                              cudaMemcpyDeviceToHost));
+      }
+    }
+    check(!source->reads.empty(), "windowed read: the payload was read, " + what);
+    std::printf("  %s: three windows decoded from a host payload, %zu device bytes held\n",
+                c.what,
+                cursor.device_bytes_held());
+  } catch (std::logic_error const& e) {
+    check(std::string{e.what()}.find("not implemented") != std::string::npos,
+          "windowed read: " + what + " failed with '" + e.what() + "'");
+    std::printf("  %s: windowed read skipped (%s)\n", c.what, e.what());
+  }
+}
+
+void test_windowed_reads()
+{
+  for (auto const& c : real_cases()) {
+    test_windowed_read(c);
+  }
+}
+
 }  // namespace
 
 int main()
@@ -808,10 +945,12 @@ int main()
   try {
     test_classification();
     test_staging();
+    test_kept_dictionary_keys();
     test_device_resident();
     test_span_validation();
     test_dispatch();
     test_real_plans();
+    test_windowed_reads();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());
     return 1;

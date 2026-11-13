@@ -45,110 +45,42 @@ void check_range(std::uint64_t offset, std::uint64_t size, std::uint64_t limit, 
   }
 }
 
-/// leaf_access over a payload_source. A device-resident payload is served zero copy. Any other
-/// payload is staged on demand: each request not already covered by one staged interval gets a
-/// device buffer of exactly the requested bytes, filled from the staged intervals it overlaps
-/// (device-to-device) and from the source for the rest. Nothing beyond the requested bytes is
-/// ever read.
-///
-/// Intervals are keyed by payload offset (leaf buffers and the validity mask are disjoint ranges
-/// of one payload), and no indexed interval contains another, so begins and ends grow together
-/// and the only interval that can cover a request is the last one starting at or before it.
-/// Staged bytes are kept until the access dies, because pointers handed out stay valid that long.
-class staged_leaf_access final : public leaf_access {
+/// Byte ranges of a payload staged in device buffers, keyed by payload offset (leaf buffers and
+/// the validity mask are disjoint ranges of one payload). A request not covered by one staged
+/// range gets a buffer of exactly the requested bytes, filled from the staged ranges it overlaps
+/// (device-to-device) and from the source for the rest, so nothing beyond the requested bytes is
+/// ever read. No indexed range contains another, so begins and ends grow together and the only
+/// range that can cover a request is the last one starting at or before it.
+class staged_ranges {
  public:
-  staged_leaf_access(std::shared_ptr<const hpln_description> description,
-                     std::size_t column,
-                     std::shared_ptr<payload_source> payload,
-                     rmm::device_async_resource_ref mr)
-    : _description{std::move(description)}, _column{column}, _payload{std::move(payload)}, _mr{mr}
+  /// Device pointer to payload bytes [begin, begin + size) if one staged range covers them.
+  [[nodiscard]] const std::byte* find(std::uint64_t begin, std::uint64_t size) const
   {
+    auto const it = _staged.upper_bound(begin);
+    if (it == _staged.begin()) { return nullptr; }
+    auto const prev = std::prev(it);
+    if (prev->second.end < begin + size) { return nullptr; }
+    return static_cast<const std::byte*>(prev->second.bytes.data()) + (begin - prev->first);
   }
 
-  [[nodiscard]] const hpln_column_description& column() const noexcept override
+  /// Device pointer to payload bytes [begin, begin + size), staging what is missing. size > 0.
+  const std::byte* stage(payload_source& payload,
+                         std::uint64_t begin,
+                         std::uint64_t size,
+                         rmm::cuda_stream_view stream,
+                         rmm::device_async_resource_ref mr)
   {
-    return _description->columns[_column];
-  }
-
-  const std::byte* device_bytes(std::size_t leaf,
-                                std::size_t buffer,
-                                std::uint64_t offset,
-                                std::uint64_t size,
-                                rmm::cuda_stream_view stream) override
-  {
-    auto const& range = buffer_range(leaf, buffer);
-    check_range(offset, size, range.size, "leaf buffer");
-    return payload_bytes(range.payload_offset + offset, size, stream);
-  }
-
-  /// Stages the bytes on the device like device_bytes (so a later device request for the same
-  /// metadata is free), then copies them to the host and waits for the stream.
-  void host_bytes(std::size_t leaf,
-                  std::size_t buffer,
-                  std::uint64_t offset,
-                  std::uint64_t size,
-                  void* dst,
-                  rmm::cuda_stream_view stream) override
-  {
-    auto const* src = device_bytes(leaf, buffer, offset, size, stream);
-    if (size == 0) { return; }
-    cuda_try(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream.value()),
-             "copy of leaf bytes to the host");
-    stream.synchronize();
-  }
-
-  const std::byte* validity_bytes(std::uint64_t offset,
-                                  std::uint64_t size,
-                                  rmm::cuda_stream_view stream) override
-  {
-    auto const& col = column();
-    check_range(offset, size, col.validity_size, "validity mask");
-    return payload_bytes(col.validity_payload_offset + offset, size, stream);
-  }
-
-  [[nodiscard]] rmm::device_async_resource_ref mr() const noexcept override { return _mr; }
-
-  /// Device bytes of every staged interval.
-  [[nodiscard]] std::size_t bytes_held() const noexcept { return _bytes_held; }
-
- private:
-  struct interval {
-    std::uint64_t end{0};
-    rmm::device_buffer bytes;
-  };
-
-  [[nodiscard]] hpln_buffer_range const& buffer_range(std::size_t leaf, std::size_t buffer) const
-  {
-    auto const& leaves = column().leaves;
-    if (leaf >= leaves.size() || buffer >= leaves[leaf].buffers.size()) {
-      throw std::out_of_range("chunk decode: no buffer " + std::to_string(buffer) + " of leaf " +
-                              std::to_string(leaf));
-    }
-    return leaves[leaf].buffers[buffer];
-  }
-
-  const std::byte* payload_bytes(std::uint64_t begin,
-                                 std::uint64_t size,
-                                 rmm::cuda_stream_view stream)
-  {
-    if (auto const* base = _payload->device_base()) { return base + begin; }
-    if (size == 0) { return nullptr; }
+    if (auto const* staged = find(begin, size)) { return staged; }
     auto const end = begin + size;
 
     auto it = _staged.upper_bound(begin);
-    if (it != _staged.begin()) {
-      auto const prev = std::prev(it);
-      if (prev->second.end >= end) {
-        return static_cast<const std::byte*>(prev->second.bytes.data()) + (begin - prev->first);
-      }
-      if (prev->second.end > begin) { it = prev; }
-    }
+    if (it != _staged.begin() && std::prev(it)->second.end > begin) { --it; }
 
-    rmm::device_buffer bytes{size, stream, _mr};
+    rmm::device_buffer bytes{size, stream, mr};
     auto* const out = static_cast<std::byte*>(bytes.data());
     auto pos        = begin;
     auto read       = [&](std::uint64_t upto) {
-      _payload->read_to_device(pos, upto - pos, out + (pos - begin), stream);
+      payload.read_to_device(pos, upto - pos, out + (pos - begin), stream);
       pos = upto;
     };
     for (; it != _staged.end() && it->first < end; ++it) {
@@ -167,7 +99,7 @@ class staged_leaf_access final : public leaf_access {
     }
     if (pos < end) { read(end); }
 
-    // Intervals the new one contains leave the index; their bytes stay alive for the pointers
+    // Ranges the new one contains leave the index; their bytes stay alive for the pointers
     // already handed out.
     for (it = _staged.lower_bound(begin); it != _staged.end() && it->second.end <= end;) {
       _retired.push_back(std::move(it->second.bytes));
@@ -175,16 +107,152 @@ class staged_leaf_access final : public leaf_access {
     }
     _bytes_held += size;
     return static_cast<const std::byte*>(
-      _staged.insert_or_assign(begin, interval{end, std::move(bytes)}).first->second.bytes.data());
+      _staged.insert_or_assign(begin, range{end, std::move(bytes)}).first->second.bytes.data());
+  }
+
+  /// Frees every staged range.
+  void clear() noexcept
+  {
+    _staged.clear();
+    _retired.clear();
+    _bytes_held = 0;
+  }
+
+  [[nodiscard]] std::size_t bytes_held() const noexcept { return _bytes_held; }
+
+ private:
+  struct range {
+    std::uint64_t end{0};
+    rmm::device_buffer bytes;
+  };
+
+  std::map<std::uint64_t, range> _staged;  ///< keyed by the range's first payload byte
+  std::vector<rmm::device_buffer> _retired;
+  std::size_t _bytes_held{0};
+};
+
+/// leaf_access over a payload_source. A device-resident payload is served zero copy. Any other
+/// payload is staged on demand, only the bytes asked for.
+///
+/// Staged bytes live for one decode call: decompress_column_chunks calls release_transient() when
+/// the decoder and write_validity have returned, so a cursor read window after window holds none
+/// of the windows behind it. The exception is the buffers of a dictionary node's own leaves (the
+/// keys), which the dictionary decoder points into for its whole life: those are staged once and
+/// kept until the access dies.
+///
+/// host_bytes never adds to what is staged.
+class staged_leaf_access final : public leaf_access {
+ public:
+  staged_leaf_access(std::shared_ptr<const hpln_description> description,
+                     std::size_t column,
+                     std::shared_ptr<payload_source> payload,
+                     rmm::device_async_resource_ref mr)
+    : _description{std::move(description)}, _column{column}, _payload{std::move(payload)}, _mr{mr}
+  {
+    auto const& col = this->column();
+    _kept_leaf.reserve(col.leaves.size());
+    for (auto const& leaf : col.leaves) {
+      _kept_leaf.push_back(leaf.node_index < col.nodes.size() &&
+                           col.nodes[leaf.node_index].op == "dictionary");
+    }
+  }
+
+  [[nodiscard]] const hpln_column_description& column() const noexcept override
+  {
+    return _description->columns[_column];
+  }
+
+  const std::byte* device_bytes(std::size_t leaf,
+                                std::size_t buffer,
+                                std::uint64_t offset,
+                                std::uint64_t size,
+                                rmm::cuda_stream_view stream) override
+  {
+    auto const& range = buffer_range(leaf, buffer);
+    check_range(offset, size, range.size, "leaf buffer");
+    auto const begin = range.payload_offset + offset;
+    if (auto const* base = _payload->device_base()) { return base + begin; }
+    if (size == 0) { return nullptr; }
+    return ranges_of(leaf).stage(*_payload, begin, size, stream, _mr);
+  }
+
+  /// Copies from the staged bytes when they cover the request. Otherwise the bytes pass through a
+  /// device buffer that is freed before returning (payload_source only reads to the device).
+  /// Waits for the stream either way.
+  void host_bytes(std::size_t leaf,
+                  std::size_t buffer,
+                  std::uint64_t offset,
+                  std::uint64_t size,
+                  void* dst,
+                  rmm::cuda_stream_view stream) override
+  {
+    auto const& range = buffer_range(leaf, buffer);
+    check_range(offset, size, range.size, "leaf buffer");
+    if (size == 0) { return; }
+    auto const begin = range.payload_offset + offset;
+
+    rmm::device_buffer bounce;
+    const std::byte* src = nullptr;
+    if (auto const* base = _payload->device_base()) {
+      src = base + begin;
+    } else if (src = ranges_of(leaf).find(begin, size); src == nullptr) {
+      bounce = rmm::device_buffer{size, stream, _mr};
+      _payload->read_to_device(begin, size, bounce.data(), stream);
+      src = static_cast<const std::byte*>(bounce.data());
+    }
+    cuda_try(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream.value()),
+             "copy of leaf bytes to the host");
+    stream.synchronize();
+  }
+
+  const std::byte* validity_bytes(std::uint64_t offset,
+                                  std::uint64_t size,
+                                  rmm::cuda_stream_view stream) override
+  {
+    auto const& col = column();
+    check_range(offset, size, col.validity_size, "validity mask");
+    auto const begin = col.validity_payload_offset + offset;
+    if (auto const* base = _payload->device_base()) { return base + begin; }
+    if (size == 0) { return nullptr; }
+    return _transient.stage(*_payload, begin, size, stream, _mr);
+  }
+
+  [[nodiscard]] rmm::device_async_resource_ref mr() const noexcept override { return _mr; }
+
+  /// Frees everything staged except the kept dictionary keys. Pointers into the freed bytes are
+  /// dead; work already enqueued on the stream they were staged on is unaffected, as with any
+  /// stream-ordered free.
+  void release_transient() noexcept { _transient.clear(); }
+
+  /// Device bytes currently staged.
+  [[nodiscard]] std::size_t bytes_held() const noexcept
+  {
+    return _kept.bytes_held() + _transient.bytes_held();
+  }
+
+ private:
+  [[nodiscard]] hpln_buffer_range const& buffer_range(std::size_t leaf, std::size_t buffer) const
+  {
+    auto const& leaves = column().leaves;
+    if (leaf >= leaves.size() || buffer >= leaves[leaf].buffers.size()) {
+      throw std::out_of_range("chunk decode: no buffer " + std::to_string(buffer) + " of leaf " +
+                              std::to_string(leaf));
+    }
+    return leaves[leaf].buffers[buffer];
+  }
+
+  [[nodiscard]] staged_ranges& ranges_of(std::size_t leaf)
+  {
+    return _kept_leaf[leaf] ? _kept : _transient;
   }
 
   std::shared_ptr<const hpln_description> _description;
   std::size_t _column;
   std::shared_ptr<payload_source> _payload;
   rmm::device_async_resource_ref _mr;
-  std::map<std::uint64_t, interval> _staged;  ///< keyed by the interval's first payload byte
-  std::vector<rmm::device_buffer> _retired;
-  std::size_t _bytes_held{0};
+  std::vector<bool> _kept_leaf;  ///< per leaf: its buffers are staged for the access's lifetime
+  staged_ranges _kept;
+  staged_ranges _transient;
 };
 
 void check_cursor_arguments(std::shared_ptr<const hpln_description> const& description,
@@ -231,7 +299,7 @@ bool is_delta_type(cudf::data_type type)
 
 }  // namespace
 
-// Not declared in chunk_decoders.hpp: test_chunk_cursor declares these two itself to exercise
+// Not declared in chunk_decoders.hpp: test_chunk_cursor declares these three itself to exercise
 // the staging without a decoder.
 
 /// The leaf_access a cursor over `column` of `description` hands to its decoder.
@@ -246,11 +314,17 @@ std::unique_ptr<leaf_access> make_staged_leaf_access(
     std::move(description), column, std::move(payload), mr);
 }
 
-/// Device bytes staged by an access made by make_staged_leaf_access.
+/// Device bytes currently staged by an access made by make_staged_leaf_access.
 std::size_t staged_bytes_held(leaf_access const& access)
 {
   auto const* staged = dynamic_cast<staged_leaf_access const*>(&access);
   return staged != nullptr ? staged->bytes_held() : 0;
+}
+
+/// What decompress_column_chunks does to its cursor's access at the end of every call.
+void release_transient_staging(leaf_access& access)
+{
+  if (auto* staged = dynamic_cast<staged_leaf_access*>(&access)) { staged->release_transient(); }
 }
 
 value_plan classify_value_plan(hpln_column_description const& column)
@@ -423,6 +497,13 @@ cudf::size_type decompress_column_chunks(compressed_column_cursor& cursor,
       "decompress_column_chunks: the column's plan is not chunk-decodable");
   }
   if (take == 0) { return 0; }
+
+  // Whatever this call stages is freed when it returns, so the cursor's footprint does not grow
+  // with the rows read through it.
+  struct release_on_exit {
+    chunk::staged_leaf_access& access;
+    ~release_on_exit() { access.release_transient(); }
+  } const release{impl.access};
 
   auto const rows = impl.decoder->decode(impl.access, span, dst, stream);
   if (rows > 0) { chunk::write_validity(impl.access, span.first_row(), rows, dst, stream); }
