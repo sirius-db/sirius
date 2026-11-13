@@ -22,25 +22,17 @@ You are identifying optimization targets in Sirius, a GPU-accelerated SQL query 
 
 Never claim an optimization improved or regressed performance based solely on profiled timings. The profiled data tells you what changed internally; the non-profiled timings tell you whether it actually got faster.
 
-## STEP 1: Confirm Profiles with the User (MANDATORY)
+## STEP 1: Select Profiles
 
-**Before running any analysis, you MUST confirm with the user which profiles to analyze.** Do NOT proceed to STEP 2 until the user has explicitly confirmed.
-
-1. **List available profiles.** Run this to show the user what's available:
-   ```bash
-   ls -d reports/*/
-   ```
-
-2. **Present the options to the user.** Show them the available report directories and ask:
-   - Which report directory (or profile path) do they want to analyze?
-   - Do they want all queries, or specific ones (e.g., `1 3 10`)?
-   - Or do they want to generate new profiles first?
-
-3. **Wait for explicit confirmation.** Do NOT run `nsys_hotspots.sh` until the user has told you which profiles and which queries to use. Even if there is only one report directory, confirm it with the user first.
+Use the report directory, profile path, and query subset supplied by the user. A report directory's
+`profiles/` subdirectory contains its raw profiles. If no query subset is specified, analyze all
+queries in the selected input. If the input is unclear, inspect available report directories and
+ask only when the intended profiles remain ambiguous. Generate new profiles when requested or
+needed for the task; resolve missing inputs and potentially costly generation before doing so.
 
 ## STEP 2: Run the Analysis
 
-Once the user has told you what to analyze, run `nsys_hotspots.sh`:
+Run `nsys_hotspots.sh` on the selected input:
 
 ```bash
 # Analyze all queries in a profile directory

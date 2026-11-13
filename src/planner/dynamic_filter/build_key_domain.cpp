@@ -24,13 +24,12 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "helper/type_conversions.hpp"
+#include "parquet_multi_file_info.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_column_origin.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_registration.hpp"
-
-#include <parquet_multi_file_info.hpp>
 
 #include <algorithm>
 #include <optional>
@@ -53,6 +52,30 @@ std::vector<std::optional<scan_column_origin>> resolve_build_key_scan_columns(
       static_cast<std::size_t>(build_side.Cast<duckdb::BoundReferenceExpression>().Index());
     scans[condition_index] =
       resolve_scan_column_origin(*join.children[1], ordinal, origin_policy::row_subset);
+  }
+  return scans;
+}
+
+duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
+                                                    std::size_t output_ordinal,
+                                                    origin_policy policy) noexcept
+{
+  auto const origin = resolve_scan_column_origin(subtree, output_ordinal, policy);
+  return origin ? origin->get : nullptr;
+}
+
+std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
+  duckdb::LogicalComparisonJoin const& join, origin_policy policy)
+{
+  std::vector<duckdb::LogicalGet const*> scans(join.conditions.size(), nullptr);
+  if (join.children.size() != 2) { return scans; }
+  for (std::size_t condition_index = 0; condition_index < join.conditions.size();
+       ++condition_index) {
+    auto const& build_side = join.conditions[condition_index].GetRHS();
+    if (build_side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
+    auto const ordinal =
+      static_cast<std::size_t>(build_side.Cast<duckdb::BoundReferenceExpression>().Index());
+    scans[condition_index] = resolve_pass_through_scan(*join.children[1], ordinal, policy);
   }
   return scans;
 }
@@ -236,6 +259,18 @@ std::vector<op::dynamic_filter_domain_evidence> build_key_domain_evidence_for(
     join, [&](duckdb::LogicalGet const& get, std::size_t ordinal) {
       return evidence_for_column(get, ordinal, context, registry);
     });
+}
+
+duckdb_base_table_cardinality::duckdb_base_table_cardinality(
+  duckdb::ClientContext& context) noexcept
+  : _context{&context}
+{
+}
+
+std::optional<std::size_t> duckdb_base_table_cardinality::operator()(
+  duckdb::LogicalGet const& get) const noexcept
+{
+  return catalog_cardinality(get, *_context);
 }
 
 }  // namespace sirius::planner

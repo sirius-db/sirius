@@ -1,5 +1,4 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
-#include "io/kvikio/kvikio_context.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
@@ -22,6 +21,7 @@
 #include <cuda/stream>
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -381,11 +381,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       CHECK(facts.predicates.front().stage == sirius::op::predicate_stage::enforced);
   };
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer  = ingestible->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto prepare = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto prepared = prepare({});
     auto& file    = dynamic_cast<parquet_file_scan_info&>(*prepared);
     CHECK(file.requires_row_positions == virtual_row);
@@ -628,9 +628,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   else
     ingestible = make_ingestible(std::unique_ptr<iceberg_ingestible_table_info>(
       static_cast<iceberg_ingestible_table_info*>(info.release())));
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared                = prepare({});
   auto const preparation_bytes = prepared->preparation_bytes();
   if (!virtual_kind && mode != "parquet") {
@@ -764,12 +764,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     decoded_sources += !footer;
   };
   auto reader    = make_ingestible(std::move(info));
-  auto ioctx     = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx     = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer = reader->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   std::size_t groups = 0;
   while (auto prepare = reader->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto metadata = prepare({});
     groups += dynamic_cast<parquet_file_scan_info const&>(*metadata).row_groups.size();
     for (auto& split : coalescer->push(std::move(metadata)))
@@ -827,12 +827,12 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     REQUIRE(deletes);
     REQUIRE_FALSE(deletes->HasError());
   }
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(directory.file("deletes.parquet"));
   // Exercise the real V2 eager loader with unsorted, duplicate negative and valid
   // positions before either visibility implementation sees the sorted list.
-  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx.get(), {}, discovery);
+  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx, discovery);
   REQUIRE(payload);
   REQUIRE(payload->positional_deletes.at(path) == std::vector<int64_t>{-3, -1, -1, 11, 11});
   auto info                 = std::make_unique<iceberg_ingestible_table_info>();
@@ -880,7 +880,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   };
   auto reader  = make_ingestible(std::move(info));
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto metadata    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
   REQUIRE(file.row_groups.size() == (pruned ? 1 : 2));
@@ -990,7 +990,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       expected_rows.push_back(row);
     }
   }
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto context = sirius::test::get_registered_sirius_context(*con);
   auto* space  = context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, rmm::get_current_cuda_device().value());
@@ -1025,7 +1025,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     iceberg_delete_discovery discovery;
     discovery.positional_delete_files.push_back(directory.file(delete_name));
-    auto payload = load_delete_payload(*con->context, delete_name, ioctx.get(), {}, discovery);
+    auto payload = load_delete_payload(*con->context, delete_name, ioctx, discovery);
     REQUIRE(payload);
     REQUIRE(payload->positional_deletes.size() == paths.size());
     for (std::size_t file = 0; file < paths.size(); ++file) {
@@ -1079,8 +1079,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     auto reader    = make_ingestible(std::move(info));
     auto coalescer = reader->create_batch_coalescer();
     std::vector<std::unique_ptr<scan_info>> splits;
-    while (auto prepare = reader->next_split_provider(
-             [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    while (
+      auto prepare = reader->next_split_provider(
+        [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
       auto ready = coalescer->push(prepare({}));
       for (auto& split : ready)
         splits.push_back(std::move(split));
@@ -1176,8 +1177,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 {
   bool const hive = GENERATE(false, true);
   bool const bulk = GENERATE(false, true);
-  // No predicate, full/partial reader pushdown, and a residual-only predicate.
-  int const filter_kind = GENERATE(0, 1, 2, 3);
+  // No predicate, full/partial pushdown, residual only, dynamic only and zero survivors.
+  int const filter_kind = GENERATE(0, 1, 2, 3, 4, 5);
   CAPTURE(hive, bulk, filter_kind);
   sirius::test::scratch_dir directory("hive_execution_record");
   std::filesystem::create_directories(directory.path() / "year=2024");
@@ -1206,38 +1207,52 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   }
   if (filter_kind) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    if (filter_kind != 3)
+    if (filter_kind != 3 && filter_kind != 4)
       info->table_filters->PushFilter(
         duckdb::ProjectionIndex(1),
         sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
-                                      duckdb::Value::INTEGER(100)));
-    if (filter_kind >= 2)
+                                      duckdb::Value::INTEGER(filter_kind == 5 ? 10000 : 100)));
+    if (filter_kind >= 2 && filter_kind != 5)
       info->table_filters->PushFilter(
         duckdb::ProjectionIndex(2), sirius::test::null_filter(duckdb::LogicalType::INTEGER, true));
+  }
+  std::optional<sirius::op::sirius_dynamic_filter_set::producer> dynamic_producer;
+  if (filter_kind == 4) {
+    using namespace sirius::op;
+    info->sirius_dynamic_filters = std::make_shared<sirius_dynamic_filter_set>();
+    dynamic_producer.emplace(info->sirius_dynamic_filters->register_producer({0}));
+    std::vector<zone_map_entry> zones;
+    zones.push_back({std::make_unique<cudf::numeric_scalar<int32_t>>(11, true),
+                     std::make_unique<cudf::numeric_scalar<int32_t>>(301, true)});
+    REQUIRE(dynamic_producer->push_filter(
+      0, std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones))));
+    dynamic_producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
   }
   auto counters            = std::make_shared<physical_check_counters>();
   counters->track_units    = true;
   info->profiles->counters = counters;
   int residual_calls = 0, decisions = 0;
   counters->parquet_filter_for_testing = [&](bool filtered, uint64_t rows) {
-    CHECK(filtered == (filter_kind == 1 || filter_kind == 2));
-    CHECK(rows == (filter_kind == 1 || filter_kind == 2 ? 2 : 1000));
+    CHECK(filtered == (filter_kind == 1 || filter_kind == 2 || filter_kind == 4));
+    CHECK(rows == (filter_kind == 5                       ? 0
+                   : filter_kind == 4                     ? 291
+                   : filter_kind == 1 || filter_kind == 2 ? 2
+                                                          : 1000));
   };
   counters->scan_residual_for_testing = [&](auto const& pending) {
     ++residual_calls;
-    // Both bulk routes retain legacy authority, including the inline Hive decision.
-    REQUIRE(pending.size() == (bulk && filter_kind == 2 ? 2 : 1));
+    REQUIRE(pending.size() == 1);
   };
   counters->scan_execution_for_testing = [&](bool authority, auto const& facts) {
     ++decisions;
-    CHECK(authority == !bulk);
+    CHECK(authority);
     CHECK(facts.whole_static_complete == (hive || filter_kind < 2));
     CHECK(facts.projection_complete == hive);
   };
   auto reader  = make_ingestible(std::move(info));
   auto ioctx   = std::make_shared<sirius::test::tracking_kvikio_context>(bulk);
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = reader->create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
   for (auto& split : coalescer->flush())
@@ -1251,8 +1266,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto batch =
     reader->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
   REQUIRE(batch.execution);
-  CHECK(batch.execution->authoritative == !bulk);
-  auto const input_rows = filter_kind == 0           ? 1000
+  CHECK(batch.execution->authoritative);
+  auto const input_rows = filter_kind == 5           ? 0
+                          : filter_kind == 4         ? (hive ? 290 : 291)
+                          : filter_kind == 0         ? 1000
                           : filter_kind == 3         ? (hive ? 999 : 1000)
                           : hive && filter_kind == 2 ? 1
                                                      : 2;
@@ -1268,6 +1285,11 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     std::iota(expected.begin(), expected.end(), 0);
     if (filter_kind == 3) expected.erase(expected.begin() + 301);
   }
+  if (filter_kind == 4) {
+    expected.resize(290);
+    std::iota(expected.begin(), expected.end(), 11);
+  }
+  if (filter_kind == 5) expected.clear();
   CHECK(host_column<int32_t>(output->view().column(0), stream) == expected);
   if (hive)
     CHECK(host_column<int32_t>(output->view().column(1), stream) ==
@@ -1348,9 +1370,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       std::make_shared<std::vector<int64_t> const>(
         deleted_row < 0 ? std::vector<int64_t>{} : std::vector<int64_t>{deleted_row})));
   auto reader  = make_ingestible(std::move(info));
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare = reader->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto metadata    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
   CHECK_FALSE(file.position_filter_eligible);
@@ -1498,9 +1520,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   };
   auto reader = make_ingestible(std::move(info));
   reader->attach_preparation_ledger(ledger);
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
   auto claimed = reader->try_claim_split(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(std::holds_alternative<preparation_job>(claimed));
   auto work = std::move(std::get<preparation_job>(claimed));
   work.unit = std::make_shared<preparation_unit>(work.requirement->key, work.requirement->required);

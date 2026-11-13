@@ -28,7 +28,10 @@ namespace sirius::io::rest::s3 {
 /// `https` and anything past `host[:port]` (path, query, fragment) is rejected. This is the
 /// parser the SigV4 authorizers construct from; callers that validate a configuration before
 /// any backend exists use the same rules through this function.
-/// @throws sirius::io::credential_error on an empty or malformed endpoint.
+/// @throws cucascade::io::credential_error on an empty or malformed endpoint.
+///
+/// cuCascade's SigV4 authorizer has the same parser but does not export it; this copy can go
+/// once cuCascade exposes it in a public header.
 [[nodiscard]] std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint);
 
 }  // namespace sirius::io::rest::s3

@@ -20,6 +20,7 @@
 #include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -118,7 +119,13 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
+
+/// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
+/// table into one scan and a per-key MIN/MAX aggregate.
+constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
+
+/// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
@@ -146,7 +153,7 @@ constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
+  /// Construct defaults with a shared batch size and 8x BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -222,9 +229,12 @@ struct operator_params {
   /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
   bool enable_dynamic_filter_multi_partition = true;
 
-  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
-  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
-    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
+  /// Saturate overflow; YAML and SQL cannot override the budget independently.
+  [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
+  {
+    return memory::saturating_mul(4, scan_task_batch_size);
+  }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
@@ -274,22 +284,32 @@ struct operator_params {
 
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
   /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
-  /// When on, pin_table observes every column it is not already asked to observe; an observed
-  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
-  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
-  /// late materialization asks for.
+  /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
+  /// late materialization is on); an observed column must be an integer column without a repeated
+  /// value in any chunk, or any column of a table under late_mat::small_table_max_rows rows, to
+  /// stay a candidate. When off, the planner ignores pin-time facts and the pin observes nothing,
+  /// so late materialization gets no proof either.
   bool prove_unique_keys{true};
 
   /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
-  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
-  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
-  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
-  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
-  /// materialization or join-key proofs asked for it.
+  /// sorts a whole column when its chunks overlap in range. Integer columns take priority over the
+  /// others when the cap is short, and earlier columns over later ones; the check's peak GPU use
+  /// is about three times the cap. A column that no longer fits stays unproven. 0 = a share
+  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
   uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
+  /// same. See `reuse_delim_rows_for_subquery_aggregates`.
+  bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
+
+  /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
+  /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
+  /// `rewrite_correlated_inequality_exists`.
+  bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
@@ -394,10 +414,7 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
-  [[nodiscard]] int max_concurrent_queries() const noexcept
-  {
-    return _scan_manager_config.max_concurrent_queries;
-  }
+  [[nodiscard]] int max_concurrent_queries() const noexcept { return _max_concurrent_queries; }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -415,7 +432,7 @@ struct sirius_config {
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
   /// disagree.
-  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  [[nodiscard]] const cucascade::io::cache::config& get_cache_config() const noexcept
   {
     return _scan_manager_config.cache;
   }
@@ -427,7 +444,7 @@ struct sirius_config {
 
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
-  void set_object_store_config(io::object_store_config config) noexcept;
+  void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -456,25 +473,27 @@ struct sirius_config {
     return _compression_config;
   }
 
-  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
-  /// Limits each query to the first @c gpus_per_query entries of the sorted
-  /// active-GPU list; the rest are left available for future concurrent queries.
+  /// Initial GPU admission cap per query. 0 = use all active GPUs (default).
+  /// Initially limits admission to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list. Admission can then add GPUs holding compressed GPU-tier pins
+  /// that match a scanned source, even if those pins ultimately do not serve the scan.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the uring prefetch reactors, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::native (the
+  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
+  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -487,6 +506,8 @@ struct sirius_config {
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
+  /// Query admission limit (`sirius.max_concurrent_queries`).
+  int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};

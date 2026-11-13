@@ -28,6 +28,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -78,12 +79,12 @@ single_join_fixture create_single_join(
                            duckdb::LogicalType::INTEGER,
                            duckdb::LogicalType::INTEGER};
 
-  auto two_ints   = sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+  auto two_ints = sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
     duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER});
-  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
-    SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
-  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
-    SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
+  auto left_child =
+    duckdb::make_uniq<test_physical_operator>(SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
+  auto right_child =
+    duckdb::make_uniq<test_physical_operator>(SiriusPhysicalOperatorType::PROJECTION, two_ints, 0);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.emplace_back(

@@ -3,7 +3,12 @@ target_sources(
   PRIVATE aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
+          aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/aggregate_types.cpp
+          window/cumulative.cpp
+          window/float_extremum.cpp
+          window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
@@ -37,6 +42,9 @@ target_sources(
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_scan_core.cpp
           scan/materialization_contract.cpp
+          scan/shared_materializer.cpp
+          scan/row_lineage.cpp
+          scan/row_lineage.cu
           scan/positional_visibility.cpp
           scan/positional_visibility.cu
           scan/field_id_mapping.cpp
@@ -46,6 +54,7 @@ target_sources(
           scan/table_scan/owned_arrow_scan.cpp
           scan/table_scan/split_validation.cpp
           scan/table_scan/bound_read_view.cpp
+          scan/table_scan/field_mapper.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
           scan/parquet_delete_reader.cpp
@@ -74,6 +83,7 @@ target_sources(
           sirius_physical_gpu_values.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp
+          join_cross_schedule.cpp
           sirius_physical_hash_join.cpp
           sirius_physical_limit.cpp
           sirius_physical_merge_sort.cpp
@@ -94,6 +104,7 @@ target_sources(
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
           sirius_physical_window.cpp
+          aggregate/average.cu
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu

@@ -30,6 +30,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::ORDER_BY: return "ORDER_BY";
     case SiriusPhysicalOperatorType::LIMIT: return "LIMIT";
     case SiriusPhysicalOperatorType::LIMIT_PERCENT: return "LIMIT_PERCENT";
+    case SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT: return "UNORDERED_STREAMING_LIMIT";
     case SiriusPhysicalOperatorType::STREAMING_LIMIT: return "STREAMING_LIMIT";
     case SiriusPhysicalOperatorType::RESERVOIR_SAMPLE: return "RESERVOIR_SAMPLE";
     case SiriusPhysicalOperatorType::STREAMING_SAMPLE: return "STREAMING_SAMPLE";

@@ -20,14 +20,13 @@
 // GpuExecutionFixture runs each query on the GPU -- asserting one GPU execution and ZERO fallbacks
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
 // meaningful: a silent CPU fallback would still produce the right answer, so a plain result check
-// would pass whether or not the operator existed. The rest of the set-operation family is asserted
-// the other way round, with expect_plan_fallback_matches_cpu -- those shapes are refused during
-// plan generation, which moves `fallbacks` and leaves `executions` flat, so expect_gpu_fallback
-// (which requires the *runtime* counter to move) would never hold for them.
+// would pass whether or not the operator existed. Distinct EXCEPT and INTERSECT also use this
+// comparator to verify that their hash join and DISTINCT execute on the GPU.
 //
-// NOT covered here (needs a fixture with a small scan_task_batch_size; the shared integration
-// config uses 100 MB, so these fixtures are one batch per arm): multi-batch streaming,
-// unequal-length arms across many batches, and multi-GPU device placement.
+// The shared integration config uses a 100 MB scan_task_batch_size, so the fixture tables are one
+// batch per arm. Only the many-batch distinct EXCEPT / INTERSECT case lowers it. NOT covered here:
+// multi-batch UNION streaming, unequal-length arms across many batches, and multi-GPU device
+// placement.
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -35,8 +34,10 @@
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -188,7 +189,7 @@ TEST_CASE_METHOD(UnionFixture,
     "SELECT k, count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t GROUP BY k");
   compare_gpu_vs_cpu("SELECT sum(k) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t");
 
-  // Ordering downstream, where UNION's NO_ORDER source_order() decides the plan's preservation.
+  // An explicit downstream ORDER BY establishes the union result's sequence.
   compare_gpu_vs_cpu_ordered(
     "SELECT k FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t ORDER BY k NULLS LAST");
   compare_gpu_vs_cpu_ordered(
@@ -248,16 +249,127 @@ TEST_CASE_METHOD(UnionFixture,
 }
 
 TEST_CASE_METHOD(UnionFixture,
-                 "gpu_execution declines the rest of the set-operation family",
-                 "[integration][gpu_execution][union][union_all]")
+                 "gpu_execution distinct EXCEPT and INTERSECT match the CPU",
+                 "[integration][gpu_execution][set_operation]")
 {
-  // EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not error, and not
-  // silently return the union of both inputs. Both are refused during plan generation
-  // (`plan_except_intersect` refuses the distinct forms), so this asserts a plan-time fallback.
-  // The helper also compares against the CPU result, which is what pins "still the right answer"
-  // without a hand-rolled second check.
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
-  expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+  for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+    compare_gpu_vs_cpu("SELECT k FROM ua " + keyword +
+                       " (WITH m AS MATERIALIZED (SELECT k, v FROM ub) "
+                       "SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+  }
+}
+
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct set operations deduplicate surviving composite rows",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  run_ok("CREATE TABLE setop_left (k INTEGER, v VARCHAR);");
+  run_ok("CREATE TABLE setop_right (k INTEGER, v VARCHAR);");
+  run_ok(
+    "INSERT INTO setop_left VALUES "
+    "(1, 'a'), (1, 'a'), (2, 'b'), (2, 'b'), (NULL, 'n'), (NULL, 'n'), "
+    "(NULL, NULL), (NULL, NULL), (3, NULL), (3, NULL);");
+  run_ok(
+    "INSERT INTO setop_right VALUES "
+    "(1, 'a'), (1, 'a'), (NULL, 'n'), (NULL, 'n'), (NULL, NULL), (3, 'other');");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM setop_right");
+  compare_gpu_vs_cpu("SELECT k, v FROM setop_left " + keyword + " SELECT k, v FROM uempty");
+  compare_gpu_vs_cpu("SELECT k, v FROM uempty " + keyword + " SELECT k, v FROM setop_right");
+}
+
+// The DISTINCT over a distinct set operation plans no aggregate of its own, so the set operation's
+// deduplication alone must remove the duplicates. DISTINCTs that can still remove rows keep theirs.
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution DISTINCT over set operations removes every duplicate",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  run_ok("CREATE TABLE dup_left (k INTEGER, v VARCHAR);");
+  run_ok("CREATE TABLE dup_right (k INTEGER, v VARCHAR);");
+  run_ok(
+    "INSERT INTO dup_left VALUES (1, 'a'), (1, 'a'), (1, 'b'), (2, 'a'), (2, 'a'), "
+    "(NULL, 'n'), (NULL, 'n'), (3, NULL), (3, NULL), (4, 'x');");
+  run_ok("INSERT INTO dup_right VALUES (1, 'b'), (4, 'x'), (4, 'x'), (5, 'y');");
+  run_ok("CHECKPOINT;");
+
+  for (std::string const keyword : {"EXCEPT", "INTERSECT"}) {
+    CAPTURE(keyword);
+    std::string const setop =
+      "SELECT k, v FROM dup_left " + keyword + " SELECT k, v FROM dup_right";
+    compare_gpu_vs_cpu(setop);
+    compare_gpu_vs_cpu("SELECT count(*) FROM (" + setop + ")");
+    compare_gpu_vs_cpu_ordered(setop + " ORDER BY k NULLS FIRST, v NULLS FIRST");
+    compare_gpu_vs_cpu("SELECT v, k FROM (" + setop + ")");
+    compare_gpu_vs_cpu("SELECT DISTINCT k FROM (" + setop + ")");
+    compare_gpu_vs_cpu("SELECT DISTINCT * FROM (SELECT k, v FROM dup_left " + keyword +
+                       " ALL SELECT k, v FROM dup_right)");
+  }
+  compare_gpu_vs_cpu(
+    "(SELECT k, v FROM dup_left EXCEPT SELECT k, v FROM dup_right) "
+    "INTERSECT SELECT k, v FROM dup_left");
+}
+
+// The fixture tables above fit in one batch and take the whole-build BUILD_PROBE join. Here both
+// inputs span many batches and hash partitions, and a zero hash-table cap moves the join to its
+// partitioned STANDARD path. Two keys carry NULLs and the DOUBLE column mixes -0.0, 0.0 and NaN.
+TEST_CASE_METHOD(UnionFixture,
+                 "gpu_execution distinct EXCEPT and INTERSECT over many batches and partitions",
+                 "[integration][gpu_execution][set_operation][setop_distinct]")
+{
+  bool const standard_join = GENERATE(false, true);
+  INFO("STANDARD join path: " << standard_join);
+
+  run_ok(
+    "CREATE TABLE sdl AS SELECT "
+    "  CASE WHEN i % 97 = 0 THEN NULL ELSE i % 500 END AS k1, "
+    "  CASE WHEN i % 89 = 0 THEN NULL ELSE i % 7 END AS k2, "
+    "  CASE i % 11 WHEN 0 THEN -(0.0::DOUBLE) WHEN 1 THEN 0.0::DOUBLE "
+    "    WHEN 2 THEN 'NaN'::DOUBLE ELSE (i % 11)::DOUBLE END AS d "
+    "FROM range(200000) t(i);");
+  run_ok(
+    "CREATE TABLE sdr AS SELECT "
+    "  CASE WHEN i % 83 = 0 THEN NULL ELSE (i * 3) % 400 END AS k1, "
+    "  CASE WHEN i % 79 = 0 THEN NULL ELSE i % 5 END AS k2, "
+    "  CASE i % 13 WHEN 0 THEN 0.0::DOUBLE WHEN 1 THEN 'NaN'::DOUBLE "
+    "    WHEN 2 THEN -(0.0::DOUBLE) ELSE (i % 13)::DOUBLE END AS d "
+    "FROM range(150000) t(i);");
+  run_ok("CREATE TABLE sdk AS SELECT i AS k1 FROM range(0, 500, 3) t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting const scan_batches{
+    *con, "scan_task_batch_size", std::uint64_t{65536}};
+  sirius::test::scoped_sirius_setting const partitions{
+    *con, "hash_partition_bytes", std::uint64_t{65536}};
+  sirius::test::scoped_sirius_setting const build_cap{
+    *con, "max_build_hash_table_bytes", standard_join ? std::uint64_t{0} : std::uint64_t{1} << 30};
+
+  std::string const left  = "SELECT k1, k2, d FROM sdl";
+  std::string const right = "SELECT k1, k2, d FROM sdr";
+  for (auto const& keywords :
+       std::array{std::pair{"EXCEPT", "INTERSECT"}, std::pair{"INTERSECT", "EXCEPT"}}) {
+    std::string const keyword = keywords.first;
+    std::string const other   = keywords.second;
+    CAPTURE(keyword);
+    auto const setop = [&](std::string const& lhs, std::string const& rhs) {
+      return lhs + " " + keyword + " " + rhs;
+    };
+    compare_gpu_vs_cpu_canonical(setop(left, right));
+    compare_gpu_vs_cpu_canonical(setop(right, left));
+    compare_gpu_vs_cpu_canonical(setop(left, right + " WHERE false"));
+    // A join above the set operation consumes its partitioned output.
+    compare_gpu_vs_cpu("SELECT s.k2, count(*), count(s.d) FROM (" + setop(left, right) +
+                       ") s JOIN sdk ON s.k1 = sdk.k1 GROUP BY s.k2");
+    // A set operation as the left input of the other one.
+    compare_gpu_vs_cpu_canonical("(" + setop(left, right) + ") " + other + " " + left +
+                                 " WHERE k2 < 4");
+  }
 }
 
 TEST_CASE_METHOD(UnionFixture,
@@ -550,4 +662,56 @@ TEST_CASE_METHOD(UnionFloatFixture,
     compare_gpu_vs_cpu_canonical("SELECT f FROM fa UNION SELECT f FROM fb");
     compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT f FROM fa UNION SELECT f FROM fb) t");
   }
+}
+
+namespace {
+
+class DistinctSetOperationFloatFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  DistinctSetOperationFloatFixture()
+  {
+    run_ok("CREATE TABLE set_float_l (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_r (d DOUBLE, f REAL);");
+    run_ok("CREATE TABLE set_float_no_nan (d DOUBLE, f REAL);");
+    run_ok(
+      "INSERT INTO set_float_l VALUES "
+      "(-(0.0::DOUBLE), -(0.0::REAL)), (0.0, 0.0), "
+      "('NaN'::DOUBLE, 'NaN'::REAL), ('NaN'::DOUBLE, 'NaN'::REAL), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (NULL, NULL), "
+      "(1.5, 1.5), (2.5, 2.5), (2.5, 2.5);");
+    run_ok(
+      "INSERT INTO set_float_r VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), (0.0, 0.0), "
+      "(-('NaN'::DOUBLE), -('NaN'::REAL)), (-('NaN'::DOUBLE), -('NaN'::REAL)), "
+      "('Infinity'::DOUBLE, 'Infinity'::REAL), ('-Infinity'::DOUBLE, '-Infinity'::REAL), "
+      "(NULL, NULL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5), (3.5, 3.5);");
+    run_ok(
+      "INSERT INTO set_float_no_nan VALUES "
+      "(0.0::DOUBLE, 0.0::REAL), ('Infinity'::DOUBLE, 'Infinity'::REAL), "
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL), (NULL, NULL), (1.5, 1.5), (3.5, 3.5);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(DistinctSetOperationFloatFixture,
+                 "gpu_execution distinct set operations match floating key equality",
+                 "[integration][gpu_execution][set_operation][setop_float]")
+{
+  std::string const column  = GENERATE("d", "f");
+  std::string const keyword = GENERATE("EXCEPT", "INTERSECT");
+  INFO(column << " " << keyword);
+  auto compare = [&](std::string const& left, std::string const& right) {
+    auto const sql =
+      "SELECT " + column + " FROM " + left + " " + keyword + " SELECT " + column + " FROM " + right;
+    compare_gpu_vs_cpu_canonical(sql);
+    compare_gpu_vs_cpu("SELECT count(*) FROM (" + sql + ") q");
+  };
+  compare("set_float_l", "set_float_r");
+  compare("set_float_r", "set_float_l");
+  // EXCEPT must retain one NaN here; the matching-arm case alone removes every left NaN.
+  compare("set_float_l", "set_float_no_nan");
+  compare("set_float_l", "set_float_r WHERE false");
 }

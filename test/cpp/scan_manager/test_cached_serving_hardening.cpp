@@ -67,6 +67,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/ioctx_resolver.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
@@ -379,7 +380,8 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
     std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
   }

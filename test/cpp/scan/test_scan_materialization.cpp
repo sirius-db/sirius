@@ -1,12 +1,11 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
-#include "io/io_errors.hpp"
-#include "io/kvikio/kvikio_context.hpp"
 #include "op/scan/arrow_materializer.hpp"
 #include "op/scan/field_id_mapping.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/table_scan/field_mapper.hpp"
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -22,6 +21,9 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/timestamp.hpp>
@@ -432,6 +434,24 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     {9, duckdb::LogicalType::BIGINT, {}, true},
     {4, duckdb::LogicalType::INTEGER, {}, false},
     {12, duckdb::LogicalType::INTEGER, duckdb::Value(duckdb::LogicalType::INTEGER), false}};
+  scan_plan mapped_layout;
+  mapped_layout.data_columns = {{0, "renamed_right"}, {1, "renamed_left"}, {2, "added"}};
+  physical_check_counters mapper_counts;
+  mapping_request request{
+    rule_set_id::iceberg_flat_v1, resolved.artifact, path, mapped_layout, program};
+  request.requirements = fields;
+  auto refused         = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<mapping_refusal>(refused));
+  CHECK(std::get<mapping_refusal>(refused).rule == refusal_rule::partition_constant_unproved);
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
+  std::unordered_set<std::string> proof{path};
+  request.files_without_partition_values = &proof;
+  auto accepted                          = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<std::shared_ptr<mapping_result const>>(accepted));
+  auto const& mapped = *std::get<std::shared_ptr<mapping_result const>>(accepted);
+  CHECK(mapped.compiled->read_names() == std::vector<std::string>{"right", "old.dot"});
+  CHECK(mapped.leaves == std::vector<std::vector<std::size_t>>{{1}, {0}});
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
   auto mapping = field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields);
   CHECK_FALSE(mapping.statistics_name(0));  // Widened value.
   CHECK_FALSE(mapping.statistics_name(1));  // Literal dot is not a nested path.
@@ -925,9 +945,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   info->field_mapping_requirements =
     std::vector<field_requirement>{{1, duckdb::LogicalType::BIGINT, {}, true}};
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare    = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);
@@ -959,9 +979,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
                  "[materialization][scan][mapping][adapter][integration][fw_s4]")
 {
-  auto defect = std::string{GENERATE(
+  auto defect               = std::string{GENERATE(
     "valid", "foreign_contract", "foreign_metadata", "missing_datasource", "foreign_identity")};
-  CAPTURE(defect);
+  bool const multiple_files = GENERATE(false, true);
+  CAPTURE(defect, multiple_files);
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
@@ -969,9 +990,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
   REQUIRE(written);
   REQUIRE_FALSE(written->HasError());
-  auto info                    = std::make_unique<parquet_ingestible_table_info>();
-  info->contract_id            = 92;
-  info->resolved_file_paths    = {path};
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 92;
+  info->resolved_file_paths = {path};
+  if (multiple_files) {
+    auto second = directory.file("second.parquet");
+    std::filesystem::copy_file(path, second);
+    info->resolved_file_paths.push_back(second);
+  }
   info->names                  = {"renamed"};
   info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
   info->column_ids             = {duckdb::ColumnIndex(0)};
@@ -986,9 +1012,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       std::move(metadata), identity, std::move(program), std::move(fields)));
   };
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare    = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared = prepare({});
   REQUIRE(prepared);
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
@@ -996,9 +1022,16 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(std::move(prepared));
+  if (multiple_files) {
+    auto second = prepare({});
+    REQUIRE(second);
+    for (auto& split : coalescer->push(std::move(second)))
+      splits.push_back(std::move(split));
+  }
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
-  REQUIRE(splits.size() == 1);
+  // File-specific mapped reader options retain the production grouping boundary.
+  REQUIRE(splits.size() == (multiple_files ? 2 : 1));
   auto& split = dynamic_cast<parquet_split_info&>(*splits.front());
   REQUIRE(split.field_mapping);
   REQUIRE(split.rg_slices.size() == 1);
@@ -1041,13 +1074,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     return;
   }
-  auto batch =
-    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
-  REQUIRE(batch.execution);
-  CHECK_FALSE(batch.execution->authoritative);
-  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
-  CHECK(output->num_rows() == 1);
-  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  for (auto const& split : splits) {
+    auto batch = ingestible->materialize_metadata_to_table(*split, *space, stream, false, nullptr);
+    REQUIRE(batch.execution);
+    CHECK(batch.execution->authoritative);
+    auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+    CHECK(output->num_rows() == 1);
+    CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -1106,9 +1140,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                                                       duckdb::Value::BIGINT(6000)));
   info->table_filters = std::move(filters);
   auto ingestible     = make_ingestible(std::move(info));
-  auto ioctx          = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx          = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare        = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(prepare);
   auto prepared    = prepare({});  // includes the footer AST name-resolution path
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
@@ -1155,14 +1189,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 namespace {
 // Exercise the production Iceberg wrapper with failures from an actual datasource,
 // after the independent Parquet footer has been prepared successfully.
-class failing_dv_context final : public sirius::io::ioctx {
+class failing_dv_context final : public cucascade::io::ioctx {
  public:
   enum class failure { corrupt, reader_io, object_changed, descriptor, cancelled, resource };
   explicit failing_dv_context(failure mode) : mode_(mode) {}
   ~failing_dv_context() override { pre_destroy(); }
-  sirius::io::io_context_type type() const noexcept override
+  cucascade::io::io_context_type type() const noexcept override
   {
-    return sirius::io::io_context_type::kvikio;
+    return cucascade::io::io_context_type::kvikio;
   }
   void shutdown() noexcept override {}
   bool supports(std::string_view) const noexcept override { return true; }
@@ -1170,13 +1204,13 @@ class failing_dv_context final : public sirius::io::ioctx {
   bool supports_host_to_device_read() const noexcept override { return false; }
   bool supports_vector_host_read() const noexcept override { return false; }
   bool supports_device_range_read() const noexcept override { return false; }
-  std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<cudf::io::text::byte_range_info const> ranges,
+  std::vector<cucascade::io::byte_range> align_and_coalesce(
+    std::span<cucascade::io::byte_range const> ranges,
     std::optional<size_t>) const noexcept override
   {
     return {ranges.begin(), ranges.end()};
   }
-  size_t host_read_io(sirius::io::io_object const& object,
+  size_t host_read_io(cucascade::io::io_object const& object,
                       size_t,
                       size_t bytes,
                       uint8_t* dst) override
@@ -1187,7 +1221,7 @@ class failing_dv_context final : public sirius::io::ioctx {
         throw sirius::transparent::classified_execution_error(
           sirius::transparent::late_failure_cause::reader_io, "DV read failed");
       case failure::object_changed:
-        throw sirius::io::object_changed_error(object.object_path(), "v1", "v2");
+        throw cucascade::io::object_changed_error(object.object_path(), "v1", "v2");
       case failure::cancelled:
         throw std::system_error(std::make_error_code(std::errc::operation_canceled));
       case failure::resource: throw std::bad_alloc();
@@ -1195,30 +1229,33 @@ class failing_dv_context final : public sirius::io::ioctx {
     }
     return 0;
   }
-  sirius::exec::semi_future<size_t> host_read_async_io(sirius::io::io_object const& object,
-                                                       size_t offset,
-                                                       size_t bytes,
-                                                       uint8_t* dst) noexcept override
+  cucascade::exec::semi_future<size_t> host_read_async_io(
+    cucascade::io::io_object const& object,
+    size_t offset,
+    size_t bytes,
+    uint8_t* dst,
+    cucascade::io::io_priority) noexcept override
   {
     try {
-      return sirius::exec::make_semi_future<size_t>(host_read_io(object, offset, bytes, dst));
+      return cucascade::exec::make_semi_future<size_t>(host_read_io(object, offset, bytes, dst));
     } catch (...) {
-      return sirius::exec::make_semi_future<size_t>(std::current_exception());
+      return cucascade::exec::make_semi_future<size_t>(std::current_exception());
     }
   }
-  sirius::exec::semi_future<size_t> mixed_readv_async_io(
-    sirius::io::io_object const&, std::vector<sirius::io::prepared_io_slice>&&) noexcept override
+  cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+    cucascade::io::io_object const&,
+    std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
   {
-    return sirius::exec::make_semi_future<size_t>(
+    return cucascade::exec::make_semi_future<size_t>(
       std::make_exception_ptr(std::logic_error("unexpected vectored DV read")));
   }
 
  protected:
-  std::shared_ptr<sirius::io::io_object> create_io_object(std::string path) override
+  std::shared_ptr<cucascade::io::io_object> create_io_object(std::string path) override
   {
     if (mode_ == failure::descriptor)
-      throw sirius::io::descriptor_mismatch_error("DV descriptor changed");
-    struct object final : sirius::io::io_object {
+      throw cucascade::io::descriptor_mismatch_error("DV descriptor changed");
+    struct object final : cucascade::io::io_object {
       std::string path;
       explicit object(std::string name) : path(std::move(name)) {}
       std::string const& raw_file_cache_id() const noexcept override { return path; }
@@ -1288,11 +1325,11 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
   info->profiles->counters     = counters;
   auto ingestible              = make_ingestible(std::move(info));
   ingestible->attach_preparation_ledger(ledger);
-  auto dataio = std::make_shared<sirius::io::kvikio_context>();
-  auto dvio   = std::make_shared<failing_dv_context>(mode);
-  auto claimed =
-    ingestible->try_claim_split([&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
-      return name == dvpath ? std::static_pointer_cast<sirius::io::ioctx>(dvio) : dataio;
+  auto dataio  = std::make_shared<cucascade::io::kvikio_context>();
+  auto dvio    = std::make_shared<failing_dv_context>(mode);
+  auto claimed = ingestible->try_claim_split(
+    [&](std::string_view name) -> std::shared_ptr<cucascade::io::ioctx> {
+      return name == dvpath ? std::static_pointer_cast<cucascade::io::ioctx>(dvio) : dataio;
     });
   REQUIRE(std::holds_alternative<preparation_job>(claimed));
   auto work = std::move(std::get<preparation_job>(claimed));
@@ -1313,7 +1350,7 @@ TEST_CASE("Iceberg Puffin wrapper retains failure diagnostics", "[materializatio
              mode == failure::descriptor));
     CHECK(error.cause == cause::reader_io);
     auto expected = mode == failure::object_changed
-                      ? std::string(sirius::io::object_changed_error(dvpath, "v1", "v2").what())
+                      ? std::string(cucascade::io::object_changed_error(dvpath, "v1", "v2").what())
                     : mode == failure::descriptor ? "DV descriptor changed"
                                                   : "DV read failed";
     CHECK(std::string(error.what()) == expected);
@@ -1414,9 +1451,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   }
   info->table_filters = std::move(filters);
   auto ingestible     = make_ingestible(std::move(info));
-  auto ioctx          = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx          = std::make_shared<cucascade::io::kvikio_context>();
   auto prepare        = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto prepared    = prepare({});
   auto const& file = dynamic_cast<parquet_file_scan_info const&>(*prepared);
   REQUIRE(file.field_mapping);

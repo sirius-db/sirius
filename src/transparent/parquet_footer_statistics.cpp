@@ -47,6 +47,7 @@ namespace sirius::transparent {
 namespace {
 
 struct file_statistics {
+  std::size_t num_rows = 0;
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
 };
 
@@ -110,6 +111,12 @@ struct cache_entry {
 std::mutex cache_mutex;
 std::unordered_map<std::string, cache_entry> cache;
 
+/// Total rows of the files of each scan add_statistics last covered, keyed like the merged
+/// statistics and bounded like them. Rewritten by every query that plans the scan, so a changed
+/// file shows up next time.
+std::mutex row_count_mutex;
+std::unordered_map<std::string, std::size_t> row_counts;
+
 std::string cache_key(std::string const& options_identity, std::string const& path)
 {
   auto key = options_identity;
@@ -139,12 +146,15 @@ std::shared_ptr<file_statistics const> statistics_of(
 {
   auto version = listed ? version_of(file.path, *listed) : std::nullopt;
   if (!listed) {
-    auto& fs = duckdb::FileSystem::GetFileSystem(context);
-    version = version_of(file.path, fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ)->Stats());
+    // A local file's metadata is one stat; opening it would cost an open and a close.
+    auto& fs            = duckdb::FileSystem::GetFileSystem(context);
+    auto const metadata = fs.GetStatsIfExists(file);
+    if (metadata) { version = version_of(file.path, *metadata); }
     if (auto hit = cached(key, version)) { return hit; }
   }
   auto result = std::make_shared<file_statistics>();
   duckdb::ParquetReader reader(context, file, options);
+  result->num_rows = reader.NumRows();
   for (auto const& column : reader.columns) {
     auto stats = reader.GetStatistics(context, column.name);
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
@@ -183,10 +193,19 @@ std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
   std::vector<std::size_t> unresolved;
   std::vector<std::string> keys(files.size());
   std::vector<std::optional<duckdb::FileMetadata>> listed(files.size());
+  auto& fs = duckdb::FileSystem::GetFileSystem(context);
   for (std::size_t i = 0; i < files.size(); ++i) {
     keys[i]   = cache_key(options_identity, files[i].path);
     listed[i] = listed_metadata(files[i]);
-    if (listed[i]) { result[i] = cached(keys[i], version_of(files[i].path, *listed[i])); }
+    if (listed[i]) {
+      result[i] = cached(keys[i], version_of(files[i].path, *listed[i]));
+    } else if (!duckdb::FileSystem::IsRemoteFile(files[i].path)) {
+      // A local file costs one stat to check, less than scheduling a task for it; only a miss,
+      // which reads a footer, goes to the executor.
+      if (auto const metadata = fs.GetStatsIfExists(files[i])) {
+        result[i] = cached(keys[i], version_of(files[i].path, *metadata));
+      }
+    }
     if (!result[i]) { unresolved.push_back(i); }
   }
   auto read = [&](std::size_t i) {
@@ -267,6 +286,59 @@ duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
     text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values));
 }
 
+/// The merged, verified statistics a scan was last given. An entry holds the very statistics
+/// objects it was merged from, so it matches only while every file's cache entry is unchanged: a
+/// rewritten file is read into a new object, and keeping the old one alive means its address cannot
+/// be reused.
+struct merge_entry {
+  std::vector<std::shared_ptr<file_statistics const>> files;
+  decltype(duckdb::MultiFileBindData::names) names;
+  decltype(duckdb::MultiFileBindData::types) types;
+  duckdb::Value statistics;
+};
+
+std::mutex merge_mutex;
+std::unordered_map<std::string, merge_entry> merges;
+
+/// Keyed by the paths the scan was given, so a glob that gains files replaces its entry instead of
+/// adding one; the entry itself says whether it fits the scan at hand.
+std::string merge_cache_key(duckdb::LogicalGet const& get)
+{
+  std::string key;
+  for (auto const& parameter : get.parameters) {
+    key += parameter.ToString();
+    key += '\0';
+  }
+  return key;
+}
+
+std::optional<duckdb::Value> cached_merge(
+  std::string const& key,
+  std::vector<std::shared_ptr<file_statistics const>> const& files,
+  duckdb::MultiFileBindData const& bind)
+{
+  std::lock_guard guard(merge_mutex);
+  auto const found = merges.find(key);
+  if (found == merges.end() || found->second.files != files || found->second.names != bind.names ||
+      found->second.types != bind.types) {
+    return std::nullopt;
+  }
+  return found->second.statistics;
+}
+
+void remember_merge(std::string const& key,
+                    std::vector<std::shared_ptr<file_statistics const>> const& files,
+                    duckdb::MultiFileBindData const& bind,
+                    duckdb::Value const& statistics)
+{
+  std::lock_guard guard(merge_mutex);
+  // A miss only costs a merge, so any entry may make room for a new set of paths.
+  if (!merges.contains(key) && merges.size() >= detail::merged_statistics_cache_capacity) {
+    merges.erase(merges.begin());
+  }
+  merges[key] = merge_entry{files, bind.names, bind.types, statistics};
+}
+
 bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
 {
   auto const& name = get.function.GetName().GetIdentifierName();
@@ -275,10 +347,13 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   if (!bind || !bind->file_list || !bind->initial_reader) { return false; }
   auto& options = bind->file_options;
   // DuckDB reads the statistics itself for one file or with union_by_name; a schema or bound
-  // schema renames columns, so the footers' names need not be the scan's.
-  if (bind->file_list->GetExpandResult() != duckdb::FileExpandResult::MULTIPLE_FILES ||
-      options.union_by_name || !options.column_statistics.IsNull() || !options.schema.empty() ||
-      !options.bound_schema.empty()) {
+  // schema renames columns, so the footers' names need not be the scan's. A one-file scan still
+  // gets its footer read, for the row count.
+  auto const expand      = bind->file_list->GetExpandResult();
+  bool const single_file = expand == duckdb::FileExpandResult::SINGLE_FILE;
+  if ((expand != duckdb::FileExpandResult::MULTIPLE_FILES && !single_file) ||
+      options.union_by_name || (!single_file && !options.column_statistics.IsNull()) ||
+      !options.schema.empty() || !options.bound_schema.empty()) {
     return false;
   }
   auto const* reader =
@@ -287,10 +362,30 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
   auto const files            = statistics_of_all(context, all_files, parquet_options);
-  auto statistics             = merged_statistics(*bind, files);
-  if (statistics.IsNull()) { return false; }
-  options.column_statistics = std::move(statistics);
-  options.VerifyColumnStatistics(bind->names, bind->types);
+  std::size_t total_rows      = 0;
+  for (auto const& file : files) {
+    total_rows += file->num_rows;
+  }
+  {
+    std::lock_guard guard(row_count_mutex);
+    auto const key = merge_cache_key(get);
+    if (!row_counts.contains(key) &&
+        row_counts.size() >= detail::merged_statistics_cache_capacity) {
+      row_counts.erase(row_counts.begin());
+    }
+    row_counts[key] = total_rows;
+  }
+  if (single_file) { return false; }
+  auto const merge_key = merge_cache_key(get);
+  if (auto const hit = cached_merge(merge_key, files, *bind)) {
+    options.column_statistics = *hit;
+  } else {
+    auto statistics = merged_statistics(*bind, files);
+    if (statistics.IsNull()) { return false; }
+    options.column_statistics = std::move(statistics);
+    options.VerifyColumnStatistics(bind->names, bind->types);
+    remember_merge(merge_key, files, *bind, options.column_statistics);
+  }
   return true;
 }
 
@@ -322,12 +417,36 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
   return added;
 }
 
+std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
+{
+  auto const& name = get.function.GetName().GetIdentifierName();
+  if (name != "read_parquet" && name != "parquet_scan") { return std::nullopt; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (!bind || !bind->file_list) { return std::nullopt; }
+  std::lock_guard guard(row_count_mutex);
+  auto const found = row_counts.find(merge_cache_key(get));
+  if (found == row_counts.end()) { return std::nullopt; }
+  return found->second;
+}
+
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths)
 {
   duckdb::ParquetOptions const options(context);
   std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
   return statistics_of_all(context, files, options).size();
+}
+
+std::size_t detail::merged_statistics_cache_size()
+{
+  std::lock_guard guard(merge_mutex);
+  return merges.size();
+}
+
+std::size_t detail::row_count_cache_size()
+{
+  std::lock_guard guard(row_count_mutex);
+  return row_counts.size();
 }
 
 }  // namespace sirius::transparent

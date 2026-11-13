@@ -68,7 +68,8 @@ class arrow_import_ingestible final : public gpu_ingestible {
     ::cuda::stream_ref,
     bool                                                   = false,
     std::shared_ptr<sirius::like_multiliteral_cache const> = {},
-    expression_query_policy                                = {}) override;
+    expression_query_policy                                = {},
+    scan_execution_context                                 = {}) override;
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&&,
     cucascade::memory::memory_space const&,

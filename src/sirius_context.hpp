@@ -30,6 +30,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -62,6 +63,7 @@
 
 namespace cucascade::memory {
 class small_pinned_host_memory_resource;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::vss {
@@ -70,7 +72,7 @@ class cuvs_index_cache;
 
 namespace sirius::memory {
 class numa_small_pinned_mr;
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius {
@@ -114,6 +116,8 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -168,6 +172,8 @@ class SiriusConnectionState : public ClientContextState {
     ++planning_generation_;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
 
@@ -213,11 +219,32 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
-  /// planning generation.
+  /// planning generation, together with the CTE reader proofs the pre-optimize hook staged for
+  /// the same optimizer run.
   void set_captured_plan(unique_ptr<LogicalOperator> plan)
   {
-    captured_plan_       = std::move(plan);
-    captured_generation_ = planning_generation_;
+    captured_plan_              = std::move(plan);
+    captured_generation_        = planning_generation_;
+    captured_cte_reader_proofs_ = std::move(staged_cte_reader_proofs_);
+    staged_cte_reader_proofs_.reset();
+  }
+
+  /// \brief Stage the CTE reader proofs collected by the pre-optimize hook. They are kept only if
+  /// the optimizer hook captures the plan of the same run (`set_captured_plan`).
+  void stage_cte_reader_proofs(
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> proofs) noexcept
+  {
+    staged_cte_reader_proofs_ = std::move(proofs);
+  }
+
+  /// \brief Consume the proofs captured with the plan iff they belong to the CURRENT planning
+  /// attempt. Without proofs, no CTE read is treated as restrictable.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const>
+  take_captured_cte_reader_proofs_if_current() noexcept
+  {
+    auto proofs = std::move(captured_cte_reader_proofs_);
+    captured_cte_reader_proofs_.reset();
+    return captured_generation_ == planning_generation_ ? std::move(proofs) : nullptr;
   }
 
   void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
@@ -255,6 +282,8 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
   }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
@@ -314,6 +343,9 @@ class SiriusConnectionState : public ClientContextState {
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
+  /// Delim-CTE reader proofs: staged by the pre-optimize hook, captured with the plan.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> staged_cte_reader_proofs_;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> captured_cte_reader_proofs_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -373,6 +405,8 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
+    uint64_t exists_minmax_rewrites = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
     uint64_t provider_internal_skips          = 0;
     uint64_t hidden_catalog_skips             = 0;
@@ -696,15 +730,11 @@ class SiriusContext : public ClientContextState {
     std::shared_ptr<sirius::pipeline::completion_handler> completion_;
   };
 
-  /// \brief Terminate the Sirius context, releasing all resources.
-  void terminate();
-
   /// \brief Restore the cuDF global pinned memory resource and threshold that
   ///        initialize() installed, before the slab allocator backing them is
-  ///        destroyed. Idempotent and no-op when nothing was installed, so it
-  ///        is safe to call from both terminate() (success path) and the
-  ///        failure/early-return paths. cuDF holds a non-owning reference to
-  ///        small_pinned_allocator_view_, so skipping this leaves it dangling.
+  ///        destroyed. Called by release_resources() during teardown and rollback;
+  ///        idempotent and no-op when nothing was installed. cuDF holds a non-owning
+  ///        reference to small_pinned_allocator_view_, so skipping this leaves it dangling.
   void restore_cudf_pinned_memory_resource() noexcept;
 
   /// \brief Log host and GPU memory pool stats (allocated, peak, and
@@ -831,6 +861,9 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
+  void record_exists_minmax_rewrites(uint64_t count) noexcept;
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -914,18 +947,19 @@ class SiriusContext : public ClientContextState {
   sirius::exec::query_admission admission_;
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
+  void release_resources() noexcept;
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
   // operator_params.use_hw_decompression is set and every GPU's CUDA driver
   // supports hardware decompression. Emplaced in initialize(), reset in
-  // terminate(); RAII restores the variable's prior state on destruction.
+  // release_resources(); RAII restores the variable's prior state on destruction.
   std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
   // after memory_manager_ so it is destroyed before it: each entry holds a
   // reservation into the manager's GPU spaces, so the manager must outlive the
-  // cache. Also reset explicitly in terminate() before the manager is torn down.
+  // cache. Also reset explicitly in release_resources() before the manager is torn down.
   std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
@@ -941,13 +975,13 @@ class SiriusContext : public ClientContextState {
   // single-pool path that hardcoded host_spaces[0] and funneled every
   // GPU's cuDF metadata allocation through one NUMA domain.
   // Destroyed before memory_manager_ (declared after it — reverse
-  // destruction order). prev_pinned_mr_ is restored in terminate() before
+  // destruction order). prev_pinned_mr_ is restored in release_resources() before
   // these are torn down to prevent cuDF from holding a dangling ref.
   std::unique_ptr<sirius::memory::numa_small_pinned_mr> small_pinned_allocator_;
   std::optional<sirius::memory::host_device_resource_view<sirius::memory::numa_small_pinned_mr>>
     small_pinned_allocator_view_{};
-  // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
-  // allocator are destroyed to prevent dangling references.
+  // Previous cuDF pinned resource and threshold — restored in release_resources() before the view
+  // and allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
@@ -961,9 +995,9 @@ class SiriusContext : public ClientContextState {
   /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
   /// before the subsystems that hold a pointer to it so it is destroyed after them.
   sirius::exec::query_lifecycle_registry query_lifecycle_;
-  // The creator and downgrade executors borrow this scheduler. Reverse member destruction
-  // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
-  // throws before terminate() can run; terminate() also stops their threads before reset.
+  // The creator and downgrade executors borrow this scheduler. release_resources()
+  // stops and destroys them before resetting the scheduler. Member declaration order
+  // preserves that lifetime relationship during destruction as well.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
@@ -976,6 +1010,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =

@@ -147,11 +147,13 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
   std::uint64_t validated_plan_pin_epoch,
-  std::optional<uint64_t> captured_transaction_id)
+  std::optional<uint64_t> captured_transaction_id,
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
     logical_plan_origin_(logical_plan_origin),
+    cte_reader_proofs_(std::move(cte_reader_proofs)),
     logical_original_views_(std::move(logical_original_views)),
     physical_original_views_(std::move(physical_original_views)),
     query_sql_(std::move(query_sql)),
@@ -302,7 +304,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // fall back to re-parsing + re-binding the unbound SQL statement, which
         // exercises the same bind path the very first run did.
         duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
-        auto rebuild_origin = candidate_origin::replan;
+        auto rebuild_origin   = candidate_origin::replan;
+        bool copied_from_hook = false;
         if (logical_plan_) {
           try {
             if (read_view_injection_stage == "execute_copy_fails") {
@@ -310,6 +313,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
             }
             fresh_plan     = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
             rebuild_origin = logical_plan_origin_;
+            copied_from_hook = rebuild_origin == candidate_origin::copy;
           } catch (duckdb::NotImplementedException&) {
             // Drop logical_plan_ — we know it can't be copied, so future executes
             // will skip straight to the replan path.
@@ -333,6 +337,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         }
         sirius::planner::sirius_physical_plan_generator planner(
           context.client, {{sirius::value_of(window->query_id())}, 0});
+        // A copy of the hook-captured plan keeps its CTE_REF indexes, so its proofs still hold.
+        if (copied_from_hook) { planner.cte_reader_proofs = cte_reader_proofs_; }
         sirius_plan = planner.create_plan(std::move(fresh_plan));
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);

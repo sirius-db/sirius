@@ -361,7 +361,8 @@ TEST_CASE("admission copies independent declarations without creating a uniquene
     {10, dynamic_filter_domain_source::pinned_parquet_exact, true},
     {20, dynamic_filter_domain_source::pinned_parquet_exact, true},
     {30, dynamic_filter_domain_source::pinned_parquet_exact, true}};
-  auto admitted = admit_dynamic_filter_keys(conditions, shapes, evidence, std::size_t{7});
+  auto admitted =
+    admit_dynamic_filter_keys(conditions, shapes, evidence, std::size_t{7}, {100, 200, 300});
   evidence.clear();
   dynamic_filter_publish_plan const plan{std::move(admitted), {}, {}};
   auto const& keys = plan.admitted_keys();
@@ -369,11 +370,13 @@ TEST_CASE("admission copies independent declarations without creating a uniquene
   CHECK(keys[0].planner_condition_index == 1);
   CHECK(keys[0].build_key_ordinal == 7);
   CHECK(keys[0].build_key_domain.cardinality == 20);
+  CHECK(keys[0].build_key_value_domain == 200);
   CHECK(keys[0].build_key_domain.declared_unique);
   CHECK(keys[0].build_key_proven_unique);
   CHECK(keys[1].planner_condition_index == 2);
   CHECK(keys[1].build_key_ordinal == 5);
   CHECK(keys[1].build_key_domain.cardinality == 30);
+  CHECK(keys[1].build_key_value_domain == 300);
   CHECK(keys[1].build_key_domain.declared_unique);
   CHECK_FALSE(keys[1].build_key_proven_unique);
 }
@@ -404,6 +407,20 @@ TEST_CASE("admission marks only the key whose build ordinal is the proven-unique
   }
 }
 
+TEST_CASE("value-domain estimates do not create coverage eligibility",
+          "[dynamic_filter][key_admission][domain_evidence]")
+{
+  auto const conditions = make_wrapped_equalities(2);
+  std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {100, 200});
+  REQUIRE(admitted.size() == 2);
+  for (std::size_t i = 0; i < admitted.size(); ++i) {
+    CHECK(admitted[i].build_key_value_domain == (i + 1) * 100);
+    CHECK(admitted[i].build_key_domain.cardinality == 0);
+    CHECK_FALSE(admitted[i].domain_gate_eligible());
+  }
+}
+
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
@@ -413,6 +430,11 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
   {
     std::vector<dynamic_filter_condition_shape> const bad_shapes(1, kDirectDirect);
     REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, bad_shapes, {}), std::invalid_argument);
+  }
+  SECTION("misaligned value domains")
+  {
+    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {100}),
+                      std::invalid_argument);
   }
   SECTION("misaligned domain cardinalities")
   {
@@ -580,6 +602,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  probe_storage_type,
                  key_shape,
                  domain,
+                 value_domain,
                  unique,
                  preserve_nulls]                             = expected_key(3);
     auto const [cardinality, domain_source, declared_unique] = expected_key(3).build_key_domain;
@@ -590,6 +613,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)probe_storage_type;
     (void)key_shape;
     (void)domain;
+    (void)value_domain;
     (void)unique;
     (void)preserve_nulls;
     (void)cardinality;
@@ -629,6 +653,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_domain                         = base;
     vary_domain.build_key_domain.cardinality = 1000;
     REQUIRE_FALSE(base == vary_domain);
+
+    auto vary_value_domain                   = base;
+    vary_value_domain.build_key_value_domain = 1000;
+    REQUIRE_FALSE(base == vary_value_domain);
 
     auto vary_proven_unique                    = base;
     vary_proven_unique.build_key_proven_unique = true;

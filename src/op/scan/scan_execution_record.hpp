@@ -13,7 +13,7 @@
 
 namespace sirius::op::scan {
 enum class filter_state;
-enum class execution_record_producer { parquet, legacy };
+enum class execution_record_producer { parquet, own_decoder, resident, legacy };
 enum class row_position_state { none, identity, runs, per_row, lost };
 
 // A binding retains the exact visibility input, not just a filename or an "applied" bit.

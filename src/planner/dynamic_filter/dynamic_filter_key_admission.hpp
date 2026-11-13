@@ -60,7 +60,8 @@ namespace sirius::planner {
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
   std::vector<op::dynamic_filter_domain_evidence> const& condition_domain_evidence,
-  std::optional<std::size_t> build_side_unique_column = std::nullopt);
+  std::optional<std::size_t> build_side_unique_column     = std::nullopt,
+  std::vector<std::size_t> const& condition_value_domains = {});
 
 /**
  * @brief Tests for safe probe filtering over direct, identical, membership-supported storage

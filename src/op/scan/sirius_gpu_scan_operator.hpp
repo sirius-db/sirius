@@ -94,6 +94,11 @@ struct read_retirement_test_hooks;
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
   /**
@@ -250,7 +255,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   // @p admit_resident performs the full resident witness check. The dequeue boundary uses it
   // before prepare_for_processing; execute only rechecks the query/contract freshness because the
   // immutable resident witness was already admitted for this input.
-  void validate_input(scan_operator_input const& input, bool admit_resident) const;
+  std::optional<split_validation> validate_input(scan_operator_input const& input,
+                                                 bool admit_resident) const;
 
   scan_manager::split_connector& get_split_connector();
 

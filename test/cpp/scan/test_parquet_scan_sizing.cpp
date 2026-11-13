@@ -17,6 +17,8 @@
 #include <cudf/strings/utilities.hpp>
 
 #include <catch.hpp>
+#include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
@@ -27,7 +29,6 @@
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/planner.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
@@ -103,9 +104,9 @@ struct scan_estimates {
 scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto file = task({});
@@ -210,8 +211,8 @@ void check_unmapped_carrier(scan::scan_plan const& plan,
 
 struct carrier_file_fixture {
   sirius::test::scratch_dir scratch{"parquet_carrier_sizing"};
-  std::shared_ptr<sirius::io::kvikio_context> ioctx =
-    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::kvikio_context> ioctx =
+    std::make_shared<cucascade::io::kvikio_context>();
 
   carrier_file_fixture()
   {
@@ -313,7 +314,7 @@ struct carrier_file_fixture {
                                                           std::size_t minimum_groups = 3)
   {
     auto task = reader.next_split_provider(
-      [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ctx; });
+      [ctx = ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ctx; });
     REQUIRE(task);
     auto info  = task({});
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
@@ -370,10 +371,10 @@ TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
-  REQUIRE_FALSE(ioctx->uses_prefetching_cache());
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  REQUIRE_FALSE(ioctx->uses_fs_cache());
   auto task = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto coalescer = ingestible->create_batch_coalescer();
@@ -1754,12 +1755,12 @@ TEST_CASE_METHOD(carrier_file_fixture,
                  "parquet source pruning resolves only surviving original file identities",
                  "[scan][parquet][source_pruning]")
 {
-  struct counted_ioctx : sirius::io::ioctx {
+  struct counted_ioctx : cucascade::io::ioctx {
     size_t opens = 0;
     ~counted_ioctx() override { pre_destroy(); }
-    sirius::io::io_context_type type() const noexcept override
+    cucascade::io::io_context_type type() const noexcept override
     {
-      return sirius::io::io_context_type::kvikio;
+      return cucascade::io::io_context_type::kvikio;
     }
     void shutdown() noexcept override {}
     bool supports(std::string_view) const noexcept override { return true; }
@@ -1767,23 +1768,24 @@ TEST_CASE_METHOD(carrier_file_fixture,
     bool supports_host_to_device_read() const noexcept override { return false; }
     bool supports_vector_host_read() const noexcept override { return false; }
     bool supports_device_range_read() const noexcept override { return false; }
-    std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-      std::span<cudf::io::text::byte_range_info const> ranges,
+    std::vector<cucascade::io::byte_range> align_and_coalesce(
+      std::span<cucascade::io::byte_range const> ranges,
       std::optional<size_t>) const noexcept override
     {
       return {ranges.begin(), ranges.end()};
     }
-    size_t host_read_io(sirius::io::io_object const&, size_t, size_t, uint8_t*) override
+    size_t host_read_io(cucascade::io::io_object const&, size_t, size_t, uint8_t*) override
     {
       throw std::runtime_error("pruned file must not be read");
     }
-    sirius::exec::semi_future<size_t> mixed_readv_async_io(
-      sirius::io::io_object const&, std::vector<sirius::io::prepared_io_slice>&&) noexcept override
+    cucascade::exec::semi_future<size_t> mixed_readv_async_io(
+      cucascade::io::io_object const&,
+      std::vector<cucascade::io::prepared_io_slice>&&) noexcept override
     {
-      return sirius::exec::make_semi_future<size_t>(
+      return cucascade::exec::make_semi_future<size_t>(
         std::make_exception_ptr(std::runtime_error("pruned file must not be read")));
     }
-    std::shared_ptr<sirius::io::io_object> create_io_object(std::string) override
+    std::shared_ptr<cucascade::io::io_object> create_io_object(std::string) override
     {
       ++opens;
       throw std::runtime_error("pruned file must not be opened");
@@ -1812,8 +1814,8 @@ TEST_CASE_METHOD(carrier_file_fixture,
                                   duckdb::Value::UBIGINT(select_none ? 99 : 2)));
   auto reader = scan::make_ingestible(std::move(info));
   std::vector<std::string> resolved;
-  auto task =
-    reader->next_split_provider([&](std::string_view name) -> std::shared_ptr<sirius::io::ioctx> {
+  auto task = reader->next_split_provider(
+    [&](std::string_view name) -> std::shared_ptr<cucascade::io::ioctx> {
       resolved.emplace_back(name);
       if (select_none && resolver_throws) {
         throw std::runtime_error("pruned file must not be resolved");
@@ -1921,7 +1923,7 @@ TEST_CASE_METHOD(carrier_file_fixture,
     auto decoded = reader->materialize_metadata_to_table(
       *split, *space, cudf::get_default_stream(), false, nullptr);
     REQUIRE(decoded.execution);
-    CHECK(decoded.execution->authoritative == !metadata_only);
+    CHECK(decoded.execution->authoritative);
     auto table = reader->post_filter_and_project(
       std::move(decoded), *space, cudf::get_default_stream(), false, nullptr, nullptr, {});
     CHECK(table->num_columns() == 1);

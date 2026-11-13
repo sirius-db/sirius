@@ -14,24 +14,16 @@
 
 expectations:
   - outcome: plan_rejected
-    reason: "Unsupported whole-partition window: FILTER"
+    reason: "Unsupported window: FILTER"
     issue: 1745
     queries: [Q02_V07]
 
   - outcome: plan_rejected
-    reason: "Unsupported whole-partition window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
+    reason: "Unsupported window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
     issue: 1745
-    queries: [Q02_V09, Q03_V09, Q15_V09, Q18_V09]
+    queries: [Q03_V09]
 
   - outcome: plan_rejected
     reason: "Unsupported expression in aggregate .*: list\\("
     issue: 2290
     queries: [Q01_V07]
-
-  # With Sirius loaded, binding fails with an INTERNAL error even on the CPU, which invalidates the
-  # database for every later test.
-  - outcome: skip
-    reason: INTERNAL binder error on native tables whenever Sirius is loaded
-    issue: 2294
-    scan: native
-    queries: [Q02_V08]

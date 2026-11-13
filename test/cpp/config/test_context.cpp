@@ -44,6 +44,7 @@
 #include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
@@ -275,7 +276,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);
-    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 1);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
+    REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
@@ -938,6 +940,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.sort_sample_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
   REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
+  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -1108,6 +1111,49 @@ TEST_CASE("startup BUILD_PROBE budgets remain independent through SET and RESET"
   execute("RESET hash_partition_bytes");
   REQUIRE(duckdb::session_operator_params(*con.context).hash_partition_bytes == 3 * mib);
   require_budgets(index_default, resident_default);
+}
+
+TEST_CASE("dynamic-filter Bloom budget follows scan size through SET and RESET",
+          "[sirius][config][operator_defaults][dynamic_filter][isolated_context]")
+{
+  std::optional<std::string> original_test_options;
+  if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) {
+    original_test_options = value;
+  }
+  finally cleanup_env{[&]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+    if (original_test_options) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", original_test_options->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+  }};
+  auto const cfg = config_fixture("operator_defaults_scan_only.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto execute = [&](char const* sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto require_budget = [&](uint64_t expected) {
+    CHECK(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
+          expected);
+  };
+  constexpr uint64_t startup_budget = 32ULL << 20;
+  require_budget(startup_budget);
+  execute("SET scan_task_batch_size = 99");
+  require_budget(4 * 99);
+  REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 123")->HasError());
+  REQUIRE(con.Query("RESET max_dynamic_filter_bloom_bytes_per_gpu")->HasError());
+  execute("RESET scan_task_batch_size");
+  require_budget(startup_budget);
+  CHECK(duckdb::session_operator_params(*con.context).scan_task_batch_size == (8ULL << 20));
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
@@ -1509,7 +1555,6 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
-      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
       current_setting('max_build_probe_resident_bytes')::UBIGINT,
       current_setting('spill_compression')::BOOLEAN,
       current_setting('pin_table_prove_unique_keys')::BOOLEAN,
@@ -1541,8 +1586,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<bool>());
-  REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
-  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(settings->Collection().GetValue(21, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
+          4 * mib);
   auto require_resident_budget = [&](uint64_t value) {
     auto result = con.Query("SELECT current_setting('max_build_probe_resident_bytes')::UBIGINT");
     REQUIRE(result != nullptr);
@@ -1558,21 +1604,18 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(resident_reset != nullptr);
   REQUIRE_FALSE(resident_reset->HasError());
   require_resident_budget(9 * mib);
-  REQUIRE(settings->Collection().GetValue(23, 0).GetValue<bool>());
-  REQUIRE_FALSE(settings->Collection().GetValue(24, 0).GetValue<bool>());
-  REQUIRE(settings->Collection().GetValue(25, 0).GetValue<uint64_t>() == 9 * mib);
+  REQUIRE(settings->Collection().GetValue(22, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->Collection().GetValue(23, 0).GetValue<bool>());
+  REQUIRE(settings->Collection().GetValue(24, 0).GetValue<uint64_t>() == 9 * mib);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =
       con.Query(std::string{"SET max_dynamic_filter_bloom_bytes_per_gpu = "} + invalid_budget);
     REQUIRE(rejected != nullptr);
     REQUIRE(rejected->HasError());
-    if (std::string_view{invalid_budget} == "0") {
-      REQUIRE_THAT(rejected->GetError(),
-                   Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
-    }
-    REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
-            17 * mib);
+    REQUIRE(
+      duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
+      4 * mib);
   }
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
@@ -1678,21 +1721,14 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
   require_ok("RESET enable_dynamic_filter_multi_partition");
   REQUIRE(duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
-  require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
-  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
-          std::numeric_limits<uint64_t>::max());
-  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
-          17 * mib);
-  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
-  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
-          17 * mib);
-  auto multi_reset = con.Query(
-    "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
-    "current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
+  REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
+          4 * mib);
+  auto multi_reset =
+    con.Query("SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN");
   REQUIRE(multi_reset != nullptr);
   REQUIRE_FALSE(multi_reset->HasError());
   REQUIRE(multi_reset->Collection().GetValue(0, 0).GetValue<bool>());
-  REQUIRE(multi_reset->Collection().GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
@@ -2593,6 +2629,25 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
       Catch::Matchers::ContainsSubstring("remove this key"));
 }
 
+TEST_CASE("failed initialization releases a newly installed converter registry",
+          "[sirius][context][public_context][isolated_context]")
+{
+  sirius::converter_registry::reset_for_testing();
+  finally restore_registry{[] { sirius::converter_registry::initialize(); }};
+  auto root = YAML::LoadFile(
+    (fs::path(__FILE__).parent_path() / "data" / "init_failure_pinned_rollback.yaml").string());
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"] = "2Mi";
+  auto config = sirius::parsed_sirius_config::from_node(root);
+  duckdb::SiriusContext engine;
+  REQUIRE_THROWS(engine.initialize(config));
+  CHECK_FALSE(sirius::converter_registry::is_initialized());
+
+  // Reuse the same engine object with a different converter configuration.
+  root["sirius"]["executor"]["scan_manager"]["uring_n_reactors"] = 1;
+  root["sirius"]["executor"]["downgrade"]["copy_chunk_bytes"]    = "1Gi";
+  REQUIRE_NOTHROW(engine.initialize(sirius::parsed_sirius_config::from_node(root)));
+}
+
 TEST_CASE("Sirius query options stay local and snapshots remain immutable",
           "[sirius][config][isolated_context][query_options]")
 {
@@ -2667,16 +2722,8 @@ TEST_CASE("Sirius admission configuration has one authoritative limit",
     return cfg;
   };
   CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
-  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
-          .max_concurrent_queries() == 2);
-  CHECK(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
-      .max_concurrent_queries() == 2);
-  REQUIRE_THROWS_WITH(
-    load(
-      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
-    Catch::Matchers::ContainsSubstring("conflicting"));
+  REQUIRE_THROWS_WITH(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}"),
+                      Catch::Matchers::ContainsSubstring("unknown config key"));
   REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
   CHECK(load("sirius: {}").max_concurrent_queries() == 1);
 }

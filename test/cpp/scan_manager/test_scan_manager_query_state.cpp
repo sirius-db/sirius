@@ -130,7 +130,7 @@ sirius::scan_manager::scan_manager_config make_local_config()
   sirius::scan_manager::scan_manager_config cfg;
   cfg.thread_pool.num_threads = 2;
   cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = sirius::io::cache::cache_mode::none;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
   cfg.apply_cache_mode();
   return cfg;
 }
@@ -160,7 +160,7 @@ struct scan_query {
     sirius::pipeline::sirius_pipeline_build_state build_state;
     for (auto& input : inputs) {
       auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(
-        sirius::pipeline::pipeline_build_context{nullptr, true});
+        sirius::pipeline::pipeline_build_context{nullptr});
       pipeline->set_pipeline_id(pipelines.size() + 1);
       pipeline->set_query_id(id);
       auto op = std::make_unique<scan::sirius_gpu_scan_operator>(

@@ -81,6 +81,8 @@ class dynamic_filter_publish_plan final {
     dynamic_filter_condition_shape key_shape{};
     // A zero cardinality disables coverage gating.
     dynamic_filter_domain_evidence build_key_domain{};
+    /// Base-scan row bound for the keep-ratio estimate; value-preserving lineage may cross joins.
+    std::size_t build_key_value_domain = 0;
     // Genuine uniqueness proof, independent of usefulness declarations.
     bool build_key_proven_unique = false;
     // NULL-safe equality: retain probe NULLs as conservative false positives.

@@ -24,8 +24,6 @@
 // headers -- parquet_gpu_ingestible.hpp pulls in DuckDB, which a benchmark has
 // no business including.
 
-#include "io/sirius_datasource.hpp"
-
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
@@ -36,6 +34,8 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <memory>
 #include <span>
@@ -48,7 +48,7 @@ namespace sirius::op::scan {
 /// @c row_group_slice that materialization actually needs, without dragging in
 /// the estimate/accounting ones.
 struct parquet_source {
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   std::shared_ptr<cudf::io::parquet::FileMetaData const> metadata;
   std::vector<cudf::size_type> row_group_indices;
 };

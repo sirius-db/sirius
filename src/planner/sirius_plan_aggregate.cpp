@@ -46,6 +46,7 @@
 #include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -283,12 +284,18 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   masked_inputs.clear();
   if (expressions.empty()) { return child; }
-  child = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  child       = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
+  auto inputs = translate_expressions(std::move(expressions));
+  // DuckDB computes an aggregate's arguments and FILTER on every row before it filters, so they
+  // raise their errors even for the rows the FILTER drops.
+  for (auto const column : masked_columns) {
+    if (inputs[column] && inputs[column]->holds<sirius::ast::case_expr>()) {
+      inputs[column]->get<sirius::ast::case_expr>().eager = true;
+    }
+  }
   auto const estimated_cardinality = child->estimated_cardinality;
-  return push_projection(std::move(child),
-                         sirius::from_duckdb_vec(types),
-                         translate_expressions(std::move(expressions)),
-                         estimated_cardinality);
+  return push_projection(
+    std::move(child), sirius::from_duckdb_vec(types), std::move(inputs), estimated_cardinality);
 }
 
 /// Column positions a fused COUNT-join reads from the two join inputs. Each index addresses the
@@ -904,17 +911,21 @@ void sirius_physical_plan_generator::require_planned_schema(
   std::string_view subject)
 {
   if (planned.size() != declared.size()) {
-    throw duckdb::NotImplementedException(
-      std::string(subject) + ": the planned input has " + std::to_string(planned.size()) +
-      (planned.size() == 1 ? " column" : " columns") + " but the node declares " +
-      std::to_string(declared.size()) + " (falling back to CPU)");
+    throw sirius::not_implemented_exception(
+      "{}: the planned input has {} {} but the node declares {} (falling back to CPU)",
+      subject,
+      planned.size(),
+      planned.size() == 1 ? "column" : "columns",
+      declared.size());
   }
   for (duckdb::idx_t i = 0; i < declared.size(); i++) {
     if (planned[i] == sirius::from_duckdb(declared[i])) { continue; }
-    throw duckdb::NotImplementedException(
-      std::string(subject) + ": the planned input has " + planned[i].to_string() + " for column " +
-      std::to_string(i) + " but the node declares " + sirius::from_duckdb(declared[i]).to_string() +
-      " (falling back to CPU)");
+    throw sirius::not_implemented_exception(
+      "{}: the planned input has {} for column {} but the node declares {} (falling back to CPU)",
+      subject,
+      planned[i].to_string(),
+      i,
+      sirius::from_duckdb(declared[i]).to_string());
   }
 }
 
@@ -952,6 +963,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
                               aggregate.GetChildren()[0]->GetReturnType().IsNested())) {
       throw duckdb::NotImplementedException(
         "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
+  // The Sirius aggregate node cannot carry an ORDER BY, so a FIRST refuses its own. A FILTER
+  // on FIRST is refused above because FIRST does not skip NULLs.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
+        sirius::aggregate_id::first) {
+      continue;
+    }
+    if (aggregate.GetOrderBys()) {
+      throw duckdb::NotImplementedException(
+        "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
+    }
+    // One carried row per key answers one grouping set, and the set expansion copies no carried
+    // columns.
+    if (has_grouping_sets) {
+      throw duckdb::NotImplementedException(
+        "grouped FIRST is not supported over several grouping sets or beside a grouping function "
+        "(falling back to CPU)");
     }
   }
 

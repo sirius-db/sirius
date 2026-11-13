@@ -25,6 +25,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 
@@ -167,7 +168,7 @@ TEST_CASE("partitioned_operator_data stamps the partition's device as its prefer
 TEST_CASE("partition consumers require an explicitly installed placement",
           "[partition_placement][unit]")
 {
-  sirius::op::sirius_physical_partition_consumer_operator consumer(
+  sirius::op::test_partition_consumer consumer(
     sirius::op::SiriusPhysicalOperatorType::CONCAT, {}, 0);
 
   // Standalone operators follow the same contract even without an engine's GPU list.
@@ -194,7 +195,7 @@ TEST_CASE("stateless single-partition consumers leave task placement to locality
   duckdb::LogicalComparisonJoin logical_join(duckdb::JoinType::INNER);
   logical_join.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT};
   auto child         = [&] {
-    return duckdb::make_uniq<sirius_physical_operator>(
+    return duckdb::make_uniq<sirius::op::test_physical_operator>(
       SiriusPhysicalOperatorType::PROJECTION, types(), 0);
   };
   sirius_physical_nested_loop_join nlj(

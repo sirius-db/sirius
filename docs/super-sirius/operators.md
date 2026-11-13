@@ -34,6 +34,56 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 
 See [Task Creator](task-creator.md) for per-operator overrides.
 
+## Output ordering
+
+Every concrete physical operator implements the pure virtual `output_order_preservation()`.
+This declaration describes its local effect on logical order, independently of its pipeline role:
+
+- `FIXED_ORDER`: establishes a global output sequence.
+- `NO_ORDER`: does not preserve a global input sequence.
+- `INSERTION_ORDER`: preserves the sequence supplied by its input; it does not establish one.
+
+`operator.output_order()` resolves this property over the physical plan subtree. Defining and
+order-destroying operators return their declaration directly. Preserving unary operators inherit
+their child's resolved order, even if they are pipeline sources. The traversal uses `get_children()`
+so collectors exposing a referenced plan participate. CTE nodes follow the consumer child, ignoring
+the materialization child. Other preserving multi-input shapes are rejected rather than combining
+unrelated sequences by child visitation order.
+
+An `INSERTION_ORDER` leaf retains that result: its input sequence is external to this tree.
+This is not proof that runtime batches carry positions. A planner must establish that external
+contract before choosing an ordered consumer; it must not silently treat this value as `NO_ORDER`.
+The analysis does not consult DuckDB's insertion-order setting or repository runtime state.
+
+Use this analysis after the child's GPU operator expansion. `ORDER_BY` and `TOP_N` execute local
+per-batch sorting; their expanded global result is established by `MERGE_SORT` and `MERGE_TOP_N`.
+The planner can query `limit.children[0]->output_order()` before choosing a LIMIT implementation
+and its pipeline boundary. The planner chooses `UNORDERED_STREAMING_LIMIT` only for a resolved `NO_ORDER`;
+`FIXED_ORDER` and unresolved `INSERTION_ORDER` retain `STREAMING_LIMIT` and its full barrier.
+An inline `REPLICATE` also retains that barrier: it can emit several batches per task, and
+publication separates them for LIMIT's one-batch claims.
+
+| Operator | `output_order_preservation()` |
+|---|---|
+| MERGE_SORT, MERGE_TOP_N | `FIXED_ORDER` |
+| ORDER_BY (local sort), TOP_N (local top-N), SORT_SAMPLE, SORT_PARTITION | `NO_ORDER` |
+| PARTITION, CONCAT, UNION | `NO_ORDER` |
+| WINDOW, REPLICATE | `NO_ORDER` |
+| HASH_JOIN, NESTED_LOOP_JOIN, DENSE_COUNT_JOIN, LEFT_DELIM_JOIN, RIGHT_DELIM_JOIN | `NO_ORDER` |
+| HASH_GROUP_BY, UNGROUPED_AGGREGATE, MERGE_GROUP_BY, MERGE_AGGREGATE | `NO_ORDER` |
+| GPU_SCAN, UNORDERED_STREAMING_LIMIT | `NO_ORDER` |
+| PROJECTION, FILTER, DYNAMIC_FILTER, BUILD_FILTER, STREAMING_LIMIT | `INSERTION_ORDER` |
+| PASSTHROUGH_SINK, CTE, materialized RESULT_COLLECTOR | `INSERTION_ORDER` |
+| TABLE_SCAN, COLUMN_DATA_SCAN (including CTE_SCAN / DELIM_SCAN), GPU_VALUES | `INSERTION_ORDER` |
+| DUMMY_SCAN, EMPTY_RESULT | `INSERTION_ORDER` |
+| STREAMING_SOURCE, STREAMING_SINK (all routing modes) | `NO_ORDER` |
+
+Abstract intermediates (partition consumer, delim join, result collector) leave the declaration
+pure virtual so concrete implementations must choose. Test-only structural placeholders use an
+explicit `NO_ORDER` test double. A subclass of a concrete operator can inherit its declared
+behavior; C++ pure virtual methods enforce the decision at the first concrete implementation,
+not anew for every descendant. Override the declaration when a specialization changes ordering.
+
 ## Scan Operators
 
 These operators produce data for pipelines. See [Scan](scan.md) for in-depth coverage.
@@ -191,6 +241,7 @@ Applies a predicate expression to filter rows.
 
 - **GPU execution:** `expression_evaluator::select(batch)` — evaluates the boolean expression and compacts rows using cuDF filtering
 - **Key members:** `expression` (filter predicate)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
 
 ### `sirius_physical_projection` — `PROJECTION`
 **File:** `src/op/sirius_physical_projection.hpp`
@@ -204,15 +255,37 @@ Evaluates a list of expressions to produce output columns.
 
   Only the entries that need evaluation are passed to the expression evaluator (via its `std::vector<sirius::ast::node const*>` constructor). See [expression evaluator](expression-executor.md).
 - **Key members:** `select_list` (output expressions)
+- **Batch ordering:** Tasks may execute in any order and forward the input batch position unchanged.
+
+### `sirius_physical_unordered_streaming_limit` — `UNORDERED_STREAMING_LIMIT`
+**File:** `src/op/sirius_physical_limit.hpp`
+
+Used only when the expanded child's `output_order()` proves `NO_ORDER`. Runs inline without an
+extra pipeline boundary. Inside `execute()`, an RAII `claim_request` reserves offset/limit rows
+under a mutex using the row count after upstream filters. The mutex is released during GPU work.
+After constructing and synchronizing the output, execution approves the request. Exceptions
+before approval refund only that request's reserved offset and limit; retries make a fresh claim.
+No batch IDs or per-input claim history are needed. A retry may select different rows, which is
+valid for this unordered input.
+
+`is_limit_exhausted()` stops further task creation only when the limit is consumed, no pending
+claim can refund offset or limit rows, and at least one output has been approved. Zero-row claims
+do not delay exhaustion, even if they keep overlapping on an open stream. Both approval and
+rollback update this condition. The pipeline waits for all already-created tasks (including retries) before
+completing. The executor's post-return diagnostics do not perform retryable GPU allocations;
+changes to its retry boundary must preserve approval after all retryable work. LIMIT 0 permits an
+initial task to emit an empty batch for downstream aggregates. This does not cancel independent
+upstream pipelines or scan I/O. Outputs carry no positions.
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
 **File:** `src/op/sirius_physical_limit.hpp`
 
-Implements LIMIT/OFFSET using atomic counters for parallel execution.
+Implements LIMIT/OFFSET with a FULL input barrier and serialized slice claims during task creation.
 
-- **Key members:** `_remaining_offset` (atomic), `_remaining_limit` (atomic), `_limit_exhausted` (atomic)
-- **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
-- **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
+- **Key members:** `_remaining_offset` and `_remaining_limit` (`size_t` counters), guarded by `_claim_mutex`.
+- **Mechanism:** After the producer finishes, `get_next_task_input_data()` consumes ordered input by ascending existing position, or unordered input in FIFO order. It snapshots existing positions for ordered input, reads the batch row count with `get_batch_rows_and_bytes()`, and claims an immutable slice under `_claim_mutex`. Unknown row counts are errors. The resulting `limiting_operator_data` carries the slice and optional position; execution and retries apply that slice without claiming again.
+- **Completion:** Every input batch is consumed, but offset-only and trailing unused batches are drained during task creation rather than sent to GPU tasks. Spilled trailing batches are released without restoring them to GPU memory. Already-created tasks and retries still finish normally. Both ordered and unordered input wait for the complete producer output before LIMIT starts consuming it.
+- **Empty output:** If no input slice selects rows (including LIMIT 0 or an offset past all input), one task emits a 0-row batch at the retained input's position, so a downstream ungrouped aggregate still returns its row. Other empty slices need no task. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ### `sirius_physical_replicate` — `REPLICATE`
 **File:** `src/op/sirius_physical_replicate.hpp`
@@ -326,9 +399,11 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
 
-It runs one task per pair of left and right batches. For every join type except INNER, join wrapping (`join_concat_all` in the plan generator) sets `concat_all` on the CONCAT feeding the side that rows are decided against, so each task sees that side whole: the right side for LEFT/SEMI/ANTI/MARK, the left side for RIGHT, and both sides for FULL OUTER. Otherwise a LEFT join would pad a row once per right batch without a match.
+Both CONCAT input ports are PARTIAL barriers. It discovers batches incrementally and runs one task per previously unscheduled pair of left and right batches, using the shared `join_cross_schedule` helpers. If build data is available but no probe batch has arrived, its readiness hint requests the probe producer so demand-driven scheduling can start joining early. The upstream build scan still feeds PARTITION through a FULL barrier. For every join type except INNER, join wrapping (`join_concat_all` in the plan generator) sets `concat_all` on the CONCAT feeding the side that rows are decided against, so each task sees that side whole: the right side for LEFT/SEMI/ANTI/MARK, the left side for RIGHT, and both sides for FULL OUTER. Otherwise a LEFT join would pad a row once per right batch without a match.
 
-Without conditions it runs a cross product with `cudf::cross_join`. When it creates its first task, it reads the row count and size of every input batch and splits each pair of left and right batches into tasks over equal row ranges of the left batch (`cross_join_num_slices` in `src/op/cross_join_slicing.hpp`). Each task's output stays near `cross_join_task_bytes` and within the cuDF row limit, with at most one task per left row. A task carries its slice in `cross_join_slice_data` and cross joins a zero-copy `cudf::slice` of the left batch. A batch is popped after the last task that uses it. Before allocating, `execute` computes the output size of its slice and throws when it exceeds the GPU memory space, so the query falls back to CPU instead.
+Without conditions it runs a cross product with `cudf::cross_join`. When it claims a new batch pair, it reads that pair's row counts and sizes and splits it into tasks over equal row ranges of the left batch (`cross_join_num_slices` in `src/op/cross_join_slicing.hpp`). Each task's output stays near `cross_join_task_bytes` and within the cuDF row limit, with at most one task per left row. A task carries its slice in `cross_join_slice_data` and cross joins a zero-copy `cudf::slice` of the left batch. A batch is popped only after the opposite producer has finished and every pair using it has been scheduled. A pending sliced pair prevents retirement until all of its slices have been issued; outstanding tasks retain their own input references. Before allocating, `execute` computes the output size of its slice and throws when it exceeds the GPU memory space, so the query falls back to CPU instead.
+
+If a producer emits no batches, after both producers finish the scheduler emits one orphan task per surviving batch. It prepares that batch normally (including spill readback), creates the absent side's empty schema on the executor GPU, and uses the existing empty-input semantics: outer joins NULL-pad, ANTI keeps probe rows, MARK marks them FALSE, and INNER/SEMI emit no rows. A real zero-row batch follows the ordinary pair path. Both cases drain their repositories and permit pipeline completion.
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
@@ -343,7 +418,8 @@ in what DuckDB's binder puts around it. `UNION ALL` is the node alone, and
 `a UNION ALL b UNION ALL c` binds to one node with three children. `UNION` and `UNION BY NAME` are
 a `DISTINCT` over that same node, which Sirius lowers to a grouped aggregate.
 The `EXCEPT ALL` / `INTERSECT ALL` lowering also uses `UNION` to merge its two tagged inputs.
-Distinct `EXCEPT` and `INTERSECT` fall back to CPU.
+Distinct `EXCEPT` and `INTERSECT` do not use `UNION`: they lower to a null-safe ANTI or SEMI hash
+join, then deduplicate its rows with a grouped aggregate (see `plan_except_intersect`).
 
 The plan builder (`plan_union` in `src/planner/sirius_plan_set_operation.cpp`) sends two more
 shapes to the CPU. The first is `allow_out_of_order = false`, which requires output in arm order.
@@ -369,8 +445,7 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 - **Arm pipelines are created in reverse child order.** The converter schedules child
   meta-pipelines last-created-first, so reversing makes arm 0 pipeline #0: the scan `start_query`
   seeds and the top execution priority. Drain order therefore matches execution order.
-- **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
-  operator, so this answer decides the whole plan's.
+- **Output order:** `NO_ORDER`; independently ordered arms do not define a global union order.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
   the operator, so the `"union_{i}"` names are resolved to `port*` once on first use.
 - **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
@@ -400,9 +475,9 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 - **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST, and COUNT(DISTINCT) on a single non-nested column
 - **FILTER clause:** Handled entirely at plan time for SUM (incl. `sum_no_overflow`), MIN, MAX, COUNT, COUNT(DISTINCT), COUNT(*), and AVG over non-nested inputs — filtered inputs are mask-wrapped to NULL in the projection below the operator, identical safe generated masks reuse a single projected column, safe nontrivial complete predicates still repeated across distinct masks share a lower BOOLEAN column, and the planner rebinds `count(*) FILTER` to `count(mask)` before generic translation; other DISTINCT aggregates, FIRST, nested inputs (such as the STRUCT of `COUNT(DISTINCT (a, b))`), and any aggregate outside this set fall back to CPU when filtered. See [Aggregate Planning](physical-plan-generation.md).
 - **COUNT(DISTINCT) handling:** each batch reduces the column to a one-row LIST with `COLLECT_SET` (NULLs excluded), `MERGE_AGGREGATE` unions the lists with `MERGE_SETS` and counts the elements. Other DISTINCT aggregates fall back to the CPU at plan time.
-- **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips. The denominator is the count of *non-null* values (matching SUM, which skips NULLs), computed with a NULL-excluding COUNT reduction; when the column has no NULLs the row count is used directly.
+- **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision; DOUBLE output goes through `average_as_double()` (`op/aggregate/average.cu`). A DECIMAL sum there is divided as DuckDB divides it, the unscaled integer sum over `count * P`, where P is 10^scale rounded to DOUBLE the way DuckDB rounds it. Rounding the scaled sum, the sum, the count or `count * P` to one FLOAT64 first would make equal averages over different counts differ in the last bit, so the sum and count are each split into two DOUBLEs, `count * P` is kept as two DOUBLEs, and the quotient is formed in double-double and rounded once. Its relative error before that rounding stays below 2^-102 across the DECIMAL128 sum and INT64 count range, so the result is correctly rounded except for quotients that close to a midpoint between two DOUBLEs. DuckDB's own `long double` (or DOUBLE, for DECIMAL inputs of width 4 or less) quotient can still differ in the last bit where it is not correctly rounded. Other sums are cast to FLOAT64 and divided. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips. The denominator is the count of *non-null* values (matching SUM, which skips NULLs), computed with a NULL-excluding COUNT reduction; when the column has no NULLs the row count is used directly.
 - **DECIMAL overflow handling:** a DECIMAL32/DECIMAL64 SUM or AVG input is reduced over DECIMAL128 only when the batch could overflow its storage width, i.e. when `rows × max|value|` can exceed 2^31-1 or 2^63-1 (`sums_to_widen`). The magnitude bound comes from base-table statistics resolved at plan time (`planner::resolve_sum_input_bounds`) when the input is a scan column that reaches the aggregate unchanged, otherwise from a per-batch `cudf::minmax` scan (`sums_needing_widening`). A batch that cannot overflow is reduced at the input width and only its one-row partial is widened. Conversely, a DECIMAL128 SUM or AVG input whose batch provably sums within 64 bits (`rows × max|value|` ≤ 2^63-1, `decimal_sums_to_narrow`) is reduced over DECIMAL64 at the same scale and its one-row partial is cast back to DECIMAL128, so the merge sees the same types and combines the partials at 128 bits.
-- **Integer SUM/AVG overflow handling:** DuckDB accumulates `sum` and `avg` over INTEGER and BIGINT in 128 bits and returns HUGEINT for SUM (`is_wide_integer_sum`), unless its statistics proved the total fits INT64 and planned `sum_no_overflow`, which keeps the plain INT64 path. On the GPU HUGEINT is carried as DECIMAL128 with scale 0. Each batch sums the INTEGER or BIGINT input in 128 bits in a single pass (`wide_integer_sum`, a CUB reduction over INT32/INT64 that skips NULLs). That needs no magnitude scan and no widening copy, so it reads the input once like the INT64 reduction it replaces. The one-row partial is an exact DECIMAL128 with scale 0 (`wide_integer_sum_type()`), so the merge cannot overflow. After the merge, AVG divides the 128-bit sum as FLOAT64; DuckDB divides in `long double`, so the last bit or two can differ. An aggregate whose result is HUGEINT (`AggregateSlot::returns_hugeint`) is finalized to DECIMAL128 (`to_hugeint_carrier`): an INT64 sum, from `sum_no_overflow`, a narrower input, or a grouped partial that stayed INT64, is widened, and a DECIMAL128 one passes through. So a total past BIGINT, and DuckDB's `SUM(x) / COUNT(x)` rewrite of AVG (ClickBench Q03's `AVG(UserID)`), stay on the GPU with exact results. A SUM over a HUGEINT input takes the decimal SUM path.
+- **Integer SUM/AVG overflow handling:** DuckDB accumulates `sum` and `avg` over INTEGER and BIGINT in 128 bits and returns HUGEINT for SUM (`is_wide_integer_sum`), unless its statistics proved the total fits INT64 and planned `sum_no_overflow`, which keeps the plain INT64 path. On the GPU HUGEINT is carried as DECIMAL128 with scale 0. Each batch sums the INTEGER or BIGINT input in 128 bits in a single pass (`wide_integer_sum`, a CUB reduction over INT32/INT64 that skips NULLs). That needs no magnitude scan and no widening copy, so it reads the input once like the INT64 reduction it replaces. The one-row partial is an exact DECIMAL128 with scale 0 (`wide_integer_sum_type()`), so the merge cannot overflow. After the merge, AVG divides the 128-bit sum with `average_as_double()` as a DECIMAL with scale 0 (P = 1), so it is rounded once from the exact quotient; DuckDB divides in `long double`, so the last bit can still differ where its quotient is not correctly rounded. An aggregate whose result is HUGEINT (`AggregateSlot::returns_hugeint`) is finalized to DECIMAL128 (`to_hugeint_carrier`): an INT64 sum, from `sum_no_overflow`, a narrower input, or a grouped partial that stayed INT64, is widened, and a DECIMAL128 one passes through. So a total past BIGINT, and DuckDB's `SUM(x) / COUNT(x)` rewrite of AVG (ClickBench Q03's `AVG(UserID)`), stay on the GPU with exact results. A SUM over a HUGEINT input takes the decimal SUM path.
 
 ### `sirius_physical_grouped_aggregate` — `HASH_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate.hpp`
@@ -410,17 +485,18 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 Hash-based GROUP BY.
 
 - **GPU execution:** `gpu_aggregate_impl::local_grouped_aggregate()` using `cudf::groupby()`
-- **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`
+- **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`; after the merge a DOUBLE AVG is finalized by `average_as_double()`, the same rounding as the ungrouped aggregate
 - **STDDEV_SAMP:** Each local group emits a STRUCT of valid count (INT64), mean (DOUBLE), and M2 (DOUBLE, the sum of squared deviations). Local grouping sorts keys and values to select cuDF's centered M2 implementation; its hash implementation uses a cancellation-prone difference of large sums. Merge uses cuDF `MERGE_M2`, then computes `sqrt(M2 / (count - 1))`. NULL inputs are skipped; fewer than two valid values yield NULL. Non-finite finalized results raise an out-of-range error. DISTINCT remains unsupported. The local and PARTITION schemas carry the STRUCT; the merge schema carries the final DOUBLE. Ungrouped aggregation uses the same state and finalization, obtaining local M2 from population variance times count because cuDF has no M2 reduction API.
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
 - **FILTER clause:** Same plan-time mask-to-null lowering and CPU-fallback rules as UNGROUPED_AGGREGATE above; group keys are never masked, so groups whose every row fails the filter still appear.
 - **Grouping sets with STDDEV_SAMP:** Subtotals merge count/mean/M2 states with `MERGE_M2` before the final cross-batch merge and stddev finalization. The partial schema includes the set id and `GROUPING()` columns before the expanded aggregate carriers. An empty grand total carries a valid zero-count state and finalizes to NULL; the set id keeps duplicate grouping sets distinct.
 - **DECIMAL overflow handling:** the same gate as the ungrouped aggregate (`sums_to_widen`): a DECIMAL32/DECIMAL64 SUM whose batch could overflow is widened to the next decimal width before `cudf::groupby`; a SUM proven safe runs at the input width and its per-group result is cast afterwards, so the merge sees one type either way. The plan-time bounds arrive in `cudf_aggregate_input_max_abs`. A DECIMAL128 SUM that provably fits 64 bits in the batch is computed over DECIMAL64 and cast back the same way (`decimal_sums_to_narrow`).
-- **Integer SUM/AVG overflow handling:** a wide integer SUM over BIGINT (see the ungrouped aggregate; flagged in `cudf_aggregate_is_wide_integer_sum`) is gated the same way. A batch that could overflow INT64 produces a DECIMAL128 per-group partial with scale 0. While the previous batch had at most 64K groups (`split_wide_sum_max_groups`), it sums the high and low 32-bit halves of each value as two INT64 SUMs and combines them (`split_int64_halves`, `combine_int64_halves`); otherwise it groups over DECIMAL128 directly. A batch proven safe stays INT64 and is not widened, so high-cardinality GROUP BYs keep INT64 partials. `gpu_merge_impl::merge_grouped_aggregate()` therefore sees INT64 or DECIMAL128 partials per batch. Once any batch carries DECIMAL128 it widens the rest, and it also widens all-INT64 partials whose total magnitude reaches 2^62 (`partial_sums_may_overflow`). Otherwise it merges in INT64. The planner records DECIMAL128 as the alternate carrier of those columns on HASH_GROUP_BY and PARTITION (`wide_integer_sum_partial_types`, `set_alternate_physical_types`), so the task-level output-type check accepts either width. The merge's post-processing widens INT64 SUM results to HUGEINT's DECIMAL128 carrier (`to_hugeint_carrier`), passes DECIMAL128 through, and divides AVG as FLOAT64. A SUM or AVG over a HUGEINT input falls back to DuckDB when its total could pass 2^127, which cuDF would wrap: per batch when rows x max |v| could (`decimal_sums_to_narrow`), and at the merge when the partials' bound could (`require_decimal128_partial_sums_in_range`).
+- **Integer SUM/AVG overflow handling:** a wide integer SUM over BIGINT (see the ungrouped aggregate; flagged in `cudf_aggregate_is_wide_integer_sum`) is gated the same way. A batch that could overflow INT64 produces a DECIMAL128 per-group partial with scale 0. While the previous batch had at most 64K groups (`split_wide_sum_max_groups`), it sums the high and low 32-bit halves of each value as two INT64 SUMs and combines them (`split_int64_halves`, `combine_int64_halves`); otherwise it groups over DECIMAL128 directly. A batch proven safe stays INT64 and is not widened, so high-cardinality GROUP BYs keep INT64 partials. `gpu_merge_impl::merge_grouped_aggregate()` therefore sees INT64 or DECIMAL128 partials per batch. Once any batch carries DECIMAL128 it widens the rest, and it also widens all-INT64 partials whose total magnitude reaches 2^62 (`partial_sums_may_overflow`). Otherwise it merges in INT64. The planner records DECIMAL128 as the alternate carrier of those columns on HASH_GROUP_BY and PARTITION (`wide_integer_sum_partial_types`, `set_alternate_physical_types`), so the task-level output-type check accepts either width. The merge's post-processing widens INT64 SUM results to HUGEINT's DECIMAL128 carrier (`to_hugeint_carrier`), passes DECIMAL128 through, and finalizes AVG with `average_as_double()`. A SUM or AVG over a HUGEINT input falls back to DuckDB when its total could pass 2^127, which cuDF would wrap: per batch when rows x max |v| could (`decimal_sums_to_narrow`), and at the merge when the partials' bound could (`require_decimal128_partial_sums_in_range`).
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input has at least 1,048,576 rows, the non-nested key is not already a single null-free fixed-width column, and an HLL estimate puts group cardinality below 1% of rows, distinct key rows are sorted lexicographically with nulls last and installed as the build side of a `cudf::distinct_hash_join`. Probing the original rows yields their dense sorted-key indices, so cuDF's `stable_sorted_order` takes its single-column INT32 radix path; representative keys are recovered by a gather at group cardinality. A single nullable or variable-width key can therefore qualify, as can a multi-column key. Non-fatal label construction failures fall back to the original key columns, and an active label path bypasses STRING dictionary encoding.
+- **FIRST:** each `FIRST` is a carried column, not a cuDF request. The local batch is `[keys..., partials..., carried...]`: one `MIN` over row positions rides the same `cudf::groupby()` call and every carried column is gathered at its result, so all of them come from one row of each group. With carried columns, at least one key and no cuDF request (every all-`FIRST` list, including `SELECT DISTINCT ON (k)` with carried columns), `local_grouped_aggregate()` runs `cudf::distinct` on `[keys..., carried...]` instead. A `FIRST` over several grouping sets or beside `GROUPING()` is refused by `create_plan(LogicalAggregate&)`
 - **Sorted-key path:** a batch whose single fixed-width, null-free key is verified ascending (`keys_ascending()`) is grouped with `cudf::sorted::YES` (run detection and segmented reductions instead of hashing). Unsorted batches keep the hash path. See [Sorted-Key Grouped Aggregation](optimizations.md#sorted-key-grouped-aggregation).
 - **Low-cardinality kernel (experimental, `SIRIUS_EXP_LOWCARD_GROUPBY=1`):** tried before the cuDF path for batches with one or two non-null one-character STRING keys and at most 64 groups, aggregating SUM/COUNT over non-null DECIMAL64 or INT64 inputs. Kernels in `src/cuda/low_cardinality_groupby.cu` map keys to dense group ids and accumulate per thread in registers (up to 8 groups) or per warp in shared memory (9-64 groups), combining into DECIMAL128 sums and INT64 counts. Any other batch returns `nullptr` and takes the cuDF path. See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental).
-- **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `cudf_aggregate_input_max_abs`, `cudf_aggregate_is_wide_integer_sum`, `aggregate_slots`, `has_avg`, `has_count_distinct`
+- **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `cudf_aggregate_input_max_abs`, `cudf_aggregate_is_wide_integer_sum`, `aggregate_slots`, `has_avg`, `has_count_distinct`, `has_first`
 
 ### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
 **File:** `src/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
@@ -445,7 +521,17 @@ sizing partitions have run.
 ### Whole-partition window evaluator
 **File:** `src/op/window/whole_partition.hpp`, `src/op/window/whole_partition.cpp`
 
-`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow.
+`evaluate_whole_partition_window()` computes `SUM`, `AVG`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the whole partition of one table. It runs a `cudf::groupby()` (a reduction when there are no partition columns) and joins the per-partition values back to the input rows with `cudf::distinct_hash_join`, so it does no sort and the results keep the input row order. `SUM` accumulates exactly in `DECIMAL128` and throws on overflow. A floating point `MIN` or `MAX` orders NaN above every other value, as in DuckDB, with the helpers in `src/op/window/float_extremum.hpp`. `AVG` divides that sum by the count with `average_as_double()`, the same rounding as the aggregates.
+
+### Ranking window evaluator
+**File:** `src/op/window/ranking.hpp`, `src/op/window/ranking.cpp`
+
+`evaluate_ranking_window()` computes `rank`, `dense_rank` and `row_number` over the window `ORDER BY` of one table. It sorts the partition columns and order keys with `cudf::stable_sorted_order()`, gathers only those key columns, runs a sorted `cudf::groupby` scan with the rank (`MIN` or `DENSE`) or count aggregation, and scatters the `INT64` results back to the input row order. The payload columns are neither sorted nor copied. Each order key has its own direction and NULL placement. With `row_number` only, the order keys are sorted on but not gathered. A window without `PARTITION BY` is one partition: a constant column stands in for the partition key, and the whole input is one bucket on one GPU. The input, the results and the scratch memory must then fit on that GPU, and the input must have fewer than 2^31 rows.
+
+### Cumulative window evaluator
+**File:** `src/op/window/cumulative.hpp`, `src/op/window/cumulative.cpp`
+
+`evaluate_cumulative_window()` computes `SUM`, `COUNT`, `COUNT(*)`, `MIN` and `MAX` over the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` of one table. It sorts like the ranking evaluator, gathers the partition columns and the argument columns, runs a sorted `cudf::groupby` scan with the sum (with overflow detection for `DECIMAL128`), count, min or max aggregation, fills the NULL results of rows with a NULL argument from the closest value before them in the same partition (`groupby::replace_nulls` with `PRECEDING`), and scatters the results back to the input row order. `SUM` accumulates like the whole-partition `SUM` and throws on overflow. `MIN` and `MAX` take integer, decimal, floating point, date and timestamp arguments. Over floating point they order NaN above every other value with the same helpers as the whole-partition evaluator: an argument without NaN is scanned as it is, and an argument with NaN is scanned with NaN replaced by NULL, then NaN is restored from a running NaN flag. A window without `PARTITION BY` is one partition on one GPU. The input, the results and the scratch memory must then fit on that GPU, and the input must have fewer than 2^31 rows.
 
 ## Pipeline Breakers (Sirius-Specific)
 
@@ -534,18 +620,23 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
 
+Each range slice is published to its original repository partition, retaining indices even when
+intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
+
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **File:** `src/op/sirius_physical_merge_sort.hpp`
 
 Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
 
-- Custom `get_next_task_input_data()`: drains all batches from one partition per call
-- Tracks `_current_partition_index` atomically under mutex
+- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
+- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
+
+- **FIRST:** `merge_grouped_aggregate()` picks one partial row per group with `MIN` over row positions and gathers the carried columns from it, or runs `cudf::distinct` when there is no cuDF request. `partials_are_output()` decides whether the merged partial layout is already the declared output; a list whose `FIRST`s all follow its other aggregates passes through, and any other mix is reordered into the declared order
 
 **Row floor on the partition count.** The merge concatenates its partition's input, and a cuDF column holds fewer than 2^31 rows. Its `get_partition_strategy` raises the byte-based count to at least `ceil(rows / 2^30)` partitions (saturating at `INT_MAX`), using the row count that PARTITION reports next to the byte total (`partition_sizing_input::total_rows`, measured from batch metadata or projected at the received row width). This targets at most 2^30 rows per partition on average; hash skew and row-count estimation can still leave an individual partition over cuDF's limit. The floor is a sizing safeguard for configurations with large `hash_partition_bytes` targets. Before it existed, a 122 GB, 3.4 billion-row merge input at a 1 TiB target failed with "Total number of concatenated rows exceeds the column size limit".
 
@@ -561,7 +652,7 @@ An empty input may contain zero batches or a batch with zero rows. After its pro
 ### `sirius_physical_top_n_merge` — `MERGE_TOP_N`
 **File:** `src/op/sirius_physical_top_n_merge.hpp`
 
-Merges local top-N results from multiple partitions.
+Merges local top-N results from multiple partitions. The final output batch is assigned position zero.
 
 ## CTE / Delim Join Operators
 
@@ -596,6 +687,9 @@ and decisions belong to concrete consumers. Indexed batch publication is inherit
 
 Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
 
+The materialized collector builds local collections in parallel. For positioned input, it combines
+them by ascending position in `get_result()`, independently of task completion order.
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/op/sirius_physical_empty_result.hpp`
 
@@ -613,7 +707,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
-| STREAMING_LIMIT | Relational | Atomic claim-based |
+| UNORDERED_STREAMING_LIMIT | Relational | Inline claims, retry-safe slices, early pipeline completion |
+| STREAMING_LIMIT | Relational | Serial slice claims after FULL input barrier |
 | REPLICATE | Relational | `gpu_replicate_impl::plan_slices()` + `materialize()`; one `cudf::gather` per output batch |
 | ORDER_BY | Sort | `gpu_order_impl::local_order_by()` |
 | TOP_N | Sort | Order + limit |

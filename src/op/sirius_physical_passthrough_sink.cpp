@@ -51,7 +51,8 @@ std::unique_ptr<operator_data> sirius_physical_passthrough_sink::execute(
     throw internal_exception(
       "sirius_physical_passthrough_sink::execute: expected pipelineable_operator_data");
   }
-  return std::make_unique<pipelineable_operator_data>(pipelineable->get_data_batches());
+  return std::make_unique<pipelineable_operator_data>(pipelineable->get_data_batches(),
+                                                      pipelineable->get_position());
 }
 
 }  // namespace op

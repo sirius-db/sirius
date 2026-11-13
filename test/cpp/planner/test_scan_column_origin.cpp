@@ -506,6 +506,65 @@ TEST_CASE("row-subset tracing refuses LEFT and DELIM joins", "[planner][scan_col
   }
 }
 
+TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
+          "[planner][scan_column_origin]")
+{
+  constexpr auto kRowWise = origin_policy::row_wise;
+  SECTION("INNER and LEFT joins forward both sides")
+  {
+    for (auto const type : {duckdb::JoinType::INNER, duckdb::JoinType::LEFT}) {
+      auto join = make_join(type, make_get(0, 2), make_get(1, 1));
+      join->ResolveOperatorTypes();
+      CHECK(origin_of(*join, 1, kRowWise) == at{0, 1});
+      CHECK(origin_of(*join, 2, kRowWise) == at{1, 0});
+    }
+  }
+  SECTION("LIMIT and DISTINCT refuse")
+  {
+    auto limit = duckdb::make_uniq<duckdb::LogicalLimit>(duckdb::BoundLimitNode::ConstantValue(10),
+                                                         duckdb::BoundLimitNode());
+    limit->children.push_back(make_get(0, 2));
+    limit->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*limit, 0, kRowWise).has_value());
+    auto distinct = duckdb::make_uniq<duckdb::LogicalDistinct>(duckdb::DistinctType::DISTINCT);
+    distinct->children.push_back(make_get(0, 2));
+    distinct->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*distinct, 0, kRowWise).has_value());
+  }
+  SECTION("SINGLE joins refuse both sides")
+  {
+    auto join = make_join(duckdb::JoinType::SINGLE, make_get(0, 1), make_get(1, 1));
+    join->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*join, 0, kRowWise).has_value());
+    CHECK_FALSE(origin_of(*join, 1, kRowWise).has_value());
+    CHECK(origin_of(*join, 0, kValues) == at{0, 0});
+    CHECK(origin_of(*join, 1, kValues) == at{1, 0});
+  }
+  SECTION("operators that evaluate an expression that can throw refuse")
+  {
+    for (auto const narrowing : {true, false}) {
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+      expressions.push_back(make_ref(0));
+      expressions.push_back(duckdb::BoundCastExpression::AddDefaultCastToType(
+        make_ref(1), narrowing ? duckdb::LogicalType::TINYINT : duckdb::LogicalType::BIGINT));
+      auto projection = make_projection(make_get(0, 2), std::move(expressions));
+      projection->ResolveOperatorTypes();
+      CHECK(origin_of(*projection, 0, kRowWise).has_value() == !narrowing);
+      CHECK(origin_of(*projection, 0, kValues) == at{0, 0});
+    }
+  }
+  SECTION("DELIM joins refuse")
+  {
+    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
+      duckdb::JoinType::INNER, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
+    join->children.push_back(make_get(0, 2));
+    join->children.push_back(make_get(1, 2));
+    join->ResolveOperatorTypes();
+    CHECK_FALSE(origin_of(*join, 0, kRowWise).has_value());
+    CHECK(origin_of(*join, 0, kValues) == at{0, 0});
+  }
+}
+
 TEST_CASE("walk locates join ordinals through non-empty projection maps",
           "[planner][scan_column_origin]")
 {
@@ -756,4 +815,14 @@ TEST_CASE("multiplying build lineage never asks for domain evidence",
   CHECK(domains[0].source == dynamic_filter_domain_source::unknown);
   CHECK_FALSE(domains[0].declared_unique);
   CHECK(calls == 0);
+
+  auto const value_domains = sirius::planner::build_key_domain_cardinalities(
+    *join,
+    [&](duckdb::LogicalGet const&) -> std::optional<std::size_t> {
+      ++calls;
+      return 1000;
+    },
+    origin_policy::value_preserving);
+  REQUIRE(value_domains == std::vector<std::size_t>{1000});
+  CHECK(calls == 1);
 }

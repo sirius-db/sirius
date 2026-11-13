@@ -19,13 +19,14 @@
 #include "transparent/replay_admission.hpp"
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/owning_table_view.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
-#include <io/io_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -204,7 +205,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   bool _have_template           = false;
   bool _produced_any            = false;
   scan_contract_id _contract_id = 0;
-  std::shared_ptr<sirius::io::sirius_datasource> _datasource;
+  std::shared_ptr<cucascade::io::datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
 
@@ -469,8 +470,10 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
     }
     if (stop.stop_requested())
       throw std::system_error(std::make_error_code(std::errc::operation_canceled));
-    auto split = std::make_unique<duckdb_native_scan_info>(
-      std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
+    auto split =
+      std::make_unique<duckdb_native_scan_info>(std::move(range.row_groups),
+                                                sirius::io::open_datasource(io_ctx, _info->db_path),
+                                                _block_manager);
     std::vector<split_materializer_certificate> certificates;
     std::vector<split_dependencies> dependencies;
     certificates.reserve(split->row_groups.size());
@@ -505,7 +508,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
-  expression_query_policy /*policy*/)
+  expression_query_policy /*policy*/,
+  scan_execution_context /*execution*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
