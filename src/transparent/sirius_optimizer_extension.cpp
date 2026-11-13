@@ -294,10 +294,56 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
   return matched;
 }
 
+namespace {
+
+// A plan copy re-binds every Parquet scan, re-parsing the footers DuckDB's metadata cache would
+// hold. The re-bound data is replaced by `preserve_parquet_bindings`, so only the cost matters.
+// Enables the cache for the copy and restores the connection's own setting afterwards.
+class scoped_parquet_metadata_cache {
+ public:
+  explicit scoped_parquet_metadata_cache(duckdb::ClientContext& context) : _context(context)
+  {
+    auto& db_config = duckdb::DBConfig::GetConfig(context);
+    duckdb::optional_ptr<duckdb::ConfigurationOption const> option;
+    auto const index = db_config.TryGetSettingIndex("parquet_metadata_cache", option);
+    if (!index.IsValid()) { return; }
+    _index   = index.GetIndex();
+    _was_set = context.config.user_settings.IsSet(_index);
+    if (_was_set) {
+      context.config.user_settings.TryGetSetting(db_config.user_settings, _index, _previous);
+    }
+    context.config.user_settings.SetUserSetting(_index, duckdb::Value::BOOLEAN(true));
+    _active = true;
+  }
+  ~scoped_parquet_metadata_cache()
+  {
+    if (!_active) { return; }
+    if (_was_set) {
+      _context.config.user_settings.SetUserSetting(_index, _previous);
+    } else {
+      _context.config.user_settings.ClearSetting(_index);
+    }
+  }
+  scoped_parquet_metadata_cache(scoped_parquet_metadata_cache const&)            = delete;
+  scoped_parquet_metadata_cache& operator=(scoped_parquet_metadata_cache const&) = delete;
+
+ private:
+  duckdb::ClientContext& _context;
+  duckdb::idx_t _index = 0;
+  duckdb::Value _previous;
+  bool _was_set = false;
+  bool _active  = false;
+};
+
+}  // namespace
+
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  auto copy = plan.Copy(context);
+  auto copy = [&] {
+    scoped_parquet_metadata_cache const cache{context};
+    return plan.Copy(context);
+  }();
   preserve_parquet_bindings(plan, *copy, context);
   // Serialization omits runtime state. Reconnect the original bindings with
   // independent, uninitialized filters for this execution.
