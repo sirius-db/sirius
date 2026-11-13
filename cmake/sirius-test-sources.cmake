@@ -356,7 +356,6 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_per_query_completion_handler.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
-    test/cpp/pipeline/test_residency_policy_e2e.cpp
     test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp

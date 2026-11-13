@@ -82,7 +82,9 @@ std::size_t windowed_merge_input::get_estimated_size_in_bytes() const
                         _row_width,
                         _key_row_width,
                         _cfg.output_target_bytes,
-                        _fallback_bytes);
+                        _fallback_bytes,
+                        _fetch_columns,
+                        _string_columns);
   auto const reader = estimate_reader_state_bytes(
     _compressed_runs, _fetch_columns, _string_columns, _cfg.window_rows);
   return sirius::memory::saturating_add(task, reader);

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // compressed_column_cursor / decompress_column_chunks: plan classification, payload staging,
-// span validation, and decoding real spill-plan columns through the cursor.
+// span validation, and the footprint a cursor keeps over a long column.
 //
-// Sections 1-3 use hand-built descriptions; sections 4-6 compress real columns with the spill
-// plans and decode windows through the cursor, comparing them with the full decode. Equivalence
-// across every plan and dtype is checked by test_chunk_decode_equivalence.
+// Sections 1-3 use hand-built descriptions; section 4 compresses real columns with the spill
+// plans and walks them window by window through the cursor. Equivalence across every plan and
+// dtype (real descriptions, device and staged payloads) is checked by
+// test_chunk_decode_equivalence.
 
 #include "api/chunk_decode.hpp"
 #include "chunk_test_utils.hpp"
@@ -653,17 +654,12 @@ void test_span_validation()
   expect(source->reads.empty(), "span: rejected calls read no payload");
 }
 
-// ─── 4. Real spill-plan graphs ──────────────────────────────────────────────
-
-// The hand-built graphs above mirror what the .hpln header holds; these compress real columns
-// with the spill plans and check that the classifier and the staging agree with what
-// compress_with_plan actually produces.
+// ─── 4. A long column leaves the cursor a window-sized footprint ────────────
 
 struct real_case {
   char const* what;
   cudf::type_id type;
   char const* plan;
-  value_plan expected;
   chunk_test::column_options options;
 };
 
@@ -674,207 +670,11 @@ std::vector<real_case> real_cases()
   nullable.null_fraction            = 0.1;
   chunk_test::column_options sorted = nullable;
   sorted.sorted                     = true;
-  chunk_test::column_options runs;
-  runs.rows                       = 3000;
-  runs.run_length                 = 40;
-  runs.sorted                     = true;
-  chunk_test::column_options keys = nullable;
-  keys.cardinality                = 16;
   return {
-    {"bitpack INT32",
-     cudf::type_id::INT32,
-     chunk_test::kBitpackPlan,
-     value_plan::bitpack,
-     nullable},
-    {"bitpack FLOAT64",
-     cudf::type_id::FLOAT64,
-     chunk_test::kBitpackPlan,
-     value_plan::bitpack,
-     nullable},
-    {"delta INT64",
-     cudf::type_id::INT64,
-     chunk_test::kDeltaBitpackPlan,
-     value_plan::delta_bitpack,
-     sorted},
-    {"delta TIMESTAMP_MICROSECONDS",
-     cudf::type_id::TIMESTAMP_MICROSECONDS,
-     chunk_test::kDeltaBitpackPlan,
-     value_plan::delta_bitpack,
-     sorted},
-    {"delta rle INT64",
-     cudf::type_id::INT64,
-     chunk_test::kDeltaRleBitpackPlan,
-     value_plan::delta_rle_bitpack,
-     runs},
-    {"dictionary STRING",
-     cudf::type_id::STRING,
-     chunk_test::kDictionaryPlan,
-     value_plan::dictionary,
-     keys},
-    {"str_split STRING",
-     cudf::type_id::STRING,
-     chunk_test::kStringSplitPlan,
-     value_plan::str_split,
-     nullable},
-    {"identity INT32", cudf::type_id::INT32, chunk_test::kStoredPlan, value_plan::stored, nullable},
-    {"identity STRING",
-     cudf::type_id::STRING,
-     chunk_test::kStoredPlan,
-     value_plan::stored,
-     nullable},
+    {"bitpack INT32", cudf::type_id::INT32, chunk_test::kBitpackPlan, nullable},
+    {"delta INT64", cudf::type_id::INT64, chunk_test::kDeltaBitpackPlan, sorted},
   };
 }
-
-void test_real_plan(real_case const& c)
-{
-  auto const stream = cudf::get_default_stream();
-  auto const mr     = rmm::mr::get_current_device_resource_ref();
-  auto const input  = chunk_test::make_random_column(c.type, c.options, stream);
-  auto const table  = chunk_test::compress_column_with_plan(input->view(), c.plan, stream, mr);
-  auto const col    = chunk_test::describe_from_table(table, 0, stream);
-  std::string const what{c.what};
-  auto check = [&](bool cond, std::string const& msg) { expect(cond, msg.c_str()); };
-
-  check(chunk::classify_value_plan(col) == c.expected, "real plan: classify " + what);
-
-  // Every leaf buffer and the validity mask, staged from a host copy of the payload, holds the
-  // payload's bytes; reading each exactly once reads exactly what was asked.
-  auto const host = chunk_test::flatten_payload_host(table, 0, stream);
-  std::vector<std::uint8_t> payload(host.size());
-  std::transform(host.begin(), host.end(), payload.begin(), [](std::byte b) {
-    return static_cast<std::uint8_t>(b);
-  });
-  auto source = std::make_shared<recording_source>(payload);
-  auto desc   = describe(col);
-  auto access = chunk::make_staged_leaf_access(desc, 0, source, mr);
-
-  std::uint64_t staged = 0;
-  for (std::size_t l = 0; l < col.leaves.size(); ++l) {
-    for (std::size_t b = 0; b < col.leaves[l].buffers.size(); ++b) {
-      auto const& range = col.leaves[l].buffers[b];
-      if (range.size == 0) { continue; }
-      auto const* p = access->device_bytes(l, b, 0, range.size, stream);
-      check(device_equals(p, payload, range.payload_offset, range.size, stream),
-            "real plan: staged leaf bytes of " + what);
-      check(source->reads.back() ==
-              std::pair<std::uint64_t, std::uint64_t>{range.payload_offset, range.size},
-            "real plan: a leaf buffer read is exactly the buffer, " + what);
-      staged += range.size;
-    }
-  }
-  check((col.validity == hpln_validity::mask) == (c.options.null_fraction > 0),
-        "real plan: a mask exactly when the input has nulls, " + what);
-  if (col.validity_size > 0) {
-    auto const* mask = access->validity_bytes(0, col.validity_size, stream);
-    check(device_equals(mask, payload, col.validity_payload_offset, col.validity_size, stream),
-          "real plan: staged validity bytes of " + what);
-    staged += col.validity_size;
-  }
-  check(staged == chunk_test::payload_size(col), "real plan: buffers cover the payload, " + what);
-  check(chunk::staged_bytes_held(*access) == staged, "real plan: bytes held, " + what);
-
-  // The cursor over the real description: its decoder supports the column, nothing read eagerly.
-  auto cursor_source = std::make_shared<recording_source>(payload);
-  {
-    compressed_column_cursor cursor{desc, 0, cursor_source, stream, mr};
-    check(cursor.supported(), "real plan: the cursor supports " + what);
-  }
-  check(cursor_source->reads.empty(), "real plan: building a cursor reads no payload, " + what);
-}
-
-void test_real_plans()
-{
-  for (auto const& c : real_cases()) {
-    test_real_plan(c);
-  }
-}
-
-// ─── 5. Windowed reads through the cursor from a host payload ───────────────
-
-/// Device bytes a cursor over a stored column may hold between calls.
-constexpr std::size_t kStoredStateBytes = 64;
-
-// A column read in three successive windows through one cursor whose payload is not on the
-// device: every window decodes to the oracle's rows although the bytes staged for the window
-// before it were freed, and a stored column leaves the cursor holding none of its payload (at
-// most the few bytes a STRING call reports its cut in).
-void test_windowed_read(real_case const& c)
-{
-  rmm::cuda_stream_view const stream{cudf::get_default_stream()};
-  auto const mr     = rmm::mr::get_current_device_resource_ref();
-  auto const input  = chunk_test::make_random_column(c.type, c.options, stream);
-  auto const table  = chunk_test::compress_column_with_plan(input->view(), c.plan, stream, mr);
-  auto const col    = chunk_test::describe_from_table(table, 0, stream);
-  auto const oracle = chunk_test::full_decode(table, 0, stream, mr);
-  std::string const what{c.what};
-  auto check = [&](bool cond, std::string const& msg) { expect(cond, msg.c_str()); };
-
-  auto const host = chunk_test::flatten_payload_host(table, 0, stream);
-  std::vector<std::uint8_t> payload(host.size());
-  std::transform(host.begin(), host.end(), payload.begin(), [](std::byte b) {
-    return static_cast<std::uint8_t>(b);
-  });
-  auto source = std::make_shared<recording_source>(payload);
-
-  bool const is_string  = c.type == cudf::type_id::STRING;
-  auto const rows       = static_cast<cudf::size_type>(col.num_rows);
-  auto const data_bytes = is_string ? static_cast<std::size_t>(rows) * 64
-                                    : static_cast<std::size_t>(rows) * cudf::size_of(col.dtype);
-  rmm::device_buffer data{data_bytes, stream, mr};
-  rmm::device_buffer offsets{(static_cast<std::size_t>(rows) + 1) * 8, stream, mr};
-  rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(rows), stream, mr};
-  cuda_check(cudaMemsetAsync(mask.data(), 0, mask.size(), stream.value()));
-
-  {
-    compressed_column_cursor cursor{describe(col), 0, source, stream, mr};
-    check(cursor.supported(), "windowed read: the cursor supports " + what);
-    cudf::size_type done   = 0;
-    std::int64_t bytes_out = 0;
-    for (cudf::size_type const end : {700, 1900, rows}) {
-      column_write_target dst;
-      dst.data            = data.data();
-      dst.data_capacity   = data.size();
-      dst.null_mask       = static_cast<cudf::bitmask_type*>(mask.data());
-      dst.offsets         = is_string ? offsets.data() : nullptr;
-      dst.offset_width    = 8;
-      dst.dst_row_offset  = done;
-      dst.dst_byte_offset = static_cast<std::size_t>(bytes_out);
-
-      auto const take    = end - done;
-      auto const written = decompress_column_chunks(
-        cursor, done / 1024, (end + 1023) / 1024, done % 1024, take, dst, stream);
-      check(written == take, "windowed read: rows written, " + what);
-      check(chunk_test::compare_rows(oracle->view(), dst, done, take, stream),
-            "windowed read: rows [" + std::to_string(done) + ", " + std::to_string(end) + ") of " +
-              what);
-      if (c.expected == value_plan::stored) {
-        check(cursor.device_bytes_held() <= kStoredStateBytes,
-              "windowed read: no payload held between calls, " + what);
-      }
-      done = end;
-      if (is_string) {
-        stream.synchronize();
-        cuda_check(cudaMemcpy(&bytes_out,
-                              static_cast<std::byte*>(offsets.data()) + std::size_t{8} * done,
-                              sizeof(bytes_out),
-                              cudaMemcpyDeviceToHost));
-      }
-    }
-    check(!source->reads.empty(), "windowed read: the payload was read, " + what);
-    std::printf("  %s: three windows decoded from a host payload, %zu device bytes held\n",
-                c.what,
-                cursor.device_bytes_held());
-  }
-}
-
-void test_windowed_reads()
-{
-  for (auto const& c : real_cases()) {
-    test_windowed_read(c);
-  }
-}
-
-// ─── 6. A long column leaves the cursor a window-sized footprint ────────────
 
 constexpr cudf::size_type kWalkWindowChunks = 4;
 /// Device bytes a cursor may hold between calls for decoder scratch, per row of its windows.
@@ -944,7 +744,6 @@ void test_long_walk_footprint()
   constexpr cudf::size_type long_rows  = 1'000'000;  // 977 chunks
   for (auto const& c : real_cases()) {
     std::string const what{c.what};
-    if (what != "bitpack INT32" && what != "delta INT64") { continue; }
     auto const short_held = walk_footprint(c, short_rows);
     auto const long_held  = walk_footprint(c, long_rows);
     std::printf(
@@ -980,8 +779,6 @@ int main()
     test_kept_dictionary_keys();
     test_device_resident();
     test_span_validation();
-    test_real_plans();
-    test_windowed_reads();
     test_long_walk_footprint();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());

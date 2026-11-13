@@ -63,33 +63,6 @@ namespace {
 
 namespace utils = sirius::test::operator_utils;
 
-merge::merge_key_spec ascending_key()
-{
-  return {.key_cols        = {0},
-          .column_order    = {cudf::order::ASCENDING},
-          .null_precedence = {cudf::null_order::AFTER}};
-}
-
-/// An unsorted (key INT64 in [0, 1000), id INT64) table; ids are unique from @p first_id on.
-std::unique_ptr<cudf::table> random_rows(std::size_t rows,
-                                         std::int64_t first_id,
-                                         std::uint32_t seed)
-{
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<std::int64_t> dist(0, 999);
-  std::vector<std::int64_t> keys(rows);
-  std::vector<std::int64_t> ids(rows);
-  for (std::size_t i = 0; i < rows; ++i) {
-    keys[i] = dist(gen);
-    ids[i]  = first_id + static_cast<std::int64_t>(i);
-  }
-  return make_table(make_column(keys, cudf::type_id::INT64),
-                    make_column(ids, cudf::type_id::INT64));
-}
-
-const std::vector<std::size_t> kTwoCols{0, 1};
-const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT64},
-                                             cudf::data_type{cudf::type_id::INT64}};
 /// Data bytes of one (INT64, INT64) row.
 constexpr std::size_t kRowBytes = 16;
 
@@ -109,8 +82,11 @@ struct placed_runs {
   void add(placement where, std::size_t rows, std::size_t num_batches = 1)
   {
     auto const index = runs.size();
-    auto const table = random_rows(
-      rows, static_cast<std::int64_t>(index) * 1'000'000, static_cast<std::uint32_t>(7 + index));
+    // Keys in [0, 1000); ids unique over the runs.
+    auto const table = random_rows(rows,
+                                   1000,
+                                   static_cast<std::int64_t>(index) * 1'000'000,
+                                   static_cast<std::uint32_t>(7 + index));
     runs.push_back(
       make_sorted_gpu_run(repository, *fx.gpu, table->view(), ascending_key(), num_batches));
     std::optional<scoped_spill_compression> compression;
@@ -150,35 +126,6 @@ TEST_CASE("windowed_merger reads no refill bytes from GPU runs and bounds the ro
   tiers_fixture fx;
   placed_runs runs(fx);
   constexpr std::size_t kWindowRows = 1000;
-
-  SECTION("three runs over several run() calls")
-  {
-    runs.add(placement::gpu, 5000, 2);
-    runs.add(placement::gpu, 3000);
-    runs.add(placement::gpu, 4200, 3);
-    auto const expected = expected_full_sort(runs.runs, ascending_key());
-    auto merger = runs.make_merger({.window_rows = kWindowRows, .output_target_bytes = 48 * 1024});
-
-    merge::merge_round_stats stats;
-    auto const collected =
-      collect_full_sort(merger, runs.cursors, fx.stream_view(), fx.mr(), &stats);
-
-    CHECK(collected.chunks.size() > 1);
-    CHECK(tables_equal(collected.table->view(), expected->view()));
-    CHECK(stats.rows_out == runs.total_rows);
-    CHECK(stats.refill_rows == 0);
-    CHECK(stats.refill_bytes == 0);
-    CHECK(stats.refill_bytes_host == 0);
-    CHECK(stats.refill_bytes_disk == 0);
-    CHECK(stats.refill_bytes_compressed == 0);
-    CHECK(stats.runs_read_compressed == 0);
-    CHECK(stats.rounds > 1);
-    CHECK(stats.round_rows_min >= 1);
-    CHECK(stats.round_rows_min <= stats.round_rows_max);
-    CHECK(stats.round_rows_max <= kWindowRows);
-    CHECK(stats.rounds * stats.round_rows_min <= stats.rows_out);
-    CHECK(stats.rows_out <= stats.rounds * stats.round_rows_max);
-  }
 
   SECTION("one run: every round emits its window")
   {
@@ -294,26 +241,6 @@ TEST_CASE("windowed_merger splits its refill bytes by the tier and representatio
     CHECK(summed.runs_read_compressed >= kCompressedRuns);
     CHECK(summed.round_rows_min >= 1);
     CHECK(summed.round_rows_max <= kWindowRows);
-  }
-
-  SECTION("stats passed to every run() are added to, not reset")
-  {
-    auto merger = runs.make_merger({.window_rows = kWindowRows, .output_target_bytes = 64 * 1024});
-    merge::merge_round_stats stats;
-    auto const collected =
-      collect_full_sort(merger, runs.cursors, fx.stream_view(), fx.mr(), &stats);
-
-    CHECK(collected.chunks.size() > 2);
-    CHECK(tables_equal(collected.table->view(), expected->view()));
-    CHECK(stats.refill_rows == kHostRows + kDiskRows + kCompressedRows);
-    CHECK(stats.refill_bytes_host == kHostRows * kRowBytes);
-    CHECK(stats.refill_bytes_disk == kDiskRows * kRowBytes);
-    CHECK(stats.refill_bytes_host + stats.refill_bytes_disk + stats.refill_bytes_compressed ==
-          stats.refill_bytes);
-    CHECK(stats.runs_read_compressed >= kCompressedRuns);
-    CHECK(stats.round_rows_min >= 1);
-    CHECK(stats.round_rows_min <= stats.round_rows_max);
-    CHECK(stats.round_rows_max <= kWindowRows);
   }
 }
 

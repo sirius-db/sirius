@@ -52,8 +52,10 @@ class windowed_merge_input final : public operator_data {
    *        converted whole to the GPU tier.
    * @param compressed_runs How many of the runs hold a compressed batch (read through decode
    *        cursors that keep scratch between refills).
-   * @param fetch_columns Columns the task fetches.
-   * @param string_columns How many of the fetched columns are STRING.
+   * @param fetch_columns Columns the task fetches. Both estimates use it: 0 leaves the validity
+   *        masks of the window buffers out of the reservation.
+   * @param string_columns How many of the fetched columns are STRING. Both estimates use it: 0
+   *        leaves the offsets and the chars slack of the window buffers out of the reservation.
    */
   windowed_merge_input(std::size_t partition,
                        std::vector<merge_input_cursor> cursors,

@@ -140,6 +140,35 @@ void tile_merge(const kway_key_comparator& cmp,
                 cudf::device_span<cudf::size_type> out_row,
                 rmm::cuda_stream_view stream);
 
+/// How tile_merge launches its kernel for one round.
+struct tile_merge_shape {
+  std::int32_t sub_tiles;      ///< threads per tile, each merging sub_rows output rows
+  cudf::size_type sub_rows;    ///< output rows per sub-tile
+  std::int32_t block_tiles;    ///< tiles per block
+  std::int32_t block_threads;  ///< block_tiles * sub_tiles
+  std::uint32_t blocks;        ///< ceil(tiles / block_tiles)
+  std::size_t shared_bytes;    ///< shared memory per block
+};
+
+/**
+ * @brief The launch shape of tile_merge: a host computation, exposed for tests.
+ *
+ * A block's shared memory is at most 40 KiB, and at most 32 KiB when there are more blocks than
+ * SMs (a single thread at a fan-in above 2048 needs more than that and keeps it).
+ *
+ * @param tiles Tiles of the round, at least 1.
+ * @param tile_rows Output rows per tile, at least 1.
+ * @param num_inputs Fan-in k, in [1, kMaxKwayMergeInputs].
+ * @param sm_count SMs of the device.
+ * @param requested_sub_tiles Sub-tiles per tile instead of the count chosen from the device
+ *        (0: choose); capped like the chosen count.
+ */
+tile_merge_shape tile_merge_launch_shape(cudf::size_type tiles,
+                                         cudf::size_type tile_rows,
+                                         std::int32_t num_inputs,
+                                         int sm_count,
+                                         std::int32_t requested_sub_tiles = 0);
+
 /// A small device array that gather_kway copies to the host in the same wait on the stream as
 /// its own counts. `source` and `destination` have the same number of entries.
 struct gather_read_back {

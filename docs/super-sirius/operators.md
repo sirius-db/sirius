@@ -666,7 +666,12 @@ fan-in, one-shot fraction) are derived once at arming from the settings, the dev
 the partition's run count and row width. `set_device_budget_provider()` supplies the GPU memory and
 task concurrency. The plan generator installs `make_device_budget_provider()`, which reports the
 GPU memory space holding most of the partition's bytes (the smallest GPU space when no run is on a
-GPU) and the configured GPU executor thread count. A directly constructed operator has no
+GPU) and the configured GPU executor thread count. The GPU memory it reports is the space's free
+bytes plus the bytes reserved by tasks in flight (`get_available_memory() +
+get_total_reserved_memory()`): the derivation already divides it among the concurrent tasks, so
+partitions of a device get the same sizes whichever task is running when each is armed. Bytes
+allocated outside a reservation (resident batches, kept window buffers) stay subtracted. A directly
+constructed operator has no
 provider: it uses the majority space (or the last one it saw, or 8 GiB with a warning when it has
 seen none) and the default GPU executor width.
 
@@ -703,6 +708,19 @@ one `run_state` per run, the next output chunk index and an `in_flight` flag.
   ends before the others does not force a rebuild. Between tasks the merger holds references to
   the unread batches and its window buffers stay allocated on the GPU
   (see [Windowed Merge Memory](memory-management.md#windowed-merge-memory)).
+- **Open partition cap.** A windowed partition is *open* while it has a task in flight or keeps
+  its merger. A kept merger's window buffers are in no repository, so they cannot be spilled, and
+  the window budget (`derive_merge_config()`) assumes one merger per concurrent task of a device.
+  `get_next_task_input_data()` therefore plans a task for a partition that holds no merger (its
+  first task, or the first task of a new pass) only while fewer partitions are open than the
+  `device_budget::concurrent_tasks` the partition was sized with (`at_open_partition_cap()`);
+  otherwise it skips the partition, and `get_next_task_hint()` does not report it. Open partitions
+  are always served, so they finish, and the commit that closes one schedules the operator again,
+  which opens the next waiting partition. The count is per device, like the budget: an open
+  partition counts on the device of its merger or running task, and one whose first task has not
+  started counts on every device, because it may land on any. Arming is not delayed (it allocates
+  nothing on the GPU), and one-shot partitions are neither counted nor held back: they keep no
+  merger and their inputs are covered by their task's reservation.
 - **Positions.** The output position is `(partition << 32) | chunk`
   (`merge::make_merge_chunk_position()`), which orders chunks by partition, then by chunk. It
   throws when either part reaches 2^32. In `auto` and `windowed` mode one-shot partitions use the
@@ -719,7 +737,8 @@ one `run_state` per run, the next output chunk index and an `in_flight` flag.
   leaves them and `in_flight` unchanged and destroys the merger it held, which frees its window
   buffers. The rescheduled task builds a new merger and replays from the same cursors,
   possibly with smaller windows (see [Shrink Before Retry](memory-management.md#shrink-before-retry)).
-  A task that returns no rows while a cursor is not exhausted throws `internal_exception`.
+  The operator does not check for progress itself: `windowed_merger::run` returns no rows only
+  when every cursor is exhausted and throws `internal_exception` on a round that makes no progress.
 - **Counters.** `merge_sort_counters` counts the partitions armed on each route, the windowed and
   intermediate tasks, the mergers built and the summed `merge::merge_round_stats`. `counters()`
   reads one operator's; `process_counters()` / `reset_process_counters()` are process-wide, for
@@ -759,7 +778,9 @@ With `n` = `window_rows`, each round does the following:
 4. **Tile merge.** `detail::tile_merge()` merges each tile independently and writes an
    `(input, row)` gather map of `target` entries. A tile is split into sub-tiles, one thread
    each with a tournament tree in shared memory; the split is chosen from the tile count, the
-   device's SM count and the shared memory the fan-in needs. It accepts at most
+   device's SM count and the shared memory the fan-in needs: a block uses at most 40 KiB, and at
+   most 32 KiB when there are more blocks than SMs, because above that fewer blocks fit an SM
+   (`detail::tile_merge_launch_shape()`). It accepts at most
    `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
 5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
    masks and STRING data, into the round's output table. The null counts, the STRING sizes and

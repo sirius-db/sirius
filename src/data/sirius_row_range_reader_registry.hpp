@@ -44,15 +44,8 @@ class row_range_reader_registry {
  public:
   using registry_type = cucascade::row_range_reader_registry;
 
-  /**
-   * @brief Initialize the row-range reader registry with the builtin readers and the readers of
-   * the compressed (Simpatico) representations.
-   *
-   * This should be called once when the extension is loaded. A second call is a no-op.
-   * The disk reader uses each source's memory-space I/O backend.
-   *
-   * @return Whether this call installed the registry
-   */
+  /// Installs the builtin readers and those of the compressed (Simpatico) representations.
+  /// Returns whether this call installed the registry; a second call is a no-op.
   static bool initialize()
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -65,12 +58,7 @@ class row_range_reader_registry {
     return true;
   }
 
-  /**
-   * @brief Get the global row-range reader registry instance.
-   *
-   * @return registry_type& Reference to the row-range reader registry
-   * @throws std::runtime_error if not initialized
-   */
+  /// @throws std::runtime_error if not initialized
   static registry_type& get()
   {
     auto* registry = published_.load(std::memory_order_acquire);
@@ -78,19 +66,11 @@ class row_range_reader_registry {
     return *registry;
   }
 
-  /**
-   * @brief Check if the row-range reader registry is initialized.
-   *
-   * @return true if initialized, false otherwise
-   */
   static bool is_initialized() noexcept
   {
     return published_.load(std::memory_order_acquire) != nullptr;
   }
 
-  /**
-   * @brief Shutdown and release the row-range reader registry.
-   */
   static void shutdown()
   {
     std::lock_guard<std::mutex> lock(mutex_);

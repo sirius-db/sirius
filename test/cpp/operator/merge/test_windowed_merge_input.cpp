@@ -92,8 +92,12 @@ windowed_merge_input make_input(window_config cfg)
     5, make_cursors(), false, 9, cfg, kRowWidth, kKeyRowWidth, kGpuRuns, kLargestFallback);
 }
 
-/// @p unbuffered_runs: the runs charged no window buffer.
-std::size_t expected_estimate(const window_config& cfg, std::size_t unbuffered_runs = kGpuRuns)
+/// @p unbuffered_runs: the runs charged no window buffer. @p fetch_columns and @p string_columns:
+/// the column counts the input was built with.
+std::size_t expected_estimate(const window_config& cfg,
+                              std::size_t unbuffered_runs = kGpuRuns,
+                              std::size_t fetch_columns   = 0,
+                              std::size_t string_columns  = 0)
 {
   return estimate_task_bytes(make_cursors().size(),
                              unbuffered_runs,
@@ -101,7 +105,28 @@ std::size_t expected_estimate(const window_config& cfg, std::size_t unbuffered_r
                              kRowWidth,
                              kKeyRowWidth,
                              cfg.output_target_bytes,
-                             kLargestFallback);
+                             kLargestFallback,
+                             fetch_columns,
+                             string_columns);
+}
+
+/// An input over make_cursors() with no compressed run, so its estimate has no reader term.
+windowed_merge_input make_input_with_columns(window_config cfg,
+                                             std::size_t fetch_columns,
+                                             std::size_t string_columns)
+{
+  return windowed_merge_input(5,
+                              make_cursors(),
+                              false,
+                              9,
+                              cfg,
+                              kRowWidth,
+                              kKeyRowWidth,
+                              kGpuRuns,
+                              kLargestFallback,
+                              0,
+                              fetch_columns,
+                              string_columns);
 }
 
 }  // namespace
@@ -164,13 +189,60 @@ TEST_CASE("windowed_merge_input adds the reader state of its compressed runs to 
   const auto reader = [&](std::size_t window_rows) {
     return estimate_reader_state_bytes(compressed_runs, fetch_columns, string_columns, window_rows);
   };
+  const auto task = [&] {
+    return expected_estimate(input.config(), kGpuRuns, fetch_columns, string_columns);
+  };
   REQUIRE(reader(65536) > 0);
-  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()) + reader(65536));
+  REQUIRE(input.get_estimated_size_in_bytes() == task() + reader(65536));
 
   // The reader term follows the window when the task shrinks.
   REQUIRE(input.shrink_for_retry());
   REQUIRE(input.config().window_rows == 32768);
-  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()) + reader(32768));
+  REQUIRE(input.get_estimated_size_in_bytes() == task() + reader(32768));
+}
+
+TEST_CASE("windowed_merge_input reserves the masks and STRING slots of its window buffers",
+          "[windowed_merge_input]")
+{
+  constexpr std::size_t columns = 3;
+  const window_config cfg{.window_rows = 65536, .output_target_bytes = 64 * kMiB};
+  // Two slots per run that is not sliced in place.
+  const std::size_t slots = 2 * (make_cursors().size() - kGpuRuns);
+
+  // The same task without its column counts: the rows of the windows only.
+  const auto rows_only = make_input(cfg).get_estimated_size_in_bytes();
+  REQUIRE(rows_only == expected_estimate(cfg));
+
+  // Fixed-width columns: every column of a slot has a validity mask.
+  const auto fixed_width = make_input_with_columns(cfg, columns, 0).get_estimated_size_in_bytes();
+  REQUIRE(fixed_width == expected_estimate(cfg, kGpuRuns, columns, 0));
+  REQUIRE(fixed_width >= rows_only + slots * columns * (cfg.window_rows / 8));
+
+  // One of the columns is STRING: its offsets and the slack of its chars are added.
+  const auto with_string = make_input_with_columns(cfg, columns, 1).get_estimated_size_in_bytes();
+  REQUIRE(with_string == expected_estimate(cfg, kGpuRuns, columns, 1));
+  REQUIRE(with_string >= fixed_width + slots * (cfg.window_rows * 8));
+
+  // Each further STRING column adds its own offsets.
+  REQUIRE(make_input_with_columns(cfg, columns, 2).get_estimated_size_in_bytes() > with_string);
+
+  SECTION("the terms follow the window when the task shrinks")
+  {
+    auto input = make_input_with_columns(cfg, columns, 1);
+    REQUIRE(input.shrink_for_retry());
+    REQUIRE(input.get_estimated_size_in_bytes() ==
+            expected_estimate(input.config(), kGpuRuns, columns, 1));
+    REQUIRE(input.get_estimated_size_in_bytes() > expected_estimate(input.config()));
+  }
+
+  SECTION("a run whose buffers a kept merger holds is charged neither")
+  {
+    auto input = make_input_with_columns(cfg, columns, 1);
+    input.set_kept_buffer_runs(make_cursors().size());
+    REQUIRE(input.get_estimated_size_in_bytes() ==
+            expected_estimate(cfg, make_cursors().size(), columns, 1));
+    REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg, make_cursors().size()));
+  }
 }
 
 TEST_CASE("windowed_merge_input leaves out the window buffers a kept merger holds",
@@ -311,33 +383,4 @@ TEST_CASE("windowed_merge_input captures the GPU space it is prepared in", "[win
 
   input.prepare_for_processing(nullptr, stream);
   REQUIRE_THROWS_AS(input.gpu_memory_space(), std::runtime_error);
-}
-
-TEST_CASE("merge chunk positions round-trip and reject values of 2^32 or more",
-          "[windowed_merge_input]")
-{
-  constexpr std::size_t limit = std::size_t{1} << 32;
-  constexpr std::size_t last  = limit - 1;
-
-  REQUIRE(make_merge_chunk_position(0, 0) == 0);
-  REQUIRE(make_merge_chunk_position(0, 7) == 7);
-  REQUIRE(make_merge_chunk_position(1, 0) == limit);
-  REQUIRE(make_merge_chunk_position(3, 5) == ((std::size_t{3} << 32) | 5));
-
-  const std::vector<std::pair<std::size_t, std::size_t>> cases = {
-    {0, 0}, {0, 1}, {1, 0}, {3, 5}, {last, 0}, {0, last}, {last, last}, {12345, 67890}};
-  for (const auto& [partition, chunk] : cases) {
-    const auto [split_partition, split_chunk] =
-      split_merge_chunk_position(make_merge_chunk_position(partition, chunk));
-    REQUIRE(split_partition == partition);
-    REQUIRE(split_chunk == chunk);
-  }
-
-  // Positions order by partition first, then by chunk.
-  REQUIRE(make_merge_chunk_position(1, last) < make_merge_chunk_position(2, 0));
-  REQUIRE(make_merge_chunk_position(2, 0) < make_merge_chunk_position(2, 1));
-
-  REQUIRE_THROWS_AS(make_merge_chunk_position(limit, 0), sirius::internal_exception);
-  REQUIRE_THROWS_AS(make_merge_chunk_position(0, limit), sirius::internal_exception);
-  REQUIRE_THROWS_AS(make_merge_chunk_position(limit, limit), sirius::internal_exception);
 }

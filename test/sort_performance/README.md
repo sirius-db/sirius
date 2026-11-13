@@ -273,9 +273,12 @@ No GPU and no Sirius extension are needed. From the repository root:
 for t in test/sort_performance/test_*.py; do pixi run python -B "$t"; done
 ```
 
-- `test_sort_merge_bench.py` and `test_bench_metrics.py` test the harness and the parsers.
-  `test_bench_metrics_source_formats.py` checks the parsers against the log format strings in the
-  C++ sources.
+- `test_sort_merge_bench.py` tests the datasets, the sizing, the generated SQL, the result
+  checks, the log scan and a `--dry-run` of the default matrix; `test_bench_metrics.py` tests
+  the log parsers. `test_bench_metrics_source_formats.py` checks the `[merge_sort][stats]` tag
+  and counters against the format string in the C++ sources.
+- Running a matrix (child processes, timeouts, signals, the samplers) has no unit tests: check
+  it with the smoke run in [How to run it](#how-to-run-it).
 - `-B` keeps Python from writing `test/sort_performance/__pycache__/` (git-ignored) into the checkout.
 - pytest is not in the pixi environment; the files run under `unittest`. Run each file as a
   script: `python -m unittest test.sort_performance...` does not work, because the standard

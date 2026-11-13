@@ -143,14 +143,19 @@ TEST_CASE("mixed ports build a task input that materializes on the GPU", "[input
   }
 }
 
-TEST_CASE("prepare locks a host batch in place when the input does not materialize on the GPU",
+TEST_CASE("prepare locks a batch in place when the input does not materialize on the GPU",
           "[input_residency_policy]")
 {
+  // A spilled batch stays on the host; a batch already where the task runs is not copied.
+  const bool on_host = GENERATE(true, false);
+  CAPTURE(on_host);
   tiered_memory_fixture f;
   REQUIRE(f.setup());
   rmm::cuda_stream stream;
-  auto batch           = f.make_host_batch(stream);
+  auto batch           = on_host ? f.make_host_batch(stream) : f.make_gpu_batch(stream);
   const auto source_id = batch->get_batch_id();
+  const auto tier      = on_host ? cucascade::memory::Tier::HOST : cucascade::memory::Tier::GPU;
+  const auto* space    = on_host ? f.host0 : f.gpu0;
 
   pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
   input.set_materialize_on_gpu(false);
@@ -159,46 +164,7 @@ TEST_CASE("prepare locks a host batch in place when the input does not materiali
   input.prepare_for_processing(f.gpu0, stream);
   stream.synchronize();
 
-  // Same batch, still on the host, read-locked; nothing was allocated on the GPU for it.
-  REQUIRE(input.get_data_batches().at(0) == batch);
-  REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{source_id});
-  REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
-  REQUIRE(f.gpu0->get_available_memory() == gpu_available_before);
-  {
-    auto ro_batches = input.get_read_only_batches();
-    REQUIRE(ro_batches.size() == 1);
-    REQUIRE(ro_batches[0].get_batch_id() == source_id);
-    REQUIRE(ro_batches[0].get_current_tier() == cucascade::memory::Tier::HOST);
-    REQUIRE(ro_batches[0].get_memory_space()->get_id() == f.host0->get_id());
-    REQUIRE(dynamic_cast<const cucascade::host_data_representation*>(ro_batches[0].get_data()) !=
-            nullptr);
-  }
-  // The stored locks keep the batch pinned after the transient copies above are gone.
-  REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
-  REQUIRE_FALSE(batch->try_to_mutable().has_value());
-
-  input.remove_read_only_lock();
-  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
-  REQUIRE(batch->try_to_mutable().has_value());
-}
-
-TEST_CASE("prepare locks a GPU batch in place when the input does not materialize on the GPU",
-          "[input_residency_policy]")
-{
-  tiered_memory_fixture f;
-  REQUIRE(f.setup());
-  rmm::cuda_stream stream;
-  auto batch           = f.make_gpu_batch(stream);
-  const auto source_id = batch->get_batch_id();
-
-  pipelineable_operator_data input(std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
-  input.set_materialize_on_gpu(false);
-
-  const auto gpu_available_before = f.gpu0->get_available_memory();
-  input.prepare_for_processing(f.gpu0, stream);
-  stream.synchronize();
-
-  // Same batch, already where the task runs, read-locked; no copy was made of it.
+  // Same batch, in the tier it was in, read-locked; nothing was allocated on the GPU for it.
   REQUIRE(input.get_data_batches().size() == 1);
   REQUIRE(input.get_data_batches()[0] == batch);
   REQUIRE(input.original_batch_ids() == std::vector<std::uint64_t>{source_id});
@@ -208,13 +174,20 @@ TEST_CASE("prepare locks a GPU batch in place when the input does not materializ
     auto ro_batches = input.get_read_only_batches();
     REQUIRE(ro_batches.size() == 1);
     REQUIRE(ro_batches[0].get_batch_id() == source_id);
-    REQUIRE(ro_batches[0].get_current_tier() == cucascade::memory::Tier::GPU);
-    REQUIRE(ro_batches[0].get_memory_space()->get_id() == f.gpu0->get_id());
+    REQUIRE(ro_batches[0].get_current_tier() == tier);
+    REQUIRE(ro_batches[0].get_memory_space()->get_id() == space->get_id());
+    if (on_host) {
+      REQUIRE(dynamic_cast<const cucascade::host_data_representation*>(ro_batches[0].get_data()) !=
+              nullptr);
+    }
   }
+  // The stored locks keep the batch pinned after the transient copies above are gone.
+  REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
   input.remove_read_only_lock();
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+  REQUIRE(batch->try_to_mutable().has_value());
 }
 
 TEST_CASE(

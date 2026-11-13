@@ -11,8 +11,10 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -69,6 +71,19 @@ struct chunk_span {
     return chunk_begin * kChunkRows + skip_head;
   }
 };
+
+/// Chars budget of a STRING destination: what is left of it, and what a 4-byte offset can
+/// address.
+[[nodiscard]] inline std::uint64_t string_chars_budget(column_write_target const& dst) noexcept
+{
+  std::uint64_t budget =
+    dst.data_capacity > dst.dst_byte_offset ? dst.data_capacity - dst.dst_byte_offset : 0;
+  if (dst.offset_width == 4) {
+    std::uint64_t const max_end = std::numeric_limits<std::int32_t>::max();
+    budget = std::min(budget, max_end > dst.dst_byte_offset ? max_end - dst.dst_byte_offset : 0);
+  }
+  return budget;
+}
 
 /// Decoder of one column's value plan. Stateful across calls (prefixes, keys, ANS headers).
 /// Writes values / offsets / chars only — never validity. Returns rows written: span.take, or

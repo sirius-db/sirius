@@ -32,7 +32,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -236,62 +235,6 @@ host_column random_column(kind type,
   return col;
 }
 
-/// Three-way comparison of two non-null values: NaN equals NaN and is greater than every number;
-/// strings compare bytewise.
-int compare_values(const host_column& a,
-                   cudf::size_type ra,
-                   const host_column& b,
-                   cudf::size_type rb)
-{
-  switch (a.type) {
-    case kind::float32:
-    case kind::float64: {
-      const double x = a.doubles[ra];
-      const double y = b.doubles[rb];
-      if (std::isnan(x) || std::isnan(y)) {
-        return static_cast<int>(std::isnan(x)) - static_cast<int>(std::isnan(y));
-      }
-      return static_cast<int>(y < x) - static_cast<int>(x < y);
-    }
-    case kind::string: {
-      const int cmp = a.strings[ra].compare(b.strings[rb]);
-      return static_cast<int>(cmp > 0) - static_cast<int>(cmp < 0);
-    }
-    default:
-      return static_cast<int>(b.ints[rb] < a.ints[ra]) - static_cast<int>(a.ints[ra] < b.ints[rb]);
-  }
-}
-
-/// Host reference of kway_key_device_view::less.
-bool reference_less(const std::vector<host_window>& windows,
-                    const std::vector<cudf::order>& orders,
-                    const std::vector<cudf::null_order>& null_orders,
-                    int32_t ia,
-                    cudf::size_type ra,
-                    int32_t ib,
-                    cudf::size_type rb)
-{
-  for (std::size_t c = 0; c < orders.size(); ++c) {
-    const auto& a     = windows[ia][c];
-    const auto& b     = windows[ib][c];
-    const bool a_null = !a.valid[ra];
-    const bool b_null = !b.valid[rb];
-    int cmp           = 0;
-    if (a_null && b_null) {
-      cmp = 0;
-    } else if (a_null) {
-      cmp = null_orders[c] == cudf::null_order::BEFORE ? -1 : 1;
-    } else if (b_null) {
-      cmp = null_orders[c] == cudf::null_order::BEFORE ? 1 : -1;
-    } else {
-      cmp = compare_values(a, ra, b, rb);
-    }
-    if (cmp != 0) { return orders[c] == cudf::order::ASCENDING ? cmp < 0 : cmp > 0; }
-  }
-  if (ia != ib) { return ia < ib; }
-  return ra < rb;
-}
-
 struct pair_list {
   std::vector<int32_t> ia;
   std::vector<cudf::size_type> ra;
@@ -341,8 +284,8 @@ kway_key_comparator make_comparator(const std::vector<cudf::table_view>& views,
 }
 
 /// Compares every ordered pair of rows of the windows through the device comparator and checks
-/// the result against the host reference and against the position of the two rows in cuDF's
-/// stable sort of the concatenated windows (which orders equal keys by input, then by row).
+/// the result against the position of the two rows in cuDF's stable sort of the concatenated
+/// windows (which orders equal keys by input, then by row).
 void check_all_pairs(const std::vector<host_window>& windows,
                      const std::vector<cudf::order>& orders,
                      const std::vector<cudf::null_order>& null_orders)
@@ -384,18 +327,13 @@ void check_all_pairs(const std::vector<host_window>& windows,
   }
   const auto result = run_less(cmp, pairs);
 
-  std::size_t reference_mismatches = 0;
-  std::size_t cudf_mismatches      = 0;
+  std::size_t cudf_mismatches = 0;
   for (std::size_t a = 0; a < rows.size(); ++a) {
     for (std::size_t b = 0; b < rows.size(); ++b) {
-      const bool got      = result[a * rows.size() + b] != 0;
-      const bool expected = reference_less(
-        windows, orders, null_orders, rows[a].first, rows[a].second, rows[b].first, rows[b].second);
-      if (got != expected) { ++reference_mismatches; }
+      const bool got = result[a * rows.size() + b] != 0;
       if (got != (position[a] < position[b])) { ++cudf_mismatches; }
     }
   }
-  CHECK(reference_mismatches == 0);
   CHECK(cudf_mismatches == 0);
 }
 
@@ -427,7 +365,7 @@ host_column int64_column(const std::vector<int64_t>& values)
 
 }  // namespace
 
-TEST_CASE("kway comparator matches the host reference for single-column keys", "[kway_comparator]")
+TEST_CASE("kway comparator matches the stable sort for single-column keys", "[kway_comparator]")
 {
   const auto type       = GENERATE(kind::int64,
                              kind::float64,

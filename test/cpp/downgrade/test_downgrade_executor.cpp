@@ -52,6 +52,7 @@
 #include <memory>
 #include <stop_token>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -864,141 +865,73 @@ struct priority_test_repo {
   }
 };
 
+/// Registers one two-batch repository per {operator id, downgrade priority} of @p repos, in that
+/// order, then asks the executor for one repository's bytes at a time and requires that the
+/// repositories are spilled in @p expected_order (indices into @p repos) while every other one
+/// stays on the GPU.
+void require_sweep_order(const std::vector<std::pair<size_t, int32_t>>& repos,
+                         const std::vector<size_t>& expected_order)
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  std::vector<priority_test_repo> handles;
+  handles.reserve(repos.size());
+  for (auto const& entry : repos) {
+    handles.emplace_back(*gpu_space, entry.second);
+    REQUIRE(handles.back().repo->get_downgrade_priority() == entry.second);
+  }
+  const size_t one_repo_bytes = handles.front().bytes();
+  for (size_t i = 0; i < repos.size(); ++i) {
+    repo_mgr.add_new_repository(repos[i].first, "out", std::move(handles[i].repo));
+  }
+
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  std::vector<bool> spilled(handles.size(), false);
+  for (auto const next : expected_order) {
+    REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
+    spilled[next] = true;
+    for (size_t i = 0; i < handles.size(); ++i) {
+      CAPTURE(next, i);
+      REQUIRE(handles[i].all_on(spilled[i] ? cucascade::memory::Tier::HOST
+                                           : cucascade::memory::Tier::GPU));
+    }
+  }
+
+  executor.stop();
+}
+
 }  // namespace
 
-TEST_CASE("tier-1 sweep visits equal-priority repositories in get_repositories() order",
+TEST_CASE("tier-1 sweep orders repositories by downgrade priority, then by get_repositories()",
           "[downgrade_executor][downgrade_priority]")
 {
-  auto mem_mgr    = make_test_memory_manager();
-  auto* gpu_space = get_gpu_space(*mem_mgr);
-  REQUIRE(gpu_space != nullptr);
-
-  sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(kTestQueryId);
-  sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
-
-  priority_test_repo first(*gpu_space);
-  priority_test_repo second(*gpu_space);
-  priority_test_repo third(*gpu_space);
-  REQUIRE(first.repo->get_downgrade_priority() == 0);
-  size_t one_repo_bytes = first.bytes();
-  // Registered out of order: get_repositories() is ascending {operator_id, port_id}.
-  repo_mgr.add_new_repository(3, "out", std::move(third.repo));
-  repo_mgr.add_new_repository(1, "out", std::move(first.repo));
-  repo_mgr.add_new_repository(2, "out", std::move(second.repo));
-
-  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
-  executor.start();
-
-  // Golden order: with every priority at the default the lowest operator id is spilled first.
-  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
-  REQUIRE(first.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(second.all_on(cucascade::memory::Tier::GPU));
-  REQUIRE(third.all_on(cucascade::memory::Tier::GPU));
-
-  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
-  REQUIRE(second.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(third.all_on(cucascade::memory::Tier::GPU));
-
-  executor.stop();
-}
-
-TEST_CASE("tier-1 sweep spills a higher-priority repository first",
-          "[downgrade_executor][downgrade_priority]")
-{
-  auto mem_mgr    = make_test_memory_manager();
-  auto* gpu_space = get_gpu_space(*mem_mgr);
-  REQUIRE(gpu_space != nullptr);
-
-  sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(kTestQueryId);
-  sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
-
-  priority_test_repo first(*gpu_space);
-  priority_test_repo second(*gpu_space);
-  priority_test_repo third(*gpu_space, /*priority=*/100);
-  size_t one_repo_bytes = first.bytes();
-  repo_mgr.add_new_repository(1, "out", std::move(first.repo));
-  repo_mgr.add_new_repository(2, "out", std::move(second.repo));
-  repo_mgr.add_new_repository(3, "out", std::move(third.repo));
-
-  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
-  executor.start();
-
-  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
-  REQUIRE(third.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(first.all_on(cucascade::memory::Tier::GPU));
-  REQUIRE(second.all_on(cucascade::memory::Tier::GPU));
-
-  executor.stop();
-}
-
-TEST_CASE("tier-1 sweep keeps the relative order of repositories with equal priority",
-          "[downgrade_executor][downgrade_priority]")
-{
-  auto mem_mgr    = make_test_memory_manager();
-  auto* gpu_space = get_gpu_space(*mem_mgr);
-  REQUIRE(gpu_space != nullptr);
-
-  sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(kTestQueryId);
-  sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
-
-  priority_test_repo low(*gpu_space);
-  priority_test_repo high_first(*gpu_space, /*priority=*/100);
-  priority_test_repo high_second(*gpu_space, /*priority=*/100);
-  size_t one_repo_bytes = low.bytes();
-  repo_mgr.add_new_repository(1, "out", std::move(low.repo));
-  repo_mgr.add_new_repository(2, "out", std::move(high_first.repo));
-  repo_mgr.add_new_repository(3, "out", std::move(high_second.repo));
-
-  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
-  executor.start();
-
-  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
-  REQUIRE(high_first.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(high_second.all_on(cucascade::memory::Tier::GPU));
-  REQUIRE(low.all_on(cucascade::memory::Tier::GPU));
-
-  REQUIRE(executor.request_free_memory_and_wait(one_repo_bytes) == one_repo_bytes);
-  REQUIRE(high_second.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(low.all_on(cucascade::memory::Tier::GPU));
-
-  executor.stop();
-}
-
-TEST_CASE("tier-1 sweep visits a negative-priority repository after the default ones",
-          "[downgrade_executor][downgrade_priority]")
-{
-  auto mem_mgr    = make_test_memory_manager();
-  auto* gpu_space = get_gpu_space(*mem_mgr);
-  REQUIRE(gpu_space != nullptr);
-
-  sirius::exec::query_lifecycle_registry lifecycle;
-  lifecycle.open_query(kTestQueryId);
-  sirius::data::data_repository_manager_registry repo_registry;
-  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
-
-  priority_test_repo negative(*gpu_space, /*priority=*/-5);
-  priority_test_repo second(*gpu_space);
-  priority_test_repo third(*gpu_space);
-  size_t one_repo_bytes = negative.bytes();
-  repo_mgr.add_new_repository(1, "out", std::move(negative.repo));
-  repo_mgr.add_new_repository(2, "out", std::move(second.repo));
-  repo_mgr.add_new_repository(3, "out", std::move(third.repo));
-
-  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
-  executor.start();
-
-  REQUIRE(executor.request_free_memory_and_wait(2 * one_repo_bytes) == 2 * one_repo_bytes);
-  REQUIRE(second.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(third.all_on(cucascade::memory::Tier::HOST));
-  REQUIRE(negative.all_on(cucascade::memory::Tier::GPU));
-
-  executor.stop();
+  SECTION("equal priorities: get_repositories() order")
+  {
+    // Registered out of order: get_repositories() is ascending {operator_id, port_id}, so with
+    // every priority at the default the lowest operator id is spilled first.
+    require_sweep_order({{3, 0}, {1, 0}, {2, 0}}, {1, 2});
+  }
+  SECTION("a higher-priority repository is spilled first")
+  {
+    require_sweep_order({{1, 0}, {2, 0}, {3, 100}}, {2});
+  }
+  SECTION("repositories with equal priority keep their relative order")
+  {
+    require_sweep_order({{1, 0}, {2, 100}, {3, 100}}, {1, 2});
+  }
+  SECTION("a negative-priority repository is visited after the default ones")
+  {
+    require_sweep_order({{1, -5}, {2, 0}, {3, 0}}, {1, 2});
+  }
 }
 
 TEST_CASE("downgrade priority does not reorder repositories across queries",

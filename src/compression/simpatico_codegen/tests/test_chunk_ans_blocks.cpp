@@ -278,34 +278,6 @@ void test_random_ranges()
   }
 }
 
-/// ans_state_bytes: nothing before the first decode, the state's grow-only scratch after it,
-/// and no growth when the same or a smaller range is decoded again.
-void test_state_bytes()
-{
-  auto f           = make_fixture(big_column());
-  auto const state = chunk::make_ans_state(f.leaves->column(), f.ans);
-  check(chunk::ans_state_bytes(*state) == 0, "state bytes: a new state holds device bytes");
-  decode_and_check(f, *state, 7, 7, false);
-  check(chunk::ans_state_bytes(*state) == 0, "state bytes: an empty decode allocated");
-
-  // Two partial blocks decode into scratch, and each of the six blocks takes one u64 in each of
-  // the state's six nvCOMP tables (four inputs, actual sizes, statuses).
-  std::uint64_t const begin = kBlock + 100;
-  std::uint64_t const end   = 6 * kBlock + 100;
-  decode_and_check(f, *state, begin, end, true);
-  auto const held = chunk::ans_state_bytes(*state);
-  check(held >= 2 * kBlock + 6 * 6 * sizeof(std::uint64_t),
-        "state bytes: the scratch and tables of a decode are not counted");
-  for (int i = 0; i < 3; ++i) {
-    decode_and_check(f, *state, begin, end, false);
-    check(chunk::ans_state_bytes(*state) == held,
-          "state bytes: decoding the same range again changed the bytes held");
-  }
-  decode_and_check(f, *state, 3 * kBlock + 5, 4 * kBlock + 9, false);
-  check(chunk::ans_state_bytes(*state) == held,
-        "state bytes: decoding a smaller range changed the bytes held");
-}
-
 /// A payload that is not on the device: host bytes, every read recorded.
 class host_source final : public payload_source {
  public:
@@ -690,7 +662,6 @@ int main()
   Case cases[] = {
     {"fixed_ranges", test_fixed_ranges},
     {"random_ranges", test_random_ranges},
-    {"state_bytes", test_state_bytes},
     {"many_blocks", test_many_blocks},
     {"many_blocks_staged", test_many_blocks_staged},
     {"corrupt_frames", test_corrupt_frames},

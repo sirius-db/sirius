@@ -130,7 +130,9 @@ pipeline executor's reschedule path calls it, on OOM only, on the input that wil
 
 `merge::windowed_merge_input` is the one override. Each call halves `window_rows` down to 1024
 rows and `output_target_bytes` down to 16 MiB, and returns `false` once both are at their floors.
-From then on a further OOM raises the floor like any other task's.
+From then on a further OOM raises the floor like any other task's. The shrunk sizes hold for the
+later tasks of the same pass of the partition, which continue the task's merger; the next pass
+starts from the derived sizes again.
 
 ## Downgrade Executor
 
@@ -252,36 +254,40 @@ memory by its windows, not by the partition.
 working set:
 
 ```
-estimate_task_bytes = 2 × (k − g) × n × w     // two window-buffer slots per run that is not sliced in place
-                    + n × (w + 8)             // one round of gathered output rows + its gather map
-                    + k × n × key_w           // key columns of every run's window
-                    + 2 × output_target_bytes // accumulated rounds + the concatenated chunk
-                    + largest fallback batch  // only when a batch has no row-range reader
+slot = n × w + cols × (n / 8 + 64)            // rows of one window + a validity mask per column
+     + n × w / 4                              // with a STRING column: 25% chars slack
+     + str_cols × (8 × (n + 1) + 2 × n + 64)  // per STRING column: offsets and the chars minimum
+
+estimate_task_bytes = 2 × (k − g) × slot                // two slots per run read through a window buffer
+                    + 2 × (output_target_bytes + n × w) // accumulated rounds + the concatenated chunk
+                    + 8 × n + (n / 2048 + 2) × (4 + 12 × k)  // gather map and tile co-ranks of one merge
+                    + fallback bytes                    // runs with a batch that has no row-range reader
 
 estimate_reader_state_bytes = c × (cols × 16 × (n + 2048)  // decode scratch per fetched column
                                    + str_cols × 2 MiB)     // offsets scratch per STRING column
 ```
 
-`k` is the number of runs the task reads, `g` how many of them consist only of uncompressed GPU
-tables (they are windowed in place; a compressed batch on the GPU is read into a window buffer
-like a host or disk batch), `n` is `window_rows`, `w` the estimated row width of the fetched
-columns and `key_w` that of the key columns. `c` is the number of runs that hold a
-Simpatico-compressed batch, `cols` the number of fetched columns and `str_cols` how many of them
-are STRING: a compressed run is read through one decode cursor per fetched column, which keeps its
-scratch between refills. The dictionary keys a cursor also keeps depend on the data and are not
-estimated. The fallback term counts a batch whose representation has no registered reader, or a
-compressed batch whose header cannot be read. A compressed batch that its reader refuses only at
-read time (see [Row-Range Readers](#row-range-readers)) is converted too, but is not in the
-estimate. The arithmetic saturates. `n` and `output_target_bytes` are the
-task's current values, so the estimate drops after a
-[shrink](#shrink-before-retry). See [Sort Merge](configuration.md#sort-merge) for how `n` and the
-output target are derived.
+`k` is the number of runs the task reads and `g` how many of them need no new window buffer: runs
+of uncompressed GPU tables only (they are windowed in place; a compressed batch on the GPU is read
+into a window buffer like a host or disk batch) and runs whose buffers the partition's kept merger
+already holds. `n` is `window_rows`, `w` the estimated row width of the fetched columns, `cols`
+the number of fetched columns and `str_cols` how many of them are STRING. `c` is the number of
+runs that hold a Simpatico-compressed batch: a compressed run is read through one decode cursor
+per fetched column, which keeps its scratch between refills. The dictionary keys a cursor also
+keeps depend on the data and are not estimated. The fallback term adds, per run, its largest batch
+whose representation has no registered reader or whose compressed header cannot be read. A
+compressed batch that its reader refuses only at read time (see
+[Row-Range Readers](#row-range-readers)) is converted too, but is not in the estimate. The
+arithmetic saturates. `n` and `output_target_bytes` are the task's current values, so the estimate
+drops after a [shrink](#shrink-before-retry). See [Sort Merge](configuration.md#sort-merge) for
+how `n` and the output target are derived.
 
 **Window buffers outlive a task.** The partition keeps its merger between tasks, so the window
 buffers of its non-GPU runs (up to about one window per such run) stay allocated on the GPU while
-no task of the partition is in flight, outside any task reservation. Each task's estimate still
-counts them. They are freed when the partition finishes, when a task fails (an OOM retry starts
-from empty windows), when the merger is rebuilt, and with the operator.
+no task of the partition is in flight, outside any task reservation. The next task's estimate
+does not count the buffers the kept merger already holds. They are freed when the partition
+finishes, when a task fails (an OOM retry starts from empty windows), when the merger is rebuilt,
+and with the operator.
 
 ### Runs stay spillable
 

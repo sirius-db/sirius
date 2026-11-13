@@ -50,15 +50,11 @@ namespace {
 
 namespace utils = sirius::test::operator_utils;
 using sirius::op::merge::detail::convert_run_batch_to_gpu;
+using sirius::test::merge_utils::has_gpu;
+using sirius::test::merge_utils::holds;
 using sirius::test::merge_utils::scoped_spill_compression;
 
 constexpr std::size_t num_rows = 200'000;
-
-bool has_gpu()
-{
-  int count = 0;
-  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
-}
 
 rmm::cuda_stream_view stream_view() { return rmm::cuda_stream_view{utils::default_stream().get()}; }
 
@@ -104,13 +100,6 @@ std::shared_ptr<cucascade::data_batch> make_run_batch(cucascade::memory::memory_
                                  space,
                                  utils::default_stream(),
                                  sirius::telemetry::batch_telemetry_info{});
-}
-
-template <typename Representation>
-bool holds(cucascade::data_batch& batch)
-{
-  auto ro = batch.to_read_only();
-  return dynamic_cast<Representation const*>(ro.get_data()) != nullptr;
 }
 
 /// True if @p batch is an uncompressed table in @p space.

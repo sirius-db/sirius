@@ -396,6 +396,80 @@ class device_leaf_access : public chunk::leaf_access {
   std::vector<validity_request> _validity_requests;
 };
 
+/// The whole of buffer `ref` as elements of T, read from the flattened payload `access` serves.
+template <typename T>
+std::vector<T> read_buffer(device_leaf_access const& access,
+                           chunk::buffer_ref ref,
+                           rmm::cuda_stream_view stream)
+{
+  auto const& range = access.column().leaves.at(ref.leaf).buffers.at(ref.buffer);
+  return read_device<T>(
+    static_cast<std::byte const*>(access.payload().data()) + range.payload_offset,
+    range.size / sizeof(T),
+    stream);
+}
+
+/// True if the logged request `r` is for buffer `ref`.
+inline bool same_buffer(device_leaf_access::request const& r, chunk::buffer_ref ref)
+{
+  return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
+}
+
+// ---------------------------------------------------------------------------
+// Harness shared by the decoder tests
+// ---------------------------------------------------------------------------
+
+/// What sentinel_buffer fills a destination with before a decode.
+inline constexpr std::uint8_t kSentinelByte = 0xA5;
+
+inline void check(bool cond, std::string const& msg)
+{
+  if (!cond) { throw std::runtime_error(msg); }
+}
+
+/// The smallest chunk span covering rows [first, first + take).
+inline chunk::chunk_span span_of(std::int64_t first, std::int64_t take)
+{
+  chunk::chunk_span span;
+  span.chunk_begin = first / kChunkRows;
+  span.skip_head   = first % kChunkRows;
+  span.chunk_end   = std::max(span.chunk_begin, (first + take + kChunkRows - 1) / kChunkRows);
+  span.take        = take;
+  return span;
+}
+
+inline rmm::device_buffer sentinel_buffer(std::size_t bytes)
+{
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  rmm::device_buffer buffer(bytes, stream);
+  if (bytes != 0) {
+    cuda_check(cudaMemsetAsync(buffer.data(), kSentinelByte, bytes, stream.value()));
+  }
+  stream.synchronize();
+  return buffer;
+}
+
+/// True if bytes [begin, end) of `buffer` still hold the sentinel.
+inline bool untouched(rmm::device_buffer const& buffer, std::size_t begin, std::size_t end)
+{
+  auto const bytes =
+    read_device<std::uint8_t>(static_cast<std::uint8_t const*>(buffer.data()) + begin, end - begin);
+  return std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t b) { return b == kSentinelByte; });
+}
+
+/// The oracle's offsets (rows + 1 of them) on the host.
+inline std::vector<std::int64_t> host_offsets(cudf::column_view oracle)
+{
+  cudf::strings_column_view const strings{oracle};
+  auto const count = static_cast<std::size_t>(oracle.size()) + 1;
+  check(oracle.offset() == 0, "sliced oracle");
+  if (strings.offsets().type().id() == cudf::type_id::INT64) {
+    return read_device<std::int64_t>(strings.offsets().head<std::int64_t>(), count);
+  }
+  auto const narrow = read_device<std::int32_t>(strings.offsets().head<std::int32_t>(), count);
+  return {narrow.begin(), narrow.end()};
+}
+
 // ---------------------------------------------------------------------------
 // Comparing decoded rows with the oracle
 // ---------------------------------------------------------------------------

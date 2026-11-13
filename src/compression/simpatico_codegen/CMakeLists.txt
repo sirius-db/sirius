@@ -117,8 +117,8 @@ add_library(
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
   src/explore/compression_explorer.cpp
-  # Chunk-span decode: header description, cursor, per-encoding chunk decoders
-  src/api/hpln_describe.cpp
+  # Chunk-span decode: cursor and per-encoding chunk decoders. The header
+  # description is in src/api/compressed_table_io.cpp.
   src/api/chunk_decode.cpp
   src/decode/chunk/validity_chunks.cu
   src/decode/chunk/bitpack_chunks.cu

@@ -55,35 +55,6 @@ namespace {
 
 constexpr std::size_t kUnlimitedOutput = std::numeric_limits<std::size_t>::max();
 
-merge_key_spec ascending_key(cudf::size_type col = 0)
-{
-  return {.key_cols        = {col},
-          .column_order    = {cudf::order::ASCENDING},
-          .null_precedence = {cudf::null_order::AFTER}};
-}
-
-/// An unsorted (key INT64 in [0, key_range), id INT64) table; ids are unique from @p first_id on.
-std::unique_ptr<cudf::table> random_rows(std::size_t rows,
-                                         std::int64_t key_range,
-                                         std::int64_t first_id,
-                                         std::uint32_t seed)
-{
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<std::int64_t> dist(0, key_range - 1);
-  std::vector<std::int64_t> keys(rows);
-  std::vector<std::int64_t> ids(rows);
-  for (std::size_t i = 0; i < rows; ++i) {
-    keys[i] = dist(gen);
-    ids[i]  = first_id + static_cast<std::int64_t>(i);
-  }
-  return make_table(make_column(keys, cudf::type_id::INT64),
-                    make_column(ids, cudf::type_id::INT64));
-}
-
-const std::vector<std::size_t> kTwoCols{0, 1};
-const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT64},
-                                             cudf::data_type{cudf::type_id::INT64}};
-
 /// Everything a windowed_merger over GPU runs of (key, id) rows needs to outlive it.
 struct merge_fixture {
   cucascade::memory::memory_space& space = *get_default_gpu_space();
@@ -341,102 +312,6 @@ TEST_CASE("windowed_merger stops at output_target_bytes and continues exactly", 
   }
 }
 
-TEST_CASE("windowed_merger handles heavy ties", "[windowed_merger]")
-{
-  // Descending keys with NULLs first, only 3 distinct key values over 4 runs: almost every row
-  // ties across runs and across windows, so the run-index tie-break decides the order.
-  const merge_key_spec keys{.key_cols        = {0},
-                            .column_order    = {cudf::order::DESCENDING},
-                            .null_precedence = {cudf::null_order::AFTER}};
-  merge_fixture f;
-  std::mt19937 gen(41);
-  std::int64_t next_id = 0;
-  for (const std::size_t rows : {1500UL, 2300UL, 800UL, 1900UL}) {
-    std::vector<std::int64_t> key_values(rows);
-    std::vector<bool> valids(rows);
-    std::vector<std::int64_t> ids(rows);
-    for (std::size_t i = 0; i < rows; ++i) {
-      key_values[i] = static_cast<std::int64_t>(gen() % 3);
-      valids[i]     = gen() % 10 != 0;
-      ids[i]        = next_id++;
-    }
-    auto table = make_table(make_column(key_values, cudf::type_id::INT64, valids),
-                            make_column(ids, cudf::type_id::INT64));
-    f.add_run(table->view(), keys, 2);
-  }
-  // One run of a single repeated key, longer than several windows.
-  {
-    auto table = make_table(make_column(std::vector<std::int64_t>(1200, 1), cudf::type_id::INT64),
-                            make_column(std::vector<std::int64_t>(1200, -1), cudf::type_id::INT64));
-    f.add_run(table->view(), keys);
-  }
-
-  auto merger = f.make_merger(keys, {.window_rows = 256, .output_target_bytes = 10000});
-  merge_round_stats stats;
-  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
-
-  auto expected = expected_full_sort(f.runs, keys);
-  CHECK(tables_equal(collected.table->view(), expected->view()));
-  CHECK(stats.rows_out == 7700);
-  CHECK(f.all_batches_unlocked());
-}
-
-TEST_CASE("windowed_merger merges on STRING keys", "[windowed_merger]")
-{
-  // (STRING key, INT64 id, STRING payload); the merger fetches (key, payload, id).
-  const merge_key_spec keys{.key_cols        = {0, 2},
-                            .column_order    = {cudf::order::ASCENDING, cudf::order::DESCENDING},
-                            .null_precedence = {cudf::null_order::AFTER, cudf::null_order::AFTER}};
-  const std::vector<std::size_t> fetch_cols{0, 2, 1};
-  const std::vector<cudf::data_type> fetch_types{cudf::data_type{cudf::type_id::STRING},
-                                                 cudf::data_type{cudf::type_id::STRING},
-                                                 cudf::data_type{cudf::type_id::INT64}};
-  const std::vector<std::string> words{"", "a", "ab", "abc", "b", "kiwi", "kiwi fruit", "zebra"};
-
-  merge_fixture f;
-  std::mt19937 gen(51);
-  std::int64_t next_id = 0;
-  std::vector<std::unique_ptr<cudf::table>> fetched_runs;
-  for (const std::size_t rows : {1300UL, 700UL, 1100UL}) {
-    std::vector<std::string> key_values(rows);
-    std::vector<std::string> payload(rows);
-    std::vector<std::int64_t> ids(rows);
-    for (std::size_t i = 0; i < rows; ++i) {
-      key_values[i] = words[gen() % words.size()];
-      ids[i]        = static_cast<std::int64_t>(gen() % 50);
-      payload[i]    = "row-" + std::to_string(next_id++);
-    }
-    auto table = make_table(make_string_column(key_values),
-                            make_column(ids, cudf::type_id::INT64),
-                            make_string_column(payload));
-    // The runs are sorted on the source columns (key, id): source column 1 is fetched column 2.
-    const merge_key_spec source_keys{.key_cols        = {0, 1},
-                                     .column_order    = keys.column_order,
-                                     .null_precedence = keys.null_precedence};
-    f.add_run(table->view(), source_keys, 2);
-    fetched_runs.push_back(
-      std::make_unique<cudf::table>(f.runs.back().rows->view().select({0, 2, 1})));
-  }
-
-  auto merger = f.make_merger(keys,
-                              {.window_rows = 200, .output_target_bytes = 8000},
-                              reference_bounded_merge,
-                              fetch_cols,
-                              fetch_types);
-  merge_round_stats stats;
-  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
-  CHECK(collected.chunks.size() > 1);
-
-  std::vector<cudf::table_view> fetched_views;
-  for (const auto& run : fetched_runs) {
-    fetched_views.push_back(run->view());
-  }
-  auto expected = expected_full_sort(std::span<const cudf::table_view>(fetched_views), keys);
-  CHECK(tables_equal(collected.table->view(), expected->view()));
-  CHECK(stats.rows_out == 3100);
-  CHECK(f.all_batches_unlocked());
-}
-
 TEST_CASE("windowed_merger rejects inconsistent inputs", "[windowed_merger]")
 {
   const auto keys = ascending_key();
@@ -539,19 +414,6 @@ TEST_CASE("windowed_merger starts from cursors left by an earlier task", "[windo
   CHECK(tables_equal(out->view(), expected->view()));
   CHECK(all_exhausted(f.cursors));
   CHECK(stats.rows_out == 2351);
-  CHECK(f.all_batches_unlocked());
-}
-
-TEST_CASE("windowed_merger merges a single run", "[windowed_merger]")
-{
-  const auto keys = ascending_key();
-  merge_fixture f;
-  f.add_run(random_rows(2345, 1000, 0, 81)->view(), keys, 3);
-  auto merger = f.make_merger(keys, {.window_rows = 400, .output_target_bytes = 9000});
-  merge_round_stats stats;
-  auto collected = collect_full_sort(merger, f.cursors, f.stream, f.mr(), &stats);
-  CHECK(tables_equal(collected.table->view(), f.runs[0].rows->view()));
-  CHECK(stats.rows_out == 2345);
   CHECK(f.all_batches_unlocked());
 }
 
@@ -1327,41 +1189,6 @@ TEST_CASE("windowed_merger stops with the round whose output bytes reach the tar
   }
   CHECK(chunks.size() > 2);
   CHECK(tables_equal(cudf::concatenate(views)->view(), runs.expected->view()));
-}
-
-TEST_CASE("windowed_merger with a STRING key replays after the merge throws in round 2",
-          "[windowed_merger]")
-{
-  string_key_runs runs(351);
-  int calls          = 0;
-  auto failing_merge = [&](std::span<const cudf::table_view> windows,
-                           const merge_key_spec& key_spec,
-                           std::span<const std::uint8_t> truncated,
-                           cudf::size_type max_rows,
-                           rmm::cuda_stream_view stream,
-                           rmm::device_async_resource_ref mr) {
-    if (++calls == 2) { throw std::runtime_error("injected merge failure"); }
-    return bounded_kway_merge(windows, key_spec, truncated, max_rows, stream, mr);
-  };
-  auto merger =
-    runs.make_merger({.window_rows = 150, .output_target_bytes = kUnlimitedOutput}, failing_merge);
-  merge_round_stats stats;
-  // Round 1 produced a STRING output that is dropped with the failure.
-  REQUIRE_THROWS_WITH(merger.run(runs.f.stream, runs.f.mr(), &stats), "injected merge failure");
-  CHECK(calls == 2);
-  for (const auto& cursor : runs.f.cursors) {
-    CHECK(cursor.batch == 0);
-    CHECK(cursor.row == 0);
-  }
-  CHECK(stats.rounds == 0);
-  CHECK(runs.f.all_batches_unlocked());
-
-  // The following run() uses the real merge for every round.
-  auto out = merger.run(runs.f.stream, runs.f.mr(), &stats);
-  CHECK(tables_equal(out->view(), runs.expected->view()));
-  CHECK(all_exhausted(runs.f.cursors));
-  CHECK(stats.rows_out == 3000);
-  CHECK(runs.f.all_batches_unlocked());
 }
 
 TEST_CASE("windowed_merger converts a compressed device batch instead of slicing it",

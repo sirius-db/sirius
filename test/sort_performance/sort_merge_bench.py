@@ -22,7 +22,6 @@ with its own Sirius config file. See README.md beside this script.
 import argparse
 import collections
 import csv
-import dataclasses
 import json
 import os
 import re
@@ -64,9 +63,6 @@ FIRST_ERRORS_FILE = "sirius_log_first_errors.txt"
 FIRST_ERRORS_LINES = 200
 # A sizing that misses --scale x limit by more than this fraction is reported.
 SIZING_TOLERANCE = 0.1
-# The run's log is parsed in pieces of about this many bytes, so a log of many
-# GiB is never held in memory.
-LOG_CHUNK_BYTES = 16 << 20
 # Lines at the end of the log searched for an out-of-memory message when the
 # run left no error text.
 OOM_TAIL_LINES = 50
@@ -526,66 +522,53 @@ def run_log_paths(log_dir):
     return paths
 
 
-def iter_run_log_chunks(log_dir, chunk_bytes=LOG_CHUNK_BYTES):
-    """Yields the run's log, oldest file first, as lists of lines (each with its
-    newline) of about `chunk_bytes` in total.
+def scan_run_log(log_dir, bench_metrics, tail_lines):
+    """One pass over the run's log, oldest file first, line by line, so a log
+    of many GiB is never held in memory: only the lines bench_metrics reads
+    (found by their tags) and the last `tail_lines` lines are kept.
 
     A last line without a newline (the process died while writing it) is left
     out, so a parser never sees half a line. Unreadable files are skipped.
+
+    Returns (metrics, tail, error): the result columns read from the log, its
+    last `tail_lines` lines, and the text of a parsing failure (else None, and
+    then `metrics` is empty).
     """
+    bm = bench_metrics
+    tags = (
+        bm.MERGE_SORT_STATS_TAG,
+        bm.DOWNGRADE_MONITOR_TAG,
+        bm.OOM_RETRY_TAG,
+        bm.DISCARD_SINK_TAG,
+    )
+    tagged = []
+    tail = collections.deque(maxlen=tail_lines)
     for path in run_log_paths(log_dir):
         try:
             with open(path, encoding="utf-8", errors="replace") as log_file:
-                while True:
-                    lines = log_file.readlines(chunk_bytes)
-                    if lines and not lines[-1].endswith("\n"):
-                        lines.pop()
-                    if not lines:
-                        break
-                    yield lines
+                for line in log_file:
+                    if not line.endswith("\n"):
+                        continue
+                    tail.append(line.rstrip("\n"))
+                    if any(tag in line for tag in tags):
+                        tagged.append(line)
         except OSError:
             continue
-
-
-class LogMetrics:
-    """Adds up what bench_metrics reads from a run's log, one piece of text at a time."""
-
-    def __init__(self, bench_metrics):
-        self._bench_metrics = bench_metrics
-        self._stats = []  # one entry per MERGE_SORT operator
-        self._downgrade = bench_metrics.parse_downgrade_totals("")
-        self._oom_retries = 0
-        self._sink_lines = []  # one line per discard sink
-
-    def feed(self, text):
-        """Parse `text`, which must end at a line boundary."""
-        bm = self._bench_metrics
-        self._stats.extend(bm.parse_merge_sort_stats(text))
-        totals = bm.parse_downgrade_totals(text)
-        for field in dataclasses.fields(totals):
-            setattr(
-                self._downgrade,
-                field.name,
-                getattr(self._downgrade, field.name) + getattr(totals, field.name),
-            )
-        self._oom_retries += bm.count_oom_retries(text)
-        self._sink_lines.extend(
-            line for line in text.splitlines() if bm.DISCARD_SINK_TAG in line
-        )
-
-    def result(self):
-        """The result columns of everything fed so far."""
-        bm = self._bench_metrics
-        out = {"merge_sort_operators": len(self._stats)}
-        out.update(bm.sum_merge_sort_stats(self._stats))
-        out["spill_bytes_host"] = self._downgrade.to_host_bytes
-        out["spill_bytes_disk"] = self._downgrade.to_disk_bytes
-        out["spill_batches_host"] = self._downgrade.to_host_batches
-        out["spill_batches_disk"] = self._downgrade.to_disk_batches
-        out["downgrade_requests"] = self._downgrade.requests
-        out["oom_retries"] = self._oom_retries
-        # Parsed in one call so that combining several sinks stays bench_metrics's job.
-        sink = bm.parse_discard_sink("\n".join(self._sink_lines))
+    out = {}
+    error = None
+    try:
+        text = "".join(tagged)
+        stats = bm.parse_merge_sort_stats(text)
+        downgrade = bm.parse_downgrade_totals(text)
+        out["merge_sort_operators"] = len(stats)
+        out.update(bm.sum_merge_sort_stats(stats))
+        out["spill_bytes_host"] = downgrade.to_host_bytes
+        out["spill_bytes_disk"] = downgrade.to_disk_bytes
+        out["spill_batches_host"] = downgrade.to_host_batches
+        out["spill_batches_disk"] = downgrade.to_disk_batches
+        out["downgrade_requests"] = downgrade.requests
+        out["oom_retries"] = bm.count_oom_retries(text)
+        sink = bm.parse_discard_sink(text)
         if sink is not None:
             out["discard_rows"] = sink.get("rows")
             out["discard_bytes"] = sink.get("bytes")
@@ -593,33 +576,10 @@ class LogMetrics:
             # Absent from a sink line that predates these keys: read as "not checked".
             out["order_checked"] = sink.get("order_checked")
             out["ranges_checked"] = sink.get("ranges_checked")
-        return out
-
-
-def scan_run_log(log_dir, bench_metrics, tail_lines, chunk_bytes=LOG_CHUNK_BYTES):
-    """One streaming pass over the run's log.
-
-    Returns (metrics, tail, error): the result columns read from the log, its
-    last `tail_lines` lines, and the text of a parsing failure (else None, and
-    then `metrics` is empty).
-    """
-    metrics = LogMetrics(bench_metrics)
-    tail = collections.deque(maxlen=tail_lines)
-    error = None
-    for lines in iter_run_log_chunks(log_dir, chunk_bytes):
-        tail.extend(lines)
-        if error is None:
-            try:
-                metrics.feed("".join(lines))
-            except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
-                error = f"{type(exc).__name__}: {exc}"
-    out = {}
-    if error is None:
-        try:
-            out = metrics.result()
-        except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
-            error = f"{type(exc).__name__}: {exc}"
-    return out, [line.rstrip("\n") for line in tail], error
+    except Exception as exc:  # noqa: BLE001 - keep the run's timing regardless
+        out = {}
+        error = f"{type(exc).__name__}: {exc}"
+    return out, list(tail), error
 
 
 def classify_failure(error_text, log_tail):

@@ -39,9 +39,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <future>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -59,6 +62,12 @@ constexpr std::size_t kGiB = std::size_t{1} << 30;
 merge::device_budget large_budget(const memory_space* = nullptr)
 {
   return {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 1};
+}
+
+/// large_budget for two concurrent tasks, so two windowed partitions may be open at once.
+merge::device_budget two_task_budget(const memory_space* = nullptr)
+{
+  return {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 2};
 }
 
 duckdb::vector<duckdb::BoundOrderByNode> key_on_column_0()
@@ -215,9 +224,9 @@ std::size_t decoded_bytes(data_batch& batch)
   return batch.to_read_only().get_data()->get_uncompressed_data_size_in_bytes();
 }
 
-/// The estimate of a windowed task over runs of @p row_width bytes per row with an INT64 key:
-/// @p unbuffered_runs of its runs are charged no window buffer, and @p fallback_bytes is the sum
-/// of the batches that may be converted whole.
+/// The estimate of a windowed task over runs of BIGINT columns only, @p row_width bytes per row,
+/// with an INT64 key: @p unbuffered_runs of its runs are charged no window buffer, and
+/// @p fallback_bytes is the sum of the batches that may be converted whole.
 std::size_t expected_task_bytes(const merge::windowed_merge_input& input,
                                 std::size_t unbuffered_runs,
                                 std::size_t fallback_bytes,
@@ -229,7 +238,9 @@ std::size_t expected_task_bytes(const merge::windowed_merge_input& input,
                                     row_width,
                                     sizeof(int64_t),
                                     input.config().output_target_bytes,
-                                    fallback_bytes);
+                                    fallback_bytes,
+                                    row_width / sizeof(int64_t),
+                                    0);
 }
 
 /// Runs the task of @p input on @p space, as a GPU pipeline task does, and drops its output.
@@ -388,7 +399,8 @@ TEST_CASE("merge sort windowed mode arms by peeking, one task per partition", "[
 
   auto merge = make_merge(repo);
   merge->set_merge_settings({.mode = sirius::sort_merge_mode::windowed});
-  merge->set_device_budget_provider(large_budget);
+  // Two concurrent tasks: both partitions may be open at once.
+  merge->set_device_budget_provider(two_task_budget);
 
   auto first     = merge->get_next_task_input_data();
   auto& windowed = require_windowed_input(first);
@@ -461,25 +473,6 @@ TEST_CASE("merge sort with more runs than the fan-in cap plans an intermediate p
 
   REQUIRE(repo.size(0) == rows.size());
   REQUIRE_FALSE(merge->get_next_task_input_data());
-}
-
-TEST_CASE("merge sort with at most fan-in runs plans a final pass", "[merge_sort_arming]")
-{
-  auto* space = get_default_gpu_space();
-  REQUIRE(space);
-  data_repository repo;
-  for (std::size_t n : {30, 10, 20}) {
-    repo.add_data_batch(make_sorted_batch(*space, n));
-  }
-
-  auto merge = make_merge(repo);
-  merge->set_merge_settings({.mode = sirius::sort_merge_mode::windowed, .max_fan_in = 3});
-  merge->set_device_budget_provider(large_budget);
-
-  auto input     = merge->get_next_task_input_data();
-  auto& windowed = require_windowed_input(input);
-  REQUIRE(windowed.final_pass());
-  REQUIRE(windowed.cursors().size() == 3);
 }
 
 TEST_CASE("merge sort merges one-shot when a fetched column is nested", "[merge_sort_arming]")
@@ -641,6 +634,8 @@ TEST_CASE("merge sort task hint is withheld while every partition with runs is i
   repo.add_data_batch(make_sorted_batch(*space, 10), 1);
 
   auto merge = make_windowed_merge(repo);
+  // Two concurrent tasks: both partitions may be open at once.
+  merge->set_device_budget_provider(two_task_budget);
 
   auto ready = merge->get_next_task_hint();
   REQUIRE(ready.has_value());
@@ -780,7 +775,8 @@ TEST_CASE("merge sort device budget provider reports the GPU spaces and the exec
   auto const unknown = provider(nullptr);
   REQUIRE(unknown.concurrent_tasks == 6);
   REQUIRE(unknown.gpu_total_bytes == gpu->get_max_memory());
-  REQUIRE(unknown.gpu_available_bytes == gpu->get_available_memory());
+  REQUIRE(unknown.gpu_available_bytes ==
+          gpu->get_available_memory() + gpu->get_total_reserved_memory());
   REQUIRE(unknown.gpu_total_bytes > 0);
   // The space holding most of the partition.
   auto const named = provider(gpu);
@@ -811,6 +807,66 @@ TEST_CASE("merge sort device budget provider reports the GPU spaces and the exec
   input.reset();
   merge.reset();
   while (repo.pop_next_data_batch(0)) {}
+}
+
+TEST_CASE("merge sort sizes a partition armed while another one's task holds a reservation alike",
+          "[merge_sort_arming]")
+{
+  auto manager = initialize_memory_manager(1,
+                                           {.gpu_bytes                = std::size_t{128} << 20,
+                                            .gpu_reservation_fraction = 0.75,
+                                            .divide_among_gpus        = false,
+                                            .per_stream_tracking      = false});
+  auto* space  = const_cast<memory_space*>(manager->get_memory_space(Tier::GPU, 0));
+  REQUIRE(space != nullptr);
+  // With the operator's provider (two tasks per device) and with none (the default width).
+  auto const with_provider = GENERATE(true, false);
+  CAPTURE(with_provider);
+  REQUIRE(sirius::exec::default_gpu_pipeline_num_threads >= 2);
+
+  data_repository repo;
+  repo.set_num_partitions(2);
+  for (std::size_t partition = 0; partition < 2; ++partition) {
+    repo.add_data_batch(make_sorted_batch(*space, 10), partition);
+    repo.add_data_batch(make_sorted_batch(*space, 10), partition);
+  }
+  const merge::merge_settings settings{.mode = sirius::sort_merge_mode::windowed};
+  auto merge = make_merge(repo);
+  merge->set_merge_settings(settings);
+  if (with_provider) {
+    merge->set_device_budget_provider(
+      sirius_physical_merge_sort::make_device_budget_provider(*manager, 2));
+  }
+
+  auto first        = merge->get_next_task_input_data();
+  auto const config = require_windowed_input(first).config();
+  REQUIRE(require_windowed_input(first).partition() == 0);
+
+  // What the executor holds for the first partition's task while the second one is armed.
+  auto const reservation = space->make_reservation(std::size_t{32} << 20);
+  REQUIRE(reservation);
+  // Sized from the free bytes alone, the second partition would get smaller windows.
+  auto const tasks = with_provider
+                       ? std::size_t{2}
+                       : static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads);
+  REQUIRE(merge::derive_merge_config(settings,
+                                     {.gpu_available_bytes = space->get_available_memory(),
+                                      .gpu_total_bytes     = space->get_max_memory(),
+                                      .concurrent_tasks    = tasks},
+                                     2,
+                                     sizeof(int64_t))
+            .window_rows < config.window_rows);
+
+  auto second        = merge->get_next_task_input_data();
+  auto& second_input = require_windowed_input(second);
+  REQUIRE(second_input.partition() == 1);
+  REQUIRE(second_input.config().window_rows == config.window_rows);
+  REQUIRE(second_input.config().output_target_bytes == config.output_target_bytes);
+
+  first.reset();
+  second.reset();
+  merge.reset();
+  drain(repo);
 }
 
 TEST_CASE("merge sort one-shot commit makes a partition deferred by a locked run armable again",
@@ -877,12 +933,14 @@ TEST_CASE("merge sort without a budget provider sizes its windows from the GPU h
 
   auto const tasks      = static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads);
   auto const from_space = [&] {
-    return merge::derive_merge_config(settings,
-                                      {.gpu_available_bytes = fixture.gpu0->get_available_memory(),
-                                       .gpu_total_bytes     = fixture.gpu0->get_max_memory(),
-                                       .concurrent_tasks    = tasks},
-                                      2,
-                                      sizeof(int64_t));
+    return merge::derive_merge_config(
+      settings,
+      {.gpu_available_bytes =
+         fixture.gpu0->get_available_memory() + fixture.gpu0->get_total_reserved_memory(),
+       .gpu_total_bytes  = fixture.gpu0->get_max_memory(),
+       .concurrent_tasks = tasks},
+      2,
+      sizeof(int64_t));
   };
   // The fixture's GPU is not the size assumed for an unknown device, so the two configs differ.
   auto const unknown = merge::derive_merge_config(
@@ -1076,9 +1134,12 @@ struct host_runs_merge {
   data_repository repo;
   std::unique_ptr<sirius_physical_merge_sort> merge;
 
-  explicit host_runs_merge(std::size_t rows, std::size_t window_rows = 1024)
+  explicit host_runs_merge(std::size_t rows,
+                           std::size_t window_rows  = 1024,
+                           int runs                 = 2,
+                           std::uint64_t max_fan_in = merge::merge_settings{}.max_fan_in)
   {
-    for (int run = 0; run < 2; ++run) {
+    for (int run = 0; run < runs; ++run) {
       auto batch = make_sorted_batch(*fx.gpu, rows);
       merge_utils::place_batch(fx, batch, merge_utils::placement::host);
       repo.add_data_batch(batch);
@@ -1086,7 +1147,8 @@ struct host_runs_merge {
     merge = make_windowed_merge(repo,
                                 {.mode         = sirius::sort_merge_mode::windowed,
                                  .window_rows  = window_rows,
-                                 .output_bytes = 1024});
+                                 .output_bytes = 1024,
+                                 .max_fan_in   = max_fan_in});
   }
 
   ~host_runs_merge()
@@ -1157,6 +1219,55 @@ TEST_CASE("merge sort keeps the sizes of a task that shrank for the partition's 
   REQUIRE(test.merge->counters().shrinks == 1);
 }
 
+TEST_CASE("merge sort starts every pass from the derived sizes after a task shrank",
+          "[merge_sort_arming]")
+{
+  // Four runs under a fan-in of 2: two intermediate passes, then the final one.
+  host_runs_merge test(20000, 4096, 4, 2);
+
+  auto first        = test.merge->get_next_task_input_data();
+  auto& first_input = require_windowed_input(first);
+  REQUIRE_FALSE(first_input.final_pass());
+  REQUIRE(first_input.config().window_rows == 4096);
+  auto const derived    = first_input.config();
+  auto const first_pass = cursor_ids(first_input);
+  // What the executor does before it retries a task that ran out of memory.
+  REQUIRE(first_input.shrink_for_retry());
+  REQUIRE(first_input.config().window_rows == 2048);
+  auto const shrunk = first_input.config();
+  test.run(*first);
+
+  // The later tasks of the pass continue the first one's merger at the shrunk sizes.
+  std::size_t later_tasks = 0;
+  std::unique_ptr<operator_data> next;
+  while (true) {
+    next           = test.merge->get_next_task_input_data();
+    auto& input    = require_windowed_input(next);
+    auto const ids = cursor_ids(input);
+    if (!std::all_of(ids.begin(), ids.end(), [&](auto id) {
+          return std::find(first_pass.begin(), first_pass.end(), id) != first_pass.end();
+        })) {
+      break;
+    }
+    REQUIRE_FALSE(input.final_pass());
+    REQUIRE(input.config().window_rows == shrunk.window_rows);
+    REQUIRE(input.config().output_target_bytes == shrunk.output_target_bytes);
+    test.run(*next);
+    ++later_tasks;
+  }
+  REQUIRE(later_tasks > 1);
+  REQUIRE(test.merge->counters().mergers_built == 1);
+
+  // The next pass reads other runs with a new merger, at the derived sizes again.
+  auto& second_pass = require_windowed_input(next);
+  REQUIRE_FALSE(second_pass.final_pass());
+  REQUIRE(second_pass.config().window_rows == derived.window_rows);
+  REQUIRE(second_pass.config().output_target_bytes == derived.output_target_bytes);
+  test.run(*next);
+  REQUIRE(test.merge->counters().mergers_built == 2);
+  REQUIRE(test.merge->counters().shrinks == 1);
+}
+
 TEST_CASE("merge sort frees the window buffers of its kept mergers when it is finalized",
           "[merge_sort_arming]")
 {
@@ -1180,4 +1291,103 @@ TEST_CASE("merge sort frees the window buffers of its kept mergers when it is fi
   test.run(*second);
   REQUIRE(test.merge->counters().mergers_built == 2);
   REQUIRE(test.fx.gpu->get_available_memory() == available_before);
+}
+
+TEST_CASE("merge sort opens no more windowed partitions than its budget has concurrent tasks",
+          "[merge_sort_arming]")
+{
+  constexpr std::size_t num_partitions = 16;
+  constexpr std::size_t cap            = 2;
+  constexpr std::size_t rows           = 3000;
+  // Declared first: destroyed after the batches and the operator.
+  merge_utils::tiers_fixture fx;
+  data_repository repo;
+  repo.set_num_partitions(num_partitions);
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    for (int run = 0; run < 2; ++run) {
+      auto batch = make_sorted_batch(*fx.gpu, rows);
+      merge_utils::place_batch(fx, batch, merge_utils::placement::host);
+      repo.add_data_batch(batch, partition);
+    }
+  }
+  // About one window a task, so every partition takes a chain of tasks and keeps its merger
+  // between them.
+  auto merge = make_windowed_merge(
+    repo, {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 1024});
+  merge->set_device_budget_provider(two_task_budget);
+
+  auto const unfinished = [&] {
+    std::size_t count = 0;
+    for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+      if (repo.size(partition) > 0) { ++count; }
+    }
+    return count;
+  };
+
+  // The tasks handed out and not run yet, by partition.
+  std::map<std::size_t, std::unique_ptr<operator_data>> pending;
+  // The partitions that were given a task and still have runs: each has a task in flight or
+  // keeps its merger.
+  std::set<std::size_t> open;
+  std::vector<std::size_t> opened;
+  std::vector<std::vector<int64_t>> merged(num_partitions);
+  std::size_t tasks = 0;
+  while (true) {
+    // What a task creation worker does: ask for the hint, then take every task there is.
+    auto const hinted = merge->get_next_task_hint().has_value();
+    std::size_t taken = 0;
+    while (auto input = merge->get_next_task_input_data()) {
+      auto const partition = require_windowed_input(input).partition();
+      REQUIRE(pending.emplace(partition, std::move(input)).second);
+      if (open.insert(partition).second) { opened.push_back(partition); }
+      REQUIRE(open.size() <= cap);
+      ++taken;
+    }
+    // The hint announces work exactly when there is some: a partition the cap holds back does
+    // not make the operator look ready.
+    REQUIRE(hinted == (taken > 0));
+    REQUIRE_FALSE(merge->get_next_task_hint().has_value());
+    // A partition that finished gave its place to the next one at once.
+    REQUIRE(open.size() == std::min(cap, unfinished()));
+    REQUIRE(pending.size() == open.size());
+    if (pending.empty()) { break; }
+
+    // Run one task, of the lower or of the higher open partition in turn.
+    auto const it        = tasks % 3 == 0 ? pending.begin() : std::prev(pending.end());
+    auto const partition = it->first;
+    it->second->prepare_for_processing(fx.gpu, fx.stream_ref());
+    auto const output = merge->execute(*it->second, fx.stream_ref());
+    fx.stream.synchronize();
+    REQUIRE(output);
+    for (auto const& batch :
+         dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()) {
+      auto const values =
+        copy_column_to_host<int64_t>(sirius::get_cudf_table_view(*batch).column(0));
+      merged[partition].insert(merged[partition].end(), values.begin(), values.end());
+    }
+    pending.erase(it);
+    if (repo.size(partition) == 0) { open.erase(partition); }
+    ++tasks;
+  }
+
+  // Every partition was merged, each from one merger, in full and in order.
+  REQUIRE(opened.size() == num_partitions);
+  REQUIRE(repo.total_size() == 0);
+  std::vector<int64_t> expected;
+  for (std::size_t row = 0; row < rows; ++row) {
+    expected.insert(expected.end(), 2, static_cast<int64_t>(row));
+  }
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    CAPTURE(partition);
+    REQUIRE(merged[partition] == expected);
+  }
+  auto const counters = merge->counters();
+  REQUIRE(counters.windowed_partitions == num_partitions);
+  REQUIRE(counters.one_shot_partitions == 0);
+  REQUIRE(counters.windowed_tasks == tasks);
+  REQUIRE(tasks > num_partitions);
+  REQUIRE(counters.mergers_built == num_partitions);
+
+  merge.reset();
+  drain(repo);
 }

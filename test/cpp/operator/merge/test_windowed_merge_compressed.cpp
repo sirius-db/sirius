@@ -147,13 +147,6 @@ struct plan_census {
 // Rows
 // ---------------------------------------------------------------------------
 
-merge::merge_key_spec ascending_key(cudf::size_type col = 0)
-{
-  return {.key_cols        = {col},
-          .column_order    = {cudf::order::ASCENDING},
-          .null_precedence = {cudf::null_order::AFTER}};
-}
-
 /// Gives @p column a null mask: row i is NULL when !valid[i].
 void set_validity(cudf::column& column, const std::vector<bool>& valid)
 {
@@ -298,28 +291,6 @@ std::unique_ptr<cudf::table> wide_run(std::size_t run_index,
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
-
-/// An unsorted (key INT64 in [0, key_range), id INT64) table; ids are unique from @p first_id on.
-std::unique_ptr<cudf::table> random_rows(std::size_t rows,
-                                         std::int64_t key_range,
-                                         std::int64_t first_id,
-                                         std::uint32_t seed)
-{
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<std::int64_t> dist(0, key_range - 1);
-  std::vector<std::int64_t> keys(rows);
-  std::vector<std::int64_t> ids(rows);
-  for (std::size_t i = 0; i < rows; ++i) {
-    keys[i] = dist(gen);
-    ids[i]  = first_id + static_cast<std::int64_t>(i);
-  }
-  return make_table(make_column(keys, cudf::type_id::INT64),
-                    make_column(ids, cudf::type_id::INT64));
-}
-
-const std::vector<std::size_t> kTwoCols{0, 1};
-const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT64},
-                                             cudf::data_type{cudf::type_id::INT64}};
 
 // ---------------------------------------------------------------------------
 // Runs of compressed batches

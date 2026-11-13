@@ -32,54 +32,6 @@ using namespace simpatico;
 using namespace simpatico::chunk_test;
 using request = device_leaf_access::request;
 
-constexpr std::uint8_t kSentinel = 0xA5;
-
-void check(bool cond, std::string const& msg)
-{
-  if (!cond) { throw std::runtime_error(msg); }
-}
-
-/// The smallest chunk span covering rows [first, first + take).
-chunk::chunk_span span_of(std::int64_t first, std::int64_t take)
-{
-  chunk::chunk_span span;
-  span.chunk_begin = first / kChunkRows;
-  span.skip_head   = first % kChunkRows;
-  span.chunk_end   = std::max(span.chunk_begin, (first + take + kChunkRows - 1) / kChunkRows);
-  span.take        = take;
-  return span;
-}
-
-rmm::device_buffer sentinel_buffer(std::size_t bytes)
-{
-  rmm::cuda_stream_view const stream = cudf::get_default_stream();
-  rmm::device_buffer buffer(bytes, stream);
-  if (bytes != 0) { cuda_check(cudaMemsetAsync(buffer.data(), kSentinel, bytes, stream.value())); }
-  stream.synchronize();
-  return buffer;
-}
-
-/// True if bytes [begin, end) of `buffer` still hold the sentinel.
-bool untouched(rmm::device_buffer const& buffer, std::size_t begin, std::size_t end)
-{
-  auto const bytes =
-    read_device<std::uint8_t>(static_cast<std::uint8_t const*>(buffer.data()) + begin, end - begin);
-  return std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t b) { return b == kSentinel; });
-}
-
-/// The oracle's offsets (rows + 1 of them) on the host.
-std::vector<std::int64_t> host_offsets(cudf::column_view oracle)
-{
-  cudf::strings_column_view const strings{oracle};
-  auto const count = static_cast<std::size_t>(oracle.size()) + 1;
-  check(oracle.offset() == 0, "sliced oracle");
-  if (strings.offsets().type().id() == cudf::type_id::INT64) {
-    return read_device<std::int64_t>(strings.offsets().head<std::int64_t>(), count);
-  }
-  auto const narrow = read_device<std::int32_t>(strings.offsets().head<std::int32_t>(), count);
-  return {narrow.begin(), narrow.end()};
-}
-
 /// The terminal leaf of output port `output` of node `node`.
 chunk::buffer_ref output_leaf(hpln_column_description const& column,
                               std::uint32_t node,

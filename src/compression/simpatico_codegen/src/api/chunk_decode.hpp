@@ -141,7 +141,7 @@ class unsupported_chunk_decode : public std::runtime_error {
 
 /// Per-(caller, batch, column) decode state: chunk-offset prefixes, dictionary keys, parsed ANS
 /// frame headers, grow-only scratch. Payload bytes staged for a decode call are freed when the
-/// call returns (dictionary keys excepted; kept_staged_bytes_bound() bounds those). Stored values
+/// call returns (dictionary keys excepted: they stay staged for the cursor's life). Stored values
 /// and chars are read straight into the destination and ANS chars pass through about 1 MiB at a
 /// time, so neither is staged whole. Not thread-safe. One stream and one memory resource
 /// for the cursor's life: its device buffers are allocated, used and freed on the stream of its
@@ -197,13 +197,6 @@ cudf::size_type decompress_column_chunks(compressed_column_cursor& cursor,
                                          cudf::size_type take,
                                          column_write_target const& dst,
                                          rmm::cuda_stream_view stream);
-
-/// Most payload bytes a cursor over `column` keeps staged on the device for its whole life when
-/// the payload is not device resident: the buffers of its dictionary nodes' own leaves (the keys),
-/// staged by the first decode. A device-resident payload keeps none of them. Known from the
-/// header alone, so a caller can reserve for it before building the cursor; decoder state (see
-/// compressed_column_cursor::device_bytes_held) comes on top.
-[[nodiscard]] std::size_t kept_staged_bytes_bound(hpln_column_description const& column) noexcept;
 
 // ─── Direct leaf reads (for the chunk decoders; not part of the public API) ─
 

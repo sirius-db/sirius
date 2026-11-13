@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tests for describe_hpln_header: the header-only parse of a .hpln stream must report
-// every payload buffer exactly where the whole-table reader finds it.
+// Tests for describe_hpln_header: the shape of the description for a known plan, validity
+// kinds and mask ranges, and malformed headers. That every described buffer lies where the
+// payload holds it, for every spill plan, is checked by test_chunk_decode_equivalence, which
+// decodes through the described offsets.
 //
 // Each test_* function throws std::runtime_error on failure; main() catches and
 // reports.
@@ -39,7 +41,6 @@ namespace {
 using simpatico::chunk_test::kBitpackPlan;
 using simpatico::chunk_test::kDeltaBitpackPlan;
 using simpatico::chunk_test::kDeltaRleBitpackPlan;
-using simpatico::chunk_test::kDictionaryPlan;
 using simpatico::chunk_test::kStoredPlan;
 using simpatico::chunk_test::kStringSplitPlan;
 
@@ -51,22 +52,6 @@ void check(bool cond, std::string const& label, char const* what)
 std::span<const std::byte> as_bytes(std::vector<std::uint8_t> const& v)
 {
   return std::as_bytes(std::span<const std::uint8_t>(v));
-}
-
-std::vector<std::uint8_t> device_bytes(void const* ptr, std::size_t size)
-{
-  std::vector<std::uint8_t> host(size);
-  if (size > 0) cuda_check(cudaMemcpy(host.data(), ptr, size, cudaMemcpyDeviceToHost));
-  return host;
-}
-
-bool payload_equals(std::vector<std::uint8_t> const& payload,
-                    std::uint64_t offset,
-                    std::vector<std::uint8_t> const& bytes)
-{
-  if (offset > payload.size() || bytes.size() > payload.size() - offset) return false;
-  return std::equal(
-    bytes.begin(), bytes.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
 // INT64 column with a sawtooth of small values; `nulls` picks the validity shape.
@@ -152,228 +137,19 @@ staged_table stage(std::string const& label,
   return s;
 }
 
-// Describe the header of `input` compressed with `dsl` and check the description against
-// the writer (structure, sizes, offsets) and against the reader (what it fetches, and
-// which bytes end up in which leaf buffer).
-simpatico::hpln_description check_describe(std::string const& label,
-                                           cudf::table_view input,
-                                           std::string const& dsl,
-                                           std::vector<std::string> column_names = {})
-{
-  ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto mr                   = rmm::mr::get_current_device_resource_ref();
-
-  auto const s    = stage(label, input, dsl, column_names);
-  auto const desc = simpatico::describe_hpln_header(as_bytes(s.header));
-
-  check(desc.version == s.header[4], label, "version");
-  check(desc.payload_bytes == s.payload.size(), label, "payload_bytes");
-  check(desc.columns.size() == s.table.columns.size(), label, "column count");
-
-  auto const written = s.table.describe(stream);
-  // Every described range, in header order: per column the validity mask (if any), then
-  // each leaf buffer -- the order build_compressed_table_header enumerates them in.
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-  std::size_t next_buffer = 0;
-  auto next_written       = [&](std::uint64_t offset, std::uint64_t size, std::size_t column) {
-    check(next_buffer < s.buffers.size(), label, "more described buffers than written");
-    auto const& b = s.buffers[next_buffer++];
-    check(b.offset == offset, label, "payload_offset differs from the writer's");
-    check(b.size_bytes == size, label, "size differs from the writer's");
-    check(b.column_index == column, label, "buffer attributed to another column");
-    ranges.emplace_back(offset, size);
-  };
-
-  for (std::size_t ci = 0; ci < desc.columns.size(); ++ci) {
-    auto const& col = desc.columns[ci];
-    auto const& src = s.table.columns[ci];
-    check(col.name == src.name, label, "column name");
-    check(col.dtype == src.dtype, label, "column dtype");
-    check(col.dtype == input.column(static_cast<cudf::size_type>(ci)).type(), label, "input dtype");
-    check(col.num_rows == src.num_rows, label, "column num_rows");
-    check(src.plan_tree != nullptr, label, "column has a plan");
-
-    auto const& validity = src.plan_tree->validity;
-    check(static_cast<std::uint8_t>(col.validity) == static_cast<std::uint8_t>(validity.kind),
-          label,
-          "validity kind");
-    check(col.null_count == validity.null_count, label, "null_count");
-    check(col.null_count == input.column(static_cast<cudf::size_type>(ci)).null_count(),
-          label,
-          "null_count of the input");
-    if (col.validity == simpatico::hpln_validity::mask) {
-      check(col.validity_size == validity.mask.size(), label, "validity mask size");
-      next_written(col.validity_payload_offset, col.validity_size, ci);
-      check(payload_equals(s.payload,
-                           col.validity_payload_offset,
-                           device_bytes(validity.mask.data(), validity.mask.size())),
-            label,
-            "validity mask bytes");
-    } else {
-      check(col.validity_size == 0 && col.validity_payload_offset == 0, label, "no mask range");
-    }
-
-    auto const& nodes = src.plan_tree->nodes;
-    check(col.nodes.size() == nodes.size(), label, "node count");
-    for (std::size_t ni = 0; ni < nodes.size(); ++ni) {
-      auto const& described = col.nodes[ni];
-      check(described.op == nodes[ni].op, label, "node op");
-      check(
-        described.is_bitjoin == nodes[ni].attrs.bitjoin.has_value(), label, "node bitjoin flag");
-      check(described.outputs == nodes[ni].output_names, label, "node outputs");
-      check(described.edges.size() == nodes[ni].children.size(), label, "node edge count");
-      for (std::size_t ei = 0; ei < described.edges.size(); ++ei) {
-        check(described.edges[ei].first == nodes[ni].children[ei].channel, label, "edge channel");
-        check(described.edges[ei].second == nodes[ni].children[ei].child, label, "edge child");
-      }
-    }
-
-    check(col.leaves.size() == written[ci].size(), label, "leaf count");
-    for (std::size_t li = 0; li < col.leaves.size(); ++li) {
-      auto const& leaf = col.leaves[li];
-      auto const& ld   = written[ci][li];
-      check(leaf.node_index == ld.node_index, label, "leaf node_index");
-      check(leaf.slot == ld.slot, label, "leaf slot");
-      check(leaf.kind == ld.kind, label, "leaf kind");
-      check(leaf.type_tag == ld.type_tag, label, "leaf type_tag");
-      check(leaf.meta.index() == ld.meta.index(), label, "leaf meta kind");
-      check(leaf.buffers.size() == ld.buffers.size(), label, "leaf buffer count");
-      for (std::size_t bi = 0; bi < leaf.buffers.size(); ++bi) {
-        auto const& range = leaf.buffers[bi];
-        auto const& bd    = ld.buffers[bi];
-        check(range.name == bd.name, label, "buffer name");
-        check(range.type_tag == bd.type_tag, label, "buffer type_tag");
-        check(range.size == bd.size_bytes, label, "buffer size vs describe()");
-        next_written(range.payload_offset, range.size, ci);
-        check(payload_equals(s.payload,
-                             range.payload_offset,
-                             device_bytes(bd.device_ptr, static_cast<std::size_t>(bd.size_bytes))),
-              label,
-              "buffer bytes at the described range");
-      }
-    }
-  }
-  check(next_buffer == s.buffers.size(), label, "fewer described buffers than written");
-
-  // The described ranges tile the payload region exactly.
-  auto tiled = ranges;
-  std::sort(tiled.begin(), tiled.end());
-  std::uint64_t end = 0;
-  for (auto const& [offset, size] : tiled) {
-    check(offset == end, label, "described ranges leave a gap or overlap");
-    end += size;
-  }
-  check(end == s.payload.size(), label, "described ranges do not cover the payload");
-
-  // The reader fetches exactly the described (non-empty) ranges ...
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> fetched;
-  simpatico::payload_fetch_fn fetch = [&](std::uint64_t off,
-                                          std::size_t sz,
-                                          void* dst,
-                                          ::cuda::stream_ref str) {
-    fetched.emplace_back(off, sz);
-    if (off > s.payload.size() || sz > s.payload.size() - off)
-      throw std::runtime_error("fetch out of the payload region");
-    cuda_check(cudaMemcpyAsync(dst, s.payload.data() + off, sz, cudaMemcpyHostToDevice, str.get()));
-  };
-  std::string rerr;
-  auto const reread =
-    simpatico::read_compressed_table_from_memory(s.header, fetch, stream, mr, &rerr);
-  check(rerr.empty(), label, ("read error: " + rerr).c_str());
-  stream.sync();
-  auto expected_fetches = ranges;
-  std::erase_if(expected_fetches, [](auto const& r) { return r.second == 0; });
-  std::sort(expected_fetches.begin(), expected_fetches.end());
-  std::sort(fetched.begin(), fetched.end());
-  check(fetched == expected_fetches, label, "reader fetch ranges differ from the description");
-
-  // ... and each reconstructed leaf buffer holds the bytes of its described range.
-  auto const restored = reread.describe(stream);
-  check(restored.size() == desc.columns.size(), label, "reread column count");
-  for (std::size_t ci = 0; ci < desc.columns.size(); ++ci) {
-    auto const& col = desc.columns[ci];
-    check(restored[ci].size() == col.leaves.size(), label, "reread leaf count");
-    for (std::size_t li = 0; li < col.leaves.size(); ++li) {
-      auto const& leaf = col.leaves[li];
-      auto const& ld   = restored[ci][li];
-      check(ld.node_index == leaf.node_index && ld.slot == leaf.slot && ld.kind == leaf.kind,
-            label,
-            "reread leaf identity");
-      check(ld.buffers.size() == leaf.buffers.size(), label, "reread leaf buffer count");
-      for (std::size_t bi = 0; bi < leaf.buffers.size(); ++bi) {
-        auto const& range = leaf.buffers[bi];
-        auto const& bd    = ld.buffers[bi];
-        check(bd.name == range.name && bd.size_bytes == range.size, label, "reread buffer shape");
-        check(payload_equals(s.payload,
-                             range.payload_offset,
-                             device_bytes(bd.device_ptr, static_cast<std::size_t>(bd.size_bytes))),
-              label,
-              "reread buffer bytes differ from the described range");
-      }
-    }
-    if (col.validity == simpatico::hpln_validity::mask) {
-      auto const& mask = reread.columns[ci].plan_tree->validity.mask;
-      check(mask.size() == col.validity_size &&
-              payload_equals(
-                s.payload, col.validity_payload_offset, device_bytes(mask.data(), mask.size())),
-            label,
-            "reread validity mask differs from the described range");
-    }
-  }
-
-  // The staged payload is the real thing: it decodes back to the input.
-  auto const out = simpatico::decompress(reread, stream, mr);
-  check(out != nullptr && out->num_columns() == input.num_columns(), label, "decompress");
-  for (cudf::size_type i = 0; i < input.num_columns(); ++i)
-    check(columns_equal_any(input.column(i), out->view().column(i), stream), label, "roundtrip");
-
-  return desc;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-// Integer spill plans over one table holding an all-valid, a mixed and an all-null column.
-void integer_plan(char const* label, char const* dsl)
-{
-  constexpr cudf::size_type num_rows = 4097;  // a partial last chunk and mask word
-  auto plain                         = make_int64_column(num_rows, nulls::none, 7);
-  auto mixed                         = make_int64_column(num_rows, nulls::some, 11);
-  auto all_null                      = make_int64_column(num_rows, nulls::all, 13);
-  cudf::table_view tbl({plain->view(), mixed->view(), all_null->view()});
-  auto const desc = check_describe(label, tbl, dsl);
-  check(desc.columns[0].validity == simpatico::hpln_validity::all_valid, label, "col 0 all_valid");
-  check(desc.columns[1].validity == simpatico::hpln_validity::mask, label, "col 1 mask");
-  check(desc.columns[2].validity == simpatico::hpln_validity::all_null, label, "col 2 all_null");
-}
-
-void test_bitpack_plan() { integer_plan("bitpack", kBitpackPlan); }
-void test_delta_bitpack_plan() { integer_plan("delta_bitpack", kDeltaBitpackPlan); }
-void test_delta_rle_bitpack_plan() { integer_plan("delta_rle_bitpack", kDeltaRleBitpackPlan); }
-void test_stored_plan() { integer_plan("stored", kStoredPlan); }
-
-// String spill plans over an all-valid and a nullable column.
-void string_plan(char const* label, char const* dsl)
-{
-  auto plain    = make_keyed_strings(5000, /*with_nulls=*/false);
-  auto nullable = make_keyed_strings(5000, /*with_nulls=*/true);
-  cudf::table_view tbl({plain->view(), nullable->view()});
-  auto const desc = check_describe(label, tbl, dsl);
-  check(desc.columns[0].validity == simpatico::hpln_validity::all_valid, label, "col 0 all_valid");
-  check(desc.columns[1].validity == simpatico::hpln_validity::mask, label, "col 1 mask");
-}
-
-void test_dictionary_plan() { string_plan("dictionary", kDictionaryPlan); }
-void test_str_split_plan() { string_plan("str_split", kStringSplitPlan); }
-void test_stored_string_plan() { string_plan("stored_string", kStoredPlan); }
 
 // The description's shape for a known plan: nodes, edges, outputs and leaf buffer names.
 void test_plan_structure()
 {
   auto col = make_int64_column(4096, nulls::none, 3);
   cudf::table_view tbl({col->view()});
-  auto const desc = check_describe("structure", tbl, kDeltaBitpackPlan, {"l_orderkey"});
+  auto const staged = stage("structure", tbl, kDeltaBitpackPlan, {"l_orderkey"});
+  auto const desc   = simpatico::describe_hpln_header(as_bytes(staged.header));
+  expect(desc.version == staged.header[4], "structure: version");
+  expect(desc.payload_bytes == staged.payload.size(), "structure: payload_bytes");
   expect(desc.columns.size() == 1, "structure: one column");
   auto const& c = desc.columns[0];
   expect(c.name == std::optional<std::string>{"l_orderkey"}, "structure: column name");
@@ -405,7 +181,8 @@ void test_plan_structure()
            (std::string("structure: missing buffer ") + wanted).c_str());
 
   // Unnamed columns and an empty table.
-  auto const unnamed = check_describe("structure_unnamed", tbl, kBitpackPlan);
+  auto const unnamed =
+    simpatico::describe_hpln_header(as_bytes(stage("structure_unnamed", tbl, kBitpackPlan).header));
   expect(!unnamed.columns[0].name.has_value(), "structure: unnamed column has no name");
   auto const empty = simpatico::describe_hpln_header(as_bytes(
     std::vector<std::uint8_t>{'H', 'P', 'L', 'N', stage("v", tbl, kStoredPlan).header[4], 0, 0}));
@@ -554,13 +331,6 @@ int main()
     void (*fn)();
   };
   Case cases[] = {
-    {"bitpack_plan", test_bitpack_plan},
-    {"delta_bitpack_plan", test_delta_bitpack_plan},
-    {"delta_rle_bitpack_plan", test_delta_rle_bitpack_plan},
-    {"dictionary_plan", test_dictionary_plan},
-    {"str_split_plan", test_str_split_plan},
-    {"stored_plan", test_stored_plan},
-    {"stored_string_plan", test_stored_string_plan},
     {"plan_structure", test_plan_structure},
     {"validity_ranges", test_validity_ranges},
     {"malformed_headers", test_malformed_headers},

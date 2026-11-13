@@ -76,13 +76,6 @@ class window_buffer {
                 rmm::cuda_stream_view stream,
                 rmm::device_async_resource_ref mr);
 
-  /// Same, with one estimate @p est_string_bytes_per_row for every STRING column.
-  window_buffer(std::vector<cudf::data_type> fetch_types,
-                std::size_t window_rows,
-                std::size_t est_string_bytes_per_row,
-                rmm::cuda_stream_view stream,
-                rmm::device_async_resource_ref mr);
-
   window_buffer(window_buffer&&) noexcept;
   window_buffer& operator=(window_buffer&&) noexcept;
   ~window_buffer();

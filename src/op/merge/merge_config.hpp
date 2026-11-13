@@ -50,7 +50,7 @@ struct merge_settings {
  * @brief GPU memory of the device a merge task runs on.
  */
 struct device_budget {
-  std::size_t gpu_available_bytes{0};  ///< GPU memory available on the device
+  std::size_t gpu_available_bytes{0};  ///< GPU memory free or reserved by tasks in flight
   std::size_t gpu_total_bytes{0};      ///< total GPU memory of the device
   std::size_t concurrent_tasks{1};     ///< sort-merge tasks that can run at once on the device
 };

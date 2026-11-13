@@ -338,6 +338,143 @@ TEST_CASE("tile merge splits tiles at a large fan-in on a small input", "[kway_t
   check_tile_merge(data, cmp, data.total_rows() - 130, 100, 4);
 }
 
+namespace {
+
+/// The launch shape before blocks that share an SM were held to 32 KiB of shared memory.
+tile_merge_shape shape_within_40k(cudf::size_type tiles,
+                                  cudf::size_type tile_rows,
+                                  std::int32_t padded_inputs,
+                                  int sm_count,
+                                  std::int32_t requested_sub_tiles)
+{
+  const auto state_bytes = static_cast<std::size_t>(padded_inputs) * 10;
+  const auto max_threads =
+    static_cast<std::int32_t>(std::clamp<std::size_t>(40 * 1024 / state_bytes, 1, 64));
+  const auto wanted        = requested_sub_tiles > 0
+                               ? requested_sub_tiles
+                               : static_cast<std::int32_t>(std::min<std::int64_t>(
+                            (std::int64_t{sm_count} * 256 - 1) / tiles + 1, 64));
+  const auto max_sub_tiles = tile_rows > 65535 ? 1 : std::clamp(tile_rows / 32, 1, max_threads);
+  tile_merge_shape shape{};
+  shape.sub_tiles     = std::clamp(wanted, 1, max_sub_tiles);
+  shape.sub_rows      = (tile_rows - 1) / shape.sub_tiles + 1;
+  shape.block_tiles   = std::min<std::int32_t>(max_threads / shape.sub_tiles, tiles);
+  shape.block_threads = shape.block_tiles * shape.sub_tiles;
+  shape.blocks        = static_cast<std::uint32_t>((tiles - 1) / shape.block_tiles + 1);
+  shape.shared_bytes  = state_bytes * static_cast<std::size_t>(shape.block_threads);
+  return shape;
+}
+
+}  // namespace
+
+TEST_CASE("tile merge launch shape keeps blocks that share an SM within 32 KiB",
+          "[kway_tile_merge][tile_merge_shape]")
+{
+  SECTION("the measured rounds: fan-in 64, 2048-row tiles, 188 SMs")
+  {
+    struct point {
+      cudf::size_type rows;
+      std::int32_t threads_before;
+      std::int32_t threads;
+    };
+    // 640 B per thread: 52 threads and more were above 32,768 B, and 25% slower.
+    for (const auto& [rows, threads_before, threads] : {point{2'099'414, 47, 47},
+                                                        point{2'021'000, 49, 49},
+                                                        point{1'960'000, 51, 51},
+                                                        point{1'940'000, 51, 51},
+                                                        point{1'920'000, 52, 51},
+                                                        point{1'889'000, 53, 51},
+                                                        point{1'800'000, 55, 51},
+                                                        point{1'200'000, 64, 51}}) {
+      CAPTURE(rows);
+      const auto tiles = (rows - 1) / kDefaultTileRows + 1;
+      CHECK(shape_within_40k(tiles, kDefaultTileRows, 64, 188, 0).block_threads == threads_before);
+      const auto shape = tile_merge_launch_shape(tiles, kDefaultTileRows, 64, 188);
+      CHECK(shape.sub_tiles == threads);
+      CHECK(shape.block_threads == threads);
+      CHECK(shape.blocks == static_cast<std::uint32_t>(tiles));
+      CHECK(shape.shared_bytes == static_cast<std::size_t>(threads) * 640);
+      CHECK(shape.shared_bytes <= 32'768);
+    }
+    // A round with an SM for every block keeps its 64 threads.
+    const auto small = tile_merge_launch_shape(188, kDefaultTileRows, 64, 188);
+    CHECK(small.block_threads == 64);
+    CHECK(small.shared_bytes == 40'960);
+  }
+
+  SECTION("every shape covers the round, and only blocks above 32 KiB that share an SM change")
+  {
+    for (const std::int32_t k : {1, 2, 5, 32, 33, 64, 65, 128, 200, 256, 1024, 2048, 2049, 4096}) {
+      std::int32_t padded = 2;
+      while (padded < k) {
+        padded *= 2;
+      }
+      for (const int sm_count : {1, 20, 188}) {
+        for (const cudf::size_type tiles : {1, 7, 188, 189, 943, 5000, 100000}) {
+          for (const cudf::size_type tile_rows : {7, 100, 2048, 65535, 65536, 100000}) {
+            for (const std::int32_t requested : {0, 1, 3, 64}) {
+              CAPTURE(k, sm_count, tiles, tile_rows, requested);
+              const auto shape  = tile_merge_launch_shape(tiles, tile_rows, k, sm_count, requested);
+              const auto before = shape_within_40k(tiles, tile_rows, padded, sm_count, requested);
+              REQUIRE(shape.sub_tiles >= 1);
+              REQUIRE(shape.block_tiles >= 1);
+              REQUIRE(shape.block_threads == shape.block_tiles * shape.sub_tiles);
+              REQUIRE(shape.block_threads <= 64);
+              REQUIRE(std::int64_t{shape.blocks} * shape.block_tiles >= tiles);
+              REQUIRE((std::int64_t{shape.blocks} - 1) * shape.block_tiles < tiles);
+              REQUIRE(std::int64_t{shape.sub_tiles} * shape.sub_rows >= tile_rows);
+              REQUIRE((shape.sub_tiles == 1 || (tile_rows <= 65535 && shape.sub_rows >= 32)));
+              REQUIRE(shape.shared_bytes ==
+                      static_cast<std::size_t>(padded) * 10 * shape.block_threads);
+              REQUIRE(shape.shared_bytes <= 40'960);
+              const bool changed =
+                before.shared_bytes > 32'768 && before.blocks > static_cast<unsigned>(sm_count);
+              if (changed) {
+                REQUIRE((shape.shared_bytes <= 32'768 || shape.block_threads == 1));
+              } else {
+                REQUIRE(shape.sub_tiles == before.sub_tiles);
+                REQUIRE(shape.block_tiles == before.block_tiles);
+                REQUIRE(shape.blocks == before.blocks);
+                REQUIRE(shape.shared_bytes == before.shared_bytes);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("tile merge is exact at a launch shape held to 32 KiB of shared memory",
+          "[kway_tile_merge][tile_merge_shape]")
+{
+  int device   = 0;
+  int sm_count = 0;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  REQUIRE(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess);
+  // 64 inputs and a few more 2048-row tiles than SMs: one block per tile, which would get 64
+  // threads and 40,960 B of shared memory, and gets 51 threads instead.
+  const std::size_t k = 64;
+  const auto tiles    = static_cast<cudf::size_type>(sm_count) + 3;
+  const auto total    = tiles * kDefaultTileRows - 100;
+  const auto shape    = tile_merge_launch_shape(tiles, kDefaultTileRows, 64, sm_count);
+  REQUIRE(shape_within_40k(tiles, kDefaultTileRows, 64, sm_count, 0).block_threads == 64);
+  REQUIRE(shape.block_threads == 51);
+  REQUIRE(shape.shared_bytes == 32'640);
+
+  std::mt19937 rng(5100);
+  std::vector<cudf::size_type> lengths(k, total / static_cast<cudf::size_type>(k));
+  lengths.front() += total % static_cast<cudf::size_type>(k);
+  const auto data = make_case(
+    int_windows(lengths, 100000, 0.0, rng), {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  REQUIRE(data.total_rows() == total);
+  auto cmp = make_comparator(data);
+  // The last tile is short; then a whole number of tiles; then 64 sub-tiles asked for.
+  check_tile_merge(data, cmp, total, kDefaultTileRows);
+  check_tile_merge(data, cmp, (tiles - 1) * kDefaultTileRows, kDefaultTileRows);
+  check_tile_merge(data, cmp, total, kDefaultTileRows, 64);
+}
+
 TEST_CASE("tile merge breaks heavy ties by input, then by row", "[kway_tile_merge]")
 {
   std::mt19937 rng(11);

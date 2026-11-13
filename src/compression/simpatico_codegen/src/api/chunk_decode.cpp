@@ -505,18 +505,6 @@ const hpln_column_description& compressed_column_cursor::column() const noexcept
   return _impl->access.column();
 }
 
-std::size_t kept_staged_bytes_bound(hpln_column_description const& column) noexcept
-{
-  std::size_t bytes = 0;
-  for (auto const& leaf : column.leaves) {
-    if (!chunk::is_kept_leaf(column, leaf)) { continue; }
-    for (auto const& buffer : leaf.buffers) {
-      bytes += buffer.size;
-    }
-  }
-  return bytes;
-}
-
 std::size_t compressed_column_cursor::device_bytes_held() const noexcept
 {
   return _impl->access.bytes_held() + (_impl->decoder ? _impl->decoder->state_bytes() : 0);

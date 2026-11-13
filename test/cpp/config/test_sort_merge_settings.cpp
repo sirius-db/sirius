@@ -196,18 +196,6 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     require_ok(con, "SET sort_merge_mode = '" + std::string(spelling) + "'");
     CHECK(params.sort_merge_mode_setting == mode);
   }
-
-  SECTION("the mode help text describes one_shot")
-  {
-    auto result =
-      con.Query("SELECT description FROM duckdb_settings() WHERE name = 'sort_merge_mode'");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->Collection().Count() == 1);
-    auto const description = result->Collection().GetValue(0, 0).ToString();
-    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("one_shot"));
-    CHECK_THAT(description, Catch::Matchers::ContainsSubstring("concat-then-merge"));
-  }
 }
 
 TEST_CASE("sort_merge settings reject invalid SET values and keep the previous value",

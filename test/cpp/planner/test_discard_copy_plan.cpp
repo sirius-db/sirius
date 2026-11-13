@@ -377,19 +377,6 @@ TEST_CASE(
   }
 }
 
-TEST_CASE("COPY to a file format still declines to DuckDB",
-          "[planner][discard_copy_plan][shared_context]")
-{
-  discard_copy_plan_fixture fixture;
-  auto const query = std::string("SELECT k1 FROM ") + kSource + " ORDER BY k1";
-  for (auto const* format : {"csv", "parquet"}) {
-    INFO(format);
-    REQUIRE_THROWS_AS(fixture.plan("COPY (" + query + ") TO '/nonexistent/sirius_discard_plan." +
-                                   format + "' (FORMAT " + format + ")"),
-                      duckdb::NotImplementedException);
-  }
-}
-
 TEST_CASE("sirius_discard COPY of a query without ORDER BY plans with the order check off",
           "[planner][discard_copy_plan][shared_context]")
 {

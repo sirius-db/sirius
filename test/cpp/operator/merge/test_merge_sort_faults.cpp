@@ -102,64 +102,9 @@ constexpr std::size_t kGiB = std::size_t{1} << 30;
 // Memory: one GPU space with a software limit, a host space and a disk space
 // ---------------------------------------------------------------------------
 
-/// Declare it before anything that holds batches of its spaces: the destructor shuts the manager
-/// and the converter registry down.
-struct fault_fixture {
-  std::filesystem::path tmp_dir;
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu  = nullptr;
-  cucascade::memory::memory_space* host = nullptr;
-  cucascade::memory::memory_space* disk = nullptr;
-  /// The host converter rejects the default stream, so conversions run on this one.
-  rmm::cuda_stream stream;
-
-  explicit fault_fixture(std::size_t gpu_bytes = 256 * kMiB)
-  {
-    sirius::converter_registry::reset_for_testing();
-    std::string tmp_template =
-      (std::filesystem::temp_directory_path() / "sirius_merge_faults_XXXXXX").string();
-    REQUIRE(mkdtemp(tmp_template.data()) != nullptr);
-    tmp_dir = tmp_template;
-
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .set_gpu_usage_limit(gpu_bytes)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(kGiB)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .track_reservation_per_stream(false)
-      .set_disk_mounting_point(0, kGiB, tmp_dir.string());
-    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    if (!sirius::row_range_reader_registry::is_initialized()) {
-      sirius::row_range_reader_registry::initialize();
-    }
-    gpu  = manager->get_memory_space(Tier::GPU, 0);
-    host = manager->get_memory_space(Tier::HOST, 0);
-    disk = manager->get_memory_space(Tier::DISK, 0);
-    REQUIRE(gpu != nullptr);
-    REQUIRE(host != nullptr);
-    REQUIRE(disk != nullptr);
-  }
-
-  ~fault_fixture()
-  {
-    manager->shutdown();
-    sirius::converter_registry::shutdown();
-    std::error_code ignored;
-    std::filesystem::remove_all(tmp_dir, ignored);
-  }
-
-  fault_fixture(const fault_fixture&)            = delete;
-  fault_fixture& operator=(const fault_fixture&) = delete;
-
-  [[nodiscard]] ::cuda::stream_ref stream_ref() const { return ::cuda::stream_ref{stream.value()}; }
-  [[nodiscard]] rmm::cuda_stream_view stream_view() const
-  {
-    return rmm::cuda_stream_view{stream.value()};
-  }
-  [[nodiscard]] rmm::device_async_resource_ref mr() const { return utils::get_resource_ref(*gpu); }
+/// merge_utils::tiers_fixture with a 256 MiB GPU space unless a test asks for another size.
+struct fault_fixture : tiers_fixture {
+  explicit fault_fixture(std::size_t gpu_bytes = 256 * kMiB) : tiers_fixture(gpu_bytes) {}
 };
 
 Tier tier_of(cucascade::data_batch& batch) { return batch.to_read_only().get_current_tier(); }
@@ -194,35 +139,6 @@ void convert_unlocked_batch(fault_fixture& fx,
 // ---------------------------------------------------------------------------
 // Rows and runs
 // ---------------------------------------------------------------------------
-
-merge::merge_key_spec ascending_key()
-{
-  return {.key_cols        = {0},
-          .column_order    = {cudf::order::ASCENDING},
-          .null_precedence = {cudf::null_order::AFTER}};
-}
-
-/// An unsorted (key INT64 in [0, key_range), id INT64) table; ids are unique from @p first_id on.
-std::unique_ptr<cudf::table> random_rows(std::size_t rows,
-                                         std::int64_t key_range,
-                                         std::int64_t first_id,
-                                         std::uint32_t seed)
-{
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<std::int64_t> dist(0, key_range - 1);
-  std::vector<std::int64_t> keys(rows);
-  std::vector<std::int64_t> ids(rows);
-  for (std::size_t i = 0; i < rows; ++i) {
-    keys[i] = dist(gen);
-    ids[i]  = first_id + static_cast<std::int64_t>(i);
-  }
-  return make_table(make_column(keys, cudf::type_id::INT64),
-                    make_column(ids, cudf::type_id::INT64));
-}
-
-const std::vector<std::size_t> kTwoCols{0, 1};
-const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT64},
-                                             cudf::data_type{cudf::type_id::INT64}};
 
 /// Sorts @p unsorted and adds it to @p partition of @p repository as one single-batch GPU run.
 test_run add_sorted_run(cucascade::shared_data_repository& repository,
@@ -1100,56 +1016,6 @@ TEST_CASE("merge sort stays exact while the downgrade executor spills its runs",
   }
 }
 
-// ---------------------------------------------------------------------------
-// 3. No reader: whole-batch fallback
-// ---------------------------------------------------------------------------
-
-namespace {
-
-/// Merges a GPU run with a run that @p make_unreadable has put in a representation without a
-/// row-range reader, over many run() calls.
-template <typename Representation, typename MakeUnreadable>
-void check_fallback_merge(fault_fixture& fx, MakeUnreadable&& make_unreadable)
-{
-  cucascade::shared_data_repository repo;
-  std::vector<test_run> runs;
-  runs.push_back(add_sorted_run(repo, *fx.gpu, random_rows(3000, 40000, 0, 7)->view()));
-  runs.push_back(add_sorted_run(repo, *fx.gpu, random_rows(2500, 40000, 10000, 8)->view()));
-  auto& batch = *runs[1].batches[0];
-  make_unreadable(batch);
-  REQUIRE(holds<Representation>(batch));
-  auto const& readers = sirius::row_range_reader_registry::get();
-  REQUIRE_FALSE(readers.has_reader(*batch.to_read_only().get_data()));
-  auto const id = batch.get_batch_id();
-
-  auto cursors = make_cursors(runs);
-  merge::windowed_merger merger(run_batches(runs),
-                                cursors,
-                                kTwoCols,
-                                kTwoInt64,
-                                ascending_key(),
-                                {.window_rows = 256, .output_target_bytes = 1},
-                                readers,
-                                *fx.gpu);
-  merge::merge_round_stats stats;
-  auto const collected = collect_full_sort(merger, cursors, fx.stream_view(), fx.mr(), &stats);
-
-  // Converted on the first round, then sliced like any GPU run for the rest of the merge.
-  REQUIRE(collected.chunks.size() > 2);
-  CHECK(stats.fallback_conversions == 1);
-  CHECK(stats.refill_rows == 0);
-  CHECK(holds<cucascade::gpu_table_representation>(batch));
-  CHECK(batch.to_read_only().get_memory_space() == fx.gpu);
-  CHECK(batch.get_batch_id() == id);
-  CHECK(repo.get_data_batch_by_id(id, 0).get() == &batch);
-
-  auto const expected = expected_full_sort(runs, ascending_key());
-  REQUIRE(collected.table->num_rows() == expected->num_rows());
-  REQUIRE(tables_equal(collected.table->view(), expected->view()));
-}
-
-}  // namespace
-
 TEST_CASE("merge sort fan-in passes stay exact while the downgrade executor spills their runs",
           "[merge_sort_faults]")
 {
@@ -1205,15 +1071,9 @@ TEST_CASE("merge sort fan-in passes stay exact while the downgrade executor spil
   }
 }
 
-TEST_CASE("windowed merge converts a packed host run to the GPU once", "[merge_sort_faults]")
-{
-  if (!has_gpu()) { SKIP("No GPU available"); }
-  fault_fixture fx;
-  check_fallback_merge<cucascade::host_data_packed_representation>(
-    fx, [&](cucascade::data_batch& batch) {
-      convert_batch<cucascade::host_data_packed_representation>(fx, batch, fx.host);
-    });
-}
+// ---------------------------------------------------------------------------
+// 3. No reader: whole-batch fallback
+// ---------------------------------------------------------------------------
 
 TEST_CASE("merge sort falls back when a run loses its reader between two tasks",
           "[merge_sort_faults]")

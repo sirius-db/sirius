@@ -6,7 +6,6 @@
 #include "api/compressed_table_io.hpp"
 
 #include "api/chunk_decode.hpp"
-#include "api/hpln_header_parse.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
@@ -25,6 +24,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <span>
@@ -1072,8 +1072,10 @@ compressed_table read_compressed_table_subset_from_memory(
 
 namespace detail {
 
-// Runs the reader's own header parser and copies the records out, so the description can
-// never disagree with what read_compressed_table_from_memory fetches.
+// The header-only .hpln parse behind describe_hpln_header (api/chunk_decode.hpp): runs the
+// reader's own header parser and copies the records out, so the description can never disagree
+// with what read_compressed_table_from_memory fetches. Returns an error message, or empty on
+// success. Touches neither the payload nor the device. May throw on a corrupt type tag.
 std::string parse_hpln_description(std::span<const std::uint8_t> header, hpln_description& out)
 {
   Reader r{header.data(), header.size()};
@@ -1137,5 +1139,20 @@ std::string parse_hpln_description(std::span<const std::uint8_t> header, hpln_de
 }
 
 }  // namespace detail
+
+hpln_description describe_hpln_header(std::span<const std::byte> header)
+{
+  hpln_description out;
+  std::string err;
+  try {
+    err = detail::parse_hpln_description(
+      {reinterpret_cast<const std::uint8_t*>(header.data()), header.size()}, out);
+  } catch (std::exception const& e) {
+    // The parser sizes buffers with cudf::size_of, which throws on a corrupt type tag.
+    err = e.what();
+  }
+  if (!err.empty()) throw std::runtime_error("describe_hpln_header: " + err);
+  return out;
+}
 
 }  // namespace simpatico

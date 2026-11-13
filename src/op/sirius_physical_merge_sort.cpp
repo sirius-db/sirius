@@ -62,6 +62,16 @@ namespace {
 /// GPU memory assumed for sizing when neither a provider nor a GPU-resident run names a device.
 constexpr std::size_t kUnknownDeviceBytes = std::size_t{8} << 30;
 
+/// GPU memory of @p space that its tasks share: the free bytes plus the bytes reserved by tasks
+/// in flight. derive_merge_config() divides it among the concurrent tasks, so a partition armed
+/// while other tasks hold reservations is sized like one armed alone. Bytes allocated outside a
+/// reservation (resident batches, kept window buffers) stay subtracted.
+std::size_t shareable_gpu_bytes(const cucascade::memory::memory_space& space)
+{
+  return sirius::memory::saturating_add(space.get_available_memory(),
+                                        space.get_total_reserved_memory());
+}
+
 std::vector<cudf::data_type> types_of(
   const std::vector<cucascade::memory::column_metadata>& columns)
 {
@@ -319,6 +329,25 @@ std::size_t sum_widths(const std::vector<std::size_t>& widths,
   return total;
 }
 
+/// The batches of @p run, in run order, as the repository of @p partition holds them.
+std::vector<std::shared_ptr<cucascade::data_batch>> resolve_run_batches(
+  ::cucascade::shared_data_repository& repo, std::size_t partition, const merge::merge_run& run)
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  batches.reserve(run.batch_ids.size());
+  for (auto id : run.batch_ids) {
+    auto batch = repo.get_data_batch_by_id(id, partition);
+    if (!batch) {
+      throw internal_exception(
+        "merge_sort: batch {} of partition {} left the repository before it was merged",
+        id,
+        partition);
+    }
+    batches.push_back(std::move(batch));
+  }
+  return batches;
+}
+
 }  // namespace
 
 sirius_physical_merge_sort::sirius_physical_merge_sort(sirius_physical_order* order_by)
@@ -369,7 +398,7 @@ sirius_physical_merge_sort::make_device_budget_provider(
       }
     }
     if (space != nullptr) {
-      budget.gpu_available_bytes = space->get_available_memory();
+      budget.gpu_available_bytes = shareable_gpu_bytes(*space);
       budget.gpu_total_bytes     = space->get_max_memory();
     }
     return budget;
@@ -475,6 +504,28 @@ std::vector<std::size_t> sirius_physical_merge_sort::output_columns(
   return columns;
 }
 
+bool sirius_physical_merge_sort::at_open_partition_cap(const partition_merge_state& candidate) const
+{
+  std::unordered_map<const cucascade::memory::memory_space*, std::size_t> on_device;
+  std::size_t undecided = 0;
+  for (auto const& [partition, state] : _partitions) {
+    if (state.route != merge::merge_route::windowed || !(state.in_flight || state.merger)) {
+      continue;
+    }
+    auto const* space = state.merger ? state.merger->space : state.task_space;
+    if (space != nullptr) {
+      ++on_device[space];
+    } else {
+      ++undecided;
+    }
+  }
+  std::size_t most = 0;
+  for (auto const& [space, open] : on_device) {
+    most = std::max(most, open);
+  }
+  return most + undecided >= std::max<std::size_t>(candidate.concurrent_tasks, 1);
+}
+
 bool sirius_physical_merge_sort::has_armable_partition(::cucascade::shared_data_repository& repo)
 {
   auto const num_partitions = repo.num_partitions();
@@ -488,7 +539,10 @@ bool sirius_physical_merge_sort::has_armable_partition(::cucascade::shared_data_
       if (repo.size(p) > 0) { return true; }
       continue;
     }
-    if (!it->second.in_flight && !it->second.runs.empty()) { return true; }
+    if (!it->second.in_flight && !it->second.runs.empty() &&
+        (it->second.merger || !at_open_partition_cap(it->second))) {
+      return true;
+    }
   }
   return false;
 }
@@ -500,8 +554,8 @@ std::optional<task_creation_hint> sirius_physical_merge_sort::get_next_task_hint
   std::lock_guard<std::mutex> lg(_drain_mutex);
   auto* repo = ports.begin()->second->repo;
   if (repo == nullptr || has_armable_partition(*repo)) { return hint; }
-  // Every partition that still has runs has a task in flight; that task schedules this operator
-  // again when it commits.
+  // Every partition that still has runs has a task in flight or waits for an open partition to
+  // finish; the task in flight schedules this operator again when it commits.
   return std::nullopt;
 }
 
@@ -548,6 +602,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
           }
         }
         if (state.runs.empty()) { continue; }
+        // Opening the partition would add a merger the window budget does not cover: it waits
+        // until an open one finishes, whose commit schedules the operator again. A partition
+        // that keeps its merger is open already and is served as before.
+        if (!state.merger && at_open_partition_cap(state)) { continue; }
         task = plan_windowed_task(p, state, *repo);
         break;
       }
@@ -728,7 +786,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     // No provider, or one that knows of no GPU memory space.
     if (most != gpu_bytes.end()) { _gpu_space_hint = most->first; }
     if (_gpu_space_hint != nullptr) {
-      budget.gpu_available_bytes = _gpu_space_hint->get_available_memory();
+      budget.gpu_available_bytes = shareable_gpu_bytes(*_gpu_space_hint);
       budget.gpu_total_bytes     = _gpu_space_hint->get_max_memory();
     } else {
       SIRIUS_LOG_WARN(
@@ -792,7 +850,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     SIRIUS_LOG_DEBUG("merge_sort: partition {} armed while a tier move held one of its runs",
                      partition);
   }
-  SIRIUS_LOG_DEBUG(
+  SIRIUS_LOG_INFO(
     "merge_sort: partition {} armed: route={} runs={} rows={} bytes={} any_non_gpu={} "
     "has_nested={} has_late_mat={}",
     partition,
@@ -806,10 +864,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
   if (route == merge::merge_route::one_shot) { return one_shot(); }
 
   count(_counters, [](merge_sort_counters& counters) { ++counters.windowed_partitions; });
-  state.route         = route;
-  state.config        = config;
-  state.column_types  = std::move(*schema);
-  state.column_widths = std::move(widths);
+  state.route            = route;
+  state.config           = config;
+  state.derived_config   = config;
+  state.concurrent_tasks = budget.concurrent_tasks;
+  state.column_types     = std::move(*schema);
+  state.column_widths    = std::move(widths);
   state.runs.reserve(num_runs);
   for (auto const& batch : peeked) {
     if (batch.rows == 0) {
@@ -847,6 +907,13 @@ sirius_physical_merge_sort::windowed_task_plan sirius_physical_merge_sort::plan_
     auto plan  = merge::plan_pass(summaries, state.config.fan_in);
     selected   = std::move(plan.runs);
     final_pass = plan.final_pass;
+    // A pass starts with a new merger, so it starts from the derived sizes again: what a task
+    // shrank to after an OOM holds for the rest of its pass only.
+    if (!final_pass || !state.final_pass_started) {
+      state.config.window_rows         = state.derived_config.window_rows;
+      state.config.output_target_bytes = state.derived_config.output_target_bytes;
+    }
+    state.final_pass_started = final_pass;
     if (!final_pass) {
       for (auto i : selected) {
         state.runs[i].in_pass = true;
@@ -876,18 +943,7 @@ sirius_physical_merge_sort::windowed_task_plan sirius_physical_merge_sort::plan_
   task.kept_buffer.reserve(selected.size());
   for (auto i : selected) {
     auto const& run = state.runs[i];
-    auto& batches   = task.batches.emplace_back();
-    batches.reserve(run.cursor.run.batch_ids.size());
-    for (auto id : run.cursor.run.batch_ids) {
-      auto batch = repo.get_data_batch_by_id(id, partition);
-      if (!batch) {
-        throw internal_exception(
-          "merge_sort: batch {} of partition {} left the repository before it was merged",
-          id,
-          partition);
-      }
-      batches.push_back(std::move(batch));
-    }
+    task.batches.push_back(resolve_run_batches(repo, partition, run.cursor.run));
     task.cursors.push_back(run.cursor);
     task.batch_bytes.push_back(run.batch_bytes);
     bool held = false;
@@ -1202,6 +1258,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     column_types = state.column_types;
     task_run_ids = state.task_runs;
     kept         = std::move(state.merger);
+    // The partition counts as open on this device from here on.
+    state.task_space = &input.gpu_memory_space();
   }
   auto const num_columns = column_types.size();
   auto plan =
@@ -1246,18 +1304,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> runs;
     runs.reserve(kept->cursors.size());
     for (auto const& cursor : kept->cursors) {
-      auto& batches = runs.emplace_back();
-      batches.reserve(cursor.run.batch_ids.size());
-      for (auto id : cursor.run.batch_ids) {
-        auto batch = repo->get_data_batch_by_id(id, partition);
-        if (!batch) {
-          throw internal_exception(
-            "merge_sort: batch {} of partition {} left the repository before it was merged",
-            id,
-            partition);
-        }
-        batches.push_back(std::move(batch));
-      }
+      runs.push_back(resolve_run_batches(*repo, partition, cursor.run));
     }
     kept->merger.emplace(std::move(runs),
                          kept->cursors,
@@ -1276,14 +1323,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
   // buffered) and leaves the partition's cursors where this task started: the retry replays.
   auto& cursors = kept->cursors;
   merge::merge_round_stats stats;
-  auto merged              = kept->merger->run(stream_view, mr, &stats);
-  auto const rows_out      = merged ? static_cast<std::size_t>(merged->num_rows()) : std::size_t{0};
-  auto const all_exhausted = std::all_of(
-    cursors.begin(), cursors.end(), [](auto const& cursor) { return cursor.exhausted(); });
-  if (rows_out == 0 && !all_exhausted) {
-    throw internal_exception("merge_sort: a windowed task of partition {} made no progress",
-                             partition);
-  }
+  auto merged = kept->merger->run(stream_view, mr, &stats);
+  // run() returns no rows only when every cursor is exhausted; a round without progress throws.
+  auto const rows_out = merged ? static_cast<std::size_t>(merged->num_rows()) : std::size_t{0};
 
   std::shared_ptr<cucascade::data_batch> output_batch;
   if (rows_out > 0) {
@@ -1354,7 +1396,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
       kept->holds_buffer[i] = at < state.task_buffered.size() && state.task_buffered[at] &&
                               consumed_counts[i] == 0 && !cursors[i].exhausted();
     }
-    // A task that shrank its windows after an OOM sets the sizes of the partition's later tasks:
+    // A task that shrank its windows after an OOM sets the sizes of the later tasks of its pass:
     // they continue its merger, and do not run out of memory at the unshrunk sizes again.
     state.config.window_rows = std::min(state.config.window_rows, input.config().window_rows);
     state.config.output_target_bytes =
@@ -1401,7 +1443,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
     });
     state.task_runs.clear();
     state.task_buffered.clear();
-    state.in_flight = false;
+    state.task_space = nullptr;
+    state.in_flight  = false;
     // The partition's next task, if it has one, is made only when the operator is scheduled.
     followup = finish_commit(*repo, true);
   }

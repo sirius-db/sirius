@@ -124,6 +124,7 @@ class recording_merge_sort final : public sirius_physical_merge_sort {
       record.final_pass  = windowed->final_pass();
       record.first_chunk = windowed->first_chunk();
       record.runs        = windowed->cursors().size();
+      note_started(record.partition);
     } else {
       auto const& one_shot = dynamic_cast<const pipelineable_operator_data&>(input);
       record.runs          = one_shot.get_data_batches().size();
@@ -153,9 +154,35 @@ class recording_merge_sort final : public sirius_physical_merge_sort {
   /// Most tasks of this operator that were inside execute() at once.
   [[nodiscard]] std::size_t peak_running() const { return _peak_running.load(); }
 
+  /// Most windowed partitions seen started and not merged to their end at once, sampled when a
+  /// partition's first task starts. Without fan-in passes each of them is open: it has a task
+  /// in flight or keeps its merger.
+  [[nodiscard]] std::size_t peak_open() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _peak_open;
+  }
+
  private:
+  /// Called when a windowed task of @p partition starts. A partition's runs leave the repository
+  /// only at the commits of its own tasks, so one that started before this call and still has
+  /// runs at any time during it was open for all of it up to then, as @p partition is.
+  void note_started(std::size_t partition)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_started.insert(partition).second) { return; }
+    auto const* repo = get_port("default")->repo;
+    std::size_t open = 1;
+    for (auto other : _started) {
+      if (other != partition && repo->size(other) > 0) { ++open; }
+    }
+    _peak_open = std::max(_peak_open, open);
+  }
+
   mutable std::mutex _mutex;
   std::vector<task_record> _records;
+  std::set<std::size_t> _started;
+  std::size_t _peak_open{0};
   std::atomic<std::size_t> _running{0};
   std::atomic<std::size_t> _peak_running{0};
 };
@@ -498,7 +525,10 @@ TEST_CASE("windowed merge sort merges several partitions in parallel", "[merge_s
 {
   // More executor threads than partitions with runs, so two tasks of one partition could overlap.
   merge_harness test{{.num_partitions = 4, .executor_threads = 4}};
-  test.configure(small_window_params());
+  // A budget for as many tasks as the executor has threads, so every partition may be open.
+  test.configure(
+    small_window_params(),
+    {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 4});
   // Partition 2 stays empty; the keys of partition p are all below those of partition p + 1.
   const std::vector<std::size_t> partitions{0, 1, 3};
   std::map<std::size_t, std::vector<host_rows>> runs;
@@ -627,32 +657,6 @@ TEST_CASE("windowed merge sort with more runs than the fan-in cap merges in pass
   }
 }
 
-TEST_CASE("windowed merge sort merges runs spread over the GPU and HOST tiers",
-          "[merge_sort_continuation]")
-{
-  merge_harness test;
-  test.configure(small_window_params());
-  std::vector<host_rows> runs;
-  for (std::size_t run = 0; run < 5; ++run) {
-    runs.push_back(test.add_run(0, run, 3000 + 400 * run));
-  }
-  test.downgrade_to_host(1);
-  test.downgrade_to_host(3);
-  REQUIRE(test.tier_of(0) == Tier::GPU);
-  REQUIRE(test.tier_of(1) == Tier::HOST);
-  auto const expected = full_sort(concatenate(runs));
-
-  test.run();
-
-  auto const records = test.merge->records();
-  REQUIRE(records.size() >= 3);
-  REQUIRE(require_chunk_chain(records, 0) == records.size());
-  REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
-  REQUIRE(test.collected() == expected);
-  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
-  test.require_inputs_popped();
-}
-
 TEST_CASE("windowed merge sort reads each HOST row once across the tasks of a partition",
           "[merge_sort_continuation]")
 {
@@ -722,62 +726,97 @@ TEST_CASE("windowed merge sort keeps its merger when a run ends before the other
   test.require_inputs_popped();
 }
 
-TEST_CASE("merge sort automatic mode routes by the one-shot share of the GPU",
+TEST_CASE("windowed merge sort keeps no more partitions open than its budget has concurrent tasks",
           "[merge_sort_continuation]")
 {
-  sirius::operator_params params;
-  params.sort_merge_mode_setting = sirius::sort_merge_mode::automatic;
-  params.sort_merge_window_rows  = 1024;
-  params.sort_merge_output_bytes = 64 * 1024;
-
-  SECTION("tiny data on a large device merges one-shot")
-  {
-    merge_harness test{{.num_partitions = 2}};
-    test.configure(params);
-    std::vector<host_rows> runs;
-    for (std::size_t run = 0; run < 3; ++run) {
-      runs.push_back(test.add_run(1, run, 64, 0, 50));
+  constexpr std::size_t num_partitions = 16;
+  constexpr std::size_t runs_per_part  = 3;
+  constexpr std::size_t cap            = 2;
+  // Twice as many executor threads as the budget has tasks: the executor alone would run four
+  // partitions at once.
+  merge_harness test{{.num_partitions = num_partitions, .executor_threads = 2 * cap}};
+  test.configure(
+    small_window_params(),
+    {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = cap});
+  // Every run is on the HOST tier, so every partition reads through window buffers, which its
+  // merger keeps between its tasks.
+  std::vector<std::vector<host_rows>> runs(num_partitions);
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    for (std::size_t run = 0; run < runs_per_part; ++run) {
+      runs[partition].push_back(test.add_run(
+        partition, run, 2500 + 200 * run, static_cast<std::int64_t>(partition) * 10000, 4000));
+      test.downgrade_to_host(partition * runs_per_part + run);
     }
-
-    test.run();
-
-    auto const records = test.merge->records();
-    REQUIRE(records.size() == 1);
-    REQUIRE_FALSE(records.front().windowed);
-    REQUIRE(records.front().runs == 3);
-    REQUIRE(records.front().output_batches == 1);
-    REQUIRE(records.front().output_rows == 3 * 64);
-    // Every mode but one_shot encodes the partition's position the same way.
-    REQUIRE(records.front().position == merge::make_merge_chunk_position(1, 0));
-    REQUIRE(test.rearms_from_execute.load() == 0);
-    require_sorted_rows(test.collected(), concatenate(runs));
-    REQUIRE(test.pipe->pipeline->is_pipeline_finished());
-    test.require_inputs_popped();
   }
 
-  SECTION("a one-shot fraction of 0.0001 of a small device forces the windowed route")
-  {
-    merge_harness test;
-    params.sort_merge_one_shot_max_fraction = 0.0001;
-    // 0.0001 of 64 MiB is under 7 KiB; the partition is about 300 KiB.
-    test.configure(
-      params,
-      {.gpu_available_bytes = 64 * kMiB, .gpu_total_bytes = 64 * kMiB, .concurrent_tasks = 1});
-    std::vector<host_rows> runs;
-    for (std::size_t run = 0; run < 5; ++run) {
-      runs.push_back(test.add_run(0, run, 3500 + 200 * run));
-    }
+  test.run();
 
-    test.run();
-
-    auto const records = test.merge->records();
-    REQUIRE(records.size() >= 3);
-    REQUIRE(require_chunk_chain(records, 0) == records.size());
-    REQUIRE(test.rearms_from_execute.load() == records.size() - 1);
-    REQUIRE(test.collected() == full_sort(concatenate(runs)));
-    REQUIRE(test.pipe->pipeline->is_pipeline_finished());
-    test.require_inputs_popped();
+  auto const records = test.merge->records();
+  host_rows expected_all;
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    CAPTURE(partition);
+    REQUIRE(require_chunk_chain(records, partition) >= 2);
+    auto const expected = full_sort(concatenate(runs[partition]));
+    REQUIRE(test.collected(partition) == expected);
+    expected_all.insert(expected_all.end(), expected.begin(), expected.end());
   }
+  REQUIRE(test.collected() == expected_all);
+
+  // The cap held although the executor had idle threads, and both places were used.
+  REQUIRE(test.merge->peak_open() == cap);
+  REQUIRE(test.merge->peak_running() <= cap);
+  // Each partition kept one merger from its first task to its last.
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.windowed_partitions == num_partitions);
+  REQUIRE(counters.one_shot_partitions == 0);
+  REQUIRE(counters.windowed_tasks == records.size());
+  REQUIRE(counters.mergers_built == num_partitions);
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
+  test.require_inputs_popped();
+}
+
+TEST_CASE("windowed merge sort under the open partition cap finishes every fan-in pass",
+          "[merge_sort_continuation]")
+{
+  constexpr std::size_t num_partitions = 6;
+  constexpr std::size_t runs_per_part  = 5;
+  constexpr std::size_t cap            = 2;
+  merge_harness test{{.num_partitions = num_partitions, .executor_threads = 2 * cap}};
+  auto params                  = small_window_params();
+  params.sort_merge_max_fan_in = 2;
+  test.configure(
+    params,
+    {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = cap});
+  // A partition gives up its merger at the end of each intermediate pass and has to open again
+  // for the next one, in turn with the partitions that were waiting.
+  std::vector<std::vector<host_rows>> runs(num_partitions);
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    for (std::size_t run = 0; run < runs_per_part; ++run) {
+      runs[partition].push_back(test.add_run(
+        partition, run, 1500 + 250 * run, static_cast<std::int64_t>(partition) * 10000, 4000));
+      if (run % 2 == 0) { test.downgrade_to_host(partition * runs_per_part + run); }
+    }
+  }
+
+  test.run();
+
+  auto const records = test.merge->records();
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    CAPTURE(partition);
+    REQUIRE(require_chunk_chain(records, partition) >= 2);
+    // A pass reorders runs, so equal keys need not keep the run order.
+    require_sorted_rows(test.collected(partition), concatenate(runs[partition]));
+  }
+  REQUIRE(sorted_by_key(test.collected()));
+
+  REQUIRE(test.merge->peak_running() <= cap);
+  auto const counters = test.merge->counters();
+  REQUIRE(counters.windowed_partitions == num_partitions);
+  REQUIRE(counters.windowed_tasks == records.size());
+  // 5 runs take three two-run intermediate merges before two runs are left for the final pass.
+  REQUIRE(counters.intermediate_tasks >= 3 * num_partitions);
+  REQUIRE(test.pipe->pipeline->is_pipeline_finished());
+  test.require_inputs_popped();
 }
 
 TEST_CASE("windowed merge sort merges runs spread over two GPUs, one partition per device",
@@ -787,7 +826,10 @@ TEST_CASE("windowed merge sort merges runs spread over two GPUs, one partition p
   constexpr std::size_t num_partitions = 4;
   constexpr std::size_t runs_per_part  = 6;
   merge_harness test{{.num_partitions = num_partitions, .executor_threads = 2, .num_gpus = 2}};
-  test.configure(small_window_params());
+  // A budget for as many tasks per device as each executor has threads.
+  test.configure(
+    small_window_params(),
+    {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 2});
   // Four runs of a partition on its own device and two on the other one: the task goes to the
   // device holding most of the partition, and the other two runs are moved to it whole.
   std::vector<std::vector<host_rows>> runs(num_partitions);

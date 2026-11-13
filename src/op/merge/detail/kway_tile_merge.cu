@@ -46,6 +46,10 @@ namespace {
 
 /// Shared memory a CTA may use.
 constexpr std::size_t kTileMergeSharedBytes = 40 * 1024;
+/// Shared memory a CTA may use when there are more CTAs than SMs: above it fewer CTAs fit an SM.
+/// Measured on 188 SMs at fan-in 64 (640 B per thread), rounds of 1.94M and 1.92M rows:
+/// 51 threads, 32,640 B per CTA: 3.47 s; 52 threads, 33,280 B: 4.33 s; flat on either side.
+constexpr std::size_t kTileMergeDenseSharedBytes = 32 * 1024;
 /// Most threads per CTA.
 constexpr std::int32_t kTileMergeMaxBlockThreads = 64;
 /// Fewest output rows of a sub-tile: below this the selection outweighs the merge it saves.
@@ -251,16 +255,68 @@ int current_device_sm_count()
   return sm_counts[slot];
 }
 
-/// Sub-tiles per tile that bring the merge threads to about kTileMergeThreadsPerSm per SM.
-std::int32_t sub_tiles_for_device(cudf::size_type tiles)
+/// The launch shape whose CTAs use at most @p shared_limit bytes of shared memory; a single
+/// thread whose state is larger keeps it.
+tile_merge_shape shape_within(std::size_t shared_limit,
+                              cudf::size_type tiles,
+                              cudf::size_type tile_rows,
+                              std::int32_t padded_inputs,
+                              int sm_count,
+                              std::int32_t requested_sub_tiles)
 {
-  const std::int64_t threads = current_device_sm_count() * kTileMergeThreadsPerSm;
-  return static_cast<std::int32_t>(
+  const std::size_t state_bytes = thread_state_bytes(padded_inputs);
+  const auto max_block_threads  = static_cast<std::int32_t>(
+    std::clamp<std::size_t>(shared_limit / state_bytes, 1, kTileMergeMaxBlockThreads));
+
+  // Sub-tiles per tile that bring the merge threads to about kTileMergeThreadsPerSm per SM.
+  const std::int64_t threads  = sm_count * kTileMergeThreadsPerSm;
+  const auto device_sub_tiles = static_cast<std::int32_t>(
     std::min<std::int64_t>((threads - 1) / tiles + 1, kTileMergeMaxBlockThreads));
+
+  // A short last tile keeps the sub-tile size of the full tiles and leaves its last threads idle.
+  const std::int32_t max_sub_tiles =
+    tile_rows > kTileMergeMaxSplitTileRows
+      ? 1
+      : std::clamp(tile_rows / kTileMergeMinSubTileRows, 1, max_block_threads);
+  tile_merge_shape shape{};
+  shape.sub_tiles =
+    std::clamp(requested_sub_tiles > 0 ? requested_sub_tiles : device_sub_tiles, 1, max_sub_tiles);
+  shape.sub_rows      = (tile_rows - 1) / shape.sub_tiles + 1;
+  shape.block_tiles   = std::min<std::int32_t>(max_block_threads / shape.sub_tiles, tiles);
+  shape.block_threads = shape.block_tiles * shape.sub_tiles;
+  shape.blocks        = static_cast<std::uint32_t>((tiles - 1) / shape.block_tiles + 1);
+  shape.shared_bytes  = state_bytes * static_cast<std::size_t>(shape.block_threads);
+  return shape;
 }
 
+}  // namespace
+
+tile_merge_shape tile_merge_launch_shape(cudf::size_type tiles,
+                                         cudf::size_type tile_rows,
+                                         std::int32_t num_inputs,
+                                         int sm_count,
+                                         std::int32_t requested_sub_tiles)
+{
+  std::int32_t padded_inputs = 2;
+  while (padded_inputs < num_inputs) {
+    padded_inputs *= 2;
+  }
+  sm_count   = std::max(sm_count, 1);
+  auto shape = shape_within(
+    kTileMergeSharedBytes, tiles, tile_rows, padded_inputs, sm_count, requested_sub_tiles);
+  // With an SM for every CTA no CTA waits for another, whatever its shared memory.
+  if (shape.shared_bytes > kTileMergeDenseSharedBytes &&
+      shape.blocks > static_cast<std::uint32_t>(sm_count)) {
+    shape = shape_within(
+      kTileMergeDenseSharedBytes, tiles, tile_rows, padded_inputs, sm_count, requested_sub_tiles);
+  }
+  return shape;
+}
+
+namespace {
+
 /// tile_merge with @p requested_sub_tiles sub-tiles per tile (0: chosen from the device); the
-/// count is capped by the shared memory of a CTA and by kTileMergeMinSubTileRows.
+/// count is capped as in tile_merge_launch_shape.
 void tile_merge_impl(const kway_key_comparator& cmp,
                      cudf::device_span<const cudf::size_type> lengths,
                      cudf::device_span<const cudf::size_type> tile_coranks,
@@ -297,25 +353,12 @@ void tile_merge_impl(const kway_key_comparator& cmp,
   while (padded_inputs < k) {
     padded_inputs *= 2;
   }
-  const std::size_t state_bytes = thread_state_bytes(padded_inputs);
-  const auto max_block_threads  = static_cast<std::int32_t>(
-    std::clamp<std::size_t>(kTileMergeSharedBytes / state_bytes, 1, kTileMergeMaxBlockThreads));
+  const auto shape =
+    tile_merge_launch_shape(tiles, tile_rows, k, current_device_sm_count(), requested_sub_tiles);
 
-  // A short last tile keeps the sub-tile size of the full tiles and leaves its last threads idle.
-  const std::int32_t max_sub_tiles =
-    tile_rows > kTileMergeMaxSplitTileRows
-      ? 1
-      : std::clamp(tile_rows / kTileMergeMinSubTileRows, 1, max_block_threads);
-  const std::int32_t sub_tiles = std::clamp(
-    requested_sub_tiles > 0 ? requested_sub_tiles : sub_tiles_for_device(tiles), 1, max_sub_tiles);
-  const cudf::size_type sub_rows   = (tile_rows - 1) / sub_tiles + 1;
-  const std::int32_t block_tiles   = std::min<std::int32_t>(max_block_threads / sub_tiles, tiles);
-  const std::int32_t block_threads = block_tiles * sub_tiles;
-  const auto blocks                = static_cast<unsigned int>((tiles - 1) / block_tiles + 1);
-
-  tile_merge_kernel<<<blocks,
-                      static_cast<unsigned int>(block_threads),
-                      state_bytes* static_cast<std::size_t>(block_threads),
+  tile_merge_kernel<<<shape.blocks,
+                      static_cast<unsigned int>(shape.block_threads),
+                      shape.shared_bytes,
                       stream.value()>>>(device_view_of(cmp),
                                         tile_coranks.data(),
                                         k,
@@ -323,8 +366,8 @@ void tile_merge_impl(const kway_key_comparator& cmp,
                                         tiles,
                                         target,
                                         tile_rows,
-                                        sub_tiles,
-                                        sub_rows,
+                                        shape.sub_tiles,
+                                        shape.sub_rows,
                                         out_input.data(),
                                         out_row.data());
   CUDF_CUDA_TRY(cudaGetLastError());

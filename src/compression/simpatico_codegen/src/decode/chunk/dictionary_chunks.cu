@@ -210,14 +210,8 @@ class dictionary_decoder final : public chunk_decoder {
     load_keys(leaves, stream);
     auto const mr = leaves.mr();
 
-    // Chars budget: what is left of the destination, and what a 4-byte offset can address.
-    std::uint64_t budget =
-      dst.data_capacity > dst.dst_byte_offset ? dst.data_capacity - dst.dst_byte_offset : 0;
-    if (dst.offset_width == 4) {
-      std::uint64_t const max_end = std::numeric_limits<std::int32_t>::max();
-      budget = std::min(budget, max_end > dst.dst_byte_offset ? max_end - dst.dst_byte_offset : 0);
-    }
-    auto const signed_budget = static_cast<std::int64_t>(
+    std::uint64_t const budget = string_chars_budget(dst);
+    auto const signed_budget   = static_cast<std::int64_t>(
       std::min<std::uint64_t>(budget, std::numeric_limits<std::int64_t>::max()));
 
     if (_record.size() == 0) { _record = rmm::device_buffer(sizeof(call_record), stream, mr); }

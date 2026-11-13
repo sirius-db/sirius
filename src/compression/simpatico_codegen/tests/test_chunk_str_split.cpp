@@ -31,60 +31,13 @@ using namespace simpatico;
 using namespace simpatico::chunk_test;
 using request = device_leaf_access::request;
 
-constexpr std::uint8_t kSentinel    = 0xA5;
 constexpr std::uint64_t kFrameAlign = 256;
 /// Offsets chunks the decoder walks per window (kWindowChunks in str_split_chunks.cu).
 constexpr std::int64_t kWindowChunks = 256;
 
 int spans_checked = 0;  ///< check_span calls that passed
 
-void check(bool cond, std::string const& msg)
-{
-  if (!cond) { throw std::runtime_error(msg); }
-}
-
 std::uint64_t align_up(std::uint64_t x, std::uint64_t a) { return (x + a - 1) / a * a; }
-
-/// The smallest chunk span covering rows [first, first + take).
-chunk::chunk_span span_of(std::int64_t first, std::int64_t take)
-{
-  chunk::chunk_span span;
-  span.chunk_begin = first / kChunkRows;
-  span.skip_head   = first % kChunkRows;
-  span.chunk_end   = std::max(span.chunk_begin, (first + take + kChunkRows - 1) / kChunkRows);
-  span.take        = take;
-  return span;
-}
-
-rmm::device_buffer sentinel_buffer(std::size_t bytes)
-{
-  rmm::cuda_stream_view const stream = cudf::get_default_stream();
-  rmm::device_buffer buffer(bytes, stream);
-  if (bytes != 0) { cuda_check(cudaMemsetAsync(buffer.data(), kSentinel, bytes, stream.value())); }
-  stream.synchronize();
-  return buffer;
-}
-
-/// True if bytes [begin, end) of `buffer` still hold the sentinel.
-bool untouched(rmm::device_buffer const& buffer, std::size_t begin, std::size_t end)
-{
-  auto const bytes =
-    read_device<std::uint8_t>(static_cast<std::uint8_t const*>(buffer.data()) + begin, end - begin);
-  return std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t b) { return b == kSentinel; });
-}
-
-/// The oracle's offsets (rows + 1 of them) on the host.
-std::vector<std::int64_t> host_offsets(cudf::column_view oracle)
-{
-  cudf::strings_column_view const strings{oracle};
-  auto const count = static_cast<std::size_t>(oracle.size()) + 1;
-  check(oracle.offset() == 0, "sliced oracle");
-  if (strings.offsets().type().id() == cudf::type_id::INT64) {
-    return read_device<std::int64_t>(strings.offsets().head<std::int64_t>(), count);
-  }
-  auto const narrow = read_device<std::int32_t>(strings.offsets().head<std::int32_t>(), count);
-  return {narrow.begin(), narrow.end()};
-}
 
 /// One column compressed with the str_split plan, its oracle, a decoder over its payload and
 /// where the plan's buffers are (located independently of the decoder).

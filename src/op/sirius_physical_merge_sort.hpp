@@ -71,7 +71,9 @@ struct merge_sort_counters {
  *    kept in the partition's state between them, so rows a task read into a window but did not
  *    emit are not read again by the next one. The window buffers of a kept merger stay
  *    allocated between two tasks, outside any reservation; the next task's estimate leaves them
- *    out, and on_finalize_operator() frees them.
+ *    out, and on_finalize_operator() frees them. The window budget assumes one such merger per
+ *    concurrent task of a device, so a partition without a merger gets its next task only while
+ *    fewer windowed partitions than that are open (see at_open_partition_cap()).
  */
 class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
@@ -113,7 +115,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  /// READY only while some partition can be armed: one with runs and no task in flight.
+  /// READY only while some partition can be armed: one with runs and no task in flight, which
+  /// either holds its merger or may open under the cap on open windowed partitions.
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /// Runs stay on whatever tier they are in and their repository is spilled first, unless the
@@ -163,6 +166,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   /// A provider that reports the memory of the space it is given, or of the smallest GPU space
   /// of @p memory_manager when it is given none, with @p concurrent_tasks tasks per device.
+  /// Its available bytes include the bytes reserved by the tasks in flight.
   /// @p memory_manager must outlive the provider.
   [[nodiscard]] static device_budget_provider make_device_budget_provider(
     const ::cucascade::memory::memory_reservation_manager& memory_manager,
@@ -245,8 +249,18 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     bool header_parsed{false};
     std::optional<std::vector<cudf::data_type>> header_schema;
     merge::merge_route route{merge::merge_route::one_shot};
-    /// Sizes of the partition's windowed tasks.
+    /// Sizes of the partition's windowed tasks: derived_config, less what a task of the pass in
+    /// progress shrank after an OOM.
     merge::derived_merge_config config{};
+    /// The sizes derived at arming; every pass starts from them.
+    merge::derived_merge_config derived_config{};
+    /// A task of the final pass has been planned.
+    bool final_pass_started{false};
+    /// device_budget::concurrent_tasks those sizes were derived with: the mergers the window
+    /// budget allows on one device at a time.
+    std::size_t concurrent_tasks{1};
+    /// The GPU memory space the task in flight runs in; null until it starts.
+    ::cucascade::memory::memory_space* task_space{nullptr};
     /// Types of the input columns, read from the partition's batches.
     std::vector<cudf::data_type> column_types;
     /// Estimated bytes per row of each input column.
@@ -349,6 +363,15 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   /// The counters to log in the statistics line, for the one caller that gets to log it; null
   /// once the line is taken. Needs _drain_mutex.
   [[nodiscard]] std::optional<merge_sort_counters> claim_stats_line();
+
+  /// Whether as many windowed partitions are open as the window budget of @p candidate assumes,
+  /// so that @p candidate, which holds no merger, has to wait for one of them to finish. A
+  /// partition is open while it has a task in flight or keeps its merger. The budget is per
+  /// device and so is the count: an open partition counts on the device of its merger or of its
+  /// running task, and one whose first task has not started, like @p candidate itself, may land
+  /// on any device and counts on each. One-shot partitions hold no merger and are not counted.
+  /// Needs _drain_mutex.
+  [[nodiscard]] bool at_open_partition_cap(const partition_merge_state& candidate) const;
 
   /// Whether a call to get_next_task_input_data() would produce a task. Needs _drain_mutex.
   [[nodiscard]] bool has_armable_partition(::cucascade::shared_data_repository& repo);

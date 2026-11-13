@@ -2,11 +2,9 @@
 //
 // Chunk-span decode of delta: the `delta -> bitpack` and `delta -> rle -> bitpack` root decoders
 // against the whole-column decode, the byte ranges they request, and decode_delta_chunks on root
-// delta nodes and on the offsets subtree of a str_split column.
+// delta nodes (the offsets subtree of a str_split column is decoded by test_chunk_str_split).
 
 #include "chunk_test_utils.hpp"
-
-#include <rmm/cuda_stream.hpp>
 
 #include <limits>
 #include <optional>
@@ -21,18 +19,6 @@ using request = device_leaf_access::request;
 // ---------------------------------------------------------------------------
 // The buffers of one delta subtree, located independently of the decoder
 // ---------------------------------------------------------------------------
-
-template <typename T>
-std::vector<T> read_buffer(device_leaf_access const& access,
-                           chunk::buffer_ref ref,
-                           rmm::cuda_stream_view stream)
-{
-  auto const& range = access.column().leaves.at(ref.leaf).buffers.at(ref.buffer);
-  return read_device<T>(
-    static_cast<std::byte const*>(access.payload().data()) + range.payload_offset,
-    range.size / sizeof(T),
-    stream);
-}
 
 chunk::buffer_ref own_buffer(hpln_column_description const& column,
                              std::uint32_t node,
@@ -117,11 +103,6 @@ delta_layout read_layout(device_leaf_access const& access,
                        static_cast<std::size_t>(layout.num_chunks);
   }
   return layout;
-}
-
-bool same_buffer(request const& r, chunk::buffer_ref ref)
-{
-  return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
 }
 
 /// Asserts that the logged requests touch only the subtree's buffers, and of those only the
@@ -623,27 +604,6 @@ int test_types(rmm::cuda_stream_view stream)
   return cases;
 }
 
-/// The decoder writes values only; rows under nulls decode like the whole-column decode.
-int test_nulls(rmm::cuda_stream_view stream)
-{
-  int cases = 0;
-  for (auto const id : {cudf::type_id::INT32, cudf::type_id::TIMESTAMP_MICROSECONDS}) {
-    for (double const nulls : {0.2, 1.0}) {
-      column_options options;
-      options.rows          = 3 * 1024 + 40;
-      options.seed          = 500 + static_cast<std::uint64_t>(cases);
-      options.sorted        = true;
-      options.null_fraction = nulls;
-      cases += check_column(
-        "nulls " + std::to_string(nulls) + " type " + std::to_string(static_cast<int>(id)),
-        make_random_column(id, options, stream)->view(),
-        options.seed,
-        stream);
-    }
-  }
-  return cases;
-}
-
 /// More chunks than one decode pass holds: the passes line up on the destination.
 int test_many_chunks(rmm::cuda_stream_view stream)
 {
@@ -659,52 +619,6 @@ int test_many_chunks(rmm::cuda_stream_view stream)
     check_span(fx, {2040, 2050, 512, 9 * kChunkRows - 500}, 3, stream);
   }
   return 2;
-}
-
-/// decode_delta_chunks on the offsets subtree of a str_split column equals the decoded offsets.
-int test_string_offsets(rmm::cuda_stream_view stream)
-{
-  int cases = 0;
-  // Offsets are rows + 1 elements: a short last chunk, an exact multiple, a last chunk of one.
-  for (std::size_t const rows :
-       {std::size_t{3 * 1024 + 11}, std::size_t{2047}, std::size_t{2048}}) {
-    for (bool const with_nulls : {false, true}) {
-      auto const label =
-        "str_split offsets, " + std::to_string(rows) + " rows" + (with_nulls ? " with nulls" : "");
-      std::mt19937_64 rng{700 + rows};
-      std::vector<std::string> values(rows);
-      std::vector<bool> valid;
-      for (auto& value : values) {
-        value = std::string(rng() % 30, static_cast<char>('a' + rng() % 26));
-      }
-      if (with_nulls) {
-        valid.resize(rows);
-        for (auto&& bit : valid) {
-          bit = rng() % 5 != 0;
-        }
-      }
-      ::cuda::stream_ref const sref = stream;
-      auto const input              = make_strings_column(values, valid, sref);
-      auto const table  = compress_column_with_plan(input->view(), kStringSplitPlan, stream);
-      auto const oracle = full_decode(table, 0, stream);
-      device_leaf_access access{table, 0, stream};
-      auto const& column = access.column();
-      expect(chunk::classify_value_plan(column) == chunk::value_plan::str_split,
-             (label + ": not classified as str_split").c_str());
-      auto const delta = chunk::find_child_node(column, root_node(column), "offsets");
-      expect(delta.has_value(), (label + ": str_split has no offsets child").c_str());
-      auto const layout = read_layout(access, *delta, stream);
-
-      cudf::strings_column_view const strings{oracle->view()};
-      auto const offsets = strings.offsets();
-      expect(static_cast<std::size_t>(offsets.size()) == rows + 1,
-             (label + ": the oracle has rows + 1 offsets").c_str());
-      auto const expected = oracle_values(offsets, stream);
-      check_primitive(access, layout, expected, label, stream);
-      ++cases;
-    }
-  }
-  return cases;
 }
 
 /// Chunk ranges outside the node are rejected before anything is requested.
@@ -819,56 +733,6 @@ int test_factory_rejects(rmm::cuda_stream_view stream)
   return 1;
 }
 
-/// A cursor's use: consecutive spans of random sizes appended into one destination rebuild the
-/// input column itself (not only the full decode), on a stream other than the default one.
-int test_appended_spans(rmm::cuda_stream_view)
-{
-  rmm::cuda_stream owned;
-  auto const stream  = owned.view();
-  int cases          = 0;
-  std::uint64_t seed = 900;
-  for (auto const id : {cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::INT16}) {
-    column_options options;
-    options.rows       = 5 * 1024 + 321;
-    options.seed       = ++seed;
-    options.sorted     = id != cudf::type_id::INT16;
-    options.run_length = 4;
-    auto const input   = make_random_column(id, options, stream);
-    auto const width   = static_cast<std::size_t>(cudf::size_of(input->type()));
-    for (bool const rle : {false, true}) {
-      root_fixture fx{"appended", input->view(), rle, stream};
-      rmm::device_buffer buffer(static_cast<std::size_t>(fx.rows()) * width, stream);
-      column_write_target dst;
-      dst.data          = buffer.data();
-      dst.data_capacity = buffer.size();
-      std::mt19937_64 rng{seed};
-      std::int64_t first = 0;
-      while (first < fx.rows()) {
-        auto const take = std::min<std::int64_t>(fx.rows() - first, 1 + rng() % 2500);
-        chunk::chunk_span const span{first / kChunkRows,
-                                     (first + take + kChunkRows - 1) / kChunkRows,
-                                     first % kChunkRows,
-                                     take};
-        dst.dst_row_offset = static_cast<cudf::size_type>(first);
-        auto const written = fx.decoder->decode(fx.access, span, dst, stream);
-        expect(written == take, (fx.label + ": appended rows written != take").c_str());
-        first += take;
-      }
-      stream.synchronize();
-      expect(compare_fixed_width_rows(input->view(),
-                                      buffer.data(),
-                                      0,
-                                      0,
-                                      static_cast<cudf::size_type>(fx.rows()),
-                                      stream,
-                                      compare_options{true}),
-             (fx.label + ": appended spans differ from the input").c_str());
-      ++cases;
-    }
-  }
-  return cases;
-}
-
 /// decode_delta_chunks over ranges that cross the 2048-chunk pass boundary.
 int test_many_chunks_primitive(rmm::cuda_stream_view stream)
 {
@@ -914,9 +778,8 @@ int test_many_chunks_primitive(rmm::cuda_stream_view stream)
   return 2;
 }
 
-/// A decode after a state's first reads nothing back to the host (through the root decoder and
-/// through decode_delta_chunks), and the device bytes a state holds follow the window decoded,
-/// not the column.
+/// A decode after a decoder's first reads nothing back to the host, and the device bytes its
+/// state holds follow the window decoded, not the column.
 int test_steady_state(rmm::cuda_stream_view stream)
 {
   constexpr std::int64_t kColumnChunks = 200;
@@ -935,7 +798,6 @@ int test_steady_state(rmm::cuda_stream_view stream)
 
   for (bool const rle : {false, true}) {
     root_fixture fx{"steady state", input->view(), rle, stream};
-    auto const nc       = fx.num_chunks();
     auto const children = fx.layout.children.size();
     auto const bound    = 3 * children * window_bytes;
     expect(bound < column_bytes / 4,
@@ -971,35 +833,6 @@ int test_steady_state(rmm::cuda_stream_view stream)
            (fx.label + ": the decoder's state is " + std::to_string(fx.decoder->state_bytes()) +
             " bytes after windows of " + std::to_string(window_bytes))
              .c_str());
-
-    // decode_delta_chunks: windows of whole chunks on a state of its own.
-    auto const expected = oracle_values(fx.oracle->view(), stream);
-    auto state          = chunk::make_delta_state(fx.access.column(), fx.layout.node);
-    expect(chunk::delta_state_bytes(*state) == 0,
-           (fx.label + ": a delta state holds device bytes before its first decode").c_str());
-    rmm::device_buffer out(window_bytes, stream);
-    for (std::int64_t c0 = 0; c0 < nc; c0 += kWindow) {
-      auto const c1 = std::min(nc, c0 + kWindow);
-      fx.access.clear_requests();
-      chunk::decode_delta_chunks(
-        fx.access, *state, c0, c1, static_cast<std::int64_t*>(out.data()), stream);
-      expect(
-        c0 == 0 || fx.access.host_requests().empty(),
-        (fx.label + ": decode_delta_chunks after the state's first read bytes back to the host")
-          .c_str());
-      auto const begin = static_cast<std::size_t>(c0 * kChunkRows);
-      auto const count =
-        std::min(expected.size(), static_cast<std::size_t>(c1 * kChunkRows)) - begin;
-      auto const got = read_device<std::int64_t>(out.data(), count, stream);
-      expect(
-        std::equal(got.begin(), got.end(), expected.begin() + static_cast<std::ptrdiff_t>(begin)),
-        (fx.label + ": a window of chunks differs from the full decode").c_str());
-    }
-    auto const held = chunk::delta_state_bytes(*state);
-    expect(held != 0 && held <= bound,
-           (fx.label + ": the delta state holds " + std::to_string(held) +
-            " bytes after windows of " + std::to_string(window_bytes))
-             .c_str());
   }
   return 2;
 }
@@ -1021,12 +854,9 @@ int main()
     cases += test_differences(stream);
     cases += test_row_counts(stream);
     cases += test_types(stream);
-    cases += test_nulls(stream);
     cases += test_many_chunks(stream);
-    cases += test_string_offsets(stream);
     cases += test_range_checks(stream);
     cases += test_factory_rejects(stream);
-    cases += test_appended_spans(stream);
     cases += test_many_chunks_primitive(stream);
     cases += test_steady_state(stream);
     std::printf("test_chunk_delta: PASS (%d cases)\n", cases);

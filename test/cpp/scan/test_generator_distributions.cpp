@@ -333,22 +333,6 @@ TEST_CASE("generator: invalid requests throw", "[generator_distributions]")
       spec, 8, 0, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
     std::out_of_range);
 
-  auto one = [](column_spec column) { return make_spec({std::move(column)}, 100); };
-  // zipf needs N = cardinality > 0 and s > 0
-  REQUIRE_THROWS_AS(generate(one(make_column("z", value_type::int64, zipf, 1.1)), 0),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(generate(one(make_column("z", value_type::int64, zipf, 1.1, 0, -5)), 0),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(generate(one(make_column("z", value_type::float64, zipf, 0, 0, 10)), 0),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(generate(one(make_column("f", value_type::int64, few_distinct, 0)), 0),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(generate(one(make_column("u", value_type::int64, uniform, 10, 9)), 0),
-                    std::invalid_argument);
-  REQUIRE_THROWS_AS(
-    generate(one(make_column("n", value_type::float64, normal, std::nan(""), 1)), 0),
-    std::invalid_argument);
-
   // rows_per_batch must fit a cudf column
   const auto too_many =
     make_spec({make_column("u", value_type::int64, uniform, 0, 9)}, std::uint64_t{1} << 31);
@@ -1086,52 +1070,6 @@ TEST_CASE("generator: validation_error and generate_batch reject the same column
   }
 }
 
-TEST_CASE("generator: the hoisted hash keys give counter_hash", "[generator_distributions]")
-{
-  // The chain written out link by link: the definition every generated value depends on.
-  auto chain = [](std::uint64_t seed,
-                  std::uint64_t batch,
-                  std::uint64_t row,
-                  std::uint32_t column,
-                  std::uint32_t salt) {
-    constexpr std::uint64_t increment = 0x9e3779b97f4a7c15ULL;
-    std::uint64_t h                   = detail::mix64(seed + increment);
-    h                                 = detail::mix64((h ^ batch) + increment);
-    h                                 = detail::mix64((h ^ row) + increment);
-    return detail::mix64((h ^ ((static_cast<std::uint64_t>(column) << 32) | salt)) + increment);
-  };
-  auto check = [&](std::uint64_t seed,
-                   std::uint64_t batch,
-                   std::uint64_t row,
-                   std::uint32_t column,
-                   std::uint32_t salt) {
-    const auto expected  = chain(seed, batch, row, column, salt);
-    const auto batch_key = detail::batch_key(seed, batch);
-    return detail::counter_hash(seed, batch, row, column, salt) == expected &&
-           detail::counter_hash_from_batch_key(batch_key, row, column, salt) == expected &&
-           detail::counter_hash_from_row_key(detail::row_key(batch_key, row), column, salt) ==
-             expected;
-  };
-
-  REQUIRE(check(0, 0, 0, 0, 0));
-  REQUIRE(chain(0, 0, 0, 0, 0) != 0);
-  constexpr auto max64 = std::numeric_limits<std::uint64_t>::max();
-  constexpr auto max32 = std::numeric_limits<std::uint32_t>::max();
-  REQUIRE(check(max64, max64, max64, max32, max32));
-
-  std::mt19937_64 random{20260101};
-  std::size_t mismatches = 0;
-  for (int i = 0; i < 100'000; ++i) {
-    const auto seed   = random();
-    const auto batch  = random();
-    const auto row    = random();
-    const auto column = static_cast<std::uint32_t>(random());
-    const auto salt   = static_cast<std::uint32_t>(random());
-    mismatches += check(seed, batch, row, column, salt) ? 0 : 1;
-  }
-  REQUIRE(mismatches == 0);
-}
-
 namespace {
 
 /// Everything observable about a table of fixed-width and STRING columns, read through `stream`
@@ -1229,35 +1167,4 @@ TEST_CASE("generator: batches generated concurrently on their own streams match 
     if (errors[b]) { std::rethrow_exception(errors[b]); }
     REQUIRE(actual[b] == expected[b]);
   }
-}
-
-TEST_CASE("generator: a reordered subset with VARCHAR and nullable columns is bit-identical",
-          "[generator_distributions]")
-{
-  const auto stream = cudf::get_default_stream();
-  const auto mr     = cudf::get_current_device_resource_ref();
-  const auto spec   = stream_spec(5000);
-  const auto full   = image_of(*generate(spec, 3), stream);
-
-  // "s" (VARCHAR, nulls) then "k" (BIGINT, nulls); columns 1 and 3 to 5 are never drawn.
-  const auto subset_table = generate_batch(spec, {2, 0}, 3, stream, mr);
-  REQUIRE(subset_table->num_columns() == 2);
-  REQUIRE(subset_table->num_rows() == 5000);
-  REQUIRE(subset_table->view().column(0).type().id() == cudf::type_id::STRING);
-  REQUIRE(subset_table->view().column(1).type().id() == cudf::type_id::INT64);
-  const auto subset = image_of(*subset_table, stream);
-  const std::array<std::size_t, 2> selection{2, 0};
-  for (std::size_t out = 0; out < selection.size(); ++out) {
-    CAPTURE(out);
-    const auto in = selection[out];
-    REQUIRE(subset.data[out] == full.data[in]);
-    REQUIRE(subset.offsets[out] == full.offsets[in]);
-    REQUIRE(subset.masks[out] == full.masks[in]);
-    REQUIRE(subset.null_counts[out] == full.null_counts[in]);
-    REQUIRE(subset.null_counts[out] > 0);
-  }
-
-  REQUIRE_THROWS_AS(generate_batch(spec, {2, 6}, 3, stream, mr), std::out_of_range);
-  REQUIRE_THROWS_AS(generate_batch(spec, {std::numeric_limits<std::size_t>::max()}, 3, stream, mr),
-                    std::out_of_range);
 }

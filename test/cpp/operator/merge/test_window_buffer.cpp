@@ -308,7 +308,7 @@ struct window_buffer_fixture {
                           cudf::data_type{cudf::type_id::FLOAT64},
                           cudf::data_type{cudf::type_id::STRING}},
                          window_rows,
-                         est_string_bytes,
+                         std::vector<std::size_t>(3, est_string_bytes),
                          stream_view(),
                          sirius::test::operator_utils::get_resource_ref(*memory.gpu0));
   }
@@ -346,7 +346,7 @@ TEST_CASE("window_buffer rejects nested types", "[window_buffer]")
   REQUIRE_THROWS_AS(
     window_buffer({cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::LIST}},
                   16,
-                  8,
+                  std::vector<std::size_t>(2, 8),
                   fixture.stream_view(),
                   sirius::test::operator_utils::get_resource_ref(*fixture.memory.gpu0)),
     std::invalid_argument);
@@ -359,7 +359,7 @@ TEST_CASE("window_buffer rejects a window above the cudf row limit", "[window_bu
   // The check comes before any allocation. The limit leaves room for the n+1 STRING offsets.
   REQUIRE_THROWS_AS(window_buffer({cudf::data_type{cudf::type_id::INT64}},
                                   std::numeric_limits<cudf::size_type>::max(),
-                                  0,
+                                  std::vector<std::size_t>(1, 0),
                                   fixture.stream_view(),
                                   mr),
                     std::invalid_argument);
@@ -614,7 +614,7 @@ TEST_CASE("window_buffer reads a DISK-tier batch the same way", "[window_buffer]
                         cudf::data_type{cudf::type_id::FLOAT64},
                         cudf::data_type{cudf::type_id::STRING}},
                        100,
-                       16,
+                       std::vector<std::size_t>(3, 16),
                        sv,
                        fx.mr());
   auto refill = [&](std::size_t row_begin) {
@@ -693,7 +693,7 @@ TEST_CASE("window_buffer fetches a reordered subset of the source columns", "[wi
   window_buffer window(
     {cudf::data_type{cudf::type_id::STRING}, cudf::data_type{cudf::type_id::INT64}},
     50,
-    9,
+    std::vector<std::size_t>(2, 9),
     fixture.stream_view(),
     sirius::test::operator_utils::get_resource_ref(*fixture.memory.gpu0));
   std::array<std::size_t, 2> const cols{2, 0};
@@ -744,7 +744,7 @@ TEST_CASE("window_buffer without STRING columns carries unaligned null masks", "
   window_buffer window(
     {cudf::data_type{cudf::type_id::FLOAT64}, cudf::data_type{cudf::type_id::INT64}},
     window_rows,
-    0,
+    std::vector<std::size_t>(2, 0),
     fixture.stream_view(),
     sirius::test::operator_utils::get_resource_ref(*fixture.memory.gpu0));
   auto const mask_bytes = cudf::bitmask_allocation_size_bytes(window_rows);
@@ -881,7 +881,8 @@ TEST_CASE("window_buffer sizes each STRING column from its own estimate", "[wind
   SECTION("one estimate for every STRING column stops the wide column short")
   {
     // The average of the four columns: the 100-byte column fits only 35% of a window.
-    window_buffer window(types, window_rows, 28, fixture.stream_view(), mr);
+    window_buffer window(
+      types, window_rows, std::vector<std::size_t>(types.size(), 28), fixture.stream_view(), mr);
     auto const result = refill(window, 0);
     REQUIRE(result.rows_written == window_rows * 28 * 5 / 4 / 100);
     REQUIRE_FALSE(result.source_exhausted);

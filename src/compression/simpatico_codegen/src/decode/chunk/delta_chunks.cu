@@ -25,6 +25,7 @@
 
 #include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
+#include "decode/chunk/load_element.hpp"
 
 #include <cudf/utilities/traits.hpp>
 
@@ -54,19 +55,6 @@ struct chunk_inputs {
   bool firsts_aligned{false};           ///< firsts can be loaded as whole elements
   bool counts_aligned{false};           ///< counts can be loaded as whole int32
 };
-
-/// Little-endian element at `bytes`, which may sit at any address when !aligned (a leaf buffer
-/// can start at any payload offset).
-template <typename U>
-__device__ __forceinline__ U load_element(const std::uint8_t* __restrict__ bytes, bool aligned)
-{
-  if (aligned) { return *reinterpret_cast<const U*>(bytes); }
-  std::uint64_t v = 0;
-  for (std::size_t k = 0; k < sizeof(U); ++k) {
-    v |= static_cast<std::uint64_t>(bytes[k]) << (8 * k);
-  }
-  return static_cast<U>(v);
-}
 
 constexpr int kChunkThreads = static_cast<int>(kChunkRows);
 /// Chunks decoded per pass; bounds the int64 scratch of the unpacked children.

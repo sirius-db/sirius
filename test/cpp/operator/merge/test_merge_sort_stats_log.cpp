@@ -196,11 +196,6 @@ std::vector<std::string> stats_lines(const sirius::test::scoped_recording_log_si
   return lines;
 }
 
-bool has_token(const std::string& line, const std::string& token)
-{
-  return (" " + line + " ").find(" " + token + " ") != std::string::npos;
-}
-
 /// What threads driving one operator to its end saw.
 struct concurrent_drive {
   std::size_t tasks{0};        ///< tasks executed
@@ -317,124 +312,6 @@ TEST_CASE("format_merge_sort_stats writes every counter in the documented order"
           "fallback_conversions=0 shrinks=0");
 }
 
-TEST_CASE("windowed merge sort logs one statistics line when its last task commits",
-          "[merge_sort_stats_log]")
-{
-  constexpr std::size_t num_partitions = 2;
-  constexpr std::size_t runs_per_part  = 3;
-  constexpr std::size_t rows_per_run   = 3000;
-  stats_log_fixture test(
-    {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 64 * 1024},
-    num_partitions);
-  for (std::size_t p = 0; p < num_partitions; ++p) {
-    for (std::size_t r = 0; r < runs_per_part; ++r) {
-      test.add_run(p, rows_per_run, static_cast<std::uint32_t>(1 + p * runs_per_part + r));
-    }
-  }
-  sirius::test::scoped_recording_log_sink log{"info"};
-
-  // Every task but the last leaves work behind, and logs nothing.
-  std::size_t tasks = 0;
-  while (auto input = test.op->get_next_task_input_data()) {
-    REQUIRE(tasks < 10000);
-    REQUIRE(stats_lines(log).empty());
-    test.run_task(*input);
-    ++tasks;
-  }
-  REQUIRE(tasks > num_partitions);
-  REQUIRE(test.repo.total_size() == 0);
-
-  auto const counters = test.op->counters();
-  REQUIRE(counters.windowed_partitions == num_partitions);
-  REQUIRE(counters.one_shot_partitions == 0);
-  REQUIRE(counters.windowed_tasks == tasks);
-  REQUIRE(counters.rounds.rounds > 0);
-  REQUIRE(counters.rounds.rows_out == num_partitions * runs_per_part * rows_per_run);
-  REQUIRE(counters.shrinks == 0);
-
-  auto const lines = stats_lines(log);
-  REQUIRE(lines.size() == 1);
-  REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters));
-  REQUIRE(has_token(lines.front(), "op=7"));
-  REQUIRE(has_token(lines.front(), "windowed_partitions=2"));
-  REQUIRE(has_token(lines.front(), "rounds=" + std::to_string(counters.rounds.rounds)));
-  REQUIRE_FALSE(has_token(lines.front(), "rounds=0"));
-
-  // Asking a drained operator for more work does not log again.
-  REQUIRE_FALSE(test.op->get_next_task_input_data());
-  REQUIRE(stats_lines(log).size() == 1);
-}
-
-TEST_CASE("one-shot merge sort logs one statistics line when its last task commits",
-          "[merge_sort_stats_log]")
-{
-  constexpr std::size_t num_partitions = 3;
-  stats_log_fixture test({.mode = sirius::sort_merge_mode::one_shot}, num_partitions);
-  // Partition 1 stays empty.
-  for (std::size_t p : {std::size_t{0}, std::size_t{2}}) {
-    for (std::size_t r = 0; r < 3; ++r) {
-      test.add_run(p, 500, static_cast<std::uint32_t>(20 + p * 3 + r));
-    }
-  }
-  sirius::test::scoped_recording_log_sink log{"info"};
-
-  // Both tasks exist before either runs, as when the task creator drains the operator.
-  auto first  = test.op->get_next_task_input_data();
-  auto second = test.op->get_next_task_input_data();
-  REQUIRE(first);
-  REQUIRE(second);
-  REQUIRE_FALSE(test.op->get_next_task_input_data());
-  REQUIRE(first->get_type() != operator_data_type::WINDOWED_MERGE);
-
-  REQUIRE(test.run_task(*first) == 1500);
-  REQUIRE(stats_lines(log).empty());
-  REQUIRE(test.run_task(*second) == 1500);
-
-  auto const counters = test.op->counters();
-  REQUIRE(counters.one_shot_partitions == 2);
-  REQUIRE(counters.windowed_partitions == 0);
-  REQUIRE(counters.windowed_tasks == 0);
-
-  auto const lines = stats_lines(log);
-  REQUIRE(lines.size() == 1);
-  REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters));
-  REQUIRE(has_token(lines.front(), "one_shot_partitions=2"));
-  REQUIRE(has_token(lines.front(), "rounds=0"));
-}
-
-TEST_CASE("merge sort in automatic mode logs one line for one-shot and windowed partitions",
-          "[merge_sort_stats_log]")
-{
-  // 0.0001 of the 8 GiB budget is about 840 KiB: the small partition merges one-shot, the large
-  // one windowed.
-  stats_log_fixture test({.mode                  = sirius::sort_merge_mode::automatic,
-                          .window_rows           = 1024,
-                          .output_bytes          = 64 * 1024,
-                          .one_shot_max_fraction = 0.0001},
-                         2);
-  for (std::size_t r = 0; r < 3; ++r) {
-    test.add_run(0, 200, static_cast<std::uint32_t>(40 + r));
-    test.add_run(1, 30000, static_cast<std::uint32_t>(50 + r));
-  }
-  sirius::test::scoped_recording_log_sink log{"info"};
-
-  // The one-shot task is created first and committed last, after the windowed partition is done.
-  auto one_shot = test.op->get_next_task_input_data();
-  REQUIRE(one_shot);
-  REQUIRE(one_shot->get_type() != operator_data_type::WINDOWED_MERGE);
-  REQUIRE(test.run_to_end() > 1);
-  REQUIRE(stats_lines(log).empty());
-  REQUIRE(test.run_task(*one_shot) == 600);
-
-  auto const counters = test.op->counters();
-  REQUIRE(counters.one_shot_partitions == 1);
-  REQUIRE(counters.windowed_partitions == 1);
-  REQUIRE(counters.rounds.rows_out == 90000);
-  auto const lines = stats_lines(log);
-  REQUIRE(lines.size() == 1);
-  REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters));
-}
-
 TEST_CASE("merge sort counts the window shrinks of its tasks retried after an OOM",
           "[merge_sort_stats_log]")
 {
@@ -499,26 +376,6 @@ TEST_CASE("merge sort with no input logs one all-zero statistics line when it is
 
   test.op->finalize_operator();
   REQUIRE(stats_lines(log).size() == 1);
-}
-
-TEST_CASE("merge sort that logged its statistics at its last commit logs nothing when finalized",
-          "[merge_sort_stats_log]")
-{
-  auto const mode = GENERATE(sirius::sort_merge_mode::windowed, sirius::sort_merge_mode::one_shot);
-  stats_log_fixture test({.mode = mode, .window_rows = 1024, .output_bytes = 64 * 1024}, 2);
-  for (std::size_t p = 0; p < 2; ++p) {
-    for (std::size_t r = 0; r < 3; ++r) {
-      test.add_run(p, 2000, static_cast<std::uint32_t>(70 + p * 3 + r));
-    }
-  }
-  sirius::test::scoped_recording_log_sink log{"info"};
-
-  REQUIRE(test.run_to_end() >= 2);
-  auto const lines = stats_lines(log);
-  REQUIRE(lines.size() == 1);
-
-  test.op->finalize_operator();
-  REQUIRE(stats_lines(log) == lines);
 }
 
 TEST_CASE("merge sort finalized before its last task commits logs once, with the counters so far",

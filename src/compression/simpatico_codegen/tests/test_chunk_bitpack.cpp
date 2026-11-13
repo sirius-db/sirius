@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Chunk-span decode of bitpack: the `bitpack` root decoder against the whole-column decode, the
-// byte ranges it requests, unpack_bitpack_chunks on root and non-root bitpack nodes, a column of
-// no rows, and a chunk count corrupted to less than the chunk's rows.
+// byte ranges it requests, unpack_bitpack_chunks on the root bitpack node (non-root nodes are
+// decoded by the delta, dictionary and str_split tests), a column of no rows, and a chunk count
+// corrupted to less than the chunk's rows.
 
 #include "chunk_test_utils.hpp"
 
 #include <bit>
 #include <limits>
-#include <map>
 
 namespace {
 
@@ -20,18 +20,6 @@ using request = device_leaf_access::request;
 // ---------------------------------------------------------------------------
 // Host reference of one bitpack node, read from the flattened payload
 // ---------------------------------------------------------------------------
-
-template <typename T>
-std::vector<T> read_buffer(device_leaf_access const& access,
-                           chunk::buffer_ref ref,
-                           rmm::cuda_stream_view stream)
-{
-  auto const& range = access.column().leaves.at(ref.leaf).buffers.at(ref.buffer);
-  return read_device<T>(
-    static_cast<std::byte const*>(access.payload().data()) + range.payload_offset,
-    range.size / sizeof(T),
-    stream);
-}
 
 struct bitpack_reference {
   std::size_t elem_size{0};
@@ -99,11 +87,6 @@ chunk::bitpack_locator root_locator(hpln_column_description const& column)
   auto const loc = chunk::find_bitpack(column, column.nodes[0].edges[0].second);
   expect(loc.has_value(), "the plan root is a bitpack leaf");
   return *loc;
-}
-
-bool same_buffer(request const& r, chunk::buffer_ref ref)
-{
-  return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
 }
 
 /// Bytes of `ref` among `requests`, and whether they all lie within [begin, end).
@@ -450,23 +433,6 @@ int test_types(rmm::cuda_stream_view stream)
   return cases;
 }
 
-/// Nulls: the decoder writes values only; rows under nulls are compared by validity elsewhere.
-int test_nulls(rmm::cuda_stream_view stream)
-{
-  int cases = 0;
-  for (double const fraction : {0.2, 1.0}) {
-    column_options options;
-    options.rows          = 3 * 1024 + 500;
-    options.seed          = 77;
-    options.null_fraction = fraction;
-    auto const input      = make_random_column(cudf::type_id::INT32, options, stream);
-    root_fixture fx{"INT32 nulls " + std::to_string(fraction), input->view(), stream};
-    check_spans(fx, 78, stream);
-    ++cases;
-  }
-  return cases;
-}
-
 /// Every bit width 0..64 (chunk c packs c bits), extremes at the chunk edges, a 17-row tail.
 int test_int64_widths(rmm::cuda_stream_view stream)
 {
@@ -577,166 +543,6 @@ int test_prefix_cache(rmm::cuda_stream_view stream)
   }
   expect(fx.decoder->state_bytes() > 0, "prefix: the decoder reports its device state");
   return 1;
-}
-
-/// A state decoding a long node window by window holds device bytes sized by the window, not
-/// by the node, and only its first decode copies anything to the host.
-int test_state_bytes_bounded(rmm::cuda_stream_view stream)
-{
-  constexpr std::int64_t kChunks = 1200;
-  constexpr std::int64_t kWindow = 4;
-  column_options options;
-  options.rows     = static_cast<cudf::size_type>(kChunks * kChunkRows - 300);
-  options.seed     = 61;
-  auto const input = make_random_column(cudf::type_id::INT32, options, stream);
-  root_fixture fx{"state bytes", input->view(), stream};
-  expect(fx.num_chunks() == kChunks, "state bytes: unexpected chunk count");
-
-  auto state = chunk::make_bitpack_state(fx.loc);
-  expect(chunk::bitpack_state_bytes(*state) == 0, "state bytes: a new state holds device bytes");
-  // Per chunk of a window: one first-word entry. Nothing per row: the kernels read the packed
-  // words where they are staged, aligned or not.
-  constexpr auto kWindowRows   = static_cast<std::size_t>(kWindow * kChunkRows);
-  constexpr std::size_t kBound = static_cast<std::size_t>(kWindow) * sizeof(std::int64_t);
-  rmm::device_buffer out(kWindowRows * sizeof(std::int64_t), stream);
-  for (std::int64_t c0 = 0; c0 < kChunks; c0 += kWindow) {
-    auto const c1 = std::min(c0 + kWindow, kChunks);
-    fx.access.clear_requests();
-    chunk::unpack_bitpack_chunks(
-      fx.access, *state, c0, c1, static_cast<std::int64_t*>(out.data()), stream);
-    expect(fx.access.host_requests().size() == (c0 == 0 ? 2U : 0U),
-           "state bytes: only the first decode reads to the host");
-    expect(chunk::bitpack_state_bytes(*state) <= kBound,
-           "state bytes: the state holds more than a window's worth of device bytes");
-    auto const got = read_device<std::int64_t>(
-      out.data(), static_cast<std::size_t>((c1 - c0) * kChunkRows), stream);
-    for (std::int64_t c = c0; c < c1; ++c) {
-      auto const& expected = fx.ref.rows[static_cast<std::size_t>(c)];
-      expect(std::equal(expected.begin(),
-                        expected.end(),
-                        got.begin() + static_cast<std::ptrdiff_t>((c - c0) * kChunkRows)),
-             "state bytes: a window's values differ from the reference");
-    }
-  }
-  expect(
-    chunk::bitpack_state_bytes(*state) >= static_cast<std::size_t>(kWindow) * sizeof(std::int64_t),
-    "state bytes: the state does not report its scratch");
-
-  // The root decoder's state is the same primitive.
-  column_write_target dst;
-  rmm::device_buffer rows(kWindowRows * sizeof(std::int32_t), stream);
-  dst.data          = rows.data();
-  dst.data_capacity = rows.size();
-  for (std::int64_t c0 = 0; c0 + kWindow <= kChunks; c0 += 100 * kWindow) {
-    fx.decoder->decode(fx.access, {c0, c0 + kWindow, 0, (kWindow - 1) * kChunkRows}, dst, stream);
-    expect(fx.decoder->state_bytes() <= kBound,
-           "state bytes: the decoder holds more than a window's worth of device bytes");
-  }
-  stream.synchronize();
-  return 1;
-}
-
-/// unpack_bitpack_chunks on a non-root node: the `indices` of a dictionary plan.
-int test_dictionary_indices(rmm::cuda_stream_view stream)
-{
-  constexpr std::size_t kRows        = 3 * 1024 + 200;
-  constexpr std::size_t kCardinality = 37;
-  std::mt19937_64 rng{11};
-  std::vector<std::string> values(kRows);
-  for (auto& value : values) {
-    value = "key-" + std::to_string(rng() % kCardinality);
-  }
-  ::cuda::stream_ref const sref = stream;
-  auto const input              = make_strings_column(values, {}, sref);
-  auto const table              = compress_column_with_plan(input->view(), kDictionaryPlan, stream);
-  device_leaf_access access{table, 0, stream};
-  auto const& column = access.column();
-  expect(chunk::classify_value_plan(column) == chunk::value_plan::dictionary,
-         "dictionary: not classified as a dictionary plan");
-
-  auto const indices = chunk::find_child_node(column, column.nodes[0].edges[0].second, "indices");
-  expect(indices.has_value(), "dictionary: no indices node");
-  auto const loc = chunk::find_bitpack(column, *indices);
-  expect(loc.has_value(), "dictionary: indices is not a bitpack leaf");
-  bool const is_unsigned = cudf::is_unsigned(loc->value_type);
-  auto const ref         = host_reference(access, *loc, is_unsigned, stream);
-  expect(ref.elem_size != 0 && ref.elem_size <= 8, "dictionary: unexpected index width");
-  expect(ref.num_chunks() == 4, "dictionary: indices are chunked like the rows");
-
-  // The reference's indices must be a consistent, injective relabeling of the input strings.
-  std::map<std::string, std::int64_t> index_of;
-  std::map<std::int64_t, std::string> key_of;
-  std::size_t row = 0;
-  for (auto const& chunk_rows : ref.rows) {
-    for (auto const index : chunk_rows) {
-      expect(row < kRows, "dictionary: more indices than rows");
-      auto const& value = values[row++];
-      expect(index_of.emplace(value, index).first->second == index,
-             "dictionary: one key has two indices");
-      expect(key_of.emplace(index, value).first->second == value,
-             "dictionary: one index names two keys");
-    }
-  }
-  expect(row == kRows, "dictionary: fewer indices than rows");
-  expect(index_of.size() <= kCardinality, "dictionary: more keys than the cardinality");
-
-  check_primitive(access, *loc, ref, "dictionary indices", stream);
-  return 1;
-}
-
-/// unpack_bitpack_chunks on every non-root bitpack node of a plan (delta.differences, the rle
-/// runs / values, str_split's offset differences) against the host reference.
-int test_nested_nodes(rmm::cuda_stream_view stream)
-{
-  auto check_nodes = [&](compressed_table const& table, std::string const& label) {
-    device_leaf_access access{table, 0, stream};
-    auto const& column = access.column();
-    int nodes          = 0;
-    for (std::uint32_t n = 1; n < column.nodes.size(); ++n) {
-      auto const loc = chunk::find_bitpack(column, n);
-      if (!loc.has_value()) { continue; }
-      bool const is_unsigned = cudf::is_unsigned(loc->value_type);
-      auto const ref         = host_reference(access, *loc, is_unsigned, stream);
-      if (ref.num_chunks() == 0 || ref.elem_size > 8) { continue; }
-      check_primitive(access, *loc, ref, label + " node " + std::to_string(n), stream);
-      ++nodes;
-    }
-    expect(nodes > 0, (label + ": no non-root bitpack node was checked").c_str());
-    return nodes;
-  };
-
-  int cases = 0;
-  {
-    column_options options;
-    options.rows     = 4 * 1024 + 33;
-    options.seed     = 41;
-    auto const input = make_random_column(cudf::type_id::INT64, options, stream);
-    cases += check_nodes(compress_column_with_plan(input->view(), kDeltaBitpackPlan, stream),
-                         "delta.differences");
-  }
-  {
-    // Long runs so the rle node's chunks are short and fewer than the rows' chunks.
-    std::vector<std::int32_t> host(5 * 1024 + 7);
-    for (std::size_t i = 0; i < host.size(); ++i) {
-      host[i] = static_cast<std::int32_t>((i / 37) * (i / 37) % 1000);
-    }
-    auto const input = make_fixed_width_column<std::int32_t>(
-      cudf::data_type{cudf::type_id::INT32}, host, {}, stream);
-    cases += check_nodes(compress_column_with_plan(input->view(), kDeltaRleBitpackPlan, stream),
-                         "delta.differences rle");
-  }
-  {
-    std::mt19937_64 rng{43};
-    std::vector<std::string> values(3 * 1024 + 11);
-    for (auto& value : values) {
-      value = std::string(rng() % 20, static_cast<char>('a' + rng() % 26));
-    }
-    ::cuda::stream_ref const sref = stream;
-    auto const input              = make_strings_column(values, {}, sref);
-    cases += check_nodes(compress_column_with_plan(input->view(), kStringSplitPlan, stream),
-                         "str_split.offsets.differences");
-  }
-  return cases;
 }
 
 /// Chunk ranges outside the node are rejected before anything is requested or written.
@@ -894,13 +700,9 @@ int main()
     rmm::cuda_stream_view const stream = cudf::get_default_stream();
     int cases                          = 0;
     cases += test_types(stream);
-    cases += test_nulls(stream);
     cases += test_int64_widths(stream);
     cases += test_primitive_extension(stream);
     cases += test_prefix_cache(stream);
-    cases += test_state_bytes_bounded(stream);
-    cases += test_dictionary_indices(stream);
-    cases += test_nested_nodes(stream);
     cases += test_range_checks(stream);
     cases += test_factory_rejects(stream);
     cases += test_zero_rows(stream);

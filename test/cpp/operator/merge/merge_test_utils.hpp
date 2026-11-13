@@ -68,6 +68,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -301,6 +302,37 @@ inline bool tables_equal(const cudf::table_view& lhs, const cudf::table_view& rh
   return ::sirius::test::expect_tables_equivalent_impl(lhs, rhs);
 }
 
+/// An ascending, nulls-last key on column @p col.
+inline op::merge::merge_key_spec ascending_key(cudf::size_type col = 0)
+{
+  return {.key_cols        = {col},
+          .column_order    = {cudf::order::ASCENDING},
+          .null_precedence = {cudf::null_order::AFTER}};
+}
+
+/// An unsorted (key INT64 in [0, key_range), id INT64) table; ids are unique from @p first_id on.
+inline std::unique_ptr<cudf::table> random_rows(std::size_t rows,
+                                                std::int64_t key_range,
+                                                std::int64_t first_id,
+                                                std::uint32_t seed)
+{
+  std::mt19937 gen(seed);
+  std::uniform_int_distribution<std::int64_t> dist(0, key_range - 1);
+  std::vector<std::int64_t> keys(rows);
+  std::vector<std::int64_t> ids(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    keys[i] = dist(gen);
+    ids[i]  = first_id + static_cast<std::int64_t>(i);
+  }
+  return make_table(make_column(keys, cudf::type_id::INT64),
+                    make_column(ids, cudf::type_id::INT64));
+}
+
+/// The fetch columns and types of the (key, id) rows of random_rows.
+inline const std::vector<std::size_t> kTwoCols{0, 1};
+inline const std::vector<cudf::data_type> kTwoInt64{cudf::data_type{cudf::type_id::INT64},
+                                                    cudf::data_type{cudf::type_id::INT64}};
+
 // ---------------------------------------------------------------------------
 // Runs as repository batches
 // ---------------------------------------------------------------------------
@@ -452,7 +484,8 @@ struct tiers_fixture {
   /// The spill converters reject the default stream, so conversions and merges run on this one.
   rmm::cuda_stream stream;
 
-  tiers_fixture()
+  /// @param gpu_bytes Usage limit of the GPU space.
+  explicit tiers_fixture(std::size_t gpu_bytes = 512 * (std::size_t{1} << 20))
   {
     sirius::converter_registry::reset_for_testing();
     std::string tmp_template =
@@ -462,7 +495,7 @@ struct tiers_fixture {
 
     cucascade::memory::reservation_manager_configurator builder;
     builder.set_number_of_gpus(1)
-      .set_gpu_usage_limit(512 * (std::size_t{1} << 20))
+      .set_gpu_usage_limit(gpu_bytes)
       .set_reservation_fraction_per_gpu(0.75)
       .set_per_numa_region_capacity(std::size_t{1} << 30)
       .use_gpu_id_as_host_id()
