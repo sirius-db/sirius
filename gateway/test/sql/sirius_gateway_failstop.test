@@ -158,3 +158,39 @@ query I
 SELECT state FROM sirius_gateway_stop();
 ----
 stopped
+
+# A start that fails partway leaves no ranks. The next statement starts them again: here it
+# succeeds once the file their session setup reads exists.
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'FROM read_csv(''{TEST_DIR}/sirius_gateway_failstop/allow.csv'')';
+
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 19810);
+----
+failed its session setup
+
+statement error
+FROM sirius_gateway_run('SELECT 42');
+----
+failed its session setup
+
+statement ok
+COPY (SELECT 1 AS allowed) TO '{TEST_DIR}/sirius_gateway_failstop/allow.csv';
+
+query I
+FROM sirius_gateway_run('SELECT 42');
+----
+42
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = '';
+
+query I
+SELECT state FROM sirius_gateway_stop();
+----
+stopped
