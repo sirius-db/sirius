@@ -4,9 +4,9 @@
 The run is the output of a DuckDB shell in `.mode csv` with `.timer on`, where each query follows
 a marker statement `SELECT 'Q<n> run <k>' AS marker;` (see
 docs/super-sirius/distributed-experiments-no-slurm.md). Rows compare in any order; numbers match
-within 1e-6 relative or 0.01 absolute. A query the reference has and the run does not counts as
-a failure. A text diff does not work: float digits and the order of equal rows differ between
-engines.
+within 1e-6 relative, or within the rounding of the one printed with fewer decimals (at most
+0.01). A query the reference has and the run does not counts as a failure. A text diff does not
+work: float digits and the order of equal rows differ between engines.
 
   compare_answers.py client.txt --ref-client ref.txt
       the reference has the same markers; run 1 of each query is the reference
@@ -80,13 +80,27 @@ def number(cell):
         return None
 
 
+def decimals(cell):
+    """Digits after the decimal point, as printed; None for an exponent form."""
+    match = re.fullmatch(r"-?\d*(?:\.(\d*))?", cell.strip())
+    return len(match.group(1) or "") if match else None
+
+
 def cells_match(a, b):
     if a == b:
         return True
     x, y = number(a), number(b)
     if x is None or y is None:
         return False
-    return abs(x - y) <= 0.01 or abs(x - y) <= 1e-6 * max(abs(x), abs(y))
+    if abs(x - y) <= 1e-6 * max(abs(x), abs(y)):
+        return True
+    # One engine rounds where the other prints more digits (a DECIMAL against a DOUBLE): they
+    # may differ by half a unit of the last place of the shorter one. A fixed 0.01 would also
+    # pass 0.05 against 0.06.
+    places = [d for d in (decimals(a), decimals(b)) if d is not None]
+    if len(places) < 2:
+        return False
+    return abs(x - y) <= min(0.01, 0.5 * 10 ** -min(places)) * (1 + 1e-9)
 
 
 def rows_match(a, b):
