@@ -182,8 +182,6 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
     // first is the post-call retention time; deadline_retained preserves the
     // pre-call timestamp used to account for a deadline-triggered emission.
     std::optional<op::scan::batch_coalescer::clock::time_point> first, deadline_retained;
-    // Worker failure, rethrown by the control driver after observing done.
-    std::exception_ptr error;
   };
   // Captured by the dispatched callback. Detects accepted work discarded without
   // completion so the attempt cannot remain parked waiting for a missing result.
@@ -293,9 +291,10 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
   std::stop_source reader_stop;
   std::shared_ptr<preparation_stop_token::reason_state> reader_stop_reason =
     std::make_shared<preparation_stop_token::reason_state>();
-  size_t next_deadline_source = 0, next_claim_source = 0;
+  size_t next_deadline_source = 0, next_claim_source = 0, next_completion_source = 0;
   statistics stats;
   std::function<void()> before_thread, before_submit, before_publish, before_control_wait;
+  std::function<void()> before_control_step;
   std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)> after_publish;
   std::function<op::scan::batch_coalescer::clock::time_point()> now =
     op::scan::batch_coalescer::clock::now;
@@ -661,6 +660,9 @@ preparation_coordinator::preparation_coordinator(pipeline::completion_handler& c
       st->dispatcher_drained = true;
       st->gate->notify_under_lock();
     }
+  });
+  dispatcher.set_submission_error_callback([weak = std::weak_ptr<state>{state_}](auto error) {
+    if (auto st = weak.lock()) st->completion->report_error(error);
   });
 }
 preparation_coordinator::~preparation_coordinator()
@@ -1039,6 +1041,13 @@ void preparation_coordinator::before_control_wait_for_testing(std::function<void
   state_->before_control_wait = std::move(hook);
 }
 
+void preparation_coordinator::before_control_step_for_testing(std::function<void()> hook)
+{
+  if (state_->phase != lifecycle::constructed)
+    throw std::logic_error("control step seam already frozen");
+  state_->before_control_step = std::move(hook);
+}
+
 void preparation_coordinator::after_publication_for_testing(
   std::function<void(size_t, std::shared_ptr<op::scan::scan_info> const&, size_t)> hook)
 {
@@ -1151,7 +1160,10 @@ bool preparation_coordinator::state::submit_coalescing(
           operation->retained_bytes = coalescer->retained_bytes();
         }
       } catch (...) {
-        operation->error = std::current_exception();
+        // EOS may have closed the gate while this operation ran. Report outside
+        // the gate even when its result will never be consumed. The dispatcher
+        // slot prevents successful retirement until this notification returns.
+        self->completion->report_error(std::current_exception());
       }
       SIRIUS_LOG_TRACE(
         "scan coalescing attempt={} source={} domain={} cpu={} queue_us={} execution_us={}",
@@ -1175,16 +1187,14 @@ bool preparation_coordinator::state::submit_coalescing(
 
 bool preparation_coordinator::state::complete_coalescing(lock_type& lock)
 {
-  for (size_t id = 0; id < sources.size(); ++id) {
+  for (size_t n = 0; n < sources.size(); ++n) {
+    auto id      = (next_completion_source + n) % sources.size();
     auto& source = sources[id];
     if (!source.coalescing || !source.coalescing->done) continue;
-    auto operation = std::move(source.coalescing);
-    // Destruction of a rejected result can reenter the gate. Always release it unlocked.
-    lock.unlock();
-    if (operation->error) std::rethrow_exception(operation->error);
-    lock.lock();
-    source.retained_since = operation->first;
-    source.retained_bytes = operation->retained_bytes;
+    next_completion_source = (id + 1) % sources.size();
+    auto operation         = std::move(source.coalescing);
+    source.retained_since  = operation->first;
+    source.retained_bytes  = operation->retained_bytes;
     queue_batch(lock,
                 id,
                 std::move(operation->batch),
@@ -1804,6 +1814,7 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
   } active{*this};
   control_step_result step;
   try {
+    if (before_control_step) before_control_step();
     step = retirement == retirement_phase::active ? control_step(st) : retire_step();
     if (step.next == control_step_result::status::retire) step = retire_step();
   } catch (...) {

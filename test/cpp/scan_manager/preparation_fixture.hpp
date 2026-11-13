@@ -206,8 +206,9 @@ struct fixture {
                    std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval,
                    std::optional<preparation_options> options   = std::nullopt,
                    native_reader_executor* native               = nullptr,
-                   coordinator_pool* coordinators               = nullptr)
-    : pool(static_cast<int>(workers)),
+                   coordinator_pool* coordinators               = nullptr,
+                   std::vector<std::vector<int>> domains        = {})
+    : pool(static_cast<int>(workers), "preparation_test", {}, nullptr, std::move(domains)),
       dispatcher(pool),
       coordinator(completion,
                   dispatcher,

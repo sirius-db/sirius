@@ -114,6 +114,17 @@ class scoped_dispatcher {
     stop_drained_ = std::move(notify);
   }
 
+  // Bind once before submitting work. Called outside mu_, while the failed
+  // submission still owns its slot, before cancellation disposes pending captures
+  // or final drain becomes visible. The callback must not throw or drain itself.
+  void set_submission_error_callback(std::function<void(std::exception_ptr)> notify)
+  {
+    std::lock_guard lock(mu_);
+    if (!notify || submission_error_ || inflight_ || !pending_empty() || stop_.stop_requested())
+      throw std::logic_error("dispatcher submission error notification must bind before work");
+    submission_error_ = std::move(notify);
+  }
+
   // Signal stop and dispose at most max_discard queued captures on this caller.
   // False means the caller must continue cleanup; running work drains independently.
   // The default preserves synchronous queue disposal for non-coordinator callers.
@@ -234,10 +245,8 @@ class scoped_dispatcher {
     try {
       submit(std::move(task));
     } catch (...) {
-      try {
-        log_exception_ptr(std::current_exception());
-      } catch (...) {
-      }
+      // submit() reported the original failure before releasing this slot.
+      // The drain waiter may already have destroyed the dispatcher.
     }
   }
 
@@ -305,7 +314,16 @@ class scoped_dispatcher {
         [this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_, domain);
     } catch (...) {
       // No worker owns this slot. Cancel pending work without executing user tasks on the
-      // producer thread, then release the failed slot and propagate the original exception.
+      // producer thread. Commit the original error before pending ticket destructors can
+      // report synthetic discard errors and before releasing the final drain reservation.
+      auto error = std::current_exception();
+      try {
+        if (submission_error_)
+          submission_error_(error);
+        else
+          log_exception_ptr(error);
+      } catch (...) {
+      }
       request_stop();
       std::unique_lock lk(mu_);
       release_slot(lk);
@@ -328,6 +346,7 @@ class scoped_dispatcher {
   std::size_t inflight_ = 0;  // Worker slots plus active cancellation cleanup calls.
   std::stop_source stop_;
   std::function<void()> stop_drained_;
+  std::function<void(std::exception_ptr)> submission_error_;
 };
 
 }  // namespace sirius::exec
