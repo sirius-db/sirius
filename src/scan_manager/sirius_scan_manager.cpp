@@ -2687,6 +2687,10 @@ void sirius_scan_manager::reset_caches()
       SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary before reset: {}",
                       _io_ctx->cache()->summary());
     }
+    if (_reset_fault) {
+      _io_ctx->shutdown_cache();
+      std::rethrow_exception(std::exchange(_reset_fault, nullptr));
+    }
     refresh(*_io_ctx);
   }
 

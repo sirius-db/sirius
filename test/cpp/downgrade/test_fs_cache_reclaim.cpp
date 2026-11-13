@@ -549,9 +549,37 @@ TEST_CASE("HOST downgrade tolerates no cache and paused rebinding",
   CHECK(fixture.executor->request_free_memory_and_wait(1) == 0);
 }
 
-TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache",
-          "[downgrade_executor][fs_cache][reset_cache][isolated_context]")
+TEST_CASE("HOST monitor stays quiet while paused and restarts on resume",
+          "[downgrade_executor][fs_cache][downgrade_lifecycle]")
 {
+  reclaim_fixture fixture{0};
+  auto live          = fixture.prepare(0, 4);
+  auto& cache        = fixture.fs_cache();
+  auto const claimed = cache.claimed_bytes();
+  auto* host         = sirius::scan_test_utils::get_space(*fixture.memory, Tier::HOST);
+  REQUIRE(host != nullptr);
+  REQUIRE_FALSE(host->should_downgrade_memory());
+  fixture.start(Tier::HOST, true, 1ms);
+  fixture.executor->pause();
+
+  auto pressure = host->make_reservation_upto(host->get_max_memory());
+  REQUIRE(host->should_downgrade_memory());
+  std::this_thread::sleep_for(50ms);
+  CHECK(fixture.executor->monitor_requests_issued_for_testing() == 0);
+  CHECK(cache.claimed_bytes() == claimed);
+
+  // Only a restarted monitor can notice the pressure: no request is queued to carry it.
+  fixture.executor->resume();
+  CHECK(wait_until([&] { return cache.claimed_bytes() == 0; }));
+  CHECK(fixture.executor->monitor_requests_issued_for_testing() >= 1);
+  pressure.reset();
+}
+
+namespace {
+
+/// One SiriusContext whose HOST executor binds the default local cache, with no DISK tier and a
+/// monitor too slow to interfere. Holds a maintenance slot, as `reset_sirius_cache()` does.
+struct sirius_reset_env {
   temporary_file config{std::string{R"yaml(sirius:
   topology:
     num_gpus: 1
@@ -583,21 +611,35 @@ TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache"
     enable_quent: false
 )yaml"}};
   temporary_file file{16ull << 20};
-  auto database = sirius::test::open_sirius_db(nullptr, config.path);
-  duckdb::Connection connection(*database);
-  auto context = connection.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(context != nullptr);
-  duckdb::SiriusContext::SlotGuard maintenance{
-    *context, *connection.context, sirius::exec::query_admission::access::maintenance};
-  auto& scans = context->get_scan_manager();
-  auto hosts  = context->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
-  REQUIRE_FALSE(hosts.empty());
-  auto& executor = context->get_downgrade_executor(hosts.front()->get_id());
+  std::unique_ptr<duckdb::DuckDB> database = sirius::test::open_sirius_db(nullptr, config.path);
+  duckdb::Connection connection{*database};
+  duckdb::shared_ptr<duckdb::SiriusContext> context =
+    connection.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  std::optional<duckdb::SiriusContext::SlotGuard> maintenance;
 
-  auto populate = [&] {
-    auto datasource = scans.create_datasource(file.path.string());
+  sirius_reset_env()
+  {
+    REQUIRE(context != nullptr);
+    maintenance.emplace(
+      *context, *connection.context, sirius::exec::query_admission::access::maintenance);
+  }
+
+  sirius::scan_manager::sirius_scan_manager& scans() { return context->get_scan_manager(); }
+
+  downgrade_executor& host_executor()
+  {
+    auto hosts = context->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+    REQUIRE_FALSE(hosts.empty());
+    return context->get_downgrade_executor(hosts.front()->get_id());
+  }
+
+  /// Fill two chunks of the current local cache and return the datasource whose handle
+  /// subscribes to them.
+  std::shared_ptr<cucascade::io::datasource> populate()
+  {
+    auto datasource = scans().create_datasource(file.path.string());
     REQUIRE(datasource != nullptr);
-    auto* cache = scans.io_ctx()->cache();
+    auto* cache = scans().io_ctx()->cache();
     REQUIRE(cache != nullptr);
     std::vector<cudf::io::text::byte_range_info> ranges{
       {0, static_cast<std::int64_t>(2 * cache->chunk_size())}};
@@ -605,18 +647,121 @@ TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache"
     REQUIRE(datasource->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
     REQUIRE(cache->claimed_bytes() > 0);
     return datasource;
-  };
+  }
 
+  /// The executor is bound to the current cache: it reclaims what a fresh population claimed.
+  void check_bound_to_current_cache()
+  {
+    auto* cache = scans().io_ctx()->cache();
+    REQUIRE(cache != nullptr);
+    CHECK(cache->claimed_bytes() == 0);
+    auto live          = populate();
+    auto const claimed = cache->claimed_bytes();
+    CHECK(host_executor().request_free_memory_and_wait(claimed) == claimed);
+    CHECK(cache->claimed_bytes() == 0);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache",
+          "[downgrade_executor][fs_cache][reset_cache][isolated_context]")
+{
+  sirius_reset_env env;
   // Prime the initial cache too: the first reset must safely discard resident buffers.
-  populate().reset();
+  env.populate().reset();
   for (int round = 0; round < 2; ++round) {
     CAPTURE(round);
-    context->reset_caches();
-    REQUIRE(scans.io_ctx()->cache() != nullptr);
-    CHECK(scans.io_ctx()->cache()->claimed_bytes() == 0);
-    auto live          = populate();
-    auto const claimed = scans.io_ctx()->cache()->claimed_bytes();
-    CHECK(executor.request_free_memory_and_wait(claimed) == claimed);
-    CHECK(scans.io_ctx()->cache()->claimed_bytes() == 0);
+    env.context->reset_caches();
+    env.check_bound_to_current_cache();
   }
+}
+
+TEST_CASE("SiriusContext reset waits for a HOST reclaim in flight",
+          "[downgrade_executor][fs_cache][reset_cache][isolated_context]")
+{
+  sirius_reset_env env;
+  auto& executor = env.host_executor();
+  // The disposed handle leaves the chunks resident, so the request's reclaim reaches them.
+  env.populate().reset();
+  auto* old_cache    = env.scans().io_ctx()->cache();
+  auto const claimed = old_cache->claimed_bytes();
+
+  // Shared with the hook by value: the cache, and so the hook, outlives this test's locals when
+  // a REQUIRE unwinds early.
+  struct hook_state {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic<bool> first{true};
+  };
+  auto state   = std::make_shared<hook_state>();
+  auto entered = state->entered.get_future();
+  old_cache->set_before_reclaim_claim_for_testing([state](cache::cached_chunk const&) {
+    if (!state->first.exchange(false)) { return; }
+    state->entered.set_value();
+    state->released.wait();
+  });
+  // Declared before the cleanup so that, on a failed REQUIRE, the hook is released before this
+  // future's destructor waits for the reset (which waits for the hooked reclaim).
+  std::future<void> reset;
+  absl::Cleanup unblock = [&] {
+    try {
+      state->release.set_value();
+    } catch (std::future_error const&) {
+    }
+  };
+
+  auto request = executor.request_free_memory(claimed);
+  REQUIRE(entered.wait_for(5s) == std::future_status::ready);
+  reset = std::async(std::launch::async, [&] { env.context->reset_caches(); });
+  // pause() joins the processing thread, which is inside the old cache's reclaim: the reset
+  // must neither destroy that cache nor rebind the executor until the reclaim returns.
+  REQUIRE(wait_until([&] { return executor.paused_for_testing(); }));
+  CHECK(reset.wait_for(100ms) == std::future_status::timeout);
+  CHECK(env.scans().io_ctx()->cache() == old_cache);
+
+  std::move(unblock).Invoke();
+  REQUIRE(request.wait_for(5s) == std::future_status::ready);
+  CHECK(request.get() == claimed);
+  REQUIRE(reset.wait_for(5s) == std::future_status::ready);
+  REQUIRE_NOTHROW(reset.get());
+  env.check_bound_to_current_cache();
+}
+
+TEST_CASE("SiriusContext reset resumes HOST reclaim when the cache rebuild fails",
+          "[downgrade_executor][fs_cache][reset_cache][isolated_context]")
+{
+  sirius_reset_env env;
+  auto& executor = env.host_executor();
+  env.populate().reset();
+
+  env.scans().fail_next_reset_for_testing(
+    std::make_exception_ptr(std::runtime_error("injected cache rebuild failure")));
+  CHECK_THROWS_WITH(env.context->reset_caches(), "injected cache rebuild failure");
+  // The old cache is gone and none was built: the executor must be bound to nullptr, not left
+  // pointing at the destroyed cache (ASan reports the use-after-free if it is).
+  CHECK(env.scans().io_ctx()->cache() == nullptr);
+  CHECK(env.context->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
+  CHECK(executor.request_free_memory_and_wait(1) == 0);
+
+  // The executor was resumed: a successful reset rebinds it to the rebuilt cache.
+  env.context->reset_caches();
+  env.check_bound_to_current_cache();
+}
+
+TEST_CASE("SiriusContext reset latches the runtime unavailable when HOST reclaim cannot resume",
+          "[downgrade_executor][fs_cache][reset_cache][isolated_context]")
+{
+  sirius_reset_env env;
+  env.host_executor().fail_next_resume_for_testing(
+    std::make_exception_ptr(std::runtime_error("injected resume failure")));
+  CHECK_THROWS_WITH(env.context->reset_caches(), "injected resume failure");
+  CHECK(env.context->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
+
+  env.maintenance.reset();
+  CHECK_THROWS_AS(
+    duckdb::SiriusContext::SlotGuard(
+      *env.context, *env.connection.context, sirius::exec::query_admission::access::maintenance),
+    duckdb::SiriusRuntimeUnavailableException);
 }

@@ -64,6 +64,7 @@ class fixed_size_host_memory_resource;
 #include <atomic>
 #include <concepts>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -629,6 +630,11 @@ class sirius_scan_manager {
   /// pins ARE chunks in the cache being destroyed, so none of them can survive
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
+
+  /// Test-only: the next @ref reset_caches throws @p error after it destroys the
+  /// default local context's cache and before it builds the new one, as a failed
+  /// rebuild would. Set only while no reset can run.
+  void fail_next_reset_for_testing(std::exception_ptr error) { _reset_fault = std::move(error); }
 
   /// Retain a checkpoint key until this execution window is reset. Pinning may hold
   /// keys without registering scan providers, so their lifetime is tracked separately.

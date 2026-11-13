@@ -195,6 +195,7 @@ void downgrade_executor::resume()
 {
   std::lock_guard lock(_lifecycle_mutex);
   if (!_running.load() || !_paused.load()) { return; }
+  if (_resume_fault) { std::rethrow_exception(std::exchange(_resume_fault, nullptr)); }
 
   _pool->resume();
   _request_queue.reactivate();
@@ -220,6 +221,12 @@ void downgrade_executor::resume()
     cancel_pending_requests();
     throw;
   }
+}
+
+void downgrade_executor::fail_next_resume_for_testing(std::exception_ptr error)
+{
+  std::lock_guard lock(_lifecycle_mutex);
+  _resume_fault = std::move(error);
 }
 
 void downgrade_executor::drain()

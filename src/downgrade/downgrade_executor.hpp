@@ -200,6 +200,13 @@ class downgrade_executor {
     return _monitor_requests_issued.load(std::memory_order_relaxed);
   }
 
+  /// Test-only: the next resume() throws @p error before restarting anything, leaving the
+  /// executor paused, as a failed thread creation would.
+  void fail_next_resume_for_testing(std::exception_ptr error);
+
+  /// Whether pause() has begun quiescing this executor and resume() has not yet run (test-only).
+  bool paused_for_testing() const { return _paused.load(); }
+
  private:
   friend struct downgrade_executor_test_access;
 
@@ -214,6 +221,7 @@ class downgrade_executor {
     std::function<void()> before_failure;
   };
   std::optional<stream_acquisition_fault> _stream_acquisition_fault;
+  std::exception_ptr _resume_fault;  // guarded by _lifecycle_mutex
   void maybe_fail_stream_acquisition(stream_acquisition_site site);
 
   void processing_loop();
