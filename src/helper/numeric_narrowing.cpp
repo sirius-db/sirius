@@ -20,6 +20,8 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -170,7 +172,13 @@ std::unique_ptr<cudf::column> cast_through_rep(cudf::column_view const& column,
   // Given caller-established carrier provenance, tunnel only when exactly one side is a
   // representation-backed DATE and the other is a strict narrow carrier. Every other pair,
   // including DATE<->TIMESTAMP, follows cuDF's conversion rules.
-  auto const source     = column.type();
+  auto const source = column.type();
+  if (is_dictionary_carrier_of(source, target)) {
+    return cudf::dictionary::decode(cudf::dictionary_column_view(column), stream, mr);
+  }
+  if (is_dictionary_carrier_of(target, source)) {
+    return cudf::dictionary::encode(column, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+  }
   auto const rep_target = narrowing_rep_type(target);
   auto const narrows_carrier =
     narrowing_rep_type(source) != source && can_narrow_to(source, target);
@@ -262,6 +270,11 @@ bool can_restore_to(cudf::data_type source, cudf::data_type target)
 {
   return same_numeric_carrier_family(source, target) &&
          cudf::size_of(source) < cudf::size_of(target);
+}
+
+bool is_dictionary_carrier_of(cudf::data_type carrier, cudf::data_type native) noexcept
+{
+  return carrier.id() == cudf::type_id::DICTIONARY32 && native.id() == cudf::type_id::STRING;
 }
 
 bool numeric_range_fits(cudf::data_type target, const numeric_range& range) noexcept

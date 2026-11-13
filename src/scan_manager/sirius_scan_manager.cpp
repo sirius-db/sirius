@@ -52,6 +52,7 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
@@ -3883,6 +3884,19 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
     if (!widest || cudf::size_of(carrier) > cudf::size_of(*widest)) { widest = carrier; }
   }
   return widest;
+}
+
+bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
+{
+  if (entry.device_chunks.empty() || entry_position >= entry.cache_info.column_ids.size()) {
+    return false;
+  }
+  return std::ranges::all_of(entry.device_chunks, [&](sirius::device_pin_chunk const& chunk) {
+    if (!chunk.compressed || !chunk.compressed->has_table()) { return false; }
+    auto const& columns = chunk.compressed->table().columns;
+    if (entry_position >= columns.size() || !columns[entry_position].plan_tree) { return false; }
+    return simpatico::probe_column(*columns[entry_position].plan_tree).can_answer_equality;
+  });
 }
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(

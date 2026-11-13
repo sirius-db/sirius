@@ -201,7 +201,8 @@ struct scan_filter_request {
   // output.
   std::optional<std::size_t> delivered_prefix;
   // Optional per-column output types, parallel to `selected`: the type the caller will restore a
-  // column to. Applied only where the decode can widen to it directly (see decode_selection).
+  // column to. Applied only where the decode can widen to it directly (see decode_selection), or,
+  // for DICTIONARY32, where the column's value root is a string dictionary it can return as is.
   std::vector<std::optional<cudf::data_type>> output_types;
   // Report how many rows the membership probes kept, together and one by one
   // (scan_filter_result::membership_rows_* and membership_probe_rows). The counts are kernels on

@@ -276,6 +276,7 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
                                                   bool compressed_materialization_on,
+                                                  bool dictionary_carrier_on,
                                                   const duckdb::vector<duckdb::ColumnIndex>& ids,
                                                   sirius::scan_manager::pinned_entry const* entry)
 {
@@ -298,7 +299,9 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     auto const native  = sirius::get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
-    if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
+    bool const dictionary_candidate =
+      native->id() == cudf::type_id::STRING && dictionary_carrier_on;
+    if (!sirius::is_narrowable_numeric_type(logical) && !dictionary_candidate) { continue; }
 
     std::size_t ids_position = output_idx;
     if (!op.projection_ids.empty()) {
@@ -306,6 +309,26 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
       ids_position = op.projection_ids[output_idx];
     }
     if (ids_position >= ids.size()) { continue; }
+
+    if (dictionary_candidate) {
+      // The scan's own filter evaluates on the decoded batch, before normalization, so a filtered
+      // column keeps its native carrier.
+      bool filtered = op.table_filters.HasMultiColumnFilters();
+      for (auto const& filter : op.table_filters) {
+        filtered = filtered || filter.GetIndex() == ids_position;
+      }
+      if (filtered) { continue; }
+      if (sirius::scan_manager::pinned_column_dictionary_in_all_chunks(*entry,
+                                                                       projection[ids_position])) {
+        result.back() = cudf::data_type{cudf::type_id::DICTIONARY32};
+        changed       = true;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_get] scan output {} (table column {}) carried as DICTIONARY32",
+          output_idx,
+          ids[ids_position].GetPrimaryIndex());
+      }
+      continue;
+    }
 
     auto const target =
       sirius::scan_manager::pinned_column_narrow_carrier(*entry, projection[ids_position], *native);
@@ -592,6 +615,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   auto physical_types = scan_physical_schema(op,
                                              sirius_state.get(),
                                              compressed_materialization_on,
+                                             duckdb::dictionary_carrier_enabled(context),
                                              column_ids,
                                              serves_insert_deltas ? nullptr : pinned);
 

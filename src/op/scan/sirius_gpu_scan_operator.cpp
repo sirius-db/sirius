@@ -234,8 +234,14 @@ std::vector<carrier_conversion_plan> preflight_physical_schema(
       plan.push_back({actual, target, carrier_conversion_kind::NONE});
       continue;
     }
-    if (can_restore_to(actual, target)) {
+    if (can_restore_to(actual, target) || is_dictionary_carrier_of(actual, target)) {
       plan.push_back({actual, target, carrier_conversion_kind::RESTORE});
+      continue;
+    }
+    // A chunk that decoded to strings (stored without a dictionary root, or decoded on a route that
+    // cannot return one) is encoded; an encode needs no range proof.
+    if (has_explicit_physical_schema && is_dictionary_carrier_of(target, actual)) {
+      plan.push_back({actual, target, carrier_conversion_kind::NARROW});
       continue;
     }
 

@@ -390,6 +390,13 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
+/// True when @p entry is a GPU-tier pin whose every chunk is Simpatico-compressed and stores the
+/// cached column at @p entry_position with a string `dictionary` value root, so each chunk can
+/// decode it straight to a DICTIONARY32 carrier. False for any other tier, an uncompressed chunk,
+/// another plan shape, a zero-chunk entry, or an out-of-range position.
+[[nodiscard]] bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry,
+                                                          std::size_t entry_position);
+
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
 /// column the entry lacks is skipped (coverage is checked separately) and an

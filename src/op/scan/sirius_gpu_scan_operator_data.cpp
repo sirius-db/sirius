@@ -349,9 +349,18 @@ void scan_operator_input::prepare_for_processing(
         // narrow-stored column directly in the type the scan would otherwise cast it to.
         if (!decode_restore_types.empty()) {
           auto attach_output_types = [&](auto* rep) {
-            if (!rep->pushdown_scan()) { return; }
             std::vector<std::optional<cudf::data_type>> types(decode_restore_types.begin(),
                                                               decode_restore_types.end());
+            if (!rep->pushdown_scan()) {
+              // A dictionary carrier changes even a plain decode, so it gets a request of its
+              // own; widening targets only matter to a compacted decode.
+              bool const any_dictionary = std::ranges::any_of(
+                decode_restore_types, [](auto t) { return t.id() == cudf::type_id::DICTIONARY32; });
+              if (!any_dictionary) { return; }
+              rep->set_pushdown_scan(std::make_shared<const sirius::decompression_pushdown_scan>(
+                sirius::pushdown_request{.output_types = std::move(types)}));
+              return;
+            }
             rep->set_pushdown_scan(rep->pushdown_scan()->with_output_types(std::move(types)));
           };
           if (auto* device_rep =

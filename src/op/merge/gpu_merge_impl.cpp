@@ -455,9 +455,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
 
-  // Decode dictionary-encoded group key columns back to STRING
+  // Decode the group key columns encoded above back to STRING. A key that arrived as a dictionary
+  // carrier leaves as one; its restore boundary decodes the grouped output.
   for (size_t i = 0; i < static_cast<size_t>(num_group_cols); i++) {
-    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32 &&
+        !cudf::is_dictionary(concatenated->get_column(static_cast<cudf::size_type>(i)).type())) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
     }
