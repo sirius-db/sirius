@@ -50,8 +50,8 @@ class not_implemented_exception : public std::runtime_error {
  * of range.
  *
  * Transparent execution answers it, like any other GPU execution error, with CPU Replay, and
- * DuckDB's result or error is final (`docs/adr/0001-cpu-replay-decides-sql-errors.md`). The
- * exception class never selects that policy.
+ * DuckDB's result or error is final (see "SQL errors" in
+ * `docs/super-sirius/expression-executor.md`). The exception class never selects that policy.
  */
 class invalid_input_exception : public std::runtime_error {
  public:

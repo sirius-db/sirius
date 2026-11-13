@@ -19,17 +19,16 @@
  * @brief SQL errors that the GPU detects are decided by CPU Replay, so every query returns DuckDB's
  * rows or DuckDB's error.
  *
- * `docs/adr/0001-cpu-replay-decides-sql-errors.md` records the policy, and the error contract in
- * `docs/super-sirius/expression-executor.md` states what it guarantees. An overflow in a branch
- * that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value, even where an evaluator
- * computes that branch over every row; an evaluated overflow returns DuckDB's error even where the
- * row's value is NULL or another AND, OR or IN operand decides it, unless a filter predicate or
- * CASE WHEN condition skips that operand for the row as DuckDB does; an unguarded conversion
- * overflow returns DuckDB's error, as does an overflow in a TRY_CAST's input; and a check that
- * DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value. Each case asserts
- * whether the query completed on the GPU or through CPU Replay, so a replay cannot hide a broken
- * GPU path. Overflow of abs and negation is covered beside their other cases in
- * `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
+ * The error contract in `docs/super-sirius/expression-executor.md` states what this guarantees. An
+ * overflow in a branch that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value,
+ * even where an evaluator computes that branch over every row; an evaluated overflow returns
+ * DuckDB's error even where the row's value is NULL or another AND, OR or IN operand decides it,
+ * unless a filter predicate or CASE WHEN condition skips that operand for the row as DuckDB does;
+ * an unguarded conversion overflow returns DuckDB's error, as does an overflow in a TRY_CAST's
+ * input; and a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value.
+ * Each case asserts whether the query completed on the GPU or through CPU Replay, so a replay
+ * cannot hide a broken GPU path. Overflow of abs and negation is covered beside their other cases
+ * in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
  */
 
 #include <catch.hpp>

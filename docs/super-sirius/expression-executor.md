@@ -252,7 +252,7 @@ mutable process globals. Standalone callers may omit the policy to use fixed def
 
 ## SQL errors
 
-The evaluator raises `sirius::invalid_input_exception` for a SQL error it detects: an overflow, a conversion out of range, or an Overflow Poison that reaches the NVRTC Sink. Such an error is a hint. Transparent execution answers every GPU error other than a user interrupt with CPU Replay where replay is available, and DuckDB's result or error is final ([ADR 0001](../adr/0001-cpu-replay-decides-sql-errors.md)). No exception class selects that policy, so a new check throws `sirius::invalid_input_exception` and adds no handler of its own.
+The evaluator raises `sirius::invalid_input_exception` for a SQL error it detects: an overflow, a conversion out of range, or an Overflow Poison that reaches the NVRTC Sink. Such an error is a hint. Transparent execution answers every GPU error other than a user interrupt with CPU Replay where replay is available, and DuckDB's result or error is final, because a GPU-detected error cannot in general prove that DuckDB would raise (see rules 1 and 3 below). No exception class selects that policy, so a new check throws `sirius::invalid_input_exception` and adds no handler of its own.
 
 The evaluator's contract relative to DuckDB, which new operators and tests use as their oracle:
 
