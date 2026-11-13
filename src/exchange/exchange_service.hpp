@@ -116,6 +116,8 @@ class exchange_service {
 
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
   void throw_if_failed();
+  /// The transport, held for the length of a call into it; null once shut down.
+  [[nodiscard]] std::shared_ptr<transport> running_transport();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(distributed_query_id query, std::exception_ptr error);
   [[nodiscard]] bool retired(distributed_query_id query) const;
@@ -136,9 +138,9 @@ class exchange_service {
   std::exception_ptr _error;
   /// shutdown() has begun: nothing that arrives from here on is kept.
   bool _shut_down{false};
-  // Last: its engine thread calls back into the members above until it is destroyed. Null once
-  // shut down.
-  std::unique_ptr<transport> _transport;
+  // Last: its engine thread calls back into the members above until it is stopped. Null once
+  // shut down. Shared, so that a sender still inside it when shutdown() runs keeps it alive.
+  std::shared_ptr<transport> _transport;
 };
 
 }  // namespace sirius::exchange
