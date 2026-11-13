@@ -733,7 +733,10 @@ std::size_t downgrade_executor::reclaim_fs_cache(cucascade::io::cache::reclaim_m
   auto const releasable = _fs_cache->releasable_bytes(numa);
   if (releasable == 0) { return 0; }
   auto const freed = _fs_cache->reclaim(mode, std::min(deficit, releasable), numa);
-  // Only the overflow above the reservation returns to this HOST space.
+  // Only the overflow above the reservation returns to this HOST space. The credit is an
+  // estimate: the snapshot is not coordinated with the cache's evictor, which can return the
+  // overflow first and leave this sweep freeing chunks inside the reservation that it still
+  // credits. An exact credit needs cuCascade to report the allocator's actual release.
   return std::min(freed, releasable);
 }
 

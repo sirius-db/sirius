@@ -719,12 +719,22 @@ repository/task spilling they use `reclaim_mode::idle`; only if a known byte tar
 unmet after dispatched spills settle do they use `reclaim_mode::forced`. Predicate-only
 requests use an unbounded deficit, still capped at releasable bytes. Credit is capped at the
 pre-pass releasable snapshot, since only overflow above the reservation relieves HOST
-pressure. Chunks inside the reservation are kept.
+pressure. A pass reclaims at most the overflow's worth of chunks, so the cache keeps at least
+its reservation, apart from the race below. `fs_cache::reclaim` does not distinguish overflow
+chunks from the rest; it only stops at the byte target.
 
 With no DISK target, the executor skips repository and task spilling, since there is nowhere
 to convert into. A cache with no overflow makes the HOST monitor back off. A monitor request
 that frees nothing, because all overflow is pinned or loading, delays the next one, doubling
 from `monitor_period` up to `max(monitor_period, 1 s)`.
+
+The credit is an estimate, not the allocator's release. The snapshot is not coordinated with
+the cache's background evictor or other reclaimers. If one of them returns the overflow first,
+the pass frees chunks inside the reservation, which relieve nothing, and still credits up to the
+snapshot. The request can then stop early, or tell an external `request_free_memory` caller
+about bytes HOST did not get back. While pressure remains, the monitor issues another request
+on its next period. An exact credit needs cuCascade to report the bytes its allocator released;
+a before/after snapshot in Sirius races the same way.
 
 Idle reclaim preserves subscribed chunks; forced reclaim may discard their cached staging
 buffers. Both modes leave pinned readers and in-flight loads untouched. Only the default

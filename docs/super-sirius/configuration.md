@@ -344,7 +344,10 @@ is still short after those workers finish, a forced pass reclaims additional unp
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them.
 Only bytes above the cache's prefetch reservation (`scan_manager.cache.min_prefetching_budget_fraction`
 of each HOST space) relieve HOST pressure: the executor reclaims and credits only those bytes,
-from its own NUMA space. Chunks inside the reservation are kept. Reclaim performs no disk writes
+from its own NUMA space, so the cache keeps at least its reservation. The credit is a
+best-effort estimate: a concurrent cache evictor can return the overflow first, and the pass is
+then still credited up to its snapshot (see [Scan](scan.md#host-downgrade-reclaim)). Reclaim
+performs no disk writes
 and needs no DISK tier. Without DISK, a HOST executor has nothing to convert repository batches
 or queued tasks into, so it runs only the two cache passes. If its cache holds nothing above the
 reservation, it backs off like any other non-viable executor. If the cache holds overflow but a

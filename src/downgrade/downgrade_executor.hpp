@@ -220,7 +220,8 @@ class downgrade_executor {
   void monitor_loop();
   void cancel_pending_requests();
 
-  // Processing thread only: reclaim and credit only bytes that relieve this HOST space.
+  // Processing thread only: reclaim and credit only bytes that relieve this HOST space. The
+  // credit is a best-effort estimate under a concurrent evictor; see the definition.
   std::size_t reclaim_fs_cache(cucascade::io::cache::reclaim_mode mode, std::size_t deficit);
 
   /**
