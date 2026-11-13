@@ -2,9 +2,11 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/call_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
@@ -32,30 +34,64 @@ bool is_gateway_name(std::string const& name)
          StringUtil::StartsWith(name, "quack_") || StringUtil::StartsWith(name, "sirius_rank_");
 }
 
-/// Functions a statement calls at its top level: `CALL f()`, `FROM f()`, `SELECT f()`.
-std::vector<std::string> called_functions(SQLStatement& stmt)
+/// What a statement calls and reads, at any depth: subqueries, CTEs and join sides included.
+struct references {
+  std::vector<std::string> functions;  ///< every function called, table functions included
+  /// The statement reads a table, a file, or a table function that is not a gateway function.
+  bool other_source = false;
+};
+
+void collect(QueryNode& node, references& refs);
+
+void collect(ParsedExpression& e, references& refs)
 {
-  std::vector<std::string> names;
-  auto add = [&](ParsedExpression& e) {
-    if (e.GetExpressionClass() == ExpressionClass::FUNCTION) {
-      names.push_back(
-        StringUtil::Lower(e.Cast<FunctionExpression>().FunctionName().GetIdentifierName()));
-    }
-  };
-  if (stmt.type == StatementType::CALL_STATEMENT) { add(*stmt.Cast<CallStatement>().function); }
-  if (stmt.type == StatementType::SELECT_STATEMENT) {
-    auto& node = *stmt.Cast<SelectStatement>().node;
-    if (node.type == QueryNodeType::SELECT_NODE) {
-      auto& select = node.Cast<SelectNode>();
-      if (select.from_table && select.from_table->type == TableReferenceType::TABLE_FUNCTION) {
-        add(*select.from_table->Cast<TableFunctionRef>().function);
-      }
-      for (auto& e : select.select_list) {
-        add(*e);
-      }
-    }
+  if (e.GetExpressionClass() == ExpressionClass::FUNCTION) {
+    refs.functions.push_back(
+      StringUtil::Lower(e.Cast<FunctionExpression>().FunctionName().GetIdentifierName()));
   }
-  return names;
+  // The iterator stops at a subquery expression: its query is not one of its children.
+  if (e.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+    collect(*e.Cast<SubqueryExpression>().SubqueryMutable()->node, refs);
+  }
+  ParsedExpressionIterator::EnumerateChildren(
+    e, [&](ParsedExpression& child) { collect(child, refs); });
+}
+
+void collect(QueryNode& node, references& refs)
+{
+  ParsedExpressionIterator::EnumerateQueryNodeChildren(
+    node,
+    [&](unique_ptr<ParsedExpression>& e) {
+      if (e) { collect(*e, refs); }
+    },
+    [&](TableRef& ref) {
+      switch (ref.type) {
+        case TableReferenceType::JOIN:
+        case TableReferenceType::SUBQUERY:
+        case TableReferenceType::EMPTY_FROM:
+        case TableReferenceType::EXPRESSION_LIST: break;  // their parts are visited on their own
+        case TableReferenceType::TABLE_FUNCTION: {
+          auto& f = *ref.Cast<TableFunctionRef>().function;
+          refs.other_source |= f.GetExpressionClass() != ExpressionClass::FUNCTION ||
+                               !is_gateway_name(StringUtil::Lower(
+                                 f.Cast<FunctionExpression>().FunctionName().GetIdentifierName()));
+          break;
+        }
+        default: refs.other_source = true;
+      }
+    });
+}
+
+references references_of(SQLStatement& stmt)
+{
+  references refs;
+  if (stmt.type == StatementType::CALL_STATEMENT) {
+    collect(*stmt.Cast<CallStatement>().function, refs);
+  }
+  if (stmt.type == StatementType::SELECT_STATEMENT) {
+    collect(*stmt.Cast<SelectStatement>().node, refs);
+  }
+  return refs;
 }
 
 /// Whether a client may call @p name, a gateway function, which then runs on the gateway.
@@ -89,13 +125,27 @@ bool runs_on_gateway(SQLStatement& stmt, bool allow_join)
       throw InvalidInputException("%s can only be set on the gateway's console", name);
     }
   }
+  references refs;
+  try {
+    refs = references_of(stmt);
+  } catch (NotImplementedException&) {
+    // A tree the iterator cannot walk goes to the ranks, which have no gateway functions.
+    return false;
+  }
   bool local = false;
-  for (auto const& name : called_functions(stmt)) {
+  for (auto const& name : refs.functions) {
     if (!is_gateway_name(name)) { continue; }
     if (!client_may_call(name, allow_join)) {
       throw InvalidInputException("%s can only be called on the gateway's console", name);
     }
     local = true;
+  }
+  // The statement runs as written in the client's gateway session. Anything else it read there
+  // would be the gateway host's files, or SQL run by a function such as query().
+  if (local && refs.other_source) {
+    throw InvalidInputException(
+      "a statement that calls a gateway function cannot read tables, files or other table "
+      "functions");
   }
   return local;
 }
