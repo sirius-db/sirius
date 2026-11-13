@@ -51,6 +51,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -61,6 +62,7 @@
 // construction, plan-DSL walk, rmm device buffers).  Keeping these
 // includes here avoids re-parsing them for the decode-only TUs that
 // already compile fine without them.
+#include "api/compressed_table_io.hpp"
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
@@ -247,7 +249,8 @@ namespace {
 // Stream-ordered: the transient bp_offsets + CUB scratch are enqueued on the
 // caller's stream and RAII-freed on it; the caller syncs before reading the
 // dense bytes from another stream. ``live_packed_bytes`` is the precomputed
-// tight byte count (always a multiple of 4).
+// tight byte count (always a multiple of 4). The bp_offsets go to
+// ``word_offsets_out`` (left empty when nothing is live) for the rep to keep.
 // ---------------------------------------------------------------------------
 std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_count,
                                                      cudf::column const& chunk_bits,
@@ -255,7 +258,8 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                                      std::int32_t stride_words,
                                                      std::int64_t live_packed_bytes,
                                                      ::cuda::stream_ref stream,
-                                                     rmm::device_async_resource_ref mr)
+                                                     rmm::device_async_resource_ref mr,
+                                                     rmm::device_buffer& word_offsets_out)
 {
   auto check_rc = [](int rc, const char* what) {
     if (rc != 0)
@@ -310,6 +314,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                           static_cast<std::int32_t>(sizeof(std::uint32_t)),
                                           stream.get()),
              "compact gather");
+    word_offsets_out = std::move(bp_offsets_buf);
   }
 
   // Zero the guard words so the decode over-read returns deterministic
@@ -329,6 +334,56 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 }
 
 }  // namespace
+
+std::vector<std::size_t> keep_bitpack_word_offsets(compressed_table& table,
+                                                   ::cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  std::vector<std::size_t> kept(table.columns.size(), 0);
+  for (std::size_t c = 0; c < table.columns.size(); ++c) {
+    auto& column = table.columns[c];
+    if (!column.plan_tree) continue;
+    for (auto& node : column.plan_tree->nodes) {
+      auto* rep = dynamic_cast<codegen_fused_representation*>(node.rep.get());
+      if (rep == nullptr || node.op != "bitpack" || rep->word_offsets.size() != 0) continue;
+      // A tail-routed chunk_count or chunk_bits exists only while a decode runs, so this node is
+      // skipped and each decode of the re-read table scans for its offsets (the encoder's own
+      // table keeps them either way).
+      bool const routed =
+        std::any_of(node.children.begin(), node.children.end(), [](auto const& e) {
+          return e.channel == "chunk_count" || e.channel == "chunk_bits";
+        });
+      if (routed) continue;
+      cudf::column_view count, bits;
+      for (auto const& channel : rep->named_channels(stream)) {
+        if (channel.name == "chunk_count") count = channel.view;
+        if (channel.name == "chunk_bits") bits = channel.view;
+      }
+      if (count.size() == 0 || bits.size() < count.size()) continue;
+      rmm::device_buffer offsets(
+        (static_cast<std::size_t>(count.size()) + 1) * sizeof(std::int32_t), stream, mr);
+      rmm::device_buffer scratch;
+      auto const rc = compute_bp_offsets(
+        count.head<void>(),
+        bits.head<void>(),
+        count.size(),
+        offsets.data(),
+        [&](std::size_t bytes) {
+          scratch = rmm::device_buffer(bytes, stream, mr);
+          return scratch.data();
+        },
+        stream.get());
+      if (rc != 0) {
+        throw std::runtime_error(
+          "keep_bitpack_word_offsets: offsets scan failed (rc=" + std::to_string(rc) + ")");
+      }
+      kept[c] += offsets.size();
+      rep->word_offsets = std::move(offsets);
+    }
+  }
+  return kept;
+}
+
 }  // namespace simpatico
 
 namespace {
@@ -365,7 +420,8 @@ void dfs_nodes(const jit::FusedTree& node, std::vector<const jit::FusedTree*>& o
 // into `out`, reading the already-bound real buffers from `persisted` (both keyed by DFS-preorder
 // node_id). Used by the structural PlanTree decode binder (bind_fused_subtree in
 // plan/decompress.cpp):
-//   * Bitpack bp_offsets: exclusive cumsum of n_words[c] via CUB (device-side
+//   * Bitpack bp_offsets: the rep's encoder-computed copy when the binder supplies it as
+//       `kept_bp_offsets`, else the exclusive cumsum of n_words[c] via CUB (device-side
 //       scan + 1-thread tail patch), reading chunk_count/chunk_bits.
 //   * Rle scatter-scan-gather transients (rle_scratch / rle_run_values):
 //       registered as null placeholders (length only) — the rendered RLE decode
@@ -384,6 +440,11 @@ void synthesize_decode_transients(const jit::FusedTree& tree,
   for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(nodes.size()); ++node_id) {
     const auto& node = *nodes[node_id];
     if (node.op == cc::OpKind::Bitpack) {
+      if (auto kept = persisted.find(jit::buffer_key(node_id, "kept_bp_offsets"));
+          kept != persisted.end()) {
+        out[jit::buffer_key(node_id, "bp_offsets")] = kept->second;
+        continue;
+      }
       auto cc_it = persisted.find(jit::buffer_key(node_id, "chunk_count"));
       auto cb_it = persisted.find(jit::buffer_key(node_id, "chunk_bits"));
       if (cc_it == persisted.end() || cb_it == persisted.end()) {
@@ -633,6 +694,51 @@ struct TrailingArgStorage {
   }
 };
 
+// The tree's shape: op kinds and child port names, which (with the dtypes and decode shape) are
+// everything the decode renderer reads.
+void append_tree_shape(std::string& key, jit::FusedTree const& node)
+{
+  key += std::to_string(static_cast<int>(node.op));
+  key += '(';
+  for (auto const& [port, child] : node.children) {
+    key += port;
+    key += '=';
+    append_tree_shape(key, *child);
+    key += ';';
+  }
+  key += ')';
+}
+
+// The rendered decode kernel for a tree shape, rendered once per process. The source is invariant
+// in the row count (chunk_id comes from blockIdx.x), so it is rendered for one chunk.
+std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(jit::FusedTree const& tree,
+                                                                  char const* cxx_dtype,
+                                                                  cdj::DecodeShape shape,
+                                                                  char const* out_dtype)
+{
+  std::string key;
+  append_tree_shape(key, tree);
+  key += '|';
+  key += cxx_dtype;
+  key += '|';
+  key += std::to_string(static_cast<int>(shape.enumerator));
+  key += '|';
+  key += std::to_string(static_cast<int>(shape.consumer));
+  key += '|';
+  if (out_dtype != nullptr) key += out_dtype;
+
+  static std::mutex mu;
+  static std::unordered_map<std::string, std::shared_ptr<cdj::DecodeKernelSpec const>> specs;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (auto it = specs.find(key); it != specs.end()) return it->second;
+  }
+  auto spec = std::make_shared<cdj::DecodeKernelSpec const>(
+    cdj::render(tree, cxx_dtype, 1, shape, out_dtype != nullptr ? out_dtype : ""));
+  std::lock_guard<std::mutex> lock(mu);
+  return specs.emplace(std::move(key), std::move(spec)).first->second;
+}
+
 // Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`
 // before the persisted buffers. The caller owns every synthesized buffer until this launch has been
 // queued.
@@ -647,8 +753,8 @@ void launch_rendered_decode(jit::FusedTree const& tree,
 {
   auto const num_chunks =
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
-  auto const spec =
-    cdj::render(tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
+  auto const spec_ptr = rendered_decode_spec(tree, cxx_dtype, va.shape, va.out_dtype);
+  auto const& spec    = *spec_ptr;
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
@@ -685,7 +791,7 @@ void launch_rendered_decode(jit::FusedTree const& tree,
   trailing.append(spec.trailing, args, "fused kernel");
 
   // A dense grid follows the renderer's block-to-chunk mapping; a row set brings its own.
-  auto const dense_grid = cuda::ceil_div(num_chunks, cdj::chunks_per_block(va.shape));
+  auto const dense_grid = cuda::ceil_div(num_chunks, spec.chunks_per_block);
   launch_decode_kernel(spec,
                        args.data(),
                        static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
@@ -949,6 +1055,23 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, out_chars, va, rows.by_row_set() ? nullptr : &mask, frame);
 }
 
+// Dictionary gather over every row: constant-width keys of the decoded codes (masked_launch.hpp).
+void launch_decode_fused_tree_dict_gather_all(codegen::jit::FusedTree const& tree,
+                                              codegen::jit::LabeledBuffers const& labeled,
+                                              char const* dtype,
+                                              std::int64_t num_rows,
+                                              void const* keys_chars,
+                                              std::int32_t key_width,
+                                              void* out_chars,
+                                              decode_frame& frame)
+{
+  VariantLaunchArgs va;
+  va.shape      = cdj::kShapePlainDictGather;
+  va.keys_chars = dev(keys_chars);
+  va.key_width  = key_width;
+  launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, va, nullptr, frame);
+}
+
 // str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  The
 // source comes from the renderer like every other kernel's — no tree behind it,
 // so it takes no arguments — and compiles through the same JIT cache.
@@ -964,7 +1087,7 @@ void launch_masked_char_copy(void const* chars,
       out_chars == nullptr) {
     throw std::invalid_argument("simpatico decode: masked char copy: null input");
   }
-  const cdj::DecodeKernelSpec spec = cdj::render_masked_char_copy();
+  static const cdj::DecodeKernelSpec spec = cdj::render_masked_char_copy();
 
   CUdeviceptr d_chars  = reinterpret_cast<CUdeviceptr>(chars);
   CUdeviceptr d_src    = reinterpret_cast<CUdeviceptr>(src_offsets);
@@ -1354,6 +1477,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
             std::move(out.dense),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0));
+        rep->word_offsets = std::move(out.offsets);
         builder->leaves.emplace(origin.plan_node, std::move(rep));
         break;
       }
@@ -1641,8 +1765,15 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // per-chunk offsets + the exact output size, then packing tight
           // directly in the encode kernel, and measure whether that beats
           // this post-encode scan+gather.
-          auto pkd_col = simpatico::compact_bitpack_packed(
-            *cnt_col, *bits_col, *pkd_overalloc, stride_words, live_packed_bytes, stream, mr);
+          rmm::device_buffer word_offsets;
+          auto pkd_col = simpatico::compact_bitpack_packed(*cnt_col,
+                                                           *bits_col,
+                                                           *pkd_overalloc,
+                                                           stride_words,
+                                                           live_packed_bytes,
+                                                           stream,
+                                                           mr,
+                                                           word_offsets);
           // compact_bitpack_packed gathers on ``stream``; sync so the dense
           // bytes are safe to read from any stream before the pointer is exposed.
           SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(stream.get()),
@@ -1655,6 +1786,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           rep->buffers.emplace_back("chunk_count", std::move(cnt_col));
           rep->buffers.emplace_back("chunk_bits", std::move(bits_col));
           rep->buffers.emplace_back("packed", std::move(pkd_col));
+          rep->word_offsets = std::move(word_offsets);
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
         }
