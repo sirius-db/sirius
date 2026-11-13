@@ -52,7 +52,7 @@ class split_provider {
   /// @c sirius_scan_manager::reset.
   op::scan::gpu_ingestible* _ingestible{nullptr};
 
-  /// Resolves each file's ioctx by path (s3:// -> rest, local -> uring/kvikio),
+  /// Resolves each file's ioctx by path (s3:// -> rest, local -> uring),
   /// forwarded into the ingestible so a mixed-scheme scan routes per file.
   sirius::io::ioctx_resolver _resolve;
 };
