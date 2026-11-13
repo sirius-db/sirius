@@ -1,0 +1,391 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "data/data_batch_utils.hpp"
+#include "op/merge/bounded_kway_merge.hpp"
+#include "op/merge/windowed_merge.hpp"
+#include "operator/operator_test_utils.hpp"
+
+#include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/merge.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace sirius::test::merge_utils {
+
+// ---------------------------------------------------------------------------
+// Reference bounded merge (the oracle)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Reference implementation of op::merge::bounded_kway_merge, usable as a bounded_merge_fn.
+ *
+ * Merges ALL window rows with cudf::merge (ties broken by window index, then row, through two
+ * extra key columns), then applies the safe-target rule on the host and slices the first
+ * `target` rows. Slow and memory-hungry on purpose: it is the oracle the real kernel and the
+ * windowed merger are checked against.
+ */
+inline op::merge::bounded_merge_result reference_bounded_merge(
+  std::span<const cudf::table_view> windows,
+  const op::merge::merge_key_spec& keys,
+  std::span<const std::uint8_t> truncated,
+  cudf::size_type max_rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  const auto k = windows.size();
+  if (truncated.size() != k) {
+    throw std::invalid_argument("reference_bounded_merge: one truncated flag per window");
+  }
+  op::merge::bounded_merge_result result;
+  result.consumed.assign(k, 0);
+  if (k == 0) {
+    result.output = std::make_unique<cudf::table>();
+    return result;
+  }
+  const auto num_cols = windows.front().num_columns();
+
+  // Tag every row with (window, row) so the merged order is the stable one.
+  std::vector<std::unique_ptr<cudf::column>> tags;
+  std::vector<cudf::table_view> tagged;
+  std::int64_t total_rows = 0;
+  bool empty_truncated    = false;
+  for (std::size_t i = 0; i < k; ++i) {
+    const auto rows = windows[i].num_rows();
+    if (rows == 0) {
+      empty_truncated = empty_truncated || truncated[i] != 0;
+      continue;
+    }
+    total_rows += rows;
+    cudf::numeric_scalar<std::int32_t> window_idx(static_cast<std::int32_t>(i), true, stream);
+    cudf::numeric_scalar<std::int32_t> zero(0, true, stream);
+    tags.push_back(cudf::make_column_from_scalar(window_idx, rows, stream));
+    tags.push_back(cudf::sequence(rows, zero, stream));
+    std::vector<cudf::column_view> cols(windows[i].begin(), windows[i].end());
+    cols.push_back(tags[tags.size() - 2]->view());
+    cols.push_back(tags[tags.size() - 1]->view());
+    tagged.emplace_back(cols);
+  }
+
+  auto key_cols        = keys.key_cols;
+  auto column_order    = keys.column_order;
+  auto null_precedence = keys.null_precedence;
+  if (null_precedence.empty()) {
+    null_precedence.assign(key_cols.size(), cudf::null_order::BEFORE);
+  }
+  for (cudf::size_type tag = 0; tag < 2; ++tag) {
+    key_cols.push_back(num_cols + tag);
+    column_order.push_back(cudf::order::ASCENDING);
+    null_precedence.push_back(cudf::null_order::BEFORE);
+  }
+
+  std::unique_ptr<cudf::table> merged;
+  std::vector<std::int32_t> source;  // window of each merged row
+  if (!tagged.empty()) {
+    merged = cudf::merge(tagged, key_cols, column_order, null_precedence, stream);
+    source = operator_utils::copy_column_to_host<std::int32_t>(merged->view().column(num_cols));
+  }
+
+  // target = min(max_rows, r_safe, Σ len); r_safe = min over truncated windows of the merged
+  // position of the window's last row, plus one.
+  auto target = std::min<std::int64_t>(max_rows, total_rows);
+  if (empty_truncated) { target = 0; }
+  std::vector<std::int64_t> last_position(k, -1);
+  for (std::size_t pos = 0; pos < source.size(); ++pos) {
+    last_position[static_cast<std::size_t>(source[pos])] = static_cast<std::int64_t>(pos);
+  }
+  for (std::size_t i = 0; i < k; ++i) {
+    if (truncated[i] != 0 && last_position[i] >= 0) {
+      target = std::min(target, last_position[i] + 1);
+    }
+  }
+
+  for (std::int64_t pos = 0; pos < target; ++pos) {
+    ++result.consumed[static_cast<std::size_t>(source[static_cast<std::size_t>(pos)])];
+  }
+
+  std::vector<cudf::size_type> payload(static_cast<std::size_t>(num_cols));
+  for (cudf::size_type c = 0; c < num_cols; ++c) {
+    payload[static_cast<std::size_t>(c)] = c;
+  }
+  if (merged) {
+    const auto head =
+      cudf::slice(merged->view().select(payload), {0, static_cast<cudf::size_type>(target)}, stream)
+        .front();
+    result.output = std::make_unique<cudf::table>(head, stream, mr);
+  } else {
+    result.output = cudf::empty_like(windows.front());
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Column and table builders
+// ---------------------------------------------------------------------------
+
+/// A fixed-width column from host values; @p valids[i] == false makes row i NULL.
+template <typename T>
+inline std::unique_ptr<cudf::column> make_column(const std::vector<T>& values,
+                                                 cudf::type_id type_id,
+                                                 const std::vector<bool>& valids = {})
+{
+  auto stream     = cudf::get_default_stream();
+  const auto size = static_cast<cudf::size_type>(values.size());
+  auto col        = cudf::make_fixed_width_column(
+    cudf::data_type{type_id},
+    size,
+    valids.empty() ? cudf::mask_state::UNALLOCATED : cudf::mask_state::ALL_VALID,
+    stream);
+  if (size > 0) {
+    cudaMemcpy(col->mutable_view().data<T>(),
+               values.data(),
+               sizeof(T) * values.size(),
+               cudaMemcpyHostToDevice);
+  }
+  if (!valids.empty()) {
+    auto view = col->mutable_view();
+    for (cudf::size_type i = 0; i < size; ++i) {
+      if (!valids[static_cast<std::size_t>(i)]) {
+        cudf::set_null_mask(view.null_mask(), i, i + 1, false, stream);
+      }
+    }
+    col->set_null_count(
+      static_cast<cudf::size_type>(std::count(valids.begin(), valids.end(), false)));
+  }
+  return col;
+}
+
+/// A STRING column from host values (no nulls).
+inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::string>& values)
+{
+  return operator_utils::make_string_column(
+    values, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+template <typename... Columns>
+inline std::unique_ptr<cudf::table> make_table(Columns&&... columns)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  (cols.push_back(std::forward<Columns>(columns)), ...);
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// @p table stably sorted by @p keys.
+inline std::unique_ptr<cudf::table> stable_sort(const cudf::table_view& table,
+                                                const op::merge::merge_key_spec& keys)
+{
+  return cudf::stable_sort_by_key(
+    table, table.select(keys.key_cols), keys.column_order, keys.null_precedence);
+}
+
+/// The oracle of a whole merge: the runs concatenated in run order, then stably sorted, which is
+/// the order a k-way merge with ties broken by run index produces.
+inline std::unique_ptr<cudf::table> expected_full_sort(std::span<const cudf::table_view> runs,
+                                                       const op::merge::merge_key_spec& keys)
+{
+  std::vector<cudf::table_view> views(runs.begin(), runs.end());
+  auto all = cudf::concatenate(views);
+  return stable_sort(all->view(), keys);
+}
+
+/// True when both tables have the same types, row count and values (NULL equals NULL).
+inline bool tables_equal(const cudf::table_view& lhs, const cudf::table_view& rhs)
+{
+  if (lhs.num_columns() != rhs.num_columns() || lhs.num_rows() != rhs.num_rows()) { return false; }
+  for (cudf::size_type c = 0; c < lhs.num_columns(); ++c) {
+    if (lhs.column(c).type() != rhs.column(c).type()) { return false; }
+    if (lhs.num_rows() == 0) { continue; }
+    const cudf::data_type bool_type{cudf::type_id::BOOL8};
+    auto equal = cudf::binary_operation(
+      lhs.column(c), rhs.column(c), cudf::binary_operator::NULL_EQUALS, bool_type);
+    auto all = cudf::reduce(
+      equal->view(), *cudf::make_all_aggregation<cudf::reduce_aggregation>(), bool_type);
+    const auto& all_equal = static_cast<const cudf::numeric_scalar<bool>&>(*all);
+    if (!all_equal.is_valid() || !all_equal.value()) { return false; }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Runs as repository batches
+// ---------------------------------------------------------------------------
+
+/// One sorted run: its batches (which stay in the repository) and its merge_run description.
+struct test_run {
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  op::merge::merge_run run;
+  std::unique_ptr<cudf::table> rows;  ///< all rows of the run, in run order (for the oracle)
+};
+
+/**
+ * @brief Split an already sorted table into GPU batches of @p batch_rows rows and add them to
+ * @p repository.
+ *
+ * @param batch_rows Rows of each batch, in run order; must sum to sorted.num_rows(). A zero entry
+ *        makes an empty batch.
+ */
+inline test_run make_gpu_run(cucascade::shared_data_repository& repository,
+                             cucascade::memory::memory_space& space,
+                             const cudf::table_view& sorted,
+                             const std::vector<std::size_t>& batch_rows)
+{
+  auto stream = operator_utils::default_stream();
+  auto mr     = operator_utils::get_resource_ref(space);
+  test_run out;
+  out.rows          = std::make_unique<cudf::table>(sorted);
+  std::size_t begin = 0;
+  for (const auto rows : batch_rows) {
+    const auto piece =
+      cudf::slice(sorted,
+                  {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(begin + rows)})
+        .front();
+    auto batch = ::sirius::make_data_batch(std::make_unique<cudf::table>(piece, stream, mr),
+                                           space,
+                                           stream,
+                                           ::sirius::telemetry::batch_telemetry_info{});
+    repository.add_data_batch(batch);
+    out.run.batch_ids.push_back(batch->get_batch_id());
+    out.run.batch_rows.push_back(rows);
+    out.batches.push_back(std::move(batch));
+    begin += rows;
+  }
+  if (begin != static_cast<std::size_t>(sorted.num_rows())) {
+    throw std::invalid_argument("make_gpu_run: batch_rows must sum to the run's rows");
+  }
+  return out;
+}
+
+/// Sort @p unsorted by @p keys and make it a GPU run of @p num_batches near-equal batches.
+inline test_run make_sorted_gpu_run(cucascade::shared_data_repository& repository,
+                                    cucascade::memory::memory_space& space,
+                                    const cudf::table_view& unsorted,
+                                    const op::merge::merge_key_spec& keys,
+                                    std::size_t num_batches = 1)
+{
+  auto sorted      = stable_sort(unsorted, keys);
+  const auto total = static_cast<std::size_t>(sorted->num_rows());
+  std::vector<std::size_t> batch_rows(num_batches, total / num_batches);
+  batch_rows.back() += total % num_batches;
+  return make_gpu_run(repository, space, sorted->view(), batch_rows);
+}
+
+/// One cursor per run, at the start of the run.
+inline std::vector<op::merge::merge_input_cursor> make_cursors(const std::vector<test_run>& runs)
+{
+  std::vector<op::merge::merge_input_cursor> cursors;
+  cursors.reserve(runs.size());
+  for (const auto& run : runs) {
+    cursors.push_back(op::merge::merge_input_cursor{.run = run.run});
+  }
+  return cursors;
+}
+
+/// The resolved batches of each run, as windowed_merger takes them.
+inline std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> run_batches(
+  const std::vector<test_run>& runs)
+{
+  std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
+  batches.reserve(runs.size());
+  for (const auto& run : runs) {
+    batches.push_back(run.batches);
+  }
+  return batches;
+}
+
+/// The oracle for @p runs: expected_full_sort of their rows.
+inline std::unique_ptr<cudf::table> expected_full_sort(const std::vector<test_run>& runs,
+                                                       const op::merge::merge_key_spec& keys)
+{
+  std::vector<cudf::table_view> views;
+  views.reserve(runs.size());
+  for (const auto& run : runs) {
+    views.push_back(run.rows->view());
+  }
+  return expected_full_sort(std::span<const cudf::table_view>(views), keys);
+}
+
+inline bool all_exhausted(std::span<const op::merge::merge_input_cursor> cursors)
+{
+  return std::all_of(
+    cursors.begin(), cursors.end(), [](const auto& cursor) { return cursor.exhausted(); });
+}
+
+/// What collect_full_sort gathered: the table of every run() call and their concatenation.
+struct collected_sort {
+  std::vector<std::unique_ptr<cudf::table>> chunks;
+  std::unique_ptr<cudf::table> table;
+};
+
+/**
+ * @brief Call merger.run() until every cursor is exhausted and concatenate the outputs.
+ *
+ * @param cursors The cursors the merger was built over.
+ * @param max_calls Fails (std::runtime_error) if the merge is not finished after this many calls.
+ */
+inline collected_sort collect_full_sort(op::merge::windowed_merger& merger,
+                                        std::span<const op::merge::merge_input_cursor> cursors,
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr,
+                                        op::merge::merge_round_stats* stats = nullptr,
+                                        std::size_t max_calls               = 100000)
+{
+  collected_sort out;
+  std::vector<cudf::table_view> views;
+  do {
+    if (out.chunks.size() == max_calls) {
+      throw std::runtime_error("collect_full_sort: the merge did not finish");
+    }
+    out.chunks.push_back(merger.run(stream, mr, stats));
+    views.push_back(out.chunks.back()->view());
+  } while (!all_exhausted(cursors));
+  out.table = cudf::concatenate(views, stream, mr);
+  return out;
+}
+
+}  // namespace sirius::test::merge_utils
