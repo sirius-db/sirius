@@ -57,6 +57,8 @@ set(SIRIUS_LINK_LIBRARIES
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
+    absl::strings
+    utf8proc::utf8proc
     kvikio::kvikio)
 
 foreach(_target sirius_objects sirius_core sirius_shared)

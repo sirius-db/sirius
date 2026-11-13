@@ -16,6 +16,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 # readers agree by construction.
 find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
+find_package(utf8proc REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)

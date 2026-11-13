@@ -57,6 +57,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
+libutf8proc = "*"
 # Fixture/data-generation Python client; the engine and LOAD tests use the pinned v2 source.
 duckdb = "=2.0.0"
 spdlog = "1.*"

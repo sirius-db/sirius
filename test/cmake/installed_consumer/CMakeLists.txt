@@ -16,7 +16,7 @@ if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
   target_link_options(consumer PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
-add_executable(c_consumer abi.c)
+add_executable(c_consumer abi.c plan.c)
 set_target_properties(
   c_consumer
   PROPERTIES C_STANDARD 99
