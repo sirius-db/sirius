@@ -10,6 +10,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -183,8 +184,15 @@ void write_parquet_part(parquet_export_spec const& spec,
   stream.sync();
   std::move(drain_on_error).Cancel();
 }
-void write_empty_parquet(parquet_export_spec const& spec, std::filesystem::path const& path)
+void write_empty_parquet(parquet_export_spec const& spec,
+                         std::filesystem::path const& path,
+                         int device_id)
 {
+  // Finalization runs on the client thread, whose ambient device may be outside
+  // the configured GPU subset. Keep the selected device current until every
+  // column is destroyed, including when writing throws. The default stream and
+  // current RMM resource below therefore both belong to this device.
+  rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{device_id}};
   std::vector<std::unique_ptr<cudf::column>> columns;
   for (auto const& field : spec.fields)
     columns.push_back(empty_column(field));

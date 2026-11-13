@@ -19,6 +19,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_parquet_sink.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
@@ -110,23 +111,28 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
       try {
         engine.execute();  // Returns only after all asynchronous plan users retire.
         if (context.IsInterrupted()) throw duckdb::InterruptException();
+        auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+        auto gpu_spaces =
+          runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+        if (gpu_spaces.empty()) throw internal_exception("Parquet export has no configured GPU");
         duckdb::unique_ptr<duckdb::QueryResult> completion;
-        sink->finish([&](output::parquet_export_result const& result) {
-          auto collection =
-            duckdb::make_uniq<duckdb::ColumnDataCollection>(context, prepared.prepared->types);
-          duckdb::ColumnDataAppendState append;
-          collection->InitializeAppend(append);
-          duckdb::DataChunk chunk;
-          chunk.Initialize(duckdb::Allocator::Get(context), prepared.prepared->types);
-          chunk.data[0].Append(duckdb::Value::BIGINT(static_cast<int64_t>(result.rows)));
-          chunk.CheckCardinality(1);
-          collection->Append(append, chunk);
-          completion = duckdb::make_uniq<duckdb::QueryResult>(prepared.prepared->statement_type,
-                                                              prepared.prepared->properties,
-                                                              prepared.prepared->names,
-                                                              std::move(collection),
-                                                              context.GetClientProperties());
-        });
+        sink->finish(
+          gpu_spaces.front()->get_device_id(), [&](output::parquet_export_result const& result) {
+            auto collection =
+              duckdb::make_uniq<duckdb::ColumnDataCollection>(context, prepared.prepared->types);
+            duckdb::ColumnDataAppendState append;
+            collection->InitializeAppend(append);
+            duckdb::DataChunk chunk;
+            chunk.Initialize(duckdb::Allocator::Get(context), prepared.prepared->types);
+            chunk.data[0].Append(duckdb::Value::BIGINT(static_cast<int64_t>(result.rows)));
+            chunk.CheckCardinality(1);
+            collection->Append(append, chunk);
+            completion = duckdb::make_uniq<duckdb::QueryResult>(prepared.prepared->statement_type,
+                                                                prepared.prepared->properties,
+                                                                prepared.prepared->names,
+                                                                std::move(collection),
+                                                                context.GetClientProperties());
+          });
         return completion;
       } catch (...) {
         // A failed retirement retains the plan in the lifecycle registry. Leave
