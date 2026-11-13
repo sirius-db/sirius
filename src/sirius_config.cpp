@@ -403,6 +403,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
       "'sirius.executor.scan_manager.object_store': no longer YAML-loadable; use "
       "CREATE SECRET (TYPE SIRIUS_S3, ...) or sirius_config::set_object_store_config()");
   }
+  opt.num_threads_explicit = r.has("num_threads");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);

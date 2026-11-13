@@ -988,3 +988,25 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
   CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
                   sirius::configuration_input_error);
 }
+
+TEST_CASE("metadata worker YAML records explicit counts even when equal to default",
+          "[config][metadata_worker_defaults]")
+{
+  auto explicit_count = GENERATE(false, true);
+  auto initial        = sirius::scan_manager::default_scan_manager_num_threads();
+  auto body           = explicit_count ? "      num_threads: " + std::to_string(initial) + "\n"
+                                       : "      backend: sirius\n";
+  scoped_yaml yaml("sirius_metadata_worker_defaults.yaml", scan_manager_yaml(body));
+  auto parsed        = sirius::parsed_sirius_config::from_file(yaml.path());
+  auto const& config = parsed.get_scan_manager_config();
+  CHECK(config.num_threads_explicit == explicit_count);
+  CHECK(config.thread_pool.num_threads == initial);
+  auto more_domains = static_cast<size_t>(initial) + 1;
+  if (explicit_count) {
+    CHECK_THROWS_AS(sirius::scan_manager::resolve_scan_manager_num_threads(config, more_domains),
+                    std::invalid_argument);
+  } else {
+    CHECK(sirius::scan_manager::resolve_scan_manager_num_threads(config, more_domains) ==
+          initial + 1);
+  }
+}

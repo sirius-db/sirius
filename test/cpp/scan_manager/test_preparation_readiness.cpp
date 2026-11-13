@@ -3244,3 +3244,314 @@ TEST_CASE("Pooled retirement yields between unit cancellation and source cleanup
   CHECK(closed == 8);
   CHECK_FALSE(f.completion.has_error());
 }
+
+namespace {
+struct worker_accumulator : sirius::test::preparation::accumulator {
+  using accumulator::accumulator;
+  std::function<void()> before_advance, before_flush, before_partial;
+  bool asynchronous_preparation() const noexcept override { return true; }
+  cursor_step advance(sirius::op::scan::scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    if (before_advance) before_advance();
+    return accumulator::advance(input, cursor, quantum);
+  }
+  std::unique_ptr<sirius::op::scan::scan_info> partial_emit() override
+  {
+    if (before_partial) before_partial();
+    return accumulator::partial_emit();
+  }
+  std::vector<std::unique_ptr<sirius::op::scan::scan_info>> flush() override
+  {
+    if (before_flush) before_flush();
+    return accumulator::flush();
+  }
+};
+}  // namespace
+
+TEST_CASE("async coalescing leaves the owner and coordinator available",
+          "[coordinator][async_coalescing]")
+{
+  using namespace sirius::test::preparation;
+  coordinator_pool coordinators(1);
+  fixture f(2, 4, k_interrupt_check_interval, std::nullopt, nullptr, &coordinators);
+  auto guard = f.shutdown_guard();
+  auto held  = f.make_hold();
+  auto slow  = std::make_shared<worker_accumulator>(1);
+  std::thread::id coalescing_thread;
+  slow->before_advance = [&] {
+    coalescing_thread = std::this_thread::get_id();
+    held->wait();
+  };
+  auto slow_out = std::make_shared<sink>(), fast_out = std::make_shared<sink>();
+  f.source(slow, slow_out, single_job([] { return std::make_unique<tagged>(1); }));
+  f.source(std::make_shared<worker_accumulator>(1), fast_out, single_job([] {
+             return std::make_unique<tagged>(2);
+           }));
+  f.start();
+  REQUIRE(held->await());
+  REQUIRE(fast_out->await(1));
+  CHECK(slow_out->count() == 0);
+  auto stats = f.coordinator.snapshot();
+  CHECK(coalescing_thread != stats.owner);
+  CHECK(coalescing_thread != stats.runner);
+  held->release();
+  REQUIRE(slow_out->await(1));
+  slow_out->consume();
+  fast_out->consume();
+  f.finish();
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("async coalescing cancellation drains held work without publication",
+          "[coordinator][async_coalescing]")
+{
+  using namespace sirius::test::preparation;
+  fixture f;
+  auto guard        = f.shutdown_guard();
+  auto held         = f.make_hold();
+  auto a            = std::make_shared<worker_accumulator>(1);
+  a->before_advance = [held] { held->wait(); };
+  auto out          = std::make_shared<sink>();
+  f.source(a, out, single_job([] { return std::make_unique<tagged>(1); }));
+  f.start();
+  REQUIRE(held->await());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  CHECK_FALSE(out->closed);
+  held->release();
+  f.finish();
+  CHECK(out->closed);
+  CHECK(out->count() == 0);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("async coalescing failure reaches query completion", "[coordinator][async_coalescing]")
+{
+  using namespace sirius::test::preparation;
+  fixture f;
+  auto guard        = f.shutdown_guard();
+  auto a            = std::make_shared<worker_accumulator>(1);
+  a->before_advance = [] { throw std::runtime_error("range preparation failed"); };
+  auto out          = std::make_shared<sink>();
+  f.source(a, out, single_job([] { return std::make_unique<tagged>(1); }));
+  auto done = f.completion.get_awaitable();
+  f.start();
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "range preparation failed");
+  f.finish();
+  CHECK(out->count() == 0);
+}
+
+TEST_CASE("async partial emission and final flush execute on metadata workers",
+          "[coordinator][async_coalescing]")
+{
+  bool partial = GENERATE(false, true);
+  fixture f;
+  auto guard = f.shutdown_guard();
+  auto a     = std::make_shared<worker_accumulator>(100);
+  auto out   = std::make_shared<sink>();
+  std::thread::id partial_thread, flush_thread;
+  a->before_partial = [&] { partial_thread = std::this_thread::get_id(); };
+  a->before_flush   = [&] { flush_thread = std::this_thread::get_id(); };
+  std::atomic<bool> exhausted{!partial};
+  f.source(a, out, [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+    if (!std::exchange(claimed, true))
+      return preparation_coordinator::job{[] { return std::make_unique<tagged>(3); }, {}};
+    if (exhausted) return preparation_exhausted{};
+    return preparation_pending{};
+  });
+  f.start();
+  REQUIRE(out->await(1));
+  out->consume();
+  exhausted = true;
+  f.coordinator.wake_for_testing();
+  f.finish();
+  auto stats = f.coordinator.snapshot();
+  CHECK(partial_thread != std::thread::id{});
+  CHECK(flush_thread != std::thread::id{});
+  CHECK(partial_thread != stats.owner);
+  CHECK(flush_thread != stats.owner);
+  CHECK(partial_thread != stats.runner);
+  CHECK(flush_thread != stats.runner);
+  CHECK(out->count() == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("stopped dispatcher rejects coalescing without parking forever",
+          "[coordinator][async_coalescing]")
+{
+  fixture f(1);
+  auto guard = f.shutdown_guard();
+  auto held  = f.make_hold();
+  auto out   = std::make_shared<sink>();
+  f.source(std::make_shared<worker_accumulator>(1), out, single_job([held] {
+             held->wait();
+             return std::make_unique<tagged>(0);
+           }));
+  auto done = f.completion.get_awaitable();
+  f.start();
+  REQUIRE(held->await());
+  // Retire the dispatcher while an accepted metadata job still owns its slot.
+  // That result settles after release, but its coalescing submission is discarded.
+  f.dispatcher.request_stop();
+  held->release();
+  REQUIRE(done.wait_for(1s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "accepted coalescing operation was discarded");
+  f.finish();
+}
+
+TEST_CASE("async coalescer failure after EOS survives retirement",
+          "[coordinator][async_coalescing][review_regression]")
+{
+  auto earlier = GENERATE(0, 1, 2);  // Normal EOS, user cancellation, existing query failure.
+  auto pooled  = GENERATE(false, true);
+  coordinator_pool coordinators(1);
+  fixture f(
+    2, 4, k_interrupt_check_interval, std::nullopt, nullptr, pooled ? &coordinators : nullptr);
+  auto held         = f.make_hold();
+  auto a            = std::make_shared<worker_accumulator>(1);
+  auto original     = std::make_exception_ptr(std::runtime_error("late range preparation failure"));
+  a->before_advance = [held, original] {
+    held->wait();
+    std::rethrow_exception(original);
+  };
+  auto out = std::make_shared<sink>();
+  f.source(a, out, single_job([] { return std::make_unique<tagged>(1); }));
+  auto done  = f.completion.get_awaitable();
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(held->await());
+  auto expected = original;
+  if (earlier == 1) {
+    f.coordinator.request_stop(stop_reason::user_cancel);
+    expected = f.completion.terminal_error();
+  } else if (earlier == 2) {
+    expected = std::make_exception_ptr(std::runtime_error("earlier query failure"));
+    f.completion.report_error(expected);
+  } else {
+    // The real GPU-completion path closes preparation normally, but cannot
+    // publish success while this accepted coalescer operation is still running.
+    f.completion.mark_completed();
+    CHECK(done.wait_for(20ms) == std::future_status::timeout);
+  }
+  CHECK_FALSE(out->closed);
+  held->release();
+  REQUIRE(done.wait_for(1s) == std::future_status::ready);
+  if (earlier == 1)
+    CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
+  else
+    CHECK_THROWS_WITH(done.get(),
+                      earlier == 2 ? "earlier query failure" : "late range preparation failure");
+  f.finish();
+  CHECK(f.completion.terminal_error() == expected);
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("accepted routed preparation handoff failure preserves the pool error",
+          "[coordinator][async_coalescing][scoped_dispatcher][review_regression]")
+{
+  bool coalescing = GENERATE(false, true);
+  bool eos        = GENERATE(false, true);
+  auto allowed    = sirius::exec::thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  preparation_options options{2, 4, 8, 1};
+  fixture f(1, 4, k_interrupt_check_interval, options, nullptr, nullptr, {{allowed.front()}});
+  auto worker = f.make_hold(), accepted = f.make_hold();
+  auto out = std::make_shared<sink>();
+  auto a   = std::make_shared<worker_accumulator>(1);
+  std::atomic<unsigned> executed{0};
+  if (coalescing) {
+    f.source(a, out, single_job([] { return std::make_unique<tagged>(1); }));
+    a->before_advance = [&] { ++executed; };
+  } else {
+    f.source(a, out, finite_jobs(2, [&](int id) {
+               if (id == 0)
+                 worker->wait();
+               else
+                 ++executed;
+               return std::make_unique<tagged>(id);
+             }));
+  }
+  bool blocker_submitted = false;
+  f.coordinator.before_control_step_for_testing([&] {
+    auto stats = f.coordinator.snapshot();
+    if (coalescing && stats.results_peak && !blocker_submitted) {
+      // Metadata is complete. Reserve the sole dispatcher slot before the
+      // controller accepts coalescing, forcing that operation into pending.
+      f.dispatcher.wait_for_all();
+      f.dispatcher.enqueue([worker] { worker->wait(); }, 0);
+      blocker_submitted = true;
+    }
+    if (coalescing ? stats.coalescing_submitted != 0 : stats.jobs_peak == 2) accepted->wait();
+  });
+  auto done  = f.completion.get_awaitable();
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(accepted->await());  // enqueue returned; this is an accepted continuation.
+  REQUIRE(worker->await());
+  if (eos) f.completion.mark_completed();
+  f.pool.stop();  // Only the running callback can finish; its handoff must fail.
+  worker->release();
+  REQUIRE(done.wait_for(1s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "thread pool is stopped");
+  // The original error is committed even while control retirement is held.
+  CHECK(f.completion.has_error());
+  accepted->release();
+  f.finish();
+  f.dispatcher.wait_for_all();
+  CHECK(executed == 0);
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("completed async sources progress beside a repeatedly ready first source",
+          "[coordinator][async_coalescing][review_regression]")
+{
+  preparation_options options{2, 4, 8, 1};
+  fixture f(2, 4, k_interrupt_check_interval, options);
+  auto first = std::make_shared<worker_accumulator>(1000);
+  auto later = std::make_shared<worker_accumulator>(1);
+  auto held  = f.make_hold();
+  std::atomic<unsigned> advances{0}, advances_at_publication{0};
+  std::atomic<bool> later_ready{false};
+  std::promise<void> later_entered;
+  auto entered          = later_entered.get_future();
+  first->before_advance = [&] {
+    if (++advances == 1) held->wait();
+  };
+  later->before_advance = [&] {
+    later_ready = true;
+    later_entered.set_value();
+  };
+  auto first_out = std::make_shared<sink>(), later_out = std::make_shared<sink>();
+  f.source(first, first_out, single_job([] { return std::make_unique<tagged>(0, 32); }));
+  auto source      = make_source(preparation_coordinator::execution_domain::metadata_worker, later);
+  source.try_claim = single_job([] { return std::make_unique<tagged>(1); });
+  source.construct = [&](auto batch) {
+    advances_at_publication = advances.load();
+    return make_publication(std::move(batch));
+  };
+  source.close = [later_out] { later_out->close(); };
+  f.register_source(std::move(source), later_out);
+  f.coordinator.before_control_step_for_testing([&] {
+    // Once the later operation starts, finish all outstanding worker callbacks
+    // before each turn. Thus source zero is ready again on every pass, while the
+    // later completion is already waiting. No timer or scheduling luck is needed.
+    if (later_ready) f.dispatcher.wait_for_all();
+  });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(held->await());
+  REQUIRE(entered.wait_for(1s) == std::future_status::ready);
+  held->release();
+  REQUIRE(later_out->await(1));
+  CHECK(advances_at_publication <= 2);
+  later_out->consume();
+  REQUIRE(first_out->await(1));
+  first_out->consume();
+  f.finish();
+  CHECK(advances == 32);
+  CHECK_FALSE(f.completion.has_error());
+}
