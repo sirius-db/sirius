@@ -71,9 +71,11 @@
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_cteref.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_expression_get.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
@@ -1162,6 +1164,59 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an EXISTS under a delim CTE builds on its small outer side",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  bool const enable_filter = GENERATE(true, false);
+  INFO("dynamic filters: " << enable_filter);
+  sirius::test::scoped_sirius_setting filter_switch(*con, "enable_dynamic_filter", enable_filter);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", true);
+  // TPC-Havoc Q05_V01 shape: the correlated scalar subquery makes a delim CTE of the outer rows,
+  // and the EXISTS sits in that CTE's body. Its outer side is the filtered `parts` (a third of 500
+  // rows) and its subquery reads all 10000 `items`.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk, (SELECT sum(i2.qty) FROM items i2 WHERE i2.fk = p.pk) FROM parts p "
+    "WHERE p.pname = 'p1' AND EXISTS (SELECT 1 FROM items i WHERE i.fk = p.pk)",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  // The EXISTS join is the only join in the CTE's body.
+  auto* cte = find_first(plan.get(), SiriusPhysicalOperatorType::CTE);
+  REQUIRE(cte != nullptr);
+  REQUIRE(cte->children.size() == 2);
+  auto const body_joins = collect(cte->children[0].get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(body_joins.size() == 1);
+  auto* exists_join = &body_joins.front()->Cast<sirius::op::sirius_physical_hash_join>();
+  REQUIRE(exists_join->children.size() == 2);
+  if (!enable_filter) {
+    // Publication is the flip's only gain, so without it the join keeps DuckDB's orientation.
+    CHECK(exists_join->join_type == duckdb::JoinType::SEMI);
+    CHECK(exists_join->dynamic_filter_plan().probe_targets().empty());
+  } else {
+    CHECK(exists_join->join_type == duckdb::JoinType::RIGHT_SEMI);
+    // The outer rows build and publish before the subquery is read: their keys reach its scan.
+    auto* build_root =
+      require_join_child_wrap(exists_join->children[1].get(), exists_join, /*is_build=*/true);
+    CHECK(build_root->type == SiriusPhysicalOperatorType::BUILD_FILTER);
+    auto const& targets = exists_join->dynamic_filter_plan().probe_targets();
+    REQUIRE_FALSE(targets.empty());
+    CHECK(std::all_of(targets.begin(), targets.end(), [](auto const& target) {
+      return target.route_class == sirius::op::dynamic_filter_route_class::scan;
+    }));
+    CHECK(find_first(exists_join->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER) !=
+          nullptr);
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - a join above a proven delim CTE filters the scans in its body",
                  "[plan_tree_shape][isolated_context][dynamic_filter][cte_body]")
 {
@@ -1280,25 +1335,44 @@ duckdb::TableIndex const kLeftRow{1};
 duckdb::TableIndex const kRightRow{2};
 duckdb::TableIndex const kMark{3};
 
-// FILTER(mark) over a MARK join of a two-column row against a one-column row: the conversion's
-// candidate in its smallest form, with bindings unresolved as the pass expects. The filter's
-// output is the join's: the two left columns, then the mark.
-duckdb::unique_ptr<duckdb::LogicalFilter> make_mark_filter(duckdb::LogicalComparisonJoin*& join)
+// A join condition between column @p left_column of the left row and the right row's only column.
+duckdb::JoinCondition row_condition(std::size_t left_column,
+                                    duckdb::ExpressionType comparison,
+                                    duckdb::LogicalType const& key_type)
+{
+  return duckdb::JoinCondition(
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      key_type, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(left_column))),
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      key_type, duckdb::ColumnBinding(kRightRow, duckdb::ProjectionIndex(0))),
+    comparison);
+}
+
+// FILTER(mark), or FILTER(NOT mark), over a MARK join of a two-column row against a one-column
+// row: the conversion's candidate in its smallest form, with bindings unresolved as the pass
+// expects. The filter's output is the join's: the two left columns, then the mark.
+duckdb::unique_ptr<duckdb::LogicalFilter> make_mark_filter(
+  duckdb::LogicalComparisonJoin*& join,
+  duckdb::ExpressionType comparison   = duckdb::ExpressionType::COMPARE_EQUAL,
+  duckdb::LogicalType const& key_type = duckdb::LogicalType::INTEGER,
+  bool negate_mark                    = false)
 {
   auto mark_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
   mark_join->mark_index = kMark;
   mark_join->children.push_back(constant_row(kLeftRow, 2, duckdb::TableIndex{4}));
   mark_join->children.push_back(constant_row(kRightRow, 1, duckdb::TableIndex{5}));
-  mark_join->conditions.emplace_back(
-    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(0))),
-    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kRightRow, duckdb::ProjectionIndex(0))),
-    duckdb::ExpressionType::COMPARE_EQUAL);
+  mark_join->conditions.push_back(row_condition(0, comparison, key_type));
   join = mark_join.get();
-  auto filter =
-    duckdb::make_uniq<duckdb::LogicalFilter>(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-      duckdb::LogicalType::BOOLEAN, duckdb::ColumnBinding(kMark, duckdb::ProjectionIndex(0))));
+  duckdb::unique_ptr<duckdb::Expression> predicate =
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::BOOLEAN, duckdb::ColumnBinding(kMark, duckdb::ProjectionIndex(0)));
+  if (negate_mark) {
+    auto negation = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+      duckdb::ExpressionType::OPERATOR_NOT, duckdb::LogicalType::BOOLEAN);
+    negation->GetChildrenMutable().push_back(std::move(predicate));
+    predicate = std::move(negation);
+  }
+  auto filter = duckdb::make_uniq<duckdb::LogicalFilter>(std::move(predicate));
   filter->children.push_back(std::move(mark_join));
   return filter;
 }
@@ -1364,6 +1438,104 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   std::size_t const expected_conversions = expect_converted ? 1 : 0;
   CHECK(sirius::planner::convert_mark_joins(*con->context, plan) == expected_conversions);
   CHECK(join->join_type == (expect_converted ? duckdb::JoinType::SEMI : duckdb::JoinType::MARK));
+}
+
+// DuckDB picks build sides while the join is still MARK, so a converted join builds on its
+// subquery unless the pass flips it. The flip needs a small outer side with a filter under it,
+// plain hash keys that early publication takes, and the settings a right-family join publishes
+// with. Each "no flip" shape drops one of those.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "mark conversion - a converted join builds on a small filtered outer side",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  auto const shape = GENERATE(as<std::string>{},
+                              "SEMI",
+                              "ANTI",
+                              "outer side not small enough",
+                              "outer side without a filter",
+                              "outer side reads a CTE",
+                              "VARCHAR key",
+                              "residual condition",
+                              "plain and null-safe keys",
+                              "dynamic filters off",
+                              "Bloom accumulation off");
+  INFO(shape);
+  bool const anti  = shape == "ANTI";
+  bool const flips = shape == "SEMI" || anti;
+  sirius::test::scoped_sirius_setting filters(
+    *con, "enable_dynamic_filter", shape != "dynamic filters off");
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", shape != "Bloom accumulation off");
+
+  duckdb::LogicalComparisonJoin* join = nullptr;
+  auto const comparison               = anti ? duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM
+                                             : duckdb::ExpressionType::COMPARE_EQUAL;
+  auto filter                         = make_mark_filter(
+    join,
+    comparison,
+    shape == "VARCHAR key" ? duckdb::LogicalType::VARCHAR : duckdb::LogicalType::INTEGER,
+    /*negate_mark=*/anti);
+  if (shape == "residual condition") {
+    join->conditions.push_back(
+      row_condition(1, duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::LogicalType::INTEGER));
+  } else if (shape == "plain and null-safe keys") {
+    join->conditions.push_back(row_condition(
+      1, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM, duckdb::LogicalType::INTEGER));
+  }
+
+  // A filter over @p child with a row estimate. A constant row reports its own row count and
+  // ignores an estimate, so each estimated side sits under a filter.
+  auto const filtered = [](duckdb::unique_ptr<duckdb::LogicalOperator> child, duckdb::idx_t rows) {
+    auto result = duckdb::make_uniq<duckdb::LogicalFilter>(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)));
+    result->children.push_back(std::move(child));
+    result->has_estimated_cardinality = true;
+    result->estimated_cardinality     = rows;
+    return result;
+  };
+
+  // The outer side: a filter (build evidence) over the left row or over a CTE read, estimated at
+  // 10 rows, or the bare one-row constant. The subquery is estimated at 1000 rows.
+  auto outer = std::move(join->children[0]);
+  if (shape == "outer side reads a CTE") {
+    outer = duckdb::make_uniq<duckdb::LogicalCTERef>(
+      kLeftRow,
+      duckdb::TableIndex{7},
+      duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                          duckdb::LogicalType::INTEGER},
+      duckdb::vector<duckdb::Identifier>{"a", "b"});
+  }
+  if (shape != "outer side without a filter") { outer = filtered(std::move(outer), 10); }
+  auto* const outer_side = outer.get();
+  join->children[0]      = std::move(outer);
+  join->children[1] =
+    filtered(std::move(join->children[1]), shape == "outer side not small enough" ? 29 : 1000);
+  // A reordering map on the outer side: the flip must move it to the side the join now emits.
+  join->left_projection_map = {duckdb::ProjectionIndex(1), duckdb::ProjectionIndex(0)};
+
+  auto expected_bindings = join->GetColumnBindings();
+  expected_bindings.pop_back();  // the mark
+  auto plan = project_left(std::move(filter));
+
+  CHECK(sirius::planner::convert_mark_joins(*con->context, plan) == 1);
+  CHECK(join->GetColumnBindings() == expected_bindings);
+  if (!flips) {
+    CHECK(join->join_type == duckdb::JoinType::SEMI);
+    CHECK(join->children[0].get() == outer_side);
+    return;
+  }
+  CHECK(join->join_type == (anti ? duckdb::JoinType::RIGHT_ANTI : duckdb::JoinType::RIGHT_SEMI));
+  CHECK(join->children[1].get() == outer_side);
+  REQUIRE(join->conditions.size() == 1);
+  auto const& condition = join->conditions[0];
+  CHECK(condition.GetComparisonType() == comparison);
+  CHECK(condition.GetLHS().Cast<duckdb::BoundColumnRefExpression>().Binding().table_index ==
+        kRightRow);
+  CHECK(condition.GetRHS().Cast<duckdb::BoundColumnRefExpression>().Binding().table_index ==
+        kLeftRow);
+  CHECK(join->left_projection_map.empty());
+  CHECK(join->right_projection_map.size() == 2);
 }
 
 namespace {

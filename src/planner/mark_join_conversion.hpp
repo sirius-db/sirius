@@ -38,8 +38,21 @@ namespace sirius::planner {
 /// can, because the probe rows such a filter drops have no match and SEMI drops them anyway.
 ///
 /// An ANTI join cannot publish: it returns exactly the probe rows without a match. Converting it
-/// still spares the GPU a mark for every probe row and the filter over it. The pass runs after
-/// DuckDB picks build sides, so it never yields a RIGHT_ANTI join, which could publish.
+/// still spares the GPU a mark for every probe row and the filter over it.
+///
+/// DuckDB picks build sides while the join is still MARK, which has no flipped form, so a converted
+/// join builds on its subquery and its filter reaches only the outer rows. The pass therefore makes
+/// that choice itself. It flips the join to RIGHT_SEMI or RIGHT_ANTI, which builds on the outer
+/// rows and publishes their keys into the subquery's scans, when:
+///   - a right-family join can publish (`right_family_publication_enabled`);
+///   - every condition is the same kind of equality (all `=` or all `IS NOT DISTINCT FROM`) and one
+///     compares INTEGER or BIGINT columns, the keys early publication takes, so that the flipped
+///     join is a plain hash join (a right-family join has no nested-loop fallback);
+///   - the outer side has filter or semi-join build evidence and reads no CTE (a CTE read there is
+///     the delim rewrite's join-back, whose outer-row read must stay reachable from joins above);
+///   - the outer side's estimated row count is at most a third of the subquery's, the ratio
+///     DuckDB's build-side optimizer uses for semi joins.
+/// A flipped join keeps its keys as they are.
 ///
 /// The rules are DuckDB's own (`FilterPushdown::PushdownMarkJoin`):
 ///   - the filter is exactly the mark column, or exactly NOT(mark column);
