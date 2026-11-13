@@ -18,30 +18,55 @@
 //                            the `values` node its run values, one per run; the lengths add up to
 //                            len - 1.
 
+//
+// The kernel reads delta_first and the per-chunk counts (the differences' chunk_count, or
+// rle_runs_offsets) from the staged payload bytes of the chunks it decodes, so a decode reads
+// nothing back to the host and keeps no per-chunk metadata of its own.
+
+#include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
 
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/std/type_traits>
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace simpatico::chunk {
 
 namespace {
 
-/// Per-chunk decode parameters, uploaded for the chunks of one call.
-struct chunk_meta {
-  std::uint64_t first;  ///< delta_first, zero-extended from the element width
-  std::int32_t n;       ///< differences in the chunk (no rle) or runs in the chunk (rle)
-  std::int32_t cap;     ///< most elements the chunk can hold (1024 unless it is the last one)
+/// The device inputs of one kernel launch: block b decodes chunk first_chunk + b of the node.
+struct chunk_inputs {
+  const std::uint8_t* firsts{nullptr};  ///< delta_first element of block 0
+  /// int32 per block, from block 0's: the differences' chunk_count (no rle), or the
+  /// rle_runs_offsets entries (rle; one more entry than blocks).
+  const std::uint8_t* counts{nullptr};
+  const std::int64_t* values{nullptr};  ///< a 1024-slot block per chunk: differences / run values
+  const std::int64_t* runs{nullptr};    ///< rle: a 1024-slot block per chunk of run lengths
+  std::int64_t first_chunk{0};          ///< node chunk index of block 0
+  std::int64_t num_values{-1};          ///< elements of the delta's input, -1 when unknown
+  bool firsts_aligned{false};           ///< firsts can be loaded as whole elements
+  bool counts_aligned{false};           ///< counts can be loaded as whole int32
 };
+
+/// Little-endian element at `bytes`, which may sit at any address when !aligned (a leaf buffer
+/// can start at any payload offset).
+template <typename U>
+__device__ __forceinline__ U load_element(const std::uint8_t* __restrict__ bytes, bool aligned)
+{
+  if (aligned) { return *reinterpret_cast<const U*>(bytes); }
+  std::uint64_t v = 0;
+  for (std::size_t k = 0; k < sizeof(U); ++k) {
+    v |= static_cast<std::uint64_t>(bytes[k]) << (8 * k);
+  }
+  return static_cast<U>(v);
+}
 
 constexpr int kChunkThreads = static_cast<int>(kChunkRows);
 /// Chunks decoded per pass; bounds the int64 scratch of the unpacked children.
@@ -62,19 +87,15 @@ __device__ __forceinline__ void block_inclusive_sum(std::uint64_t* src, std::uin
   }
 }
 
-/// One block per chunk, one thread per element. `values` (and `runs`) hold one 1024-slot block
-/// per chunk: the chunk's differences, or with `runs != nullptr` its run values and run lengths.
-/// Element i of chunk c is position pos_base + c * 1024 + i; positions in [lo, hi) are written
+/// One block per chunk, one thread per element. in.values (and in.runs) hold one 1024-slot block
+/// per chunk: the chunk's differences, or with in.runs != nullptr its run values and run lengths.
+/// Element i of block c is position pos_base + c * 1024 + i; positions in [lo, hi) are written
 /// to out[position - lo]. Src is the delta's element type (its width wraps the sum and its
-/// signedness extends it into Out).
+/// signedness extends it into Out). A chunk's count is clamped to what its block holds, so
+/// corrupt counts decode to wrong values but never read or write outside the blocks.
 template <typename Src, typename Out>
-__global__ void delta_kernel(const chunk_meta* __restrict__ meta,
-                             const std::int64_t* __restrict__ values,
-                             const std::int64_t* __restrict__ runs,
-                             std::int64_t pos_base,
-                             std::int64_t lo,
-                             std::int64_t hi,
-                             Out* __restrict__ out)
+__global__ void delta_kernel(
+  chunk_inputs in, std::int64_t pos_base, std::int64_t lo, std::int64_t hi, Out* __restrict__ out)
 {
   __shared__ std::uint64_t sa[kChunkThreads];
   __shared__ std::uint64_t sb[kChunkThreads];
@@ -84,13 +105,29 @@ __global__ void delta_kernel(const chunk_meta* __restrict__ meta,
   const std::int64_t chunk_at = pos_base + c * kChunkRows;
   // The same for every thread of the block, so the barriers below stay block-wide.
   if (chunk_at >= hi || chunk_at + kChunkRows <= lo) { return; }
-  const chunk_meta m           = meta[c];
-  const std::int64_t* const in = values + c * kChunkRows;
+  using U                          = typename ::cuda::std::make_unsigned<Src>::type;
+  const std::int64_t* const values = in.values + c * kChunkRows;
+  const std::uint64_t first        = load_element<U>(in.firsts + c * sizeof(U), in.firsts_aligned);
+  // Differences in the chunk (no rle) or runs in the chunk (rle): a chunk of len elements has
+  // len - 1 differences, in at most as many runs.
+  const std::uint8_t* const count_at = in.counts + c * sizeof(std::int32_t);
+  std::int64_t count                 = load_element<std::int32_t>(count_at, in.counts_aligned);
+  if (in.runs != nullptr) {
+    count = load_element<std::int32_t>(count_at + sizeof(std::int32_t), in.counts_aligned) - count;
+  }
+  const int n =
+    count < 0 ? 0 : (count < kChunkThreads ? static_cast<int>(count) : kChunkThreads - 1);
+  // Most elements the chunk can hold: 1024 unless it is the last one.
+  std::int64_t cap = kChunkThreads;
+  if (in.num_values >= 0) {
+    const std::int64_t left = in.num_values - (in.first_chunk + c) * kChunkRows;
+    cap                     = left < 0 ? 0 : (left < cap ? left : cap);
+  }
 
   int ndiff = 0;
-  if (runs != nullptr) {
-    const int nruns = m.n;
-    sa[tid]         = tid < nruns ? static_cast<std::uint64_t>(runs[c * kChunkRows + tid]) : 0;
+  if (in.runs != nullptr) {
+    const int nruns = n;
+    sa[tid]         = tid < nruns ? static_cast<std::uint64_t>(in.runs[c * kChunkRows + tid]) : 0;
     __syncthreads();
     block_inclusive_sum(sa, sb, tid);  // sa[r] = differences up to and including run r
     if (nruns > 0) {
@@ -101,38 +138,30 @@ __global__ void delta_kernel(const chunk_meta* __restrict__ meta,
     const int j        = tid - 1;
     if (j >= 0 && j < ndiff) {
       // The run holding difference j: the first whose end is past j (j < sa[nruns - 1]).
-      int first = 0;
-      int last  = nruns - 1;
-      while (first < last) {
-        const int mid = (first + last) >> 1;
+      int run  = 0;
+      int last = nruns - 1;
+      while (run < last) {
+        const int mid = (run + last) >> 1;
         if (sa[mid] > static_cast<std::uint64_t>(j)) {
           last = mid;
         } else {
-          first = mid + 1;
+          run = mid + 1;
         }
       }
-      diff = static_cast<std::uint64_t>(in[first]);
+      diff = static_cast<std::uint64_t>(values[run]);
     }
     sb[tid] = diff;
   } else {
-    ndiff   = m.n;
-    sb[tid] = (tid >= 1 && tid - 1 < ndiff) ? static_cast<std::uint64_t>(in[tid - 1]) : 0;
+    ndiff   = n;
+    sb[tid] = (tid >= 1 && tid - 1 < ndiff) ? static_cast<std::uint64_t>(values[tid - 1]) : 0;
   }
   __syncthreads();
   block_inclusive_sum(sb, sa, tid);  // sb[i] = sum of the differences before element i
 
-  const int len          = ndiff + 1 < m.cap ? ndiff + 1 : m.cap;
+  const std::int64_t len = ndiff + 1 < cap ? ndiff + 1 : cap;
   const std::int64_t pos = chunk_at + tid;
   if (tid < len && pos >= lo && pos < hi) {
-    out[pos - lo] = static_cast<Out>(static_cast<Src>(m.first + sb[tid]));
-  }
-}
-
-void cuda_try(cudaError_t status, char const* what)
-{
-  if (status != cudaSuccess) {
-    throw std::runtime_error(std::string{"delta chunk decode: "} + what +
-                             " failed: " + cudaGetErrorString(status));
+    out[pos - lo] = static_cast<Out>(static_cast<Src>(first + sb[tid]));
   }
 }
 
@@ -170,80 +199,15 @@ struct delta_state {
   // Bitpack children: the differences (!with_rle), or the run values and run lengths.
   std::unique_ptr<bitpack_state, void (*)(bitpack_state*)> values{no_bitpack_state()};
   std::unique_ptr<bitpack_state, void (*)(bitpack_state*)> runs{no_bitpack_state()};
-  // Per-call transients, kept (grow-only) so a call allocates nothing in the steady state.
-  std::vector<std::uint8_t> host_firsts;
-  std::vector<std::int32_t> host_counts;
-  std::vector<chunk_meta> host_meta;
-  rmm::device_buffer device_meta;
+  // Grow-only scratch of the unpacked children: at most kMaxChunksPerPass chunks, so a call
+  // allocates nothing in the steady state.
   rmm::device_buffer values_scratch;
   rmm::device_buffer runs_scratch;
 
   [[nodiscard]] std::size_t device_bytes() const noexcept
   {
-    return device_meta.size() + values_scratch.size() + runs_scratch.size();
-  }
-
-  /// Reads and uploads the per-chunk parameters of chunks [chunk_begin, chunk_end).
-  const chunk_meta* stage_meta(leaf_access& leaves,
-                               std::int64_t chunk_begin,
-                               std::int64_t chunk_end,
-                               rmm::cuda_stream_view stream)
-  {
-    auto const n = static_cast<std::size_t>(chunk_end - chunk_begin);
-    host_firsts.resize(n * elem_size);
-    leaves.host_bytes(first.leaf,
-                      first.buffer,
-                      static_cast<std::uint64_t>(chunk_begin) * elem_size,
-                      n * elem_size,
-                      host_firsts.data(),
-                      stream);
-    host_meta.assign(n, chunk_meta{});
-    if (with_rle) {
-      host_counts.resize(n + 1);
-      leaves.host_bytes(runs_offsets.leaf,
-                        runs_offsets.buffer,
-                        static_cast<std::uint64_t>(chunk_begin) * sizeof(std::int32_t),
-                        (n + 1) * sizeof(std::int32_t),
-                        host_counts.data(),
-                        stream);
-      for (std::size_t i = 0; i < n; ++i) {
-        host_meta[i].n = host_counts[i + 1] - host_counts[i];
-      }
-    } else {
-      host_counts.resize(n);
-      leaves.host_bytes(diff_counts.leaf,
-                        diff_counts.buffer,
-                        static_cast<std::uint64_t>(chunk_begin) * sizeof(std::int32_t),
-                        n * sizeof(std::int32_t),
-                        host_counts.data(),
-                        stream);
-      for (std::size_t i = 0; i < n; ++i) {
-        host_meta[i].n = host_counts[i];
-      }
-    }
-    for (std::size_t i = 0; i < n; ++i) {
-      auto& m = host_meta[i];
-      // A chunk of len elements has len - 1 differences, in at most as many runs.
-      if (m.n < 0 || m.n >= kChunkRows) {
-        throw std::runtime_error("delta chunk decode: corrupt chunk metadata");
-      }
-      std::memcpy(&m.first, host_firsts.data() + i * elem_size, elem_size);  // little-endian
-      m.cap = static_cast<std::int32_t>(kChunkRows);
-      if (num_values >= 0) {
-        auto const before = (chunk_begin + static_cast<std::int64_t>(i)) * kChunkRows;
-        m.cap = static_cast<std::int32_t>(std::clamp<std::int64_t>(num_values - before, 0, m.cap));
-      }
-    }
-    auto const meta_bytes = n * sizeof(chunk_meta);
-    if (device_meta.size() < meta_bytes) {
-      device_meta = rmm::device_buffer(meta_bytes, stream, leaves.mr());
-    }
-    // host_meta stays alive (and unchanged) until the next call on this state.
-    cuda_try(
-      cudaMemcpyAsync(
-        device_meta.data(), host_meta.data(), meta_bytes, cudaMemcpyHostToDevice, stream.value()),
-      "chunk metadata upload");
-    return static_cast<const chunk_meta*>(device_meta.data());
+    return values_scratch.size() + runs_scratch.size() +
+           (values ? bitpack_state_bytes(*values) : 0) + (runs ? bitpack_state_bytes(*runs) : 0);
   }
 
   /// Decodes chunks [chunk_begin, chunk_end) (non-empty, within the node) and writes the
@@ -258,7 +222,23 @@ struct delta_state {
               Out* out,
               rmm::cuda_stream_view stream)
   {
-    auto const* const meta = stage_meta(leaves, chunk_begin, chunk_end, stream);
+    // delta_first and the counts of exactly the chunks decoded, read by the kernel in place.
+    auto const c0            = static_cast<std::uint64_t>(chunk_begin);
+    auto const n             = static_cast<std::uint64_t>(chunk_end - chunk_begin);
+    auto const& counts       = with_rle ? runs_offsets : diff_counts;
+    auto const* const firsts = reinterpret_cast<const std::uint8_t*>(
+      leaves.device_bytes(first.leaf, first.buffer, c0 * elem_size, n * elem_size, stream));
+    auto const* const count_bytes = reinterpret_cast<const std::uint8_t*>(
+      leaves.device_bytes(counts.leaf,
+                          counts.buffer,
+                          c0 * sizeof(std::int32_t),
+                          (n + (with_rle ? 1 : 0)) * sizeof(std::int32_t),
+                          stream));
+    chunk_inputs in;
+    in.num_values     = num_values;
+    in.firsts_aligned = reinterpret_cast<std::uintptr_t>(firsts) % elem_size == 0;
+    in.counts_aligned = reinterpret_cast<std::uintptr_t>(count_bytes) % alignof(std::int32_t) == 0;
+
     auto const pass_chunks = std::min(chunk_end - chunk_begin, kMaxChunksPerPass);
     auto const scratch = static_cast<std::size_t>(pass_chunks * kChunkRows) * sizeof(std::int64_t);
     if (values_scratch.size() < scratch) {
@@ -269,21 +249,21 @@ struct delta_state {
     }
     auto* const values_out = static_cast<std::int64_t*>(values_scratch.data());
     auto* const runs_out   = with_rle ? static_cast<std::int64_t*>(runs_scratch.data()) : nullptr;
+    in.values              = values_out;
+    in.runs                = runs_out;
 
     for (auto begin = chunk_begin; begin < chunk_end; begin += kMaxChunksPerPass) {
       auto const end = std::min(chunk_end, begin + kMaxChunksPerPass);
       unpack_bitpack_chunks(leaves, *values, begin, end, values_out, stream);
       if (with_rle) { unpack_bitpack_chunks(leaves, *runs, begin, end, runs_out, stream); }
+      auto const done = static_cast<std::size_t>(begin - chunk_begin);
+      in.firsts       = firsts + done * elem_size;
+      in.counts       = count_bytes + done * sizeof(std::int32_t);
+      in.first_chunk  = begin;
       delta_kernel<Src, Out>
         <<<static_cast<unsigned>(end - begin), kChunkThreads, 0, stream.value()>>>(
-          meta + (begin - chunk_begin),
-          values_out,
-          runs_out,
-          (begin - chunk_begin) * kChunkRows,
-          lo,
-          hi,
-          out);
-      cuda_try(cudaGetLastError(), "delta kernel launch");
+          in, static_cast<std::int64_t>(done) * kChunkRows, lo, hi, out);
+      throw_if_cuda_error(cudaGetLastError(), "delta chunk decode: delta kernel launch");
     }
   }
 
@@ -333,15 +313,15 @@ class delta_decoder final : public chunk_decoder {
     }
     auto* const out =
       static_cast<std::byte*>(dst.data) + static_cast<std::size_t>(dst.dst_row_offset) * width;
-    auto run = [&]<typename T>(T*) {
+    auto dispatch = [&]<typename T>(T*) {
       _state->decode<T, T>(
         leaves, chunk_begin, chunk_end, skip, skip + span.take, reinterpret_cast<T*>(out), stream);
     };
     switch (width) {
-      case 1: run(static_cast<std::uint8_t*>(nullptr)); break;
-      case 2: run(static_cast<std::uint16_t*>(nullptr)); break;
-      case 4: run(static_cast<std::uint32_t*>(nullptr)); break;
-      default: run(static_cast<std::uint64_t*>(nullptr)); break;
+      case 1: dispatch(static_cast<std::uint8_t*>(nullptr)); break;
+      case 2: dispatch(static_cast<std::uint16_t*>(nullptr)); break;
+      case 4: dispatch(static_cast<std::uint32_t*>(nullptr)); break;
+      default: dispatch(static_cast<std::uint64_t*>(nullptr)); break;
     }
     return span.take;
   }
@@ -353,6 +333,8 @@ class delta_decoder final : public chunk_decoder {
 };
 
 }  // namespace
+
+std::size_t delta_state_bytes(delta_state const& state) noexcept { return state.device_bytes(); }
 
 std::unique_ptr<delta_state, void (*)(delta_state*)> make_delta_state(
   hpln_column_description const& column, std::uint32_t delta_node)
@@ -436,23 +418,23 @@ void decode_delta_chunks(leaf_access& leaves,
   if (chunk_end == chunk_begin) { return; }
   // One 1024-value block per chunk; the kernel stops at each chunk's own length.
   auto const hi = (chunk_end - chunk_begin) * kChunkRows;
-  auto run      = [&]<typename T>(T*) {
+  auto dispatch = [&]<typename T>(T*) {
     state.decode<T, std::int64_t>(leaves, chunk_begin, chunk_end, 0, hi, out, stream);
   };
   switch (state.elem_size) {
     case 1:
-      state.is_unsigned ? run(static_cast<std::uint8_t*>(nullptr))
-                        : run(static_cast<std::int8_t*>(nullptr));
+      state.is_unsigned ? dispatch(static_cast<std::uint8_t*>(nullptr))
+                        : dispatch(static_cast<std::int8_t*>(nullptr));
       break;
     case 2:
-      state.is_unsigned ? run(static_cast<std::uint16_t*>(nullptr))
-                        : run(static_cast<std::int16_t*>(nullptr));
+      state.is_unsigned ? dispatch(static_cast<std::uint16_t*>(nullptr))
+                        : dispatch(static_cast<std::int16_t*>(nullptr));
       break;
     case 4:
-      state.is_unsigned ? run(static_cast<std::uint32_t*>(nullptr))
-                        : run(static_cast<std::int32_t*>(nullptr));
+      state.is_unsigned ? dispatch(static_cast<std::uint32_t*>(nullptr))
+                        : dispatch(static_cast<std::int32_t*>(nullptr));
       break;
-    default: run(static_cast<std::int64_t*>(nullptr)); break;
+    default: dispatch(static_cast<std::int64_t*>(nullptr)); break;
   }
 }
 

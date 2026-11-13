@@ -19,7 +19,9 @@
 
 namespace simpatico::chunk {
 
-/// One column's compressed bytes, staged on demand and cached for the cursor's lifetime.
+/// One column's compressed bytes, staged on demand. What a decode call stages is freed when that
+/// call returns; the buffers of a dictionary node's own leaves (the keys) are the exception and
+/// stay staged for the cursor's life. A device-resident payload is served in place.
 class leaf_access {
  public:
   virtual ~leaf_access() = default;
@@ -27,14 +29,16 @@ class leaf_access {
   [[nodiscard]] virtual const hpln_column_description& column() const noexcept = 0;
 
   /// Device pointer to bytes [offset, offset + size) of buffer `buffer` of leaf `leaf`; valid
-  /// until the cursor dies.
+  /// until the current decode call returns (until the cursor dies for a dictionary node's own
+  /// leaf buffers).
   virtual const std::byte* device_bytes(std::size_t leaf,
                                         std::size_t buffer,
                                         std::uint64_t offset,
                                         std::uint64_t size,
                                         rmm::cuda_stream_view stream) = 0;
 
-  /// Synchronous host copy of the same bytes (small per-chunk metadata only).
+  /// Synchronous host copy of the same bytes (small per-chunk metadata only). Waits for the
+  /// stream and stages nothing: keep it off the per-call path.
   virtual void host_bytes(std::size_t leaf,
                           std::size_t buffer,
                           std::uint64_t offset,
@@ -77,7 +81,8 @@ class chunk_decoder {
                               column_write_target const& dst,
                               rmm::cuda_stream_view stream) = 0;
 
-  /// Device bytes of decoder-owned state (counted in the cursor's device_bytes_held()).
+  /// Device bytes of decoder-owned state, the state of the primitives it uses included (counted
+  /// in the cursor's device_bytes_held()).
   [[nodiscard]] virtual std::size_t state_bytes() const noexcept = 0;
 };
 
@@ -194,6 +199,8 @@ void unpack_bitpack_chunks(leaf_access& leaves,
                            std::int64_t chunk_end,
                            std::int64_t* out,
                            rmm::cuda_stream_view stream);
+/// Device bytes `state` holds between calls.
+[[nodiscard]] std::size_t bitpack_state_bytes(bitpack_state const& state) noexcept;
 
 /// Delta primitive: decodes chunks [chunk_begin, chunk_end) of a delta(->rle)->bitpack subtree
 /// rooted at `delta_node` to int64 values at out (device).
@@ -206,6 +213,8 @@ void decode_delta_chunks(leaf_access& leaves,
                          std::int64_t chunk_end,
                          std::int64_t* out,
                          rmm::cuda_stream_view stream);
+/// Device bytes `state` holds between calls, its bitpack children included.
+[[nodiscard]] std::size_t delta_state_bytes(delta_state const& state) noexcept;
 
 /// ANS primitive: writes uncompressed bytes [byte_begin, byte_end) of the ANS leaf buffer `ans`
 /// to dst (device), decoding only the 64 KiB blocks that cover the range.
@@ -218,5 +227,20 @@ void decode_ans_range(leaf_access& leaves,
                       std::uint64_t byte_end,
                       void* dst,
                       rmm::cuda_stream_view stream);
+/// Device bytes `state` holds between calls.
+[[nodiscard]] std::size_t ans_state_bytes(ans_state const& state) noexcept;
+
+// ─── Staging, exposed for tests ─────────────────────────────────────────────
+
+/// The leaf_access a cursor over `column` of `description` hands to its decoder.
+std::unique_ptr<leaf_access> make_staged_leaf_access(
+  std::shared_ptr<const hpln_description> description,
+  std::size_t column,
+  std::shared_ptr<payload_source> payload,
+  rmm::device_async_resource_ref mr);
+/// Device bytes currently staged by an access made by make_staged_leaf_access.
+[[nodiscard]] std::size_t staged_bytes_held(leaf_access const& access);
+/// What decompress_column_chunks does to its cursor's access at the end of every call.
+void release_transient_staging(leaf_access& access);
 
 }  // namespace simpatico::chunk

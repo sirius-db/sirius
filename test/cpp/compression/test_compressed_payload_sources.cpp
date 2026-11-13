@@ -49,6 +49,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,7 @@ namespace {
 namespace utils = sirius::test::operator_utils;
 using sirius::compression::describe;
 using sirius::compression::make_payload_source;
+using sirius::compression::open_compressed_payload;
 
 bool has_gpu()
 {
@@ -521,4 +523,35 @@ TEST_CASE("compressed payload sources: a device batch without a table is rejecte
   sirius::compressed_device_representation empty(*env().gpu, nullptr, {"a"}, 0, 0, 0);
   CHECK_THROWS_AS(make_payload_source(empty), std::invalid_argument);
   CHECK_THROWS_AS(describe(empty), std::invalid_argument);
+  CHECK_THROWS_AS(open_compressed_payload(empty, ::cuda::stream_ref{env().stream.value()}),
+                  std::invalid_argument);
+}
+
+TEST_CASE("compressed payload sources: a batch opens as a matching description and source",
+          "[compressed_payload_sources]")
+{
+  if (!has_gpu()) { return; }
+  const sirius::simpatico_compressed_representation* const batches[] = {
+    &tiers().host(), &tiers().disk(), tiers().device.get()};
+  // Dense offsets of the host image, in the same buffer order as every description.
+  auto const host_ranges = buffer_ranges(*describe(tiers().host()));
+  for (auto const* batch : batches) {
+    CAPTURE(typeid(*batch).name());
+    auto const opened = open_compressed_payload(*batch, ::cuda::stream_ref{env().stream.value()});
+    REQUIRE(opened.description != nullptr);
+    REQUIRE(opened.source != nullptr);
+    auto const separate = describe(*batch);
+    check_same_structure(*opened.description, *separate);
+    CHECK(opened.description->payload_bytes == separate->payload_bytes);
+    // The description's offsets are the ones its own source reads the buffers at.
+    auto const ranges = buffer_ranges(*opened.description);
+    CHECK(ranges == buffer_ranges(*separate));
+    REQUIRE(ranges.size() == host_ranges.size());
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+      CAPTURE(i);
+      REQUIRE(ranges[i].second == host_ranges[i].second);
+      CHECK(read_range(*opened.source, ranges[i].first, ranges[i].second) ==
+            expected_range(host_ranges[i].first, host_ranges[i].second));
+    }
+  }
 }

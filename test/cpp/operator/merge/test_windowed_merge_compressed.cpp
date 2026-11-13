@@ -51,6 +51,8 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
 
@@ -1151,17 +1153,15 @@ TEST_CASE("windowed ORDER BY reads the runs the downgrade executor spilled compr
           "[windowed_merge_compressed]")
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
-  // One run stays on the GPU: the operator takes the partition's schema from it.
+  // One run stays on the GPU and is sliced in place next to the compressed ones.
   check_order_by_over_spilled_runs(1);
 }
 
-// Hidden: fails until sirius_physical_merge_sort can take the schema of a partition from a
-// compressed batch. With every run compressed it finds no schema and merges the partition
-// one-shot, converting every run whole to the GPU.
 TEST_CASE("windowed ORDER BY reads a partition whose runs were all spilled compressed",
-          "[.][windowed_merge_all_compressed]")
+          "[windowed_merge_compressed][windowed_merge_all_compressed]")
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
+  // No run exposes a table: the operator takes the partition's schema from a compressed header.
   check_order_by_over_spilled_runs(0);
 }
 
@@ -1232,4 +1232,85 @@ TEST_CASE("windowed_merger reads compressed runs through 1024-row windows",
   CHECK(stats.fallback_conversions == 0);
   CHECK(stats.refill_rows == runs.total_rows);
   CHECK(runs.representations() == representations);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Where the readers' device memory comes from
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Makes @p resource the current device resource until the end of the scope.
+class current_resource_guard {
+ public:
+  explicit current_resource_guard(rmm::device_async_resource_ref resource)
+    : _previous(cudf::set_current_device_resource(
+        ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource}))
+  {
+  }
+  current_resource_guard(const current_resource_guard&)            = delete;
+  current_resource_guard& operator=(const current_resource_guard&) = delete;
+  ~current_resource_guard() { (void)cudf::set_current_device_resource(std::move(_previous)); }
+
+ private:
+  ::cuda::mr::any_resource<::cuda::mr::device_accessible> _previous;
+};
+
+}  // namespace
+
+TEST_CASE("windowed_merger keeps the compressed readers' memory in the task's GPU space",
+          "[windowed_merge_compressed]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  tiers_fixture fx;
+  scoped_spill_compression compression;
+  // Dictionary, bitpack and delta columns: their readers keep decode state on the device from
+  // one refill to the next, and so from one run() to the next.
+  compressed_runs runs(fx,
+                       {{.batch_rows = {9000}, .null_keys = 50},
+                        {.batch_rows = {7000}, .null_keys = 0},
+                        {.batch_rows = {8000}, .null_keys = 3}},
+                       3);
+  CHECK(runs.plans.ops.contains("dictionary"));
+  auto const keys     = ascending_key();
+  auto const expected = expected_full_sort(runs.runs, keys);
+  fx.stream.synchronize();
+
+  // What the merge leaves allocated in the current device resource, the one a reader without a
+  // scratch reservation uses.
+  rmm::mr::statistics_resource_adaptor current{
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      cudf::get_current_device_resource_ref()}};
+  auto const available_before = fx.gpu->get_available_memory();
+  std::vector<cudf::table_view> views;
+  std::vector<std::unique_ptr<cudf::table>> chunks;
+  {
+    auto merger = runs.make_merger(keys, {.window_rows = 1024, .output_target_bytes = 1});
+    merge::merge_round_stats stats;
+    {
+      const current_resource_guard guard{rmm::device_async_resource_ref{current}};
+      while (!all_exhausted(runs.cursors)) {
+        REQUIRE(chunks.size() < 1000);
+        chunks.push_back(merger.run(fx.stream_view(), fx.mr(), &stats));
+        views.push_back(chunks.back()->view());
+        // Between two run() calls the merger holds its windows and the readers' state: all of
+        // it in the GPU space, none in the current device resource.
+        CHECK(current.get_bytes_counter().value == 0);
+        if (!all_exhausted(runs.cursors)) {
+          CHECK(fx.gpu->get_available_memory() < available_before);
+        }
+      }
+    }
+    CHECK(chunks.size() > 3);
+    CHECK(stats.fallback_conversions == 0);
+    CHECK(stats.refill_rows == runs.total_rows);
+    auto const merged = cudf::concatenate(views, fx.stream_view(), fx.mr());
+    REQUIRE(merged->num_rows() == expected->num_rows());
+    CHECK(tables_equal(merged->view(), expected->view()));
+    views.clear();
+    chunks.clear();
+  }
+  // The merger is gone, and with it every window and reader state.
+  fx.stream.synchronize();
+  CHECK(fx.gpu->get_available_memory() == available_before);
 }

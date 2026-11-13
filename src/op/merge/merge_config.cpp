@@ -176,4 +176,22 @@ std::size_t estimate_task_bytes(std::size_t k,
   return saturating_add(total, largest_fallback_run_bytes);
 }
 
+std::size_t estimate_reader_state_bytes(std::size_t compressed_runs,
+                                        std::size_t fetch_columns,
+                                        std::size_t string_columns,
+                                        std::size_t window_rows)
+{
+  // Rows of the 1024-row chunks that cover a window starting anywhere in a chunk.
+  constexpr std::size_t chunk_slack_rows = 2048;
+  // Two int64 scratch values per row: the run values and run lengths of a delta column.
+  constexpr std::size_t scratch_bytes_per_row = 16;
+  // Offsets scratch of a str_split column.
+  constexpr std::size_t string_scratch_bytes = std::size_t{2} << 20;
+  auto const per_column =
+    saturating_mul(scratch_bytes_per_row, saturating_add(window_rows, chunk_slack_rows));
+  auto const per_run = saturating_add(saturating_mul(fetch_columns, per_column),
+                                      saturating_mul(string_columns, string_scratch_bytes));
+  return saturating_mul(compressed_runs, per_run);
+}
+
 }  // namespace sirius::op::merge

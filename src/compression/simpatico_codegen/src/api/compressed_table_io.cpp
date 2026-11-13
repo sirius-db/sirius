@@ -6,6 +6,7 @@
 #include "api/compressed_table_io.hpp"
 
 #include "api/chunk_decode.hpp"
+#include "api/hpln_header_parse.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
@@ -1071,11 +1072,9 @@ compressed_table read_compressed_table_subset_from_memory(
 
 namespace detail {
 
-// Backs describe_hpln_header (api/hpln_describe.cpp): runs the reader's own header
-// parser and copies the records out, so the description can never disagree with what
-// read_compressed_table_from_memory fetches. Returns an error message, or empty on
-// success. Touches neither the payload nor the device.
-std::string describe_hpln_header(std::span<const std::uint8_t> header, hpln_description& out)
+// Runs the reader's own header parser and copies the records out, so the description can
+// never disagree with what read_compressed_table_from_memory fetches.
+std::string parse_hpln_description(std::span<const std::uint8_t> header, hpln_description& out)
 {
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> recs;

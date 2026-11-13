@@ -125,8 +125,9 @@ bool same_buffer(request const& r, chunk::buffer_ref ref)
 }
 
 /// Asserts that the logged requests touch only the subtree's buffers, and of those only the
-/// metadata and packed words of chunks [chunk_begin, chunk_end) (chunk_count / chunk_bits of a
-/// bitpack child may start earlier: its word prefix needs them).
+/// metadata and packed words of chunks [chunk_begin, chunk_end). chunk_count / chunk_bits of a
+/// bitpack child are the exception: its state reads the whole node's to the host once, so only
+/// what is staged on the device is held to the span.
 void expect_requests(device_leaf_access const& access,
                      delta_layout const& layout,
                      std::int64_t chunk_begin,
@@ -181,11 +182,15 @@ void expect_requests(device_leaf_access const& access,
     if (bytes(loc.chunk_min) != (c1 - c0) * child.elem_size) {
       fail(child.name + " chunk_min bytes requested != the span's");
     }
-    if (!within(loc.chunk_count, 0, c1 * 4)) {
-      fail(child.name + " chunk_count requested past the span");
-    }
-    if (!within(loc.chunk_bits, 0, c1)) {
-      fail(child.name + " chunk_bits requested past the span");
+    for (auto const& r : access.device_requests()) {
+      auto const offset = std::get<2>(r);
+      auto const end    = offset + std::get<3>(r);
+      if (same_buffer(r, loc.chunk_count) && (offset < c0 * 4 || end > c1 * 4)) {
+        fail(child.name + " chunk_count staged outside the span");
+      }
+      if (same_buffer(r, loc.chunk_bits) && (offset < c0 || end > c1)) {
+        fail(child.name + " chunk_bits staged outside the span");
+      }
     }
     auto const word_begin = child.word_prefix[c0] * 4;
     auto const word_end   = child.word_prefix[c1] * 4;
@@ -879,6 +884,96 @@ int test_many_chunks_primitive(rmm::cuda_stream_view stream)
   return 2;
 }
 
+/// A decode after a state's first reads nothing back to the host (through the root decoder and
+/// through decode_delta_chunks), and the device bytes a state holds follow the window decoded,
+/// not the column.
+int test_steady_state(rmm::cuda_stream_view stream)
+{
+  constexpr std::int64_t kColumnChunks = 200;
+  constexpr std::int64_t kWindow       = 4;  // chunks per decode
+  column_options options;
+  options.rows       = static_cast<cudf::size_type>(kColumnChunks * kChunkRows - 300);
+  options.seed       = 1000;
+  options.sorted     = true;
+  options.run_length = 3;
+  auto const input   = make_random_column(cudf::type_id::INT64, options, stream);
+  // One window's int64 scratch of one bitpack child; a state holds that, at most as much again
+  // to realign the packed words, and per-chunk metadata far smaller than either.
+  auto const window_bytes = static_cast<std::size_t>(kWindow * kChunkRows) * sizeof(std::int64_t);
+  auto const column_bytes =
+    static_cast<std::size_t>(kColumnChunks * kChunkRows) * sizeof(std::int64_t);
+
+  for (bool const rle : {false, true}) {
+    root_fixture fx{"steady state", input->view(), rle, stream};
+    auto const nc       = fx.num_chunks();
+    auto const children = fx.layout.children.size();
+    auto const bound    = 3 * children * window_bytes;
+    expect(bound < column_bytes / 4,
+           (fx.label + ": the window is not small in the column").c_str());
+
+    // Root decoder: windows of rows that start mid-chunk.
+    rmm::device_buffer buffer(window_bytes, stream);
+    column_write_target dst;
+    dst.data          = buffer.data();
+    dst.data_capacity = buffer.size();
+    bool first_call   = true;
+    for (std::int64_t row = 100; row < fx.rows(); row += kWindow * kChunkRows - 7) {
+      auto const take = std::min<std::int64_t>(kWindow * kChunkRows - 7, fx.rows() - row);
+      chunk::chunk_span const span{
+        row / kChunkRows, (row + take + kChunkRows - 1) / kChunkRows, row % kChunkRows, take};
+      fx.access.clear_requests();
+      expect(fx.decoder->decode(fx.access, span, dst, stream) == take,
+             (fx.label + ": rows written != take").c_str());
+      expect(
+        first_call || fx.access.host_requests().empty(),
+        (fx.label + ": a decode after the decoder's first read bytes back to the host").c_str());
+      first_call = false;
+      expect(compare_fixed_width_rows(fx.oracle->view(),
+                                      buffer.data(),
+                                      0,
+                                      static_cast<cudf::size_type>(row),
+                                      static_cast<cudf::size_type>(take),
+                                      stream,
+                                      compare_options{true}),
+             (fx.label + ": a window's rows differ from the full decode").c_str());
+    }
+    expect(fx.decoder->state_bytes() != 0 && fx.decoder->state_bytes() <= bound,
+           (fx.label + ": the decoder's state is " + std::to_string(fx.decoder->state_bytes()) +
+            " bytes after windows of " + std::to_string(window_bytes))
+             .c_str());
+
+    // decode_delta_chunks: windows of whole chunks on a state of its own.
+    auto const expected = oracle_values(fx.oracle->view(), stream);
+    auto state          = chunk::make_delta_state(fx.access.column(), fx.layout.node);
+    expect(chunk::delta_state_bytes(*state) == 0,
+           (fx.label + ": a delta state holds device bytes before its first decode").c_str());
+    rmm::device_buffer out(window_bytes, stream);
+    for (std::int64_t c0 = 0; c0 < nc; c0 += kWindow) {
+      auto const c1 = std::min(nc, c0 + kWindow);
+      fx.access.clear_requests();
+      chunk::decode_delta_chunks(
+        fx.access, *state, c0, c1, static_cast<std::int64_t*>(out.data()), stream);
+      expect(
+        c0 == 0 || fx.access.host_requests().empty(),
+        (fx.label + ": decode_delta_chunks after the state's first read bytes back to the host")
+          .c_str());
+      auto const begin = static_cast<std::size_t>(c0 * kChunkRows);
+      auto const count =
+        std::min(expected.size(), static_cast<std::size_t>(c1 * kChunkRows)) - begin;
+      auto const got = read_device<std::int64_t>(out.data(), count, stream);
+      expect(
+        std::equal(got.begin(), got.end(), expected.begin() + static_cast<std::ptrdiff_t>(begin)),
+        (fx.label + ": a window of chunks differs from the full decode").c_str());
+    }
+    auto const held = chunk::delta_state_bytes(*state);
+    expect(held != 0 && held <= bound,
+           (fx.label + ": the delta state holds " + std::to_string(held) +
+            " bytes after windows of " + std::to_string(window_bytes))
+             .c_str());
+  }
+  return 2;
+}
+
 }  // namespace
 
 int main()
@@ -903,6 +998,7 @@ int main()
     cases += test_factory_rejects(stream);
     cases += test_appended_spans(stream);
     cases += test_many_chunks_primitive(stream);
+    cases += test_steady_state(stream);
     std::printf("test_chunk_delta: PASS (%d cases)\n", cases);
     return 0;
   } catch (std::exception const& e) {

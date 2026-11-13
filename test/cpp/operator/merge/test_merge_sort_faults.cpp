@@ -57,8 +57,6 @@
 
 #include <cuda_runtime.h>
 
-#include <compression/compressed_representation.hpp>
-#include <compression/spill_compression.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -205,18 +203,6 @@ void convert_unlocked_batch(fault_fixture& fx,
   }
   fx.stream.synchronize();
 }
-
-/// Switches spill compression on for one test and off afterwards.
-struct scoped_spill_compression {
-  scoped_spill_compression()
-  {
-    sirius::compression::spill_compression_settings settings;
-    settings.enabled         = true;
-    settings.min_batch_bytes = 0;
-    sirius::compression::set_spill_compression_settings(settings);
-  }
-  ~scoped_spill_compression() { sirius::compression::set_spill_compression_settings({}); }
-};
 
 // ---------------------------------------------------------------------------
 // Rows and runs
@@ -1279,21 +1265,6 @@ TEST_CASE("windowed merge converts a packed host run to the GPU once", "[merge_s
   check_fallback_merge<cucascade::host_data_packed_representation>(
     fx, [&](cucascade::data_batch& batch) {
       convert_batch<cucascade::host_data_packed_representation>(fx, batch, fx.host);
-    });
-}
-
-TEST_CASE("windowed merge converts a spill-compressed run to the GPU once", "[merge_sort_faults]")
-{
-  if (!has_gpu()) { SKIP("No GPU available"); }
-  fault_fixture fx;
-  scoped_spill_compression compression;
-  check_fallback_merge<sirius::compressed_host_representation>(
-    fx, [&](cucascade::data_batch& batch) {
-      // The spill path: the downgrade's own conversion, with compression on.
-      auto shared = batch.shared_from_this();
-      sirius::convertible_data_batch convertible(shared);
-      REQUIRE(convertible.convert({fx.host}, fx.stream_ref(), *fx.manager, true).has_value());
-      fx.stream.synchronize();
     });
 }
 

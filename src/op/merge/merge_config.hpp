@@ -159,4 +159,22 @@ std::size_t estimate_task_bytes(std::size_t k,
                                 std::size_t output_target_bytes,
                                 std::size_t largest_fallback_run_bytes);
 
+/**
+ * @brief Estimate the GPU bytes the row-range readers of compressed runs keep between refills.
+ *
+ * A compressed run is read through one decode cursor per fetched column. A cursor keeps grow-only
+ * scratch sized by the chunks that cover one window: up to two int64 values per row (delta with
+ * run lengths), and a fixed scratch for a STRING column's offsets. Dictionary keys, which a
+ * cursor also keeps, depend on the data and are not estimated.
+ *
+ * @param compressed_runs Runs of the task that hold a compressed batch.
+ * @param fetch_columns Columns the task fetches.
+ * @param string_columns How many of them are STRING.
+ * @param window_rows n: maximum rows per input window.
+ */
+std::size_t estimate_reader_state_bytes(std::size_t compressed_runs,
+                                        std::size_t fetch_columns,
+                                        std::size_t string_columns,
+                                        std::size_t window_rows);
+
 }  // namespace sirius::op::merge

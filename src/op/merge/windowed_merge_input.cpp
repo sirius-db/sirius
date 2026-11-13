@@ -19,6 +19,7 @@
 #include "op/merge/merge_config.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -46,7 +47,10 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
                                            std::size_t row_width,
                                            std::size_t key_row_width,
                                            std::size_t gpu_runs,
-                                           std::size_t largest_fallback_run_bytes)
+                                           std::size_t largest_fallback_run_bytes,
+                                           std::size_t compressed_runs,
+                                           std::size_t fetch_columns,
+                                           std::size_t string_columns)
   : _partition(partition),
     _cursors(std::move(cursors)),
     _final_pass(final_pass),
@@ -55,7 +59,10 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
     _row_width(row_width),
     _key_row_width(key_row_width),
     _gpu_runs(gpu_runs),
-    _largest_fallback_run_bytes(largest_fallback_run_bytes)
+    _largest_fallback_run_bytes(largest_fallback_run_bytes),
+    _compressed_runs(compressed_runs),
+    _fetch_columns(fetch_columns),
+    _string_columns(string_columns)
 {
 }
 
@@ -67,13 +74,18 @@ void windowed_merge_input::prepare_for_processing(
 
 std::size_t windowed_merge_input::get_estimated_size_in_bytes() const
 {
-  return estimate_task_bytes(_cursors.size(),
-                             _gpu_runs,
-                             _cfg.window_rows,
-                             _row_width,
-                             _key_row_width,
-                             _cfg.output_target_bytes,
-                             _largest_fallback_run_bytes);
+  auto const task   = estimate_task_bytes(_cursors.size(),
+                                        _gpu_runs,
+                                        _cfg.window_rows,
+                                        _row_width,
+                                        _key_row_width,
+                                        _cfg.output_target_bytes,
+                                        _largest_fallback_run_bytes);
+  auto const reader = estimate_reader_state_bytes(
+    _compressed_runs, _fetch_columns, _string_columns, _cfg.window_rows);
+  return reader > std::numeric_limits<std::size_t>::max() - task
+           ? std::numeric_limits<std::size_t>::max()
+           : task + reader;
 }
 
 std::size_t windowed_merge_input::get_estimated_working_set_size_in_bytes() const

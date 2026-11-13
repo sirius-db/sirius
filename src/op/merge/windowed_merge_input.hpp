@@ -46,6 +46,10 @@ class windowed_merge_input final : public operator_data {
    * @param key_row_width Estimated row width in bytes of the key columns.
    * @param gpu_runs How many of the runs are GPU-resident.
    * @param largest_fallback_run_bytes Largest run that may be converted whole to the GPU tier.
+   * @param compressed_runs How many of the runs hold a compressed batch (read through decode
+   *        cursors that keep scratch between refills).
+   * @param fetch_columns Columns the task fetches.
+   * @param string_columns How many of the fetched columns are STRING.
    */
   windowed_merge_input(std::size_t partition,
                        std::vector<merge_input_cursor> cursors,
@@ -55,7 +59,10 @@ class windowed_merge_input final : public operator_data {
                        std::size_t row_width,
                        std::size_t key_row_width,
                        std::size_t gpu_runs,
-                       std::size_t largest_fallback_run_bytes);
+                       std::size_t largest_fallback_run_bytes,
+                       std::size_t compressed_runs = 0,
+                       std::size_t fetch_columns   = 0,
+                       std::size_t string_columns  = 0);
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -66,7 +73,8 @@ class windowed_merge_input final : public operator_data {
   void prepare_for_processing(const cucascade::memory::memory_space* requested_memory_space,
                               ::cuda::stream_ref stream) override;
 
-  /// estimate_task_bytes(...) of the task's current window_config.
+  /// estimate_task_bytes(...) plus estimate_reader_state_bytes(...) of the task's current
+  /// window_config.
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   /// Same as get_estimated_size_in_bytes().
@@ -104,6 +112,9 @@ class windowed_merge_input final : public operator_data {
   std::size_t _key_row_width;
   std::size_t _gpu_runs;
   std::size_t _largest_fallback_run_bytes;
+  std::size_t _compressed_runs;
+  std::size_t _fetch_columns;
+  std::size_t _string_columns;
   cucascade::memory::memory_space* _gpu_memory_space = nullptr;
 };
 

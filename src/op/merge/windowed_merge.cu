@@ -33,6 +33,7 @@
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/disk_table.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -288,6 +289,7 @@ struct windowed_merger::impl {
                    std::size_t run_idx,
                    rmm::cuda_stream_view stream,
                    rmm::device_async_resource_ref mr,
+                   cucascade::memory::reservation* scratch,
                    merge_round_stats& stats)
   {
     if (run.gpu_lock) {
@@ -358,7 +360,7 @@ struct windowed_merger::impl {
                                            fetch_cols,
                                            run.cursor.row + carried,
                                            &held.reader_state,
-                                           nullptr,
+                                           scratch,
                                            stream);
                 stats.window_growths += held.buffer->chars_growths() - growths_before;
               } catch (const detail::window_row_too_large_error&) {
@@ -454,6 +456,14 @@ struct windowed_merger::impl {
                                    rmm::device_async_resource_ref mr,
                                    merge_round_stats* stats)
   {
+    // The readers take their device memory from the resource of a scratch reservation: the
+    // temporaries of a refill and, for a compressed batch, the decode state kept in the run's
+    // reader state. An empty reservation of the task's GPU space names that space's allocator,
+    // which charges what is allocated on `stream` to the task, like the windows. It reserves no
+    // bytes and no reader draws on it; it lives for this call only, so that no reservation of
+    // the merger is left open between two tasks.
+    const auto scratch = gpu_space->make_reservation_upto(0);
+
     // Everything below works on copies; the caller's cursors and stats change only on return.
     round_windows windows(runs.size(), stream);
     for (std::size_t i = 0; i < runs.size(); ++i) {
@@ -503,7 +513,7 @@ struct windowed_merger::impl {
       for (std::size_t i = 0; i < windows.runs.size(); ++i) {
         auto& run = windows.runs[i];
         if (run.cursor.exhausted()) { continue; }
-        fill_window(run, i, stream, mr, local);
+        fill_window(run, i, stream, mr, scratch.get(), local);
         active.push_back(i);
         round_views.push_back(run.window);
         truncated.push_back(

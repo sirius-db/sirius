@@ -308,6 +308,21 @@ TEST_CASE("plan_pass picks the smallest runs for an intermediate pass", "[merge_
   }
 }
 
+TEST_CASE("estimate_reader_state_bytes covers the decode scratch of compressed runs",
+          "[merge_config][unit]")
+{
+  using sirius::op::merge::estimate_reader_state_bytes;
+  constexpr std::size_t runs = 6, columns = 9, strings = 2, n = 100'000;
+
+  // Two int64 per row of the chunks covering a window, per column; 2 MiB per STRING column.
+  CHECK(estimate_reader_state_bytes(runs, columns, strings, n) ==
+        runs * (columns * 16 * (n + 2048) + strings * 2 * kMiB));
+  CHECK(estimate_reader_state_bytes(0, columns, strings, n) == 0);
+  CHECK(estimate_reader_state_bytes(runs, 0, 0, n) == 0);
+  CHECK(estimate_reader_state_bytes(kMax, columns, strings, n) == kMax);
+  CHECK(estimate_reader_state_bytes(runs, columns, strings, kMax) == kMax);
+}
+
 TEST_CASE("estimate_task_bytes sums windows, keys, output and the fallback run",
           "[merge_config][unit]")
 {

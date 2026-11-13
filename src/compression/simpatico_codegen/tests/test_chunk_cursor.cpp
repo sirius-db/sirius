@@ -30,17 +30,6 @@
 #include <utility>
 #include <vector>
 
-// Defined in api/chunk_decode.cpp for this test: the cursor's leaf_access without a decoder.
-namespace simpatico::chunk {
-std::unique_ptr<leaf_access> make_staged_leaf_access(
-  std::shared_ptr<const hpln_description> description,
-  std::size_t column,
-  std::shared_ptr<payload_source> payload,
-  rmm::device_async_resource_ref mr);
-std::size_t staged_bytes_held(leaf_access const& access);
-void release_transient_staging(leaf_access& access);
-}  // namespace simpatico::chunk
-
 namespace {
 
 using namespace simpatico;
@@ -846,9 +835,13 @@ void test_real_plans()
 
 // ─── 6. Windowed reads through the cursor from a host payload ───────────────
 
+/// Device bytes a cursor over a stored column may hold between calls.
+constexpr std::size_t kStoredStateBytes = 64;
+
 // A column read in three successive windows through one cursor whose payload is not on the
 // device: every window decodes to the oracle's rows although the bytes staged for the window
-// before it were freed, and a decoder without state leaves the cursor holding nothing.
+// before it were freed, and a stored column leaves the cursor holding none of its payload (at
+// most the few bytes a STRING call reports its cut in).
 void test_windowed_read(real_case const& c)
 {
   rmm::cuda_stream_view const stream{cudf::get_default_stream()};
@@ -902,8 +895,8 @@ void test_windowed_read(real_case const& c)
             "windowed read: rows [" + std::to_string(done) + ", " + std::to_string(end) + ") of " +
               what);
       if (c.expected == value_plan::stored) {
-        check(cursor.device_bytes_held() == 0,
-              "windowed read: nothing held between calls, " + what);
+        check(cursor.device_bytes_held() <= kStoredStateBytes,
+              "windowed read: no payload held between calls, " + what);
       }
       done = end;
       if (is_string) {
@@ -932,6 +925,96 @@ void test_windowed_reads()
   }
 }
 
+// ─── 7. A long column leaves the cursor a window-sized footprint ────────────
+
+constexpr cudf::size_type kWalkWindowChunks = 4;
+/// Device bytes a cursor may hold between calls for decoder scratch, per row of its windows.
+constexpr std::size_t kWalkScratchBytesPerRow = 64;
+/// How far the footprints of a short and a long column walked alike may differ.
+constexpr std::size_t kWalkFootprintSlack = 4096;
+
+// Reads the column window by window through one cursor over a host payload. Returns the most
+// device bytes the cursor held between calls.
+std::size_t walk_footprint(real_case const& c, cudf::size_type rows)
+{
+  rmm::cuda_stream_view const stream{cudf::get_default_stream()};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  auto options      = c.options;
+  options.rows      = rows;
+  auto const input  = chunk_test::make_random_column(c.type, options, stream);
+  auto const table  = chunk_test::compress_column_with_plan(input->view(), c.plan, stream, mr);
+  auto const col    = chunk_test::describe_from_table(table, 0, stream);
+  auto const oracle = chunk_test::full_decode(table, 0, stream, mr);
+  auto const what   = std::string{c.what} + ", " + std::to_string(rows) + " rows";
+  auto check        = [&](bool cond, std::string const& msg) { expect(cond, msg.c_str()); };
+
+  auto const host = chunk_test::flatten_payload_host(table, 0, stream);
+  std::vector<std::uint8_t> payload(host.size());
+  std::transform(host.begin(), host.end(), payload.begin(), [](std::byte b) {
+    return static_cast<std::uint8_t>(b);
+  });
+  auto source = std::make_shared<recording_source>(std::move(payload));
+
+  auto const window = static_cast<cudf::size_type>(kWalkWindowChunks * kChunkRows);
+  rmm::device_buffer data{static_cast<std::size_t>(window) * cudf::size_of(col.dtype), stream, mr};
+  rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(window), stream, mr};
+  column_write_target dst;
+  dst.data          = data.data();
+  dst.data_capacity = data.size();
+  dst.null_mask     = static_cast<cudf::bitmask_type*>(mask.data());
+
+  compressed_column_cursor cursor{describe(col), 0, source, stream, mr};
+  check(cursor.supported(), "long walk: the cursor supports " + what);
+  auto const window_bytes = static_cast<std::size_t>(window) * kWalkScratchBytesPerRow;
+  std::size_t most_held   = 0;
+  for (cudf::size_type row = 0; row < rows; row += window) {
+    auto const take    = std::min(window, rows - row);
+    auto const begin   = static_cast<cudf::size_type>(row / kChunkRows);
+    auto const end     = static_cast<cudf::size_type>((row + take + kChunkRows - 1) / kChunkRows);
+    auto const written = decompress_column_chunks(cursor, begin, end, 0, take, dst, stream);
+    check(written == take, "long walk: rows written, " + what);
+    check(
+      chunk_test::compare_rows(oracle->view(), dst, row, take, stream),
+      "long walk: rows [" + std::to_string(row) + ", +" + std::to_string(take) + ") of " + what);
+    auto const held = cursor.device_bytes_held();
+    check(held <= window_bytes,
+          "long walk: the cursor holds " + std::to_string(held) + " device bytes after rows [" +
+            std::to_string(row) + ", +" + std::to_string(take) + ") of " + what + ", over the " +
+            std::to_string(window_bytes) + " of a window");
+    most_held = std::max(most_held, held);
+  }
+  return most_held;
+}
+
+// What a cursor holds between calls is sized by its windows, not by the column: a column of
+// about a million rows walked in windows of four chunks leaves the cursor the footprint a column
+// a sixteenth of its length does.
+void test_long_walk_footprint()
+{
+  constexpr cudf::size_type short_rows = 62'500;     // 62 chunks
+  constexpr cudf::size_type long_rows  = 1'000'000;  // 977 chunks
+  for (auto const& c : real_cases()) {
+    std::string const what{c.what};
+    if (what != "bitpack INT32" && what != "delta INT64") { continue; }
+    auto const short_held = walk_footprint(c, short_rows);
+    auto const long_held  = walk_footprint(c, long_rows);
+    std::printf(
+      "  %s: cursor holds at most %zu device bytes between calls over %d rows, %zu over "
+      "%d rows\n",
+      c.what,
+      short_held,
+      short_rows,
+      long_held,
+      long_rows);
+    expect(
+      long_held <= short_held + kWalkFootprintSlack,
+      ("long walk: the cursor's footprint grows with the column: " + std::to_string(short_held) +
+       " device bytes over " + std::to_string(short_rows) + " rows, " + std::to_string(long_held) +
+       " over " + std::to_string(long_rows) + " rows of " + what)
+        .c_str());
+  }
+}
+
 }  // namespace
 
 int main()
@@ -951,6 +1034,7 @@ int main()
     test_dispatch();
     test_real_plans();
     test_windowed_reads();
+    test_long_walk_footprint();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());
     return 1;

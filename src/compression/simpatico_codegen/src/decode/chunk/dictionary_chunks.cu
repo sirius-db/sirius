@@ -19,6 +19,7 @@
 // to know the longest key) and are kept on the device as int64; the chars stay where the
 // leaf_access staged them.
 
+#include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
 
 #include <cudf/utilities/traits.hpp>
@@ -43,13 +44,6 @@
 namespace simpatico::chunk {
 
 namespace {
-
-void check_cuda(cudaError_t status)
-{
-  if (status != cudaSuccess) {
-    throw std::runtime_error(std::string{"dictionary chunk decode: "} + cudaGetErrorString(status));
-  }
-}
 
 // Length of the key row `i` of the span points at; 0 for an index outside the keys.
 struct key_length_fn {
@@ -218,11 +212,10 @@ class dictionary_decoder final : public chunk_decoder {
     return rows;
   }
 
-  // The bitpack primitive's own scratch (per-call chunk metadata, realigned words) is opaque
-  // here and not counted.
   [[nodiscard]] std::size_t state_bytes() const noexcept override
   {
-    return _key_offsets.size() + _indices.size() + _ends.size();
+    return _key_offsets.size() + _indices.size() + _ends.size() +
+           bitpack_state_bytes(*_indices_state);
   }
 
  private:
@@ -271,9 +264,12 @@ class dictionary_decoder final : public chunk_decoder {
     }
 
     rmm::device_buffer device(count * sizeof(std::int64_t), stream, leaves.mr());
-    check_cuda(cudaMemcpyAsync(
-      device.data(), offsets.data(), device.size(), cudaMemcpyHostToDevice, stream.value()));
-    // `offsets` dies with this scope.
+    throw_if_cuda_error(
+      cudaMemcpyAsync(
+        device.data(), offsets.data(), device.size(), cudaMemcpyHostToDevice, stream.value()),
+      "dictionary chunk decode: key offsets upload");
+    // `offsets` dies with this scope: the copy must have run before it does. This is the first
+    // decode only, which has already waited for the stream to read the offsets.
     stream.synchronize();
 
     if (_loc.keys_chars_bytes != 0) {

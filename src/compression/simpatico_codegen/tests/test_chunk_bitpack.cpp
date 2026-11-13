@@ -105,9 +105,31 @@ bool same_buffer(request const& r, chunk::buffer_ref ref)
   return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
 }
 
-/// Asserts that the logged requests touch only the minima and packed words of chunks
-/// [chunk_begin, chunk_end), both staged on the device with no host readback. chunk_count /
-/// chunk_bits are the exception: the state reads the whole node's once, on its first decode.
+/// Bytes of `ref` among `requests`, and whether they all lie within [begin, end).
+struct buffer_requests {
+  std::uint64_t bytes{0};
+  bool within{true};
+};
+
+buffer_requests requests_of(std::vector<request> const& requests,
+                            chunk::buffer_ref ref,
+                            std::uint64_t begin,
+                            std::uint64_t end)
+{
+  buffer_requests out;
+  for (auto const& r : requests) {
+    if (!same_buffer(r, ref)) { continue; }
+    auto const offset = std::get<2>(r);
+    auto const size   = std::get<3>(r);
+    out.bytes += size;
+    out.within = out.within && offset >= begin && offset + size <= end;
+  }
+  return out;
+}
+
+/// Asserts that the logged requests stage only the minima, counts, bits and packed words of
+/// chunks [chunk_begin, chunk_end) on the device. The one host readback allowed is the state's
+/// first decode reading the whole node's chunk_count / chunk_bits, once.
 void expect_requests(device_leaf_access const& access,
                      chunk::bitpack_locator const& loc,
                      bitpack_reference const& ref,
@@ -138,9 +160,17 @@ void expect_requests(device_leaf_access const& access,
       (c1 - c0) * ref.elem_size) {
     fail("chunk_min bytes requested != the span's");
   }
-  auto const count_bytes = access.requested_bytes(loc.chunk_count.leaf, loc.chunk_count.buffer);
-  auto const bits_bytes  = access.requested_bytes(loc.chunk_bits.leaf, loc.chunk_bits.buffer);
+  auto const staged_counts = requests_of(access.device_requests(), loc.chunk_count, c0 * 4, c1 * 4);
+  auto const staged_bits   = requests_of(access.device_requests(), loc.chunk_bits, c0, c1);
+  if (!staged_counts.within || !staged_bits.within) {
+    fail("chunk_count / chunk_bits staged outside the span");
+  }
+  if (staged_counts.bytes != (c1 - c0) * 4 || staged_bits.bytes != c1 - c0) {
+    fail("chunk_count / chunk_bits bytes staged != the span's");
+  }
   auto const nc          = static_cast<std::uint64_t>(ref.num_chunks());
+  auto const count_bytes = requests_of(access.host_requests(), loc.chunk_count, 0, nc * 4).bytes;
+  auto const bits_bytes  = requests_of(access.host_requests(), loc.chunk_bits, 0, nc).bytes;
   if (!(count_bytes == 0 && bits_bytes == 0) && !(count_bytes == nc * 4 && bits_bytes == nc)) {
     fail("chunk_count / chunk_bits not read whole, once");
   }
@@ -516,8 +546,8 @@ int test_primitive_extension(rmm::cuda_stream_view stream)
   return 6;
 }
 
-/// chunk_count / chunk_bits of the whole node are read once, on the first decode; no later
-/// decode copies anything to the host (so none waits for the stream).
+/// chunk_count / chunk_bits of the whole node are read to the host once, on the first decode;
+/// no later decode copies anything to the host (so none waits for the stream).
 int test_prefix_cache(rmm::cuda_stream_view stream)
 {
   column_options options;
@@ -526,10 +556,10 @@ int test_prefix_cache(rmm::cuda_stream_view stream)
   auto const input = make_random_column(cudf::type_id::INT64, options, stream);
   root_fixture fx{"prefix cache", input->view(), stream};
   auto const count_bytes = [&] {
-    return fx.access.requested_bytes(fx.loc.chunk_count.leaf, fx.loc.chunk_count.buffer);
+    return requests_of(fx.access.host_requests(), fx.loc.chunk_count, 0, 7 * 4).bytes;
   };
   auto const bits_bytes = [&] {
-    return fx.access.requested_bytes(fx.loc.chunk_bits.leaf, fx.loc.chunk_bits.buffer);
+    return requests_of(fx.access.host_requests(), fx.loc.chunk_bits, 0, 7).bytes;
   };
 
   expect(fx.access.requests().empty(), "prefix: building the decoder requests no bytes");
@@ -544,6 +574,64 @@ int test_prefix_cache(rmm::cuda_stream_view stream)
     expect(count_bytes() == 0 && bits_bytes() == 0, "prefix: a later decode re-reads counts");
   }
   expect(fx.decoder->state_bytes() > 0, "prefix: the decoder reports its device state");
+  return 1;
+}
+
+/// A state decoding a long node window by window holds device bytes sized by the window, not
+/// by the node, and only its first decode copies anything to the host.
+int test_state_bytes_bounded(rmm::cuda_stream_view stream)
+{
+  constexpr std::int64_t kChunks = 1200;
+  constexpr std::int64_t kWindow = 4;
+  column_options options;
+  options.rows     = static_cast<cudf::size_type>(kChunks * kChunkRows - 300);
+  options.seed     = 61;
+  auto const input = make_random_column(cudf::type_id::INT32, options, stream);
+  root_fixture fx{"state bytes", input->view(), stream};
+  expect(fx.num_chunks() == kChunks, "state bytes: unexpected chunk count");
+
+  auto state = chunk::make_bitpack_state(fx.loc);
+  expect(chunk::bitpack_state_bytes(*state) == 0, "state bytes: a new state holds device bytes");
+  // Per chunk of a window: one first-word entry, and at most the chunk's packed words (an
+  // unaligned `packed` is realigned into scratch).
+  constexpr auto kWindowRows = static_cast<std::size_t>(kWindow * kChunkRows);
+  constexpr std::size_t kBound =
+    static_cast<std::size_t>(kWindow) * sizeof(std::int64_t) + kWindowRows * sizeof(std::int32_t);
+  rmm::device_buffer out(kWindowRows * sizeof(std::int64_t), stream);
+  for (std::int64_t c0 = 0; c0 < kChunks; c0 += kWindow) {
+    auto const c1 = std::min(c0 + kWindow, kChunks);
+    fx.access.clear_requests();
+    chunk::unpack_bitpack_chunks(
+      fx.access, *state, c0, c1, static_cast<std::int64_t*>(out.data()), stream);
+    expect(fx.access.host_requests().size() == (c0 == 0 ? 2U : 0U),
+           "state bytes: only the first decode reads to the host");
+    expect(chunk::bitpack_state_bytes(*state) <= kBound,
+           "state bytes: the state holds more than a window's worth of device bytes");
+    auto const got = read_device<std::int64_t>(
+      out.data(), static_cast<std::size_t>((c1 - c0) * kChunkRows), stream);
+    for (std::int64_t c = c0; c < c1; ++c) {
+      auto const& expected = fx.ref.rows[static_cast<std::size_t>(c)];
+      expect(std::equal(expected.begin(),
+                        expected.end(),
+                        got.begin() + static_cast<std::ptrdiff_t>((c - c0) * kChunkRows)),
+             "state bytes: a window's values differ from the reference");
+    }
+  }
+  expect(
+    chunk::bitpack_state_bytes(*state) >= static_cast<std::size_t>(kWindow) * sizeof(std::int64_t),
+    "state bytes: the state does not report its scratch");
+
+  // The root decoder's state is the same primitive.
+  column_write_target dst;
+  rmm::device_buffer rows(kWindowRows * sizeof(std::int32_t), stream);
+  dst.data          = rows.data();
+  dst.data_capacity = rows.size();
+  for (std::int64_t c0 = 0; c0 + kWindow <= kChunks; c0 += 100 * kWindow) {
+    fx.decoder->decode(fx.access, {c0, c0 + kWindow, 0, (kWindow - 1) * kChunkRows}, dst, stream);
+    expect(fx.decoder->state_bytes() <= kBound,
+           "state bytes: the decoder holds more than a window's worth of device bytes");
+  }
+  stream.synchronize();
   return 1;
 }
 
@@ -720,6 +808,7 @@ int main()
     cases += test_int64_widths(stream);
     cases += test_primitive_extension(stream);
     cases += test_prefix_cache(stream);
+    cases += test_state_bytes_bounded(stream);
     cases += test_dictionary_indices(stream);
     cases += test_nested_nodes(stream);
     cases += test_range_checks(stream);

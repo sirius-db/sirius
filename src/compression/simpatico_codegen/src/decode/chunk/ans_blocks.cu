@@ -44,6 +44,34 @@ inline bool is_aligned(void const* p, std::size_t alignment)
   return alignment <= 1 || reinterpret_cast<std::uintptr_t>(p) % alignment == 0;
 }
 
+/// Entries [first, first + count) of the four nvCOMP input tables (compressed pointers,
+/// compressed sizes, uncompressed sizes, uncompressed pointers). Passed to the kernel by value:
+/// a launch copies its arguments before it returns, so the tables reach the device without a
+/// host buffer that would have to outlive an asynchronous copy.
+constexpr std::size_t kBlocksPerLaunch = 64;
+struct table_batch {
+  std::uint64_t first;
+  std::uint64_t count;
+  std::uint64_t comp_ptrs[kBlocksPerLaunch];
+  std::uint64_t comp_bytes[kBlocksPerLaunch];
+  std::uint64_t uncomp_bytes[kBlocksPerLaunch];
+  std::uint64_t uncomp_ptrs[kBlocksPerLaunch];
+};
+
+/// Writes a batch into the tables: num_blocks u64 each, laid out back to back.
+__global__ void write_tables_kernel(table_batch batch,
+                                    std::uint64_t* __restrict__ tables,
+                                    std::uint64_t num_blocks)
+{
+  const std::uint64_t i = threadIdx.x;
+  if (i >= batch.count) { return; }
+  const std::uint64_t at      = batch.first + i;
+  tables[at]                  = batch.comp_ptrs[i];
+  tables[num_blocks + at]     = batch.comp_bytes[i];
+  tables[2 * num_blocks + at] = batch.uncomp_bytes[i];
+  tables[3 * num_blocks + at] = batch.uncomp_ptrs[i];
+}
+
 inline void check(nvcompStatus_t s, char const* what)
 {
   if (s != nvcompSuccess) {
@@ -143,6 +171,15 @@ void parse_frame_header(leaf_access& leaves, ans_state& state, rmm::cuda_stream_
 
 }  // namespace
 
+std::size_t ans_state_bytes(ans_state const& state) noexcept
+{
+  std::size_t bytes = 0;
+  for (auto const* buffer : {&state.tables, &state.temp, &state.scratch, &state.staged}) {
+    if (buffer->has_value()) { bytes += (*buffer)->size(); }
+  }
+  return bytes;
+}
+
 std::unique_ptr<ans_state, void (*)(ans_state*)> make_ans_state(
   hpln_column_description const& column, buffer_ref ans)
 {
@@ -212,52 +249,51 @@ void decode_ans_range(leaf_access& leaves,
   };
   std::vector<scratch_copy> copies;
   std::uint64_t const slot_bytes = align_up(block_bytes, detail::kFrameAlign);
-
-  // Host image of the four input tables, laid out like the device block.
-  static_assert(sizeof(void*) == sizeof(std::uint64_t) &&
-                sizeof(std::size_t) == sizeof(std::uint64_t));
-  std::vector<std::uint64_t> host(4 * num_blocks);
-  auto* const h_comp_ptrs    = host.data();
-  auto* const h_comp_bytes   = host.data() + num_blocks;
-  auto* const h_uncomp_bytes = host.data() + 2 * num_blocks;
-  auto* const h_uncomp_ptrs  = host.data() + 3 * num_blocks;
-  std::vector<bool> direct(num_blocks);
+  auto const block_begin         = [&](std::size_t i) { return (first_block + i) * block_bytes; };
+  auto const block_end           = [&](std::size_t i) {
+    return std::min(block_begin(i) + block_bytes, state.uncompressed_bytes);
+  };
+  auto const direct = [&](std::size_t i) {
+    return block_begin(i) >= byte_begin && block_end(i) <= byte_end &&
+           is_aligned(out + (block_begin(i) - byte_begin), state.alignments.output);
+  };
   for (std::size_t i = 0; i < num_blocks; ++i) {
-    std::uint64_t const block = first_block + i;
-    std::uint64_t const begin = block * block_bytes;
-    std::uint64_t const end   = std::min(begin + block_bytes, state.uncompressed_bytes);
-    h_comp_ptrs[i] =
-      reinterpret_cast<std::uint64_t>(compressed + (state.block_offsets[block] - span_begin));
-    h_comp_bytes[i]   = state.block_sizes[block];
-    h_uncomp_bytes[i] = end - begin;
-    direct[i]         = begin >= byte_begin && end <= byte_end &&
-                is_aligned(out + (begin - byte_begin), state.alignments.output);
-    if (direct[i]) {
-      h_uncomp_ptrs[i] = reinterpret_cast<std::uint64_t>(out + (begin - byte_begin));
-    } else {
-      std::uint64_t const from = std::max(begin, byte_begin);
-      std::uint64_t const to   = std::min(end, byte_end);
-      copies.push_back({copies.size(), from - begin, from - byte_begin, to - from});
+    if (!direct(i)) {
+      std::uint64_t const from = std::max(block_begin(i), byte_begin);
+      std::uint64_t const to   = std::min(block_end(i), byte_end);
+      copies.push_back({copies.size(), from - block_begin(i), from - byte_begin, to - from});
     }
   }
-  if (!copies.empty()) {
-    auto* const scratch =
-      static_cast<std::byte*>(ensure(state.scratch, copies.size() * slot_bytes, stream, mr));
-    std::size_t slot = 0;
-    for (std::size_t i = 0; i < num_blocks; ++i) {
-      if (!direct[i]) {
-        h_uncomp_ptrs[i] = reinterpret_cast<std::uint64_t>(scratch + slot++ * slot_bytes);
-      }
-    }
-  }
+  auto* const scratch =
+    copies.empty()
+      ? nullptr
+      : static_cast<std::byte*>(ensure(state.scratch, copies.size() * slot_bytes, stream, mr));
 
   // Device tables: the four inputs, then the actual-size and status outputs (not read back,
   // as in the whole-frame decode).
+  static_assert(sizeof(void*) == sizeof(std::uint64_t) &&
+                sizeof(std::size_t) == sizeof(std::uint64_t));
   std::size_t const table_bytes = num_blocks * sizeof(std::uint64_t);
   auto* const tables = static_cast<std::byte*>(ensure(state.tables, 6 * table_bytes, stream, mr));
-  throw_if_cuda_error(
-    cudaMemcpyAsync(tables, host.data(), 4 * table_bytes, cudaMemcpyHostToDevice, s),
-    "chunk ANS decode: H2D block tables");
+  std::size_t slot   = 0;
+  for (std::size_t first = 0; first < num_blocks; first += kBlocksPerLaunch) {
+    table_batch batch;
+    batch.first = first;
+    batch.count = std::min(num_blocks - first, kBlocksPerLaunch);
+    for (std::size_t k = 0; k < batch.count; ++k) {
+      std::size_t const i       = first + k;
+      std::uint64_t const block = first_block + i;
+      batch.comp_ptrs[k] =
+        reinterpret_cast<std::uint64_t>(compressed + (state.block_offsets[block] - span_begin));
+      batch.comp_bytes[k]   = state.block_sizes[block];
+      batch.uncomp_bytes[k] = block_end(i) - block_begin(i);
+      batch.uncomp_ptrs[k]  = reinterpret_cast<std::uint64_t>(
+        direct(i) ? out + (block_begin(i) - byte_begin) : scratch + slot++ * slot_bytes);
+    }
+    write_tables_kernel<<<1, kBlocksPerLaunch, 0, s>>>(
+      batch, reinterpret_cast<std::uint64_t*>(tables), num_blocks);
+    throw_if_cuda_error(cudaGetLastError(), "chunk ANS decode: block table kernel launch");
+  }
 
   std::size_t temp_bytes = 0;
   check(SIMPATICO_NVCOMP_GET_TEMP_SIZE(nvcompBatchedANSDecompressGetTempSize,
@@ -284,8 +320,6 @@ void decode_ans_range(leaf_access& leaves,
                                     s),
     "decompress_async");
 
-  auto const* const scratch =
-    state.scratch.has_value() ? static_cast<const std::byte*>(state.scratch->data()) : nullptr;
   for (auto const& copy : copies) {
     throw_if_cuda_error(cudaMemcpyAsync(out + copy.dst_offset,
                                         scratch + copy.slot * slot_bytes + copy.src_offset,

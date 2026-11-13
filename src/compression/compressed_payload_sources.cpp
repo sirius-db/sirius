@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -75,7 +76,8 @@ struct device_payload_layout {
   std::uint64_t buffers = 0;
 };
 
-device_payload_layout device_layout(const compressed_device_representation& representation)
+device_payload_layout device_layout(const compressed_device_representation& representation,
+                                    ::cuda::stream_ref stream)
 {
   if (!representation.has_table()) {
     throw std::invalid_argument(
@@ -85,7 +87,7 @@ device_payload_layout device_layout(const compressed_device_representation& repr
   std::vector<simpatico::payload_buffer_ref> buffers;
   std::uint64_t dense_bytes = 0;
   if (auto error = simpatico::build_compressed_table_header(
-        representation.table(), layout.header, buffers, dense_bytes, cudf::get_default_stream());
+        representation.table(), layout.header, buffers, dense_bytes, stream);
       !error.empty()) {
     throw std::runtime_error("[compressed_payload_sources] " + error);
   }
@@ -112,8 +114,9 @@ device_payload_layout device_layout(const compressed_device_representation& repr
 
 class device_payload_source final : public simpatico::payload_source {
  public:
-  explicit device_payload_source(const compressed_device_representation& representation)
-    : _owner(share(representation)), _base(device_layout(representation).base)
+  device_payload_source(const compressed_device_representation& representation,
+                        const device_payload_layout& layout)
+    : _owner(share(representation)), _base(layout.base)
   {
   }
 
@@ -140,10 +143,10 @@ class device_payload_source final : public simpatico::payload_source {
   std::uintptr_t _base;
 };
 
+/// The header of @p layout, with every payload offset relative to the layout's base.
 std::shared_ptr<const simpatico::hpln_description> describe_device(
-  const compressed_device_representation& representation)
+  const device_payload_layout& layout)
 {
-  auto const layout = device_layout(representation);
   auto description =
     simpatico::describe_hpln_header(std::as_bytes(std::span<const std::uint8_t>{layout.header}));
 
@@ -201,6 +204,29 @@ class host_payload_source final : public simpatico::payload_source {
 
 // ── Disk ─────────────────────────────────────────────────────────────────────
 
+/// Frees the host bytes of a copy once the stream has run it. Runs on a CUDA-owned thread and
+/// makes no CUDA call.
+void CUDART_CB free_host_bytes(void* bytes) { delete static_cast<std::vector<std::byte>*>(bytes); }
+
+/// Enqueues a copy of @p bytes (pageable host memory) to @p dst on @p stream and keeps them
+/// alive until the stream has run it: CUDA may stage such a copy after cudaMemcpyAsync returns.
+/// cuCascade's disk reader guards the same hazard with a stream wait (host_copy_guard in
+/// cucascade/src/cudf/row_range_reader_disk.cpp); here a host function on the stream frees the
+/// bytes instead, so that a read of many buffers does not wait once per buffer.
+void copy_host_bytes_to_device(std::unique_ptr<std::vector<std::byte>> bytes,
+                               void* dst,
+                               rmm::cuda_stream_view stream)
+{
+  CUCASCADE_CUDA_TRY(
+    cudaMemcpyAsync(dst, bytes->data(), bytes->size(), cudaMemcpyHostToDevice, stream.value()));
+  if (cudaLaunchHostFunc(stream.value(), free_host_bytes, bytes.get()) == cudaSuccess) {
+    static_cast<void>(bytes.release());
+    return;
+  }
+  // No host function: wait for the copy, then `bytes` goes with this scope.
+  CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+}
+
 class disk_payload_source final : public simpatico::payload_source {
  public:
   explicit disk_payload_source(const compressed_disk_representation& representation)
@@ -225,11 +251,9 @@ class disk_payload_source final : public simpatico::payload_source {
     // any offset; the device read then starts aligned.
     if (auto const misaligned = file_offset % cucascade::DISK_FILE_ALIGNMENT; misaligned != 0) {
       auto const head = std::min(remaining, cucascade::DISK_FILE_ALIGNMENT - misaligned);
-      std::vector<std::byte> staged(head);
-      backend.read(file.path(), staged.data(), head, file_offset);
-      // A copy from pageable memory is staged before the call returns, so `staged` may go.
-      CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(destination, staged.data(), head, cudaMemcpyHostToDevice, stream.value()));
+      auto staged     = std::make_unique<std::vector<std::byte>>(head);
+      backend.read(file.path(), staged->data(), head, file_offset);
+      copy_host_bytes_to_device(std::move(staged), destination, stream);
       file_offset += head;
       destination += head;
       remaining -= head;
@@ -255,7 +279,8 @@ std::shared_ptr<const simpatico::hpln_description> describe_disk(
 std::shared_ptr<simpatico::payload_source> make_payload_source(
   const compressed_device_representation& representation)
 {
-  return std::make_shared<device_payload_source>(representation);
+  return std::make_shared<device_payload_source>(
+    representation, device_layout(representation, cudf::get_default_stream()));
 }
 
 std::shared_ptr<simpatico::payload_source> make_payload_source(
@@ -280,10 +305,30 @@ std::shared_ptr<const simpatico::hpln_description> describe(
     return describe_disk(*disk);
   }
   if (auto const* device = dynamic_cast<const compressed_device_representation*>(&representation)) {
-    return describe_device(*device);
+    return describe_device(device_layout(*device, cudf::get_default_stream()));
   }
   throw std::invalid_argument(
     "[compressed_payload_sources] describe: not a compressed device, host or disk batch");
+}
+
+compressed_payload open_compressed_payload(
+  const simpatico_compressed_representation& representation, ::cuda::stream_ref stream)
+{
+  if (auto const* host = dynamic_cast<const compressed_host_representation*>(&representation)) {
+    return {.description = parse_header(host->header()), .source = make_payload_source(*host)};
+  }
+  if (auto const* disk = dynamic_cast<const compressed_disk_representation*>(&representation)) {
+    return {.description = describe_disk(*disk), .source = make_payload_source(*disk)};
+  }
+  if (auto const* device = dynamic_cast<const compressed_device_representation*>(&representation)) {
+    // One layout for both: the description's offsets are relative to the source's base.
+    auto const layout = device_layout(*device, stream);
+    return {.description = describe_device(layout),
+            .source      = std::make_shared<device_payload_source>(*device, layout)};
+  }
+  throw std::invalid_argument(
+    "[compressed_payload_sources] open_compressed_payload: not a compressed device, host or disk "
+    "batch");
 }
 
 }  // namespace sirius::compression

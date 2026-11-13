@@ -28,8 +28,29 @@ namespace sirius::compression {
  * @brief Reader state for one (caller, compressed batch).
  *
  * Created by the reader on the first read and handed back on later reads of the same batch, so
- * the parsed header, the payload source and each column's decode state (staged bytes, chunk
- * prefixes, dictionary keys) are built once. Not thread-safe: one reader call at a time.
+ * the parsed header, the payload source and each column's cursor (decoder state, grow-only
+ * scratch, dictionary keys) are built once. The payload bytes a read stages on the device are
+ * freed when that read returns; only a dictionary's keys stay with their cursor.
+ *
+ * Which batch the state reads is recorded in `payload`: the reader wraps the source of
+ * make_payload_source in a file-local type tagged with the batch's representation type and
+ * backing store, and replaces a state whose payload is not such a wrapper or tags another batch
+ * or tier. The wrapper also records the stream and the memory resource of the cursors.
+ *
+ * One stream and one memory resource per set of cursors. The cursors allocate device memory on
+ * the stream of the read that built them, from that read's resource: `scratch`'s
+ * get_memory_resource(), or the current device resource when the read has no scratch. A read on
+ * another stream, or with another resource, first waits for the device work of the earlier reads
+ * and destroys every cursor; they are rebuilt as columns are requested. Destroying the state
+ * waits for the last read too.
+ *
+ * Lifetime: every memory resource a read of this state used must outlive the state (the cursors
+ * free their memory through it, when they are dropped or with the state), and the stream of the
+ * last read must still be a live stream when the next read starts and when the state is
+ * destroyed. A scratch reservation need not outlive the read it was passed to; its memory space
+ * must.
+ *
+ * Not thread-safe: one read at a time per state.
  */
 struct compressed_reader_state final : cucascade::row_range_reader_state {
   std::shared_ptr<const simpatico::hpln_description> description;
@@ -43,8 +64,14 @@ struct compressed_reader_state final : cucascade::row_range_reader_state {
  * compressed_host_representation and compressed_disk_representation.
  *
  * The readers decode only the 1024-row chunks covering the requested rows. A column whose plan
- * is not chunk-decodable makes the reader throw cucascade::row_range_unsupported_error, so the
- * caller falls back to a whole-batch decode.
+ * is not chunk-decodable, a projection or a filtered view of a chunk, and a device batch without
+ * a table make the reader throw cucascade::row_range_unsupported_error, so the caller falls back
+ * to a whole-batch decode.
+ *
+ * Device memory (decode state and staged payload) is allocated on the read's stream from
+ * `scratch->get_memory_resource()` when the read has a scratch reservation, the same resource
+ * the built-in readers take their temporaries from; without one, from the current device
+ * resource. See compressed_reader_state for the rules a state kept across reads follows.
  */
 void register_compressed_row_range_readers(cucascade::row_range_reader_registry& registry);
 

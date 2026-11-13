@@ -11,6 +11,9 @@
 //      (STRING: small chars capacities, so calls are cut short and resumed);
 //   2. random isolated spans, each on a fresh cursor and on a reused one;
 //   3. one window of 1-2 chunks on a fresh staging cursor stages < 25% of the column's payload.
+// Every decode call through a staging cursor is also held to a budget of payload bytes read
+// (the share of the chunks it covers, plus metadata) and of device bytes the cursor holds when
+// the call has returned (window-sized scratch; no payload at all for a stored column).
 //
 // Each check throws std::runtime_error on failure; main() catches and reports.
 
@@ -41,6 +44,32 @@ void check(bool cond, std::string const& what)
 {
   if (!cond) { throw std::runtime_error(what); }
 }
+
+// ─── Staging budgets ────────────────────────────────────────────────────────
+//
+// What a decode call stages is freed when it returns, so a chunk two calls share and the
+// per-chunk metadata of a span are read once per call. The budgets below bound one call by the
+// chunks it covers, never by the calls before it.
+
+/// A call may read this many times the even share of the payload its chunks have: chunks differ
+/// in size.
+constexpr std::uint64_t kShareFactor = 2;
+/// Chunks a call may read beyond the ones it covers: ANS chars come in 64 KiB blocks, so a span
+/// reads up to one block of neighbouring rows on each side.
+constexpr std::uint64_t kNeighbourChunks = 8;
+/// Per-chunk metadata (chunk minimum, count, bit width, first value, run offsets) a call may read
+/// for every chunk of the column, whichever chunks it decodes.
+constexpr std::uint64_t kMetadataBytesPerChunk = 64;
+/// Metadata that does not scale with the chunks: frame headers, a string column's end offset.
+constexpr std::uint64_t kMetadataBytes = 4096;
+/// Device bytes of decoder state per chunk of the column.
+constexpr std::uint64_t kStateBytesPerChunk = 64;
+/// Device bytes of decoder scratch per row of the largest span decoded so far.
+constexpr std::uint64_t kScratchBytesPerRow = 64;
+/// Scratch that does not scale with the span: the ANS blocks around it.
+constexpr std::uint64_t kScratchBytes = std::uint64_t{4} << 16;
+/// A stored column has no state to keep: at most the record a STRING call reports its cut in.
+constexpr std::uint64_t kStoredStateBytes = 64;
 
 // ─── Cases ──────────────────────────────────────────────────────────────────
 
@@ -206,6 +235,43 @@ struct column_context {
   {
     return payload_size(description->columns[index]);
   }
+  /// Payload bytes of the dictionary keys (the buffers of a dictionary node's own leaves), which
+  /// a cursor stages once and keeps.
+  [[nodiscard]] std::uint64_t key_bytes() const
+  {
+    auto const& col     = description->columns[index];
+    std::uint64_t bytes = 0;
+    for (auto const& leaf : col.leaves) {
+      if (col.nodes.at(leaf.node_index).op != "dictionary") { continue; }
+      for (auto const& buffer : leaf.buffers) {
+        bytes += buffer.size;
+      }
+    }
+    return bytes;
+  }
+  [[nodiscard]] bool is_stored() const
+  {
+    auto const& col = description->columns[index];
+    return col.nodes.at(col.nodes.at(0).edges.at(0).second).op == "identity";
+  }
+  /// Most payload bytes one decode call over `span_chunks` chunks may read.
+  [[nodiscard]] std::uint64_t read_budget(cudf::size_type span_chunks) const
+  {
+    auto const total = payload_bytes();
+    auto const count = static_cast<std::uint64_t>(std::max<cudf::size_type>(chunks(), 1));
+    auto const share =
+      kShareFactor * total * (static_cast<std::uint64_t>(span_chunks) + kNeighbourChunks) / count;
+    return std::min(total, share) + count * kMetadataBytesPerChunk + kMetadataBytes + key_bytes();
+  }
+  /// Most device bytes a cursor may hold between calls when its largest call so far covered
+  /// `span_chunks` chunks.
+  [[nodiscard]] std::uint64_t held_budget(cudf::size_type span_chunks) const
+  {
+    if (is_stored()) { return kStoredStateBytes; }
+    return key_bytes() + static_cast<std::uint64_t>(chunks()) * kStateBytesPerChunk +
+           static_cast<std::uint64_t>(span_chunks) * kChunkRows * kScratchBytesPerRow +
+           kScratchBytes;
+  }
 
   [[nodiscard]] compressed_column_cursor cursor(std::shared_ptr<payload_source> source) const
   {
@@ -222,6 +288,62 @@ struct column_context {
   {
     return std::make_shared<staging_source>(host_payload);
   }
+};
+
+// ─── Staging of one cursor, call by call ────────────────────────────────────
+
+/// Checks every decode call of one staging cursor against the column's budgets.
+class staging_watch {
+ public:
+  staging_watch(column_context const& ctx,
+                compressed_column_cursor const& cursor,
+                std::shared_ptr<const staging_source> source)
+    : _ctx{ctx}, _cursor{cursor}, _source{std::move(source)}, _seen{_source->bytes_read}
+  {
+  }
+
+  /// Call after each decompress_column_chunks over `span_chunks` chunks.
+  void after_call(cudf::size_type span_chunks, std::string const& label)
+  {
+    auto const read = _source->bytes_read - _seen;
+    _seen           = _source->bytes_read;
+    _largest_span   = std::max(_largest_span, span_chunks);
+    auto const held = _cursor.device_bytes_held();
+
+    auto const read_budget = _ctx.read_budget(span_chunks);
+    check(read <= read_budget,
+          label + ": a call over " + std::to_string(span_chunks) + " chunk(s) read " +
+            std::to_string(read) + " payload bytes, budget " + std::to_string(read_budget) +
+            " of " + std::to_string(_ctx.payload_bytes()));
+    auto const held_budget = _ctx.held_budget(_largest_span);
+    check(held <= held_budget,
+          label + ": the cursor holds " + std::to_string(held) + " device bytes after a call, " +
+            "budget " + std::to_string(held_budget) + " (largest span " +
+            std::to_string(_largest_span) + " chunk(s))");
+
+    _budget_total += read_budget;
+    _most_held = std::max<std::uint64_t>(_most_held, held);
+    if (read_budget != 0) {
+      _most_read_share =
+        std::max(_most_read_share, static_cast<double>(read) / static_cast<double>(read_budget));
+    }
+  }
+
+  /// Sum of the read budgets of the calls so far.
+  [[nodiscard]] std::uint64_t budget_total() const noexcept { return _budget_total; }
+  [[nodiscard]] std::uint64_t most_held() const noexcept { return _most_held; }
+  /// Largest fraction of its read budget any call used.
+  [[nodiscard]] double most_read_share() const noexcept { return _most_read_share; }
+
+ private:
+  column_context const& _ctx;
+  compressed_column_cursor const& _cursor;
+  std::shared_ptr<const staging_source> _source;
+  std::uint64_t _seen{0};
+  cudf::size_type _largest_span{0};
+  std::uint64_t _budget_total{0};
+  std::uint64_t _most_held{0};
+  double _most_read_share{0.0};
 };
 
 // ─── Destination helpers ────────────────────────────────────────────────────
@@ -289,13 +411,15 @@ struct walk_stats {
 };
 
 // Walks the column front to back in windows of random sizes, every window appended to the same
-// destination, then compares the assembled destination with the oracle.
+// destination, then compares the assembled destination with the oracle. `watch`, when given,
+// checks the staging of every call.
 walk_stats walk_column(column_context const& ctx,
                        compressed_column_cursor& cursor,
                        std::uint8_t offset_width,
                        bool with_mask,
                        std::mt19937_64& rng,
-                       std::string const& what)
+                       std::string const& what,
+                       staging_watch* watch = nullptr)
 {
   auto const stream = ctx.stream;
   auto const rows   = ctx.rows();
@@ -341,6 +465,7 @@ walk_stats walk_column(column_context const& ctx,
     auto written =
       decompress_column_chunks(cursor, chunk_begin, chunk_end, skip_head, take, dst, stream);
     ++stats.calls;
+    if (watch != nullptr) { watch->after_call(chunk_end - chunk_begin, label); }
     check(written == expected,
           label + ": rows [" + std::to_string(row) + ", +" + std::to_string(take) + ") wrote " +
             std::to_string(written) + " rows, expected " + std::to_string(expected));
@@ -351,6 +476,7 @@ walk_stats walk_column(column_context const& ctx,
       written =
         decompress_column_chunks(cursor, chunk_begin, chunk_end, skip_head, take, dst, stream);
       ++stats.calls;
+      if (watch != nullptr) { watch->after_call(chunk_end - chunk_begin, label); }
       check(written == take, label + ": retry with room writes the whole window");
     }
     row += written;
@@ -408,13 +534,15 @@ std::vector<span> pick_spans(column_context const& ctx, std::mt19937_64& rng)
 }
 
 // Decodes one span at a random place of a fresh destination and compares what was written with
-// the oracle's rows; everything around it must be left alone.
+// the oracle's rows; everything around it must be left alone. `watch`, when given, checks the
+// staging of the call.
 void check_span(column_context const& ctx,
                 compressed_column_cursor& cursor,
                 span s,
                 std::uint8_t offset_width,
                 std::mt19937_64& rng,
-                std::string const& what)
+                std::string const& what,
+                staging_watch* watch = nullptr)
 {
   auto const stream = ctx.stream;
   auto const label  = ctx.label + ": " + what + " rows [" + std::to_string(s.row) + ", +" +
@@ -467,6 +595,7 @@ void check_span(column_context const& ctx,
 
   auto const written =
     decompress_column_chunks(cursor, chunk_begin, chunk_end, skip_head, s.rows, dst, stream);
+  if (watch != nullptr) { watch->after_call(chunk_end - chunk_begin, label); }
   check(
     written == expected,
     label + ": wrote " + std::to_string(written) + " rows, expected " + std::to_string(expected));
@@ -505,22 +634,23 @@ void check_isolated_spans(column_context const& ctx, std::mt19937_64& rng)
       check_span(ctx, cursor, spans[i], width(i), rng, "fresh device cursor");
       check(source->reads == 0, ctx.label + ": a device payload is never read");
     } else {
-      auto cursor = ctx.cursor(ctx.staged());
-      check_span(ctx, cursor, spans[i], width(i), rng, "fresh staging cursor");
+      auto staging = ctx.staged();
+      auto cursor  = ctx.cursor(staging);
+      staging_watch watch{ctx, cursor, staging};
+      check_span(ctx, cursor, spans[i], width(i), rng, "fresh staging cursor", &watch);
     }
   }
 
-  // One cursor of each kind for all spans, in an order that jumps back and forth.
+  // One cursor of each kind for all spans, in an order that jumps back and forth. Every call of
+  // the staging cursor stays within the budget of its own span, whatever was decoded before it.
   auto device_cursor  = ctx.cursor(ctx.on_device());
-  auto staging_source = ctx.staged();
-  auto staging_cursor = ctx.cursor(staging_source);
+  auto staging        = ctx.staged();
+  auto staging_cursor = ctx.cursor(staging);
+  staging_watch watch{ctx, staging_cursor, staging};
   for (std::size_t i = 0; i < spans.size(); ++i) {
     check_span(ctx, device_cursor, spans[i], width(i + 2), rng, "reused device cursor");
-    check_span(ctx, staging_cursor, spans[i], width(i), rng, "reused staging cursor");
+    check_span(ctx, staging_cursor, spans[i], width(i), rng, "reused staging cursor", &watch);
   }
-  // Overlapping spans are staged once: the cursor never reads more than the column holds.
-  check(staging_source->bytes_read <= ctx.payload_bytes(),
-        ctx.label + ": a reused cursor stages no payload byte twice");
 }
 
 // ─── 3. A small window stages a small part of the payload ───────────────────
@@ -618,6 +748,10 @@ void run_table(cudf::size_type rows, double null_fraction, std::uint64_t seed)
   int cut_short    = 0;
   double max_ratio = -1.0;
   std::string max_ratio_case;
+  double max_read_share = 0.0;  // of a walk call's read budget
+  std::string max_read_share_case;
+  std::uint64_t max_held = 0;  // device bytes a walking cursor held between calls
+  std::string max_held_case;
   for (std::size_t c = 0; c < cases.size(); ++c) {
     auto const oracle = full_decode(table, c);
     auto const& col   = description->columns[c];
@@ -672,12 +806,25 @@ void run_table(cudf::size_type rows, double null_fraction, std::uint64_t seed)
     }
     // (b) staged from pinned host memory: 8-byte offsets, always a destination mask.
     {
-      auto source      = ctx.staged();
-      auto cursor      = ctx.cursor(source);
-      auto const stats = walk_column(ctx, cursor, 8, true, rng, "staging walk");
+      auto source = ctx.staged();
+      auto cursor = ctx.cursor(source);
+      staging_watch watch{ctx, cursor, source};
+      auto const stats = walk_column(ctx, cursor, 8, true, rng, "staging walk", &watch);
       check(source->bytes_read > 0, ctx.label + ": a staging cursor reads the payload");
-      check(source->bytes_read <= ctx.payload_bytes(),
-            ctx.label + ": a whole-column walk stages no payload byte twice");
+      // Each call was within the budget of its own span, so the walk as a whole is too: windows
+      // re-read the chunk they share and their metadata, and nothing else accumulates.
+      check(source->bytes_read <= watch.budget_total(),
+            ctx.label + ": a whole-column walk read " + std::to_string(source->bytes_read) +
+              " payload bytes, over the " + std::to_string(watch.budget_total()) +
+              " its calls may read");
+      if (watch.most_read_share() > max_read_share) {
+        max_read_share      = watch.most_read_share();
+        max_read_share_case = cases[c].name;
+      }
+      if (watch.most_held() > max_held) {
+        max_held      = watch.most_held();
+        max_held_case = cases[c].name;
+      }
       calls += stats.calls;
       // Half of the windows get a short capacity; a long column has enough windows to be sure.
       if (ctx.is_string && ctx.chars(0, rows) > 0 && ctx.chunks() >= 64) {
@@ -707,7 +854,13 @@ void run_table(cudf::size_type rows, double null_fraction, std::uint64_t seed)
     std::printf(
       ", small window stages at most %.1f%% (%s)", max_ratio * 100.0, max_ratio_case.c_str());
   }
-  std::printf("\n");
+  std::printf(
+    "\n    staging walk: a call reads at most %.0f%% of its budget (%s), the cursor holds "
+    "at most %llu device bytes between calls (%s)\n",
+    max_read_share * 100.0,
+    max_read_share_case.c_str(),
+    static_cast<unsigned long long>(max_held),
+    max_held_case.c_str());
 }
 
 }  // namespace

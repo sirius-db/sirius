@@ -267,9 +267,31 @@ void check_span(dictionary_column& column,
                                chunk_begin * column.min_width,
                                chunk_end * column.min_width),
         what + "requested chunk_min outside the span's chunks");
-  check(access.requests_within(ix.chunk_count.leaf, ix.chunk_count.buffer, 0, chunk_end * 4) &&
-          access.requests_within(ix.chunk_bits.leaf, ix.chunk_bits.buffer, 0, chunk_end),
-        what + "requested chunk metadata past the span's chunks");
+  // chunk_count / chunk_bits: the span's chunks are staged on the device; the whole node's are
+  // read to the host by the first decode only.
+  auto const whole_counts = column.range(ix.chunk_count).size;
+  auto const whole_bits   = column.range(ix.chunk_bits).size;
+  for (auto const& [leaf, buffer, offset, size] : access.device_requests()) {
+    if (leaf == ix.chunk_count.leaf && buffer == ix.chunk_count.buffer) {
+      check(offset >= chunk_begin * 4 && offset + size <= chunk_end * 4,
+            what + "staged chunk_count outside the span's chunks");
+    } else if (leaf == ix.chunk_bits.leaf && buffer == ix.chunk_bits.buffer) {
+      check(offset >= chunk_begin && offset + size <= chunk_end,
+            what + "staged chunk_bits outside the span's chunks");
+    }
+  }
+  std::uint64_t host_counts = 0;
+  std::uint64_t host_bits   = 0;
+  for (auto const& [leaf, buffer, offset, size] : access.host_requests()) {
+    if (leaf == ix.chunk_count.leaf && buffer == ix.chunk_count.buffer) {
+      host_counts += size;
+    } else if (leaf == ix.chunk_bits.leaf && buffer == ix.chunk_bits.buffer) {
+      host_bits += size;
+    }
+  }
+  check(
+    host_counts == (first_call ? whole_counts : 0) && host_bits == (first_call ? whole_bits : 0),
+    what + "chunk metadata was not read to the host whole by the first decode only");
 }
 
 void test_column(cudf::size_type rows,

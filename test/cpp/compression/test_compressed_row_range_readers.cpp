@@ -23,6 +23,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda_runtime.h>
 
@@ -38,6 +39,8 @@
 #include <compression/spill_compression.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/row_range_read.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
@@ -1581,5 +1584,128 @@ TEST_CASE("compressed readers refuse a column projection of the stored chunk",
   {
     auto dsts = roomy_dsts(main.data, whole, 100);
     read_and_check(main, device_tier, whole, dsts, 300, 100, &state);
+  }
+}
+
+namespace {
+
+/// A GPU memory space whose allocator sits on a counting resource, so a test sees what the
+/// reservations of this space, and nothing else, allocate.
+struct counted_gpu_space {
+  rmm::mr::statistics_resource_adaptor allocations{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{env().gpu->get_default_allocator()}};
+  cucascade::memory::memory_space space{cucascade::memory::gpu_memory_space_config{
+    .device_id       = env().gpu->get_device_id(),
+    .memory_capacity = env().gpu->get_max_memory(),
+    .mr_factory_fn   = [this](int, std::size_t) {
+      return cuda::mr::any_resource<cuda::mr::device_accessible>{allocations};
+    }}};
+
+  [[nodiscard]] std::int64_t bytes_held() const { return allocations.get_bytes_counter().value; }
+  [[nodiscard]] std::int64_t allocations_made() const
+  {
+    return allocations.get_allocations_counter().total;
+  }
+};
+
+/// Reads with @p scratch on the default stream and checks the rows against the source.
+void read_with_scratch(compressed_source const& source,
+                       tier const& t,
+                       std::span<const std::size_t> columns,
+                       std::size_t row_begin,
+                       std::size_t max_rows,
+                       cucascade::memory::reservation* scratch,
+                       reader_state* state)
+{
+  auto dsts = roomy_dsts(source.data, columns, max_rows, 5, 2);
+  std::vector<cucascade::column_destination> dest;
+  for (auto const& d : dsts) {
+    dest.push_back(d.dest);
+  }
+  cucascade::row_range_request request;
+  request.columns   = columns;
+  request.row_begin = row_begin;
+  request.max_rows  = max_rows;
+  auto ro           = t.batch->to_read_only();
+  auto const result = cucascade::read_rows_into(
+    registry(), ro, request, dest, utils::default_stream(), scratch, state);
+  check_read(source.data, columns, dsts, row_begin, max_rows, result);
+}
+
+std::vector<const simpatico::compressed_column_cursor*> cursors_of(reader_state const& state)
+{
+  auto const* compressed =
+    dynamic_cast<const sirius::compression::compressed_reader_state*>(state.get());
+  REQUIRE(compressed != nullptr);
+  std::vector<const simpatico::compressed_column_cursor*> cursors;
+  for (auto const& cursor : compressed->cursors) {
+    cursors.push_back(cursor.get());
+  }
+  return cursors;
+}
+
+}  // namespace
+
+TEST_CASE("compressed readers allocate from the scratch reservation's resource of each read",
+          "[compressed_row_range_readers]")
+{
+  if (!has_gpu()) { return; }
+  auto const& main = main_batch();
+  // A dictionary column keeps its keys on the device for the cursor's life, so a state that has
+  // read it holds device memory between reads.
+  const std::size_t columns[] = {kDict, kRandom, kSorted, kSplitNulls, kRandomNulls};
+  for (auto const& t : main.tiers) {
+    INFO(t.name);
+    // The spaces outlive the state: its cursors free their memory through them.
+    counted_gpu_space first;
+    counted_gpu_space second;
+    {
+      reader_state state;
+      {
+        auto scratch = first.space.make_reservation_upto(0);
+        REQUIRE(scratch != nullptr);
+        read_with_scratch(main, t, columns, 0, 1200, scratch.get(), &state);
+        // The reservation goes; its space, whose allocator the cursors use, stays.
+      }
+      utils::default_stream().sync();
+      CHECK(first.allocations_made() > 0);
+      CHECK(first.bytes_held() > 0);
+      CHECK(second.allocations_made() == 0);
+
+      // A later reservation of the same space names the same resource: the cursors stay.
+      auto const kept = cursors_of(state);
+      {
+        auto scratch = first.space.make_reservation_upto(0);
+        REQUIRE(scratch != nullptr);
+        read_with_scratch(main, t, columns, 1200, 1200, scratch.get(), &state);
+      }
+      CHECK(cursors_of(state) == kept);
+      CHECK(second.allocations_made() == 0);
+
+      // Another resource on the same stream: the cursors are rebuilt with it, and nothing is
+      // allocated from, or left in, the first one.
+      utils::default_stream().sync();
+      auto const made_in_first = first.allocations_made();
+      {
+        auto scratch = second.space.make_reservation_upto(0);
+        REQUIRE(scratch != nullptr);
+        read_with_scratch(main, t, columns, 4095, 1200, scratch.get(), &state);
+        CHECK(first.allocations_made() == made_in_first);
+        CHECK(first.bytes_held() == 0);
+        read_with_scratch(main, t, columns, 19500, 1200, scratch.get(), &state);
+      }
+      utils::default_stream().sync();
+      CHECK(first.allocations_made() == made_in_first);
+      CHECK(first.bytes_held() == 0);
+      CHECK(second.bytes_held() > 0);
+
+      // No scratch: the current device resource, again another one.
+      auto const made_in_second = second.allocations_made();
+      read_with_scratch(main, t, columns, 300, 1200, nullptr, &state);
+      CHECK(second.allocations_made() == made_in_second);
+      CHECK(second.bytes_held() == 0);
+    }
+    CHECK(first.bytes_held() == 0);
+    CHECK(second.bytes_held() == 0);
   }
 }

@@ -136,15 +136,20 @@ class unsupported_chunk_decode : public std::runtime_error {
 
 // ─── Cursor + decode ────────────────────────────────────────────────────────
 
-/// Per-(caller, batch, column) decode state: staged leaf bytes, chunk-offset prefixes, decoded
-/// dictionary keys, parsed ANS frame headers. Not thread-safe; one stream at a time.
+/// Per-(caller, batch, column) decode state: chunk-offset prefixes, dictionary keys, parsed ANS
+/// frame headers, grow-only scratch. Payload bytes staged for a decode call are freed when the
+/// call returns (dictionary keys excepted). Not thread-safe. One stream and one memory resource
+/// for the cursor's life: its device buffers are allocated, used and freed on the stream of its
+/// decode calls, so a caller that changes stream (or resource) drops the cursor and builds a new
+/// one, as the Sirius row-range reader does.
 class compressed_column_cursor {
  public:
   /// @param description Parsed header of the batch; shared with the caller.
   /// @param column      Index into description->columns.
   /// @param payload     Source of the batch's payload bytes.
   /// @param stream      Stream any eager staging is enqueued on.
-  /// @param mr          Allocates the staged bytes and the decoder state.
+  /// @param mr          Allocates the staged bytes and the decoder state; must outlive the
+  ///                    cursor.
   compressed_column_cursor(std::shared_ptr<const hpln_description> description,
                            std::size_t column,
                            std::shared_ptr<payload_source> payload,

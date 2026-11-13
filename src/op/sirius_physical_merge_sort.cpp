@@ -16,6 +16,9 @@
 
 #include "op/sirius_physical_merge_sort.hpp"
 
+#include "compression/compressed_disk_representation.hpp"
+#include "compression/compressed_payload_sources.hpp"
+#include "compression/compressed_representation.hpp"
 #include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/host_column_carrier.hpp"
@@ -105,8 +108,55 @@ bool same_position(const merge::merge_input_cursor& a, const merge::merge_input_
          a.run.batch_rows == b.run.batch_rows;
 }
 
-/// Column types of a batch representation, or nullopt when the representation does not expose
-/// them (a compressed one).
+/// Whether @p representation is its stored chunk, not a projection or a filtered view of it.
+template <typename Representation>
+bool is_whole_chunk(const Representation& representation)
+{
+  return !representation.selected_indices().has_value() &&
+         representation.pushdown_scan() == nullptr && !representation.visibility_mask().has_mask();
+}
+
+/// How much work it is to take the schema of a spill-compressed batch from its header: 0 for a
+/// host batch (the header is in memory), 1 for a device batch (the header is rebuilt from the
+/// table), 2 for a disk batch (the header is read from the file). nullopt for a batch the
+/// row-range readers refuse (a projection or a filtered view, whose columns are not the stored
+/// ones, or a device batch without a table) and for any other representation.
+std::optional<int> compressed_schema_cost(const cucascade::idata_representation& data)
+{
+  if (auto const* host = dynamic_cast<const sirius::compressed_host_representation*>(&data)) {
+    return is_whole_chunk(*host) ? std::optional<int>{0} : std::nullopt;
+  }
+  if (auto const* device = dynamic_cast<const sirius::compressed_device_representation*>(&data)) {
+    return is_whole_chunk(*device) && device->has_table() ? std::optional<int>{1} : std::nullopt;
+  }
+  if (dynamic_cast<const sirius::compressed_disk_representation*>(&data) != nullptr) { return 2; }
+  return std::nullopt;
+}
+
+/// Column types of a spill-compressed batch, from its header; nullopt for a batch without a
+/// compressed_schema_cost, or when the header cannot be parsed. Parses the header on every call.
+std::optional<std::vector<cudf::data_type>> compressed_column_types(
+  const cucascade::idata_representation& data)
+{
+  auto const* compressed = dynamic_cast<const sirius::simpatico_compressed_representation*>(&data);
+  if (compressed == nullptr || !compressed_schema_cost(data).has_value()) { return std::nullopt; }
+  try {
+    auto const description = sirius::compression::describe(*compressed);
+    std::vector<cudf::data_type> result;
+    result.reserve(description->columns.size());
+    for (auto const& column : description->columns) {
+      result.push_back(column.dtype);
+    }
+    return result;
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN("merge_sort: cannot take the schema of a compressed batch from its header: {}",
+                    e.what());
+    return std::nullopt;
+  }
+}
+
+/// Column types of an uncompressed batch representation; nullopt for any other representation
+/// (see compressed_column_types for a spill-compressed one).
 std::optional<std::vector<cudf::data_type>> representation_column_types(
   const cucascade::idata_representation& data)
 {
@@ -131,9 +181,14 @@ std::optional<std::vector<cudf::data_type>> representation_column_types(
 }
 
 /// Whether the windowed merge can read @p data by row range; otherwise it converts the whole
-/// batch to the GPU tier.
+/// batch to the GPU tier. A compressed batch whose reader refuses it for its plan (known only
+/// from its header) still counts as readable.
 bool has_row_range_reader(const cucascade::idata_representation& data)
 {
+  if (dynamic_cast<const sirius::simpatico_compressed_representation*>(&data) != nullptr &&
+      !compressed_schema_cost(data).has_value()) {
+    return false;
+  }
   if (sirius::row_range_reader_registry::is_initialized()) {
     return sirius::row_range_reader_registry::get().has_reader(data);
   }
@@ -487,6 +542,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
   std::sort(ids.begin(), ids.end());
   std::shared_ptr<cucascade::data_batch> first_locked;
   std::shared_ptr<cucascade::data_batch> unsized_locked;
+  // The read lock of the compressed batch whose header is the cheapest to parse.
+  std::optional<cucascade::read_only_data_batch> schema_source;
+  int schema_source_cost = 0;
   for (auto id : ids) {
     auto batch = repo.get_data_batch_by_id(id, partition);
     if (!batch) { continue; }
@@ -495,7 +553,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
       std::lock_guard<std::mutex> lg(_pushed_mutex);
       if (auto const it = _pushed_sizes.find(id); it != _pushed_sizes.end()) { size = it->second; }
     }
-    if (auto const ro = batch->try_to_read_only(); ro.has_value()) {
+    if (auto ro = batch->try_to_read_only(); ro.has_value()) {
       auto const* data = ro->get_data();
       auto* space      = ro->get_memory_space();
       if (!size.has_value()) {
@@ -510,7 +568,16 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
       } else {
         any_non_gpu = true;
       }
-      if (!schema.has_value() && data != nullptr) { schema = representation_column_types(*data); }
+      if (!schema.has_value() && data != nullptr) {
+        schema = representation_column_types(*data);
+        // A compressed batch names its columns only in its header. It is parsed after the loop,
+        // for one batch, and only if no uncompressed batch has given the schema by then.
+        if (auto const cost = schema.has_value() ? std::nullopt : compressed_schema_cost(*data);
+            cost.has_value() && (!schema_source.has_value() || *cost < schema_source_cost)) {
+          schema_source_cost = *cost;
+          schema_source.emplace(std::move(*ro));
+        }
+      }
     } else {
       any_non_gpu = true;
       if (!size.has_value() && !unsized_locked) { unsized_locked = batch; }
@@ -522,6 +589,10 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     total_bytes += size->bytes;
     total_rows += size->rows.value_or(0);
   }
+  if (!schema.has_value() && schema_source.has_value()) {
+    schema = compressed_column_types(*schema_source->get_data());
+  }
+  schema_source.reset();
   // A locked batch that was never sized, or that may be the only one exposing the schema, has
   // to be read before the route can be chosen: the partition is armed at a later attempt.
   if (unsized_locked || (first_locked && !schema.has_value())) {
@@ -684,10 +755,12 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
   std::unordered_map<int, std::size_t> device_bytes;
   std::size_t gpu_runs                   = 0;
   std::size_t largest_fallback_run_bytes = 0;
+  std::size_t compressed_runs            = 0;
   for (auto i : selected) {
     auto const& run = state.runs[i];
     cursors.push_back(run.cursor);
-    bool all_on_gpu = true;
+    bool all_on_gpu     = true;
+    bool any_compressed = false;
     for (std::size_t b = 0; b < run.cursor.run.batch_ids.size(); ++b) {
       auto const id = run.cursor.run.batch_ids[b];
       auto batch    = repo.get_data_batch_by_id(id, partition);
@@ -704,14 +777,19 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
       if (data != nullptr && space != nullptr &&
           ro->get_current_tier() == cucascade::memory::Tier::GPU) {
         device_bytes[space->get_device_id()] += run.batch_bytes[b];
-        continue;
+        // Only an uncompressed table is sliced in place; a compressed device batch is read into
+        // a window buffer like the batches of the other tiers.
+        if (dynamic_cast<const cucascade::gpu_table_representation*>(data) != nullptr) { continue; }
       }
       all_on_gpu = false;
       if (data != nullptr && !has_row_range_reader(*data)) {
         largest_fallback_run_bytes = std::max(largest_fallback_run_bytes, run.batch_bytes[b]);
       }
+      any_compressed =
+        any_compressed || dynamic_cast<const simpatico_compressed_representation*>(data) != nullptr;
     }
     if (all_on_gpu) { ++gpu_runs; }
+    if (any_compressed) { ++compressed_runs; }
   }
 
   auto const num_columns = state.column_types.size();
@@ -733,7 +811,13 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::make_windowed_input(
     sum_widths(state.column_widths, plan.fetch_cols),
     sum_widths(state.column_widths, key_columns),
     gpu_runs,
-    largest_fallback_run_bytes);
+    largest_fallback_run_bytes,
+    compressed_runs,
+    plan.fetch_cols.size(),
+    static_cast<std::size_t>(
+      std::count_if(plan.fetch_cols.begin(), plan.fetch_cols.end(), [&state](auto column) {
+        return state.column_types[column].id() == cudf::type_id::STRING;
+      })));
   if (!device_bytes.empty()) {
     input->set_preferred_device_id(
       std::max_element(device_bytes.begin(), device_bytes.end(), [](auto const& a, auto const& b) {

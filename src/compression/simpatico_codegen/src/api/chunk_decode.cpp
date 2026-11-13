@@ -3,7 +3,9 @@
 
 #include "api/chunk_decode.hpp"
 
+#include "codegen/util/cuda_check.hpp"
 #include "decode/chunk/chunk_decoders.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -26,14 +28,6 @@ namespace simpatico {
 namespace chunk {
 
 namespace {
-
-void cuda_try(cudaError_t status, char const* what)
-{
-  if (status != cudaSuccess) {
-    throw std::runtime_error(std::string{"chunk decode: "} + what + ": " +
-                             cudaGetErrorString(status));
-  }
-}
 
 /// Throws unless [offset, offset + size) lies within a region of `limit` bytes.
 void check_range(std::uint64_t offset, std::uint64_t size, std::uint64_t limit, char const* what)
@@ -87,13 +81,13 @@ class staged_ranges {
       if (it->first > pos) { read(it->first); }
       auto const upto = std::min(end, it->second.end);
       if (upto > pos) {
-        cuda_try(cudaMemcpyAsync(
-                   out + (pos - begin),
-                   static_cast<const std::byte*>(it->second.bytes.data()) + (pos - it->first),
-                   upto - pos,
-                   cudaMemcpyDeviceToDevice,
-                   stream.value()),
-                 "copy of staged bytes");
+        throw_if_cuda_error(cudaMemcpyAsync(out + (pos - begin),
+                                            static_cast<const std::byte*>(it->second.bytes.data()) +
+                                              (pos - it->first),
+                                            upto - pos,
+                                            cudaMemcpyDeviceToDevice,
+                                            stream.value()),
+                            "chunk decode: copy of staged bytes");
         pos = upto;
       }
     }
@@ -177,8 +171,8 @@ class staged_leaf_access final : public leaf_access {
   }
 
   /// Copies from the staged bytes when they cover the request. Otherwise the bytes pass through a
-  /// device buffer that is freed before returning (payload_source only reads to the device).
-  /// Waits for the stream either way.
+  /// device buffer that is freed once the stream has completed (payload_source only reads to the
+  /// device). Waits for the stream either way, also when the copy fails.
   void host_bytes(std::size_t leaf,
                   std::size_t buffer,
                   std::uint64_t offset,
@@ -200,9 +194,8 @@ class staged_leaf_access final : public leaf_access {
       _payload->read_to_device(begin, size, bounce.data(), stream);
       src = static_cast<const std::byte*>(bounce.data());
     }
-    cuda_try(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream.value()),
-             "copy of leaf bytes to the host");
-    stream.synchronize();
+    // Returns, or throws, only after the stream has completed, so `bounce` outlives its copies.
+    read_device_bytes_completed(dst, src, size, stream);
   }
 
   const std::byte* validity_bytes(std::uint64_t offset,
@@ -299,10 +292,6 @@ bool is_delta_type(cudf::data_type type)
 
 }  // namespace
 
-// Not declared in chunk_decoders.hpp: test_chunk_cursor declares these three itself to exercise
-// the staging without a decoder.
-
-/// The leaf_access a cursor over `column` of `description` hands to its decoder.
 std::unique_ptr<leaf_access> make_staged_leaf_access(
   std::shared_ptr<const hpln_description> description,
   std::size_t column,
@@ -314,14 +303,12 @@ std::unique_ptr<leaf_access> make_staged_leaf_access(
     std::move(description), column, std::move(payload), mr);
 }
 
-/// Device bytes currently staged by an access made by make_staged_leaf_access.
 std::size_t staged_bytes_held(leaf_access const& access)
 {
   auto const* staged = dynamic_cast<staged_leaf_access const*>(&access);
   return staged != nullptr ? staged->bytes_held() : 0;
 }
 
-/// What decompress_column_chunks does to its cursor's access at the end of every call.
 void release_transient_staging(leaf_access& access)
 {
   if (auto* staged = dynamic_cast<staged_leaf_access*>(&access)) { staged->release_transient(); }

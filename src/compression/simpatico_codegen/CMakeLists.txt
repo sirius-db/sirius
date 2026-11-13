@@ -239,6 +239,7 @@ add_codegen_host_test(test_chunk_dictionary)
 add_codegen_host_test(test_chunk_str_split)
 add_codegen_host_test(test_chunk_decode_equivalence)
 add_codegen_host_test(test_render_signature_contract)
+add_codegen_host_test(test_chunk_test_utils)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -283,3 +284,4 @@ add_test(NAME chunk_dictionary COMMAND test_chunk_dictionary)
 add_test(NAME chunk_str_split COMMAND test_chunk_str_split)
 add_test(NAME chunk_decode_equivalence COMMAND test_chunk_decode_equivalence)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
+add_test(NAME chunk_test_utils COMMAND test_chunk_test_utils)

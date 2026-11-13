@@ -142,6 +142,13 @@ using bounded_merge_fn = std::function<bounded_merge_result(std::span<const cudf
  * detail::convert_run_batch_to_gpu once. The null count of a window's columns is an upper bound
  * (exact only when 0): the merge kernel must read the masks.
  *
+ * Memory: the window buffers, the merge scratch and the output come from the `mr` of run(). The
+ * readers allocate from the default allocator of the GPU space, on the stream of the run() that
+ * reads: the temporaries of a refill and, for a compressed batch, the decode state its reader
+ * keeps with the run between refills (dropped with the run's rows, and by the reader when a
+ * later run() uses another stream). The operator passes that same allocator as `mr`, so all of
+ * it is charged to the task whose reservation is attached to the stream.
+ *
  * run() stops when its output reaches cfg.output_target_bytes or every cursor is exhausted, and
  * returns ONE table (0 rows only if all inputs were already exhausted). `cursors` are written
  * back only when run() returns normally.
@@ -171,7 +178,9 @@ class windowed_merger {
    * @param keys Sort keys; key_cols index into fetch_cols order.
    * @param cfg Window rows and output target of this task.
    * @param readers Row-range reader registry; must outlive the merger.
-   * @param gpu_space The task's GPU memory space; must outlive the merger.
+   * @param gpu_space The task's GPU memory space; must outlive the merger. Batches are converted
+   *        to it when they cannot be read by row range, and the readers allocate from its default
+   *        allocator.
    * @param merge The bounded merge kernel (tests may substitute it).
    */
   windowed_merger(std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> runs,
@@ -193,8 +202,9 @@ class windowed_merger {
    *
    * @param stream CUDA stream used for device memory operations and kernel launches; may differ
    *        from one call to the next.
-   * @param mr Device memory resource used for windows, scratch and the output table; the same
-   *        resource in every call, and it must outlive the merger.
+   * @param mr Device memory resource used for windows, merge scratch and the output table; the
+   *        same resource in every call, and it must outlive the merger. The readers do not use
+   *        it: they allocate from the GPU space's default allocator.
    * @param stats Optional counters, added to (not reset); may be nullptr.
    * @return ONE table with the fetched columns in fetch_cols order.
    */

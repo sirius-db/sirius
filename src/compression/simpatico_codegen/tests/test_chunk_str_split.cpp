@@ -188,7 +188,8 @@ struct str_split_column {
   std::uint64_t block_bytes{0};
   std::uint64_t header_bytes{0};
   std::vector<std::uint64_t> block_offsets, block_sizes;
-  bool header_read{false};  ///< the decoder has parsed the ANS frame header
+  bool header_read{false};     ///< the decoder has parsed the ANS frame header
+  bool offsets_loaded{false};  ///< the decoder has loaded the differences' chunk metadata
 };
 
 std::unique_ptr<cudf::column> make_strings(cudf::size_type rows,
@@ -276,8 +277,9 @@ std::int64_t check_span(str_split_column& column,
     return got;
   }
 
-  // Chars: one request for exactly the compressed bytes of the blocks covering the range; the
-  // frame header is read by the first decode with chars and never again.
+  // Chars: one request for exactly the compressed bytes of the blocks covering the range, and
+  // at most those blocks' entries of the frame's size table; the frame header is read to the
+  // host by the first decode with chars and never again.
   std::vector<request> ans_device, ans_host;
   for (auto const& r : access.device_requests()) {
     if (std::get<0>(r) == column.ans.leaf) { ans_device.push_back(r); }
@@ -292,16 +294,25 @@ std::int64_t check_span(str_split_column& column,
     auto const b1         = (chars_end - 1) / column.block_bytes;
     auto const span_begin = column.block_offsets[b0];
     auto const span_bytes = column.block_offsets[b1] + column.block_sizes[b1] - span_begin;
-    check(ans_device.size() == 1 &&
-            ans_device[0] == request{column.ans.leaf, column.ans.buffer, span_begin, span_bytes},
+    request const blocks{column.ans.leaf, column.ans.buffer, span_begin, span_bytes};
+    check(std::count(ans_device.begin(), ans_device.end(), blocks) == 1,
           what + "the ANS blocks requested are not exactly those covering the chars");
+    for (auto const& r : ans_device) {
+      if (r == blocks) { continue; }
+      check(std::get<2>(r) >= 16 + 8 * b0 && std::get<2>(r) + std::get<3>(r) <= 16 + 8 * (b1 + 1),
+            what + "ANS bytes other than the covering blocks and their sizes were staged");
+    }
     if (column.header_read) {
       check(ans_host.empty(), what + "the ANS frame header was read again");
     } else {
-      check(
-        ans_host.size() == 2 && ans_host[0] == request{column.ans.leaf, column.ans.buffer, 0, 16} &&
-          ans_host[1] == request{column.ans.leaf, column.ans.buffer, 16, column.header_bytes - 16},
-        what + "the first decode with chars did not read the ANS frame header");
+      std::uint64_t header_read = 0;
+      for (auto const& r : ans_host) {
+        check(std::get<2>(r) + std::get<3>(r) <= column.header_bytes,
+              what + "a host read past the ANS frame header");
+        header_read += std::get<3>(r);
+      }
+      check(header_read == column.header_bytes,
+            what + "the first decode with chars did not read the ANS frame header once");
       column.header_read = true;
     }
   }
@@ -325,9 +336,24 @@ std::int64_t check_span(str_split_column& column,
                                chunk_begin * column.first_width,
                                chunk_end * column.first_width),
         what + "requested delta_first outside the span's offsets chunks");
-  check(access.requests_within(ix.chunk_count.leaf, ix.chunk_count.buffer, 0, chunk_end * 4) &&
-          access.requests_within(ix.chunk_bits.leaf, ix.chunk_bits.buffer, 0, chunk_end),
-        what + "requested chunk metadata past the span's offsets chunks");
+  // The differences' chunk_count / chunk_bits: the bitpack state reads the whole node's to the
+  // host once, on the column's first decode. After that the only host reads a decode may make
+  // are the ANS frame header's, so none grows with `take`; chunk_count is then staged on the
+  // device for the span's chunks alone.
+  auto const is = [](request const& r, chunk::buffer_ref ref) {
+    return std::get<0>(r) == ref.leaf && std::get<1>(r) == ref.buffer;
+  };
+  for (auto const& r : access.host_requests()) {
+    if (std::get<0>(r) == column.ans.leaf) { continue; }
+    check(!column.offsets_loaded && (is(r, ix.chunk_count) || is(r, ix.chunk_bits)),
+          what + "a decode after the first read offsets metadata back to the host");
+  }
+  column.offsets_loaded = true;
+  for (auto const& r : access.device_requests()) {
+    if (!is(r, ix.chunk_count)) { continue; }
+    check(std::get<2>(r) >= chunk_begin * 4 && std::get<2>(r) + std::get<3>(r) <= chunk_end * 4,
+          what + "staged chunk_count outside the span's offsets chunks");
+  }
   check(access.requested_bytes(column.delta_first.leaf, column.delta_first.buffer) != 0,
         what + "a decode requested no offsets");
   ++spans_checked;
@@ -361,12 +387,14 @@ void test_column(cudf::size_type rows,
              static_cast<std::size_t>(offsets[middle + 1] - offsets[middle]),
              what);
 
-  // The whole column next, so the decoder's scratch is as large as it will get.
+  // The whole column next: the decoder's offsets scratch is as large as it will get. The state
+  // (that scratch, the offsets' delta state and the chars' ANS state) stays within one window's
+  // int64 offsets on these small columns, whatever is decoded afterwards.
   auto const everything = static_cast<std::size_t>(offsets.back());
   check(check_span(column, offsets, 0, rows, 8, 3, 17, everything, what) == rows,
         what + "the whole column did not fit its own size");
-  auto const state_bytes = column.decoder->state_bytes();
-  check(state_bytes != 0 && state_bytes <= static_cast<std::size_t>(kWindowChunks * kChunkRows) * 8,
+  auto const state_bound = static_cast<std::size_t>(kWindowChunks * kChunkRows) * 8;
+  check(column.decoder->state_bytes() != 0 && column.decoder->state_bytes() <= state_bound,
         what + "state_bytes is not the bounded offsets scratch");
 
   std::vector<std::pair<std::int64_t, std::int64_t>> spans{
@@ -403,8 +431,8 @@ void test_column(cudf::size_type rows,
                                 ? std::size_t{0}
                                 : std::uniform_int_distribution<std::size_t>{1, 300}(rng);
         check_span(column, offsets, first, take, offset_width, dst_row, dst_byte, budget, what);
-        check(column.decoder->state_bytes() == state_bytes,
-              what + "state_bytes changed between calls");
+        check(column.decoder->state_bytes() <= state_bound,
+              what + "state_bytes grew past the bounded scratch");
       }
     }
   }
@@ -422,9 +450,13 @@ void test_windows()
 
   check(check_span(column, offsets, 0, kRows, 4, 0, 0, total, what) == kRows,
         what + "the whole column did not fit");
-  check(column.decoder->state_bytes() ==
-          static_cast<std::size_t>(kWindowChunks * kChunkRows) * sizeof(std::int64_t),
-        what + "the offsets scratch is not one window");
+  // One window of int64 offsets in the decoder and one in the offsets' delta state; the rest
+  // (the differences' packed-word scratch and metadata, the ANS state) is smaller than a third.
+  auto const window_bytes =
+    static_cast<std::size_t>(kWindowChunks * kChunkRows) * sizeof(std::int64_t);
+  auto const held = column.decoder->state_bytes();
+  check(held >= 2 * window_bytes && held <= 3 * window_bytes,
+        what + "the state is " + std::to_string(held) + " bytes, not two windows of offsets");
   // Starts mid-chunk, ends mid-chunk, crosses two window boundaries; cut in the last window.
   auto const first = std::int64_t{700};
   auto const take  = std::int64_t{2 * kWindowChunks * kChunkRows + 5000};

@@ -248,10 +248,12 @@ void check_string_span(device_leaf_access& access,
   auto const offsets_end   = static_cast<std::uint64_t>(first + take + 1) * stored_width;
   check(access.requests_within(0, 0, offsets_begin, offsets_end),
         what + "requested offsets outside the span");
-  check(
-    access.host_requests().size() == 1 &&
-      access.host_requests().front() == request{0, 0, offsets_begin, offsets_end - offsets_begin},
-    what + "the host fetch is not the span's offsets");
+  // The offsets are staged once, on the device; the cut is found there, so no call reads
+  // payload bytes back to the host, whatever its take.
+  check(access.requested_bytes(0, 0) == offsets_end - offsets_begin,
+        what + "the span's offsets were not staged exactly once");
+  check(access.host_requests().empty(), what + "a decode read payload bytes back to the host");
+  check(decoder.state_bytes() <= 64, what + "the decoder's state grows with the span");
   check(access.requests_within(0,
                                1,
                                static_cast<std::uint64_t>(offsets[begin]),
@@ -403,6 +405,55 @@ void test_string_wide_stored_offsets()
     access, *decoder, oracle->view(), 8, options.seed, "string, INT64 stored offsets: ");
 }
 
+/// Stored offsets that start negative or decrease are reported as corrupt, wherever in the span
+/// they are, and the decoder still works on the rows before them.
+void test_string_corrupt_offsets()
+{
+  column_options options;
+  options.rows       = 3000;
+  options.seed       = 5;
+  options.min_length = 1;
+  options.max_length = 9;
+  auto input         = make_random_column(cudf::type_id::STRING, options);
+  auto table         = compress_column_with_plan(input->view(), kStoredPlan);
+  auto description   = describe_from_table(table, 0);
+  auto payload       = flatten_payload_host(table, 0);
+  auto const& range  = description.leaves.at(0).buffers.at(0);
+  check(range.size == (static_cast<std::size_t>(options.rows) + 1) * 4,
+        "corrupt offsets: stored offsets are not INT32");
+  auto poke = [&](std::size_t element, std::int32_t value) {
+    std::memcpy(payload.data() + range.payload_offset + element * 4, &value, sizeof(value));
+  };
+  poke(0, -1);     // the first row starts before the chars
+  poke(2000, 17);  // row 1999 ends before it starts
+
+  rmm::cuda_stream_view const stream = cudf::get_default_stream();
+  rmm::device_buffer device(payload.size(), stream);
+  cuda_check(cudaMemcpyAsync(
+    device.data(), payload.data(), payload.size(), cudaMemcpyHostToDevice, stream.value()));
+  stream.synchronize();
+  device_leaf_access access{description, std::move(device)};
+  auto decoder = chunk::make_stored_decoder(access.column());
+
+  auto chars       = sentinel_buffer(64 * 1024);
+  auto dst_offsets = sentinel_buffer((static_cast<std::size_t>(options.rows) + 1) * 8);
+  column_write_target dst;
+  dst.data          = chars.data();
+  dst.data_capacity = chars.size();
+  dst.offsets       = dst_offsets.data();
+  dst.offset_width  = 8;
+  check(throws<std::runtime_error>([&] { decoder->decode(access, span_of(0, 10), dst, stream); }),
+        "corrupt offsets: a negative first offset was not reported");
+  check(
+    throws<std::runtime_error>([&] { decoder->decode(access, span_of(1500, 1000), dst, stream); }),
+    "corrupt offsets: decreasing offsets were not reported");
+  check(throws<std::runtime_error>([&] { decoder->decode(access, span_of(1999, 1), dst, stream); }),
+        "corrupt offsets: a row ending before it starts was not reported");
+  check(decoder->decode(access, span_of(1, 1000), dst, stream) == 1000,
+        "corrupt offsets: the rows between the corrupt offsets did not decode");
+  stream.synchronize();
+}
+
 /// A description that does not have the stored layout is refused, not misread.
 void test_refusals()
 {
@@ -464,6 +515,7 @@ int main()
     test_string(2048, 0.0, 0, 0);  // every value empty: all rows fit a budget of 0
     test_string(1, 0.0, 5, 5);
     test_string_wide_stored_offsets();
+    test_string_corrupt_offsets();
     test_refusals();
   } catch (std::exception const& e) {
     std::fprintf(stderr, "FAIL: %s\n", e.what());

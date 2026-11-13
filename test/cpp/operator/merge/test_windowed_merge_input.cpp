@@ -120,6 +120,35 @@ TEST_CASE("windowed_merge_input exposes its fields and a window-sized estimate",
   REQUIRE(base.get_estimated_working_set_size_in_bytes() == expected);
 }
 
+TEST_CASE("windowed_merge_input adds the reader state of its compressed runs to the estimate",
+          "[windowed_merge_input]")
+{
+  using sirius::op::merge::estimate_reader_state_bytes;
+  constexpr std::size_t compressed_runs = 2, fetch_columns = 5, string_columns = 1;
+  windowed_merge_input input(5,
+                             make_cursors(),
+                             false,
+                             9,
+                             {.window_rows = 65536, .output_target_bytes = 64 * kMiB},
+                             kRowWidth,
+                             kKeyRowWidth,
+                             kGpuRuns,
+                             kLargestFallback,
+                             compressed_runs,
+                             fetch_columns,
+                             string_columns);
+  const auto reader = [&](std::size_t window_rows) {
+    return estimate_reader_state_bytes(compressed_runs, fetch_columns, string_columns, window_rows);
+  };
+  REQUIRE(reader(65536) > 0);
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()) + reader(65536));
+
+  // The reader term follows the window when the task shrinks.
+  REQUIRE(input.shrink_for_retry());
+  REQUIRE(input.config().window_rows == 32768);
+  REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config()) + reader(32768));
+}
+
 TEST_CASE("windowed_merge_input shrinks by halving down to both floors", "[windowed_merge_input]")
 {
   // window_rows: 5000 -> 2500 -> 1250 -> 1024; output: 100 -> 50 -> 25 -> 16 MiB.
