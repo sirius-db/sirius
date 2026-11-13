@@ -271,7 +271,7 @@ class EdgeValues:
     probability: float = 0.02
     int_extremes: bool = True
     negative_zero: bool = True
-    nan_inf: bool = True
+    nan_inf: bool = gap_switch(False)  # nonfinite floating aggregates mismatch
     rounding_ties: bool = gap_switch(False)
     date_extremes: bool = True
     unicode_case: bool = gap_switch(False)  # GPU case mapping differs for ß and İ

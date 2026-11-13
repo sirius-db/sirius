@@ -204,9 +204,10 @@ shapes. Integer narrowing and sign changes remain in gaps mode while overflow
 behavior differs; decimal scale reduction and timestamp second/millisecond
 casts also remain in gaps mode because one-expression checks found mismatches.
 `data.edge_values.unicode_case` exposes Unicode case-mapping differences in
-gaps mode. The edge-value switches for NaN/infinity, negative zero, date
-extremes, rounding ties such as `0.125`, and strings over 64 KiB are independently
-configurable. The long-string switch inserts at most one such value per small dataset;
+gaps mode. NaN/infinity data is also gaps-only after the Phase 2c campaigns
+found mismatches in floating aggregates; negative zero and date extremes stay on
+by default. Rounding ties such as `0.125` and strings over 64 KiB have their
+own gaps switches. The long-string switch inserts at most one such value per small dataset;
 DuckDB-native GPU scans currently decline overflow strings.
 
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);

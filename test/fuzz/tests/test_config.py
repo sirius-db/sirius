@@ -65,6 +65,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.variants.per_query, 0)
         # Gaps mode also explores float/decimal formatting casts.
         self.assertTrue(f.casts.to_varchar)
+        self.assertFalse(default.data.edge_values.nan_inf)
+        self.assertTrue(cfg.data.edge_values.nan_inf)
         # Data shape and the CPU-vs-GPU oracle are untouched.
         self.assertEqual(f.types, default.features.types)
         self.assertEqual(cfg.oracle, default.oracle)
