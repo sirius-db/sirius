@@ -850,10 +850,6 @@ device_pin_result materialize_all_batches_compressed(
   device_pin_result out;
   bool compression_failed = false;
 
-  // The device insert path stores no statistics sidecar (device_pin_result carries none), so a
-  // capture would be computed and dropped — force it off.
-  options.capture_chunk_stats = false;
-
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,

@@ -62,6 +62,9 @@ also fall back. An explicit plan that does not cover the pinned columns is rejec
 a warning and the pin stays raw; it is not silently replaced by an automatic plan.
 The `parquet` pin tier continues to cache file bytes without this decode/compress step.
 
+When pinned zone-map capture is enabled, supported native min/max statistics are
+retained for compressed chunks on both tiers, so entire chunks can be pruned before decode.
+
 Fully raw automatic GPU results retain the ordinary column-major storage and incremental
 column-merge behavior. GPU pins containing compressed chunks retain their existing
 replacement behavior on re-pin: pin the full intended column set in one call, or opt out

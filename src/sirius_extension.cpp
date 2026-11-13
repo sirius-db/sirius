@@ -1439,7 +1439,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         pinned_column_types,
         pin_comp,
         {.expression_policy                 = pin_op_params.expression_policy(),
-         .capture_chunk_stats               = pin_comp.plan_dsl.empty() && capture_chunk_stats,
+         .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
@@ -1481,7 +1481,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
           std::move(dev_result.chunks),
           *gpu_spaces_mut[0],
           std::move(dev_result.column_storage),
-          pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+          pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)),
+          std::move(pinned_column_types),
+          std::move(dev_result.chunk_stats));
       }
     } else {
       // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table

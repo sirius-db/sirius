@@ -764,12 +764,17 @@ class sirius_scan_manager {
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
   ///                      chunk's types are unreadable here, so its cells are trusted.
-  void insert_pinned_entry_device(const std::string& name,
-                                  cache_entry_info cache_info,
-                                  std::vector<sirius::device_pin_chunk> chunks,
-                                  cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage,
-                                  pinned_entry_metadata metadata = {});
+  /// \param column_types Pin-time DuckDB column types for optional zone-map capture.
+  /// \param chunk_stats  Captured native statistics, indexed by chunk and cached column.
+  void insert_pinned_entry_device(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<sirius::device_pin_chunk> chunks,
+    cucascade::memory::memory_space& memory_space,
+    sirius::pinned_column_storage_matrix column_storage,
+    pinned_entry_metadata metadata                                                   = {},
+    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);

@@ -29,6 +29,7 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/pinned_entry_census.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
@@ -148,6 +149,7 @@ sirius::scan_manager::pinned_entry const* find_entry(duckdb::SiriusContext& siri
 std::size_t entry_chunk_count(sirius::scan_manager::pinned_entry const& e)
 {
   if (e.tier == cucascade::memory::Tier::HOST) { return e.host_chunks.size(); }
+  if (!e.device_chunks.empty()) { return e.device_chunks.size(); }
   return e.data_batches_by_column.empty() ? 0 : e.data_batches_by_column.begin()->second.size();
 }
 
@@ -242,16 +244,24 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx);
 
+    require_ok(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;"),
+               "disable size gate");
     for (auto const* tier : {"host", "gpu"}) {
-      DYNAMIC_SECTION("tier = " << tier)
-      {
-        auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
-                             ", tier='" + std::string(tier) + "', name='t');");
-        require_ok(pin, "pin_table");
+      for (bool const compression : {false, true}) {
+        DYNAMIC_SECTION("tier = " << tier << ", compression = " << compression)
+        {
+          auto pin =
+            con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                      ", tier='" + std::string(tier) + "', name='t', compression => " +
+                      (compression ? "true" : "false") + ");");
+          require_ok(pin, "pin_table");
+          auto const census = sirius::test::census_entry(con, "t");
+          REQUIRE(census.compressed_chunks == (compression ? census.chunks : 0));
 
-        run_pruning_assertions(con, *sirius_ctx, "t", "t");
+          run_pruning_assertions(con, *sirius_ctx, "t", "t");
 
-        require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+          require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+        }
       }
     }
 
@@ -276,8 +286,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
       REQUIRE(sel->Collection().GetValue(1, 0).ToString() == std::to_string(kExpectSum));
       REQUIRE(probe_pruned_count(*entry_ptr) == 0);
 
-      // ...until a re-pin: the same-name GPU re-pin takes the equal-row-count
-      // merge and the statless entry adopts the fresh capture.
+      // ...until a re-pin installs a fresh capture. Raw column-major pins merge;
+      // compressed pins replace their prior generation.
       auto repin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
                              ", tier='gpu', name='t');");
       require_ok(repin, "re-pin with capture enabled");
@@ -318,16 +328,23 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx);
 
+    require_ok(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;"),
+               "disable size gate");
     for (auto const* tier : {"host", "gpu"}) {
-      DYNAMIC_SECTION("tier = " << tier)
-      {
-        auto pin = con.Query("CALL pin_table(format='duckdb', name='zm_native_t', tier='" +
-                             std::string(tier) + "');");
-        require_ok(pin, "pin_table");
+      for (bool const compression : {false, true}) {
+        DYNAMIC_SECTION("tier = " << tier << ", compression = " << compression)
+        {
+          auto pin = con.Query("CALL pin_table(format='duckdb', name='zm_native_t', tier='" +
+                               std::string(tier) + "', compression => " +
+                               (compression ? "true" : "false") + ");");
+          require_ok(pin, "pin_table");
+          auto const census = sirius::test::census_entry(con, "zm_native_t");
+          REQUIRE(census.compressed_chunks == (compression ? census.chunks : 0));
 
-        run_pruning_assertions(con, *sirius_ctx, "zm_native_t", "zm_native_t");
+          run_pruning_assertions(con, *sirius_ctx, "zm_native_t", "zm_native_t");
 
-        require_ok(con.Query("CALL unpin_table('zm_native_t');"), "unpin");
+          require_ok(con.Query("CALL unpin_table('zm_native_t');"), "unpin");
+        }
       }
     }
   }
