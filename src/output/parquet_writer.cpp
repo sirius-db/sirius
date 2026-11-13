@@ -8,6 +8,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -99,6 +100,16 @@ cudf::column_view parquet_view(parquet_field const& field,
       std::move(*contents.null_mask),
       nulls));
     return owners.back()->view();
+  }
+  // Aggregate fast paths can retain DECIMAL64 for a declared DECIMAL(38,s).
+  // Footer precision must fit the physical carrier even when all actual values
+  // are small. Widen recursively without narrowing an already wider carrier.
+  if (field.type.is_decimal() && cudf::is_fixed_point(column.type())) {
+    auto const required = physical_type(field.type);
+    if (cudf::size_of(column.type()) < cudf::size_of(required)) {
+      owners.push_back(cudf::cast(column, required, stream));
+      return owners.back()->view();
+    }
   }
   if (!field.children.empty()) {
     std::vector<cudf::column_view> children;

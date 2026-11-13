@@ -7,6 +7,8 @@
 
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/string_util.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/parser/parsed_data/copy_info.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/parser/statement/copy_statement.hpp>
@@ -15,6 +17,29 @@
 
 namespace sirius::planner {
 namespace {
+void authorize_export_directory(duckdb::ClientContext& context,
+                                std::filesystem::path const& directory)
+{
+  auto& config = duckdb::DBConfig::GetConfig(context);
+  if (!config.CanAccessFile(directory.string(), duckdb::FileType::FILE_TYPE_REGULAR))
+    throw duckdb::PermissionException("Cannot access Parquet output directory: %s",
+                                      directory.string());
+  if (duckdb::Settings::Get<duckdb::EnableExternalAccessSetting>(config)) return;
+
+  // An exact allowed_paths entry authorizes only the directory's own pathname.
+  // Authorize the entire generated-file namespace here, before handing a plain
+  // Sirius specification to the engine. DuckDB stores normalized directory
+  // prefixes with a trailing slash; matching one covers every direct child.
+  auto path = config.SanitizeAllowedPath(directory.string());
+  if (!duckdb::StringUtil::EndsWith(path, "/")) path += "/";
+  for (auto const& allowed : config.GetAllowedDirectories()) {
+    if (duckdb::StringUtil::StartsWith(path, allowed)) return;
+  }
+  throw duckdb::NotImplementedException(
+    "Sirius multipart Parquet COPY requires allowed_directories to authorize generated parts "
+    "when enable_external_access is false; allowed_paths entries are exact, not wildcards");
+}
+
 output::parquet_field export_field(std::string name, duckdb::LogicalType const& type)
 {
   using T = duckdb::LogicalTypeId;
@@ -96,6 +121,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
   spec.directory =
     std::filesystem::absolute(duckdb::FileSystem::GetFileSystem(context).ExpandPath(copy.file_path))
       .lexically_normal();
+  authorize_export_directory(context, spec.directory);
   auto runtime     = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   spec.compression = runtime->get_config().parquet_output_compression();
   if (auto option = copy.copy_info->options.find("compression");

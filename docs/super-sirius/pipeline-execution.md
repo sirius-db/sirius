@@ -97,7 +97,7 @@ parallel::itask                          // base: local_state + global_state + e
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
 - `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`
 
-**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each:
+**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute_with_context()` on each (ordinary operators delegate to `execute()`; COPY requires the context):
 ```cpp
 auto operators = pipeline->get_operators();  // includes source and sink
 for (size_t i = start_index; i < operators.size(); i++) {
@@ -115,7 +115,7 @@ pipeline->get_sink()->sink(output_data, stream);
 
 **`execute(stream)`** handles the full flow:
 1. Lock each input batch and convert to GPU if needed (`lock_or_prepare_batch`)
-2. Call `compute_task()` (iterates all operators' `execute()`)
+2. Call `compute_task()` (iterates all operators' `execute_with_context()`)
 3. Call `publish_output()` (calls sink's `sink()` to push to downstream ports)
 4. Processing handles released automatically on scope exit
 
@@ -168,7 +168,7 @@ The reservation was attached by the GPU executor's manager loop (see [GPU Pipeli
 
 **Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
 
-This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it.
+This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute_with_context()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it.
 
 **Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-clones it.**
 
@@ -378,9 +378,9 @@ The reservation request size comes from the task's memory-history estimate (`pea
 
 After a task completes:
 
-1. Retrieve `output_consumers` — first operators of parent pipelines
-2. If query not complete: call `task_creator->schedule(consumer)` for each
-3. If pipeline sink is `RESULT_COLLECTOR` and pipeline is finished: `completion_handler->mark_completed()`
+1. Check whether `pipeline->is_query_terminal()` (RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE) and the pipeline is finished
+2. If complete: `completion_handler->mark_completed()`
+3. Otherwise, retrieve `output_consumers` — first operators of parent pipelines — and call `task_creator->schedule(consumer)` for each
 
 The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
 

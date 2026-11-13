@@ -213,8 +213,8 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
   [[nodiscard]] bool is_limit_exhausted() const;
 
-  //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
-  //! completion signals execute().
+  //! Query-terminal sink (RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE): no downstream
+  //! schedule/wiring; completion signals execute().
   [[nodiscard]] bool is_query_terminal() const;
 
   void mark_task_created();
