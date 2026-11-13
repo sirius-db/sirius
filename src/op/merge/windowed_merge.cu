@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "compression/simpatico_compressed_representation.hpp"
 #include "op/merge/detail/run_fallback.hpp"
 #include "op/merge/detail/window_buffer.hpp"
 #include "op/merge/windowed_merge.hpp"
@@ -147,6 +148,8 @@ struct run_window {
   cudf::table_view gpu_view;  // the fetched columns of the locked batch
 
   cudf::table_view window;  // this round's window
+
+  bool read_compressed{false};  // a refill of this run() read a compressed batch
 };
 
 /// The windows of one run() call. Releases every GPU read lock when it goes out of scope, also on
@@ -376,8 +379,20 @@ struct windowed_merger::impl {
             if (read) {
               held.refill_blocked = false;
               stats.refill_rows += read->rows_written;
+              std::size_t refill_bytes = 0;
               for (const auto bytes : read->data_bytes_written) {
-                stats.refill_bytes += bytes;
+                refill_bytes += bytes;
+              }
+              stats.refill_bytes += refill_bytes;
+              // The split by what the refill read: a compressed batch of any tier, else the tier
+              // of an uncompressed one (a GPU batch read through a reader is in neither).
+              if (is_simpatico_compressed_representation(data)) {
+                stats.refill_bytes_compressed += refill_bytes;
+                run.read_compressed = true;
+              } else if (lock.get_current_tier() == cucascade::memory::Tier::HOST) {
+                stats.refill_bytes_host += refill_bytes;
+              } else if (lock.get_current_tier() == cucascade::memory::Tier::DISK) {
+                stats.refill_bytes_disk += refill_bytes;
               }
               // Fewer rows than there was room for, with rows left in the batch: a STRING slot
               // ran out of chars.
@@ -564,6 +579,9 @@ struct windowed_merger::impl {
       }
 
       local.rows_out += out_rows;
+      local.round_rows_min =
+        local.round_rows_min == 0 ? out_rows : std::min(local.round_rows_min, out_rows);
+      local.round_rows_max = std::max(local.round_rows_max, out_rows);
       // The sizes of the buffers the round's output owns: known on the host, no device read.
       output_bytes += merged.output->alloc_size();
       outputs.push_back(std::move(merged.output));
@@ -593,14 +611,10 @@ struct windowed_merger::impl {
     }
     rollback.committed = true;
     if (stats != nullptr) {
-      stats->rounds += local.rounds;
-      stats->rows_out += local.rows_out;
-      stats->refill_rows += local.refill_rows;
-      stats->refill_bytes += local.refill_bytes;
-      stats->refill_truncated += local.refill_truncated;
-      stats->window_growths += local.window_growths;
-      stats->compacted_rows += local.compacted_rows;
-      stats->fallback_conversions += local.fallback_conversions;
+      for (const auto& run : windows.runs) {
+        local.runs_read_compressed += run.read_compressed ? 1 : 0;
+      }
+      accumulate(*stats, local);
     }
     return result;
   }
