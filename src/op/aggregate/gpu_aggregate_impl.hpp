@@ -128,6 +128,8 @@ class gpu_aggregate_impl {
    * 2. For each grouping set, aggregate that result again grouped by only the keys in the set.
    *    Sets are computed in decreasing order of key count, and each starts from the smallest
    *    already-computed result whose keys contain its own (for ROLLUP, the level above it).
+   *    STRING keys that step 1 dictionary-encodes stay as INT32 codes through these
+   *    re-aggregations and are decoded once per set.
    *
    * For example, with keys `(a, b)` and `ROLLUP(a, b)`, the output has these rows:
    * - set `{a, b}`, set id 0: one row per `(a, b)`, as in step 1
