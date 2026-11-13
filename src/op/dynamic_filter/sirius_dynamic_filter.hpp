@@ -67,7 +67,9 @@ class sirius_dynamic_filter {
   // Set only before publication: a static estimate of the share of probe rows the filter keeps.
   void set_estimated_selectivity(double value) noexcept { _estimated_selectivity = value; }
   [[nodiscard]] std::optional<double> estimated_selectivity() const noexcept
-  { return _estimated_selectivity; }
+  {
+    return _estimated_selectivity;
+  }
 
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 

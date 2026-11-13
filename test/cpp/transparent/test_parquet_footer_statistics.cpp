@@ -339,7 +339,7 @@ TEST_CASE_METHOD(ParquetFilesFixture,
 
   // A scan of one file gets no footer statistics, but its footer is read for the row count.
   auto const single      = con->ExtractPlan("SELECT x FROM read_parquet('" +
-                                            (dir / "f0.parquet").string() + "') WHERE x >= 50");
+                                       (dir / "f0.parquet").string() + "') WHERE x >= 50");
   auto const* single_get = first_get(*single);
   REQUIRE(single_get != nullptr);
   CHECK(sirius::transparent::parquet_scan_row_count(*single_get) ==

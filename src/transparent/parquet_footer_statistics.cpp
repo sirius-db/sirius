@@ -376,7 +376,7 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
     row_counts[key] = total_rows;
   }
   if (single_file) { return false; }
-  auto const merge_key        = merge_cache_key(get);
+  auto const merge_key = merge_cache_key(get);
   if (auto const hit = cached_merge(merge_key, files, *bind)) {
     options.column_statistics = *hit;
   } else {

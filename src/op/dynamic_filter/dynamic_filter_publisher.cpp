@@ -694,10 +694,10 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       }
       operation.claimed = std::move(claimed);
       operation.inventory.emplace(std::move(*inventory));
-      operation.active_keys = std::move(active_keys);
+      operation.active_keys           = std::move(active_keys);
       operation.estimated_selectivity = std::move(estimated_selectivity);
-      operation.builder     = std::move(built);
-      operation.current     = state::phase::COLLECTING;
+      operation.builder               = std::move(built);
+      operation.current               = state::phase::COLLECTING;
       // Start counters are visible at once; the attempt's outcome is recorded when it settles.
       selection.accumulations_started               = 1;
       selection.accumulation_expected_contributions = expected;

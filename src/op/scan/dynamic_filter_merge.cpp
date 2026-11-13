@@ -579,15 +579,15 @@ std::unique_ptr<application_program_state> prepare_state(
     }
     if (!representative) { continue; }
     selected_step step{
-      .identity       = representative->identity,
-      .column_index   = current.column_index,
-      .represented    = std::move(represented),
-      .mask_source    = mask,
-      .ast_source     = ast,
-      .expected_keep  = representative->expected_keep,
-      .sample         = history_known && mask && !covered_by(program->receipt.decode_attached) &&
-                        !representative->expected_keep,
-      .snapshot_index = representative->snapshot_index,
+      .identity      = representative->identity,
+      .column_index  = current.column_index,
+      .represented   = std::move(represented),
+      .mask_source   = mask,
+      .ast_source    = ast,
+      .expected_keep = representative->expected_keep,
+      .sample        = history_known && mask && !covered_by(program->receipt.decode_attached) &&
+                !representative->expected_keep,
+      .snapshot_index        = representative->snapshot_index,
       .estimated_selectivity = representative->identity.filter->estimated_selectivity()};
     if (mask) {
       program->membership.push_back(std::move(step));

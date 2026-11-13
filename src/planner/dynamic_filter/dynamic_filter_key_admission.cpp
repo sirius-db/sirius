@@ -166,11 +166,11 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
                                       ? condition_value_domains[condition_index]
                                       : 0;
     auto admitted                 = admit_scan_route_key(conditions[condition_index],
-                                                         condition_shapes[condition_index],
-                                                         condition_index,
-                                                         domain_cardinality,
-                                                         value_domain,
-                                                         build_side_unique_column);
+                                         condition_shapes[condition_index],
+                                         condition_index,
+                                         domain_cardinality,
+                                         value_domain,
+                                         build_side_unique_column);
     if (!admitted.has_value()) { continue; }
     admitted_keys.push_back(*std::move(admitted));
   }
