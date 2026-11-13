@@ -757,10 +757,21 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
 
   // Owners of the columns that the per-set views below reference.
   std::vector<std::vector<std::unique_ptr<cudf::column>>> owned(grouping_sets.size());
-  std::vector<cudf::table_view> set_views;
-  set_views.reserve(grouping_sets.size());
+  std::vector<cudf::table_view> set_views(grouping_sets.size());
+  // Each computed set in the layout of `partial`: every key (NULL where the set leaves it out)
+  // followed by the aggregates. A set can be computed from any computed set whose keys contain its
+  // own, because re-aggregating a re-aggregated partial is still exact.
+  std::vector<std::optional<cudf::table_view>> results(grouping_sets.size());
 
-  for (std::size_t set_idx = 0; set_idx < grouping_sets.size(); ++set_idx) {
+  // Sets with more keys first, so a coarser set can start from a smaller, finer result rather
+  // than the partial (each ROLLUP level from the one above it).
+  std::vector<std::size_t> order(grouping_sets.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::ranges::stable_sort(order, [&](std::size_t lhs, std::size_t rhs) {
+    return grouping_sets[lhs].size() > grouping_sets[rhs].size();
+  });
+
+  for (auto const set_idx : order) {
     auto const& set = grouping_sets[set_idx];
     auto& owner     = owned[set_idx];
     owner.reserve(num_keys + aggregates.size() + 1 + grouping_functions.size());
@@ -779,20 +790,31 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       }
       num_rows = partial.num_rows();
     } else {
+      // The smallest computed result grouped by a superset of this set's keys.
+      cudf::table_view source = partial;
+      for (std::size_t other = 0; other < grouping_sets.size(); ++other) {
+        auto const& candidate = grouping_sets[other];
+        if (results[other] && results[other]->num_rows() < source.num_rows() &&
+            std::ranges::includes(candidate, set)) {
+          source = *results[other];
+        }
+      }
+      auto const source_aggregates = source.select(aggregate_col_ids);
+
       std::vector<cudf::column_view> set_keys;
       set_keys.reserve(set.empty() ? 1 : set.size());
       std::unique_ptr<cudf::column> constant_key;
       if (set.empty()) {
-        constant_key = make_constant_column<int8_t>(0, partial.num_rows(), stream, mr);
+        constant_key = make_constant_column<int8_t>(0, source.num_rows(), stream, mr);
         set_keys.push_back(constant_key->view());
       }
       for (auto const k : set) {
-        set_keys.push_back(partial.column(static_cast<cudf::size_type>(k)));
+        set_keys.push_back(source.column(static_cast<cudf::size_type>(k)));
       }
       cudf::groupby::groupby grouper(cudf::table_view(set_keys), cudf::null_policy::INCLUDE);
       std::vector<cudf::groupby::aggregation_request> requests(aggregates.size());
       for (std::size_t i = 0; i < aggregates.size(); ++i) {
-        requests[i].values = partial_aggregates.column(static_cast<cudf::size_type>(i));
+        requests[i].values = source_aggregates.column(static_cast<cudf::size_type>(i));
         requests[i].aggregations.push_back(make_reaggregation(aggregates[i]));
       }
       auto [grouped_keys, results] = grouper.aggregate(requests, stream, mr);
@@ -833,6 +855,10 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       }
     }
 
+    std::vector<cudf::column_view> result_cols(keys.begin(), keys.end());
+    result_cols.insert(result_cols.end(), values.begin(), values.end());
+    results[set_idx] = cudf::table_view(result_cols);
+
     std::vector<cudf::column_view> cols;
     cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
     cols.assign(keys.begin(), keys.end());
@@ -852,7 +878,7 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       owner.push_back(std::move(col));
     }
     cols.insert(cols.end(), values.begin(), values.end());
-    set_views.emplace_back(cols);
+    set_views[set_idx] = cudf::table_view(cols);
   }
 
   return cudf::concatenate(set_views, stream, mr);

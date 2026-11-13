@@ -126,6 +126,8 @@ class gpu_aggregate_impl {
    * This is the local step of ROLLUP, CUBE and GROUPING SETS. It works in two steps:
    * 1. Aggregate the batch grouped by all keys in `group_idx`, like `local_grouped_aggregate()`.
    * 2. For each grouping set, aggregate that result again grouped by only the keys in the set.
+   *    Sets are computed in decreasing order of key count, and each starts from the smallest
+   *    already-computed result whose keys contain its own (for ROLLUP, the level above it).
    *
    * For example, with keys `(a, b)` and `ROLLUP(a, b)`, the output has these rows:
    * - set `{a, b}`, set id 0: one row per `(a, b)`, as in step 1
