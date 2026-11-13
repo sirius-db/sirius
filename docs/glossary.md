@@ -34,7 +34,7 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## E
 
-**Evaluated Operation** - An operation that SQL semantics actually apply to a given row, i.e. one not inside a branch that a Row-exact Guard excluded for that row. Only an evaluated operation can raise a SQL error.
+**Evaluated Operation** - An operation that DuckDB actually applies to a given row: one not inside a branch that a Row-exact Guard excluded for that row, nor an AND or OR operand that a filter predicate or CASE WHEN condition skipped because the row was already decided. Only an evaluated operation can raise a SQL error.
 
 **Expression Evaluator Strategy** - The per-query choice of how Sirius evaluates expressions on the GPU: `materialize`, `ast_interpret`, `ast_jit`, or `nvrtc_jit`.
 

@@ -5,13 +5,13 @@ A SQL error that Sirius detects on the GPU (an overflow, a conversion out of ran
 We chose this because a GPU-detected error cannot in general prove that DuckDB would raise:
 
 - The materialize and cuDF AST strategies compute every CASE branch over every row, and an NVRTC kernel compiled for a subexpression of such a branch does the same, so they detect overflow on rows that a Row-exact Guard excludes.
-- DuckDB's own raising depends on vector granularity, predicate order and LIMIT early stop: a projection `(x <> MIN) AND abs(x) > 0` errors on a 2-row table but not on a 1-row table, and a filter `abs(x) > 0 AND x <> MIN` does not error because the conjuncts are reordered.
+- DuckDB's own raising depends on where an expression sits, on run-time adaptation and on LIMIT early stop. Its `ExpressionExecutor` evaluates every AND and OR operand of a select-list expression on every row, so `SELECT (x <> MIN) AND abs(x) > 0` raises. A filter predicate or CASE WHEN condition goes through `Select`, which runs a later operand only on rows the earlier ones leave undecided, so `WHERE (x <> MIN) AND abs(x) > 0` returns rows; `Select` also reorders those operands by their observed cost as it runs, so whether such a filter raises can change between chunks. A LIMIT can stop the query before it reaches the row that would raise.
 - DuckDB's error type and message are the user-facing contract. A Sirius-raised error reports, for example, an out-of-range DATE to TIMESTAMP cast where DuckDB reports a Conversion Error.
 - A check can be stricter than DuckDB: Sirius rejects a non-finite STDDEV_SAMP, which DuckDB returns as infinity.
 
 ## Considered Options
 
-- **Surface proven-exact errors directly.** Only an error from a fused NVRTC kernel at the root of an expression would skip replay. Every throw site would then have to know where it sits in evaluation, and the result would still diverge where DuckDB's raising is order- or chunk-dependent and in the error type.
+- **Surface proven-exact errors directly.** Only an error from a fused NVRTC kernel at the root of an expression would skip replay. Every throw site would then have to know where it sits in evaluation, and the result would still diverge where DuckDB's raising depends on run-time operand reordering or LIMIT early stop, and in the error type.
 - **Surface errors of DuckDB's OUT_OF_RANGE type directly** (the first revision of the NVRTC evaluator). This turned guarded overflow into false errors under every strategy, stopped replaying the pre-existing STDDEV_SAMP check, and changed the DATE to TIMESTAMP error type.
 
 ## Consequences
