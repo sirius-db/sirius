@@ -438,7 +438,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           state.sirius_context)
         state.sirius_context->record_late_failure(failure.cause);
       const std::string gpu_msg = gpu_error.RawMessage();
-      SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
+      sirius::log::log_noexcept(
+        [&] { SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg); });
+
+      // Preserve cancellation classification before the side-effecting COPY guard.
+      if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
       // File export is side-effecting. Never replay it after a runtime failure,
       // even when no rows have yet been returned to the client.
@@ -447,9 +451,6 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         throw duckdb::ExecutorException("Sirius Parquet export failed (CPU replay disabled): " +
                                         gpu_msg);
       }
-
-      // A user interrupt is never a fallback candidate — propagate it as-is.
-      if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
 
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU

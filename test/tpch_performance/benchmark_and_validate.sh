@@ -284,14 +284,6 @@ if [ "${1:-}" = "--report" ]; then
     REPORT_FLOAT_TOL="1e-10"
     while [ $# -gt 1 ]; do
         case "$1" in
-        --result-format)
-            export TPCH_RESULT_FORMAT="$2"
-            shift 2
-            ;;
-        --parquet-compression)
-            export TPCH_PARQUET_COMPRESSION="$2"
-            shift 2
-            ;;
             --float-tolerance)
                 REPORT_FLOAT_TOL="$2"
                 shift 2
@@ -334,6 +326,21 @@ PIN_AFTER_ITERATION=0
 FLOAT_TOL="1e-10"
 while [ $# -gt 1 ]; do
     case "$1" in
+        --result-format)
+            case "$2" in
+                rows|parquet) export TPCH_RESULT_FORMAT="$2" ;;
+                *) echo "ERROR: --result-format must be 'rows' or 'parquet'"; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        --parquet-compression)
+            case "${2,,}" in
+                none|uncompressed|snappy|gzip|brotli|zstd|lz4|lz4_raw)
+                    export TPCH_PARQUET_COMPRESSION="${2,,}" ;;
+                *) echo "ERROR: unsupported --parquet-compression: $2"; exit 1 ;;
+            esac
+            shift 2
+            ;;
         --config)
             export SIRIUS_CONFIG_FILE="$2"
             shift 2
@@ -420,6 +427,7 @@ if [ $# -ne 1 ]; then
     echo "          [--parquet-dir <path>] [--iceberg-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
     echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>]"
+    echo "          [--result-format rows|parquet] [--parquet-compression <codec>]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"

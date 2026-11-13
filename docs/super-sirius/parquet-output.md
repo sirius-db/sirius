@@ -146,3 +146,9 @@ floating-point tolerance. Reusing `--duckdb-results` is currently text-only.
 CPU/GPU file counts and sizes may differ because the engines batch differently.
 Export measurements must not be mixed with query-only timings or interpreted as
 isolated writer cost. The default benchmark mode still returns normal client rows.
+
+Nsight (`--precmd nsys`, including S3 input) and GDB (`--precmd gdb`, local input)
+also execute COPY for Parquet result mode. They retain the generated SQL and
+use separate output paths per iteration, disable GPU fallback, and verify cuDF
+writer footers after the profiled process exits. Setup and cleanup statements
+are excluded from the recorded iteration timing.

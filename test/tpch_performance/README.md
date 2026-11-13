@@ -290,7 +290,7 @@ Key flags:
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
-- `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
+- `--validation` — compare GPU vs CPU after timing. Row output compares `result.txt` exactly first, then allows `abs_tol=1e-10` on float columns. Parquet output requires matching schemas and exact row multisets; see [Parquet output](../../docs/super-sirius/parquet-output.md). Requires `--engine both`.
 - `--precmd none|nsys|gdb` — normal in-process execution, per-query Nsight Systems capture, or per-query batch-mode GDB with an automatic all-thread crash backtrace. External runners require `--engine gpu` and are incompatible with `--profile`, `--validation`, and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout for the `nsys` and `gdb` runners (default 90s).
 - `--name <NAME>` — label appended to the benchmark subdirectory name (`tpch_<ts>_<profile>_<engine>_iter<N>_<NAME>`); the run's parameters stay in the name.

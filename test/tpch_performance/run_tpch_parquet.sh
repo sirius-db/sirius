@@ -569,6 +569,10 @@ run_multi_session() {
                 printf ".print __TPCH_UNPIN_END__ %s\n" "$q"
             fi
         } > "$TEMP_SQL"
+        if [ "$RESULT_FORMAT" = "parquet" ] && [ -n "${Q_DIR:-}" ]; then
+            cp "$TEMP_SQL" "$Q_DIR/query.sql"
+        fi
+
 
         # Run in a fresh DuckDB process.
         # For sirius, set SIRIUS_LOG_DIR to the per-query directory so logs are isolated.
