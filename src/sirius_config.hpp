@@ -94,6 +94,11 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
+/// Estimated probe-to-build row ratio at which a RIGHT_SEMI / RIGHT_ANTI join builds on its kept
+/// (build) side and streams the probe side. DuckDB only plans the right variants when the kept side
+/// is the smaller one, so 1.0 admits every such join whose estimates agree.
+constexpr double DEFAULT_SEMI_JOIN_KEPT_BUILD_RATIO = 1.0;
+
 struct valid_domain_coverage_threshold {
   [[nodiscard]] bool operator()(double value) const noexcept
   {
@@ -214,6 +219,12 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// For RIGHT_SEMI / RIGHT_ANTI joins: build one hash table per partition on the kept (build)
+  /// side and stream the probe side through it, accumulating per-row matched flags, when the
+  /// estimated probe rows are at least this many times the estimated build rows. Otherwise the
+  /// probe side is folded whole per partition. Set to 0 to disable.
+  double semi_join_kept_build_ratio = config::DEFAULT_SEMI_JOIN_KEPT_BUILD_RATIO;
 
   /// Engine-owned policy: when enabled and the planner could not prove build-key uniqueness, test
   /// it at runtime (one cudf::distinct_count pass over the build keys) and take the single-pass

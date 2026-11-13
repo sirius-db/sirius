@@ -2867,6 +2867,19 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
                    params->mark_join_build_switch_ratio);
 }
 
+static void SetSemiJoinKeptBuildRatio(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params       = get_operator_params(context, scope);
+  const double ratio = parameter.GetValue<double>();
+  if (!(ratio >= 0.0) || !std::isfinite(ratio)) {
+    throw InvalidInputException("semi_join_kept_build_ratio must be finite and >= 0.0, got %f",
+                                ratio);
+  }
+  params->semi_join_kept_build_ratio = ratio;
+  SIRIUS_LOG_DEBUG("Updated config SEMI_JOIN_KEPT_BUILD_RATIO to {}",
+                   params->semi_join_kept_build_ratio);
+}
+
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
@@ -3590,6 +3603,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
+
+  config.AddExtensionOption(
+    "semi_join_kept_build_ratio",
+    "For RIGHT_SEMI/RIGHT_ANTI joins, build the hash table on the kept (build) side and stream the "
+    "probe side through it when the estimated probe rows are at least this many times the "
+    "estimated build rows (0 disables).",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.semi_join_kept_build_ratio),
+    SetSemiJoinKeptBuildRatio);
 
   config.AddExtensionOption(
     "gpu_execution",
