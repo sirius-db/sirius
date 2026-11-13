@@ -539,8 +539,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
-    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
-                   : std::vector<std::size_t>{};
+    build_evidence ? build_key_domain_evidence_for(op, context, sirius_context->get_scan_manager())
+                   : std::vector<sirius::op::dynamic_filter_domain_evidence>{};
   // The coverage gate needs a domain that bounds rows. A filter's keep-ratio estimate needs only a
   // bound on the values, which survive any join, and can use a Parquet scan's footer row count.
   auto condition_value_domains =

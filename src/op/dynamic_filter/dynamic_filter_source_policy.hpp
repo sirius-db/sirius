@@ -21,6 +21,42 @@
 
 namespace sirius::op {
 
+/// Origin of the row-count evidence used only to decide dynamic-filter usefulness.
+enum class dynamic_filter_domain_source : std::uint8_t {
+  unknown,
+  catalog_bound,
+  pinned_parquet_exact
+};
+
+/// Spelling used by dynamic-filter diagnostics.
+[[nodiscard]] constexpr char const* to_string(dynamic_filter_domain_source source) noexcept
+{
+  switch (source) {
+    case dynamic_filter_domain_source::unknown: return "unknown";
+    case dynamic_filter_domain_source::catalog_bound: return "catalog_bound";
+    case dynamic_filter_domain_source::pinned_parquet_exact: return "pinned_parquet_exact";
+  }
+  return "invalid";
+}
+
+/// Row-domain evidence for one build key, copied so plans retain no registry entry. It decides
+/// dynamic-filter usefulness only.
+struct dynamic_filter_domain_evidence {
+  /// Base-table row count, exact for pins and an upper bound from the catalog; 0 means unknown.
+  std::size_t cardinality             = 0;
+  dynamic_filter_domain_source source = dynamic_filter_domain_source::unknown;
+  /// A pin's `unique_cols` declaration; never a correctness-bearing uniqueness proof.
+  bool declared_unique = false;
+
+  /// Whether a uniqueness declaration is backed by an exact pinned row count
+  [[nodiscard]] constexpr bool has_backed_declaration() const noexcept
+  {
+    return declared_unique && source == dynamic_filter_domain_source::pinned_parquet_exact;
+  }
+
+  [[nodiscard]] bool operator==(dynamic_filter_domain_evidence const&) const = default;
+};
+
 enum class membership_filter_kind : std::uint8_t { none, small_in_list, hash_in_list, bloom };
 
 struct membership_choice_inputs {
@@ -56,18 +92,21 @@ struct membership_choice_inputs {
 }
 
 /**
- * @brief Tests whether a proven-unique build covers the configured fraction of a known domain
+ * @brief Tests whether an eligible build covers the configured fraction of a known domain
  *
- * Unknown domains, non-unique keys, and thresholds above 1 disable the gate.
+ * Unknown domains, empty builds, build counts larger than the domain, keys without uniqueness
+ * eligibility, and thresholds above 1 disable the gate.
  */
 [[nodiscard]] constexpr bool domain_coverage_gate_fires(std::size_t build_rows,
                                                         std::size_t domain_cardinality,
-                                                        bool build_key_proven_unique,
+                                                        bool build_key_eligible,
                                                         double threshold) noexcept
 {
   if (threshold > 1.0) { return false; }
-  if (!build_key_proven_unique) { return false; }
-  if (domain_cardinality == 0) { return false; }
+  if (!build_key_eligible) { return false; }
+  if (build_rows == 0 || domain_cardinality == 0 || build_rows > domain_cardinality) {
+    return false;
+  }
   return static_cast<double>(build_rows) / static_cast<double>(domain_cardinality) >= threshold;
 }
 

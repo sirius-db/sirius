@@ -192,6 +192,8 @@ struct pinned_entry_metadata {
   std::optional<duckdb_mvcc_metadata> mvcc;
   // Proofs describe incoming data. Merges apply them only to columns actually stored.
   std::vector<std::string> proven_unique_columns;
+  // Usefulness hints for the incoming cached columns, independent of the proofs above.
+  std::vector<std::string> declared_unique_columns;
 };
 
 /**
@@ -279,6 +281,10 @@ struct pinned_entry {
   /// path appends columns and a positional attach would then describe the wrong
   /// ones.
   std::vector<bool> proven_unique_columns;
+  /// Sorted, distinct column names declared independently unique for dynamic-filter usefulness
+  /// only. These are not correctness proofs for late materialization, distinct joins, or
+  /// deduplication.
+  std::vector<std::string> declared_unique_columns;
   /// Generation-checked handle for late materialization. It points weakly back
   /// to this exact entry, so an unpin/replacement hides it from new queries
   /// without revoking a query that already co-owns it. Null unless the late-mat
@@ -845,6 +851,12 @@ class sirius_scan_manager {
   /// Read by the plan-time compressed-materialization residency gate.
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
+
+  /// Every pinned entry whose parquet identity matches @p resolved_file_paths, in registry
+  /// order. OWNING, like find_pinned_entry_for_parquet_files. One file set may be pinned under
+  /// several names with different column sets, and the serve-time matcher may use any of them.
+  [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
+  find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
 
   /// Device ids of the GPUs that hold Simpatico-compressed GPU-tier chunks of any pinned
   /// entry over the same source as @p table_info (same parquet file set or same DuckDB table

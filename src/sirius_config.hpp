@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -238,9 +239,12 @@ struct operator_params {
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
-  /// above 1 disable the gate.
-  double dynamic_filter_domain_coverage_threshold = 0.9;
+  /// Skip an eligible key when its complete build meets this known row-domain coverage. A key is
+  /// eligible when proven unique, or declared through `pin_table(..., unique_cols => [...])` on a
+  /// matching materialized Parquet pin. Unknown or zero domains disable the gate, as do values
+  /// above 1.
+  double dynamic_filter_domain_coverage_threshold =
+    sirius::op::default_dynamic_filter_domain_coverage_threshold;
 
   /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
   /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.

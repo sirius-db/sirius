@@ -2955,10 +2955,30 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
 }
 
 namespace {
+void validate_declared_unique_columns(cache_entry_info const& info,
+                                      pinned_entry_metadata const& metadata)
+{
+  if (metadata.declared_unique_columns.empty()) { return; }
+  if (!info.table_name.empty() || info.resolved_file_paths.empty()) {
+    throw std::invalid_argument("pin declarations require a materialized Parquet source");
+  }
+  for (auto const& name : metadata.declared_unique_columns) {
+    if (std::find(info.names.begin(), info.names.end(), name) == info.names.end()) {
+      throw std::invalid_argument("pin declaration names an uncached column: " + name);
+    }
+  }
+}
+
 void apply_pin_metadata(pinned_entry& entry,
                         pinned_entry_metadata metadata,
                         std::span<const std::string> stored_columns)
 {
+  auto& declared = entry.declared_unique_columns;
+  declared.insert(declared.end(),
+                  metadata.declared_unique_columns.begin(),
+                  metadata.declared_unique_columns.end());
+  std::sort(declared.begin(), declared.end());
+  declared.erase(std::unique(declared.begin(), declared.end()), declared.end());
   if (metadata.mvcc) {
     entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(*metadata.mvcc));
     entry.mvcc_mask_cache.reset();
@@ -2986,6 +3006,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
+  validate_declared_unique_columns(cache_info, metadata);
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
   // there is exactly one
@@ -3085,14 +3106,15 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       // Build privately: validation/allocation failure leaves the published generation intact.
       pinned_entry entry;
       // The source is unchanged. Preserve its evidence; revalidate the merged layout below.
-      entry.identity_evidence      = previous.identity_evidence;
-      entry.cache_info             = previous.cache_info;
-      entry.data_batches_by_column = previous.data_batches_by_column;
-      entry.chunk_memory_spaces    = previous.chunk_memory_spaces;
-      entry.column_storage         = previous.column_storage;
-      entry.num_rows               = previous.num_rows;
-      entry.zone_maps              = previous.zone_maps.clone();
-      entry.proven_unique_columns  = previous.proven_unique_columns;
+      entry.identity_evidence       = previous.identity_evidence;
+      entry.cache_info              = previous.cache_info;
+      entry.data_batches_by_column  = previous.data_batches_by_column;
+      entry.chunk_memory_spaces     = previous.chunk_memory_spaces;
+      entry.column_storage          = previous.column_storage;
+      entry.num_rows                = previous.num_rows;
+      entry.zone_maps               = previous.zone_maps.clone();
+      entry.proven_unique_columns   = previous.proven_unique_columns;
+      entry.declared_unique_columns = previous.declared_unique_columns;
       if (!metadata.mvcc && previous.mvcc) {
         entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(*previous.mvcc);
       }
@@ -3310,6 +3332,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
+  validate_declared_unique_columns(cache_info, metadata);
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
@@ -3402,6 +3425,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
+  validate_declared_unique_columns(cache_info, metadata);
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
     if (chunk.compressed) {
@@ -3696,6 +3720,18 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_p
     if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry; }
   }
   return nullptr;
+}
+
+std::vector<std::shared_ptr<const pinned_entry>>
+sirius_scan_manager::find_pinned_entries_for_parquet_files(
+  std::span<std::string const> resolved_file_paths) const
+{
+  std::vector<std::shared_ptr<const pinned_entry>> matches;
+  std::lock_guard pin_lk{_pinned_entries_mutex};
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { matches.push_back(entry); }
+  }
+  return matches;
 }
 
 std::vector<int> sirius_scan_manager::compressed_gpu_pin_owner_devices(

@@ -198,8 +198,14 @@ All three membership representations compact null build keys out before building
 
 If no probe-GPU L2 size is available, the hash IN-list is not selected; the publisher uses Bloom when supported. Two additional gates avoid unproductive work:
 
-- The domain-coverage gate skips the key before either filter is built when a proven-unique native build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table domain.
-- The consumer keep-ratio gate disables ineffective dynamic filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
+- The domain-coverage gate skips the key before either filter is built, and before accumulated partials are allocated, when an eligible build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table row domain. Eligibility comes from a genuine uniqueness proof or a per-column `pin_table(..., unique_cols => [...])` usefulness declaration for a matching materialized Parquet pin.
+- The consumer keep-ratio gate disables ineffective post-decode filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
+
+Native scans retain their catalog row bounds and genuine uniqueness proofs. With `pin_table_prove_unique_keys`, a column the pin proved distinct is a genuine proof for a Parquet build key too, so an undeclared but proven key is also eligible. Parquet evidence requires a trusted plain-Parquet reader with default decoding options, the complete pinned file list (including duplicate multiplicity), and the same cached source column and native type. When one file set is pinned under several names, any pin holding that column may supply the evidence, and a declaration on any of them applies; pins that disagree on the row count supply none. Projections and filters may preserve that origin; row-multiplying joins, multiple grouping sets, computed or virtual columns, reader transformations and unresolved origins supply no pinned evidence. The planner copies the row count, provenance and declaration into the immutable publication plan while the registry is stable; existing registry-epoch checks rebuild plans after pin changes.
+
+The domain is a row count, not a `[min,max]` range: holes in key values do not enlarge it. Unknown or zero domains, builds larger than their domain, and keys without eligibility disable this optional gate. A false declaration can skip a useful filter, but cannot change join results: declarations never feed late-materialization proofs, distinct joins, or deduplication. The default threshold remains `0.9`; `0.45` is an explicit measurement profile, not a new default. The Bloom allocation cap and publication transport are unchanged.
+
+At DEBUG level, each considered bound key emits `[dynamic_filter_domain] path=ordinary|accumulated condition=N rows=N domain=N provenance=unknown|catalog_bound|pinned_parquet_exact eligible=0|1 threshold=X decision=skip|keep`. `condition` is the original join-condition index. `eligible` reports only the uniqueness proof or backed declaration; `domain` and `decision` show the coverage check. Accumulated type mismatches report `eligible=0 decision=keep`; `skip` means the domain gate actually applies. Use separate INFO runs for timings.
 
 ### Key types
 
@@ -296,7 +302,7 @@ The settings live under `sirius.operator_params`:
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
 | `enable_dynamic_filter_multi_partition` | `true` | Enable PARTITION accumulation and early BUILD_FILTER publication for right semi/anti joins |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
-| `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |
+| `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip an eligible key at or above this known row-domain coverage; values above `1.0` disable the gate |
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
 | `dynamic_filter_keep_threshold` | `0.9` | Disable dynamic filtering when the measured keep ratio is higher |
 

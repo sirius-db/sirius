@@ -751,6 +751,8 @@ struct PinTableArgs {
   std::string tier;
   std::string name;
   std::optional<std::vector<std::string>> cols;
+  /// Per-column usefulness hints from `unique_cols`; each name denotes an independent key.
+  std::vector<std::string> declared_unique_columns;
   /// Optional per-call request for Simpatico pin compression. When omitted,
   /// the legacy session/config setting remains the default.
   std::optional<bool> compression;
@@ -1041,6 +1043,16 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
     result->args.compression = compression_it->second.GetValue<bool>();
   }
 
+  auto unique_cols_it = input.named_parameters.find("unique_cols");
+  if (unique_cols_it != input.named_parameters.end() && !unique_cols_it->second.IsNull()) {
+    for (auto const& value : ListValue::GetChildren(unique_cols_it->second)) {
+      if (value.IsNull()) {
+        throw BinderException("pin_table 'unique_cols' list cannot contain NULL entries");
+      }
+      result->args.declared_unique_columns.push_back(value.ToString());
+    }
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1090,6 +1102,12 @@ unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context
     if (schema_it != input.named_parameters.end() && !schema_it->second.IsNull()) {
       result->args.schema = schema_it->second.ToString();
     }
+  }
+
+  if (!result->args.declared_unique_columns.empty() &&
+      (result->args.format != "parquet" || result->args.tier == "parquet")) {
+    throw BinderException(
+      "pin_table 'unique_cols' requires format 'parquet' and tier 'gpu' or 'host'");
   }
 
   return_types.emplace_back(LogicalType::BOOLEAN);
@@ -1268,6 +1286,20 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // ingestible_table_info and drives later cache-hit matching + the gather.
     auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
+    // Normalize declarations to the cached spelling; the registry sorts and deduplicates them.
+    for (auto& column : data.args.declared_unique_columns) {
+      auto const& names = cache_info.column_names();
+      auto const found  = std::find_if(names.begin(), names.end(), [&](auto const& name) {
+        return StringUtil::CIEquals(name, column);
+      });
+      if (found == names.end()) {
+        throw InvalidInputException("pin_table 'unique_cols' entry '" + column +
+                                    "' is not a column this pin caches for '" + data.args.name +
+                                    "'");
+      }
+      column = *found;
+    }
+
     // Compression config (tier-agnostic): load the per-table plan DSL from the plan
     // directory (if configured), then resolve it into a compression_pin_config. Both
     // the host and GPU pin paths compress with this when enabled.
@@ -1380,6 +1412,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
       sirius::scan_manager::pinned_entry_metadata metadata;
+      metadata.declared_unique_columns = data.args.declared_unique_columns;
       if (verdicts.size() == pinned_column_names.size()) {
         for (std::size_t i = 0; i < verdicts.size(); ++i) {
           if (verdicts[i] == sirius::late_mat::unique_verdict::proven)
@@ -2509,6 +2542,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
       options.Add("tier", LogicalType::VARCHAR);
       options.Add("name", LogicalType::VARCHAR);
       options.Add("cols", LogicalType::LIST(LogicalType::VARCHAR));
+      options.Add("unique_cols", LogicalType::LIST(LogicalType::VARCHAR));
       options.Add("compression", LogicalType::BOOLEAN);
       options.Add("format", LogicalType::VARCHAR);
       options.Add("schema_name", LogicalType::VARCHAR);

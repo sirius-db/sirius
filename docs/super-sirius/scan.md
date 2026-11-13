@@ -359,6 +359,8 @@ CALL unpin_table('lineitem');
 
 ### Materializing a pin
 
+Materialized Parquet pins on `gpu` or `host` may add `unique_cols => ['column_name']` to declare columns independently unique for the dynamic-filter usefulness gate. A list of several names declares each column separately; it does not declare a composite key. Names must belong to the pinned columns, are normalized to schema spelling, and repeated names are deduplicated. NULL list entries and nonempty declarations for native DuckDB sources or undecoded `tier='parquet'` are rejected. Omitted or empty lists preserve existing behavior. These declarations are hints, separate from measured late-materialization uniqueness proofs; false declarations may cost filtering performance but cannot select a distinct join or remove duplicate result rows.
+
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
 
 - **Shared range step:** zone-map statistics, when enabled, are captured from the unnarrowed decoded
@@ -428,6 +430,8 @@ The stale index remains cached until it is rebuilt, explicitly dropped, or the c
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
 ### Re-pin semantics
+
+Usefulness declarations are published atomically with each pin's data and metadata. A replacement starts with only its incoming declarations. A same-source, same-row-count GPU merge preserves prior declarations and adds validated declarations for incoming cached columns, including retained columns. Omitting `unique_cols` on a merge does not revoke earlier hints; unpin and pin again to clear them. Existing query owners keep their previous immutable generation.
 
 For the GPU tier, `insert_pinned_entry` merges into an existing entry when that entry reads the **same source** (`same_source_as`: same table incarnation and storage, or same file set) and the row count matches — adding only columns not already cached, with per-chunk memory-space placement required to match — and replaces it otherwise. The identity half of that test is what stops a pin name reused across a `DROP`/`CREATE` from fusing two unrelated tables into one entry: an equally-sized different table passes every chunk-shape guard the merge applies. The HOST tier always replaces, since each host chunk already holds every column.
 

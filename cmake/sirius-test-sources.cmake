@@ -114,6 +114,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_domain_evidence.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
