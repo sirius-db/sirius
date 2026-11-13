@@ -109,6 +109,7 @@ sirius:
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
+    sort_merge_mode:            auto        # auto | windowed | one_shot (see Sort Merge)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
@@ -629,6 +630,11 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
+| `sort_merge_mode` | `auto` | Merge path of MERGE_SORT: `auto`, `windowed` or `one_shot`. See [Sort Merge](#sort-merge). |
+| `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge |
+| `sort_merge_output_bytes` | 0 (derive) | Output chunk target per windowed merge task; accepts byte suffixes |
+| `sort_merge_one_shot_max_fraction` | 0 (derive) | In `auto` mode, the fraction of GPU memory above which a partition takes the windowed path |
+| `sort_merge_max_fan_in` | 64 | Most sorted runs one merge task reads |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
@@ -661,6 +667,72 @@ Runtime distinct-build probing is an internal join policy, not a user configurat
 temporarily disabled while the cuCollections defect tracked in #1600 remains unresolved. The
 engine retains the guarded single-pass `cudf::distinct_hash_join` path for policy-controlled use
 after that dependency is fixed.
+
+### Sort Merge
+
+**Files:** `src/sirius_config.hpp`, `src/sirius_config.cpp`, `src/sirius_extension.cpp`, `src/op/merge/merge_config.cpp`
+
+Five settings control how MERGE_SORT merges the sorted runs of a partition (see
+[Operators](operators.md#sirius_physical_merge_sort--merge_sort)). Each is a key under
+`sirius.operator_params` and a session `SET` variable of the same name.
+
+| Setting | Type | Default | Meaning |
+|---------|------|---------|---------|
+| `sort_merge_mode` | VARCHAR | `auto` | `auto`: windowed merge for a partition that has a batch off the GPU tier, or whose bytes plus output exceed `sort_merge_one_shot_max_fraction` of the GPU; otherwise one-shot. `windowed`: always the windowed k-way merge. `one_shot`: always the concat-then-merge path. Case-insensitive. |
+| `sort_merge_window_rows` | UBIGINT | 0 | `n`: maximum rows per input window, and the most rows one merge round emits. 0 derives it. |
+| `sort_merge_output_bytes` | UBIGINT | 0 | Output chunk target per merge task. 0 derives it. |
+| `sort_merge_one_shot_max_fraction` | DOUBLE | 0 | The `auto` threshold, as a fraction of the device's total GPU memory. 0 derives it. |
+| `sort_merge_max_fan_in` | UBIGINT | 64 | Most runs one merge task reads. A partition with more runs is merged in passes. |
+
+`one_shot` is kept for A/B testing against the windowed path and is slated for removal once the
+windowed path is proven. Partitions with nested columns or late materialization still take the
+one-shot route in every mode.
+
+**Derivation.** A value left at 0 is derived for each partition when its first merge task is
+created (`merge::derive_merge_config()`), from:
+
+- `G`: GPU memory available on the device, and the device's total GPU memory;
+- `T`: merge tasks that can run at once on the device;
+- `w`: estimated row width in bytes (fixed widths, plus an equal share of the rest of the average
+  row for each variable-width column);
+- `k`: the fan-in, `min(runs in the partition, fan-in cap)`.
+
+The per-task budget is `B = 0.5 × G / T`.
+
+| Value | Heuristic |
+|-------|-----------|
+| Fan-in cap | `clamp(B / (3 × 65536 × w), 2, sort_merge_max_fan_in)`: the most runs whose windows fit `B` with `n` at its floor |
+| `sort_merge_window_rows` | `n = min(max(B / (3 × k × w), 65536), G / (16 × k × w))`, at least 1. The ceiling is applied last, so it wins when it is below the 65,536-row floor. |
+| `sort_merge_output_bytes` | `clamp(B / 16, 64 MiB, 1 GiB)` |
+| `sort_merge_one_shot_max_fraction` | 0.20 below 16 GiB of total GPU memory, 0.25 below 64 GiB, otherwise 0.33 |
+
+The operator currently takes `G` from the GPU memory space that holds most of the partition's
+bytes and `T` from the default GPU pipeline executor width, not the configured
+`executor.pipeline.num_threads`. A partition with no batch on the GPU reuses the last GPU space the
+operator saw, or sizes for 8 GiB and logs a warning when it has seen none. The derived values are
+logged at DEBUG level (`sort merge config: ...`).
+
+**Validation.** `SET` throws an invalid-input error and keeps the previous value; the config file
+fails to load with the same rule, prefixed with `'operator_params.<key>'`.
+
+| Setting | Accepted |
+|---------|----------|
+| `sort_merge_mode` | `auto`, `windowed`, `one_shot` |
+| `sort_merge_window_rows` | 0, or at least 1024 |
+| `sort_merge_output_bytes` | 0, or at least 1 MiB |
+| `sort_merge_one_shot_max_fraction` | 0, or in (0, 1]; NaN and infinity are rejected |
+| `sort_merge_max_fan_in` | at least 2 |
+
+The variables are session settings: `SET GLOBAL` is rejected and `RESET` restores the config-file
+value. After an OOM a windowed task may run with a smaller window and output target than these
+values; see [Shrink Before Retry](memory-management.md#shrink-before-retry).
+
+```sql
+SET sort_merge_mode = 'one_shot';        -- concat-then-merge, for A/B comparison
+SET sort_merge_mode = 'windowed';        -- force the windowed merge
+SET sort_merge_window_rows = 1048576;    -- pin n
+SET sort_merge_window_rows = 0;          -- back to the derived n
+```
 
 ## Telemetry
 
@@ -902,6 +974,11 @@ SET enable_compressed_materialization = false;
 |----------|---------|-------------|
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
+| `sort_merge_mode` | `auto` | MERGE_SORT merge path: `auto`, `windowed` or `one_shot` (kept for A/B testing, slated for removal); see [Sort Merge](#sort-merge) |
+| `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge; 0 or at least 1024 |
+| `sort_merge_output_bytes` | 0 (derive) | Output chunk target per merge task; 0 or at least 1 MiB |
+| `sort_merge_one_shot_max_fraction` | 0 (derive) | Fraction of GPU memory above which `auto` takes the windowed path; 0 or in (0, 1] |
+| `sort_merge_max_fan_in` | 64 | Most sorted runs one merge task reads; at least 2 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |

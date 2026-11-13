@@ -185,9 +185,14 @@ there is no separate repository completion protocol.
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | Base class (no override) |
-| `get_next_task_input_data()` | Mutex-locked: drains ALL batches from one partition, advances `_current_partition_index`. |
-| Why custom | One task per partition — must drain entire partition for multi-way merge |
+| `get_next_task_hint()` | Base class first. A READY hint is kept only when some partition can produce a task: it has runs and no task in flight. Otherwise no hint; the task in flight schedules the operator again. |
+| `get_next_task_input_data()` | Mutex-locked (`_drain_mutex`): takes the lowest partition that has runs and no task in flight. The first call for a partition chooses its route. One-shot: pops ALL batches of the partition into a `pipelineable_operator_data`. Windowed: peeks the batches without popping them and returns a `windowed_merge_input` with a copy of the partition's cursors, marking the partition in flight. |
+| Why custom | A one-shot merge must drain the entire partition; a windowed merge is a chain of tasks per partition, each starting from the cursors the previous one committed |
+
+The windowed route uses the two mechanisms described under
+[Self-Rescheduling Operators](#self-rescheduling-operators) and
+[Non-pipelineable Task Inputs](#non-pipelineable-task-inputs). See
+[Operators](operators.md#sirius_physical_merge_sort--merge_sort) for the routes.
 
 ### MERGE_AGGREGATE
 
@@ -217,11 +222,57 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
-| MERGE_SORT | Base class | Drain all from one partition | Per-partition merge |
+| MERGE_SORT | Base class, READY only while a partition has runs and no task in flight | Drain all from one partition (one-shot) or one cursor-based task per partition at a time (windowed) | Per-partition merge; windowed continuation tasks |
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | MERGE_AGGREGATE | Claim one task after upstream completion | Drain all partials or create input-free descriptor | Final SQL row even with zero input batches |
 | TOP_N_MERGE | Base class | Drain all from one partition | Per-partition merge |
 | DELIM_JOIN | N/A | Delegates to partition_join | Wrapper pattern |
+
+## Self-Rescheduling Operators
+
+The creation loop for an operator ends at the first null input, and a finished task schedules its
+output consumers, not the operator that created it. An operator whose next task depends on one of
+its own tasks finishing therefore has to ask for it: it calls
+`get_pipeline()->get_task_creator()->schedule(this)`.
+
+| Operator | When it calls `schedule(this)` | Why |
+|----------|-------------------------------|-----|
+| UNION | In `get_next_task_input_data()`, after it drains the active arm and moves to the next one | The next arm's batches are already waiting; no producer will schedule the operator for them |
+| MERGE_SORT (windowed route) | In `execute()`, after a task commits its cursors, when some partition has runs and no task in flight | A partition runs one task at a time, so its next task can be created only after the current one commits |
+
+Rules for such an operator:
+
+- Its `get_next_task_hint()` must stop returning READY while every remaining unit of work has a
+  task in flight, so the creator is not sent to an operator that has no task to hand out.
+  MERGE_SORT returns no hint in that state.
+- Its ports must stay non-empty until the work is finished, so the pipeline does not complete
+  between tasks. MERGE_SORT leaves the runs in its input repository and pops a batch only when a
+  task has read it to the end, so `all_ports_empty()` stays false until the last run is consumed.
+- A rescheduled (retried) task reuses its input object. `get_next_task_input_data()` is not
+  called again for it, so in-flight state must survive a failed attempt unchanged.
+
+## Non-pipelineable Task Inputs
+
+Most task inputs are `pipelineable_operator_data` (or its `partitioned_operator_data` subclass):
+they own the batches the task reads. An input may instead derive from `operator_data` directly and
+describe the work without holding batches. `get_type()` identifies it:
+
+| `operator_data_type` | Class | Holds |
+|----------------------|-------|-------|
+| `GPU_SCAN` | `scan_operator_input` | A scan split |
+| `INPUT_FREE` | `input_free_operator_data` | Nothing; the task constructs its output |
+| `WINDOWED_MERGE` | `merge::windowed_merge_input` | A partition index, cursors (batch ids and row positions) into its runs, the chunk index and the window sizes |
+
+What the task machinery does for a `WINDOWED_MERGE` input:
+
+| Machinery | Behaviour |
+|-----------|-----------|
+| Empty-input check in the creation loop | Applies to pipelineable inputs only. The operator returns null when it has no task, never an empty input. |
+| Batch subscription | None: the input holds no batches, so the runs stay idle in the repository and can be downgraded while the task is queued. |
+| `prepare_for_processing()` | Captures the task's GPU memory space. Locks and uploads nothing; the task locks batches itself, window by window. |
+| Reservation | `get_estimated_size_in_bytes()` is the window working set, and `bytes_to_materialize_input` is 0. See [Window reservations](memory-management.md#window-reservations). |
+| OOM retry | `shrink_for_retry()` halves the window sizes. See [Shrink Before Retry](memory-management.md#shrink-before-retry). |
+| Device | The data-locality scoring walks the batches of a pipelineable input, so it does not apply. The operator stamps a preferred device on the input; see [Device Assignment](#device-assignment-for-gpu-tasks). |
 
 ## Task Creator Manager Loop
 
@@ -266,6 +317,19 @@ The task creator is constructed with a `task_creator_config` whose internal `str
 **File:** `src/creator/task_creator.cpp`
 
 When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `preferred_device_id` (which GPU executor the scheduler should route it to). The choice is resolved in priority order: a device stamped on the input by its producer (a scan split's assigned GPU, or a partition's device), then data-locality by input bytes, then NUMA-affinity. Cached-scan inputs (a resident `scan_operator_input`, which is not a `pipelineable_operator_data`) are handled separately: a GPU-tier cached chunk pins to its own device, and a HOST-tier pinned chunk routes to a NUMA-local GPU via the topology index. The full locality math lives in [`multi-gpu-architecture.md`](multi-gpu-architecture.md); the partition pin is summarized here because it is a correctness requirement.
+
+### Preferred-device hints
+
+Any `operator_data` can carry a device through `set_preferred_device_id()`; the task creator reads
+it with `get_preferred_device_id()` before it tries any heuristic. A scan split and a pinned
+partition are stamped by their producers. A non-pipelineable input has no batches for the
+locality scoring to walk, so the operator that builds it supplies the hint: MERGE_SORT stamps a
+`windowed_merge_input` with the device that holds the most bytes of the task's GPU-resident run
+batches, where those runs are sliced without a copy. When no run batch is on a GPU the input
+carries no hint and the task is placed like any other unpreferred task. The hint is a locality
+preference, not a correctness pin: a batch on another GPU is read through its row-range reader or
+converted. Like every preference it is clamped to the query's admitted GPUs and carried across an
+OOM reschedule.
 
 ### Partition device pin
 
@@ -314,4 +378,6 @@ See [Query lifetime and retirement](query-lifecycle.md) for the full sequence.
 | `src/op/sirius_physical_partition.cpp` | Sibling sync, adaptive count |
 | `src/op/sirius_physical_concat.cpp` | Byte-threshold batching |
 | `src/op/sirius_physical_sort_sample.cpp` | N-batch sampling |
-| `src/op/sirius_physical_merge_sort.cpp` | Per-partition drain |
+| `src/op/sirius_physical_merge_sort.cpp` | Per-partition drain, windowed continuation tasks, `schedule(this)` re-arm |
+| `src/op/merge/windowed_merge_input.hpp` | `windowed_merge_input`, the non-pipelineable MERGE_SORT task input |
+| `src/op/sirius_physical_union.cpp` | Arm-by-arm drain with `schedule(this)` |

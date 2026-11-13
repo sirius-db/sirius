@@ -622,12 +622,141 @@ Each range slice is published to its original repository partition, retaining in
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
 
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
-**File:** `src/op/sirius_physical_merge_sort.hpp`
+**Files:** `src/op/sirius_physical_merge_sort.hpp`, `src/op/sirius_physical_merge_sort.cpp`, `src/op/merge/` (`merge_config`, `windowed_merge_input`, `windowed_merge`, `bounded_kway_merge`, `merge_chunk_position`, `detail/`)
 
-Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
+Merges the sorted runs of each range partition into the query's output order. Every batch that
+SORT_PARTITION publishes to a partition is one sorted run. The operator starts after the
+SORT_PARTITION producer finishes (FULL barrier) and skips empty partitions.
 
-- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
-- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
+#### Routes
+
+A partition takes one of two routes, chosen when its first task is created (`arm_partition()`):
+
+| Route | Task input | Behaviour |
+|-------|------------|-----------|
+| one-shot | `pipelineable_operator_data` holding every batch of the partition | One task pops the whole partition, uploads it to the GPU and merges it with `gpu_merge_impl::merge_order_by()` (cuDF multi-way merge). Peak memory is the partition plus its merged output. |
+| windowed | `merge::windowed_merge_input` holding cursors, not batches | A chain of tasks, one at a time per partition, reads the runs in bounded windows. The runs stay in the input repository on whatever tier they are in. Peak memory is a few windows per run. |
+
+The `sort_merge_mode` setting selects the route (see
+[Sort Merge](configuration.md#sort-merge)):
+
+| `sort_merge_mode` | Route |
+|-------------------|-------|
+| `one_shot` | Always one-shot. Output position is the partition index. |
+| `windowed` | Windowed, unless the partition is one of the exceptions below. |
+| `auto` (default) | Windowed when any batch of the partition is not on the GPU tier, or when the partition's bytes plus its output (the same bytes again) exceed `sort_merge_one_shot_max_fraction` of the device's total GPU memory. Otherwise one-shot. |
+
+In `auto` and `windowed` mode these partitions take the one-shot route:
+
+- a fetched column (a sort key or an output column) is nested (LIST or STRUCT), or any column is
+  nested and the partition has more runs than the fan-in cap, because an intermediate pass rewrites
+  every column;
+- late materialization is installed on the operator (`has_late_materialization()`);
+- no batch exposes its column types (every batch is Simpatico-compressed), a batch has no row
+  count, the partition has zero rows, or a sort key is not a plain column reference.
+
+A one-shot partition in these modes sets `set_materialize_on_gpu(true)` on its input, which
+overrides the port's residency policy for that task (see
+[Input Residency and Downgrade Priority](memory-management.md#input-residency-and-downgrade-priority)).
+An operator that never receives settings through `set_merge_settings()` behaves as `one_shot`;
+the plan generator installs the query's settings.
+
+The sizes of a windowed partition (`merge::derived_merge_config`: window rows, output target,
+fan-in, one-shot fraction) are derived once at arming from the settings, the device's GPU memory and
+the partition's run count and row width. `set_device_budget_provider()` supplies the GPU memory and
+task concurrency; without a provider the operator uses the GPU memory space that holds most of the
+partition's bytes (or the last one it saw, or 8 GiB with a warning when it has seen none) and the
+default GPU executor width.
+
+#### Continuation tasks
+
+`_partitions` maps each partition to a `partition_merge_state`, guarded by `_drain_mutex`. It holds
+one `run_state` per run, the next output chunk index and an `in_flight` flag.
+
+- **Cursors.** A run is a list of batch ids in key order (`merge::merge_run`): one batch, or the
+  batches of an intermediate run. A `merge::merge_input_cursor` is the run plus the next unread
+  `(batch, row)`. Cursors hold no device state.
+- **Peek without pop.** Arming reads batch ids, row counts, sizes, tiers and column types through
+  `get_batch_ids()` and `get_data_batch_by_id()`. The batches are not popped and the task does not
+  subscribe them, so they stay spillable while tasks are queued and running. Zero-row batches are
+  popped at arming.
+- **One task per partition at a time.** Each task starts from the cursors the previous one
+  committed. Different partitions run in parallel. `get_next_task_hint()` returns READY only when
+  some partition has runs and no task in flight, and no hint otherwise.
+- **One positioned chunk per task.** A task copies the cursors, resolves the batch ids, and runs
+  one `merge::windowed_merger::run()`, which returns one table of about `output_target_bytes`. A
+  final-pass task fetches the output columns plus the keys they lack, drops the key-only columns
+  and publishes one batch.
+- **Positions.** The output position is `(partition << 32) | chunk`
+  (`merge::make_merge_chunk_position()`), which orders chunks by partition, then by chunk. It
+  throws when either part reaches 2^32. In `auto` and `windowed` mode one-shot partitions use the
+  same encoding with chunk 0. In `one_shot` mode the position is the partition index.
+- **Commit → pop → `schedule(this)`.** After the merge returns, the task commits under
+  `_drain_mutex`: it pops every batch that was read to the end (which frees it), stores the
+  cursors rebased to the remaining batches, advances the chunk index and clears `in_flight`. It
+  then calls `task_creator::schedule(this)` when some partition can produce a task, because nothing
+  else asks an operator for its next task when one of its own tasks finishes (see
+  [Self-Rescheduling Operators](task-creator.md#self-rescheduling-operators)).
+- **Retry.** The partition's cursors change only at commit. A task that fails (for example on OOM)
+  leaves them and `in_flight` unchanged, and the rescheduled task replays from the same cursors,
+  possibly with smaller windows (see [Shrink Before Retry](memory-management.md#shrink-before-retry)).
+  A task that returns no rows while a cursor is not exhausted throws `internal_exception`.
+
+#### Bounded k-way merge round
+
+`windowed_merger::run()` repeats rounds until the accumulated output reaches
+`output_target_bytes` or every cursor is exhausted, then concatenates the rounds into one table.
+With `n` = `window_rows`, each round does the following:
+
+1. **Windows.** Every run that is not exhausted gets a window of at most `n` rows of its current
+   batch, starting at the cursor. A window never spans two batches of a run.
+   - A batch on the GPU tier in the task's memory space is windowed with `cudf::slice` over a
+     read-locked view. Nothing is copied. The lock is held until the batch is finished or `run()`
+     returns.
+   - Any other batch is read into a `detail::window_buffer`: two preallocated slots of `n` rows
+     per run. `consume()` copies the unread tail to the front of the other slot, and `refill()`
+     appends rows after it with `cucascade::read_rows_into`, under a read lock held only for that
+     refill (see [Row-Range Readers](memory-management.md#row-range-readers)).
+2. **Safe bound.** A window is *truncated* when its run has unread rows beyond it. The round emits
+   `target = min(n, r_safe, Σ window rows)` rows, where `r_safe` is the smallest, over the
+   truncated windows, of the rank of the window's last row in the combined order, plus one
+   (`detail::safe_target()`). Every emitted row therefore orders at or before every unread row, so
+   the emitted prefix is final.
+3. **Co-rank.** `detail::corank_split()` finds, for an output rank `r`, how many rows of each
+   window are among the first `r` rows of the merged order. It is evaluated at every tile boundary
+   (`kDefaultTileRows` = 2048 output rows) and at `target`.
+4. **Tile merge.** `detail::tile_merge()` merges each tile independently, one thread per tile with
+   a tournament tree in shared memory, and writes an `(input, row)` gather map of `target`
+   entries. It accepts at most 4096 windows.
+5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
+   masks and STRING data, into the round's output table.
+6. **Advance.** The co-ranks at `target` are the rows consumed from each window. Cursors advance by
+   them and the window buffers drop the consumed rows.
+
+`bounded_kway_merge()` never materializes the `k × n` window rows, and it breaks ties by window
+index and then row, so the result matches a stable merge. Nested key types are not supported.
+
+#### Fan-in cap and intermediate runs
+
+One task reads at most `fan_in` runs: the largest count whose windows fit the task budget with `n`
+at its 65,536-row floor, capped by `sort_merge_max_fan_in` and never below 2.
+
+- With more runs than the cap, `merge::plan_pass()` selects the `fan_in` smallest runs by bytes
+  for an **intermediate pass**. Its tasks fetch every column, add their output batches to the same
+  partition of the input repository, and publish nothing downstream.
+- The selected runs stay in the pass until they are exhausted. The batches the pass wrote then
+  join the partition as one run, and the next pass is planned.
+- With at most `fan_in` runs left, tasks are **final-pass** tasks and publish positioned chunks.
+- Intermediate runs are ordinary repository batches: they can be spilled like the original runs.
+
+#### Convert-once fallback
+
+A batch whose representation has no row-range reader, or whose read throws
+`row_range_unsupported_error`, is converted once to the GPU tier in the task's memory space
+(`detail::convert_run_batch_to_gpu()`), under the batch's exclusive lock. It stays in the
+repository and is then windowed as a GPU batch. Simpatico-compressed batches take this path. The
+task input adds the largest such batch to its memory estimate. If a downgrade moves the batch
+again before the merger re-locks it, the merger retries, three attempts in all, then throws.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
@@ -712,7 +841,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |
 | SORT_PARTITION | Sort | Range partition by boundaries |
-| MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
+| MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` (one-shot), `merge::windowed_merger` (windowed) |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |
 | HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
