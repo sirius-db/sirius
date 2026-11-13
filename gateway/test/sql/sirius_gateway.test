@@ -220,6 +220,27 @@ SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up';
 statement ok con2
 DISCONNECT;
 
+# A start that its arguments refuse changes nothing: the ranks, their catalog and the log stay.
+statement error
+FROM sirius_gateway_start(2, gpus := '0', quack_base_port := 19500);
+----
+gpus lists 1 GPUs for 2 ranks
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+query I
+SELECT count(*) > 0 FROM sirius_gateway_log();
+----
+true
+
 query I
 SELECT state FROM sirius_gateway_stop();
 ----

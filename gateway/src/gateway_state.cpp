@@ -501,7 +501,6 @@ void gateway_state::start(ClientContext& context, start_options options, bool re
   turn t{*this, context};
   {
     std::lock_guard lock{state_mutex_};
-    if (!replay_saved) { ddl_log_.clear(); }
     auto_start_ = false;
     if (replay_saved) { options_ = options; }
   }
@@ -512,7 +511,7 @@ void gateway_state::start(ClientContext& context, start_options options, bool re
     recover_locked(context);
     return;
   }
-  start_locked(context, std::move(options));
+  start_locked(context, std::move(options), /*discard_log=*/true);
   // Only once the new ranks run: a start that fails keeps the saved log.
   if (auto const file = ddl_file(context); !file.empty()) { std::filesystem::remove(file); }
 }
@@ -573,14 +572,10 @@ void gateway_state::wait_for_ranks(ClientContext& context, std::string const& sq
   }
 }
 
-void gateway_state::start_locked(ClientContext& context, start_options options)
+void gateway_state::start_locked(ClientContext& context, start_options options, bool discard_log)
 {
-  stop_locked();
-  {
-    std::lock_guard lock{state_mutex_};
-    state_ = cluster_state::starting;
-    reason_.clear();
-  }
+  // Everything up to stop_locked() only checks and prepares: a start that is refused there
+  // leaves the running ranks, the state and the DDL log as they were.
   std::vector<rank_spec> registered;
   {
     std::lock_guard lock{state_mutex_};
@@ -655,6 +650,13 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
   for (auto& r : ranks) {
     r.catalog = "sirius_rank_" + std::to_string(r.index);
     peers += (r.index ? "," : "") + r.host + ":" + std::to_string(r.exchange_port);
+  }
+  stop_locked();
+  {
+    std::lock_guard lock{state_mutex_};
+    state_ = cluster_state::starting;
+    reason_.clear();
+    if (discard_log) { ddl_log_.clear(); }
   }
   try {
     {

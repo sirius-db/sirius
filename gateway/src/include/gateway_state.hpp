@@ -173,7 +173,9 @@ class gateway_state {
   /// `sirius_gateway_min_ranks` are registered, for at most `sirius_gateway_join_wait` seconds,
   /// or until the client interrupts. Registering takes the turn, so the wait must not hold it.
   void wait_for_ranks(duckdb::ClientContext& context, std::string const& sql);
-  void start_locked(duckdb::ClientContext& context, start_options options);
+  void start_locked(duckdb::ClientContext& context,
+                    start_options options,
+                    bool discard_log = false);
   /// Attaches to @p r and opens its session, retrying until @p patience runs out or @p give_up
   /// is set. With @p join, a registered rank still running the process the gateway last saw is
   /// asked to exit if that process has joined, and its replacement waited for.
