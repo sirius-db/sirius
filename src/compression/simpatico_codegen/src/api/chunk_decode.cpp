@@ -1,0 +1,432 @@
+// SPDX-License-Identifier: Apache-2.0
+// Chunk-decode cursor: plan classification, on-demand payload staging and decoder dispatch.
+
+#include "api/chunk_decode.hpp"
+
+#include "decode/chunk/chunk_decoders.hpp"
+
+#include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <iterator>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace simpatico {
+
+namespace chunk {
+
+namespace {
+
+void cuda_try(cudaError_t status, char const* what)
+{
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string{"chunk decode: "} + what + ": " +
+                             cudaGetErrorString(status));
+  }
+}
+
+/// Throws unless [offset, offset + size) lies within a region of `limit` bytes.
+void check_range(std::uint64_t offset, std::uint64_t size, std::uint64_t limit, char const* what)
+{
+  if (offset > limit || size > limit - offset) {
+    throw std::out_of_range(std::string{"chunk decode: "} + what + " range [" +
+                            std::to_string(offset) + ", +" + std::to_string(size) +
+                            ") exceeds its " + std::to_string(limit) + " bytes");
+  }
+}
+
+/// leaf_access over a payload_source. A device-resident payload is served zero copy. Any other
+/// payload is staged on demand: each request not already covered by one staged interval gets a
+/// device buffer of exactly the requested bytes, filled from the staged intervals it overlaps
+/// (device-to-device) and from the source for the rest. Nothing beyond the requested bytes is
+/// ever read.
+///
+/// Intervals are keyed by payload offset (leaf buffers and the validity mask are disjoint ranges
+/// of one payload), and no indexed interval contains another, so begins and ends grow together
+/// and the only interval that can cover a request is the last one starting at or before it.
+/// Staged bytes are kept until the access dies, because pointers handed out stay valid that long.
+class staged_leaf_access final : public leaf_access {
+ public:
+  staged_leaf_access(std::shared_ptr<const hpln_description> description,
+                     std::size_t column,
+                     std::shared_ptr<payload_source> payload,
+                     rmm::device_async_resource_ref mr)
+    : _description{std::move(description)}, _column{column}, _payload{std::move(payload)}, _mr{mr}
+  {
+  }
+
+  [[nodiscard]] const hpln_column_description& column() const noexcept override
+  {
+    return _description->columns[_column];
+  }
+
+  const std::byte* device_bytes(std::size_t leaf,
+                                std::size_t buffer,
+                                std::uint64_t offset,
+                                std::uint64_t size,
+                                rmm::cuda_stream_view stream) override
+  {
+    auto const& range = buffer_range(leaf, buffer);
+    check_range(offset, size, range.size, "leaf buffer");
+    return payload_bytes(range.payload_offset + offset, size, stream);
+  }
+
+  /// Stages the bytes on the device like device_bytes (so a later device request for the same
+  /// metadata is free), then copies them to the host and waits for the stream.
+  void host_bytes(std::size_t leaf,
+                  std::size_t buffer,
+                  std::uint64_t offset,
+                  std::uint64_t size,
+                  void* dst,
+                  rmm::cuda_stream_view stream) override
+  {
+    auto const* src = device_bytes(leaf, buffer, offset, size, stream);
+    if (size == 0) { return; }
+    cuda_try(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream.value()),
+             "copy of leaf bytes to the host");
+    stream.synchronize();
+  }
+
+  const std::byte* validity_bytes(std::uint64_t offset,
+                                  std::uint64_t size,
+                                  rmm::cuda_stream_view stream) override
+  {
+    auto const& col = column();
+    check_range(offset, size, col.validity_size, "validity mask");
+    return payload_bytes(col.validity_payload_offset + offset, size, stream);
+  }
+
+  [[nodiscard]] rmm::device_async_resource_ref mr() const noexcept override { return _mr; }
+
+  /// Device bytes of every staged interval.
+  [[nodiscard]] std::size_t bytes_held() const noexcept { return _bytes_held; }
+
+ private:
+  struct interval {
+    std::uint64_t end{0};
+    rmm::device_buffer bytes;
+  };
+
+  [[nodiscard]] hpln_buffer_range const& buffer_range(std::size_t leaf, std::size_t buffer) const
+  {
+    auto const& leaves = column().leaves;
+    if (leaf >= leaves.size() || buffer >= leaves[leaf].buffers.size()) {
+      throw std::out_of_range("chunk decode: no buffer " + std::to_string(buffer) + " of leaf " +
+                              std::to_string(leaf));
+    }
+    return leaves[leaf].buffers[buffer];
+  }
+
+  const std::byte* payload_bytes(std::uint64_t begin,
+                                 std::uint64_t size,
+                                 rmm::cuda_stream_view stream)
+  {
+    if (auto const* base = _payload->device_base()) { return base + begin; }
+    if (size == 0) { return nullptr; }
+    auto const end = begin + size;
+
+    auto it = _staged.upper_bound(begin);
+    if (it != _staged.begin()) {
+      auto const prev = std::prev(it);
+      if (prev->second.end >= end) {
+        return static_cast<const std::byte*>(prev->second.bytes.data()) + (begin - prev->first);
+      }
+      if (prev->second.end > begin) { it = prev; }
+    }
+
+    rmm::device_buffer bytes{size, stream, _mr};
+    auto* const out = static_cast<std::byte*>(bytes.data());
+    auto pos        = begin;
+    auto read       = [&](std::uint64_t upto) {
+      _payload->read_to_device(pos, upto - pos, out + (pos - begin), stream);
+      pos = upto;
+    };
+    for (; it != _staged.end() && it->first < end; ++it) {
+      if (it->first > pos) { read(it->first); }
+      auto const upto = std::min(end, it->second.end);
+      if (upto > pos) {
+        cuda_try(cudaMemcpyAsync(
+                   out + (pos - begin),
+                   static_cast<const std::byte*>(it->second.bytes.data()) + (pos - it->first),
+                   upto - pos,
+                   cudaMemcpyDeviceToDevice,
+                   stream.value()),
+                 "copy of staged bytes");
+        pos = upto;
+      }
+    }
+    if (pos < end) { read(end); }
+
+    // Intervals the new one contains leave the index; their bytes stay alive for the pointers
+    // already handed out.
+    for (it = _staged.lower_bound(begin); it != _staged.end() && it->second.end <= end;) {
+      _retired.push_back(std::move(it->second.bytes));
+      it = _staged.erase(it);
+    }
+    _bytes_held += size;
+    return static_cast<const std::byte*>(
+      _staged.insert_or_assign(begin, interval{end, std::move(bytes)}).first->second.bytes.data());
+  }
+
+  std::shared_ptr<const hpln_description> _description;
+  std::size_t _column;
+  std::shared_ptr<payload_source> _payload;
+  rmm::device_async_resource_ref _mr;
+  std::map<std::uint64_t, interval> _staged;  ///< keyed by the interval's first payload byte
+  std::vector<rmm::device_buffer> _retired;
+  std::size_t _bytes_held{0};
+};
+
+void check_cursor_arguments(std::shared_ptr<const hpln_description> const& description,
+                            std::size_t column,
+                            std::shared_ptr<payload_source> const& payload)
+{
+  if (!description) { throw std::invalid_argument("chunk decode: null hpln_description"); }
+  if (!payload) { throw std::invalid_argument("chunk decode: null payload_source"); }
+  if (column >= description->columns.size()) {
+    throw std::invalid_argument("chunk decode: column " + std::to_string(column) + " of " +
+                                std::to_string(description->columns.size()));
+  }
+}
+
+/// Child of `node` via `channel` when `node` has exactly `num_edges` edges.
+std::optional<std::uint32_t> child_of(hpln_column_description const& column,
+                                      std::uint32_t node,
+                                      std::string_view channel,
+                                      std::size_t num_edges)
+{
+  if (column.nodes[node].edges.size() != num_edges) { return std::nullopt; }
+  return find_child_node(column, node, channel);
+}
+
+bool is_bitpack(hpln_column_description const& column, std::optional<std::uint32_t> node)
+{
+  return node && column.nodes[*node].op == "bitpack" && column.nodes[*node].edges.empty() &&
+         find_bitpack(column, *node).has_value();
+}
+
+/// delta -> differences -> bitpack
+bool is_delta_bitpack(hpln_column_description const& column, std::optional<std::uint32_t> node)
+{
+  return node && column.nodes[*node].op == "delta" &&
+         is_bitpack(column, child_of(column, *node, "differences", 1));
+}
+
+bool is_delta_type(cudf::data_type type)
+{
+  return (cudf::is_integral_not_bool(type) || cudf::is_chrono(type) ||
+          cudf::is_fixed_point(type)) &&
+         cudf::size_of(type) <= sizeof(std::int64_t);
+}
+
+}  // namespace
+
+// Not declared in chunk_decoders.hpp: test_chunk_cursor declares these two itself to exercise
+// the staging without a decoder.
+
+/// The leaf_access a cursor over `column` of `description` hands to its decoder.
+std::unique_ptr<leaf_access> make_staged_leaf_access(
+  std::shared_ptr<const hpln_description> description,
+  std::size_t column,
+  std::shared_ptr<payload_source> payload,
+  rmm::device_async_resource_ref mr)
+{
+  check_cursor_arguments(description, column, payload);
+  return std::make_unique<staged_leaf_access>(
+    std::move(description), column, std::move(payload), mr);
+}
+
+/// Device bytes staged by an access made by make_staged_leaf_access.
+std::size_t staged_bytes_held(leaf_access const& access)
+{
+  auto const* staged = dynamic_cast<staged_leaf_access const*>(&access);
+  return staged != nullptr ? staged->bytes_held() : 0;
+}
+
+value_plan classify_value_plan(hpln_column_description const& column)
+{
+  auto const& nodes = column.nodes;
+  // nodes[0] is the column input; its one edge leads to the plan's first operator.
+  if (nodes.empty() || nodes[0].edges.size() != 1) { return value_plan::unsupported; }
+  if (std::any_of(nodes.begin(), nodes.end(), [](auto const& n) { return n.is_bitjoin; })) {
+    return value_plan::unsupported;
+  }
+  auto const root = nodes[0].edges[0].second;
+  if (root == 0 || root >= nodes.size()) { return value_plan::unsupported; }
+
+  auto const& op        = nodes[root].op;
+  auto const type       = column.dtype;
+  bool const is_string  = type.id() == cudf::type_id::STRING;
+  bool const is_fixed   = cudf::is_fixed_width(type);
+  auto const node_count = nodes.size();
+
+  if (op == "bitpack") {
+    return is_fixed && node_count == 2 && is_bitpack(column, root) ? value_plan::bitpack
+                                                                   : value_plan::unsupported;
+  }
+  if (op == "delta") {
+    if (!is_fixed || !is_delta_type(type)) { return value_plan::unsupported; }
+    if (node_count == 3 && is_delta_bitpack(column, root)) { return value_plan::delta_bitpack; }
+    auto const rle = child_of(column, root, "differences", 1);
+    if (node_count == 5 && rle && nodes[*rle].op == "rle" &&
+        is_bitpack(column, child_of(column, *rle, "runs", 2)) &&
+        is_bitpack(column, child_of(column, *rle, "values", 2))) {
+      return value_plan::delta_rle_bitpack;
+    }
+    return value_plan::unsupported;
+  }
+  if (op == "dictionary") {
+    return is_string && node_count == 3 && is_bitpack(column, child_of(column, root, "indices", 1))
+             ? value_plan::dictionary
+             : value_plan::unsupported;
+  }
+  if (op == "str_split") {
+    auto const chars = child_of(column, root, "chars", 2);
+    return is_string && node_count == 5 &&
+               is_delta_bitpack(column, child_of(column, root, "offsets", 2)) && chars &&
+               nodes[*chars].op == "ans" && nodes[*chars].edges.empty()
+             ? value_plan::str_split
+             : value_plan::unsupported;
+  }
+  if (op == "identity") {
+    return (is_string || is_fixed) && node_count == 2 && nodes[root].edges.empty()
+             ? value_plan::stored
+             : value_plan::unsupported;
+  }
+  return value_plan::unsupported;
+}
+
+}  // namespace chunk
+
+struct compressed_column_cursor::impl {
+  impl(std::shared_ptr<const hpln_description> description,
+       std::size_t column,
+       std::shared_ptr<payload_source> payload,
+       rmm::device_async_resource_ref mr)
+    : access{std::move(description), column, std::move(payload), mr}
+  {
+  }
+
+  chunk::staged_leaf_access access;
+  chunk::value_plan plan{chunk::value_plan::unsupported};
+  std::unique_ptr<chunk::chunk_decoder> decoder;
+};
+
+compressed_column_cursor::compressed_column_cursor(
+  std::shared_ptr<const hpln_description> description,
+  std::size_t column,
+  std::shared_ptr<payload_source> payload,
+  rmm::cuda_stream_view /*stream*/,  // nothing is staged eagerly
+  rmm::device_async_resource_ref mr)
+{
+  chunk::check_cursor_arguments(description, column, payload);
+  _impl = std::make_unique<impl>(std::move(description), column, std::move(payload), mr);
+
+  auto const& col = _impl->access.column();
+  _impl->plan     = chunk::classify_value_plan(col);
+  try {
+    switch (_impl->plan) {
+      case chunk::value_plan::bitpack: _impl->decoder = chunk::make_bitpack_decoder(col); break;
+      case chunk::value_plan::delta_bitpack:
+        _impl->decoder = chunk::make_delta_decoder(col, false);
+        break;
+      case chunk::value_plan::delta_rle_bitpack:
+        _impl->decoder = chunk::make_delta_decoder(col, true);
+        break;
+      case chunk::value_plan::dictionary:
+        _impl->decoder = chunk::make_dictionary_decoder(col);
+        break;
+      case chunk::value_plan::str_split: _impl->decoder = chunk::make_str_split_decoder(col); break;
+      case chunk::value_plan::stored: _impl->decoder = chunk::make_stored_decoder(col); break;
+      case chunk::value_plan::unsupported: break;
+    }
+  } catch (unsupported_chunk_decode const&) {
+    // The plan has the right shape but the decoder refuses this column.
+    _impl->decoder.reset();
+  }
+  if (!_impl->decoder) { _impl->plan = chunk::value_plan::unsupported; }
+}
+
+compressed_column_cursor::~compressed_column_cursor()                                   = default;
+compressed_column_cursor::compressed_column_cursor(compressed_column_cursor&&) noexcept = default;
+compressed_column_cursor& compressed_column_cursor::operator=(compressed_column_cursor&&) noexcept =
+  default;
+
+bool compressed_column_cursor::supported() const noexcept { return _impl->decoder != nullptr; }
+
+const hpln_column_description& compressed_column_cursor::column() const noexcept
+{
+  return _impl->access.column();
+}
+
+std::size_t compressed_column_cursor::device_bytes_held() const noexcept
+{
+  return _impl->access.bytes_held() + (_impl->decoder ? _impl->decoder->state_bytes() : 0);
+}
+
+cudf::size_type decompress_column_chunks(compressed_column_cursor& cursor,
+                                         cudf::size_type chunk_begin,
+                                         cudf::size_type chunk_end,
+                                         cudf::size_type skip_head,
+                                         cudf::size_type take,
+                                         column_write_target const& dst,
+                                         rmm::cuda_stream_view stream)
+{
+  auto const& col = cursor.column();
+  chunk::chunk_span const span{chunk_begin, chunk_end, skip_head, take};
+
+  auto const num_chunks = (col.num_rows + kChunkRows - 1) / kChunkRows;
+  if (chunk_begin < 0 || chunk_end < chunk_begin || span.chunk_end > num_chunks) {
+    throw std::invalid_argument("decompress_column_chunks: chunks [" + std::to_string(chunk_begin) +
+                                ", " + std::to_string(chunk_end) +
+                                ") are not within the column's " + std::to_string(num_chunks));
+  }
+  if (skip_head < 0 || skip_head >= kChunkRows || take < 0) {
+    throw std::invalid_argument("decompress_column_chunks: skip_head " + std::to_string(skip_head) +
+                                " or take " + std::to_string(take) + " out of range");
+  }
+  if (span.first_row() + span.take > std::min(span.chunk_end * kChunkRows, col.num_rows)) {
+    throw std::invalid_argument("decompress_column_chunks: rows [" +
+                                std::to_string(span.first_row()) + ", +" + std::to_string(take) +
+                                ") run past the chunk span or the column");
+  }
+
+  if (dst.dst_row_offset < 0) {
+    throw std::invalid_argument("decompress_column_chunks: negative dst_row_offset");
+  }
+  if (col.dtype.id() == cudf::type_id::STRING) {
+    if (dst.offsets == nullptr || (dst.offset_width != 4 && dst.offset_width != 8) ||
+        dst.dst_byte_offset > dst.data_capacity) {
+      throw std::invalid_argument("decompress_column_chunks: bad STRING destination");
+    }
+  } else if (cudf::is_fixed_width(col.dtype) && take > 0) {
+    auto const rows = static_cast<std::size_t>(dst.dst_row_offset) + static_cast<std::size_t>(take);
+    if (dst.data == nullptr || rows * cudf::size_of(col.dtype) > dst.data_capacity) {
+      throw std::invalid_argument("decompress_column_chunks: destination holds fewer than " +
+                                  std::to_string(rows) + " rows");
+    }
+  }
+
+  auto& impl = *cursor._impl;
+  if (!impl.decoder) {
+    throw unsupported_chunk_decode(
+      "decompress_column_chunks: the column's plan is not chunk-decodable");
+  }
+  if (take == 0) { return 0; }
+
+  auto const rows = impl.decoder->decode(impl.access, span, dst, stream);
+  if (rows > 0) { chunk::write_validity(impl.access, span.first_row(), rows, dst, stream); }
+  return static_cast<cudf::size_type>(rows);
+}
+
+}  // namespace simpatico
