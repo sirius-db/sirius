@@ -1672,8 +1672,14 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   fixture.warm();
 
   auto shape = codegen::jit::FusedTree::make(codegen::OpKind::Bitpack);
-  auto spec =
-    codegen::decode::jit::render(*shape, "int32_t", codegen::num_chunks_for(input->num_rows()));
+  // The fixture's values share no common divisor, so their bitpack carries no
+  // `chunk_divisors` channel and the session renders node 0 undivided.
+  auto spec = codegen::decode::jit::render(*shape,
+                                           "int32_t",
+                                           codegen::num_chunks_for(input->num_rows()),
+                                           codegen::decode::jit::kShapePlain,
+                                           {},
+                                           {0});
   codegen::jit::CompileOptions options;
   options.arch_cc = codegen::jit::arch_cc_for_current_device();
   auto handle     = cache.get_or_compile_plain(spec.source, spec.entry_symbol, options);

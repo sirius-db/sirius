@@ -105,7 +105,7 @@ void io_roundtrip(char const* label,
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == 15, "file version is independent of codec and nvCOMP build");
+    expect(version == 16, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -727,7 +727,7 @@ void test_nvcomp_payload_compatibility()
       bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
       bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
       if (matches && !unavailable) continue;
-      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 15};
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 16};
       auto append = [&](std::uint64_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
           header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
