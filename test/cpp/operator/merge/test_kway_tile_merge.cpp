@@ -41,6 +41,21 @@
 #include <utility>
 #include <vector>
 
+namespace sirius::op::merge::detail {
+
+// Defined in kway_tile_merge.cu.
+void tile_merge_with_sub_tiles_for_test(const kway_key_comparator& cmp,
+                                        cudf::device_span<const cudf::size_type> lengths,
+                                        cudf::device_span<const cudf::size_type> tile_coranks,
+                                        cudf::size_type target,
+                                        cudf::size_type tile_rows,
+                                        cudf::device_span<std::int32_t> out_input,
+                                        cudf::device_span<cudf::size_type> out_row,
+                                        std::int32_t sub_tiles,
+                                        rmm::cuda_stream_view stream);
+
+}  // namespace sirius::op::merge::detail
+
 using namespace sirius::op::merge::detail;
 using namespace sirius::test;
 
@@ -203,13 +218,15 @@ kway_key_comparator make_comparator(const merge_case& data)
 }
 
 /// Runs tile_merge for the first @p target merged rows and checks the gather map against the
-/// reference order; entries past @p target must stay untouched.
+/// reference order; entries past @p target must stay untouched. @p sub_tiles > 0 forces that many
+/// sub-tiles per tile; 0 runs tile_merge itself, which chooses the count from the device.
 void check_tile_merge(const merge_case& data,
                       const kway_key_comparator& cmp,
                       cudf::size_type target,
-                      cudf::size_type tile_rows)
+                      cudf::size_type tile_rows,
+                      std::int32_t sub_tiles = 0)
 {
-  CAPTURE(data.views.size(), data.total_rows(), target, tile_rows);
+  CAPTURE(data.views.size(), data.total_rows(), target, tile_rows, sub_tiles);
   auto stream  = cudf::get_default_stream();
   auto lengths = to_device(data.lengths);
   auto coranks = to_device(reference_coranks(data, target, tile_rows));
@@ -218,14 +235,16 @@ void check_tile_merge(const merge_case& data,
   auto out_input      = to_device(std::vector<std::int32_t>(out_size, kUntouched));
   auto out_row        = to_device(std::vector<cudf::size_type>(out_size, kUntouched));
 
-  tile_merge(cmp,
-             cudf::device_span<const cudf::size_type>(lengths.data(), lengths.size()),
-             cudf::device_span<const cudf::size_type>(coranks.data(), coranks.size()),
-             target,
-             tile_rows,
-             cudf::device_span<std::int32_t>(out_input.data(), out_input.size()),
-             cudf::device_span<cudf::size_type>(out_row.data(), out_row.size()),
-             stream);
+  const cudf::device_span<const cudf::size_type> lengths_span(lengths.data(), lengths.size());
+  const cudf::device_span<const cudf::size_type> coranks_span(coranks.data(), coranks.size());
+  const cudf::device_span<std::int32_t> input_span(out_input.data(), out_input.size());
+  const cudf::device_span<cudf::size_type> row_span(out_row.data(), out_row.size());
+  if (sub_tiles > 0) {
+    tile_merge_with_sub_tiles_for_test(
+      cmp, lengths_span, coranks_span, target, tile_rows, input_span, row_span, sub_tiles, stream);
+  } else {
+    tile_merge(cmp, lengths_span, coranks_span, target, tile_rows, input_span, row_span, stream);
+  }
 
   const auto got_input   = to_host(out_input);
   const auto got_row     = to_host(out_row);
@@ -244,20 +263,25 @@ void check_tile_merge(const merge_case& data,
   CHECK(mismatches == 0);
 }
 
-/// Checks target = Σ len and two targets below it, for each of @p tile_rows_list.
+/// Checks target = Σ len and targets below it, for each of @p tile_rows_list: through tile_merge
+/// (0) and with 1, 3, 16 and 64 sub-tiles per tile forced (a tile of fewer than 64 rows is never
+/// split, and the fan-in caps the count, so the larger values also cover the capping).
 void check_targets(const merge_case& data, const std::vector<cudf::size_type>& tile_rows_list)
 {
   auto cmp         = make_comparator(data);
   const auto total = data.total_rows();
   for (const auto tile_rows : tile_rows_list) {
-    check_tile_merge(data, cmp, total, tile_rows);
-    if (total > 1) {
-      check_tile_merge(data, cmp, total * 2 / 3, tile_rows);
-      check_tile_merge(data, cmp, 1, tile_rows);
-    }
-    if (total > tile_rows) {
-      // A whole number of tiles: the last tile is full.
-      check_tile_merge(data, cmp, total / tile_rows * tile_rows, tile_rows);
+    for (const std::int32_t sub_tiles : {0, 1, 3, 16, 64}) {
+      if (sub_tiles > 1 && tile_rows < 64) { continue; }
+      check_tile_merge(data, cmp, total, tile_rows, sub_tiles);
+      if (total > 1) {
+        check_tile_merge(data, cmp, total * 2 / 3, tile_rows, sub_tiles);
+        check_tile_merge(data, cmp, 1, tile_rows, sub_tiles);
+      }
+      if (total > tile_rows) {
+        // A whole number of tiles: the last tile is full.
+        check_tile_merge(data, cmp, total / tile_rows * tile_rows, tile_rows, sub_tiles);
+      }
     }
   }
 }
@@ -293,7 +317,7 @@ TEST_CASE("tile merge matches the reference merged order", "[kway_tile_merge]")
   const auto data = make_case(
     int_windows(lengths, 1000, 0.0, rng), {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
   REQUIRE(data.total_rows() > 2048);
-  check_targets(data, {7, 2048});
+  check_targets(data, {7, 100, 2048});
 }
 
 TEST_CASE("tile merge handles the largest fan-ins", "[kway_tile_merge]")
@@ -304,7 +328,7 @@ TEST_CASE("tile merge handles the largest fan-ins", "[kway_tile_merge]")
   const auto data = make_case(int_windows(random_lengths(k, 6, rng), 50, 0.0, rng),
                               {cudf::order::ASCENDING},
                               {cudf::null_order::AFTER});
-  check_targets(data, {7, 2048});
+  check_targets(data, {7, 100, 2048});
 }
 
 TEST_CASE("tile merge breaks heavy ties by input, then by row", "[kway_tile_merge]")
@@ -317,7 +341,7 @@ TEST_CASE("tile merge breaks heavy ties by input, then by row", "[kway_tile_merg
     const auto data       = make_case(int_windows(random_lengths(7, 900, rng), 3, 0.2, rng),
                                       {cudf::order::ASCENDING},
                                       {null_order});
-    check_targets(data, {7, 2048});
+    check_targets(data, {7, 100, 2048});
   }
 
   SECTION("every key equal")
@@ -328,7 +352,7 @@ TEST_CASE("tile merge breaks heavy ties by input, then by row", "[kway_tile_merg
     // With equal keys the merged order is the inputs one after the other.
     REQUIRE(data.merged.front() == std::pair<std::int32_t, cudf::size_type>{0, 0});
     REQUIRE(data.merged[500] == std::pair<std::int32_t, cudf::size_type>{2, 0});
-    check_targets(data, {7, 2048});
+    check_targets(data, {7, 100, 2048});
   }
 }
 
@@ -341,7 +365,7 @@ TEST_CASE("tile merge orders STRING keys", "[kway_tile_merge]")
     windows.push_back(merge_utils::make_table(random_string_column(rows, rng)));
   }
   const auto data = make_case(std::move(windows), {order}, {cudf::null_order::AFTER});
-  check_targets(data, {7, 2048});
+  check_targets(data, {7, 100, 2048});
 }
 
 TEST_CASE("tile merge orders descending and multi-column keys", "[kway_tile_merge]")
@@ -354,7 +378,7 @@ TEST_CASE("tile merge orders descending and multi-column keys", "[kway_tile_merg
     const auto data       = make_case(int_windows(random_lengths(9, 700, rng), 400, 0.1, rng),
                                       {cudf::order::DESCENDING},
                                       {null_order});
-    check_targets(data, {7, 2048});
+    check_targets(data, {7, 100, 2048});
   }
 
   SECTION("descending INT64, then ascending STRING")
@@ -367,7 +391,7 @@ TEST_CASE("tile merge orders descending and multi-column keys", "[kway_tile_merg
     const auto data = make_case(std::move(windows),
                                 {cudf::order::DESCENDING, cudf::order::ASCENDING},
                                 {cudf::null_order::BEFORE, cudf::null_order::AFTER});
-    check_targets(data, {7, 2048});
+    check_targets(data, {7, 100, 2048});
   }
 }
 

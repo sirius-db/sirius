@@ -14,22 +14,15 @@
  * limitations under the License.
  */
 
-// Tile merge: every output tile is merged independently by one thread that owns a tournament
-// tree in shared memory.
+// A merge is sequential, so its parallelism is the number of independent runs. The caller's tiles
+// alone leave most of the device idle on a small round, so every tile is split into sub-tiles,
+// one thread each: the thread first finds the co-ranks of the end of its sub-tile by
+// multi-sequence selection inside the tile's sub-ranges, then merges its rows with a tournament
+// tree. All of a thread's state is in shared memory, transposed (element e of thread t at
+// [e * blockDim.x + t]) so the lanes of a warp that touch the same element hit different banks.
 //
-// Design: a tile's merge is sequential (each output row depends on the previous winner), so the
-// parallelism comes from the tiles. A CTA holds as many tiles as fit its shared-memory budget, one
-// thread per tile, so the lanes of a warp stay busy: every thread runs the same loop (one output
-// row, then one replay of log2(k) comparisons) on its own tile. Per tile the shared state is
-// - head[i]: the next unmerged row of input i (kp 32-bit words), and
-// - tree[n]: the input that wins the subtree of node n (kp 16-bit words, node 0 unused),
-// where kp is k rounded up to a power of two (at least 2). Leaves past k and inputs whose
-// sub-range is used up lose every comparison. Each output row costs log2(kp) calls of
-// kway_key_device_view::less, whose tie-break (input, then row) makes the merged order unique.
-//
-// Limit: k <= kTileMergeMaxInputs (4096). At that fan-in one tile's state is 24 KiB, which still
-// fits the default 48 KiB of shared memory of a CTA; tile_merge throws std::invalid_argument for a
-// larger k.
+// Limit: k <= kTileMergeMaxInputs (4096), where one thread's state (40 KiB) still fits the default
+// 48 KiB of shared memory of a CTA; tile_merge throws std::invalid_argument for a larger k.
 
 #include "op/merge/detail/kway_comparator.cuh"
 #include "op/merge/detail/kway_merge_detail.hpp"
@@ -50,22 +43,30 @@ namespace {
 
 /// Largest fan-in tile_merge accepts.
 constexpr std::int32_t kTileMergeMaxInputs = 4096;
-/// Shared memory a CTA may use for the tiles it merges.
-constexpr std::size_t kTileMergeSharedBytes = 32 * 1024;
-/// Most tiles (threads) per CTA.
-constexpr std::int32_t kTileMergeMaxBlockThreads = 32;
+/// Shared memory a CTA may use.
+constexpr std::size_t kTileMergeSharedBytes = 40 * 1024;
+/// Most threads per CTA.
+constexpr std::int32_t kTileMergeMaxBlockThreads = 64;
+/// Fewest output rows of a sub-tile: below this the selection outweighs the merge it saves.
+constexpr cudf::size_type kTileMergeMinSubTileRows = 32;
+/// A tile is split only when the sub-range of an input fits the 16-bit selection scratch.
+constexpr cudf::size_type kTileMergeMaxSplitTileRows = 65535;
+/// Merge threads per SM that tile_merge aims for when it chooses the sub-tiles of a tile.
+constexpr std::int64_t kTileMergeThreadsPerSm = 256;
 
-/// Shared-memory bytes of one tile: head (32-bit) and tree (16-bit) entries for kp leaves.
-constexpr std::size_t tile_state_bytes(std::int32_t padded_inputs)
+/// Shared-memory bytes of one thread: lo and hi (32-bit, k entries) and the tree (16-bit, kp).
+constexpr std::size_t thread_state_bytes(std::int32_t padded_inputs)
 {
-  return static_cast<std::size_t>(padded_inputs) * (sizeof(cudf::size_type) + sizeof(std::int16_t));
+  return static_cast<std::size_t>(padded_inputs) *
+         (2 * sizeof(cudf::size_type) + sizeof(std::uint16_t));
 }
 
-static_assert(tile_state_bytes(kTileMergeMaxInputs) <= kTileMergeSharedBytes);
-static_assert(kTileMergeMaxInputs <= INT16_MAX);
+static_assert(thread_state_bytes(kTileMergeMaxInputs) <= kTileMergeSharedBytes);
+static_assert(kTileMergeMaxInputs <= UINT16_MAX);
 
-/// One thread per tile; thread `threadIdx.x` of block `blockIdx.x` merges tile
-/// `blockIdx.x * blockDim.x + threadIdx.x`.
+/// Thread `threadIdx.x` of block `blockIdx.x` merges sub-tile `threadIdx.x % sub_tiles` of tile
+/// `blockIdx.x * (blockDim.x / sub_tiles) + threadIdx.x / sub_tiles`. The shared memory holds
+/// blockDim.x * (2 * padded_inputs 32-bit words + padded_inputs 16-bit words).
 __global__ void tile_merge_kernel(kway_key_device_view keys,
                                   const cudf::size_type* tile_coranks,
                                   std::int32_t num_inputs,
@@ -73,72 +74,185 @@ __global__ void tile_merge_kernel(kway_key_device_view keys,
                                   cudf::size_type tiles,
                                   cudf::size_type target,
                                   cudf::size_type tile_rows,
+                                  std::int32_t sub_tiles,
+                                  cudf::size_type sub_rows,
                                   std::int32_t* out_input,
                                   cudf::size_type* out_row)
 {
-  // The heads of every tile of the block come first, then the trees, so both stay aligned.
   extern __shared__ cudf::size_type shared_state[];
 
-  const std::int64_t tile = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (tile >= tiles) { return; }
+  const std::int32_t k           = num_inputs;
+  const std::int32_t kp          = padded_inputs;
+  const std::uint32_t stride     = blockDim.x;
+  const std::uint32_t tid        = threadIdx.x;
+  cudf::size_type* const lo_base = shared_state + tid;
+  cudf::size_type* const hi_base = shared_state + static_cast<std::size_t>(kp) * stride + tid;
+  std::uint16_t* const tree_base =
+    reinterpret_cast<std::uint16_t*>(shared_state + 2 * static_cast<std::size_t>(kp) * stride) +
+    tid;
+  auto lo   = [&](std::int32_t i) -> cudf::size_type& { return lo_base[i * stride]; };
+  auto hi   = [&](std::int32_t i) -> cudf::size_type& { return hi_base[i * stride]; };
+  auto tree = [&](std::int32_t n) -> std::uint16_t& { return tree_base[n * stride]; };
 
-  const std::int32_t k  = num_inputs;
-  const std::int32_t kp = padded_inputs;
-  cudf::size_type* head = shared_state + static_cast<std::size_t>(threadIdx.x) * kp;
-  std::int16_t* tree    = reinterpret_cast<std::int16_t*>(shared_state + blockDim.x * kp) +
-                       static_cast<std::size_t>(threadIdx.x) * kp;
-  const cudf::size_type* begin = tile_coranks + tile * k;
+  const std::int32_t sub  = static_cast<std::int32_t>(tid) % sub_tiles;
+  const std::int64_t tile = static_cast<std::int64_t>(blockIdx.x) * (stride / sub_tiles) +
+                            static_cast<std::int32_t>(tid) / sub_tiles;
+  // This sub-tile is the tile-local ranks [sub_begin, sub_end).
+  const std::int64_t tile_begin = tile * tile_rows;
+  const std::int64_t tile_left  = tile < tiles ? target - tile_begin : 0;
+  const std::int64_t tile_size  = tile_left < tile_rows ? tile_left : tile_rows;
+  const std::int64_t sub_begin  = static_cast<std::int64_t>(sub) * sub_rows;
+  const std::int64_t sub_end = sub_begin + sub_rows < tile_size ? sub_begin + sub_rows : tile_size;
+  // Threads past the last tile, or past the last row of a short tile, only pass the barrier.
+  const bool active = sub_begin < tile_size;
+
+  const cudf::size_type* begin = tile_coranks + (active ? tile * k : 0);
   const cudf::size_type* end   = begin + k;
 
+  // Leave lo == hi == the co-ranks of the end of this sub-tile.
+  if (active && sub_end == tile_size) {
+    for (std::int32_t i = 0; i < k; ++i) {
+      lo(i) = end[i];
+      hi(i) = end[i];
+    }
+  } else if (active) {
+    // Invariant: lo[i] <= c[i] <= hi[i] for the co-ranks c of rank sub_end. `need` rows are
+    // still to be selected out of the `open` rows inside the intervals.
+    std::int64_t need         = sub_end;
+    std::int64_t open         = 0;
+    std::int32_t widest       = 0;
+    cudf::size_type widest_by = -1;
+    for (std::int32_t i = 0; i < k; ++i) {
+      const cudf::size_type width = end[i] - begin[i];
+      lo(i)                       = begin[i];
+      hi(i)                       = end[i];
+      open += width;
+      if (width > widest_by) {
+        widest_by = width;
+        widest    = i;
+      }
+    }
+    while (need > 0 && need < open) {
+      const std::int32_t pivot_input  = widest;
+      const cudf::size_type pivot_row = lo(pivot_input) + (hi(pivot_input) - lo(pivot_input)) / 2;
+      // The tree is unused until the merge: it holds the rows of each interval before the pivot.
+      std::int64_t before = 0;
+      for (std::int32_t i = 0; i < k; ++i) {
+        const cudf::size_type first = lo(i);
+        cudf::size_type left        = first;
+        if (i == pivot_input) {
+          left = pivot_row;
+        } else {
+          cudf::size_type right = hi(i);
+          while (left < right) {
+            const cudf::size_type mid = left + (right - left) / 2;
+            if (keys.less(i, mid, pivot_input, pivot_row)) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+        }
+        tree(i) = static_cast<std::uint16_t>(left - first);
+        before += left - first;
+      }
+      // Searching only inside [lo, hi) clamps the counts, which cannot change this decision.
+      const bool pivot_selected = before < need;
+      widest_by                 = -1;
+      for (std::int32_t i = 0; i < k; ++i) {
+        const cudf::size_type split = lo(i) + tree(i);
+        if (pivot_selected) {
+          lo(i) = split + (i == pivot_input ? 1 : 0);
+        } else {
+          hi(i) = split;
+        }
+        const cudf::size_type width = hi(i) - lo(i);
+        if (width > widest_by) {
+          widest_by = width;
+          widest    = i;
+        }
+      }
+      if (pivot_selected) {
+        need -= before + 1;
+        open -= before + 1;
+      } else {
+        open = before;
+      }
+    }
+    // Either no open row is selected (the co-ranks are lo) or all of them are (hi).
+    for (std::int32_t i = 0; i < k; ++i) {
+      if (need == 0) {
+        hi(i) = lo(i);
+      } else {
+        lo(i) = hi(i);
+      }
+    }
+  }
+  if (sub_tiles > 1) { __syncthreads(); }
+  if (!active) { return; }
+
+  // The sub-tile begins where its left neighbour ends; nothing writes a hi after the barrier.
   for (std::int32_t i = 0; i < k; ++i) {
-    head[i] = begin[i];
+    lo(i) = sub == 0 ? begin[i] : (&hi(i))[-1];
   }
 
-  auto alive = [&](std::int32_t i) { return i < k && head[i] < end[i]; };
+  auto alive = [&](std::int32_t i) { return i < k && lo(i) < hi(i); };
   // True when the next row of input a is emitted before the next row of input b (a != b).
   auto wins = [&](std::int32_t a, std::int32_t b) {
     if (!alive(b)) { return true; }
     if (!alive(a)) { return false; }
-    return keys.less(a, head[a], b, head[b]);
+    return keys.less(a, lo(a), b, lo(b));
   };
   // Winner of the subtree of child node c; nodes kp .. 2kp-1 are the leaves.
   auto winner_of = [&](std::int32_t c) {
-    return c >= kp ? c - kp : static_cast<std::int32_t>(tree[c]);
+    return c >= kp ? c - kp : static_cast<std::int32_t>(tree(c));
   };
   auto play = [&](std::int32_t node) {
     const std::int32_t left  = winner_of(2 * node);
     const std::int32_t right = winner_of(2 * node + 1);
-    tree[node]               = static_cast<std::int16_t>(wins(left, right) ? left : right);
+    tree(node)               = static_cast<std::uint16_t>(wins(left, right) ? left : right);
   };
 
   for (std::int32_t node = kp - 1; node >= 1; --node) {
     play(node);
   }
 
-  const cudf::size_type out_begin = static_cast<cudf::size_type>(tile) * tile_rows;
-  const cudf::size_type out_end   = out_begin + min(tile_rows, target - out_begin);
-  for (cudf::size_type out = out_begin; out < out_end; ++out) {
-    const std::int32_t winner = tree[1];
+  const std::int64_t out_end = tile_begin + sub_end;
+  for (std::int64_t out = tile_begin + sub_begin; out < out_end; ++out) {
+    const std::int32_t winner = tree(1);
     // Only when the co-ranks do not cover the tile; never read past a sub-range.
     if (!alive(winner)) { break; }
     out_input[out] = winner;
-    out_row[out]   = head[winner]++;
+    out_row[out]   = lo(winner)++;
     for (std::int32_t node = (winner + kp) >> 1; node >= 1; node >>= 1) {
       play(node);
     }
   }
 }
 
-}  // namespace
+/// Sub-tiles per tile that bring the merge threads to about kTileMergeThreadsPerSm per SM.
+std::int32_t sub_tiles_for_device(cudf::size_type tiles)
+{
+  int device   = 0;
+  int sm_count = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  const std::int64_t threads = std::max<std::int64_t>(sm_count, 1) * kTileMergeThreadsPerSm;
+  return static_cast<std::int32_t>(
+    std::min<std::int64_t>((threads - 1) / tiles + 1, kTileMergeMaxBlockThreads));
+}
 
-void tile_merge(const kway_key_comparator& cmp,
-                cudf::device_span<const cudf::size_type> lengths,
-                cudf::device_span<const cudf::size_type> tile_coranks,
-                cudf::size_type target,
-                cudf::size_type tile_rows,
-                cudf::device_span<std::int32_t> out_input,
-                cudf::device_span<cudf::size_type> out_row,
-                rmm::cuda_stream_view stream)
+/// tile_merge with @p requested_sub_tiles sub-tiles per tile (0: chosen from the device); the
+/// count is capped by the shared memory of a CTA and by kTileMergeMinSubTileRows.
+void tile_merge_impl(const kway_key_comparator& cmp,
+                     cudf::device_span<const cudf::size_type> lengths,
+                     cudf::device_span<const cudf::size_type> tile_coranks,
+                     cudf::size_type target,
+                     cudf::size_type tile_rows,
+                     cudf::device_span<std::int32_t> out_input,
+                     cudf::device_span<cudf::size_type> out_row,
+                     std::int32_t requested_sub_tiles,
+                     rmm::cuda_stream_view stream)
 {
   const std::int32_t k = cmp.num_inputs();
   if (k > kTileMergeMaxInputs) {
@@ -166,10 +280,21 @@ void tile_merge(const kway_key_comparator& cmp,
   while (padded_inputs < k) {
     padded_inputs *= 2;
   }
-  const std::size_t state_bytes = tile_state_bytes(padded_inputs);
-  const auto block_threads      = static_cast<std::int32_t>(
+  const std::size_t state_bytes = thread_state_bytes(padded_inputs);
+  const auto max_block_threads  = static_cast<std::int32_t>(
     std::clamp<std::size_t>(kTileMergeSharedBytes / state_bytes, 1, kTileMergeMaxBlockThreads));
-  const auto blocks = static_cast<unsigned int>((tiles - 1) / block_threads + 1);
+
+  // A short last tile keeps the sub-tile size of the full tiles and leaves its last threads idle.
+  const std::int32_t max_sub_tiles =
+    tile_rows > kTileMergeMaxSplitTileRows
+      ? 1
+      : std::clamp(tile_rows / kTileMergeMinSubTileRows, 1, max_block_threads);
+  const std::int32_t sub_tiles = std::clamp(
+    requested_sub_tiles > 0 ? requested_sub_tiles : sub_tiles_for_device(tiles), 1, max_sub_tiles);
+  const cudf::size_type sub_rows   = (tile_rows - 1) / sub_tiles + 1;
+  const std::int32_t block_tiles   = std::min<std::int32_t>(max_block_threads / sub_tiles, tiles);
+  const std::int32_t block_threads = block_tiles * sub_tiles;
+  const auto blocks                = static_cast<unsigned int>((tiles - 1) / block_tiles + 1);
 
   tile_merge_kernel<<<blocks,
                       static_cast<unsigned int>(block_threads),
@@ -181,9 +306,41 @@ void tile_merge(const kway_key_comparator& cmp,
                                         tiles,
                                         target,
                                         tile_rows,
+                                        sub_tiles,
+                                        sub_rows,
                                         out_input.data(),
                                         out_row.data());
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+}  // namespace
+
+void tile_merge(const kway_key_comparator& cmp,
+                cudf::device_span<const cudf::size_type> lengths,
+                cudf::device_span<const cudf::size_type> tile_coranks,
+                cudf::size_type target,
+                cudf::size_type tile_rows,
+                cudf::device_span<std::int32_t> out_input,
+                cudf::device_span<cudf::size_type> out_row,
+                rmm::cuda_stream_view stream)
+{
+  tile_merge_impl(cmp, lengths, tile_coranks, target, tile_rows, out_input, out_row, 0, stream);
+}
+
+/// Test hook: tile_merge with a given number of sub-tiles per tile instead of the count chosen
+/// from the device (still capped as in tile_merge). Declared by the tile merge's unit test.
+void tile_merge_with_sub_tiles_for_test(const kway_key_comparator& cmp,
+                                        cudf::device_span<const cudf::size_type> lengths,
+                                        cudf::device_span<const cudf::size_type> tile_coranks,
+                                        cudf::size_type target,
+                                        cudf::size_type tile_rows,
+                                        cudf::device_span<std::int32_t> out_input,
+                                        cudf::device_span<cudf::size_type> out_row,
+                                        std::int32_t sub_tiles,
+                                        rmm::cuda_stream_view stream)
+{
+  tile_merge_impl(
+    cmp, lengths, tile_coranks, target, tile_rows, out_input, out_row, sub_tiles, stream);
 }
 
 }  // namespace sirius::op::merge::detail
