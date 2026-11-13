@@ -15,6 +15,7 @@ vcpkg_from_github(
   static-cuda-math.patch
   disable-openmp.patch
   fix-host-refine-template-arguments.patch
+  exclude-sources.patch
   HEAD_REF
   main)
 
@@ -117,6 +118,17 @@ vcpkg_replace_string(
   "  if(CUVS_DISABLE_CUTILE)\n    message(STATUS \"cuTile kernels disabled for the Sirius vcpkg port\")\n    set(_CUTILE_SETUP_OK FALSE PARENT_SCOPE)\n    return()\n  endif()\n\n  find_package(CUDAToolkit REQUIRED)"
 )
 
+# Sirius only uses brute-force and IVF-Flat search (src/cuda/vss/). Skip the
+# sources of other algorithms; update this list when using more cuVS APIs.
+set(CUVS_EXCLUDED_SOURCES
+    "^src/cluster/(agglomerative|gmm_|single_linkage|spectral)"
+    "^src/core/(bloom_filter|roaring)"
+    "^src/distance/(kde|sparse_distance)"
+    "^src/neighbors/(all_neighbors|ball_cover|brute_force_serialize|cagra|composite/|detail/cagra/|dynamic_batching|epsilon_neighborhood|iface/|ivf_pq|ivf_rabitq|ivf_sq|nn_descent|refine/|roaring_bitmap_filter|scann/|sparse_brute_force|tiered_index|vamana)"
+    "^src/(preprocessing|stats)/"
+    "^generated_kernels/(cagra|ivf_pq|ivf_rabitq|ivf_sq)/")
+list(JOIN CUVS_EXCLUDED_SOURCES "|" CUVS_EXCLUDE_SOURCES_REGEX)
+
 # cuVS consumes RTCX, which is installed by the cuDF port and declared as a
 # direct manifest dependency below. Static link forces BUILD_TESTS/
 # BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no gtest/hnswlib source is
@@ -142,6 +154,7 @@ vcpkg_cmake_configure(
   -DDISABLE_OPENMP=ON
   -DCUVS_NVTX=OFF
   -DCUVS_DISABLE_CUTILE=ON
+  "-DCUVS_EXCLUDE_SOURCES_REGEX=${CUVS_EXCLUDE_SOURCES_REGEX}"
   "-DCMAKE_CUDA_ARCHITECTURES=${VCPKG_CUDA_ARCHITECTURES}"
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
   # GCC 15 diagnoses RAFT's error.hpp snprintf buffer sizing under cuVS -Werror.
