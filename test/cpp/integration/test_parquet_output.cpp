@@ -1,9 +1,11 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "log/logging.hpp"
 #include "output/parquet_writer.hpp"
+#include "sirius/exception.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
@@ -16,6 +18,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -502,4 +505,158 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   check_export(
     "WITH c AS MATERIALIZED (SELECT k FROM export_cte_repeat WHERE false) "
     "SELECT * FROM c UNION ALL SELECT * FROM c");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds preserve infinity and NULL like CPU COPY",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_seconds(t TIMESTAMP_S)");
+  unsigned sequence = 0;
+  for (auto const* value : {"'infinity'",
+                            "'-infinity'",
+                            "NULL",
+                            "'1970-01-01 00:00:00'",
+                            "'1969-12-31 23:59:59'",
+                            "'2024-03-10 01:02:03'"}) {
+    INFO(value);
+    auto cpu = root.path / ("cpu_" + std::to_string(sequence));
+    auto gpu = root.path / ("gpu_" + std::to_string(sequence++));
+    run_ok("SET gpu_execution=false");
+    run_ok("DELETE FROM export_seconds");
+    run_ok(std::string("INSERT INTO export_seconds VALUES (") + value + "::TIMESTAMP_S)");
+    run_ok("CHECKPOINT");
+    run_ok("COPY (SELECT t FROM export_seconds) TO " + quote(cpu) +
+           " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto copied = con->Query("COPY (SELECT t FROM export_seconds) TO " + quote(gpu) +
+                             " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    if (copied->HasError()) UNSCOPED_INFO(copied->GetError());
+    REQUIRE_FALSE(copied->HasError());
+    REQUIRE(copied->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 1);
+    run_ok("SET gpu_execution=false");
+    auto read = [&](auto const& path) {
+      auto rows = con->Query("SELECT t::VARCHAR, isinf(t), t IS NULL FROM read_parquet(" +
+                             quote(path / "*.parquet") + ")");
+      REQUIRE_FALSE(rows->HasError());
+      return sirius::test::collect_rows(*rows);
+    };
+    REQUIRE(read(gpu) == read(cpu));
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds normalization recurses into structs lists and arrays",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  using namespace sirius;
+  export_directory root;
+  auto seconds = [] {
+    auto column = cudf::make_timestamp_column(
+      cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, 4, cudf::mask_state::ALL_NULL);
+    int64_t const values[]        = {std::numeric_limits<int64_t>::max(),
+                                     -std::numeric_limits<int64_t>::max(),
+                                     123,
+                                     std::numeric_limits<int64_t>::min()};
+    cudf::bitmask_type const mask = 7;
+    REQUIRE(cudaMemcpy(column->mutable_view().data<int64_t>(),
+                       values,
+                       sizeof(values),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(
+      cudaMemcpy(column->mutable_view().null_mask(), &mask, sizeof(mask), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    column->set_null_count(1);
+    return column;
+  };
+  auto list = [&] {
+    auto offsets = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, 5, cudf::mask_state::UNALLOCATED);
+    int32_t const values[] = {0, 1, 2, 3, 4};
+    REQUIRE(cudaMemcpy(offsets->mutable_view().data<int32_t>(),
+                       values,
+                       sizeof(values),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return cudf::make_lists_column(4, std::move(offsets), seconds(), 0, {});
+  };
+  output::parquet_field scalar;
+  scalar.name = "t";
+  scalar.type = logical_type::make(type_id::TIMESTAMP_SEC);
+  auto child  = scalar;
+  child.name  = "v";
+  output::parquet_field structure;
+  structure.name     = "st";
+  structure.type     = logical_type::make(type_id::STRUCT);
+  structure.children = {child};
+  output::parquet_field list_field;
+  list_field.name     = "li";
+  list_field.type     = logical_type::make(type_id::LIST);
+  list_field.children = {child};
+  auto array_field    = list_field;
+  array_field.name    = "ar";
+  array_field.type    = logical_type::make_array(scalar.type, 1);
+  output::parquet_export_spec spec;
+  spec.fields = {scalar, structure, list_field, array_field};
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.push_back(seconds());
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(seconds());
+  columns.push_back(cudf::make_structs_column(4, std::move(children), 0, {}));
+  columns.push_back(list());
+  columns.push_back(list());
+  cudf::table table(std::move(columns));
+  output::write_parquet_part(
+    spec, table.view(), root.path / "nested.parquet", cudf::get_default_stream());
+  run_ok("SET gpu_execution=false");
+  auto rows = con->Query(
+    "SELECT t::VARCHAR, isinf(t), st.v::VARCHAR, li[1]::VARCHAR, "
+    "ar[1]::VARCHAR, t IS NULL FROM read_parquet(" +
+    quote(root.path / "nested.parquet") + ")");
+  REQUIRE_FALSE(rows->HasError());
+  auto actual = sirius::test::collect_rows(*rows, false);
+  REQUIRE(actual == std::vector<std::vector<std::string>>{
+                      {"infinity", "true", "infinity", "infinity", "infinity", "false"},
+                      {"-infinity", "true", "-infinity", "-infinity", "-infinity", "false"},
+                      {"1970-01-01 00:02:03",
+                       "false",
+                       "1970-01-01 00:02:03",
+                       "1970-01-01 00:02:03",
+                       "1970-01-01 00:02:03",
+                       "false"},
+                      {"NULL", "NULL", "NULL", "NULL", "NULL", "true"}});
+  output::write_empty_parquet(spec, root.path / "empty.parquet");
+  auto empty =
+    con->Query("SELECT count(*) FROM read_parquet(" + quote(root.path / "empty.parquet") + ")");
+  REQUIRE_FALSE(empty->HasError());
+  REQUIRE(empty->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet seconds rejects finite conversion overflow before creating a file",
+                 "[parquet_export_gpu][integration][parquet_timestamp_seconds]")
+{
+  export_directory root;
+  auto column = cudf::make_timestamp_column(
+    cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, 1, cudf::mask_state::UNALLOCATED);
+  sirius::output::parquet_export_spec spec;
+  sirius::output::parquet_field field;
+  field.name = "t";
+  field.type = sirius::logical_type::make(sirius::type_id::TIMESTAMP_SEC);
+  spec.fields.push_back(field);
+  for (auto ticks : {std::numeric_limits<int64_t>::max() / 1000000 + 1,
+                     std::numeric_limits<int64_t>::min() / 1000000 - 1}) {
+    REQUIRE(cudaMemcpy(column->mutable_view().data<int64_t>(),
+                       &ticks,
+                       sizeof(ticks),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE_THROWS_AS(sirius::output::write_parquet_part(spec,
+                                                         cudf::table_view({column->view()}),
+                                                         root.path / "overflow.parquet",
+                                                         cudf::get_default_stream()),
+                      sirius::invalid_input_exception);
+    REQUIRE_FALSE(std::filesystem::exists(root.path / "overflow.parquet"));
+  }
 }
