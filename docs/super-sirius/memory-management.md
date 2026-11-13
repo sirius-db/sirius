@@ -230,6 +230,10 @@ MERGE_SORT returns `{.materialize_inputs_on_gpu = false, .downgrade_priority = 1
 range, so they are the cheapest batches of the query to spill. A partition that takes the one-shot
 route in `auto` or `windowed` mode sets `set_materialize_on_gpu(true)` on its own input.
 
+DISCARD_SINK returns `{.materialize_inputs_on_gpu = false, .downgrade_priority = -100}` (the
+order check turns materialization back on): it only counts its input, so a spilled batch is not
+read back, and batches about to be dropped are the last ones worth spilling.
+
 ## Windowed Merge Memory
 
 **Files:** `src/op/merge/merge_config.cpp`, `src/op/merge/windowed_merge_input.cpp`, `src/op/merge/windowed_merge.cu`, `src/data/sirius_row_range_reader_registry.hpp`

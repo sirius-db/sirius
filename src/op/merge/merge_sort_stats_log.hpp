@@ -34,6 +34,10 @@ inline constexpr std::string_view kMergeSortStatsTag = "[merge_sort][stats]";
 ///  runs_read_compressed=… window_growths=… compacted_rows=… fallback_conversions=… shrinks=…"
 /// This format is the contract with test/sort_performance/bench_metrics.py: append new keys at
 /// the end only.
+///
+/// runs_read_compressed counts (run, windowed task) pairs, an upper bound on the distinct
+/// compressed runs (see merge_round_stats).
+/// Logged once per operator per query: at its last task's commit, else when it is finalized.
 std::string format_merge_sort_stats(std::size_t operator_id, const merge_sort_counters& counters);
 
 }  // namespace sirius::op::merge

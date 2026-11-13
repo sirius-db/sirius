@@ -1,0 +1,8 @@
+sirius:
+  memory:
+    host:
+      capacity_bytes: 103079215104
+    gpu:
+      usage_limit_bytes: 85899345920
+    disk:
+      downgrade_root_dirs: /mnt/disk_2/sirius_spill/sort_bench_20261113_083741/sequential__one_shot__uncompressed__r1

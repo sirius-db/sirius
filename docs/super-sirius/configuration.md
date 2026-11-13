@@ -685,7 +685,8 @@ Five settings control how MERGE_SORT merges the sorted runs of a partition (see
 | `sort_merge_max_fan_in` | UBIGINT | 64 | Most runs one merge task reads. A partition with more runs is merged in passes. |
 
 `one_shot` is kept for A/B testing against the windowed path and is slated for removal once the
-windowed path is proven. Partitions with nested columns or late materialization still take the
+windowed path is proven (measurements and the conditions for the removal:
+[`test/sort_performance/RESULTS.md`](../../test/sort_performance/RESULTS.md)). Partitions with nested columns or late materialization still take the
 one-shot route in every mode.
 
 **Derivation.** A value left at 0 is derived for each partition when its first merge task is

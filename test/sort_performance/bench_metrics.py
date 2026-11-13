@@ -55,6 +55,11 @@ _OOM_REASON_RE = re.compile(
 
 _DISCARD_SINK_KEYS = ("rows", "bytes", "order_violations")
 
+# spdlog line: "[<timestamp>] [<level>] [<thread or file:line>] <message>". The levels kept by
+# first_problem_lines; spdlog's other names are trace, debug and info.
+_PROBLEM_LEVEL_RE = re.compile(r"^\[[^\]]*\] \[(?:warning|error|critical)\] ")
+_DIGITS_RE = re.compile(r"\d+")
+
 
 def _tagged_remainders(log_text: str, tag: str):
     """Yields, for each line containing `tag`, the text after the tag."""
@@ -166,6 +171,42 @@ def parse_discard_sink(log_text: str) -> dict[str, int] | None:
         for key in _DISCARD_SINK_KEYS:
             totals[key] += values[key]
     return totals
+
+
+def first_problem_lines(
+    paths: list[str],
+    max_lines: int = 200,
+    max_per_message: int = 5,
+    max_line_chars: int = 2000,
+) -> list[str]:
+    """Returns the first `max_lines` log lines at warning level or above, in file order.
+
+    The files are streamed line by line and reading stops once `max_lines` are kept, so a log of
+    many GiB is never held in memory. A message that repeats (same text once every number is
+    masked, e.g. a warning logged per batch) is kept `max_per_message` times only, so it cannot
+    fill the result. Lines longer than `max_line_chars` are cut. Unreadable files are skipped.
+    """
+    kept: list[str] = []
+    seen: dict[str, int] = {}  # one entry per kept message shape, so at most max_lines
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as log_file:
+                for line in log_file:
+                    if _PROBLEM_LEVEL_RE.match(line) is None:
+                        continue
+                    line = line.rstrip("\n")[:max_line_chars]
+                    # The line without its timestamp, numbers masked.
+                    shape = _DIGITS_RE.sub("N", line.split("] ", 1)[-1])
+                    count = seen.get(shape, 0)
+                    if count >= max_per_message:
+                        continue
+                    seen[shape] = count + 1
+                    kept.append(line)
+                    if len(kept) >= max_lines:
+                        return kept
+        except OSError:
+            continue
+    return kept
 
 
 class LogTail:

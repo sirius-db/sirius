@@ -180,6 +180,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   /// lock of a run that is being moved between tiers by then.
   void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch) override;
 
+  /// Logs the statistics line if no task commit has: an operator with no input, or one whose
+  /// pipeline finished before its last task committed (a LIMIT downstream), still logs one line.
+  void on_finalize_operator() override;
+
  private:
   /// One sorted run of a partition and where the merge has read up to.
   struct run_state {
@@ -264,6 +268,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute_windowed(const merge::windowed_merge_input& input,
                                                   ::cuda::stream_ref stream);
 
+  /// The counters to log in the statistics line, for the one caller that gets to log it; null
+  /// once the line is taken. Needs _drain_mutex.
+  [[nodiscard]] std::optional<merge_sort_counters> claim_stats_line();
+
   /// Whether a call to get_next_task_input_data() would produce a task. Needs _drain_mutex.
   [[nodiscard]] bool has_armable_partition(::cucascade::shared_data_repository& repo);
 
@@ -277,11 +285,15 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   duckdb::vector<std::size_t> _final_projections;
   merge::merge_settings _merge_settings{.mode = sort_merge_mode::one_shot};
   device_budget_provider _device_budget_provider;
-  //! Guards _partitions, _gpu_space_hint and _counters, in get_next_task_hint() too. Never held
-  //! while a merge runs or while waiting for a batch lock.
+  //! Guards _partitions, _gpu_space_hint, _counters and _stats_logged, in get_next_task_hint()
+  //! too. Taken before the process-wide counter mutex when both are held. Never held while a
+  //! merge runs or while waiting for a batch lock.
   mutable std::mutex _drain_mutex;
   std::map<std::size_t, partition_merge_state> _partitions;
   merge_sort_counters _counters;
+  //! The statistics line was logged, or is about to be by the thread that set this. Guarded by
+  //! _drain_mutex, so the last commit and on_finalize_operator() log it once between them.
+  bool _stats_logged{false};
   //! Guards _pushed_sizes; taken after _drain_mutex when both are held.
   std::mutex _pushed_mutex;
   /// Sizes of the batches of partitions not armed yet, by batch id.

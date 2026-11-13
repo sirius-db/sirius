@@ -1,0 +1,26 @@
+[08:28:54.615] GPU limit 4294967296 bytes (4.00 GiB), data 10x the limit, GPU index 0
+[08:28:54.615] Matrix: 3 datasets x 1 modes x 2 compression x 1 repeat = 6 runs
+[08:28:54.615]   uniform-1key: 336 x 8000000 rows = 2688000000 rows, 16 bytes/row, 40.05 GiB
+[08:28:54.615]   zipf-1key: 336 x 8000000 rows = 2688000000 rows, 16 bytes/row, 40.05 GiB
+[08:28:54.615]   normal-multikey: 192 x 8000000 rows = 1536000000 rows, 28 bytes/row, 40.05 GiB
+[08:28:54.615]   [1/6] uniform-1key  mode=windowed  compression=false  repeat=1
+[08:28:54.615]   [2/6] uniform-1key  mode=windowed  compression=true  repeat=1
+[08:28:54.615]   [3/6] zipf-1key  mode=windowed  compression=false  repeat=1
+[08:28:54.615]   [4/6] zipf-1key  mode=windowed  compression=true  repeat=1
+[08:28:54.615]   [5/6] normal-multikey  mode=windowed  compression=false  repeat=1
+[08:28:54.615]   [6/6] normal-multikey  mode=windowed  compression=true  repeat=1
+[08:28:54.617] Results: /mnt/disk_2/sort_merge_bench/followup/validate-disk
+[08:28:54.617] --- [1/6] uniform-1key__windowed__uncompressed__r1 ---
+[08:29:42.952]   ok in 47.4s, peak GPU 5860 MiB
+[08:29:42.953] --- [2/6] uniform-1key__windowed__compressed__r1 ---
+[08:30:41.753]   ok in 57.9s, peak GPU 6094 MiB
+[08:30:41.754] --- [3/6] zipf-1key__windowed__uncompressed__r1 ---
+[08:31:13.554]   ok in 30.9s, peak GPU 5860 MiB
+[08:31:13.554] --- [4/6] zipf-1key__windowed__compressed__r1 ---
+[08:32:49.320]   ok in 94.9s, peak GPU 5998 MiB
+[08:32:49.320] --- [5/6] normal-multikey__windowed__uncompressed__r1 ---
+[08:33:38.656]   ok in 48.4s, peak GPU 5814 MiB
+[08:33:38.657] --- [6/6] normal-multikey__windowed__compressed__r1 ---
+[08:37:41.303]   ok in 241.7s, peak GPU 5760 MiB
+[08:37:41.303] Wrote /mnt/disk_2/sort_merge_bench/followup/validate-disk/results.csv
+[08:37:41.303] Wrote /mnt/disk_2/sort_merge_bench/followup/validate-disk/results.md

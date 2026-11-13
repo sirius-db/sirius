@@ -264,6 +264,12 @@ class CopyDiscardFixture : public sirius::test::GpuExecutionFixture {
       if (record.message.rfind("sirius_discard: check_order disabled", 0) == 0) {
         out.order_check_disabled = true;
       }
+      // The sink declares the one count column it emits: the task-level schema diagnostic has
+      // nothing to say about its output.
+      if (record.message.find("DISCARD_SINK") != std::string::npos &&
+          record.message.find("mismatch") != std::string::npos) {
+        FAIL(record.message);
+      }
       if (record.message.rfind("[discard_sink] ", 0) != 0) { continue; }
       INFO(record.message);
       REQUIRE(std::sscanf(record.message.c_str(),
@@ -426,6 +432,81 @@ TEST_CASE_METHOD(CopyDiscardFixture,
       CHECK(checked.summary.order_violations == 0);
     }
   }
+}
+
+TEST_CASE_METHOD(CopyDiscardFixture,
+                 "a COPY to another format stays on DuckDB",
+                 "[integration][gpu_execution][copy_discard]")
+{
+  create_table("cd_csv", "SELECT CAST(i AS BIGINT) AS id FROM range(1000) AS t(i)");
+
+  // Only the discard format is handed to the GPU: any other COPY writes its file on the CPU.
+  run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result =
+    con->Query("COPY (SELECT id FROM cd_csv ORDER BY id) TO '" + target + "' (FORMAT csv)");
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("COPY error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+  sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1000);
+  REQUIRE(std::filesystem::exists(target));
+  CHECK(std::filesystem::file_size(target) > 0);
+  std::filesystem::remove(target);
+}
+
+TEST_CASE_METHOD(CopyDiscardFixture,
+                 "a prepared sirius_discard COPY returns the count each time it is executed",
+                 "[integration][gpu_execution][copy_discard]")
+{
+  create_table("cd_prepared", "SELECT CAST(i AS BIGINT) AS id FROM range(20000) AS t(i)");
+
+  run_ok("SET gpu_execution = true;");
+  run_ok("PREPARE cd_prepared_copy AS " +
+         discard_copy("SELECT id FROM cd_prepared ORDER BY id DESC") + ";");
+  for (int execution = 0; execution < 2; ++execution) {
+    INFO("execution " << execution);
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto result       = con->Query("EXECUTE cd_prepared_copy;");
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("EXECUTE error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    // The GPU ran it, with no fallback to DuckDB's CPU copy.
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    REQUIRE(result->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
+    REQUIRE(result->RowCount() == 1);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 20000);
+    REQUIRE_FALSE(std::filesystem::exists(target));
+  }
+  run_ok("DEALLOCATE cd_prepared_copy;");
+}
+
+TEST_CASE_METHOD(
+  CopyDiscardFixture,
+  "a sirius_discard COPY that fails on the GPU is finished by DuckDB's copy function",
+  "[integration][gpu_execution][copy_discard]")
+{
+  create_table("cd_fallback", "SELECT CAST(i AS BIGINT) AS id FROM range(20000) AS t(i)");
+
+  run_ok("SET gpu_execution = true;");
+  run_ok("SET enable_duckdb_fallback = true;");
+  // Fails the GPU attempt at run time; the CPU plan kept for the replay is DuckDB's COPY.
+  run_ok("SET sirius_test_inject_transparent_gpu_error = 'copy discard boom';");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query(discard_copy("SELECT id FROM cd_fallback ORDER BY id DESC"));
+  auto const after  = sirius::test::get_transparent_execution_stats(*con);
+  run_ok("SET sirius_test_inject_transparent_gpu_error = '';");
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("COPY error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+  REQUIRE(result->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 20000);
+  REQUIRE_FALSE(std::filesystem::exists(target));
 }
 
 TEST_CASE_METHOD(CopyDiscardFixture,

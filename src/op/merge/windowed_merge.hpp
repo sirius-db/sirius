@@ -124,7 +124,9 @@ struct merge_round_stats {
   std::size_t refill_bytes_disk{0};     ///< of refill_bytes, read from DISK (uncompressed) runs
   /// Of refill_bytes, read from compressed runs (device, host or disk).
   std::size_t refill_bytes_compressed{0};
-  /// Runs whose window was filled from a compressed batch at least once.
+  /// (run, run() call) pairs in which a refill read a compressed batch. Not a distinct-run count:
+  /// a run compressed over several calls counts once per call, so this is an upper bound on the
+  /// compressed runs, equal to it only for a single run() call.
   std::size_t runs_read_compressed{0};
   std::size_t round_rows_min{0};  ///< smallest rows emitted by one round (0 = no round yet)
   std::size_t round_rows_max{0};  ///< largest rows emitted by one round
@@ -135,6 +137,7 @@ struct merge_round_stats {
  *
  * Every counter is summed, except round_rows_min / round_rows_max, which take the minimum and
  * the maximum of the two (a round_rows_min of 0 means "no round yet" and never wins).
+ * That includes runs_read_compressed, which therefore counts a run once per call.
  */
 inline void accumulate(merge_round_stats& into, const merge_round_stats& from) noexcept
 {

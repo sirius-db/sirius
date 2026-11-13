@@ -22,16 +22,25 @@
 #include "sirius/exception.hpp"
 #include "utils/log_test_utils.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/sorting.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cucascade/data/data_repository.hpp>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace sirius::op;
@@ -409,8 +418,8 @@ TEST_CASE("sirius_physical_discard_sink counts a HOST batch without converting i
   CHECK(host_batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
   CHECK(host_batch.use_count() == 1);
 
-  // The count row is a GPU table: a task whose batches are all off the GPU has no memory space
-  // for it. Nothing is counted for the failed task.
+  // An input that did not come from the sink's port and was never prepared names no GPU memory
+  // space for the count row. Nothing is counted for the failed task.
   pipelineable_operator_data host_only(batch_vector{host_batch}, 5);
   CHECK_THROWS_AS(sink.execute(host_only, stream), sirius::internal_exception);
   CHECK(sink.rows_discarded() == 2 * rows);
@@ -533,4 +542,296 @@ TEST_CASE("sirius_physical_discard_sink logs its summary once even without an or
     return record.message == "[discard_sink] rows=4 bytes=32 order_violations=0";
   });
   CHECK(summary == 1);
+}
+
+namespace {
+
+/// Wires a "default" input port to @p sink the way the repository wiring does, policy included.
+void attach_input_port(sirius_physical_discard_sink& sink, cucascade::shared_data_repository& repo)
+{
+  auto port           = std::make_unique<sirius_physical_operator::port>();
+  port->type          = MemoryBarrierType::PIPELINE;
+  port->repo          = &repo;
+  port->src_pipeline  = nullptr;
+  port->dest_pipeline = nullptr;
+  port->residency     = sink.input_residency_policy("default");
+  repo.set_downgrade_priority(port->residency.downgrade_priority);
+  sink.add_port("default", std::move(port));
+}
+
+}  // namespace
+
+TEST_CASE(
+  "sirius_physical_discard_sink input port skips GPU materialization unless it checks order",
+  "[physical_discard_sink]")
+{
+  auto const counting = make_sink(duckdb::LogicalType::BIGINT).input_residency_policy("default");
+  CHECK_FALSE(counting.materialize_inputs_on_gpu);
+  // Spilled last: below the default (0) and the merge sort's inputs (100).
+  CHECK(counting.downgrade_priority < 0);
+
+  auto const checking =
+    make_sink(duckdb::LogicalType::BIGINT, check_first_column()).input_residency_policy("default");
+  CHECK(checking.materialize_inputs_on_gpu);
+  CHECK(checking.downgrade_priority == counting.downgrade_priority);
+
+  // `check_order` without key columns checks nothing, so it needs nothing on the GPU.
+  auto const keyless =
+    make_sink(duckdb::LogicalType::BIGINT, {.check_order = true}).input_residency_policy("default");
+  CHECK_FALSE(keyless.materialize_inputs_on_gpu);
+}
+
+TEST_CASE("sirius_physical_discard_sink counts a task whose batches all spilled, without an upload",
+          "[physical_discard_sink]")
+{
+  tiered_memory_fixture fixture;
+  REQUIRE(fixture.setup());
+  rmm::cuda_stream stream;
+  auto const rows = tiered_memory_fixture::default_num_rows;
+
+  auto sink = make_sink(duckdb::LogicalType::BIGINT);
+  cucascade::shared_data_repository repo;
+  attach_input_port(sink, repo);
+
+  auto host_batch = fixture.make_host_batch(stream);
+  sink.push_data_batch_at_position("default", host_batch, 6);
+
+  auto input = sink.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  CHECK(sink.get_next_task_input_data() == nullptr);
+  auto const& task_input = dynamic_cast<const pipelineable_operator_data&>(*input);
+  CHECK_FALSE(task_input.materializes_on_gpu());
+  CHECK(task_input.get_position() == std::optional<std::size_t>{6});
+
+  // What the task does: prepare for its GPU memory space, then run.
+  input->prepare_for_processing(fixture.gpu0, stream);
+  CHECK(host_batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+  auto output = sink.execute(*input, stream);
+  CHECK(host_batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+  CHECK(sink.rows_discarded() == rows);
+  CHECK(sink.bytes_discarded() == rows * sizeof(std::int64_t));
+
+  // The count row is in the task's memory space, not derived from an input batch.
+  auto const& counted = dynamic_cast<const pipelineable_operator_data&>(*output);
+  CHECK(counted.get_position() == std::optional<std::size_t>{6});
+  REQUIRE(counted.get_data_batches().size() == 1);
+  auto const count_row = counted.get_data_batches().front()->to_read_only();
+  CHECK(count_row.get_current_tier() == cucascade::memory::Tier::GPU);
+  CHECK(count_row.get_memory_space() == fixture.gpu0);
+  auto const view = sirius::get_cudf_table_view(count_row);
+  REQUIRE(view.num_rows() == 1);
+  CHECK(copy_column_to_host<std::int64_t>(view.column(0)).front() ==
+        static_cast<std::int64_t>(rows));
+}
+
+TEST_CASE("sirius_physical_discard_sink order check has its spilled input brought to the GPU",
+          "[physical_discard_sink]")
+{
+  tiered_memory_fixture fixture;
+  REQUIRE(fixture.setup());
+  rmm::cuda_stream stream;
+  auto const rows = tiered_memory_fixture::default_num_rows;
+
+  auto sink = make_sink(duckdb::LogicalType::BIGINT, check_first_column());
+  cucascade::shared_data_repository repo;
+  attach_input_port(sink, repo);
+
+  auto host_batch = fixture.make_host_batch(stream);
+  sink.push_data_batch_at_position("default", host_batch, 0);
+
+  auto input = sink.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  CHECK(dynamic_cast<const pipelineable_operator_data&>(*input).materializes_on_gpu());
+  input->prepare_for_processing(fixture.gpu0, stream);
+  auto output = sink.execute(*input, stream);
+  CHECK(sink.rows_discarded() == rows);
+  // The fixture's batch holds random values, so the check ran and found it unsorted.
+  CHECK(sink.order_violations() == 1);
+}
+
+TEST_CASE("sirius_physical_discard_sink declares the count it emits, not the schema it drops",
+          "[physical_discard_sink]")
+{
+  auto const options = check_first_column(cudf::order::DESCENDING, cudf::null_order::AFTER);
+  sirius_physical_discard_sink sink(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+      duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::DOUBLE}),
+    options,
+    1000);
+  // The task-level schema diagnostic compares get_types() with what execute() returns.
+  CHECK(sink.get_types() ==
+        sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}));
+  CHECK(sink.input_types().size() == 3);
+  CHECK(sink.options().check_order);
+  CHECK(sink.options().key_columns == options.key_columns);
+  CHECK(sink.options().column_order == options.column_order);
+  CHECK(sink.options().null_precedence == options.null_precedence);
+  // Its input streams whatever produces it.
+  CHECK(sink.input_barrier_for(sink) == MemoryBarrierType::PIPELINE);
+}
+
+TEST_CASE("sirius_physical_discard_sink order check agrees with cudf::is_sorted on the whole input",
+          "[physical_discard_sink]")
+{
+  // The check across batches compares key rows on the host; the check within a batch is cudf's.
+  // Both must order nulls, NaN and descending keys the same way.
+  auto const nan = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<std::optional<double>> domain{std::nullopt, nan, -1.0, 0.0, 1.0, 2.5};
+  auto& space = *get_default_gpu_space();
+  std::mt19937 rng(20261113);
+
+  for (auto const order : {cudf::order::ASCENDING, cudf::order::DESCENDING}) {
+    for (auto const null_order : {cudf::null_order::BEFORE, cudf::null_order::AFTER}) {
+      std::size_t sorted_inputs = 0;
+      for (int trial = 0; trial < 12; ++trial) {
+        std::vector<double> data;
+        std::vector<bool> valid;
+        for (int i = 0; i < 24; ++i) {
+          auto const& value = domain[rng() % domain.size()];
+          data.push_back(value.value_or(0.0));
+          valid.push_back(value.has_value());
+        }
+        auto const source =
+          make_numeric_batch_with_nulls<double>(space, data, valid, cudf::type_id::FLOAT64);
+        // Two trials in three feed sorted rows, the others the rows as drawn.
+        std::unique_ptr<cudf::table> rows;
+        if (trial % 3 != 0) {
+          rows = cudf::sort(sirius::get_cudf_table_view(*source), {order}, {null_order});
+        } else {
+          rows = std::make_unique<cudf::table>(sirius::get_cudf_table_view(*source));
+        }
+        auto const expected = cudf::is_sorted(rows->view(), {order}, {null_order});
+        sorted_inputs += expected ? 1 : 0;
+
+        // Cut the rows into tasks of 1 to 6 rows, at increasing positions.
+        std::vector<cudf::size_type> cuts;
+        for (cudf::size_type begin = 0; begin < rows->num_rows();) {
+          auto const end =
+            std::min<cudf::size_type>(rows->num_rows(), begin + 1 + static_cast<int>(rng() % 6));
+          cuts.push_back(begin);
+          cuts.push_back(end);
+          begin = end;
+        }
+        auto const slices = cudf::slice(rows->view(), cuts);
+        std::vector<std::size_t> arrival(slices.size());
+        std::iota(arrival.begin(), arrival.end(), std::size_t{0});
+        std::shuffle(arrival.begin(), arrival.end(), rng);
+
+        auto sink = make_sink(duckdb::LogicalType::DOUBLE, check_first_column(order, null_order));
+        for (auto const position : arrival) {
+          auto batch = sirius::make_data_batch(
+            std::make_unique<cudf::table>(slices[position]), space, default_stream(), {});
+          discard(sink, {std::move(batch)}, position);
+        }
+        sink.finish();
+        INFO("order " << static_cast<int>(order) << " null_order " << static_cast<int>(null_order)
+                      << " trial " << trial);
+        CHECK((sink.order_violations() == 0) == expected);
+      }
+      CHECK(sorted_inputs >= 8);
+    }
+  }
+}
+
+namespace {
+
+/// Runs one task per entry of @p slices on its own thread and stream, in the order of @p arrival.
+/// Returns the number of tasks that threw.
+std::size_t discard_concurrently(sirius_physical_discard_sink& sink,
+                                 const std::vector<std::shared_ptr<data_batch>>& slices,
+                                 const std::vector<std::size_t>& positions,
+                                 const std::vector<std::size_t>& arrival)
+{
+  std::atomic<std::size_t> failures{0};
+  std::atomic<bool> go{false};
+  std::vector<std::thread> threads;
+  for (auto const index : arrival) {
+    threads.emplace_back([&, index] {
+      rmm::cuda_stream stream;
+      while (!go.load()) {
+        std::this_thread::yield();
+      }
+      try {
+        pipelineable_operator_data input(batch_vector{slices[index]}, positions[index]);
+        sink.execute(input, stream);
+      } catch (...) {
+        failures.fetch_add(1);
+      }
+    });
+  }
+  go.store(true);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  return failures.load();
+}
+
+}  // namespace
+
+TEST_CASE("sirius_physical_discard_sink counts and checks order with tasks running concurrently",
+          "[physical_discard_sink]")
+{
+  constexpr std::size_t num_tasks      = 8;
+  constexpr std::int64_t rows_per_task = 512;
+  std::vector<std::shared_ptr<data_batch>> slices;
+  for (std::size_t task = 0; task < num_tasks; ++task) {
+    std::vector<std::int64_t> values(rows_per_task);
+    std::iota(values.begin(), values.end(), static_cast<std::int64_t>(task) * rows_per_task);
+    slices.push_back(int64_batch(values));
+  }
+  std::vector<std::size_t> in_order(num_tasks);
+  std::iota(in_order.begin(), in_order.end(), std::size_t{0});
+  std::mt19937 rng(7);
+
+  SECTION("sorted input: every row counted once, no violation whatever the interleaving")
+  {
+    for (int round = 0; round < 20; ++round) {
+      auto arrival = in_order;
+      std::shuffle(arrival.begin(), arrival.end(), rng);
+      auto sink = make_sink(duckdb::LogicalType::BIGINT, check_first_column());
+      REQUIRE(discard_concurrently(sink, slices, in_order, arrival) == 0);
+      sink.finish();
+      CHECK(sink.rows_discarded() == num_tasks * rows_per_task);
+      CHECK(sink.bytes_discarded() == num_tasks * rows_per_task * sizeof(std::int64_t));
+      CHECK(sink.order_violations() == 0);
+    }
+  }
+
+  SECTION("two neighbouring tasks at each other's position: one violation at finish()")
+  {
+    // Slices 3 and 4 swapped: ... 2 | 4 | 3 | 5 ... has exactly one descent, between 4 and 3.
+    auto positions = in_order;
+    std::swap(positions[3], positions[4]);
+    for (int round = 0; round < 20; ++round) {
+      auto arrival = in_order;
+      std::shuffle(arrival.begin(), arrival.end(), rng);
+      auto sink = make_sink(duckdb::LogicalType::BIGINT, check_first_column());
+      REQUIRE(discard_concurrently(sink, slices, positions, arrival) == 0);
+      CHECK(sink.order_violations() == 0);
+      sink.finish();
+      CHECK(sink.order_violations() == 1);
+    }
+  }
+
+  SECTION("finish() from two threads walks the positions and logs once")
+  {
+    auto positions = in_order;
+    std::swap(positions[3], positions[4]);
+    for (int round = 0; round < 20; ++round) {
+      auto sink = make_sink(duckdb::LogicalType::BIGINT, check_first_column());
+      REQUIRE(discard_concurrently(sink, slices, positions, in_order) == 0);
+
+      sirius::test::scoped_recording_log_sink log("info");
+      std::thread first([&] { sink.finish(); });
+      std::thread second([&] { sink.finish(); });
+      first.join();
+      second.join();
+      CHECK(sink.order_violations() == 1);
+      auto const records = log.records();
+      auto const summary = std::count_if(records.begin(), records.end(), [](auto const& record) {
+        return record.message.rfind("[discard_sink] ", 0) == 0;
+      });
+      CHECK(summary == 1);
+    }
+  }
 }

@@ -78,7 +78,12 @@ void validate_operator_output_types(const op::operator_data* data,
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
-    cudf::table_view tbl = get_cudf_table_view(*batch);
+    // Only a GPU table has a schema to compare; an operator may forward a batch it left in
+    // another tier.
+    auto const ro         = batch->to_read_only();
+    auto const* gpu_table = dynamic_cast<const cucascade::gpu_table_representation*>(ro.get_data());
+    if (gpu_table == nullptr) { continue; }
+    cudf::table_view tbl = gpu_table->get_table_view();
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
@@ -140,8 +145,9 @@ void log_operator_data(const op::sirius_physical_operator& op,
     num_batches         = batches.size();
     for (auto const& batch : batches) {
       if (batch.get_data()) {
-        auto view = get_cudf_table_view(batch);
-        batch_rows += std::to_string(view.num_rows()) + "  ";
+        // A port that opts out of GPU materialization hands its operator batches in any tier.
+        auto const rows = representation_num_rows(batch.get_data());
+        batch_rows += (rows ? std::to_string(*rows) : std::string("?")) + "  ";
         total_bytes = memory::saturating_add(total_bytes, batch.get_data()->get_size_in_bytes());
       }
     }

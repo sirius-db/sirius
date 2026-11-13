@@ -212,9 +212,13 @@ TEST_CASE("sirius_discard COPY of an ORDER BY plans MERGE_SORT into a streaming 
     // COPY's result: the row count.
     CHECK(physical->types == sirius::from_duckdb_vec(
                                duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}));
-    // The sink sees the query's columns.
+    // The sink sees the query's columns and declares what it emits: one count.
     auto const& sink = sink_of(*physical);
     CHECK(sink.children.front()->types.size() == 2);
+    CHECK(sink.input_types().size() == 2);
+    CHECK(sink.get_types() == physical->types);
+    // Without the order check, batches that spilled while they waited are counted where they are.
+    CHECK_FALSE(sink.input_residency_policy("default").materialize_inputs_on_gpu);
     CHECK_FALSE(sink.is_sink());
     CHECK_FALSE(sink.is_source());
   }
@@ -257,6 +261,12 @@ TEST_CASE("sirius_discard check_order carries the ORDER BY keys into the sink",
   {
     auto physical = fixture.plan(discard_copy(query, ", check_order true"));
     auto& sink    = sink_of(*physical);
+    CHECK(sink.options().check_order);
+    CHECK(sink.options().key_columns == std::vector<cudf::size_type>{1, 0});
+    CHECK(sink.options().column_order ==
+          std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
+    // The order check reads the keys on the GPU.
+    CHECK(sink.input_residency_policy("default").materialize_inputs_on_gpu);
     CHECK(violations_in(sink, fixture.batch({1, 2, 0}, {9, 9, 5}), 0) == 0);
     // k1 ascending: the first key's direction.
     CHECK(violations_in(sink, fixture.batch({0, 1, 2}, {5, 9, 9}), 1) == 1);
@@ -267,6 +277,7 @@ TEST_CASE("sirius_discard check_order carries the ORDER BY keys into the sink",
   SECTION("check_order false")
   {
     auto physical = fixture.plan(discard_copy(query, ", check_order false"));
+    CHECK_FALSE(sink_of(*physical).options().check_order);
     CHECK(violations_in(sink_of(*physical), fixture.batch({0, 1, 2}, {5, 9, 9}), 0) == 0);
   }
 
@@ -358,8 +369,8 @@ TEST_CASE("sirius_discard COPY of a query without ORDER BY plans with the order 
   });
 }
 
-// The transparent path does not route COPY statements to this planner, so the plan is run on the
-// engine directly: the SUM, its cast and the streaming port have to work together.
+// The plan is run on the engine directly, without the transparent path: the SUM, its cast and
+// the streaming port have to work together. ([copy_discard] covers the statement typed as SQL.)
 TEST_CASE("sirius_discard COPY plan returns the query's row count",
           "[planner][discard_copy_plan][shared_context]")
 {

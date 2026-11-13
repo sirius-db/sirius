@@ -1069,9 +1069,12 @@ try {
       for (auto const& space : capacity_builder.build(hw_topology)) {
         if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
             gpu && *bytes > gpu->memory_capacity) {
+          // The capacity is what the device reports as usable, which is below the total that
+          // nvidia-smi shows: name both numbers so the largest accepted limit is not a guess.
           throw configuration_input_error(
             "sirius.memory.gpu.usage_limit_bytes exceeds the capacity of GPU " +
-            std::to_string(gpu->device_id));
+            std::to_string(gpu->device_id) + ": requested " + std::to_string(*bytes) +
+            " bytes, capacity " + std::to_string(gpu->memory_capacity) + " bytes");
         }
       }
     }

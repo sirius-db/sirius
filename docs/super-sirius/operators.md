@@ -795,6 +795,25 @@ repository and is then windowed as a GPU batch. Simpatico-compressed batches tak
 task input adds the largest such batch to its memory estimate. If a downgrade moves the batch
 again before the merger re-locks it, the merger retries, three attempts in all, then throws.
 
+#### Statistics line
+
+Each MERGE_SORT logs one line per query at INFO, built by `merge::format_merge_sort_stats`
+(`src/op/merge/merge_sort_stats_log.hpp`):
+
+```text
+[merge_sort][stats] op=<id> windowed_partitions=… one_shot_partitions=… windowed_tasks=… intermediate_tasks=… mergers_built=… rounds=… rows_out=… round_rows_min=… round_rows_max=… refill_rows=… refill_bytes=… refill_bytes_host=… refill_bytes_disk=… refill_bytes_compressed=… runs_read_compressed=… window_growths=… compacted_rows=… fallback_conversions=… shrinks=…
+```
+
+- It is logged at the commit of the operator's last task. An operator that never gets there (no
+  input, or a pipeline that finished early under a LIMIT) logs it from `on_finalize_operator()`
+  with the counters so far. A flag under `_drain_mutex` keeps it to one line.
+- `refill_bytes_host`, `_disk` and `_compressed` split `refill_bytes` by where a refill read
+  from. A GPU-tier batch read through a reader counts in `refill_bytes` only.
+- `runs_read_compressed` counts (run, windowed task) pairs, not distinct runs.
+- `shrinks` counts windowed inputs that shrank their window for an OOM retry.
+- The keys and their order are the contract with `test/sort_performance/bench_metrics.py`
+  (`test_bench_metrics_source_formats.py` fails when they drift): append new keys at the end.
+
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
 
@@ -854,6 +873,39 @@ Final sink that materializes query results into a `ColumnDataCollection`. The GP
 The materialized collector builds local collections in parallel. For positioned input, it combines
 them by ascending position in `get_result()`, independently of task completion order.
 
+### `sirius_physical_discard_sink` — `DISCARD_SINK`
+**Files:** `src/op/sirius_physical_discard_sink.hpp`, `src/op/discard_copy_function.hpp`
+
+Runs a query without returning or keeping its rows. It exists for benchmarks and validation
+(`test/sort_performance/`), and is reached only through the `sirius_discard` COPY format:
+
+```sql
+COPY (SELECT ... ORDER BY k) TO '/dev/null' (FORMAT sirius_discard);
+COPY (SELECT ... ORDER BY k) TO 'ignored' (FORMAT sirius_discard, check_order true);
+```
+
+The path is never opened. The result is COPY's: one BIGINT row, the row count. Every other COPY
+format stays on DuckDB, and with `gpu_execution = false` (or after a runtime fallback) DuckDB's
+copy function for the format counts and drops the rows on the CPU.
+
+- **Plan.** `query → DISCARD_SINK → UNGROUPED_AGGREGATE(SUM) → MERGE_AGGREGATE → PROJECTION`. The
+  sink emits one row per task (the task's row count, at the input's position), so its declared
+  output type is one BIGINT, not the schema it drops (`input_types()`).
+- **Streaming input.** `input_barrier_for` returns `PIPELINE` for any producer, so each batch is
+  dropped as it arrives and the sort's output never accumulates.
+- **Counts batches where they are.** `input_residency_policy` returns
+  `{.materialize_inputs_on_gpu = false, .downgrade_priority = -100}`: a batch that spilled while
+  it waited is counted from its metadata, not read back, and the sink's repository is the last
+  one of the query the downgrade sweep visits. The count row is allocated in the task's GPU
+  memory space, which the sink's task input records at `prepare_for_processing`.
+- **`check_order`** is a validation mode. It is on only when the query's root is an ORDER BY
+  whose keys are all plain output columns; otherwise the planner logs the reason at DEBUG and
+  leaves it off. With it the input is materialized on the GPU: each batch is checked with
+  `cudf::is_sorted`, and the first and last key rows of each task are copied to the host. When
+  the pipeline finishes (`on_finalize_operator` → `finish()`), the tasks are walked in position
+  order and every seam is compared with a host comparator that follows cudf's row order.
+- `finish()` logs `[discard_sink] rows=… bytes=… order_violations=…` at INFO, once.
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/op/sirius_physical_empty_result.hpp`
 
@@ -898,3 +950,4 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
 | STREAMING_SINK | Result | Terminal operator of a streaming fragment |
+| DISCARD_SINK | Result | Counts and drops each batch (`FORMAT sirius_discard`); optional `cudf::is_sorted` order check |

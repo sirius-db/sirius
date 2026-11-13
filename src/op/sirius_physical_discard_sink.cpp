@@ -17,6 +17,7 @@
 #include "op/sirius_physical_discard_sink.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -38,7 +39,6 @@
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 
@@ -59,36 +59,38 @@ struct key_range {
   host_key_row last;
 };
 
-//! What the order check remembers between tasks, and whether finish() already ran.
-struct discard_sink_state {
-  std::mutex mutex;
-  //! Position -> key range. Tasks that share a position keep their arrival order.
-  std::multimap<std::size_t, key_range> ranges;
-  bool finished{false};
-};
+//! Task input of the discard sink. Its batches may be anywhere, so it keeps the GPU memory space
+//! the task prepared it for: that is where the count row is allocated.
+class discard_sink_input final : public pipelineable_operator_data {
+ public:
+  using pipelineable_operator_data::pipelineable_operator_data;
 
-// The operator's header (owned by another task) has no member for this state, so it is kept here,
-// keyed by operator. The constructor replaces the entry, which also drops what a destroyed
-// operator at the same address left behind.
-std::mutex g_states_mutex;
-std::unordered_map<const sirius_physical_discard_sink*, std::shared_ptr<discard_sink_state>>
-  g_states;
-
-void reset_state(const sirius_physical_discard_sink& op)
-{
-  std::lock_guard<std::mutex> guard(g_states_mutex);
-  g_states[&op] = std::make_shared<discard_sink_state>();
-}
-
-std::shared_ptr<discard_sink_state> state_of(const sirius_physical_discard_sink& op)
-{
-  std::lock_guard<std::mutex> guard(g_states_mutex);
-  auto it = g_states.find(&op);
-  if (it == g_states.end()) {
-    throw internal_exception("sirius_physical_discard_sink: operator has no state");
+  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+                              ::cuda::stream_ref stream) override
+  {
+    _task_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
+    pipelineable_operator_data::prepare_for_processing(requested_memory_space, stream);
   }
-  return it->second;
-}
+
+  //! The memory space of the task, or nullptr before preparation or when the task named none.
+  [[nodiscard]] ::cucascade::memory::memory_space* task_space() const noexcept
+  {
+    return _task_space;
+  }
+
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override
+  {
+    auto replacement = std::make_unique<discard_sink_input>(std::move(batches), get_position());
+    replacement->adopt_row_identity(*this);
+    replacement->set_materialize_on_gpu(materializes_on_gpu());
+    replacement->_task_space = _task_space;
+    return replacement;
+  }
+
+ private:
+  ::cucascade::memory::memory_space* _task_space{nullptr};
+};
 
 //! Copies a valid scalar's value to the host.
 struct host_key_reader {
@@ -203,13 +205,23 @@ bool orders_before(const host_key_row& lhs,
 
 }  // namespace
 
+struct sirius_physical_discard_sink::order_check_state {
+  std::mutex mutex;
+  //! Position -> key range. Tasks that share a position keep their arrival order.
+  std::multimap<std::size_t, key_range> ranges;
+  bool finished{false};
+};
+
 sirius_physical_discard_sink::sirius_physical_discard_sink(
   duckdb::vector<sirius::logical_type> input_types,
   discard_sink_options options,
   std::size_t estimated_cardinality)
-  : sirius_physical_operator(
-      SiriusPhysicalOperatorType::DISCARD_SINK, std::move(input_types), estimated_cardinality),
-    _options(std::move(options))
+  : sirius_physical_operator(SiriusPhysicalOperatorType::DISCARD_SINK,
+                             {sirius::from_duckdb(duckdb::LogicalType::BIGINT)},
+                             estimated_cardinality),
+    _options(std::move(options)),
+    _input_types(std::move(input_types)),
+    _state(std::make_unique<order_check_state>())
 {
   auto const num_keys = _options.key_columns.size();
   if ((!_options.column_order.empty() && _options.column_order.size() != num_keys) ||
@@ -218,8 +230,9 @@ sirius_physical_discard_sink::sirius_physical_discard_sink(
       "sirius_physical_discard_sink: column_order and null_precedence must be empty or have one "
       "entry per key column");
   }
-  reset_state(*this);
 }
+
+sirius_physical_discard_sink::~sirius_physical_discard_sink() = default;
 
 std::string sirius_physical_discard_sink::get_name() const { return "DISCARD_SINK"; }
 
@@ -238,10 +251,19 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
   // prepared is locked in the tier it is in and counted from its metadata.
   auto const batches = input->get_read_only_batches();
 
-  std::uint64_t rows                           = 0;
-  std::uint64_t bytes                          = 0;
-  std::uint64_t violations                     = 0;
+  // The count row goes to the task's GPU memory space, or failing that (an input that was not
+  // prepared) to the space of the first input batch that is on the GPU.
   ::cucascade::memory::memory_space* gpu_space = nullptr;
+  if (const auto* own_input = dynamic_cast<const discard_sink_input*>(input)) {
+    auto* task_space = own_input->task_space();
+    if (task_space != nullptr && task_space->get_tier() == ::cucascade::memory::Tier::GPU) {
+      gpu_space = task_space;
+    }
+  }
+
+  std::uint64_t rows       = 0;
+  std::uint64_t bytes      = 0;
+  std::uint64_t violations = 0;
   std::optional<key_range> range;
   for (auto const& batch : batches) {
     auto const* data = batch.get_data();
@@ -280,11 +302,11 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
   std::vector<std::shared_ptr<::cucascade::data_batch>> output;
   if (!batches.empty()) {
     if (gpu_space == nullptr) {
-      // The count row is a GPU table and needs a GPU memory space, which only a GPU-resident
-      // input batch provides here.
+      // Reached only by an input that did not come from get_next_task_input_data() or was not
+      // prepared.
       throw internal_exception(
-        "sirius_physical_discard_sink: no input batch is on the GPU, so there is no memory space "
-        "for the count row");
+        "sirius_physical_discard_sink: the task has no GPU memory space and no input batch is on "
+        "the GPU, so there is nowhere to put the count row");
     }
     auto const mr = gpu_space->get_default_allocator();
     cudf::numeric_scalar<std::int64_t> count(static_cast<std::int64_t>(rows), true, stream, mr);
@@ -297,14 +319,39 @@ std::unique_ptr<operator_data> sirius_physical_discard_sink::execute(
   // Record only once nothing can fail any more, so a task that is retried is counted once.
   if (range && input->get_position()) {
     // Without a position there is no order between tasks to check.
-    auto const state = state_of(*this);
-    std::lock_guard<std::mutex> guard(state->mutex);
-    state->ranges.emplace(*input->get_position(), std::move(*range));
+    std::lock_guard<std::mutex> guard(_state->mutex);
+    _state->ranges.emplace(*input->get_position(), std::move(*range));
   }
   _rows_discarded.fetch_add(rows);
   _bytes_discarded.fetch_add(bytes);
   if (violations != 0) { _order_violations.fetch_add(violations); }
   return std::make_unique<pipelineable_operator_data>(std::move(output), input->get_position());
+}
+
+MemoryBarrierType sirius_physical_discard_sink::input_barrier_for(
+  sirius_physical_operator const& /*producer*/) const
+{
+  return MemoryBarrierType::PIPELINE;
+}
+
+port_residency_policy sirius_physical_discard_sink::input_residency_policy(
+  std::string_view /*port_id*/) const
+{
+  auto const check_order = _options.check_order && !_options.key_columns.empty();
+  return {.materialize_inputs_on_gpu = check_order, .downgrade_priority = -100};
+}
+
+std::unique_ptr<operator_data> sirius_physical_discard_sink::get_next_task_input_data()
+{
+  auto input = sirius_physical_operator::get_next_task_input_data();
+  if (input == nullptr) { return nullptr; }
+  auto const& popped = dynamic_cast<const pipelineable_operator_data&>(*input);
+  auto own = std::make_unique<discard_sink_input>(popped.get_data_batches(), popped.get_position());
+  own->set_materialize_on_gpu(popped.materializes_on_gpu());
+  if (auto const device = popped.get_preferred_device_id()) {
+    own->set_preferred_device_id(*device);
+  }
+  return own;
 }
 
 std::size_t sirius_physical_discard_sink::no_history_peak_memory_estimate(
@@ -336,21 +383,20 @@ std::uint64_t sirius_physical_discard_sink::order_violations() const noexcept
 
 void sirius_physical_discard_sink::finish()
 {
-  auto const state = state_of(*this);
-  std::lock_guard<std::mutex> guard(state->mutex);
-  if (state->finished) { return; }
-  state->finished = true;
+  std::lock_guard<std::mutex> guard(_state->mutex);
+  if (_state->finished) { return; }
+  _state->finished = true;
 
   std::uint64_t violations  = 0;
   const key_range* previous = nullptr;
-  for (auto const& [position, range] : state->ranges) {
+  for (auto const& [position, range] : _state->ranges) {
     if (previous != nullptr && orders_before(range.first, previous->last, _options)) {
       ++violations;
     }
     previous = &range;
   }
   if (violations != 0) { _order_violations.fetch_add(violations); }
-  state->ranges.clear();
+  _state->ranges.clear();
 
   SIRIUS_LOG_INFO("[discard_sink] rows={} bytes={} order_violations={}",
                   _rows_discarded.load(),

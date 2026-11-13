@@ -14,7 +14,7 @@
 
 """Tests of bench_metrics.py. No GPU needed: the sampler runs against a fake nvidia-smi.
 
-Run: pixi run python test/sort_performance/test_bench_metrics.py   (also collectable by pytest)
+Run: pixi run python -B test/sort_performance/test_bench_metrics.py   (also collectable by pytest)
 """
 
 import os
@@ -169,6 +169,84 @@ class DiscardSinkTest(unittest.TestCase):
             bench_metrics.parse_discard_sink(text),
             {"rows": 15, "bytes": 120, "order_violations": 3},
         )
+
+
+class FirstProblemLinesTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+
+    def write(self, name: str, text: str) -> str:
+        path = os.path.join(self._dir.name, name)
+        with open(path, "w") as log_file:
+            log_file.write(text)
+        return path
+
+    def test_keeps_warning_and_above_in_order(self):
+        lines = bench_metrics.first_problem_lines([str(FIXTURES / "oom_retries.log")])
+        fixture = read_fixture("oom_retries.log").splitlines()
+        self.assertEqual(
+            lines, [l for l in fixture if "] [warning] " in l or "] [error] " in l]
+        )
+        self.assertTrue(any("] [error] " in l for l in lines))
+        # INFO and DEBUG lines are not problems.
+        self.assertEqual(
+            bench_metrics.first_problem_lines([str(FIXTURES / "downgrade.log")]), []
+        )
+
+    def test_level_is_read_from_the_prefix_only(self):
+        path = self.write(
+            "a.log",
+            "[2026-11-13 03:46:00.079] [info] [x.cpp:1] the text says [error] here\n"
+            "[2026-11-13 03:46:00.080] [critical] [x.cpp:2] stop\n"
+            "=== Pipeline Overview === [warning]\n"
+            "[2026-11-13 03:46:00.081] [error] [x.cpp:3] CUDF failure\n",
+        )
+        self.assertEqual(
+            bench_metrics.first_problem_lines([path]),
+            [
+                "[2026-11-13 03:46:00.080] [critical] [x.cpp:2] stop",
+                "[2026-11-13 03:46:00.081] [error] [x.cpp:3] CUDF failure",
+            ],
+        )
+
+    def test_bounded_and_files_in_the_given_order(self):
+        first = self.write(
+            "a.log",
+            "".join(f"[t] [error] [x.cpp:1] failure {'a' * i}\n" for i in range(150)),
+        )
+        second = self.write(
+            "b.log",
+            "".join(f"[t] [warning] [x.cpp:1] retry {'b' * i}\n" for i in range(150)),
+        )
+        lines = bench_metrics.first_problem_lines([first, second], max_lines=200)
+        self.assertEqual(len(lines), 200)
+        self.assertEqual(lines[0], "[t] [error] [x.cpp:1] failure ")
+        self.assertEqual(lines[150], "[t] [warning] [x.cpp:1] retry ")
+        self.assertEqual(len(bench_metrics.first_problem_lines([first], 7)), 7)
+
+    def test_a_repeated_message_cannot_fill_the_result(self):
+        # The same warning for every batch, as the discard sink logs it, then the real error.
+        noise = "".join(
+            f"[2026-11-13 03:38:00.{i:03d}] [warning] [gpu_pipeline_task.cpp:83] operator "
+            f"'DISCARD_SINK' (id=5) output batch {i} column count mismatch: got 1, expected 2\n"
+            for i in range(900)
+        )
+        path = self.write("a.log", noise + "[t] [error] [x.cpp:3] CUDF failure\n")
+        lines = bench_metrics.first_problem_lines([path], max_lines=200)
+        self.assertEqual(len(lines), 6)
+        self.assertIn("output batch 4 column", lines[4])
+        self.assertTrue(lines[5].endswith("CUDF failure"))
+        self.assertEqual(
+            len(bench_metrics.first_problem_lines([path], max_per_message=2)), 3
+        )
+
+    def test_long_lines_are_cut_and_missing_files_skipped(self):
+        path = self.write("a.log", "[t] [error] [x.cpp:1] " + "x" * 5000 + "\n")
+        missing = os.path.join(self._dir.name, "missing.log")
+        lines = bench_metrics.first_problem_lines([missing, path], max_line_chars=100)
+        self.assertEqual([len(l) for l in lines], [100])
+        self.assertEqual(bench_metrics.first_problem_lines([]), [])
 
 
 class LogTailTest(unittest.TestCase):

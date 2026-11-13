@@ -37,11 +37,16 @@
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -194,6 +199,79 @@ std::vector<std::string> stats_lines(const sirius::test::scoped_recording_log_si
 bool has_token(const std::string& line, const std::string& token)
 {
   return (" " + line + " ").find(" " + token + " ") != std::string::npos;
+}
+
+/// What threads driving one operator to its end saw.
+struct concurrent_drive {
+  std::size_t tasks{0};        ///< tasks executed
+  std::size_t rows{0};         ///< rows they emitted
+  std::size_t early_lines{0};  ///< times a statistics line existed while a task was still to run
+  bool timed_out{false};
+  std::string error;  ///< what() of the first exception a thread threw
+};
+
+/// Creates and executes the operator's tasks from @p num_threads threads, each on its own stream,
+/// until the operator has no task and its repository is empty. Catch2 assertions are not
+/// thread-safe, so the threads only record; the caller asserts.
+concurrent_drive drive_concurrently(stats_log_fixture& test,
+                                    const sirius::test::scoped_recording_log_sink& log,
+                                    std::size_t num_threads)
+{
+  std::atomic<std::size_t> tasks{0};
+  std::atomic<std::size_t> rows{0};
+  std::atomic<std::size_t> early_lines{0};
+  std::atomic<bool> timed_out{false};
+  std::mutex error_mutex;
+  std::string error;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+
+  auto const worker = [&] {
+    try {
+      rmm::cuda_stream stream;
+      ::cuda::stream_ref stream_ref{stream.value()};
+      while (true) {
+        auto input = test.op->get_next_task_input_data();
+        if (!input) {
+          // Null also while every partition with runs has its task on another thread.
+          if (test.repo.total_size() == 0) { return; }
+          if (std::chrono::steady_clock::now() > deadline) {
+            timed_out = true;
+            return;
+          }
+          std::this_thread::yield();
+          continue;
+        }
+        // This task has not committed, so no commit can have been the operator's last.
+        for (auto const& record : log.records()) {
+          if (record.message.starts_with(merge::kMergeSortStatsTag)) { ++early_lines; }
+        }
+        input->prepare_for_processing(test.memory.gpu0, stream_ref);
+        auto const output = test.op->execute(*input, stream_ref);
+        for (auto const& batch :
+             dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()) {
+          rows += sirius::get_batch_rows_and_bytes(*batch).rows.value_or(0);
+        }
+        ++tasks;
+      }
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> lg(error_mutex);
+      if (error.empty()) { error = e.what(); }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(num_threads);
+  for (std::size_t t = 0; t < num_threads; ++t) {
+    threads.emplace_back(worker);
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  return {.tasks       = tasks,
+          .rows        = rows,
+          .early_lines = early_lines,
+          .timed_out   = timed_out,
+          .error       = error};
 }
 
 }  // namespace
@@ -402,4 +480,142 @@ TEST_CASE("merge sort counts the window shrinks of its tasks retried after an OO
   REQUIRE(lines.size() == 1);
   REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters));
   REQUIRE(lines.front().ends_with(" shrinks=1"));
+}
+
+TEST_CASE("merge sort with no input logs one all-zero statistics line when it is finalized",
+          "[merge_sort_stats_log]")
+{
+  stats_log_fixture test(
+    {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 64 * 1024}, 2);
+  sirius::test::scoped_recording_log_sink log{"info"};
+
+  REQUIRE_FALSE(test.op->get_next_task_input_data());
+  REQUIRE(stats_lines(log).empty());
+
+  test.op->finalize_operator();
+  auto const lines = stats_lines(log);
+  REQUIRE(lines.size() == 1);
+  REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, {}));
+
+  test.op->finalize_operator();
+  REQUIRE(stats_lines(log).size() == 1);
+}
+
+TEST_CASE("merge sort that logged its statistics at its last commit logs nothing when finalized",
+          "[merge_sort_stats_log]")
+{
+  auto const mode = GENERATE(sirius::sort_merge_mode::windowed, sirius::sort_merge_mode::one_shot);
+  stats_log_fixture test({.mode = mode, .window_rows = 1024, .output_bytes = 64 * 1024}, 2);
+  for (std::size_t p = 0; p < 2; ++p) {
+    for (std::size_t r = 0; r < 3; ++r) {
+      test.add_run(p, 2000, static_cast<std::uint32_t>(70 + p * 3 + r));
+    }
+  }
+  sirius::test::scoped_recording_log_sink log{"info"};
+
+  REQUIRE(test.run_to_end() >= 2);
+  auto const lines = stats_lines(log);
+  REQUIRE(lines.size() == 1);
+
+  test.op->finalize_operator();
+  REQUIRE(stats_lines(log) == lines);
+}
+
+TEST_CASE("merge sort finalized before its last task commits logs once, with the counters so far",
+          "[merge_sort_stats_log]")
+{
+  // What a LIMIT downstream does: the pipeline finishes while the operator still has runs.
+  stats_log_fixture test(
+    {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 64 * 1024}, 1);
+  for (std::size_t r = 0; r < 3; ++r) {
+    test.add_run(0, 3000, static_cast<std::uint32_t>(80 + r));
+  }
+  sirius::test::scoped_recording_log_sink log{"info"};
+
+  auto first = test.op->get_next_task_input_data();
+  REQUIRE(first);
+  test.run_task(*first);
+  auto const counters_at_finalize = test.op->counters();
+  REQUIRE(counters_at_finalize.windowed_tasks == 1);
+  REQUIRE(stats_lines(log).empty());
+
+  test.op->finalize_operator();
+  auto const lines = stats_lines(log);
+  REQUIRE(lines.size() == 1);
+  REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters_at_finalize));
+
+  // Tasks that still run afterwards commit without a second line.
+  REQUIRE(test.run_to_end() > 0);
+  REQUIRE(test.repo.total_size() == 0);
+  REQUIRE(stats_lines(log) == lines);
+}
+
+TEST_CASE("merge sort driven from four threads logs exactly one statistics line",
+          "[merge_sort_stats_log]")
+{
+  constexpr std::size_t num_threads = 4;
+  constexpr std::size_t repetitions = 10;
+  constexpr std::size_t small_rows  = 200;
+  constexpr std::size_t large_rows  = 30000;
+  constexpr std::size_t runs        = 3;
+
+  struct scenario {
+    sirius::sort_merge_mode mode;
+    std::vector<std::size_t> rows_per_run;  // of each partition
+    std::size_t one_shot_partitions;
+    std::size_t windowed_partitions;
+  };
+  // Automatic: 0.0001 of the 8 GiB budget is about 860 KiB, so the small partitions merge
+  // one-shot and the large ones windowed.
+  auto const which = GENERATE(as<std::string>{}, "automatic", "windowed", "one_shot");
+  auto const scen =
+    which == "automatic" ? scenario{sirius::sort_merge_mode::automatic,
+                                    {small_rows, large_rows, small_rows, large_rows, small_rows},
+                                    3,
+                                    2}
+    : which == "windowed"
+      ? scenario{sirius::sort_merge_mode::windowed,
+                 {large_rows, large_rows, large_rows, large_rows},
+                 0,
+                 4}
+      : scenario{sirius::sort_merge_mode::one_shot, {large_rows, small_rows, large_rows}, 3, 0};
+  CAPTURE(which);
+
+  for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
+    CAPTURE(repetition);
+    stats_log_fixture test({.mode                  = scen.mode,
+                            .window_rows           = 1024,
+                            .output_bytes          = 64 * 1024,
+                            .one_shot_max_fraction = 0.0001},
+                           scen.rows_per_run.size());
+    std::size_t total_rows = 0;
+    for (std::size_t p = 0; p < scen.rows_per_run.size(); ++p) {
+      for (std::size_t r = 0; r < runs; ++r) {
+        test.add_run(p, scen.rows_per_run[p], static_cast<std::uint32_t>(100 + p * runs + r));
+        total_rows += scen.rows_per_run[p];
+      }
+    }
+    sirius::test::scoped_recording_log_sink log{"info"};
+
+    auto const drive = drive_concurrently(test, log, num_threads);
+    REQUIRE(drive.error.empty());
+    REQUIRE_FALSE(drive.timed_out);
+    REQUIRE(drive.early_lines == 0);
+    REQUIRE(drive.rows == total_rows);
+    REQUIRE(test.repo.total_size() == 0);
+    REQUIRE_FALSE(test.op->get_next_task_input_data());
+
+    auto const counters = test.op->counters();
+    REQUIRE(counters.one_shot_partitions == scen.one_shot_partitions);
+    REQUIRE(counters.windowed_partitions == scen.windowed_partitions);
+    REQUIRE(counters.windowed_tasks + counters.one_shot_partitions == drive.tasks);
+
+    // The line holds the final counters: it was logged by the last commit, not an earlier one.
+    auto const lines = stats_lines(log);
+    REQUIRE(lines.size() == 1);
+    REQUIRE(lines.front() == merge::format_merge_sort_stats(kOperatorId, counters));
+
+    test.op->finalize_operator();
+    REQUIRE(stats_lines(log).size() == 1);
+  }
 }

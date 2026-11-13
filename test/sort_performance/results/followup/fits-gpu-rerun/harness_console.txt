@@ -1,0 +1,25 @@
+[09:25:29.966] GPU limit 85899345920 bytes (80.00 GiB), data 0.4x the limit, GPU index 0
+[09:25:29.966] Matrix: 2 datasets x 1 modes x 1 compression x 3 repeat = 6 runs
+[09:25:29.966]   normal-multikey: 153 x 8000000 rows = 1224000000 rows, 28 bytes/row, 31.92 GiB
+[09:25:29.966]   sequential: 268 x 8000000 rows = 2144000000 rows, 16 bytes/row, 31.95 GiB
+[09:25:29.966]   [1/6] normal-multikey  mode=one_shot  compression=false  repeat=1
+[09:25:29.966]   [2/6] normal-multikey  mode=one_shot  compression=false  repeat=2
+[09:25:29.966]   [3/6] normal-multikey  mode=one_shot  compression=false  repeat=3
+[09:25:29.966]   [4/6] sequential  mode=one_shot  compression=false  repeat=1
+[09:25:29.966]   [5/6] sequential  mode=one_shot  compression=false  repeat=2
+[09:25:29.966]   [6/6] sequential  mode=one_shot  compression=false  repeat=3
+[09:25:29.969] Results: /mnt/disk_2/sort_merge_bench/followup/fits-gpu-rerun
+[09:25:29.969] --- [1/6] normal-multikey__one_shot__uncompressed__r1 ---
+[09:27:32.476]   oom in 120.9s, peak GPU 90320 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 298: OOM at operator MERGE_SORT (index 0)
+[09:27:32.476] --- [2/6] normal-multikey__one_shot__uncompressed__r2 ---
+[09:30:57.801]   oom in 204.0s, peak GPU 82544 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 297: OOM at operator MERGE_SORT (index 0)
+[09:30:57.801] --- [3/6] normal-multikey__one_shot__uncompressed__r3 ---
+[09:34:23.726]   oom in 204.6s, peak GPU 89872 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 297: OOM at operator MERGE_SORT (index 0)
+[09:34:23.727] --- [4/6] sequential__one_shot__uncompressed__r1 ---
+[09:35:32.504]   oom in 67.6s, peak GPU 86368 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 521: OOM at operator MERGE_SORT (index 0)
+[09:35:32.504] --- [5/6] sequential__one_shot__uncompressed__r2 ---
+[09:36:41.207]   oom in 67.5s, peak GPU 86368 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 521: OOM at operator MERGE_SORT (index 0)
+[09:36:41.208] --- [6/6] sequential__one_shot__uncompressed__r3 ---
+[09:37:49.602]   oom in 67.2s, peak GPU 87454 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 521: OOM at operator MERGE_SORT (index 0)
+[09:37:49.602] Wrote /mnt/disk_2/sort_merge_bench/followup/fits-gpu-rerun/results.csv
+[09:37:49.602] Wrote /mnt/disk_2/sort_merge_bench/followup/fits-gpu-rerun/results.md

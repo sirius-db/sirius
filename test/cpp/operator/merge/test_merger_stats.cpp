@@ -21,7 +21,6 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "data/sirius_row_range_reader_registry.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/merge/bounded_kway_merge.hpp"
 #include "op/merge/windowed_merge.hpp"
 #include "operator/merge/merge_test_utils.hpp"
@@ -42,115 +41,32 @@
 #include <compression/compressed_payload_sources.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/device_compressed_blob.hpp>
-#include <compression/spill_compression.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <vector>
 
 using namespace sirius::op;
 using namespace sirius::test::merge_utils;
-using cucascade::memory::Tier;
 
 namespace {
 
 namespace utils = sirius::test::operator_utils;
-
-constexpr std::size_t kMiB = std::size_t{1} << 20;
-constexpr std::size_t kGiB = std::size_t{1} << 30;
 
 bool has_gpu()
 {
   int count = 0;
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
-
-/// A GPU space, a host space and a disk space (tiered_memory_fixture has no DISK tier). Declare
-/// it before anything that holds batches of its spaces: the destructor shuts the manager and the
-/// converter registry down.
-struct tiers_fixture {
-  std::filesystem::path tmp_dir;
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu  = nullptr;
-  cucascade::memory::memory_space* host = nullptr;
-  cucascade::memory::memory_space* disk = nullptr;
-  /// The spill converters reject the default stream, so conversions and merges run on this one.
-  rmm::cuda_stream stream;
-
-  tiers_fixture()
-  {
-    sirius::converter_registry::reset_for_testing();
-    std::string tmp_template =
-      (std::filesystem::temp_directory_path() / "sirius_merger_stats_XXXXXX").string();
-    REQUIRE(mkdtemp(tmp_template.data()) != nullptr);
-    tmp_dir = tmp_template;
-
-    cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
-      .set_gpu_usage_limit(512 * kMiB)
-      .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(kGiB)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
-      .track_reservation_per_stream(false)
-      .set_disk_mounting_point(0, kGiB, tmp_dir.string());
-    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
-    sirius::converter_registry::initialize();
-    if (!sirius::row_range_reader_registry::is_initialized()) {
-      sirius::row_range_reader_registry::initialize();
-    }
-    gpu  = manager->get_memory_space(Tier::GPU, 0);
-    host = manager->get_memory_space(Tier::HOST, 0);
-    disk = manager->get_memory_space(Tier::DISK, 0);
-    REQUIRE(gpu != nullptr);
-    REQUIRE(host != nullptr);
-    REQUIRE(disk != nullptr);
-  }
-
-  ~tiers_fixture()
-  {
-    manager->shutdown();
-    sirius::converter_registry::shutdown();
-    std::error_code ignored;
-    std::filesystem::remove_all(tmp_dir, ignored);
-  }
-
-  tiers_fixture(const tiers_fixture&)            = delete;
-  tiers_fixture& operator=(const tiers_fixture&) = delete;
-
-  [[nodiscard]] ::cuda::stream_ref stream_ref() const { return ::cuda::stream_ref{stream.value()}; }
-  [[nodiscard]] rmm::cuda_stream_view stream_view() const
-  {
-    return rmm::cuda_stream_view{stream.value()};
-  }
-  [[nodiscard]] rmm::device_async_resource_ref mr() const { return utils::get_resource_ref(*gpu); }
-};
-
-/// Switches spill compression on for one scope; every batch is a candidate and every encode is
-/// kept.
-struct scoped_spill_compression {
-  scoped_spill_compression()
-  {
-    sirius::compression::spill_compression_settings settings;
-    settings.enabled                 = true;
-    settings.min_batch_bytes         = 0;
-    settings.max_compressed_fraction = 2.0;
-    sirius::compression::set_spill_compression_settings(settings);
-  }
-  ~scoped_spill_compression() { sirius::compression::set_spill_compression_settings({}); }
-};
 
 template <typename Representation>
 bool holds(cucascade::data_batch& batch)
@@ -480,6 +396,49 @@ TEST_CASE("windowed_merger splits its refill bytes by the tier and representatio
     CHECK(stats.round_rows_min <= stats.round_rows_max);
     CHECK(stats.round_rows_max <= kWindowRows);
   }
+}
+
+TEST_CASE(
+  "runs_read_compressed is call-scoped: one compressed run refilled in two run() calls "
+  "accumulates to 2, not 1",
+  "[merger_stats]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  tiers_fixture fx;
+  placed_runs runs(fx);
+  constexpr std::size_t kWindowRows = 1000;
+  // The only run, so each round emits its whole window and the next call has to refill it.
+  runs.add(placement::compressed_host, 6000);
+  auto merger =
+    runs.make_merger({.window_rows = kWindowRows, .output_target_bytes = kWindowRows * kRowBytes});
+
+  merge::merge_round_stats first;
+  auto const first_output = merger.run(fx.stream_view(), fx.mr(), &first);
+  merge::merge_round_stats second;
+  auto const second_output = merger.run(fx.stream_view(), fx.mr(), &second);
+
+  REQUIRE(first_output->num_rows() > 0);
+  REQUIRE(second_output->num_rows() > 0);
+  REQUIRE_FALSE(runs.cursors[0].exhausted());
+  REQUIRE(first.refill_bytes_compressed > 0);
+  REQUIRE(second.refill_bytes_compressed > 0);
+  CHECK(first.runs_read_compressed == 1);
+  CHECK(second.runs_read_compressed == 1);
+
+  merge::merge_round_stats summed;
+  merge::accumulate(summed, first);
+  merge::accumulate(summed, second);
+  CHECK(summed.runs_read_compressed == 2);
+
+  // The same sum when one stats object is passed to both calls.
+  placed_runs again(fx);
+  again.add(placement::compressed_host, 6000);
+  auto second_merger =
+    again.make_merger({.window_rows = kWindowRows, .output_target_bytes = kWindowRows * kRowBytes});
+  merge::merge_round_stats shared;
+  (void)second_merger.run(fx.stream_view(), fx.mr(), &shared);
+  (void)second_merger.run(fx.stream_view(), fx.mr(), &shared);
+  CHECK(shared.runs_read_compressed == 2);
 }
 
 TEST_CASE("windowed_merger leaves the new counters untouched when run() throws", "[merger_stats]")

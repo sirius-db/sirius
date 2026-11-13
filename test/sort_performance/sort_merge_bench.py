@@ -49,6 +49,19 @@ SEED = 42
 DEFAULT_ROWS_PER_BATCH = 8_000_000
 DEFAULT_SPILL_MIN_BATCH_BYTES = 1 << 20
 
+# Names under --out-dir. The repository's .gitignore ignores `runs/` and
+# `*output.txt`; these names are not ignored, so a results directory can be
+# committed as the harness wrote it.
+PER_RUN_DIR = "per_run"
+CHILD_STDOUT_FILE = "child_stdout.txt"
+LOG_TAIL_FILE = "sirius_log_tail.txt"
+# Written for a run that did not end `ok`: the first warnings and errors of
+# its log, which the tail of a long failing run no longer holds.
+FIRST_ERRORS_FILE = "sirius_log_first_errors.txt"
+FIRST_ERRORS_LINES = 200
+# A sizing that misses --scale x limit by more than this fraction is reported.
+SIZING_TOLERANCE = 0.1
+
 # Bytes per row by column type, used to size a dataset. VARCHAR adds its mean
 # length (see row_width).
 TYPE_WIDTH = {"BIGINT": 8, "INTEGER": 4, "DOUBLE": 8, "VARCHAR": 4}
@@ -186,6 +199,12 @@ _BYTE_UNITS = {
     "ti": 1 << 40,
     "tib": 1 << 40,
 }
+
+
+# `log`, `_load_yaml`, `_dump_yaml`, `_dig`, `_plant` and `_sql_literal` below
+# are copies of the functions of the same names in
+# test/tpch_performance/performance_test.py. The two copies must change
+# together.
 
 
 def log(msg):
@@ -466,14 +485,19 @@ def _kill_group(proc):
             continue
 
 
-def read_run_log(log_dir, bench_metrics):
-    """The text of every Sirius log file the run wrote (the log rotates daily)."""
+def run_log_paths(log_dir):
+    """The Sirius log files the run wrote, oldest first (the log rotates daily)."""
     if not os.path.isdir(log_dir):
-        return ""
+        return []
     names = sorted(n for n in os.listdir(log_dir) if n.startswith("sirius"))
     paths = [os.path.join(log_dir, n) for n in names]
     paths.sort(key=os.path.getmtime)
-    return "".join(bench_metrics.LogTail(p).read_new() for p in paths)
+    return paths
+
+
+def read_run_log(log_dir, bench_metrics):
+    """The text of every Sirius log file the run wrote."""
+    return "".join(bench_metrics.LogTail(p).read_new() for p in run_log_paths(log_dir))
 
 
 def collect_metrics(log_text, bench_metrics):
@@ -535,13 +559,17 @@ def execute_run(run, args, bench_metrics):
     env["SIRIUS_LOG_DIR"] = log_dir
     env["SIRIUS_LOG_BACKEND"] = "spdlog"
     env["SIRIUS_LOG_LEVEL"] = "info"
+    # nvidia-smi, which the sampler asks about index args.device, numbers the
+    # GPUs by PCI bus. CUDA's default order is fastest first, so without this
+    # the run and the sampler could be on different GPUs.
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = str(args.device)
 
     sampler = bench_metrics.GpuMemorySampler(args.device)
     timed_out = False
     started = time.perf_counter()
     try:
-        with open(os.path.join(run_dir, "child_output.txt"), "w") as child_out:
+        with open(os.path.join(run_dir, CHILD_STDOUT_FILE), "w") as child_out:
             proc = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), "--_child", job_path],
                 stdout=child_out,
@@ -599,8 +627,14 @@ def execute_run(run, args, bench_metrics):
         row["error"] = " ".join(error.split())[:2000]
 
         tail = log_text.splitlines()[-args.log_tail_lines :]
-        with open(os.path.join(run_dir, "sirius_log_tail.txt"), "w") as f:
+        with open(os.path.join(run_dir, LOG_TAIL_FILE), "w") as f:
             f.write("\n".join(tail) + ("\n" if tail else ""))
+        if row["status"] != "ok":
+            first = bench_metrics.first_problem_lines(
+                run_log_paths(log_dir), FIRST_ERRORS_LINES
+            )
+            with open(os.path.join(run_dir, FIRST_ERRORS_FILE), "w") as f:
+                f.write("\n".join(first) + ("\n" if first else ""))
         if not args.keep_logs:
             shutil.rmtree(log_dir, ignore_errors=True)
     finally:
@@ -774,7 +808,8 @@ def parse_args(argv=None):
         "--scale",
         type=float,
         default=10.0,
-        help="Data bytes as a multiple of the GPU limit (default: 10)",
+        help="Data bytes as a multiple of the GPU limit; may be below 1 for data "
+        "that fits the GPU (default: 10)",
     )
     p.add_argument(
         "--datasets",
@@ -868,7 +903,7 @@ def parse_args(argv=None):
         "--log-tail-lines",
         type=int,
         default=200,
-        help="Lines of each run's log kept in sirius_log_tail.txt (default: 200)",
+        help=f"Lines of each run's log kept in {LOG_TAIL_FILE} (default: 200)",
     )
     args = p.parse_args(argv)
 
@@ -925,7 +960,7 @@ def build_matrix(args, base_config, out_dir, spill_root):
                     runs.append(
                         {
                             "name": name,
-                            "run_dir": os.path.join(out_dir, "runs", name),
+                            "run_dir": os.path.join(out_dir, PER_RUN_DIR, name),
                             "spill_dir": spill_dir,
                             "sql": sql,
                             "settings": session_settings(mode, compression),
@@ -967,6 +1002,14 @@ def print_matrix(args, runs, sizings):
             f"= {sizing['rows']} rows, {sizing['row_width']} bytes/row, "
             f"{_gib(sizing['bytes'])} GiB"
         )
+        target = args.scale * args.gpu_limit_bytes
+        if abs(sizing["bytes"] - target) > SIZING_TOLERANCE * target:
+            actual = sizing["bytes"] / args.gpu_limit_bytes
+            log(
+                f"  WARNING: {dataset} is {actual:.2f}x the limit, not "
+                f"{args.scale:g}x: the data is a whole number of batches (at least "
+                "one); lower --rows-per-batch to get closer"
+            )
     for i, run in enumerate(runs, 1):
         row = run["row"]
         log(
@@ -1014,7 +1057,7 @@ def main():
     sys.path.insert(0, SCRIPT_DIR)
     import bench_metrics
 
-    os.makedirs(os.path.join(out_dir, "runs"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, PER_RUN_DIR), exist_ok=True)
     os.makedirs(spill_root, exist_ok=True)
     if args.base_config:
         shutil.copyfile(args.base_config, os.path.join(out_dir, "base_config.yml"))

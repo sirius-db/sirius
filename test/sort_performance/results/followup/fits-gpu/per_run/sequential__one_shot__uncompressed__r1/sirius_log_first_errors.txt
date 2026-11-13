@@ -1,0 +1,8 @@
+[2026-11-13 08:57:13.799] [warning] [sirius_scan_manager.cpp:1720] [sirius_scan_manager::prepare_for_query] no GPU scan operators found in query
+[2026-11-13 08:57:14.368] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (1088000000 bytes freed), reservation still partial (52683345920/66432000000 bytes) for pipeline 2 task 521 -- proceeding with partial reservation
+[2026-11-13 08:57:14.978] [warning] [gpu_pipeline_task.cpp:299] Pipeline 2: MERGE_SORT (id=4) threw during input materialization or execute: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 08:57:14.978] [warning] [gpu_pipeline_task.cpp:549] Pipeline 2: OOM at operator MERGE_SORT (id=4, index 0/1), requested 8192000000 bytes (7812.50 MB), global usage 85899345920 bytes (81920.00 MB), peak allocated 57792000000 bytes (55114.75 MB), bytes to materialize input 0 bytes (0.00 MB), reservation 52683345920 bytes (50242.75 MB), rescheduling task 521
+[2026-11-13 08:57:14.978] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 1/100) for task 521 (original task 521), resuming from operator index 0: OOM at operator MERGE_SORT (index 0)
+[2026-11-13 08:57:14.978] [error] [gpu_pipeline_executor.cpp:619] GPU task execution, retry or completion failed: std::bad_cast
+[2026-11-13 08:57:14.978] [error] [sirius_engine.cpp:302] Error executing query: std::bad_cast
+[2026-11-13 08:57:15.029] [error] [physical_sirius_execution.cpp:438] Transparent GPU execution error: std::bad_cast

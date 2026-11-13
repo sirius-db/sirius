@@ -1,0 +1,145 @@
+[08:37:41.353] GPU limit 85899345920 bytes (80.00 GiB), data 0.4x the limit, GPU index 0
+[08:37:41.353] Matrix: 5 datasets x 3 modes x 1 compression x 3 repeat = 45 runs
+[08:37:41.353]   uniform-1key: 268 x 8000000 rows = 2144000000 rows, 16 bytes/row, 31.95 GiB
+[08:37:41.353]   zipf-1key: 268 x 8000000 rows = 2144000000 rows, 16 bytes/row, 31.95 GiB
+[08:37:41.353]   normal-multikey: 153 x 8000000 rows = 1224000000 rows, 28 bytes/row, 31.92 GiB
+[08:37:41.353]   few_distinct-strings: 195 x 8000000 rows = 1560000000 rows, 22 bytes/row, 31.96 GiB
+[08:37:41.353]   sequential: 268 x 8000000 rows = 2144000000 rows, 16 bytes/row, 31.95 GiB
+[08:37:41.353]   [1/45] uniform-1key  mode=one_shot  compression=false  repeat=1
+[08:37:41.353]   [2/45] uniform-1key  mode=one_shot  compression=false  repeat=2
+[08:37:41.353]   [3/45] uniform-1key  mode=one_shot  compression=false  repeat=3
+[08:37:41.353]   [4/45] uniform-1key  mode=windowed  compression=false  repeat=1
+[08:37:41.353]   [5/45] uniform-1key  mode=windowed  compression=false  repeat=2
+[08:37:41.353]   [6/45] uniform-1key  mode=windowed  compression=false  repeat=3
+[08:37:41.353]   [7/45] uniform-1key  mode=auto  compression=false  repeat=1
+[08:37:41.353]   [8/45] uniform-1key  mode=auto  compression=false  repeat=2
+[08:37:41.353]   [9/45] uniform-1key  mode=auto  compression=false  repeat=3
+[08:37:41.353]   [10/45] zipf-1key  mode=one_shot  compression=false  repeat=1
+[08:37:41.353]   [11/45] zipf-1key  mode=one_shot  compression=false  repeat=2
+[08:37:41.353]   [12/45] zipf-1key  mode=one_shot  compression=false  repeat=3
+[08:37:41.353]   [13/45] zipf-1key  mode=windowed  compression=false  repeat=1
+[08:37:41.353]   [14/45] zipf-1key  mode=windowed  compression=false  repeat=2
+[08:37:41.353]   [15/45] zipf-1key  mode=windowed  compression=false  repeat=3
+[08:37:41.353]   [16/45] zipf-1key  mode=auto  compression=false  repeat=1
+[08:37:41.353]   [17/45] zipf-1key  mode=auto  compression=false  repeat=2
+[08:37:41.353]   [18/45] zipf-1key  mode=auto  compression=false  repeat=3
+[08:37:41.353]   [19/45] normal-multikey  mode=one_shot  compression=false  repeat=1
+[08:37:41.353]   [20/45] normal-multikey  mode=one_shot  compression=false  repeat=2
+[08:37:41.353]   [21/45] normal-multikey  mode=one_shot  compression=false  repeat=3
+[08:37:41.353]   [22/45] normal-multikey  mode=windowed  compression=false  repeat=1
+[08:37:41.353]   [23/45] normal-multikey  mode=windowed  compression=false  repeat=2
+[08:37:41.353]   [24/45] normal-multikey  mode=windowed  compression=false  repeat=3
+[08:37:41.353]   [25/45] normal-multikey  mode=auto  compression=false  repeat=1
+[08:37:41.353]   [26/45] normal-multikey  mode=auto  compression=false  repeat=2
+[08:37:41.353]   [27/45] normal-multikey  mode=auto  compression=false  repeat=3
+[08:37:41.353]   [28/45] few_distinct-strings  mode=one_shot  compression=false  repeat=1
+[08:37:41.353]   [29/45] few_distinct-strings  mode=one_shot  compression=false  repeat=2
+[08:37:41.353]   [30/45] few_distinct-strings  mode=one_shot  compression=false  repeat=3
+[08:37:41.353]   [31/45] few_distinct-strings  mode=windowed  compression=false  repeat=1
+[08:37:41.353]   [32/45] few_distinct-strings  mode=windowed  compression=false  repeat=2
+[08:37:41.353]   [33/45] few_distinct-strings  mode=windowed  compression=false  repeat=3
+[08:37:41.353]   [34/45] few_distinct-strings  mode=auto  compression=false  repeat=1
+[08:37:41.353]   [35/45] few_distinct-strings  mode=auto  compression=false  repeat=2
+[08:37:41.353]   [36/45] few_distinct-strings  mode=auto  compression=false  repeat=3
+[08:37:41.353]   [37/45] sequential  mode=one_shot  compression=false  repeat=1
+[08:37:41.353]   [38/45] sequential  mode=one_shot  compression=false  repeat=2
+[08:37:41.353]   [39/45] sequential  mode=one_shot  compression=false  repeat=3
+[08:37:41.353]   [40/45] sequential  mode=windowed  compression=false  repeat=1
+[08:37:41.353]   [41/45] sequential  mode=windowed  compression=false  repeat=2
+[08:37:41.353]   [42/45] sequential  mode=windowed  compression=false  repeat=3
+[08:37:41.353]   [43/45] sequential  mode=auto  compression=false  repeat=1
+[08:37:41.353]   [44/45] sequential  mode=auto  compression=false  repeat=2
+[08:37:41.353]   [45/45] sequential  mode=auto  compression=false  repeat=3
+[08:37:41.356] Results: /mnt/disk_2/sort_merge_bench/followup/fits-gpu
+[08:37:41.356] --- [1/45] uniform-1key__one_shot__uncompressed__r1 ---
+[08:37:45.205]   ok in 2.7s, peak GPU 83006 MiB
+[08:37:45.205] --- [2/45] uniform-1key__one_shot__uncompressed__r2 ---
+[08:37:49.105]   ok in 2.7s, peak GPU 82526 MiB
+[08:37:49.105] --- [3/45] uniform-1key__one_shot__uncompressed__r3 ---
+[08:37:52.953]   ok in 2.7s, peak GPU 82686 MiB
+[08:37:52.953] --- [4/45] uniform-1key__windowed__uncompressed__r1 ---
+[08:37:57.601]   ok in 3.5s, peak GPU 82526 MiB
+[08:37:57.601] --- [5/45] uniform-1key__windowed__uncompressed__r2 ---
+[08:38:02.228]   ok in 3.5s, peak GPU 82526 MiB
+[08:38:02.228] --- [6/45] uniform-1key__windowed__uncompressed__r3 ---
+[08:38:06.926]   ok in 3.5s, peak GPU 82526 MiB
+[08:38:06.927] --- [7/45] uniform-1key__auto__uncompressed__r1 ---
+[08:38:11.574]   ok in 3.5s, peak GPU 82526 MiB
+[08:38:11.574] --- [8/45] uniform-1key__auto__uncompressed__r2 ---
+[08:38:16.273]   ok in 3.5s, peak GPU 82526 MiB
+[08:38:16.274] --- [9/45] uniform-1key__auto__uncompressed__r3 ---
+[08:38:20.950]   ok in 3.5s, peak GPU 82526 MiB
+[08:38:20.950] --- [10/45] zipf-1key__one_shot__uncompressed__r1 ---
+[08:38:24.398]   ok in 2.2s, peak GPU 82526 MiB
+[08:38:24.398] --- [11/45] zipf-1key__one_shot__uncompressed__r2 ---
+[08:38:27.796]   ok in 2.2s, peak GPU 82526 MiB
+[08:38:27.797] --- [12/45] zipf-1key__one_shot__uncompressed__r3 ---
+[08:38:31.194]   ok in 2.2s, peak GPU 82526 MiB
+[08:38:31.194] --- [13/45] zipf-1key__windowed__uncompressed__r1 ---
+[08:38:35.142]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:35.142] --- [14/45] zipf-1key__windowed__uncompressed__r2 ---
+[08:38:39.042]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:39.042] --- [15/45] zipf-1key__windowed__uncompressed__r3 ---
+[08:38:42.935]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:42.936] --- [16/45] zipf-1key__auto__uncompressed__r1 ---
+[08:38:46.831]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:46.831] --- [17/45] zipf-1key__auto__uncompressed__r2 ---
+[08:38:50.778]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:50.779] --- [18/45] zipf-1key__auto__uncompressed__r3 ---
+[08:38:54.727]   ok in 2.7s, peak GPU 82526 MiB
+[08:38:54.727] --- [19/45] normal-multikey__one_shot__uncompressed__r1 ---
+[08:40:50.488]   error in 114.0s, peak GPU 90388 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: std::bad_cast
+[08:40:50.488] --- [20/45] normal-multikey__one_shot__uncompressed__r2 ---
+[08:43:19.091]   oom in 147.2s, peak GPU 89966 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 298: OOM at operator MERGE_SORT (index 0)
+[08:43:19.091] --- [21/45] normal-multikey__one_shot__uncompressed__r3 ---
+[08:46:43.844]   oom in 203.5s, peak GPU 82544 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 297: OOM at operator MERGE_SORT (index 0)
+[08:46:43.845] --- [22/45] normal-multikey__windowed__uncompressed__r1 ---
+[08:46:51.803]   ok in 6.7s, peak GPU 82544 MiB
+[08:46:51.804] --- [23/45] normal-multikey__windowed__uncompressed__r2 ---
+[08:46:59.709]   ok in 6.7s, peak GPU 82544 MiB
+[08:46:59.710] --- [24/45] normal-multikey__windowed__uncompressed__r3 ---
+[08:47:07.547]   ok in 6.7s, peak GPU 82544 MiB
+[08:47:07.547] --- [25/45] normal-multikey__auto__uncompressed__r1 ---
+[08:47:15.449]   ok in 6.7s, peak GPU 82544 MiB
+[08:47:15.450] --- [26/45] normal-multikey__auto__uncompressed__r2 ---
+[08:47:23.353]   ok in 6.7s, peak GPU 82544 MiB
+[08:47:23.354] --- [27/45] normal-multikey__auto__uncompressed__r3 ---
+[08:47:31.259]   ok in 6.7s, peak GPU 82544 MiB
+[08:47:31.259] --- [28/45] few_distinct-strings__one_shot__uncompressed__r1 ---
+[08:50:13.886]   oom in 161.1s, peak GPU 82748 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 378: OOM at operator MERGE_SORT (index 0)
+[08:50:13.887] --- [29/45] few_distinct-strings__one_shot__uncompressed__r2 ---
+[08:52:59.016]   oom in 163.6s, peak GPU 82724 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 379: OOM at operator MERGE_SORT (index 0)
+[08:52:59.017] --- [30/45] few_distinct-strings__one_shot__uncompressed__r3 ---
+[08:55:41.036]   oom in 160.8s, peak GPU 82526 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 378: OOM at operator MERGE_SORT (index 0)
+[08:55:41.037] --- [31/45] few_distinct-strings__windowed__uncompressed__r1 ---
+[08:55:56.402]   ok in 14.2s, peak GPU 82526 MiB
+[08:55:56.402] --- [32/45] few_distinct-strings__windowed__uncompressed__r2 ---
+[08:56:11.765]   ok in 14.2s, peak GPU 82526 MiB
+[08:56:11.766] --- [33/45] few_distinct-strings__windowed__uncompressed__r3 ---
+[08:56:27.127]   ok in 14.2s, peak GPU 82526 MiB
+[08:56:27.128] --- [34/45] few_distinct-strings__auto__uncompressed__r1 ---
+[08:56:42.491]   ok in 14.2s, peak GPU 82526 MiB
+[08:56:42.492] --- [35/45] few_distinct-strings__auto__uncompressed__r2 ---
+[08:56:57.787]   ok in 14.2s, peak GPU 82526 MiB
+[08:56:57.788] --- [36/45] few_distinct-strings__auto__uncompressed__r3 ---
+[08:57:13.151]   ok in 14.2s, peak GPU 82526 MiB
+[08:57:13.151] --- [37/45] sequential__one_shot__uncompressed__r1 ---
+[08:57:15.648]   error in 1.2s, peak GPU 86688 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: std::bad_cast
+[08:57:15.648] --- [38/45] sequential__one_shot__uncompressed__r2 ---
+[08:57:18.094]   error in 1.2s, peak GPU 86304 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: std::bad_cast
+[08:57:18.095] --- [39/45] sequential__one_shot__uncompressed__r3 ---
+[08:57:20.542]   error in 1.2s, peak GPU 86528 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: std::bad_cast
+[08:57:20.543] --- [40/45] sequential__windowed__uncompressed__r1 ---
+[08:57:23.189]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:23.189] --- [41/45] sequential__windowed__uncompressed__r2 ---
+[08:57:25.834]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:25.834] --- [42/45] sequential__windowed__uncompressed__r3 ---
+[08:57:28.457]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:28.458] --- [43/45] sequential__auto__uncompressed__r1 ---
+[08:57:31.052]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:31.052] --- [44/45] sequential__auto__uncompressed__r2 ---
+[08:57:33.697]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:33.697] --- [45/45] sequential__auto__uncompressed__r3 ---
+[08:57:36.343]   ok in 1.4s, peak GPU 82526 MiB
+[08:57:36.344] Wrote /mnt/disk_2/sort_merge_bench/followup/fits-gpu/results.csv
+[08:57:36.344] Wrote /mnt/disk_2/sort_merge_bench/followup/fits-gpu/results.md

@@ -38,6 +38,7 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
+#include "op/discard_copy_function.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
@@ -61,6 +62,7 @@
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/operator/helper/physical_execute.hpp>
 #include <duckdb/execution/operator/helper/physical_prepare.hpp>
+#include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
@@ -1805,12 +1807,24 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
   // In v2, SQL and C++ prepared executions both have an EXECUTE wrapper.
   auto statement_type = prepared.statement_type;
-  if (statement_type == StatementType::EXECUTE_STATEMENT && prepared.physical_plan &&
-      prepared.physical_plan->Root().type == PhysicalOperatorType::EXECUTE) {
-    statement_type =
-      prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
+  // The root of the statement's own plan, under the EXECUTE wrapper when there is one.
+  const PhysicalOperator* statement_root =
+    prepared.physical_plan ? &prepared.physical_plan->Root() : nullptr;
+  if (statement_type == StatementType::EXECUTE_STATEMENT && statement_root != nullptr &&
+      statement_root->type == PhysicalOperatorType::EXECUTE) {
+    auto const& execute = statement_root->Cast<PhysicalExecute>();
+    statement_type      = execute.prepared->statement_type;
+    statement_root      = &execute.plan;
   }
-  if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
+  // The one COPY that runs on the GPU is the discard format, which writes nothing: the planner
+  // ends its query in a discard sink. Every other COPY stays on DuckDB.
+  auto const is_discard_copy =
+    statement_type == StatementType::COPY_STATEMENT && statement_root != nullptr &&
+    statement_root->type == PhysicalOperatorType::COPY_TO_FILE &&
+    statement_root->Cast<PhysicalCopyToFile>().function.name == sirius::op::kDiscardCopyFormat;
+  if (statement_type != StatementType::SELECT_STATEMENT && !is_discard_copy) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).

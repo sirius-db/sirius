@@ -13,7 +13,9 @@ Measured on 2026-11-13 on the workstation `felipe-TRX50-AERO-D` (192.168.0.248) 
   faster, by 22–56 %.
 - **Recommendation:** deprecate `one_shot` now and remove it one release later, once the three
   conditions in [Recommendation](#recommendation-one_shot-deprecation) hold. The main one is
-  speed on inputs small enough for `one_shot` to finish, which this run does not measure.
+  speed on inputs small enough for `one_shot` to finish. A later measurement at 32 GiB found
+  `windowed` 22–29 % slower there, so that condition is not met yet
+  ([follow-up](#follow-up-measurements-after-the-integration)).
 - Three things limit how far these numbers go: one repeat per cell, no order check at this scale
   (the row count is checked), and a GPU limit so close to the card's size that every windowed run
   retried tasks after real device allocation failures (1,362–19,989 retries per run).
@@ -315,6 +317,98 @@ grew to 113 GiB, the machine had 4.6 GiB available and was swapping, and the fir
 (`uniform-1key` windowed uncompressed) had not finished after 12 minutes when it was stopped.
 With the 96 GiB cap the same run took 423 s. Files: `results/full/attempt1-default-host-capacity/`.
 
+## Follow-up measurements after the integration
+
+Measured on 2026-11-13 on the same workstation and GPU, after the phase's integration changed
+the code (see [What changed after the whole-GPU matrix](#what-changed-after-the-whole-gpu-matrix)).
+**Every number above this section was measured before those changes and was not re-measured.**
+One GPU, pinned; spill compression off unless a table says otherwise. Files:
+`results/followup/` (`driver.sh`, `driver_rerun.sh`, and one directory per step).
+
+### Data that fits the GPU: 32 GiB under an 80 GiB limit, three repeats
+
+`--gpu-limit-bytes 85899345920 --scale 0.4 --modes one_shot,windowed,auto --repeat 3`, host cap
+96 GiB. Nothing was spilled by the runs that finished. Wall seconds of the three repeats:
+
+| Dataset | Rows | one_shot | windowed | auto | windowed ÷ one_shot |
+|---|---|---|---|---|---|
+| `uniform-1key` | 2,144,000,000 | 2.70 / 2.68 / 2.69 | 3.48 / 3.48 / 3.49 | 3.48 / 3.48 / 3.47 | 1.29 |
+| `zipf-1key` | 2,144,000,000 | 2.24 / 2.25 / 2.24 | 2.73 / 2.74 / 2.74 | 2.75 / 2.73 / 2.73 | 1.22 |
+| `sequential` | 2,144,000,000 | oom ×3 (67 s each) | 1.42 / 1.42 / 1.42 | 1.42 / 1.42 / 1.43 | — |
+| `few_distinct-strings` | 1,560,000,000 | oom ×3 (161–164 s) | 14.17 / 14.20 / 14.18 | 14.17 / 14.16 / 14.16 | — |
+| `normal-multikey` | 1,224,000,000 | oom ×3 (121–205 s) | 6.72 / 6.70 / 6.68 | 6.70 / 6.73 / 6.72 | — |
+
+- **Where `one_shot` finishes, `windowed` takes 22–29 % longer.** The repeats agree to within
+  0.02 s. The runs last 2–4 s, not minutes: data that fits the GPU sorts that fast.
+- **`one_shot` fails on three of five datasets even when the data is 40 % of the limit.** Each
+  failure is `GPU pipeline task exceeded maximum retry limit (100) ... OOM at operator MERGE_SORT`.
+  The data is in two partitions of about 16 GiB; why merging them in single calls does not fit
+  under 80 GiB was not investigated. The `one_shot` rows of `sequential` and `normal-multikey` are from the second
+  pass (`fits-gpu-rerun`); in the first pass four of those six runs ended with `std::bad_cast`,
+  a bug that is now fixed (below).
+- **`auto` chose the windowed route** for both partitions of every dataset except `sequential`,
+  where it took one partition each way, and its times equal the windowed ones.
+
+### Twice the GPU: 160 GiB under the same 80 GiB limit, one repeat
+
+`--scale 2`, 10,736,000,000 rows, host cap 96 GiB.
+
+| Dataset | Mode | Status | Wall s | OOM retries | Spill to host GB | Spill to disk GB |
+|---|---|---|---|---|---|---|
+| `uniform-1key` | windowed | ok | 61.3 | 6 | 181 | 44 |
+| `uniform-1key` | auto | ok | 54.4 | 46 | 164 | 46 |
+| `uniform-1key` | one_shot | oom (retry limit) | 449.0 | 201 | 333 | 154 |
+| `zipf-1key` | windowed | ok | 67.2 | 19 | 155 | 29 |
+| `zipf-1key` | auto | ok | 56.1 | 69 | 153 | 28 |
+| `zipf-1key` | one_shot | oom (retry limit) | 770.5 | 400 | 10,538 | 209 |
+
+- `windowed` and `auto` finish in about a minute (2.4–2.9 GiB/s). `auto` took the windowed route
+  for all 7 partitions and was 11–17 % faster than forced `windowed`; with one repeat that
+  difference is not established.
+- `one_shot` did not finish either dataset. The `zipf-1key` run moved 10.5 TB between the GPU and
+  host memory before it gave up.
+- The device reached 95,998–97,246 MiB under an 81,920 MiB limit, so the 15 GiB of headroom was
+  used up and the OOM retries came back. This is problem 3 below, still not diagnosed.
+
+### Order check at a size that reaches the disk
+
+`--gpu-limit-bytes 4294967296 --scale 10 --validate --modes windowed` with a 4 GiB host cap:
+40 GiB per run, `check_order true`.
+
+| Dataset | Compression | Status | Order violations | Wall s | Spill to disk GB | Intermediate passes | Smallest round (rows) |
+|---|---|---|---|---|---|---|---|
+| `uniform-1key` | off | ok | 0 | 47.4 | 125 | 3,801 | 8 |
+| `uniform-1key` | on | ok | 0 | 57.9 | 95 | 5,270 | 23 |
+| `zipf-1key` | off | ok | 0 | 30.9 | 82 | 917 | 278 |
+| `zipf-1key` | on | ok | 0 | 94.9 | 91 | 12,547 | 2 |
+| `normal-multikey` | off | ok | 0 | 48.4 | 125 | 3,979 | 15 |
+| `normal-multikey` | on | ok | 0 | 241.7 | 49 | 12,123 | 1 |
+
+- The output is in order and complete in all six runs, with the disk tier and intermediate
+  passes in use. This is 40 GiB, not the 470 GiB of the matrix.
+- **At this small limit compression made every dataset slower** (1.2×, 3.1× and 5.0×), the
+  opposite of the whole-GPU result. The compressed runs take 1.3–8.4 times as many merge tasks and
+  have rounds of 1–2 rows. The smoke run saw the same on `zipf-1key`. Not diagnosed.
+
+The smoke matrix was also run again on the integrated code with `--validate`
+(`results/followup/smoke-post/`): 10 of 10 windowed runs correct with 0 order violations;
+`one_shot` finished 4 of 10 and ran out of memory in the other 6.
+
+### What changed after the whole-GPU matrix
+
+- **The discard sink no longer reads spilled batches back.** During the matrix every batch that
+  spilled while it waited for the sink was uploaded to the GPU again, only to be counted. That
+  cost is inside the wall times above and competed with the merge for GPU memory. It is gone
+  now; how much time it took was not measured.
+- **`std::bad_cast` with a spilled batch at the sink** (found by the first pass of these
+  measurements, fixed in `src/pipeline/gpu_pipeline_task.cpp`): the task's logging cast every
+  input batch to a GPU table, so the first sink task whose input had spilled ended the query.
+  It could only happen after the change above and affects none of the matrix numbers.
+- Problems 1 and 6 below are fixed: the capacity error now states the requested bytes and the
+  device capacity, and the sink declares the one column it emits, so the warning is gone.
+- Problem 7: a run that does not end `ok` now also keeps the first 200 warning and error lines
+  of its log (`sirius_log_first_errors.txt`).
+
 ## Recommendation: `one_shot` deprecation
 
 **Deprecate `one_shot` now. Remove it one release later, when the conditions below hold.**
@@ -345,12 +439,25 @@ What must be true before it is removed:
 3. **The windowed path has an order check at scale.** Order was validated at 12 GiB only. Run
    one dataset with `--validate` at a size that reaches the disk tier and intermediate passes.
 
+Where the conditions stand after the
+[follow-up measurements](#follow-up-measurements-after-the-integration):
+
+1. **Not met.** On the two datasets where `one_shot` finishes at 32 GiB, `windowed` is 22 % and
+   29 % slower. On the other three `one_shot` does not finish at all, at 40 % of the limit.
+2. **Measured at two sizes, one of them with one repeat.** `auto` took the windowed route almost
+   everywhere and matched it. So the gap in condition 1 is what a user of the default pays today
+   on data that fits the GPU: closing it, or letting `auto` use an in-memory merge there, is the
+   work that remains.
+3. **Met at 40 GiB** with the disk tier and intermediate passes, not at 470 GiB.
+
 Not blocking, but worth doing before the removal: understand the OOM retries at a limit close to
 the device size (they cost time on every windowed run here), and the rounds of 14–58 rows.
 
 ## Problems found
 
-No source was changed. Each item names the command, the output and where to look.
+No source was changed while the matrix ran. Each item names the command, the output and where
+to look. Items 1 and 6 were fixed afterwards and item 7 in part
+([what changed](#what-changed-after-the-whole-gpu-matrix)); items 2 to 5 are open.
 
 1. **A 96 GiB or 95 GiB limit is rejected on a 97,887 MiB card.**
    Command: `results/full/whole-gpu-5x/probe/probe.sh`. Output:

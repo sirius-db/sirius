@@ -186,9 +186,20 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
       YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_bytes: "
                  "18446744073709551615}}}"),
       "capacity.yaml");
-    REQUIRE_THROWS_WITH(parsed.resolve(topology),
-                        Catch::Matchers::ContainsSubstring("capacity.yaml") &&
-                          Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds"));
+    REQUIRE_THROWS_WITH(
+      parsed.resolve(topology),
+      Catch::Matchers::ContainsSubstring("capacity.yaml") &&
+        Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds") &&
+        // Both numbers, so the largest limit the device accepts is not a guess.
+        Catch::Matchers::ContainsSubstring("requested 18446744073709551615 bytes, capacity ") &&
+        Catch::Matchers::ContainsSubstring(
+          std::to_string(gpu_space(sirius::parsed_sirius_config::from_node(
+                                     YAML::Load("sirius: {topology: {num_gpus: "
+                                                "1}, memory: {gpu: "
+                                                "{usage_limit_fraction: 1.0}}}"))
+                                     .resolve(topology))
+                           .memory_capacity) +
+          " bytes"));
   }
   SECTION("fraction limits use physical capacity")
   {

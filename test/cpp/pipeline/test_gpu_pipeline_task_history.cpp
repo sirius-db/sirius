@@ -1077,6 +1077,69 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// Test: an input whose port opted out of GPU materialization runs through the task where it is.
+//
+// The task's bookkeeping around execute() (the per-operator data log, the output schema check)
+// must not assume a GPU table: casting a spilled input to one ended the query with
+// std::bad_cast.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task runs an operator over a host batch left in its tier",
+          "[gpu_pipeline_task][history][residency_policy_e2e]")
+{
+  constexpr std::size_t kNumRows = 1000;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+  rmm::cuda_stream stream, stream_data_init;
+  auto input_batch = f.create_host_data_batch(kNumRows, stream_data_init);
+
+  for (bool forward_input : {false, true}) {
+    INFO("operator forwards its input: " << forward_input);
+    auto ctx = create_pipeline_context();
+    std::optional<std::size_t> rows_seen;
+    ctx.stub_op->on_execute = [&](const sirius::op::operator_data& input, ::cuda::stream_ref) {
+      auto& pipelineable = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
+      auto const batches = pipelineable.get_read_only_batches();
+      REQUIRE(batches.size() == 1);
+      CHECK(batches[0].get_current_tier() == cucascade::memory::Tier::HOST);
+      rows_seen = sirius::representation_num_rows(batches[0].get_data());
+      std::vector<std::shared_ptr<cucascade::data_batch>> output;
+      if (forward_input) { output = pipelineable.get_data_batches(); }
+      return std::make_unique<sirius::op::pipelineable_operator_data>(std::move(output));
+    };
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+    auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{input_batch});
+    op_data->set_materialize_on_gpu(false);
+    auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      /*task_id=*/1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
+      global_state);
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
+    auto reservation = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, 1ULL << 20);
+    REQUIRE(reservation != nullptr);
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
+    advance_to_reserving(*task);
+
+    REQUIRE_NOTHROW(task->execute(stream));
+    CHECK(rows_seen == std::optional<std::size_t>{kNumRows});
+    task.reset();
+    CHECK(input_batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Test: a prepare OOM resumes at the attempt's current start index.
 //
 // prepare_for_processing runs before any operator in this attempt, so the input

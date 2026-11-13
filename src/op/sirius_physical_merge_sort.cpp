@@ -364,6 +364,23 @@ void sirius_physical_merge_sort::reset_process_counters()
   process.counters = {};
 }
 
+std::optional<merge_sort_counters> sirius_physical_merge_sort::claim_stats_line()
+{
+  if (_stats_logged) { return std::nullopt; }
+  _stats_logged = true;
+  return _counters;
+}
+
+void sirius_physical_merge_sort::on_finalize_operator()
+{
+  std::optional<merge_sort_counters> final_counters;
+  {
+    std::lock_guard<std::mutex> lg(_drain_mutex);
+    final_counters = claim_stats_line();
+  }
+  if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
+}
+
 void sirius_physical_merge_sort::on_input_batch_pushed(std::string_view,
                                                        ::cucascade::data_batch& batch)
 {
@@ -890,7 +907,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
         other.arm_deferred = false;
       }
       more_tasks = deferred && has_armable_partition(*repo);
-      if (no_work_left(_partitions, *repo)) { final_counters = _counters; }
+      if (no_work_left(_partitions, *repo)) { final_counters = claim_stats_line(); }
     }
   }
   if (final_counters.has_value()) { log_stats(operator_id, *final_counters); }
@@ -1169,7 +1186,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute_windowed(
       other.arm_deferred = false;
     }
     more_tasks = has_armable_partition(*repo);
-    if (no_work_left(_partitions, *repo)) { final_counters = _counters; }
+    if (no_work_left(_partitions, *repo)) { final_counters = claim_stats_line(); }
   }
   // Outside the mutex: frees the windows of a merger the partition no longer needs.
   kept.reset();
