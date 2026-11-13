@@ -1,0 +1,6 @@
+[2026-11-12 10:16:00.001] [info] [140300] [downgrade][monitor] [gpu0] request done: 3 batches, 3000000 bytes in 12.50 ms (228.9 MB/s), satisfied=true | to_host: 2/2000000 batches/bytes, to_disk: 1/1000000 batches/bytes
+[2026-11-12 10:16:00.050] [debug] [140300] [downgrade] [gpu0] request done: 3 batches, 3000000 bytes (target 2500000, planned 3000000) in 12.50 ms (228.9 MB/s) | repos: 3/3000000 batches/bytes, pipeline_queue: 0/0 | to_host: 2/2000000 batches/bytes, to_disk: 1/1000000 batches/bytes
+[2026-11-12 10:16:01.200] [info] [140301] [downgrade][monitor] [host] request done: 5 batches, 8000000 bytes in 250.00 ms (30.5 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 5/8000000 batches/bytes
+[2026-11-12 10:16:01.300] [info] [140301] [downgrade][monitor] [gpu0] request started: target 4000000 bytes
+[2026-11-12 10:16:01.400] [info] [140301] [downgrade][monitor] [gpu0] request done: x batches, 10 bytes in 1.00 ms (0.0 MB/s), satisfied=true | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-12 10:16:02.000] [info] [140302] [downgrade][monitor] [gpu0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
