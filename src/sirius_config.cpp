@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/merge/merge_config.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -433,6 +434,46 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
              yaml::fraction<double>{});
+  if (std::string mode; r.optional("sort_merge_mode", mode), !mode.empty()) {
+    auto const parsed = parse_sort_merge_mode(mode);
+    if (!parsed) {
+      throw std::runtime_error("'operator_params.sort_merge_mode': invalid value '" + mode +
+                               "'; valid values: auto, windowed, one_shot");
+    }
+    opt.sort_merge_mode_setting = *parsed;
+  }
+  // Counts are read signed: the reader's unsigned conversion would wrap a negative value.
+  auto const read_count = [&r](const char* key, uint64_t& out) {
+    auto value = static_cast<int64_t>(out);
+    r.optional(key, value);
+    if (value < 0) {
+      throw std::runtime_error(std::string("'operator_params.") + key + "': must be non-negative");
+    }
+    out = static_cast<uint64_t>(value);
+  };
+  read_count("sort_merge_window_rows", opt.sort_merge_window_rows);
+  if (opt.sort_merge_window_rows != 0 &&
+      opt.sort_merge_window_rows < op::merge::kMinExplicitWindowRows) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_window_rows': must be 0 (derive) or at least " +
+      std::to_string(op::merge::kMinExplicitWindowRows));
+  }
+  r.optional("sort_merge_output_bytes", yaml::bytes(opt.sort_merge_output_bytes));
+  if (opt.sort_merge_output_bytes != 0 && opt.sort_merge_output_bytes < (1ULL << 20)) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_output_bytes': must be 0 (derive) or at least 1 MiB");
+  }
+  r.optional("sort_merge_one_shot_max_fraction", opt.sort_merge_one_shot_max_fraction);
+  // Written so that NaN is rejected too.
+  if (!(opt.sort_merge_one_shot_max_fraction >= 0.0 &&
+        opt.sort_merge_one_shot_max_fraction <= 1.0)) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_one_shot_max_fraction': must be 0 (derive) or in (0, 1]");
+  }
+  read_count("sort_merge_max_fan_in", opt.sort_merge_max_fan_in);
+  if (opt.sort_merge_max_fan_in < 2) {
+    throw std::runtime_error("'operator_params.sort_merge_max_fan_in': must be at least 2");
+  }
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   if (opt.hash_partition_bytes == 0) {
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");

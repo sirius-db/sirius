@@ -93,6 +93,7 @@ extern "C" int cudaProfilerStop();
 #include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "op/merge/merge_config.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -2694,6 +2695,71 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                    params->max_sort_partition_memory_fraction);
 }
 
+static void SetSortMergeMode(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const value  = StringValue::Get(parameter);
+  auto const parsed = sirius::parse_sort_merge_mode(value);
+  if (!parsed) {
+    throw InvalidInputException(
+      "Invalid sort_merge_mode '%s'. Valid values: auto, windowed, one_shot", value);
+  }
+  auto* params                    = get_operator_params(context, scope);
+  params->sort_merge_mode_setting = *parsed;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_mode to {}", sirius::to_string(*parsed));
+}
+
+static void SetSortMergeWindowRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rows = UBigIntValue::Get(parameter);
+  if (rows != 0 && rows < sirius::op::merge::kMinExplicitWindowRows) {
+    throw InvalidInputException("sort_merge_window_rows must be 0 (derive) or at least %s, got %s",
+                                std::to_string(sirius::op::merge::kMinExplicitWindowRows),
+                                std::to_string(rows));
+  }
+  auto* params                   = get_operator_params(context, scope);
+  params->sort_merge_window_rows = rows;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_window_rows to {}", params->sort_merge_window_rows);
+}
+
+static void SetSortMergeOutputBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes != 0 && bytes < (1ULL << 20)) {
+    throw InvalidInputException(
+      "sort_merge_output_bytes must be 0 (derive) or at least 1 MiB (1048576), got %s",
+      std::to_string(bytes));
+  }
+  auto* params                    = get_operator_params(context, scope);
+  params->sort_merge_output_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_output_bytes to {}", params->sort_merge_output_bytes);
+}
+
+static void SetSortMergeOneShotMaxFraction(ClientContext& context, SetScope scope, Value& parameter)
+{
+  const double fraction = parameter.GetValue<double>();
+  // Written so that NaN is rejected too.
+  if (!(fraction >= 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException(
+      "sort_merge_one_shot_max_fraction must be 0 (derive) or in (0, 1], got %f", fraction);
+  }
+  auto* params                             = get_operator_params(context, scope);
+  params->sort_merge_one_shot_max_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_one_shot_max_fraction to {}",
+                   params->sort_merge_one_shot_max_fraction);
+}
+
+static void SetSortMergeMaxFanIn(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const fan_in = UBigIntValue::Get(parameter);
+  if (fan_in < 2) {
+    throw InvalidInputException("sort_merge_max_fan_in must be at least 2, got %s",
+                                std::to_string(fan_in));
+  }
+  auto* params                  = get_operator_params(context, scope);
+  params->sort_merge_max_fan_in = fan_in;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_max_fan_in to {}", params->sort_merge_max_fan_in);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3493,6 +3559,45 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
+
+  // Add in config options for the MERGE_SORT merge path
+  config.AddExtensionOption(
+    "sort_merge_mode",
+    "Merge path for sorted runs: 'auto' (windowed under memory pressure or when any input is not "
+    "on the GPU), 'windowed' (always the windowed k-way merge), or 'one_shot' (the legacy "
+    "concat-then-merge path, kept for A/B testing and slated for removal once the windowed path "
+    "is proven)",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::to_string(operator_defaults.sort_merge_mode_setting))),
+    SetSortMergeMode);
+  config.AddExtensionOption(
+    "sort_merge_window_rows",
+    "Maximum rows per input window of the windowed merge (0 = derive from available GPU memory; "
+    "otherwise at least 1024)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_window_rows),
+    SetSortMergeWindowRows);
+  config.AddExtensionOption(
+    "sort_merge_output_bytes",
+    "Output chunk target in bytes per merge task (0 = derive from available GPU memory; "
+    "otherwise at least 1 MiB)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_output_bytes),
+    SetSortMergeOutputBytes);
+  config.AddExtensionOption(
+    "sort_merge_one_shot_max_fraction",
+    "Fraction of GPU memory above which sort_merge_mode = 'auto' takes the windowed path (0 = "
+    "derive from the device's GPU memory size; otherwise in (0, 1])",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.sort_merge_one_shot_max_fraction),
+    SetSortMergeOneShotMaxFraction);
+  config.AddExtensionOption(
+    "sort_merge_max_fan_in",
+    "Most sorted runs one merge task reads; a partition with more runs is merged in passes (at "
+    "least 2)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_max_fan_in),
+    SetSortMergeMaxFanIn);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",
