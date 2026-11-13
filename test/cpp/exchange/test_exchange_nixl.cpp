@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -177,23 +178,40 @@ std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
     cfg.lanes   = lanes;
     return cfg;
   };
-  // Each constructor waits for the other's hello.
+  // Each constructor waits for the other's hello. A constructor can return with notifications
+  // to its peer still queued in NIXL, which only a poll sends, and nothing polls a rank before
+  // start(): so the rank that is up first polls until the other is up or has failed.
+  std::atomic<bool> r0_done{false};
+  std::atomic<bool> r1_done{false};
+  auto const poll_until = [](nixl_rank& r, std::atomic<bool> const& done) {
+    std::vector<sirius::exchange::fabric_notification> none;
+    while (!done.load()) {
+      r.fab->poll(none);
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  };
   std::unique_ptr<nixl_rank> r0;
   std::exception_ptr r0_error;
   std::thread other([&] {
     try {
       r0 = std::make_unique<nixl_rank>(config(0), 64 * KiB);
+      r0_done.store(true);
+      poll_until(*r0, r1_done);
     } catch (...) {
       r0_error = std::current_exception();
+      r0_done.store(true);
     }
   });
   std::unique_ptr<nixl_rank> r1;
   try {
     r1 = std::make_unique<nixl_rank>(config(1), 64 * KiB);
+    poll_until(*r1, r0_done);
   } catch (...) {
+    r1_done.store(true);
     other.join();
     throw;
   }
+  r1_done.store(true);
   other.join();
   if (r0_error) { std::rethrow_exception(r0_error); }
   return {std::move(r0), std::move(r1)};
