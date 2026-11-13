@@ -3,9 +3,10 @@
 
 The run is the output of a DuckDB shell in `.mode csv` with `.timer on`, where each query follows
 a marker statement `SELECT 'Q<n> run <k>' AS marker;` (see
-docs/super-sirius/distributed-experiments.md). Rows compare in any order; numbers match within
-1e-6 relative or 0.01 absolute. A text diff does not work: float digits and the order of equal
-rows differ between engines.
+docs/super-sirius/distributed-experiments-no-slurm.md). Rows compare in any order; numbers match
+within 1e-6 relative or 0.01 absolute. A query the reference has and the run does not counts as
+a failure. A text diff does not work: float digits and the order of equal rows differ between
+engines.
 
   compare_answers.py client.txt --ref-client ref.txt
       the reference has the same markers; run 1 of each query is the reference
@@ -212,6 +213,22 @@ def main():
         print(
             f"| Q{query} | {k} | {run['time']} | {len(run['rows'])} | {len(ref_rows)} | {verdict} |"
         )
+    ran = {query for query, _ in runs}
+    if reference is not None:
+        expected = {query for query, _ in reference}
+    else:
+        name = re.compile(
+            re.sub(r"\\\{n[^}]*\\\}", r"(\\d+)", re.escape(args.ref_pattern))
+        )
+        expected = {
+            int(match.group(1))
+            for match in map(name.fullmatch, os.listdir(args.ref_dir))
+            if match
+        }
+    # A client that stopped early leaves no marker for the queries it never reached.
+    for query in sorted(expected - ran):
+        print(f"| Q{query} | - | - | - | - | NOT RUN |")
+        bad += 1
     if notes:
         print()
         for note in notes:
