@@ -57,6 +57,7 @@ constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_CHUNK_BYTES     = DEFAULT_BATCH_SIZE;
 
 /// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
 /// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
@@ -75,8 +76,10 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
-/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
-constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+/// Cap on a sort partition, as a fraction of available GPU memory, when
+/// max_sort_partition_bytes is 0. One partition is merged by one task, which holds about
+/// four times its input; partitions may exceed the target by the merge slack.
+constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.08;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
@@ -185,6 +188,9 @@ struct operator_params {
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
   uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
+
+  /// Decoded-byte target for owning ORDER BY runs and merge chunks; one row may exceed it.
+  uint64_t sort_chunk_bytes = config::DEFAULT_SORT_CHUNK_BYTES;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;

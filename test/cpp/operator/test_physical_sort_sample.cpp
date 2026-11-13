@@ -14,17 +14,23 @@
  * limitations under the License.
  */
 
+#include "data/convertible_data_batch.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
+
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <op/order/bounded_sort.hpp>
+#include <op/sirius_physical_sort_partition.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
@@ -300,11 +306,24 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_num_partitions() == 2);
-  REQUIRE(sample_op.get_partition_boundaries().num_rows() == 1);
+  CHECK(sample_op.get_partition_bytes() == 2500);
+  REQUIRE(sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries)
+            .num_rows() == 1);
 
-  const auto boundary_key =
-    read_int32_column(sample_op.get_partition_boundaries().view().column(0), 0);
+  const auto boundary_key = read_int32_column(
+    sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries).column(0),
+    0);
   REQUIRE(boundary_key == 50);
+
+  // Replaying a boundary-producing task after a downstream compute failure keeps
+  // the original ranges, even though the operator is already marked DONE.
+  auto retried       = sample_op.execute(pipelineable_operator_data({batch_high, batch_low}),
+                                   cudf::get_default_stream());
+  auto& retry_output = dynamic_cast<sort_sample_output&>(*retried);
+  REQUIRE(retry_output.boundaries);
+  CHECK(sample_op.get_num_partitions() == 2);
+  CHECK(read_int32_column(sirius::get_cudf_table_view(*retry_output.boundaries).column(0), 0) ==
+        50);
 }
 
 TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual bytes",
@@ -338,9 +357,60 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   REQUIRE(input != nullptr);
   REQUIRE(repo->all_empty());
 
-  (void)sample_op.execute(*input, cudf::get_default_stream());
+  auto output = sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == 2);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
+  CHECK(sample_op.get_partition_bytes() == batch_bytes - 1);
+  CHECK(sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries)
+          .num_rows() == 1);
+
+  // Subsequent tasks include boundaries in admission and device preparation, but
+  // never expose boundary rows as payload rows to partitioning.
+  add_int_batches(*repo, *space, 1, 10);
+  auto continuation = sample_op.get_next_task_input_data();
+  REQUIRE(continuation);
+  auto& prepared = dynamic_cast<pipelineable_operator_data&>(*continuation);
+  REQUIRE(prepared.get_data_batches().size() == 2);
+  continuation->prepare_for_processing(space, cudf::get_default_stream());
+  auto forwarded = sample_op.execute(*continuation, cudf::get_default_stream());
+  auto& sampled  = dynamic_cast<sort_sample_output&>(*forwarded);
+  REQUIRE(sampled.boundaries);
+  CHECK(sampled.get_data_batches().size() == 1);
+  CHECK(sirius::get_cudf_table_view(*sampled.boundaries).num_rows() == 1);
+}
+
+TEST_CASE("sirius_physical_sort_sample sizes automatic partitions from runs and chunk size",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+  // Two complete runs and a tiny chunk: the piece floor (two runs of 64 MiB) sets
+  // the target, so this small input stays in one range. The whole of the test memory
+  // space is the cap, which keeps it above the floor.
+  sirius_physical_sort_sample sample_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    1000,
+    /*sort_sample_bytes=*/1'000'000,
+    /*max_partition_bytes=*/0,
+    /*max_partition_memory_fraction=*/1.0,
+    nullptr,
+    /*chunk_bytes=*/1);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 2, 10);
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  REQUIRE(space->get_available_memory(cudf::get_default_stream()) >
+          4 * sirius::op::sort_min_piece_bytes);
+  sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == 1);
+  CHECK(sample_op.get_partition_bytes() == 2 * sirius::op::sort_min_piece_bytes);
 }
 
 TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
@@ -391,7 +461,81 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   REQUIRE(input != nullptr);
   REQUIRE(repo->all_empty() == expect_repo_empty);
 
-  (void)sample_op.execute(*input, cudf::get_default_stream());
+  auto output = sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == rows_per_batch);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
+  CHECK(sirius::get_cudf_table_view(*dynamic_cast<sort_sample_output&>(*output).boundaries)
+          .num_rows() == rows_per_batch - 1);
+}
+
+TEST_CASE("registered sampled boundaries spill and route duplicate ranges on another GPU",
+          "[multi_gpu][sort_boundaries]")
+{
+  int devices = 0;
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  if (devices < 2) { SKIP("requires two GPUs"); }
+  std::optional<rmm::cuda_stream> remote_stream;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* gpu    = manager->get_memory_space(Tier::GPU, 0);
+  auto* remote = manager->get_memory_space(Tier::GPU, 1);
+  auto* host   = manager->get_memory_space(Tier::HOST, 0);
+  REQUIRE(gpu);
+  REQUIRE(remote);
+  REQUIRE(host);
+  rmm::cuda_stream stream;
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{1}};
+    remote_stream.emplace();
+  }
+  cucascade::shared_data_repository_manager repositories;
+  auto sample        = make_sort_sample(16, 16);
+  sample.operator_id = 1;
+  sample.register_boundaries(repositories);
+  cucascade::shared_data_repository input;
+  attach_port(sample, input);
+  input.add_data_batch(make_numeric_batch<int32_t>(*gpu, {0, 0, 4, 4}, cudf::type_id::INT32));
+  auto first = sample.get_next_task_input_data();
+  REQUIRE(first);
+  auto computed = sample.execute(*first, stream);
+  stream.synchronize();
+  REQUIRE(sample.get_num_partitions() == 4);
+  computed.reset();
+  first.reset();
+  auto* boundaries = repositories.get_repository(1, "sort_boundaries").get();
+  sirius::convertible_data_batch_provider candidates(boundaries);
+  auto candidate = candidates.get_next_convertible(gpu, true);
+  REQUIRE(candidate);
+  REQUIRE(candidate->convert({host}, stream, *manager, true).has_value());
+  auto boundary = boundaries->get_data_batch_by_id(boundaries->get_batch_ids().front());
+  {
+    auto ro = boundary->to_read_only();
+    CHECK(ro.get_memory_space() == host);
+  }
+  input.add_data_batch(make_numeric_batch<int32_t>(*gpu, {0, 1, 4, 8}, cudf::type_id::INT32));
+  auto next = sample.get_next_task_input_data();
+  REQUIRE(next);
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{1}};
+    next->prepare_for_processing(remote, *remote_stream);
+    auto forwarded = sample.execute(*next, *remote_stream);
+    auto& sampled  = dynamic_cast<sort_sample_output&>(*forwarded);
+    REQUIRE(sampled.boundaries);
+    CHECK(sampled.boundaries->get_memory_space() == remote);
+    sirius_physical_sort_partition partition(
+      sample.types, copy_orders(sample.orders), {0}, 0, sample.comparison);
+    partition.set_sample_op(&sample);
+    auto output = partition.execute(*forwarded, *remote_stream);
+    remote_stream->synchronize();
+    auto& routed = dynamic_cast<sort_partition_output&>(*output);
+    CHECK(routed.partitions == std::vector<std::size_t>{1, 3});
+    REQUIRE(routed.get_data_batches().size() == 2);
+    CHECK(copy_column_to_host<int32_t>(
+            sirius::get_cudf_table_view(*routed.get_data_batches()[0]).column(0)) ==
+          std::vector<int32_t>{0, 1});
+    CHECK(copy_column_to_host<int32_t>(
+            sirius::get_cudf_table_view(*routed.get_data_batches()[1]).column(0)) ==
+          std::vector<int32_t>{4, 8});
+  }
+  next.reset();
+  sample.clear_partition_boundaries();
+  CHECK(boundaries->all_empty());
 }

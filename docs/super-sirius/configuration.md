@@ -108,7 +108,7 @@ sirius:
     task_creator: { num_threads: 1 }
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
-    max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
+    max_sort_partition_bytes:   0           # 0 = auto (see below)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
@@ -605,10 +605,10 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
-The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
-`concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
+The six batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
+`concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`, `sort_chunk_bytes`) share one built-in default. Without an
 explicit GPU capacity in YAML, it is computed at startup as
 `clamp(smallest visible physical GPU memory / 40, 512 MiB, 5 GiB)` (800 MiB when no
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
@@ -631,15 +631,16 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
-| `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
+| `max_sort_partition_bytes` | 0 (auto) | Target bytes per sort partition, each merged by one task. Auto = max(`sort_chunk_bytes`, min(runs × 64 MiB, `max_sort_partition_memory_fraction` of available GPU memory)). |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
+| `sort_chunk_bytes` | Shared physical/effective GPU batch default described above | Decoded-byte target for owning ORDER BY runs and merge chunks; positive, soft target that one row may exceed |
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
-| `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_memory_fraction` | 0.08 | Cap on a sort partition, as a fraction of available GPU memory, when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
@@ -900,8 +901,8 @@ SET enable_compressed_materialization = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
-| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_bytes` | 0 (auto) | Target sort partition bytes |
+| `max_sort_partition_memory_fraction` | 0.08 | Auto sort-partition cap when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |
@@ -916,9 +917,12 @@ Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an 
 policy rather than a user configuration choice; see
 [Merge fusion](physical-plan-generation.md#merge-fusion).
 
-The CONCAT output-batch target is derived from effective GPU capacity. Advanced
-benchmark and test envelopes may still override `concat_batch_bytes` in YAML
-under `sirius.operator_params`, but it is not a normal session setting.
+The CONCAT output-batch and ORDER BY chunk targets use the shared GPU batch default.
+Advanced benchmark and test envelopes may override `concat_batch_bytes` and
+`sort_chunk_bytes` in YAML under `sirius.operator_params`. These are internal
+settings rather than normal session settings; the test-options gate also enables
+their session overrides. Explicit chunk targets have no separate 64 MiB ceiling.
+Task admission accounts for inputs and workspace independently of these soft targets.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 

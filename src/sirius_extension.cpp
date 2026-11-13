@@ -2668,6 +2668,13 @@ static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
+static void SetSortChunkBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("sort_chunk_bytes must be greater than zero"); }
+  get_operator_params(context, scope)->sort_chunk_bytes = bytes;
+}
+
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                     = get_operator_params(context, scope);
@@ -3389,6 +3396,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetDefaultScanTaskBatchSize);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sort_chunk_bytes",
+                    "override the internally derived ORDER BY chunk target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.sort_chunk_bytes),
+                    SetSortChunkBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "fuse_merge_pipelines",
                     "toggle merge pipeline fusion",
                     LogicalType::BOOLEAN,
@@ -3478,17 +3492,18 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
-                            "Maximum bytes per sort partition (0 = auto based on "
+                            "Target bytes per sort partition, each merged by one task (0 = auto: "
+                            "at least sort_chunk_bytes, capped by "
                             "max_sort_partition_memory_fraction of GPU memory)",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
-  config.AddExtensionOption(
-    "max_sort_partition_memory_fraction",
-    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
-    SetMaxSortPartitionMemoryFraction);
+  config.AddExtensionOption("max_sort_partition_memory_fraction",
+                            "Cap on a sort partition as a fraction of available GPU memory when "
+                            "max_sort_partition_bytes is 0",
+                            LogicalType::DOUBLE,
+                            Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
+                            SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",

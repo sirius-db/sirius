@@ -2043,7 +2043,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // Keeping a placeholder must not admit nested materialization to the flat mapper.
   {
     sirius::test::scoped_recording_log_sink logs;
-    expect_iceberg_rows("SELECT nested, count FROM " + scan + " ORDER BY count",
+    // Keep this a scan-runtime rejection: nested full sorting declines earlier in planning.
+    expect_iceberg_rows("SELECT nested, count FROM " + scan,
                         gpu_route::runtime_fallback,
                         {{"NULL", "1"}, {"NULL", "3"}, {"NULL", "5"}});
     bool refused = false;

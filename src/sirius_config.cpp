@@ -82,6 +82,7 @@ constexpr batch_setting batch_settings[] = {
   {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
   {"cross_join_task_bytes", &operator_params::cross_join_task_bytes, 1},
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
+  {"sort_chunk_bytes", &operator_params::sort_chunk_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
   {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
 
@@ -440,6 +441,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("cross_join_task_bytes", yaml::bytes(opt.cross_join_task_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
+  r.optional("sort_chunk_bytes", yaml::bytes(opt.sort_chunk_bytes));
+  if (opt.sort_chunk_bytes == 0) {
+    throw std::runtime_error("'operator_params.sort_chunk_bytes': must be greater than zero");
+  }
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_build_probe_resident_bytes", yaml::bytes(opt.max_build_probe_resident_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));

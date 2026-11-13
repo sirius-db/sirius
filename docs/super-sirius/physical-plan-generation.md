@@ -331,18 +331,27 @@ graph LR
 
 For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and channel publication before downstream task creation follows that join into its **immediate** probe producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each doing a `concat_all` push of the full build. `dynamic_filter_publication_session` elects and pins one delivery, invokes the hash join's repository deposit, then checks source usability/readiness and publishes inline before the push returns. An unusable delivery can release the claim only while input remains open. This edge ordering does not gate a base scan reached transitively through an intervening join; such a scan samples the channel opportunistically under normal scheduler order. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
-### ORDER_BY → 3-Phase Sort
+### ORDER_BY → Sort pipelines
 
 ```mermaid
 graph LR
-    P1["Pipeline 1<br/>[scan, ..., ORDER_BY]"] -->|"PIPELINE"| P2["Pipeline 2<br/>[SORT_SAMPLE, SORT_PARTITION]"]
-    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_SORT]"]
-    P3 -->|"FULL"| DS["downstream"]
+    P1["scan, ..., ORDER_BY"] -->|"PIPELINE"| P2["SORT_SAMPLE, SORT_PARTITION"]
+    P2 -->|"FULL"| N["SORT_NORMALIZE"]
+    N -->|"FULL"| C["SORT_CUTS"]
+    C -->|"FULL"| E["SORT_EXTRACT"]
+    E -->|"FULL"| M["MERGE_SORT"]
+    M -->|"FULL"| DS["downstream"]
 ```
 
-1. **Pipeline 1**: Current pipeline keeps ORDER_BY as sink (local sort per batch)
-2. **Pipeline 2**: SORT_SAMPLE and SORT_PARTITION run back-to-back in the same `gpu_pipeline_task`. `PIPELINE` barrier from Pipeline 1 — batches arrive as produced; SORT_SAMPLE overrides `get_next_task_hint()` to wait for N samples before computing boundaries; SORT_PARTITION reads boundaries directly from SORT_SAMPLE via `_sample_op`
-3. **Pipeline 3**: MERGE_SORT. `FULL` barrier — must wait for all partitions. Downstream pipelines that previously used ORDER_BY as source are updated to use MERGE_SORT
+Each box is a separate pipeline. Local sorting and range partitioning retain their
+existing sampling behavior. Normalization/coalescing and cut planning each consume one
+complete range partition per task. Extraction consumes one matched run/cut-table pair;
+merge consumes one tile. Intermediate owners live in ordinary registered repositories.
+Global tile positions are fixed after cut planning, so final merges may complete in any
+order. Final projection removes hidden sort keys only after merging.
+
+See [Tiled sort pipelines](operators.md#tiled-sort-pipelines--sort_normalize-sort_cuts-sort_extract-merge_sort)
+for repository schemas, ordering, ownership, and capacity limits.
 
 ### HASH_GROUP_BY
 

@@ -16,71 +16,187 @@
 
 #pragma once
 
-#include "duckdb/planner/bound_query_node.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sort_comparison_config.hpp"
+
+#include <cucascade/data/data_repository_manager.hpp>
 
 #include <mutex>
+#include <set>
 
-namespace sirius {
-namespace op {
+namespace sirius::op {
 
+class sirius_physical_sort_sample;
+
+// Input: individually sorted contributions in each range partition. Each range is a
+// refinement node with an interval of output positions. A node whose decoded bytes fit
+// the merge limit (from metadata only) is merged by one task; its output is sliced into
+// chunk_bytes batches published at consecutive positions from the start of its interval.
+// The merge limit is the sample operator's partition target plus slack, so ranges are
+// normally merged directly. An oversized node (skew, a poor estimate) is refined in
+// place into partition-target-sized children, through registered repositories owned by
+// this operator:
+//
+//   ready -> sampling (bounded contribution groups) -> plan (one splitter task)
+//         -> cutting (bounded contribution groups) -> children ready
+//
+// If the sample would exceed one tile's rows (many small contributions), an oversized
+// node is first coalesced instead: greedy groups of contributions are merged into runs
+// of a replacement node with the same interval, which is then decided afresh. A pass is
+// taken only when it reduces the contribution count, so coalescing terminates.
+//
+// Children subdivide the parent's interval, so output order is independent of task
+// completion order and positions may have gaps. Every task is one bounded step; the
+// state machine advances only when a task's output is published.
 class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
-  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  static constexpr auto TYPE = SiriusPhysicalOperatorType::MERGE_SORT;
+  using batches              = std::vector<std::shared_ptr<cucascade::data_batch>>;
+
+  enum class step : uint8_t { merge, sample, plan, cut, coalesce };
+
+  // `ordinals` identify each payload batch within its node (merge/sample/cut/coalesce).
+  // For a cut, the node's shared splitter table is the final batch. `parameter` is the
+  // interval width (merge), sample stride (sample), splitter step (plan), first child
+  // node (cut) or replacement node (coalesce).
+  struct work : pipelineable_operator_data {
+    step kind;
+    std::size_t node;
+    std::vector<uint64_t> ordinals;
+    uint64_t parameter;
+    work(batches values,
+         step kind,
+         std::size_t node,
+         std::vector<uint64_t> ordinals,
+         uint64_t parameter,
+         std::optional<std::size_t> position = std::nullopt);
+    [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+      batches values) const override;
+  };
+
+  struct piece {
+    std::size_t child;
+    uint64_t ordinal, rows, bytes;
+  };
+
+  // Batches align with `ordinals` (sample) or `pieces` (cut). A plan result holds the
+  // splitter table, and `ordinals` holds its row count; a merge result holds the
+  // node's ordered output chunks, positioned from the start of its interval.
+  struct result : pipelineable_operator_data {
+    step kind;
+    std::size_t node;
+    std::vector<uint64_t> ordinals;
+    std::vector<piece> pieces;
+    result(batches values,
+           step kind,
+           std::size_t node,
+           std::vector<uint64_t> ordinals,
+           std::vector<piece> pieces,
+           std::optional<std::size_t> position = std::nullopt);
+    [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+      batches values) const override;
+  };
+
+  [[nodiscard]] std::unique_ptr<operator_data> get_next_task_input_data() override;
+  std::optional<task_creation_hint> get_next_task_hint() override;
+  bool all_ports_empty() override;
+  void on_task_output_published(operator_data const& output) override;
+  void register_refinement(cucascade::shared_data_repository_manager& manager);
+  // Supplies the partition target that sets the merge limit; without it, chunk_bytes.
+  void set_sample_op(sirius_physical_sort_sample const* sample) { _sample_op = sample; }
+  sirius_physical_merge_sort(sirius_physical_order* order_by);
+  sirius_physical_merge_sort(duckdb::vector<sirius::logical_type> types,
+                             duckdb::vector<duckdb::BoundOrderByNode> orders,
+                             duckdb::vector<std::size_t> projections,
+                             std::size_t estimated_cardinality,
+                             std::shared_ptr<const sort_comparison_config> comparison = nullptr);
+  bool is_source() const override { return true; }
+  bool is_sink() const override { return true; }
+  MemoryBarrierType input_barrier_for(sirius_physical_operator const&) const override
+  {
+    return MemoryBarrierType::FULL;
+  }
+  sirius::OrderPreservationType output_order_preservation() const override
   {
     return sirius::OrderPreservationType::FIXED_ORDER;
   }
-
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_SORT;
-
- public:
-  sirius_physical_merge_sort(sirius_physical_order* order_by);
-
-  sirius_physical_merge_sort(duckdb::vector<sirius::logical_type> types,
-                             duckdb::vector<duckdb::BoundOrderByNode> orders,
-                             duckdb::vector<std::size_t> projections_p,
-                             std::size_t estimated_cardinality,
-                             bool is_index_sort_p = false);
-
-  //! Input data
-  duckdb::vector<duckdb::BoundOrderByNode> orders;
-  duckdb::vector<std::size_t> projections;
-  bool is_index_sort;
-
-  sirius_physical_operator* child_op;
-  sirius_physical_operator* get_child_op() const { return child_op; }
-
- public:
-  // Source interface
-  bool is_source() const override { return true; }
-
- public:
-  // Sink interface
-  bool is_sink() const override { return true; }
-
- public:
-  std::unique_ptr<operator_data> get_next_task_input_data() override;
-
-  std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         ::cuda::stream_ref stream) override;
-
-  //! Set the final output projection (applied after merge, to remove sort-key-only columns)
-  void set_final_projections(duckdb::vector<std::size_t> proj,
+  std::size_t no_history_peak_memory_estimate(input_stats const& stats) const override;
+  [[nodiscard]] std::unique_ptr<operator_data> execute(operator_data const&,
+                                                       ::cuda::stream_ref) override;
+  void sink(operator_data const& output, ::cuda::stream_ref stream) override;
+  void set_final_projections(duckdb::vector<std::size_t> projection,
                              duckdb::vector<sirius::logical_type> output_types)
   {
-    _final_projections = std::move(proj);
+    _final_projections = std::move(projection);
     types              = std::move(output_types);
   }
 
- private:
-  //! Final projection to apply after merge (empty = no extra projection)
-  duckdb::vector<std::size_t> _final_projections;
-  //! Guards concurrent calls to get_next_task_input_data().
-  std::mutex _drain_mutex;
-  //! Tracks which partition to drain next (one task per partition).
-  size_t _current_partition_index{0};
-};
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  duckdb::vector<std::size_t> projections;
+  std::shared_ptr<const sort_comparison_config> comparison;
+  // Decoded-byte target for a published output chunk, and for the input of one
+  // sample, cut or coalesce task.
+  std::size_t chunk_bytes{config::DEFAULT_SORT_CHUNK_BYTES};
 
-}  // namespace op
-}  // namespace sirius
+ private:
+  struct contribution {
+    uint64_t ordinal, rows, bytes;
+  };
+  // collecting: children whose producers are still cutting; not yet actionable.
+  enum class phase : uint8_t {
+    collecting,
+    ready,
+    merging,
+    sampling,
+    plan_ready,
+    planning,
+    cutting,
+    coalescing,
+    done
+  };
+  struct node {
+    std::size_t lo, hi;  // output positions [lo, hi)
+    std::vector<contribution> parts;
+    uint64_t rows{0}, bytes{0};
+    phase state{phase::collecting};
+    std::size_t cursor{0}, outstanding{0};
+    uint64_t stride{0}, sample_step{0};
+    // Cutting: the children. Coalescing: the replacement node (count one).
+    std::size_t first_child{0}, child_count{0};
+  };
+
+  // Returns (ranges, nonempty ranges).
+  std::pair<std::size_t, std::size_t> ingest();
+  [[nodiscard]] bool fits(node const& n) const;
+  [[nodiscard]] std::optional<std::size_t> actionable() const;
+  [[nodiscard]] std::unique_ptr<work> claim(std::size_t id);
+  [[nodiscard]] std::unique_ptr<work> claim_group(std::size_t id, step kind, bool pop);
+  // Nullptr when only single contributions remained; they move without a task.
+  [[nodiscard]] std::unique_ptr<work> claim_coalesce(std::size_t id);
+  // End of the greedy group of n.parts starting at begin: at least one, up to chunk_bytes.
+  [[nodiscard]] std::size_t group_end(node const& n, std::size_t begin) const;
+  void finish_coalesce(std::size_t id);
+  void retire(std::size_t id);
+
+  std::unique_ptr<operator_data> execute_merge(work const&, ::cuda::stream_ref);
+  std::unique_ptr<operator_data> execute_sample(work const&, ::cuda::stream_ref);
+  std::unique_ptr<operator_data> execute_plan(work const&, ::cuda::stream_ref);
+  std::unique_ptr<operator_data> execute_cut(work const&, ::cuda::stream_ref);
+  std::unique_ptr<operator_data> execute_coalesce(work const&, ::cuda::stream_ref);
+
+  duckdb::vector<std::size_t> _final_projections;
+  sirius_physical_sort_sample const* _sample_op = nullptr;
+  // Largest node merged by one task, and the target size of refined children; set at
+  // ingest.
+  std::size_t _merge_bytes{0}, _tile_bytes{0};
+  // Payload contributions by node, positioned by ordinal; samples likewise; one splitter
+  // table per node at position zero. All are registered, so queued state is spillable.
+  cucascade::shared_data_repository* _parts     = nullptr;
+  cucascade::shared_data_repository* _samples   = nullptr;
+  cucascade::shared_data_repository* _splitters = nullptr;
+  std::vector<node> _nodes;
+  // Actionable or in-flight nodes ordered by output position: leftmost work first.
+  std::set<std::pair<std::size_t, std::size_t>> _active;
+  bool _ingested{false};
+};
+}  // namespace sirius::op

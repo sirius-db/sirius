@@ -452,10 +452,18 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 ### `sirius_physical_order` — `ORDER_BY`
 **File:** `src/op/sirius_physical_order.hpp`
 
-Local sort of each data batch.
+Produces independently owned sorted chunks from each input batch. The planner expands
+ORDER BY into `ORDER_BY -> SORT_SAMPLE -> SORT_PARTITION -> MERGE_SORT`.
 
-- **GPU execution:** `gpu_order_impl::local_order_by()` using `cudf::order_by()`
+- **GPU execution:** metadata-based row slices, `cudf::sorted_order()` on each slice's keys,
+  then `cudf::gather()` of its payload. `sort_chunk_bytes` is a decoded-byte sizing target;
+  average row widths do not impose a hard byte cap on skewed strings.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
+
+The expanded stages share `sort_comparison_config` for key columns, directions and null
+precedence. Hidden sort keys remain available through merging; final projection removes
+them. Local sorting does not establish global output order. GPU ORDER BY currently
+declines nested STRUCT/LIST/ARRAY payloads during planning.
 
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/op/sirius_physical_top_n.hpp`
@@ -542,8 +550,7 @@ Routes rows using explicit key columns and normalization types supplied by the p
 Complex join keys are materialized into columns before this description is constructed.
 
 - **Routing:** hash, single-destination, replication, and resident-device selection use a resolved
-  `partition_layout`. Sort range routing retains its separate implementation pending the ordered
-  repository work.
+  `partition_layout`. Sort range routing uses the dedicated SORT_PARTITION operator.
 - **Order-preserving hash partition:** a `HASH` partition whose single fixed-width, non-floating-point key is ascending uses a stable partition (`src/op/partition/gpu_partition_impl.cpp`), so rows keep their input order within each partition and sorted partials stay sorted for the merge; any other input uses `cudf::hash_partition`. Both assign rows by MurmurHash3 row hash modulo the partition count, so a key lands in one partition whichever path a batch takes. See [Order-Preserving Partition and Sorted Merge](optimizations.md#order-preserving-partition-and-sorted-merge).
 - **Fixed layout:** `set_fixed_layout()` supplies the destination count/placement without a sizing
   consumer. Conflicting changes to an installed layout are rejected.
@@ -613,6 +620,12 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 - `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
+Range count is derived from estimated total decoded bytes and the configured partition-byte
+target, or a fraction of available GPU memory. It is an estimate, not a maximum range size:
+skew and equal keys can concentrate rows. Boundary tables live in a registered repository
+and are prepared on each task's device; they are not untracked device pointers retained by
+the planner.
+
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
@@ -621,18 +634,95 @@ Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
 
-### `sirius_physical_merge_sort` — `MERGE_SORT`
-**File:** `src/op/sirius_physical_merge_sort.hpp`
+### Tiled sort pipelines — `SORT_NORMALIZE`, `SORT_CUTS`, `SORT_EXTRACT`, `MERGE_SORT`
 
-Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
+**Implementation:** `src/op/sirius_physical_tiled_merge_sort.cpp`; declarations in
+`src/op/sirius_physical_merge_sort.hpp`. Arithmetic and GPU helpers live in
+`src/op/order/sampled_merge.hpp` and `src/cuda/sampled_merge.cu`.
 
-- Custom `get_next_task_input_data()`: drains all batches from the next nonempty range partition per call after the SORT_PARTITION producer finishes. Empty ranges are skipped.
-- Tracks `_current_partition_index` under a mutex and uses the range index as the merged output batch position.
+After `SORT_PARTITION`, four separate pipelines replace the operator-local resumable
+state machine. Each edge has a FULL barrier and an ordinary registered repository.
+Each stage runs its algorithm to completion in `execute()`.
+
+| Stage | Task input | Repository output |
+|---|---|---|
+| `SORT_NORMALIZE` | All sorted contributions in one range partition | Normalized/coalesced runs at frozen run positions within that partition |
+| `SORT_CUTS` | All frozen runs in one range partition | Run/cut-table pairs at positions `2*i` and `2*i+1` in that partition |
+| `SORT_EXTRACT` | One matched run/cut-table pair | Owning pieces, partitioned by global tile number and positioned by run ordinal |
+| `MERGE_SORT` | All pieces of one tile | One sorted batch at global logical position equal to the tile number |
+
+Normalization estimates rows per chunk from each batch's total bytes and rows, then
+copies equal-row slices once (with a possibly shorter final slice). Variable-width skew
+can leave slices above `sort_chunk_bytes`; they are not recursively split.
+A single fixed coalescing pass merges
+small adjacent contributions toward the byte target, capped by cuDF's native row limit.
+Singletons forward their ownership. Run ordinals are frozen after coalescing, independent
+of task completion order.
+
+Cut planning chooses `R = min(native_rows, max(1, chunk_bytes / ceil_average_row_bytes))`.
+For `k` runs, it uses the existing sampled-merge proof:
+
+```text
+stride = floor(R / k / 4) + 1
+uncertainty = k * (stride - 1)
+sample_step = floor((R - uncertainty) / stride)
+max_tile_rows = stride * sample_step + uncertainty <= R
+```
+
+Samples carry SQL keys and `(run ordinal, row ordinal)`. These coordinates break ties
+under SQL comparator equivalence, including null and floating-point semantics. Each run
+gets an INT32 cut table containing internal boundaries only. A zero-row cut table means
+one tile and must not be discarded. Runs are forwarded alongside cuts, so they remain
+available to extraction without an extra payload copy. All samples and splitters are
+local to the cut-planning task; there are no splitter-page continuation tasks.
+
+After the FULL cut-planning barrier, extraction computes a prefix sum of tile counts in
+range-partition order using cut-table row metadata. It claims each pair once, restores
+the run and its cuts, reads the cuts, and validates monotonicity between endpoints zero
+and the run's row count. Adjacent half-open slices cover the input exactly once. Pieces
+own their allocations, so a subsequent merge restores only its tile's backing.
+
+Tile merge preserves all sort keys until final projection. Output positions are fixed
+before merge execution: tasks can complete backwards without affecting result order.
+Empty tiles may leave gaps. The output repository uses ORDERED mode, and consumers must
+use logical positions rather than batch IDs or arrival order. Existing LIMIT and result
+collection paths already preserve these positions.
+
+Normalization, cut planning, and tile merge keep a partition cursor and pop one
+complete partition into each task. Positioned pops arrive in arrival order, so cuts
+and merge explicitly restore logical position order. Claimed inputs belong to the
+task, including through retries; queued tasks are discoverable by the downgrade
+executor. These stages keep no snapshot of future input IDs and retire no repository
+entries at completion. Outstanding task counts still prevent premature completion.
+
+Extraction also keeps a partition cursor, validating each partition's pair layout
+and cut counts before popping its runs and cut tables by matching logical positions.
+It accumulates the global tile base as it advances between partitions. Extraction
+inputs carry a run ordinal and tile base; outputs carry the run ordinal and explicit
+tile indices for the nonempty pieces. Runtime batch replacement preserves these
+coordinates. Completion only decrements the stage's outstanding task count. No stage retains input ID snapshots
+or retires repository entries at publication. Preparation and compute failures use ordinary
+reservation-growth retries; sink failures are fatal and are not replayed.
+
+
+**Capacity:** normalization/coalescing and cut planning each prepare a whole range
+partition in one task. Extraction prepares one run and its cut table; merging prepares
+one tile. This is a deliberate coarser memory envelope than the previous suspended
+implementation. Row targets do not bound variable-width bytes, sample workspace, or
+restoration costs. A partition that cannot fit the task's attainable reservation fails
+through the runtime's capacity path; there is no intra-stage spilling or subdivision on
+OOM. The cold estimate remains an estimate, not an allocation guarantee.
+
+The stage regression tests cover range and tile ordering, duplicate keys, empty input,
+normalization/coalescing, hidden-key projection, metadata replacement, compute retries,
+spill/restore handoffs, concurrent claims, publication failure, and cross-GPU restoration.
+Historical tiled-sort qualification reports describe the superseded implementation and
+are not evidence of performance or memory behavior for this pipeline implementation.
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
 
-Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
+Merges grouped aggregate results from multiple partitions. Drains one partition per task.
 
 - **FIRST:** `merge_grouped_aggregate()` picks one partial row per group with `MIN` over row positions and gathers the carried columns from it, or runs `cudf::distinct` when there is no cuDF request. `partials_are_output()` decides whether the merged partial layout is already the declared output; a list whose `FIRST`s all follow its other aggregates passes through, and any other mix is reordered into the declared order
 
@@ -712,7 +802,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | TOP_N | Sort | Order + limit |
 | SORT_SAMPLE | Sort | Sample + boundary computation |
 | SORT_PARTITION | Sort | Range partition by boundaries |
-| MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
+| MERGE_SORT | Sort | Sampled cuts, owning tile extraction and n-ary `cudf::merge()` |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |
 | HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
