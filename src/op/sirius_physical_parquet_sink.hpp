@@ -23,10 +23,6 @@ class sirius_physical_parquet_sink : public sirius_physical_operator {
                        pipeline::sirius_meta_pipeline& meta) override;
   std::unique_ptr<operator_data> execute(operator_data const& data,
                                          ::cuda::stream_ref stream) override;
-  std::unique_ptr<operator_data> execute_with_context(
-    operator_data const& data,
-    ::cuda::stream_ref stream,
-    operator_execution_context const& context) override;
   void sink(operator_data const&, ::cuda::stream_ref) override {}
   std::size_t no_history_peak_memory_estimate(input_stats const& stats) const override;
   output::parquet_export_result finish(

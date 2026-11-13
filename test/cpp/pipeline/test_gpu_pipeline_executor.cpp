@@ -552,3 +552,84 @@ TEST_CASE("bounded pool survives a throwing error sink and releases its slot",
   pool.wait_all();
   CHECK(ran);
 }
+
+TEST_CASE("Pipeline execution stamps delivery metadata on each actual operator input",
+          "[gpu_pipeline_executor][delivery_metadata]")
+{
+  namespace op = sirius::op;
+  namespace pl = sirius::pipeline;
+  class recording_operator final : public op::test_physical_operator {
+   public:
+    recording_operator() : test_physical_operator(op::SiriusPhysicalOperatorType::PROJECTION, {}, 0)
+    {
+    }
+    std::vector<op::delivery_metadata> seen;
+    std::unique_ptr<op::operator_data> execute(op::operator_data const& input,
+                                               ::cuda::stream_ref) override
+    {
+      REQUIRE(input.delivery() != nullptr);
+      seen.push_back(*input.delivery());
+      auto output = std::make_unique<op::pipelineable_operator_data>();
+      // The next invocation must not trust metadata inherited from a producer.
+      output->set_delivery({999, 99});
+      return output;
+    }
+  } first, second;
+  first.operator_id  = 1;
+  second.operator_id = 2;
+  auto pipeline      = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr});
+  pipeline->set_pipeline_id(17);
+  pl::sirius_pipeline_build_state build;
+  build.set_pipeline_source(*pipeline, first);
+  build.set_pipeline_operators(*pipeline, {first, second});
+  build.set_pipeline_sink(*pipeline, &second, 1);
+  auto global = std::make_shared<pl::sirius_pipeline_task_global_state>(
+    pipeline, sirius::test::make_test_telemetry_context());
+  // Keep tasks alive until all invocations are checked, so the synthetic
+  // port-less pipeline cannot finalize between them.
+  std::vector<std::unique_ptr<pl::gpu_pipeline_task>> deliveries;
+  auto run = [&](uint64_t attempt, std::optional<uint64_t> original, uint32_t retries) {
+    auto input = std::make_unique<op::pipelineable_operator_data>();
+    REQUIRE(input->delivery() == nullptr);
+    input->set_delivery({888, 88});
+    auto local              = std::make_unique<pl::gpu_pipeline_task_local_state>(std::move(input));
+    local->original_task_id = original;
+    local->retry_count      = retries;
+    auto task               = std::make_unique<pl::gpu_pipeline_task>(
+      attempt, std::vector<cucascade::shared_data_repository*>{}, std::move(local), global);
+    task->telemetry_fsm().queued(
+      {.queue = {.target = quent::task_queue::TaskQueueId{quent::nil_uuid()},
+                 .data   = {.entries = 1}}});
+    task->telemetry_fsm().reserving(
+      {.requested_bytes      = 0,
+       .input_basis          = 0,
+       .peak_estimate        = 0,
+       .bytes_to_materialize = 0,
+       .manager_thread       = {
+               .target = quent::task_manager_loop_thread::TaskManagerLoopThreadId{quent::nil_uuid()},
+               .data   = {}}});
+    task->telemetry_fsm().preparing(
+      {.origin_tier     = {},
+       .target_tier     = "GPU",
+       .input_bytes     = 0,
+       .executor_thread = {.target = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()},
+                           .data   = {}},
+       .reservation     = {.target = quent::memory_space::MemorySpaceId{quent::nil_uuid()},
+                           .data   = {.bytes = 0}}});
+    auto output = task->compute_task(::cuda::stream_ref{cudaStream_t{}});
+    REQUIRE(output != nullptr);
+    deliveries.push_back(std::move(task));
+  };
+  run(0, std::nullopt, 0);
+  run(91, 0, 1);
+  run(7, std::nullopt, 0);
+  for (auto const* recorded : {&first, &second}) {
+    REQUIRE(recorded->seen.size() == 3);
+    REQUIRE(recorded->seen[0].original_task_id == 0);
+    REQUIRE(recorded->seen[0].retry_count == 0);
+    REQUIRE(recorded->seen[1].original_task_id == 0);
+    REQUIRE(recorded->seen[1].retry_count == 1);
+    REQUIRE(recorded->seen[2].original_task_id == 7);
+    REQUIRE(recorded->seen[2].retry_count == 0);
+  }
+}

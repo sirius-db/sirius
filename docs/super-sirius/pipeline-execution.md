@@ -17,7 +17,7 @@ operators[0] --> operators[1] --> ... --> operators[N-1]
 - `sink` is an alias for the last operator — it also has a `sink()` method called after the execute loop
 - `operators` contains **all** operators, including source and sink (unlike DuckDB where source/sink are separate from the operators list)
 
-Each operator's `execute_with_context()` entry point is called in sequence by `compute_task()`; by default it delegates to `execute()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
+Each operator's `execute()` entry point is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
 
 Pipelines are connected through **ports** on operators. When a sink pushes output into ports, a **task creator** monitors data availability and creates `gpu_pipeline_task` objects. These tasks are scheduled on the `gpu_pipeline_executor`, which manages GPU memory, CUDA streams, and a thread pool.
 
@@ -43,22 +43,24 @@ See [Operators](operators.md) for the complete operator reference.
 
 After pipeline finalization, `source` and `sink` are simply aliases for the first and last operator in the `operators` list. During execution:
 
-- `execute_with_context(input_data, stream, context)` — called on **every** operator in the pipeline by `compute_task()`; ordinary operators delegate to `execute(input_data, stream)`
+- `execute(input_data, stream)` — called on **every** operator in the pipeline by `compute_task()`
 - `sink(output_data, stream)` — called on the **last** operator by `publish_output()` to push results to downstream ports
 
 See [Operators](operators.md) for the complete operator reference.
 
-### Logical execution identity
+### Delivery metadata
 
-The GPU task invokes operators through `execute_with_context()`, whose default
-implementation delegates to `execute()`. Its Sirius-owned context distinguishes
-the current attempt ID from `(query ID, original task ID)`. Rescheduling assigns a
-new attempt ID while retaining the original task ID, including an original ID of
-zero. Side-effecting operators such as Parquet COPY use the logical identity for
-retry accounting. Two tasks may consume the same shared physical batch and must
-still count as two deliveries. Context is passed per invocation; it is not stored
-on shared operators or used as row-order metadata. Physical batch identity,
-scan receipts, and row-preserving replacement contracts are unaffected.
+Before invoking `execute()`, the GPU task stamps `delivery_metadata` onto the actual
+input, after any deferred-column materialization. The metadata contains the original
+task ID and retry count; rescheduling retains the original ID, including zero.
+The retry count describes the attempt and is not part of the deduplication key.
+A replacement payload need not propagate metadata: the executor stamps each operator
+invocation and overwrites any metadata inherited from an upstream task.
+
+Parquet COPY requires this metadata and keys its query-local session by original task
+ID. Two tasks may consume the same shared physical batch and still count as separate
+deliveries. No query ID or separate contextual execution method is needed. Delivery
+metadata does not change physical batch identity, scan receipts, or row ordering.
 
 ### Ports
 
@@ -97,7 +99,7 @@ parallel::itask                          // base: local_state + global_state + e
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
 - `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`
 
-**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute_with_context()` on each (ordinary operators delegate to `execute()`; COPY requires the context):
+**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each with delivery metadata on the input:
 ```cpp
 auto operators = pipeline->get_operators();  // includes source and sink
 for (size_t i = start_index; i < operators.size(); i++) {
@@ -115,7 +117,7 @@ pipeline->get_sink()->sink(output_data, stream);
 
 **`execute(stream)`** handles the full flow:
 1. Lock each input batch and convert to GPU if needed (`lock_or_prepare_batch`)
-2. Call `compute_task()` (iterates all operators' `execute_with_context()`)
+2. Call `compute_task()` (iterates all operators' `execute()`)
 3. Call `publish_output()` (calls sink's `sink()` to push to downstream ports)
 4. Processing handles released automatically on scope exit
 
@@ -168,7 +170,7 @@ The reservation was attached by the GPU executor's manager loop (see [GPU Pipeli
 
 **Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
 
-This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute_with_context()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it.
+This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it.
 
 **Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-clones it.**
 

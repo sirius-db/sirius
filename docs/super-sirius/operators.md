@@ -15,11 +15,12 @@ After pipeline finalization (see [Physical Plan Generation — Pipeline Finaliza
 - `sink` = last operator in the list
 
 During task execution:
-1. `compute_task()` iterates over **every** operator in `operators`, calling `execute_with_context()` on each
+1. `compute_task()` iterates over **every** operator in `operators`, calling `execute()` on each
 2. `publish_output()` then calls `sink()` on the last operator to push results to downstream ports
 
-The execution context carries the query ID and original task ID, which stay stable across
-rescheduled attempts. COPY uses this identity to distinguish retries from separate CTE/UNION
+The executor stamps optional `delivery_metadata` onto the actual input before each `execute()`
+call. It contains the original task ID and retry count, without a query ID. COPY uses that
+identity within its query-local session to distinguish retries from separate CTE/UNION
 deliveries of the same physical batch. See [Parquet output](parquet-output.md).
 
 An operator's position in a pipeline is determined by `sirius_engine::initialize_internal()`. Many blocking operators appear as both the source (first) of one pipeline and the sink (last) of another — they accumulate data as a sink, then emit results as a source. See the [Operator Summary Table](#operator-summary-table) for the full per-operator breakdown.
@@ -28,8 +29,7 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 
 | Method | Purpose |
 |--------|---------|
-| `execute_with_context(input_data, stream, context)` | Task entry on **every** operator during `compute_task()`; the default delegates to `execute()` |
-| `execute(input_data, stream)` | Ordinary operator implementation; COPY requires `execute_with_context()` and rejects this entry |
+| `execute(input_data, stream)` | Called on **every** operator during `compute_task()`; task delivery metadata is available through `input_data.delivery()` |
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
 | `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
@@ -700,7 +700,7 @@ Returns an empty result set for queries with contradicted filters.
 
 ## Operator Summary Table
 
-After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators enter through `execute_with_context()` during `compute_task()` (ordinary operators delegate to `execute()`; COPY requires the context); only the last operator additionally has `sink()` called via `publish_output()`.
+After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators enter through `execute()` during `compute_task()` with delivery metadata on their input; only the last operator additionally has `sink()` called via `publish_output()`.
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|

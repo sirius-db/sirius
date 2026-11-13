@@ -22,16 +22,13 @@ void sirius_physical_parquet_sink::build_pipelines(pipeline::sirius_pipeline& cu
   auto& child = meta.create_child_meta_pipeline(current, *this);
   child.build(*children[0]);
 }
-std::unique_ptr<operator_data> sirius_physical_parquet_sink::execute(operator_data const&,
-                                                                     ::cuda::stream_ref)
+std::unique_ptr<operator_data> sirius_physical_parquet_sink::execute(operator_data const& data,
+                                                                     ::cuda::stream_ref stream)
 {
-  throw internal_exception("Parquet export requires logical task execution identity");
-}
-std::unique_ptr<operator_data> sirius_physical_parquet_sink::execute_with_context(
-  operator_data const& data, ::cuda::stream_ref stream, operator_execution_context const& context)
-{
-  auto const& input = dynamic_cast<pipelineable_operator_data const&>(data);
-  auto locked       = input.get_read_only_batches();
+  auto const& input    = dynamic_cast<pipelineable_operator_data const&>(data);
+  auto const* delivery = input.delivery();
+  if (!delivery) throw internal_exception("Parquet export requires delivery metadata");
+  auto locked = input.get_read_only_batches();
   std::vector<cudf::table_view> tables;
   std::vector<std::uint64_t> rows;
   for (auto const& batch : locked) {
@@ -41,7 +38,7 @@ std::unique_ptr<operator_data> sirius_physical_parquet_sink::execute_with_contex
     rows.push_back(table.num_rows());
   }
   session_.write(
-    context.logical_task, input.get_position(), rows, [&](std::size_t i, auto const& path) {
+    delivery->original_task_id, input.get_position(), rows, [&](std::size_t i, auto const& path) {
       output::write_parquet_part(session_.spec(), tables[i], path, stream);
     });
   return std::make_unique<pipelineable_operator_data>();
