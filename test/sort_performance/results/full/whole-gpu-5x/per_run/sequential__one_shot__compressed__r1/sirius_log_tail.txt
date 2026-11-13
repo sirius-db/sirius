@@ -1,0 +1,400 @@
+[2026-11-13 04:33:44.929] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1782)
+[2026-11-13 04:33:44.929] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.939] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1783)
+[2026-11-13 04:33:44.939] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.940] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:44.940] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:44.940] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 78/100) for task 9196 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:44.949] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1784)
+[2026-11-13 04:33:44.949] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.960] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1785)
+[2026-11-13 04:33:44.960] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.970] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1786)
+[2026-11-13 04:33:44.970] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.980] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1787)
+[2026-11-13 04:33:44.980] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.990] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1788)
+[2026-11-13 04:33:44.990] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:44.992] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9197: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:44.992] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9197 -- proceeding with partial reservation
+[2026-11-13 04:33:44.999] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:44.999] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:44.999] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 79/100) for task 9197 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.001] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1789)
+[2026-11-13 04:33:45.001] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.011] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1790)
+[2026-11-13 04:33:45.011] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.021] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1791)
+[2026-11-13 04:33:45.021] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.031] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1792)
+[2026-11-13 04:33:45.031] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.042] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1793)
+[2026-11-13 04:33:45.042] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.050] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9198: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.050] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9198 -- proceeding with partial reservation
+[2026-11-13 04:33:45.052] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1794)
+[2026-11-13 04:33:45.052] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.058] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.058] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.058] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 80/100) for task 9198 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.062] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1795)
+[2026-11-13 04:33:45.062] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.072] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1796)
+[2026-11-13 04:33:45.072] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.082] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1797)
+[2026-11-13 04:33:45.082] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.093] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1798)
+[2026-11-13 04:33:45.093] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.103] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1799)
+[2026-11-13 04:33:45.103] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.109] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9199: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.109] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9199 -- proceeding with partial reservation
+[2026-11-13 04:33:45.113] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1800)
+[2026-11-13 04:33:45.113] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.116] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.116] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.116] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 81/100) for task 9199 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.123] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1801)
+[2026-11-13 04:33:45.123] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.133] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1802)
+[2026-11-13 04:33:45.133] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.143] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1803)
+[2026-11-13 04:33:45.143] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.153] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1804)
+[2026-11-13 04:33:45.154] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.164] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1805)
+[2026-11-13 04:33:45.164] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.168] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9200: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.168] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9200 -- proceeding with partial reservation
+[2026-11-13 04:33:45.174] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1806)
+[2026-11-13 04:33:45.174] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.175] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.175] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.175] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 82/100) for task 9200 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.184] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1807)
+[2026-11-13 04:33:45.184] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.194] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1808)
+[2026-11-13 04:33:45.194] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.204] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1809)
+[2026-11-13 04:33:45.204] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.04 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.215] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1810)
+[2026-11-13 04:33:45.215] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.225] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1811)
+[2026-11-13 04:33:45.225] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.226] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9201: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.226] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9201 -- proceeding with partial reservation
+[2026-11-13 04:33:45.233] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.233] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.233] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 83/100) for task 9201 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.235] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1812)
+[2026-11-13 04:33:45.235] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.245] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1813)
+[2026-11-13 04:33:45.245] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.255] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1814)
+[2026-11-13 04:33:45.255] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.266] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1815)
+[2026-11-13 04:33:45.266] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.276] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1816)
+[2026-11-13 04:33:45.276] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.285] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9202: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.285] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9202 -- proceeding with partial reservation
+[2026-11-13 04:33:45.286] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1817)
+[2026-11-13 04:33:45.286] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.293] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.293] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.293] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 84/100) for task 9202 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.297] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1818)
+[2026-11-13 04:33:45.297] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.307] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1819)
+[2026-11-13 04:33:45.307] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.317] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1820)
+[2026-11-13 04:33:45.317] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.327] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1821)
+[2026-11-13 04:33:45.327] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.337] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1822)
+[2026-11-13 04:33:45.337] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.06 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.345] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9203: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.345] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9203 -- proceeding with partial reservation
+[2026-11-13 04:33:45.347] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1823)
+[2026-11-13 04:33:45.347] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.352] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.352] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.352] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 85/100) for task 9203 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.359] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1824)
+[2026-11-13 04:33:45.359] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.369] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1825)
+[2026-11-13 04:33:45.369] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.379] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1826)
+[2026-11-13 04:33:45.379] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.389] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1827)
+[2026-11-13 04:33:45.389] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.399] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1828)
+[2026-11-13 04:33:45.399] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.403] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9204: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.403] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9204 -- proceeding with partial reservation
+[2026-11-13 04:33:45.409] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1829)
+[2026-11-13 04:33:45.409] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.410] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.410] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.410] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 86/100) for task 9204 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.420] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1830)
+[2026-11-13 04:33:45.420] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.430] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1831)
+[2026-11-13 04:33:45.430] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.440] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1832)
+[2026-11-13 04:33:45.440] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.450] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1833)
+[2026-11-13 04:33:45.451] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.461] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1834)
+[2026-11-13 04:33:45.461] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.462] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9205: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.462] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9205 -- proceeding with partial reservation
+[2026-11-13 04:33:45.470] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.470] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.470] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 87/100) for task 9205 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.471] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1835)
+[2026-11-13 04:33:45.471] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.481] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1836)
+[2026-11-13 04:33:45.481] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.492] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1837)
+[2026-11-13 04:33:45.492] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.502] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1838)
+[2026-11-13 04:33:45.502] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.512] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1839)
+[2026-11-13 04:33:45.512] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.521] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9206: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.521] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9206 -- proceeding with partial reservation
+[2026-11-13 04:33:45.522] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1840)
+[2026-11-13 04:33:45.522] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.528] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.528] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.528] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 88/100) for task 9206 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.532] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1841)
+[2026-11-13 04:33:45.532] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.542] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1842)
+[2026-11-13 04:33:45.542] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.553] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1843)
+[2026-11-13 04:33:45.553] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.563] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1844)
+[2026-11-13 04:33:45.563] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.573] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1845)
+[2026-11-13 04:33:45.573] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.579] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9207: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.579] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9207 -- proceeding with partial reservation
+[2026-11-13 04:33:45.583] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1846)
+[2026-11-13 04:33:45.583] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.586] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.587] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.587] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 89/100) for task 9207 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.593] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1847)
+[2026-11-13 04:33:45.593] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.604] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1848)
+[2026-11-13 04:33:45.604] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.614] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1849)
+[2026-11-13 04:33:45.614] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.624] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1850)
+[2026-11-13 04:33:45.624] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.634] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1851)
+[2026-11-13 04:33:45.634] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.638] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9208: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.638] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9208 -- proceeding with partial reservation
+[2026-11-13 04:33:45.644] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1852)
+[2026-11-13 04:33:45.644] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.645] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.645] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.645] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 90/100) for task 9208 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.654] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1853)
+[2026-11-13 04:33:45.654] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.665] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1854)
+[2026-11-13 04:33:45.665] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.675] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1855)
+[2026-11-13 04:33:45.675] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.685] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1856)
+[2026-11-13 04:33:45.685] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.06 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.696] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1857)
+[2026-11-13 04:33:45.696] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.696] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9209: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.696] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9209 -- proceeding with partial reservation
+[2026-11-13 04:33:45.703] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.704] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.704] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 91/100) for task 9209 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.706] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1858)
+[2026-11-13 04:33:45.706] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.716] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1859)
+[2026-11-13 04:33:45.716] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.726] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1860)
+[2026-11-13 04:33:45.727] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.737] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1861)
+[2026-11-13 04:33:45.737] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.747] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1862)
+[2026-11-13 04:33:45.747] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.755] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9210: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.755] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9210 -- proceeding with partial reservation
+[2026-11-13 04:33:45.757] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1863)
+[2026-11-13 04:33:45.757] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.762] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.762] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.762] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 92/100) for task 9210 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.767] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1864)
+[2026-11-13 04:33:45.767] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.777] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1865)
+[2026-11-13 04:33:45.777] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.787] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1866)
+[2026-11-13 04:33:45.787] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.797] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1867)
+[2026-11-13 04:33:45.797] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.808] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1868)
+[2026-11-13 04:33:45.808] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.813] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9211: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.813] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9211 -- proceeding with partial reservation
+[2026-11-13 04:33:45.818] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1869)
+[2026-11-13 04:33:45.818] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.821] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.821] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.821] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 93/100) for task 9211 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.828] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1870)
+[2026-11-13 04:33:45.828] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.838] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1871)
+[2026-11-13 04:33:45.838] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.848] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1872)
+[2026-11-13 04:33:45.848] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.858] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1873)
+[2026-11-13 04:33:45.858] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.868] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1874)
+[2026-11-13 04:33:45.868] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.872] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9212: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.872] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9212 -- proceeding with partial reservation
+[2026-11-13 04:33:45.878] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1875)
+[2026-11-13 04:33:45.878] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.879] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.879] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.879] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 94/100) for task 9212 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.888] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1876)
+[2026-11-13 04:33:45.888] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.898] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1877)
+[2026-11-13 04:33:45.898] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.909] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1878)
+[2026-11-13 04:33:45.909] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.919] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1879)
+[2026-11-13 04:33:45.919] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.929] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1880)
+[2026-11-13 04:33:45.929] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.930] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9213: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.930] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9213 -- proceeding with partial reservation
+[2026-11-13 04:33:45.937] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.937] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.937] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 95/100) for task 9213 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:45.939] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1881)
+[2026-11-13 04:33:45.939] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.949] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1882)
+[2026-11-13 04:33:45.949] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.960] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1883)
+[2026-11-13 04:33:45.960] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.970] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1884)
+[2026-11-13 04:33:45.970] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.980] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1885)
+[2026-11-13 04:33:45.980] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.989] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9214: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:45.989] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9214 -- proceeding with partial reservation
+[2026-11-13 04:33:45.990] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1886)
+[2026-11-13 04:33:45.990] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:45.998] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:45.998] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:45.998] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 96/100) for task 9214 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.001] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1887)
+[2026-11-13 04:33:46.001] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.011] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1888)
+[2026-11-13 04:33:46.011] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.021] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1889)
+[2026-11-13 04:33:46.021] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.031] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1890)
+[2026-11-13 04:33:46.031] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.041] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1891)
+[2026-11-13 04:33:46.041] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.049] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9215: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:46.049] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9215 -- proceeding with partial reservation
+[2026-11-13 04:33:46.051] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1892)
+[2026-11-13 04:33:46.051] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.058] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:46.058] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:46.058] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 97/100) for task 9215 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.061] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1893)
+[2026-11-13 04:33:46.061] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.071] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1894)
+[2026-11-13 04:33:46.072] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.082] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1895)
+[2026-11-13 04:33:46.082] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.092] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1896)
+[2026-11-13 04:33:46.092] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.102] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1897)
+[2026-11-13 04:33:46.102] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.109] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9216: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:46.109] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9216 -- proceeding with partial reservation
+[2026-11-13 04:33:46.112] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1898)
+[2026-11-13 04:33:46.112] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.117] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:46.117] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:46.117] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 98/100) for task 9216 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.122] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1899)
+[2026-11-13 04:33:46.122] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.132] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1900)
+[2026-11-13 04:33:46.132] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.142] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1901)
+[2026-11-13 04:33:46.142] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.153] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1902)
+[2026-11-13 04:33:46.153] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.163] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1903)
+[2026-11-13 04:33:46.163] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.169] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9217: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:46.169] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9217 -- proceeding with partial reservation
+[2026-11-13 04:33:46.173] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1904)
+[2026-11-13 04:33:46.173] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.177] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:46.177] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:46.177] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 99/100) for task 9217 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.183] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1905)
+[2026-11-13 04:33:46.184] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.194] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1906)
+[2026-11-13 04:33:46.194] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.204] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1907)
+[2026-11-13 04:33:46.204] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.214] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1908)
+[2026-11-13 04:33:46.214] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.224] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1909)
+[2026-11-13 04:33:46.224] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.230] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9218: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:46.230] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9218 -- proceeding with partial reservation
+[2026-11-13 04:33:46.235] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1910)
+[2026-11-13 04:33:46.235] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.237] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:46.237] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:46.237] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 100/100) for task 9218 (original task 8920), resuming from operator index 0: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.245] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1911)
+[2026-11-13 04:33:46.245] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.255] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1912)
+[2026-11-13 04:33:46.255] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.265] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1913)
+[2026-11-13 04:33:46.265] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.275] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1914)
+[2026-11-13 04:33:46.275] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.285] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40199549543 bytes (monitor request #1915)
+[2026-11-13 04:33:46.285] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.288] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9219: needed 100931731456 bytes (shortfall 100758588416), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:33:46.288] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (173143040/100931731456 bytes) for pipeline 2 task 9219 -- proceeding with partial reservation
+[2026-11-13 04:33:46.295] [error] [sirius_physical_operator.cpp:195] pipelineable_operator_data: OOM at batch 2453 preparing for processing, state: 0
+[2026-11-13 04:33:46.295] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #1916)
+[2026-11-13 04:33:46.295] [error] [gpu_pipeline_task.cpp:762] Pipeline 2: OOM preparing batches for processing
+[2026-11-13 04:33:46.295] [error] [gpu_pipeline_executor.cpp:476] GPU Pipeline Executor: task 9219 (original task 8920) exceeded 100 retries at operator index 0 — terminating query: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:46.295] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:33:46.301] [error] [sirius_engine.cpp:302] Error executing query: GPU pipeline task exceeded maximum retry limit (100) for original task 8920: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:47.469] [info] [sirius_physical_discard_sink.cpp:355] [discard_sink] rows=150588235 bytes=2409411760 order_violations=0
+[2026-11-13 04:33:47.478] [info] [sirius_context.cpp:587] QueryEnd
+[2026-11-13 04:33:47.478] [warning] [sirius_context.cpp:624] SiriusContext::release_query_state: query 2 operator 7 port 'default' still had 16 un-consumed data batch(es) (memory leak).
+[2026-11-13 04:33:47.478] [info] [sirius_context.cpp:240] [host_pool] HOST:0 QueryEnd instance=0x6463060ef510 connection=1 window=2 query=4 allocated=269484032 bytes peak=103079215104 bytes free_blocks=98047
+[2026-11-13 04:33:47.478] [info] [sirius_context.cpp:255] [gpu_pool] GPU:0 QueryEnd instance=0x6463060ef510 connection=1 window=2 query=4 allocated=0 bytes peak=100931731456 bytes reserved=0 bytes
+[2026-11-13 04:33:47.478] [info] [sirius_context.cpp:721] [window] end instance=0x6463060ef510 connection=1 window=2 query=4 outcome=ok
+[2026-11-13 04:33:47.478] [error] [physical_sirius_execution.cpp:438] Transparent GPU execution error: GPU pipeline task exceeded maximum retry limit (100) for original task 8920: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[2026-11-13 04:33:47.487] [info] [replay_admission.cpp:35] late failure cause=4 replay=false refused_by=-1
+[2026-11-13 04:33:47.519] [info] [sirius_context.cpp:2268] Connection closed.
+[2026-11-13 04:33:47.577] [info] [task_scheduler.cpp:298] Task queue interrupted, exiting management event loop.
+[2026-11-13 04:33:47.577] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop

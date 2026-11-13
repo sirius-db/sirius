@@ -1,0 +1,400 @@
+[2026-11-13 04:47:23.453] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 25661311703 bytes (monitor request #18)
+[2026-11-13 04:47:24.292] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7916 from operator index 1 (of 2)
+[2026-11-13 04:47:26.686] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7953 from operator index 1 (of 2)
+[2026-11-13 04:47:27.304] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7964 from operator index 1 (of 2)
+[2026-11-13 04:47:28.560] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7983 from operator index 1 (of 2)
+[2026-11-13 04:47:29.044] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7991 from operator index 1 (of 2)
+[2026-11-13 04:47:29.458] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 7998 from operator index 1 (of 2)
+[2026-11-13 04:47:30.365] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8012 from operator index 1 (of 2)
+[2026-11-13 04:47:31.413] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8029 from operator index 1 (of 2)
+[2026-11-13 04:47:33.548] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8063 from operator index 1 (of 2)
+[2026-11-13 04:47:33.810] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8068 from operator index 1 (of 2)
+[2026-11-13 04:47:34.678] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8081 from operator index 1 (of 2)
+[2026-11-13 04:47:36.397] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8108 from operator index 1 (of 2)
+[2026-11-13 04:47:37.077] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8119 from operator index 1 (of 2)
+[2026-11-13 04:47:38.836] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 2442 batches, 25666319250 bytes in 15382.85 ms (1591.2 MB/s), satisfied=true | to_host: 1224/12887082462 batches/bytes, to_disk: 1218/12779236788 batches/bytes
+[2026-11-13 04:47:38.843] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40123441255 bytes (monitor request #19)
+[2026-11-13 04:47:41.179] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [HOST:0] request done: 1984 batches, 20611405036 bytes in 24258.00 ms (810.3 MB/s), satisfied=true | to_host: 0/0 batches/bytes, to_disk: 1984/20611405036 batches/bytes
+[2026-11-13 04:47:41.180] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [HOST:0] memory pressure: requesting downgrade of 20579142861 bytes (monitor request #13)
+[2026-11-13 04:48:02.179] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 3859 batches, 40128437880 bytes in 23336.44 ms (1639.9 MB/s), satisfied=true | to_host: 1914/19936953828 batches/bytes, to_disk: 1945/20191484052 batches/bytes
+[2026-11-13 04:48:02.197] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 0 task 8209: needed 9220038656 bytes (shortfall 3691685120), downgrade freed 0 bytes, reservation satisfied
+[2026-11-13 04:48:02.197] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8209 from operator index 1 (of 2)
+[2026-11-13 04:48:02.293] [info] [gpu_pipeline_task.cpp:464] Pipeline 0: resuming task 8211 from operator index 1 (of 2)
+[2026-11-13 04:48:02.295] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 34308403815 bytes (monitor request #20)
+[2026-11-13 04:48:03.563] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 198 batches, 2571914312 bytes in 1267.62 ms (1934.9 MB/s), satisfied=true | to_host: 100/1300650674 batches/bytes, to_disk: 98/1271263638 batches/bytes
+[2026-11-13 04:48:05.157] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [HOST:0] request done: 1897 batches, 20582036808 bytes in 23977.28 ms (818.6 MB/s), satisfied=true | to_host: 0/0 batches/bytes, to_disk: 1897/20582036808 batches/bytes
+[2026-11-13 04:48:05.165] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [HOST:0] memory pressure: requesting downgrade of 20612697293 bytes (monitor request #14)
+[2026-11-13 04:48:23.263] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9459: needed 56112798620 bytes (shortfall 17680662172), downgrade freed 32568383314 bytes, reservation satisfied
+[2026-11-13 04:48:23.263] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #21)
+[2026-11-13 04:48:23.269] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.38 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.274] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #22)
+[2026-11-13 04:48:23.277] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.74 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.284] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #23)
+[2026-11-13 04:48:23.287] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.80 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.294] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #24)
+[2026-11-13 04:48:23.298] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.46 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.304] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #25)
+[2026-11-13 04:48:23.308] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.63 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.314] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #26)
+[2026-11-13 04:48:23.318] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.69 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.324] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #27)
+[2026-11-13 04:48:23.328] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.49 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.334] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #28)
+[2026-11-13 04:48:23.338] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.32 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.344] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #29)
+[2026-11-13 04:48:23.349] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.55 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.354] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #30)
+[2026-11-13 04:48:23.358] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.57 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.364] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #31)
+[2026-11-13 04:48:23.368] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.86 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.374] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #32)
+[2026-11-13 04:48:23.377] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.07 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.384] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #33)
+[2026-11-13 04:48:23.388] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.65 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.394] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #34)
+[2026-11-13 04:48:23.397] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.07 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.404] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #35)
+[2026-11-13 04:48:23.408] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.414] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #36)
+[2026-11-13 04:48:23.417] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.94 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.424] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #37)
+[2026-11-13 04:48:23.429] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.25 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.434] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #38)
+[2026-11-13 04:48:23.438] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.13 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.444] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #39)
+[2026-11-13 04:48:23.448] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.17 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.455] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #40)
+[2026-11-13 04:48:23.458] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.68 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.465] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #41)
+[2026-11-13 04:48:23.468] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.59 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.475] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #42)
+[2026-11-13 04:48:23.478] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.25 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.485] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #43)
+[2026-11-13 04:48:23.489] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.95 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.495] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #44)
+[2026-11-13 04:48:23.498] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.26 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.505] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #45)
+[2026-11-13 04:48:23.507] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.49 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.515] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #46)
+[2026-11-13 04:48:23.519] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.79 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.525] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #47)
+[2026-11-13 04:48:23.528] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.535] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #48)
+[2026-11-13 04:48:23.539] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.55 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.545] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #49)
+[2026-11-13 04:48:23.548] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.14 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.555] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #50)
+[2026-11-13 04:48:23.560] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.97 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.565] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #51)
+[2026-11-13 04:48:23.569] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.94 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.575] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #52)
+[2026-11-13 04:48:23.580] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.62 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.586] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #53)
+[2026-11-13 04:48:23.589] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.61 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.596] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #54)
+[2026-11-13 04:48:23.600] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.03 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.606] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #55)
+[2026-11-13 04:48:23.610] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.15 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.616] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #56)
+[2026-11-13 04:48:23.619] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.91 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.626] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #57)
+[2026-11-13 04:48:23.630] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.636] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #58)
+[2026-11-13 04:48:23.639] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.83 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.646] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #59)
+[2026-11-13 04:48:23.650] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.45 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.656] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #60)
+[2026-11-13 04:48:23.660] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.68 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.666] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #61)
+[2026-11-13 04:48:23.668] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.09 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.676] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #62)
+[2026-11-13 04:48:23.680] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.87 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.686] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #63)
+[2026-11-13 04:48:23.689] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.48 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.696] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #64)
+[2026-11-13 04:48:23.700] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.38 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.707] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #65)
+[2026-11-13 04:48:23.709] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.87 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.717] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #66)
+[2026-11-13 04:48:23.721] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.96 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.727] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #67)
+[2026-11-13 04:48:23.729] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.74 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.737] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #68)
+[2026-11-13 04:48:23.741] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.82 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.747] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #69)
+[2026-11-13 04:48:23.750] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.67 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.757] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #70)
+[2026-11-13 04:48:23.761] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.02 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.767] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #71)
+[2026-11-13 04:48:23.770] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.04 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.777] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #72)
+[2026-11-13 04:48:23.781] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.74 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.787] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #73)
+[2026-11-13 04:48:23.790] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.26 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.797] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #74)
+[2026-11-13 04:48:23.801] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.88 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.807] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #75)
+[2026-11-13 04:48:23.810] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.17 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.817] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #76)
+[2026-11-13 04:48:23.822] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.23 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.828] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #77)
+[2026-11-13 04:48:23.830] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.59 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.838] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #78)
+[2026-11-13 04:48:23.842] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.27 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.848] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #79)
+[2026-11-13 04:48:23.850] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.64 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.858] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #80)
+[2026-11-13 04:48:23.861] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.29 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.868] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #81)
+[2026-11-13 04:48:23.872] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.59 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.878] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #82)
+[2026-11-13 04:48:23.881] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.93 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.888] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #83)
+[2026-11-13 04:48:23.891] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.34 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.898] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #84)
+[2026-11-13 04:48:23.901] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.85 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.908] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #85)
+[2026-11-13 04:48:23.912] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.76 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.918] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #86)
+[2026-11-13 04:48:23.922] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.73 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.928] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #87)
+[2026-11-13 04:48:23.931] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.74 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.938] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #88)
+[2026-11-13 04:48:23.942] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.04 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.949] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #89)
+[2026-11-13 04:48:23.952] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.22 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.959] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #90)
+[2026-11-13 04:48:23.962] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.66 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.969] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #91)
+[2026-11-13 04:48:23.973] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.17 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.979] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #92)
+[2026-11-13 04:48:23.982] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.98 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.989] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #93)
+[2026-11-13 04:48:23.992] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.61 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:23.999] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #94)
+[2026-11-13 04:48:24.001] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.10 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.009] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #95)
+[2026-11-13 04:48:24.013] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.47 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.019] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #96)
+[2026-11-13 04:48:24.024] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.87 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.029] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #97)
+[2026-11-13 04:48:24.033] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.53 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.039] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #98)
+[2026-11-13 04:48:24.042] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.38 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.049] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #99)
+[2026-11-13 04:48:24.052] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.85 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.059] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #100)
+[2026-11-13 04:48:24.062] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.25 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.069] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #101)
+[2026-11-13 04:48:24.073] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.51 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.079] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #102)
+[2026-11-13 04:48:24.083] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.35 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.089] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #103)
+[2026-11-13 04:48:24.093] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.78 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.099] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #104)
+[2026-11-13 04:48:24.104] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.53 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.110] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #105)
+[2026-11-13 04:48:24.113] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.41 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.120] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #106)
+[2026-11-13 04:48:24.123] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.74 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.130] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #107)
+[2026-11-13 04:48:24.132] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.48 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.140] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #108)
+[2026-11-13 04:48:24.143] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.71 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.150] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #109)
+[2026-11-13 04:48:24.153] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.17 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.160] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #110)
+[2026-11-13 04:48:24.163] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.20 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.170] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #111)
+[2026-11-13 04:48:24.174] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.65 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.180] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #112)
+[2026-11-13 04:48:24.182] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.47 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.190] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #113)
+[2026-11-13 04:48:24.193] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.52 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.200] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #114)
+[2026-11-13 04:48:24.203] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.84 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.210] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #115)
+[2026-11-13 04:48:24.213] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.13 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.220] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #116)
+[2026-11-13 04:48:24.224] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.59 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.230] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #117)
+[2026-11-13 04:48:24.233] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.56 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.240] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #118)
+[2026-11-13 04:48:24.244] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.57 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.250] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #119)
+[2026-11-13 04:48:24.255] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.19 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.260] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #120)
+[2026-11-13 04:48:24.265] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.19 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.270] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #121)
+[2026-11-13 04:48:24.273] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.57 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.280] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #122)
+[2026-11-13 04:48:24.284] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.66 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.291] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #123)
+[2026-11-13 04:48:24.293] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.68 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.301] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #124)
+[2026-11-13 04:48:24.304] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.69 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.311] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #125)
+[2026-11-13 04:48:24.315] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.10 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.321] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #126)
+[2026-11-13 04:48:24.324] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.16 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.331] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #127)
+[2026-11-13 04:48:24.335] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.341] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #128)
+[2026-11-13 04:48:24.343] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.62 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.351] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #129)
+[2026-11-13 04:48:24.355] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.64 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.361] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #130)
+[2026-11-13 04:48:24.365] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.10 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.371] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #131)
+[2026-11-13 04:48:24.374] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.77 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.381] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #132)
+[2026-11-13 04:48:24.385] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.28 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.391] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #133)
+[2026-11-13 04:48:24.394] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.06 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.401] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #134)
+[2026-11-13 04:48:24.403] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.96 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.411] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #135)
+[2026-11-13 04:48:24.415] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.14 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.421] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #136)
+[2026-11-13 04:48:24.424] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.17 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.431] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #137)
+[2026-11-13 04:48:24.435] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.84 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.441] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #138)
+[2026-11-13 04:48:24.446] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.14 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.451] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #139)
+[2026-11-13 04:48:24.454] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.86 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.462] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #140)
+[2026-11-13 04:48:24.467] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.56 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.472] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #141)
+[2026-11-13 04:48:24.478] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 6.53 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.482] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #142)
+[2026-11-13 04:48:24.486] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.22 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.492] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #143)
+[2026-11-13 04:48:24.494] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.30 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.502] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #144)
+[2026-11-13 04:48:24.504] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.96 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.512] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #145)
+[2026-11-13 04:48:24.514] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.79 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.522] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #146)
+[2026-11-13 04:48:24.524] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.96 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.532] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #147)
+[2026-11-13 04:48:24.534] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.94 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.542] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #148)
+[2026-11-13 04:48:24.544] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 1.91 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.552] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #149)
+[2026-11-13 04:48:24.557] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.73 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.562] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #150)
+[2026-11-13 04:48:24.568] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.53 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.572] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #151)
+[2026-11-13 04:48:24.576] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.95 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.582] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #152)
+[2026-11-13 04:48:24.585] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 2.55 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.592] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #153)
+[2026-11-13 04:48:24.596] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.72 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.603] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #154)
+[2026-11-13 04:48:24.607] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.09 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.613] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #155)
+[2026-11-13 04:48:24.617] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.33 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.623] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #156)
+[2026-11-13 04:48:24.626] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.25 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.633] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #157)
+[2026-11-13 04:48:24.637] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.15 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.643] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #158)
+[2026-11-13 04:48:24.648] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.56 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.653] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #159)
+[2026-11-13 04:48:24.656] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.36 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.663] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #160)
+[2026-11-13 04:48:24.667] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.12 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.673] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #161)
+[2026-11-13 04:48:24.678] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.34 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.683] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #162)
+[2026-11-13 04:48:24.687] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.06 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.693] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #163)
+[2026-11-13 04:48:24.697] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.80 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.703] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #164)
+[2026-11-13 04:48:24.708] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.12 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.713] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #165)
+[2026-11-13 04:48:24.718] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.62 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.723] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #166)
+[2026-11-13 04:48:24.728] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.09 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.734] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #167)
+[2026-11-13 04:48:24.737] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.92 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.744] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #168)
+[2026-11-13 04:48:24.748] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.47 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.754] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #169)
+[2026-11-13 04:48:24.758] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.27 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.764] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #170)
+[2026-11-13 04:48:24.767] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.46 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.774] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #171)
+[2026-11-13 04:48:24.779] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.39 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.784] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #172)
+[2026-11-13 04:48:24.789] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.10 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.794] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #173)
+[2026-11-13 04:48:24.798] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.82 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.804] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #174)
+[2026-11-13 04:48:24.808] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.06 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.814] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #175)
+[2026-11-13 04:48:24.819] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 5.10 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.824] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23537897987 bytes (monitor request #176)
+[2026-11-13 04:48:24.829] [warning] [gpu_pipeline_task.cpp:299] Pipeline 2: MERGE_SORT (id=4) threw during input materialization or execute: std::bad_alloc: out_of_memory: std::bad_alloc: out_of_memory: CUDA error (failed to allocate 85566207 bytes) at: /tmp/conda-bld-output/bld/rattler-build_librmm/work/cpp/src/mr/cuda_async_view_memory_resource.cpp:43: cudaErrorMemoryAllocation out of memory
+[2026-11-13 04:48:24.829] [warning] [gpu_pipeline_task.cpp:549] Pipeline 2: OOM at operator MERGE_SORT (id=4, index 0/1), requested 85566207 bytes (81.60 MB), global usage 84096936860 bytes (80201.09 MB), peak allocated 28290794860 bytes (26980.20 MB), bytes to materialize input 48661908 bytes (46.41 MB), reservation 56112798620 bytes (53513.33 MB), rescheduling task 9459
+[2026-11-13 04:48:24.829] [warning] [gpu_pipeline_executor.cpp:496] GPU Pipeline Executor: reschedule (retry 1/100) for task 9459 (original task 9459), resuming from operator index 0: OOM at operator MERGE_SORT (index 0)
+[2026-11-13 04:48:24.829] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.69 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.832] [info] [gpu_pipeline_executor.cpp:341] [downgrade][reserve] pipeline 2 task 9475: needed 100931731456 bytes (shortfall 28041641728), downgrade freed 0 bytes, reservation partial
+[2026-11-13 04:48:24.832] [warning] [gpu_pipeline_executor.cpp:366] GPU Pipeline Executor: after downgrade (0 bytes freed), reservation still partial (72890089728/100931731456 bytes) for pipeline 2 task 9475 -- proceeding with partial reservation
+[2026-11-13 04:48:24.834] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #177)
+[2026-11-13 04:48:24.838] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.05 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.844] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #178)
+[2026-11-13 04:48:24.848] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.21 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.854] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #179)
+[2026-11-13 04:48:24.859] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 4.19 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.864] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #180)
+[2026-11-13 04:48:24.868] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.94 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.875] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #181)
+[2026-11-13 04:48:24.878] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 3.95 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:48:24.885] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 40372692583 bytes (monitor request #182)
+[2026-11-13 04:48:38.057] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [HOST:0] request done: 4 batches, 37136225364 bytes in 32892.42 ms (1076.7 MB/s), satisfied=true | to_host: 0/0 batches/bytes, to_disk: 4/37136225364 batches/bytes
+[2026-11-13 04:48:38.062] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [HOST:0] memory pressure: requesting downgrade of 20418710733 bytes (monitor request #15)
+[2026-11-13 04:48:40.667] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 1 batches, 28040908504 bytes in 15782.67 ms (1694.4 MB/s), satisfied=false | to_host: 1/26711290418 batches/bytes, to_disk: 1/1329618086 batches/bytes
+[2026-11-13 04:48:58.268] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [HOST:0] request done: 2 batches, 32988731324 bytes in 20205.85 ms (1557.0 MB/s), satisfied=true | to_host: 0/0 batches/bytes, to_disk: 2/32988731324 batches/bytes
+[2026-11-13 04:49:14.942] [warning] [gpu_pipeline_task.cpp:299] Pipeline 2: MERGE_SORT (id=4) threw during input materialization or execute: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[2026-11-13 04:49:14.952] [error] [gpu_pipeline_executor.cpp:619] GPU task execution, retry or completion failed: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[2026-11-13 04:49:14.952] [error] [sirius_engine.cpp:302] Error executing query: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[2026-11-13 04:49:26.161] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 20769089895 bytes (monitor request #183)
+[2026-11-13 04:49:26.161] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.242] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23938367079 bytes (monitor request #184)
+[2026-11-13 04:49:26.242] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.252] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 32679571303 bytes (monitor request #185)
+[2026-11-13 04:49:26.252] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.313] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 20264395367 bytes (monitor request #186)
+[2026-11-13 04:49:26.313] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.323] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 28510507111 bytes (monitor request #187)
+[2026-11-13 04:49:26.323] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.333] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 39443715431 bytes (monitor request #188)
+[2026-11-13 04:49:26.333] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:26.338] [warning] [gpu_pipeline_task.cpp:299] Pipeline 2: MERGE_SORT (id=4) threw during input materialization or execute: std::bad_alloc: out_of_memory: std::bad_alloc: out_of_memory: CUDA error (failed to allocate 10933208319 bytes) at: /tmp/conda-bld-output/bld/rattler-build_librmm/work/cpp/src/mr/cuda_async_view_memory_resource.cpp:43: cudaErrorMemoryAllocation out of memory
+[2026-11-13 04:49:26.338] [warning] [gpu_pipeline_task.cpp:549] Pipeline 2: OOM at operator MERGE_SORT (id=4, index 0/1), requested 10933208319 bytes (10426.72 MB), global usage 100002754304 bytes (95370.06 MB), peak allocated 71962387660 bytes (68628.68 MB), bytes to materialize input 28040366644 bytes (26741.38 MB), reservation 56339536382 bytes (53729.57 MB), rescheduling task 9474
+[2026-11-13 04:49:26.343] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 27347963731 bytes (monitor request #189)
+[2026-11-13 04:49:26.343] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.621] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 20766913127 bytes (monitor request #190)
+[2026-11-13 04:49:37.621] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.01 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.661] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 21691650663 bytes (monitor request #191)
+[2026-11-13 04:49:37.661] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.712] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 23935811431 bytes (monitor request #192)
+[2026-11-13 04:49:37.712] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.722] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 32676780647 bytes (monitor request #193)
+[2026-11-13 04:49:37.722] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.782] [info] [downgrade_executor.cpp:697] [downgrade][monitor] [GPU:0] memory pressure: requesting downgrade of 20318662247 bytes (monitor request #194)
+[2026-11-13 04:49:37.782] [info] [downgrade_executor.cpp:555] [downgrade][monitor] [GPU:0] request done: 0 batches, 0 bytes in 0.00 ms (0.0 MB/s), satisfied=false | to_host: 0/0 batches/bytes, to_disk: 0/0 batches/bytes
+[2026-11-13 04:49:37.792] [warning] [gpu_pipeline_task.cpp:299] Pipeline 2: MERGE_SORT (id=4) threw during input materialization or execute: std::bad_alloc: out_of_memory: std::bad_alloc: out_of_memory: CUDA error (failed to allocate 10932806911 bytes) at: /tmp/conda-bld-output/bld/rattler-build_librmm/work/cpp/src/mr/cuda_async_view_memory_resource.cpp:43: cudaErrorMemoryAllocation out of memory
+[2026-11-13 04:49:37.792] [warning] [gpu_pipeline_task.cpp:549] Pipeline 2: OOM at operator MERGE_SORT (id=4, index 0/1), requested 10932806911 bytes (10426.34 MB), global usage 99999449088 bytes (95366.91 MB), peak allocated 71960030908 bytes (68626.43 MB), bytes to materialize input 28039418180 bytes (26740.47 MB), reservation 56337630700 bytes (53727.75 MB), rescheduling task 9473
+[2026-11-13 04:49:37.801] [info] [sirius_physical_discard_sink.cpp:355] [discard_sink] rows=0 bytes=0 order_violations=0
+[2026-11-13 04:49:37.803] [info] [sirius_context.cpp:587] QueryEnd
+[2026-11-13 04:49:37.803] [info] [sirius_context.cpp:240] [host_pool] HOST:0 QueryEnd instance=0x7466c5598e40 connection=1 window=2 query=4 allocated=269484032 bytes peak=103079215104 bytes free_blocks=98047
+[2026-11-13 04:49:37.803] [info] [sirius_context.cpp:255] [gpu_pool] GPU:0 QueryEnd instance=0x7466c5598e40 connection=1 window=2 query=4 allocated=0 bytes peak=100931731456 bytes reserved=0 bytes
+[2026-11-13 04:49:37.803] [info] [sirius_context.cpp:721] [window] end instance=0x7466c5598e40 connection=1 window=2 query=4 outcome=ok
+[2026-11-13 04:49:37.803] [error] [physical_sirius_execution.cpp:438] Transparent GPU execution error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[2026-11-13 04:49:37.803] [info] [replay_admission.cpp:35] late failure cause=6 replay=false refused_by=-1
+[2026-11-13 04:49:37.808] [info] [sirius_context.cpp:2268] Connection closed.
+[2026-11-13 04:49:37.828] [info] [task_scheduler.cpp:298] Task queue interrupted, exiting management event loop.
+[2026-11-13 04:49:37.828] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop

@@ -1,0 +1,205 @@
+[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
+[workstation] building (release + extension)
+### 2026-11-13 01:20:56 run uniform-1key comp=false mode=windowed timeout=10800 | 1018G avail | mem avail 118G | gpu0 20 MiB
+[01:20:56.346] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[01:20:56.346] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[01:20:56.346]   uniform-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[01:20:56.348] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__windowed
+[01:20:56.348] --- [1/1] uniform-1key__windowed__uncompressed__r1 ---
+[01:34:57.300]   ok in 837.3s, peak GPU 97250 MiB
+[01:34:57.305] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__windowed/results.csv
+[01:34:57.305] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__windowed/results.md
+### rc=0 status=ok wall_s=837.316 peak_gpu_mib=97250 spill_host=747718385568 spill_disk=670568167184 oom_retries=17479
+### 2026-11-13 01:34:57 run uniform-1key comp=false mode=one_shot timeout=3348 | 1017G avail | mem avail 119G | gpu0 20 MiB
+[01:34:57.463] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[01:34:57.463] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[01:34:57.463]   uniform-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[01:34:57.465] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__one_shot
+[01:34:57.465] --- [1/1] uniform-1key__one_shot__uncompressed__r1 ---
+[02:30:49.987]   timeout in 3349.9s, peak GPU 97250 MiB: killed after --timeout-s 3348.0
+[02:30:49.999] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__one_shot/results.csv
+[02:30:49.999] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-false__one_shot/results.md
+### rc=0 status=timeout wall_s=3349.872 peak_gpu_mib=97250 spill_host=3685088577024 spill_disk=3585420233584 oom_retries=19475
+### 2026-11-13 02:30:50 run uniform-1key comp=true mode=windowed timeout=10800 | 1017G avail | mem avail 119G | gpu0 20 MiB
+[02:30:50.193] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[02:30:50.193] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[02:30:50.193]   uniform-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[02:30:50.194] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__windowed
+[02:30:50.194] --- [1/1] uniform-1key__windowed__compressed__r1 ---
+[02:41:43.402]   ok in 649.5s, peak GPU 97250 MiB
+[02:41:43.403] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__windowed/results.csv
+[02:41:43.403] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__windowed/results.md
+### rc=0 status=ok wall_s=649.467 peak_gpu_mib=97250 spill_host=936731335456 spill_disk=454910740918 oom_retries=15311
+### 2026-11-13 02:41:43 run uniform-1key comp=true mode=one_shot timeout=2596 | 1016G avail | mem avail 119G | gpu0 20 MiB
+[02:41:43.506] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[02:41:43.506] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[02:41:43.506]   uniform-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[02:41:43.508] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__one_shot
+[02:41:43.508] --- [1/1] uniform-1key__one_shot__compressed__r1 ---
+[03:25:04.453]   timeout in 2598.2s, peak GPU 97250 MiB: killed after --timeout-s 2596.0
+[03:25:04.453] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__one_shot/results.csv
+[03:25:04.453] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/uniform-1key__comp-true__one_shot/results.md
+### rc=0 status=timeout wall_s=2598.219 peak_gpu_mib=97250 spill_host=3639550558464 spill_disk=2541549185916 oom_retries=20210
+### 2026-11-13 03:25:04 run zipf-1key comp=false mode=windowed timeout=10800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[03:25:04.560] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[03:25:04.560] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[03:25:04.560]   zipf-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[03:25:04.562] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__windowed
+[03:25:04.562] --- [1/1] zipf-1key__windowed__uncompressed__r1 ---
+[03:38:25.013]   ok in 796.8s, peak GPU 97250 MiB
+[03:38:25.017] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__windowed/results.csv
+[03:38:25.017] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__windowed/results.md
+### rc=0 status=ok wall_s=796.811 peak_gpu_mib=97250 spill_host=668995887856 spill_disk=622813393376 oom_retries=17766
+### 2026-11-13 03:38:25 run zipf-1key comp=false mode=one_shot timeout=3184 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[03:38:25.179] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[03:38:25.179] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[03:38:25.179]   zipf-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[03:38:25.181] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__one_shot
+[03:38:25.181] --- [1/1] zipf-1key__one_shot__uncompressed__r1 ---
+[03:46:03.012]   error in 454.0s, peak GPU 97250 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[03:46:03.016] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__one_shot/results.csv
+[03:46:03.016] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-false__one_shot/results.md
+### rc=0 status=error wall_s=453.974 peak_gpu_mib=97250 spill_host=123951634416 spill_disk=245707691136 oom_retries=20089
+### 2026-11-13 03:46:03 run zipf-1key comp=true mode=windowed timeout=10800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[03:46:03.181] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[03:46:03.181] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[03:46:03.181]   zipf-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[03:46:03.182] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__windowed
+[03:46:03.182] --- [1/1] zipf-1key__windowed__compressed__r1 ---
+[03:54:24.810]   ok in 498.2s, peak GPU 97250 MiB
+[03:54:24.813] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__windowed/results.csv
+[03:54:24.813] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__windowed/results.md
+### rc=0 status=ok wall_s=498.193 peak_gpu_mib=97250 spill_host=582188228672 spill_disk=207167274437 oom_retries=19989
+### 2026-11-13 03:54:24 run zipf-1key comp=true mode=one_shot timeout=1992 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[03:54:24.944] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[03:54:24.944] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[03:54:24.944]   zipf-1key: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[03:54:24.946] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__one_shot
+[03:54:24.946] --- [1/1] zipf-1key__one_shot__compressed__r1 ---
+[04:00:41.644]   error in 373.9s, peak GPU 97250 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[04:00:41.644] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__one_shot/results.csv
+[04:00:41.644] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/zipf-1key__comp-true__one_shot/results.md
+### rc=0 status=error wall_s=373.870 peak_gpu_mib=97250 spill_host=101765570288 spill_disk=131546019871 oom_retries=21222
+### 2026-11-13 04:00:41 run sequential comp=false mode=windowed timeout=10800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:00:41.746] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:00:41.746] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:00:41.746]   sequential: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[04:00:41.748] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__windowed
+[04:00:41.748] --- [1/1] sequential__windowed__uncompressed__r1 ---
+[04:17:24.230]   ok in 999.0s, peak GPU 97250 MiB
+[04:17:24.233] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__windowed/results.csv
+[04:17:24.233] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__windowed/results.md
+### rc=0 status=ok wall_s=999.033 peak_gpu_mib=97250 spill_host=1081829205232 spill_disk=976849081040 oom_retries=2252
+### 2026-11-13 04:17:24 run sequential comp=false mode=one_shot timeout=3996 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:17:24.396] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:17:24.396] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:17:24.396]   sequential: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[04:17:24.397] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__one_shot
+[04:17:24.398] --- [1/1] sequential__one_shot__uncompressed__r1 ---
+[04:23:50.966]   oom in 382.9s, peak GPU 97250 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 10111: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[04:23:50.969] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__one_shot/results.csv
+[04:23:50.969] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-false__one_shot/results.md
+### rc=0 status=oom wall_s=382.889 peak_gpu_mib=97250 spill_host=402989176480 spill_disk=539158588256 oom_retries=2378
+### 2026-11-13 04:23:51 run sequential comp=true mode=windowed timeout=10800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:23:51.131] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:23:51.132] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:23:51.132]   sequential: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[04:23:51.133] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__windowed
+[04:23:51.133] --- [1/1] sequential__windowed__compressed__r1 ---
+[04:31:10.618]   ok in 435.9s, peak GPU 97250 MiB
+[04:31:10.621] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__windowed/results.csv
+[04:31:10.622] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__windowed/results.md
+### rc=0 status=ok wall_s=435.876 peak_gpu_mib=97250 spill_host=1167201315744 spill_disk=342792927435 oom_retries=1362
+### 2026-11-13 04:31:10 run sequential comp=true mode=one_shot timeout=1800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:31:10.779] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:31:10.779] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:31:10.779]   sequential: 3943 x 8000000 rows = 31544000000 rows, 16 bytes/row, 470.04 GiB
+[04:31:10.780] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__one_shot
+[04:31:10.780] --- [1/1] sequential__one_shot__compressed__r1 ---
+[04:33:50.185]   oom in 155.8s, peak GPU 97250 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: GPU pipeline task exceeded maximum retry limit (100) for original task 8920: OOM while preparing batches for processing: std::bad_alloc: out_of_memory: not enough capacity to allocate memory
+[04:33:50.188] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__one_shot/results.csv
+[04:33:50.188] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__one_shot/results.md
+### rc=0 status=oom wall_s=155.756 peak_gpu_mib=97250 spill_host=414531764704 spill_disk=307809235692 oom_retries=1320
+### 2026-11-13 04:33:50 run few_distinct-strings comp=false mode=windowed timeout=10800 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:33:50.343] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:33:50.343] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:33:50.343]   few_distinct-strings: 2867 x 8000000 rows = 22936000000 rows, 22 bytes/row, 469.94 GiB
+[04:33:50.345] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__windowed
+[04:33:50.345] --- [1/1] few_distinct-strings__windowed__uncompressed__r1 ---
+[04:43:33.577]   ok in 580.2s, peak GPU 97246 MiB
+[04:43:33.577] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__windowed/results.csv
+[04:43:33.577] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__windowed/results.md
+### rc=0 status=ok wall_s=580.186 peak_gpu_mib=97246 spill_host=652392486020 spill_disk=547331163186 oom_retries=5592
+### 2026-11-13 04:43:33 run few_distinct-strings comp=false mode=one_shot timeout=2320 | 1015G avail | mem avail 119G | gpu0 20 MiB
+[04:43:33.698] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:43:33.698] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:43:33.698]   few_distinct-strings: 2867 x 8000000 rows = 22936000000 rows, 22 bytes/row, 469.94 GiB
+[04:43:33.700] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__one_shot
+[04:43:33.700] --- [1/1] few_distinct-strings__one_shot__uncompressed__r1 ---
+[04:49:39.833]   error in 363.2s, peak GPU 97246 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[04:49:39.833] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__one_shot/results.csv
+[04:49:39.833] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-false__one_shot/results.md
+### rc=0 status=error wall_s=363.194 peak_gpu_mib=97246 spill_host=339152025386 spill_disk=421031964056 oom_retries=3740
+### 2026-11-13 04:49:39 run few_distinct-strings comp=true mode=windowed timeout=10800 | 1014G avail | mem avail 119G | gpu0 20 MiB
+[04:49:39.942] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:49:39.942] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:49:39.942]   few_distinct-strings: 2867 x 8000000 rows = 22936000000 rows, 22 bytes/row, 469.94 GiB
+[04:49:39.944] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__windowed
+[04:49:39.944] --- [1/1] few_distinct-strings__windowed__compressed__r1 ---
+[04:56:26.185]   ok in 404.2s, peak GPU 97250 MiB
+[04:56:26.185] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__windowed/results.csv
+[04:56:26.185] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__windowed/results.md
+### rc=0 status=ok wall_s=404.234 peak_gpu_mib=97250 spill_host=892464751448 spill_disk=0 oom_retries=12513
+### 2026-11-13 04:56:26 run few_distinct-strings comp=true mode=one_shot timeout=1800 | 1014G avail | mem avail 119G | gpu0 20 MiB
+[04:56:26.272] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[04:56:26.272] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[04:56:26.272]   few_distinct-strings: 2867 x 8000000 rows = 22936000000 rows, 22 bytes/row, 469.94 GiB
+[04:56:26.273] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__one_shot
+[04:56:26.273] --- [1/1] few_distinct-strings__one_shot__compressed__r1 ---
+[05:02:10.388]   error in 342.2s, peak GPU 97250 MiB: Error: CPU fallback is not supported: sirius_generate: stream source has no CPU body. Underlying GPU error: CUDF failure at: /tmp/conda-bld-output/bld/rattler-build_libcudf/work/cpp/src/merge/merge.cu:628: Total number of merged rows exceeds row limit
+[05:02:10.388] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__one_shot/results.csv
+[05:02:10.388] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/few_distinct-strings__comp-true__one_shot/results.md
+### rc=0 status=error wall_s=342.167 peak_gpu_mib=97250 spill_host=670140975364 spill_disk=0 oom_retries=8755
+### 2026-11-13 05:02:10 run normal-multikey comp=false mode=windowed timeout=10800 | 1014G avail | mem avail 119G | gpu0 20 MiB
+[05:02:10.471] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[05:02:10.471] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[05:02:10.471]   normal-multikey: 2253 x 8000000 rows = 18024000000 rows, 28 bytes/row, 470.01 GiB
+[05:02:10.472] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__windowed
+[05:02:10.472] --- [1/1] normal-multikey__windowed__uncompressed__r1 ---
+[05:16:09.190]   ok in 835.9s, peak GPU 97250 MiB
+[05:16:09.191] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__windowed/results.csv
+[05:16:09.191] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__windowed/results.md
+### rc=0 status=ok wall_s=835.942 peak_gpu_mib=97250 spill_host=467017939561 spill_disk=488636604724 oom_retries=10206
+### 2026-11-13 05:16:09 run normal-multikey comp=false mode=one_shot timeout=3340 | 1014G avail | mem avail 119G | gpu0 20 MiB
+[05:16:09.287] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[05:16:09.287] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[05:16:09.287]   normal-multikey: 2253 x 8000000 rows = 18024000000 rows, 28 bytes/row, 470.01 GiB
+[05:16:09.288] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__one_shot
+[05:16:09.288] --- [1/1] normal-multikey__one_shot__uncompressed__r1 ---
+[06:11:53.490]   timeout in 3341.7s, peak GPU 97250 MiB: killed after --timeout-s 3340.0
+[06:11:53.495] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__one_shot/results.csv
+[06:11:53.495] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__one_shot/results.md
+### rc=0 status=timeout wall_s=3341.744 peak_gpu_mib=97250 spill_host=3228461328972 spill_disk=3165801870074 oom_retries=6915
+### 2026-11-13 06:11:53 run normal-multikey comp=true mode=windowed timeout=10800 | 1014G avail | mem avail 119G | gpu0 20 MiB
+[06:11:53.590] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[06:11:53.591] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[06:11:53.591]   normal-multikey: 2253 x 8000000 rows = 18024000000 rows, 28 bytes/row, 470.01 GiB
+[06:11:53.592] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__windowed
+[06:11:53.592] --- [1/1] normal-multikey__windowed__compressed__r1 ---
+[06:20:06.534]   ok in 490.0s, peak GPU 97250 MiB
+[06:20:06.534] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__windowed/results.csv
+[06:20:06.534] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__windowed/results.md
+### rc=0 status=ok wall_s=489.980 peak_gpu_mib=97250 spill_host=833083762779 spill_disk=191837146010 oom_retries=7329
+### 2026-11-13 06:20:06 run normal-multikey comp=true mode=one_shot timeout=1956 | 1014G avail | mem avail 118G | gpu0 20 MiB
+[06:20:06.631] GPU limit 100931731456 bytes (94.00 GiB), data 5x the limit, GPU index 0
+[06:20:06.631] Matrix: 1 datasets x 1 modes x 1 compression x 1 repeat = 1 runs
+[06:20:06.631]   normal-multikey: 2253 x 8000000 rows = 18024000000 rows, 28 bytes/row, 470.01 GiB
+[06:20:06.632] Results: /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__one_shot
+[06:20:06.632] --- [1/1] normal-multikey__one_shot__compressed__r1 ---
+[06:52:46.543]   timeout in 1958.1s, peak GPU 97250 MiB: killed after --timeout-s 1956.0
+[06:52:46.544] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__one_shot/results.csv
+[06:52:46.544] Wrote /mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-true__one_shot/results.md
+### rc=0 status=timeout wall_s=1958.072 peak_gpu_mib=97250 spill_host=3761252105964 spill_disk=1602308796466 oom_retries=7606
+### 2026-11-13 06:52:46 all cells done
+/dev/nvme1n1    1.8T  728G 1013G  42% /mnt/disk_2
+suite_rc=0

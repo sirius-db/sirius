@@ -1,0 +1,59 @@
+{
+  "started": "2026-11-13T04:23:51",
+  "host": "felipe-TRX50-AERO-D",
+  "argv": [
+    "--device",
+    "0",
+    "--spill-dir",
+    "/mnt/disk_2/sirius_spill",
+    "--base-config",
+    "/mnt/disk_2/sort_merge_bench/whole-gpu-5x/base_config.yml",
+    "--gpu-limit-bytes",
+    "100931731456",
+    "--scale",
+    "5",
+    "--datasets",
+    "sequential",
+    "--compression",
+    "true",
+    "--modes",
+    "windowed",
+    "--timeout-s",
+    "10800",
+    "--log-tail-lines",
+    "400",
+    "--out-dir",
+    "/mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/sequential__comp-true__windowed"
+  ],
+  "extension": "/mnt/disk_2/sirius-scalable-sort/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension",
+  "seed": 42,
+  "datasets": {
+    "sequential": {
+      "description": "BIGINT sequential (already sorted) key + DOUBLE payload",
+      "columns": [
+        {
+          "name": "k",
+          "type": "BIGINT",
+          "dist": "sequential",
+          "p1": 0,
+          "p2": 1
+        },
+        {
+          "name": "v",
+          "type": "DOUBLE",
+          "dist": "uniform",
+          "p1": 0,
+          "p2": 1
+        }
+      ],
+      "keys": [
+        "k"
+      ],
+      "num_batches": 3943,
+      "rows_per_batch": 8000000,
+      "rows": 31544000000,
+      "row_width": 16,
+      "bytes": 504704000000
+    }
+  }
+}

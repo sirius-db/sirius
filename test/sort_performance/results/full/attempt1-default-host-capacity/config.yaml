@@ -1,0 +1,6 @@
+sirius:
+  memory:
+    gpu:
+      usage_limit_bytes: 25769803776
+    disk:
+      downgrade_root_dirs: /mnt/disk_2/sirius_spill/sort_bench_20261113_001847/uniform-1key__windowed__uncompressed__r1

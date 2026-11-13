@@ -1,0 +1,42 @@
+[workstation] syncing /home/felipe/sirius/.worktrees/ws-d7931a22-3ecb-4bcc-8514-34bfa14af105 -> felipe@192.168.0.248:/mnt/disk_2/sirius-scalable-sort
+[workstation] building (release + extension)
+[workstation] running: bash -c $'set -u; mkdir -p /mnt/disk_2/sort_merge_bench/full; printf \'sirius:\\n  memory:\\n    host:\\n      capacity_bytes: 103079215104\\n\' > /mnt/disk_2/sort_merge_bench/full/base_config.yml; df -h /mnt/disk_2; free -g; date\necho \'### windowed\'; python test/sort_performance/sort_merge_bench.py --device 0 --spill-dir /mnt/disk_2/sirius_spill --base-config /mnt/disk_2/sort_merge_bench/full/base_config.yml --gpu-limit-bytes 25769803776 --scale 10 --modes windowed --timeout-s 14400 --out-dir /mnt/disk_2/sort_merge_bench/full/windowed; echo windowed_rc=$?\nT=$(cat /mnt/disk_2/sort_merge_bench/full/one_shot_timeout 2>/dev/null || echo 3600)\ndate; echo "### one_shot timeout $T"; python test/sort_performance/sort_merge_bench.py --device 0 --spill-dir /mnt/disk_2/sirius_spill --base-config /mnt/disk_2/sort_merge_bench/full/base_config.yml --gpu-limit-bytes 25769803776 --scale 10 --modes one_shot --timeout-s $T --out-dir /mnt/disk_2/sort_merge_bench/full/one_shot; echo one_shot_rc=$?\ndate; df -h /mnt/disk_2' 
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme1n1    1.8T  722G 1018G  42% /mnt/disk_2
+               total        used        free      shared  buff/cache   available
+Mem:             125           6         118           0           1         118
+Swap:              7           3           4
+Fri Nov 13 12:32:38 AM CST 2026
+### windowed
+[00:32:38.074] GPU limit 25769803776 bytes (24.00 GiB), data 10x the limit, GPU index 0
+[00:32:38.074] Matrix: 5 datasets x 1 modes x 2 compression x 1 repeat = 10 runs
+[00:32:38.074]   uniform-1key: 2013 x 8000000 rows = 16104000000 rows, 16 bytes/row, 239.97 GiB
+[00:32:38.074]   zipf-1key: 2013 x 8000000 rows = 16104000000 rows, 16 bytes/row, 239.97 GiB
+[00:32:38.074]   normal-multikey: 1150 x 8000000 rows = 9200000000 rows, 28 bytes/row, 239.91 GiB
+[00:32:38.074]   few_distinct-strings: 1464 x 8000000 rows = 11712000000 rows, 22 bytes/row, 239.97 GiB
+[00:32:38.074]   sequential: 2013 x 8000000 rows = 16104000000 rows, 16 bytes/row, 239.97 GiB
+[00:32:38.074]   [1/10] uniform-1key  mode=windowed  compression=false  repeat=1
+[00:32:38.074]   [2/10] uniform-1key  mode=windowed  compression=true  repeat=1
+[00:32:38.074]   [3/10] zipf-1key  mode=windowed  compression=false  repeat=1
+[00:32:38.074]   [4/10] zipf-1key  mode=windowed  compression=true  repeat=1
+[00:32:38.074]   [5/10] normal-multikey  mode=windowed  compression=false  repeat=1
+[00:32:38.074]   [6/10] normal-multikey  mode=windowed  compression=true  repeat=1
+[00:32:38.074]   [7/10] few_distinct-strings  mode=windowed  compression=false  repeat=1
+[00:32:38.074]   [8/10] few_distinct-strings  mode=windowed  compression=true  repeat=1
+[00:32:38.074]   [9/10] sequential  mode=windowed  compression=false  repeat=1
+[00:32:38.074]   [10/10] sequential  mode=windowed  compression=true  repeat=1
+[00:32:38.076] Results: /mnt/disk_2/sort_merge_bench/full/windowed
+[00:32:38.076] --- [1/10] uniform-1key__windowed__uncompressed__r1 ---
+[00:39:44.716]   ok in 423.0s, peak GPU 30972 MiB
+[00:39:44.719] --- [2/10] uniform-1key__windowed__compressed__r1 ---
+[00:44:53.242]   ok in 306.0s, peak GPU 35512 MiB
+[00:44:53.242] --- [3/10] zipf-1key__windowed__uncompressed__r1 ---
+[00:52:41.747]   ok in 465.3s, peak GPU 29660 MiB
+[00:52:41.750] --- [4/10] zipf-1key__windowed__compressed__r1 ---
+[00:56:08.299]   ok in 203.9s, peak GPU 29750 MiB
+[00:56:08.309] --- [5/10] normal-multikey__windowed__uncompressed__r1 ---
+[01:06:25.674]   ok in 614.5s, peak GPU 29454 MiB
+[01:06:25.675] --- [6/10] normal-multikey__windowed__compressed__r1 ---
+[01:14:48.392]   ok in 500.4s, peak GPU 29512 MiB
+[01:14:48.392] --- [7/10] few_distinct-strings__windowed__uncompressed__r1 ---
+suite_rc=255

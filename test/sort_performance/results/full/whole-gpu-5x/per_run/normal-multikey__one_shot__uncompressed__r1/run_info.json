@@ -1,0 +1,68 @@
+{
+  "started": "2026-11-13T05:16:09",
+  "host": "felipe-TRX50-AERO-D",
+  "argv": [
+    "--device",
+    "0",
+    "--spill-dir",
+    "/mnt/disk_2/sirius_spill",
+    "--base-config",
+    "/mnt/disk_2/sort_merge_bench/whole-gpu-5x/base_config.yml",
+    "--gpu-limit-bytes",
+    "100931731456",
+    "--scale",
+    "5",
+    "--datasets",
+    "normal-multikey",
+    "--compression",
+    "false",
+    "--modes",
+    "one_shot",
+    "--timeout-s",
+    "3340",
+    "--log-tail-lines",
+    "400",
+    "--out-dir",
+    "/mnt/disk_2/sort_merge_bench/whole-gpu-5x/cells/normal-multikey__comp-false__one_shot"
+  ],
+  "extension": "/mnt/disk_2/sirius-scalable-sort/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension",
+  "seed": 42,
+  "datasets": {
+    "normal-multikey": {
+      "description": "INTEGER normal + BIGINT uniform + VARCHAR(8-16) keys",
+      "columns": [
+        {
+          "name": "k1",
+          "type": "INTEGER",
+          "dist": "normal",
+          "p1": 0,
+          "p2": 1000000
+        },
+        {
+          "name": "k2",
+          "type": "BIGINT",
+          "dist": "uniform",
+          "p1": 0,
+          "p2": 1000000000000000
+        },
+        {
+          "name": "s",
+          "type": "VARCHAR",
+          "dist": "uniform",
+          "p1": 8,
+          "p2": 16
+        }
+      ],
+      "keys": [
+        "k1",
+        "k2",
+        "s"
+      ],
+      "num_batches": 2253,
+      "rows_per_batch": 8000000,
+      "rows": 18024000000,
+      "row_width": 28,
+      "bytes": 504672000000
+    }
+  }
+}
