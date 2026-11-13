@@ -26,11 +26,11 @@ output::parquet_field export_field(std::string name, duckdb::LogicalType const& 
                                           type.ToString());
   field.type = sirius::from_duckdb(type);
   if (type.id() == T::DECIMAL) field.decimal_precision = duckdb::DecimalType::GetWidth(type);
-  if (type.id() == T::STRUCT) {
-    for (duckdb::idx_t i = 0; i < duckdb::StructType::GetChildCount(type); ++i)
-      field.children.push_back(
-        export_field(duckdb::StructType::GetChildName(type, i).GetIdentifierName(),
-                     duckdb::StructType::GetChildType(type, i)));
+  if (duckdb::StructType::IsStruct(type)) {
+    // row(...) produces TUPLE; DuckDB's Parquet writer assigns positional
+    // element names through the same helper used here.
+    for (auto const& [child_name, child_type] : duckdb::TupleType::NamedChildren(type))
+      field.children.push_back(export_field(child_name.GetIdentifierName(), child_type));
   } else if (type.id() == T::LIST || type.id() == T::ARRAY) {
     field.children.push_back(export_field("element",
                                           type.id() == T::LIST

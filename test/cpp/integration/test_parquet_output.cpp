@@ -1,4 +1,5 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
+#include "log/logging.hpp"
 #include "output/parquet_writer.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 
@@ -10,8 +11,13 @@
 #include <catch.hpp>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <thread>
 
 namespace {
 struct export_directory {
@@ -283,4 +289,160 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     REQUIRE(std::distance(std::filesystem::directory_iterator(target),
                           std::filesystem::directory_iterator{}) == 1);
   }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU Parquet timestamps retain CPU naive timestamp semantics",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("SET TimeZone='America/Los_Angeles'");
+  run_ok(
+    "CREATE TABLE export_timestamps AS SELECT "
+    "TIMESTAMP '2024-03-10 01:02:03.123456' t, "
+    "TIMESTAMP '2024-03-10 01:02:03.123'::TIMESTAMP_MS ms, "
+    "TIMESTAMP '2024-03-10 01:02:03'::TIMESTAMP_S sec, "
+    "TIMESTAMP '2024-03-10 01:02:03.123456'::TIMESTAMP_NS ns "
+    "FROM range(3)");
+  run_ok("CHECKPOINT");
+  for (bool empty : {false, true}) {
+    auto suffix = empty ? " WHERE false" : "";
+    auto query  = std::string("SELECT * FROM export_timestamps") + suffix;
+    auto cpu    = root.path / (empty ? "cpu_empty" : "cpu");
+    auto gpu    = root.path / (empty ? "gpu_empty" : "gpu");
+    run_ok("SET gpu_execution=false");
+    run_ok("COPY (" + query + ") TO " + quote(cpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    run_ok("COPY (" + query + ") TO " + quote(gpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=false");
+    auto describe = [&](auto const& path) {
+      auto schema =
+        con->Query("DESCRIBE SELECT * FROM read_parquet(" + quote(path / "*.parquet") + ")");
+      if (schema->HasError()) UNSCOPED_INFO(schema->GetError());
+      REQUIRE_FALSE(schema->HasError());
+      return sirius::test::collect_rows(*schema);
+    };
+    REQUIRE(describe(cpu) == describe(gpu));
+    auto difference =
+      con->Query("SELECT count(*) FROM (SELECT * FROM read_parquet(" + quote(cpu / "*.parquet") +
+                 ") EXCEPT ALL SELECT * FROM read_parquet(" + quote(gpu / "*.parquet") + "))");
+    REQUIRE_FALSE(difference->HasError());
+    REQUIRE(difference->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 0);
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU empty tuple export retains recursive CPU field names and precision",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_empty_tuple(k INTEGER)");
+  run_ok("CHECKPOINT");
+  auto query =
+    "SELECT row(k, k::DECIMAL(9,2), row(k, TIMESTAMP '2024-01-02 03:04:05')) AS r FROM "
+    "export_empty_tuple";
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "cpu_tuple") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=false");
+  run_ok(std::string("COPY (") + query + ") TO " + quote(root.path / "gpu_tuple") +
+         " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+  run_ok("SET gpu_execution=false");
+  auto cpu = con->Query("DESCRIBE SELECT * FROM read_parquet(" +
+                        quote(root.path / "cpu_tuple/*.parquet") + ")");
+  auto gpu = con->Query("DESCRIBE SELECT * FROM read_parquet(" +
+                        quote(root.path / "gpu_tuple/*.parquet") + ")");
+  REQUIRE_FALSE(cpu->HasError());
+  REQUIRE_FALSE(gpu->HasError());
+  REQUIRE(sirius::test::collect_rows(*cpu) == sirius::test::collect_rows(*gpu));
+}
+
+namespace {
+class interrupted_copy_log_gate final : public sirius::log::sink {
+ public:
+  void set_level(sirius::log::level) override {}
+  bool should_log(sirius::log::level) const override { return true; }
+  bool flush() override { return true; }
+  void log(sirius::log::level,
+           std::source_location const& location,
+           std::string_view message) override
+  {
+    std::unique_lock lock(mutex);
+    if (!blocked && message.find("COPY_TO_FILE") != std::string_view::npos &&
+        message.find("executing on") != std::string_view::npos) {
+      blocked = true;
+      condition.notify_all();
+      condition.wait_for(lock, std::chrono::seconds(15), [&] { return released; });
+    }
+    if (std::string_view(location.file_name()).ends_with("sirius_engine.cpp") &&
+        message.starts_with("Error executing query:")) {
+      diagnostic = true;
+      condition.notify_all();
+      throw std::bad_alloc();
+    }
+  }
+  bool wait_for(bool interrupted_copy_log_gate::* flag)
+  {
+    std::unique_lock lock(mutex);
+    return condition.wait_for(lock, std::chrono::seconds(5), [&] { return this->*flag; });
+  }
+  void release()
+  {
+    std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_all();
+  }
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool blocked    = false;
+  bool diagnostic = false;
+  bool released   = false;
+};
+struct restore_export_test_logger {
+  std::shared_ptr<sirius::log::sink> previous = sirius::log::get_sink();
+  ~restore_export_test_logger() { sirius::log::set_sink(previous); }
+};
+}  // namespace
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Cancelled COPY retains interrupt classification even when error logging throws",
+                 "[parquet_export_gpu][integration]")
+{
+  export_directory root;
+  run_ok("SET gpu_execution=false");
+  run_ok("CREATE TABLE export_cancel_input AS SELECT i::INTEGER k FROM range(100) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=true");
+  run_ok("SET enable_duckdb_fallback=true");
+  auto gate = std::make_shared<interrupted_copy_log_gate>();
+  duckdb::unique_ptr<duckdb::QueryResult> result;
+  bool blocked = false, diagnostic = false;
+  {
+    restore_export_test_logger restore;
+    sirius::log::set_sink(gate, sirius::log::level::trace);
+    std::thread query([&] {
+      result =
+        con->Query("COPY (SELECT * FROM export_cancel_input) TO " + quote(root.path / "cancelled") +
+                   " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    });
+    blocked = gate->wait_for(&interrupted_copy_log_gate::blocked);
+    if (blocked) {
+      con->Interrupt();
+      diagnostic = gate->wait_for(&interrupted_copy_log_gate::diagnostic);
+    }
+    gate->release();
+    query.join();
+  }
+  REQUIRE(blocked);
+  REQUIRE(diagnostic);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  REQUIRE(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "cancelled"));
+  auto next = con->Query("SELECT count(*) FROM export_cancel_input");
+  REQUIRE_FALSE(next->HasError());
+  REQUIRE(next->Collection().GetRows().GetValue(0, 0).GetValue<int64_t>() == 100);
 }

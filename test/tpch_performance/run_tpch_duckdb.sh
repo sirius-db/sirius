@@ -380,6 +380,10 @@ run_multi_session() {
                 printf '\n'
             done
         } > "$TEMP_SQL"
+        if [ "$RESULT_FORMAT" = "parquet" ] && [ -n "${Q_DIR:-}" ]; then
+            cp "$TEMP_SQL" "$Q_DIR/query.sql"
+        fi
+
 
         local OUTPUT=""
         local Q_EXIT=0

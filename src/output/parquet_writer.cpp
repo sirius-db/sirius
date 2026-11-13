@@ -5,6 +5,7 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -115,8 +116,9 @@ std::unique_ptr<cudf::column> empty_column(parquet_field const& field)
   if (field.type.id() == type_id::LIST || field.type.id() == type_id::ARRAY) {
     auto offsets = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::UNALLOCATED);
-    if (cudaMemset(offsets->mutable_view().data<int32_t>(), 0, sizeof(int32_t)) != cudaSuccess)
-      throw std::runtime_error("Initializing empty Parquet list offsets failed");
+    auto status = cudaMemset(offsets->mutable_view().data<int32_t>(), 0, sizeof(int32_t));
+    if (status != cudaSuccess)
+      throw cudf::cuda_error("Initializing empty Parquet list offsets failed", status);
     return cudf::make_lists_column(
       0, std::move(offsets), empty_column(field.children.at(0)), 0, {});
   }
@@ -149,6 +151,8 @@ void write_parquet_part(parquet_export_spec const& spec,
   auto options =
     cudf::io::parquet_writer_options::builder(cudf::io::sink_info(path.string()), table)
       .metadata(std::move(metadata))
+      // Accepted SQL timestamp types are timezone-naive, including nested fields.
+      .utc_timestamps(false)
       .compression(cudf_codec(spec.compression))
       .build();
   cudf::io::write_parquet(options, stream);

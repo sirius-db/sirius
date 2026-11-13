@@ -129,7 +129,9 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
         });
         return completion;
       } catch (...) {
-        sink->abort();
+        // A failed retirement retains the plan in the lifecycle registry. Leave
+        // cleanup to its eventual destruction rather than racing live writers.
+        if (engine.plan_users_quiescent()) sink->abort();
         throw;
       }
     }
