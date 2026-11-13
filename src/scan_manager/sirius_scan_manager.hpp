@@ -859,7 +859,13 @@ class sirius_scan_manager {
   /// @c cache_handle -- alive under @p name until @ref remove_pinned_entry
   /// drops it. That is load-bearing rather than incidental: the evictor only
   /// considers a request's chunks once its consumer is disposed, so a live
-  /// handle is what keeps them out of the reclaim sweep entirely.
+  /// handle keeps them out of the evictor's and the idle reclaim's sweeps.
+  ///
+  /// Residency is still best-effort: under HOST memory pressure, a HOST downgrade
+  /// executor's forced reclaim (@c reclaim_mode::forced) also takes subscribed chunks
+  /// above the prefetch reservation, whatever the eviction settings. The pin stays
+  /// registered and later scans re-read the missing ranges from storage. The gpu and
+  /// host tiers hold their own memory and are not subject to it.
   ///
   /// Does not survive @ref reset_caches: that destroys the cache holding the
   /// chunks, so it drops these datasources (and warns) rather than leave a pin
@@ -1216,9 +1222,11 @@ class sirius_scan_manager {
   };
   /// Datasources retained by @ref pin_parquet_ranges, keyed by pin name. Holding
   /// them is the pin: each owns the cache_handle whose live consumer keeps
-  /// its chunks out of the evictor's reach.
+  /// its chunks out of the evictor's reach (but not a forced HOST reclaim's).
   std::unordered_map<std::string, std::vector<std::shared_ptr<cucascade::io::datasource>>>
     _pinned_parquet_sources;
+  /// Consumed by the next @ref reset_caches; see @ref fail_next_reset_for_testing.
+  std::exception_ptr _reset_fault;
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};

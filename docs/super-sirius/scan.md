@@ -357,6 +357,15 @@ CALL unpin_table('lineitem');
 
 `format` is `parquet` or `duckdb`, resolved at bind time from an explicit parameter or inferred from the path extension. `tier` is `gpu` (columns in GPU device memory), `host` (columns in pinned host memory) or `parquet` (parquet sources only: caches undecoded column-chunk ranges for the selected columns, or all columns when `cols` is omitted; cache hits avoid fetching those ranges, but scans still decode them; requires `scan_manager.cache.mode: cucs`).
 
+A `parquet` pin's residency is best-effort. The pin holds a live cache subscription, so the
+evictor and idle reclaim leave its chunks alone with `eviction: lru` and
+`eviction_threshold_fraction: 1.0` (the pin warns when either setting would let the evictor
+take them). Under HOST memory pressure, though, a HOST downgrade executor's forced reclaim takes
+subscribed chunks above the prefetch reservation regardless of those settings (see
+[HOST downgrade reclaim](#host-downgrade-reclaim)). The pin stays registered, and later scans
+re-read the reclaimed ranges from storage. Use `tier => 'host'` or `'gpu'` when the data must stay
+resident.
+
 ### Materializing a pin
 
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
@@ -737,7 +746,8 @@ on its next period. An exact credit needs cuCascade to report the bytes its allo
 a before/after snapshot in Sirius races the same way.
 
 Idle reclaim preserves subscribed chunks; forced reclaim may discard their cached staging
-buffers. Both modes leave pinned readers and in-flight loads untouched. Only the default
+buffers, including the chunks of a `pin_table(..., tier => 'parquet')` pin. Both modes leave
+pinned readers and in-flight loads untouched. Only the default
 local ioctx cache is bound to HOST executors; caches on routed remote contexts are not swept
 by this path.
 

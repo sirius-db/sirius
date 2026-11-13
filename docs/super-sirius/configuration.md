@@ -341,7 +341,9 @@ Thread pool (default `num_threads: 1`) plus:
 HOST downgrade executors synchronously reclaim idle staging chunks from the default local
 ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
-non-loading chunks up to the remaining deficit, even if a future scan subscribes to them.
+non-loading chunks up to the remaining deficit, even if a future scan subscribes to them. That
+includes the chunks of a `pin_table(..., tier => 'parquet')` pin, whatever the eviction settings:
+the pin stays registered and later scans re-read those ranges from storage.
 Only bytes above the cache's prefetch reservation (`scan_manager.cache.min_prefetching_budget_fraction`
 of each HOST space) relieve HOST pressure: the executor reclaims and credits only those bytes,
 from its own NUMA space, so the cache keeps at least its reservation. The credit is a

@@ -3497,15 +3497,21 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
       "sirius.executor.scan_manager.cache.mode to 'cucs' on a backend that supports it");
   }
   // Worth warning rather than failing: the pin still populates the cache and
-  // still serves reads either way, it is just not durable.
+  // still serves reads either way, it is just not durable. Even with the
+  // settings recommended here, HOST memory pressure can force-reclaim pinned
+  // chunks above the prefetch reservation; only the gpu/host tiers hold theirs.
   if (_config.cache.dispose_on_idle) {
     SIRIUS_LOG_WARN(
       "[pin_table] cache.eviction is 'idle', so pinned parquet chunks are reclaimed as soon "
-      "as nothing is reading them; set eviction to 'lru' for a durable pin");
+      "as nothing is reading them; set eviction to 'lru' to keep them while HOST memory "
+      "allows (HOST memory pressure can still reclaim them; use tier 'host' or 'gpu' for "
+      "guaranteed residency)");
   } else if (_config.cache.eviction_threshold_fraction < 1.0) {
     SIRIUS_LOG_WARN(
       "[pin_table] cache.eviction_threshold_fraction is {}, so the evictor starts before the "
-      "pool is full and can reclaim pinned chunks; set it to 1.0 for a durable pin",
+      "pool is full and can reclaim pinned chunks; set it to 1.0 to keep them while HOST "
+      "memory allows (HOST memory pressure can still reclaim them; use tier 'host' or 'gpu' "
+      "for guaranteed residency)",
       _config.cache.eviction_threshold_fraction);
   }
 
