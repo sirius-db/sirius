@@ -154,8 +154,9 @@ at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may ha
 lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
 `sirius_exchange_mnnvl`; a rank offered
 lanes by a peer it reaches another way fails to connect, saying so. On gcn-17/gcn-18 over one
-200 Gb/s port (`[nixl_bandwidth]`), 1+1 ranks moved 15.2-16.4 GB/s each way instead of 0.19, and
-4+4 ranks about 8.5 GB/s per rank.
+200 Gb/s port (`[nixl_bandwidth]`, 16 receive frames per peer), 1+1 ranks with 16 lanes moved
+19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
+across the link each way; raw TCP reaches 24.75 there.
 
 ### NVLink between nodes (MNNVL)
 
@@ -456,14 +457,19 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   [gateway](distributed-gateway.md) does this restart.
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
-  scripts set both by default: `UCX_TLS` in `launcher_env.sh`, and `UCX_NET_DEVICES` from the
-  rank's address ([quick start](distributed-quickstart.md)).
-  More than two hosts, and RDMA between hosts, are untested (#2372).
-- **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
+  scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)): the
+  GPU rail NICs with every UCX transport on a host that has them, else `tcp` on the interface of
+  the rank's address.
+  Between nodes of one NVLink domain the data goes over the
+  [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
+  ran for all of TPC-H at SF30000, and between other hosts over TCP lanes (#2372).
+- **Credits:** each peer gets a fixed share of the receive ring (16 frames of 16 MiB by
+  default: `sirius_exchange_recv_frames_per_peer`, `sirius_exchange_frame_bytes`).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
-- **Ring memory:** the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB at 2 ranks,
-  576 MiB at 8), allocated outside the GPU memory space's budget, which does not shrink for
-  them. Reserving them from the space instead stalls any task whose request is clamped to the
+- **Ring memory:** by default the rings take (32 + 16 x (ranks - 1)) x 16 MiB per GPU (768 MiB
+  at 2 ranks, 2.25 GiB at 8), allocated outside the GPU memory space's budget, which does not
+  shrink for them. A rank on the TCP lanes path also pins, in host memory, a mirror the size of
+  its receive ring and two send slots of one frame per lane. Reserving them from the space instead stalls any task whose request is clamped to the
   space's whole budget, so charging them waits for the budget to shrink with them (#2371).
 - **CI:** the one-rank-per-process tests (`[nixl_multiprocess]`) need several GPUs and run only on
   developer machines (#2480).
