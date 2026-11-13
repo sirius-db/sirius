@@ -93,6 +93,7 @@ extern "C" int cudaProfilerStop();
 #include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "op/discard_copy_function.hpp"
 #include "op/merge/merge_config.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
@@ -2445,6 +2446,8 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   sirius::exec::register_stream_source_function(instance);
   // sirius_generate(...): synthetic data produced on the GPU by the GENERATOR source.
   sirius::op::scan::generator::register_generate_function(instance);
+  // COPY ... (FORMAT sirius_discard): runs a query and drops its rows.
+  sirius::op::register_discard_copy_function(instance);
 
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
