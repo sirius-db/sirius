@@ -26,6 +26,12 @@
 
 namespace sirius {
 
+namespace compression {
+// Defined in compression/compressed_row_range_readers.hpp; declared here so that this header
+// does not pull in the Simpatico decode API.
+void register_compressed_row_range_readers(cucascade::row_range_reader_registry& registry);
+}  // namespace compression
+
 /**
  * @brief Centralized accessor for the row-range reader registry.
  *
@@ -39,7 +45,8 @@ class row_range_reader_registry {
   using registry_type = cucascade::row_range_reader_registry;
 
   /**
-   * @brief Initialize the row-range reader registry with the builtin readers.
+   * @brief Initialize the row-range reader registry with the builtin readers and the readers of
+   * the compressed (Simpatico) representations.
    *
    * This should be called once when the extension is loaded. A second call is a no-op.
    * The disk reader uses each source's memory-space I/O backend.
@@ -52,7 +59,7 @@ class row_range_reader_registry {
     if (instance_) { return false; }
     auto registry = std::make_unique<registry_type>();
     cucascade::register_builtin_row_range_readers(*registry);
-    // Builtin readers only: compressed (Simpatico) representations have no reader.
+    compression::register_compressed_row_range_readers(*registry);
     instance_ = std::move(registry);
     published_.store(instance_.get(), std::memory_order_release);
     return true;
