@@ -5,6 +5,7 @@
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/positional_visibility.hpp"
+#include "op/scan/table_scan/field_mapper.hpp"
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -433,6 +434,24 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     {9, duckdb::LogicalType::BIGINT, {}, true},
     {4, duckdb::LogicalType::INTEGER, {}, false},
     {12, duckdb::LogicalType::INTEGER, duckdb::Value(duckdb::LogicalType::INTEGER), false}};
+  scan_plan mapped_layout;
+  mapped_layout.data_columns = {{0, "renamed_right"}, {1, "renamed_left"}, {2, "added"}};
+  physical_check_counters mapper_counts;
+  mapping_request request{
+    rule_set_id::iceberg_flat_v1, resolved.artifact, path, mapped_layout, program};
+  request.requirements = fields;
+  auto refused         = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<mapping_refusal>(refused));
+  CHECK(std::get<mapping_refusal>(refused).rule == refusal_rule::partition_constant_unproved);
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
+  std::unordered_set<std::string> proof{path};
+  request.files_without_partition_values = &proof;
+  auto accepted                          = map_file(request, &mapper_counts);
+  REQUIRE(std::holds_alternative<std::shared_ptr<mapping_result const>>(accepted));
+  auto const& mapped = *std::get<std::shared_ptr<mapping_result const>>(accepted);
+  CHECK(mapped.compiled->read_names() == std::vector<std::string>{"right", "old.dot"});
+  CHECK(mapped.leaves == std::vector<std::vector<std::size_t>>{{1}, {0}});
+  CHECK(mapper_counts.mapper_refusals[2][10].load() == 1);
   auto mapping = field_id_mapping::compile(resolved.artifact, resolved.identity, program, fields);
   CHECK_FALSE(mapping.statistics_name(0));  // Widened value.
   CHECK_FALSE(mapping.statistics_name(1));  // Literal dot is not a nested path.
@@ -960,9 +979,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "Adapter mapping hook runs without an Iceberg physical schema",
                  "[materialization][scan][mapping][adapter][integration][fw_s4]")
 {
-  auto defect = std::string{GENERATE(
+  auto defect               = std::string{GENERATE(
     "valid", "foreign_contract", "foreign_metadata", "missing_datasource", "foreign_identity")};
-  CAPTURE(defect);
+  bool const multiple_files = GENERATE(false, true);
+  CAPTURE(defect, multiple_files);
   sirius::test::scratch_dir directory("materialization_adapter_mapping");
   auto path = directory.file("input.parquet");
   auto written =
@@ -970,9 +990,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                " (FORMAT PARQUET, FIELD_IDS {old_id: 1})");
   REQUIRE(written);
   REQUIRE_FALSE(written->HasError());
-  auto info                    = std::make_unique<parquet_ingestible_table_info>();
-  info->contract_id            = 92;
-  info->resolved_file_paths    = {path};
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = 92;
+  info->resolved_file_paths = {path};
+  if (multiple_files) {
+    auto second = directory.file("second.parquet");
+    std::filesystem::copy_file(path, second);
+    info->resolved_file_paths.push_back(second);
+  }
   info->names                  = {"renamed"};
   info->returned_types         = {sirius::logical_type::make(sirius::type_id::BIGINT)};
   info->column_ids             = {duckdb::ColumnIndex(0)};
@@ -997,9 +1022,16 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(file.field_mapping->read_names() == std::vector<std::string>{"old_id"});
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(std::move(prepared));
+  if (multiple_files) {
+    auto second = prepare({});
+    REQUIRE(second);
+    for (auto& split : coalescer->push(std::move(second)))
+      splits.push_back(std::move(split));
+  }
   for (auto& split : coalescer->flush())
     splits.push_back(std::move(split));
-  REQUIRE(splits.size() == 1);
+  // File-specific mapped reader options retain the production grouping boundary.
+  REQUIRE(splits.size() == (multiple_files ? 2 : 1));
   auto& split = dynamic_cast<parquet_split_info&>(*splits.front());
   REQUIRE(split.field_mapping);
   REQUIRE(split.rg_slices.size() == 1);
@@ -1042,13 +1074,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     return;
   }
-  auto batch =
-    ingestible->materialize_metadata_to_table(*splits.front(), *space, stream, false, nullptr);
-  REQUIRE(batch.execution);
-  CHECK_FALSE(batch.execution->authoritative);
-  auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
-  CHECK(output->num_rows() == 1);
-  CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  for (auto const& split : splits) {
+    auto batch = ingestible->materialize_metadata_to_table(*split, *space, stream, false, nullptr);
+    REQUIRE(batch.execution);
+    CHECK(batch.execution->authoritative);
+    auto output = ingestible->post_filter_and_project(std::move(batch), *space, stream);
+    CHECK(output->num_rows() == 1);
+    CHECK(output->view().column(0).type().id() == cudf::type_id::INT64);
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

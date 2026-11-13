@@ -102,7 +102,7 @@ sirius:
       num_threads: 4
       backend: native
       uring_n_reactors: 4
-      cache: { mode: none, eviction: lru }
+      cache: { mode: cucs, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -114,7 +114,6 @@ sirius:
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
     enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
-    max_dynamic_filter_bloom_bytes_per_gpu: 256Mi  # accumulated Bloom arrays across keys, per GPU
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip all filters for keys meeting known-domain coverage
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
@@ -496,7 +495,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
+| `mode` | enum: `none`, `os`, `cucs` | `cucs` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
@@ -504,6 +503,11 @@ sirius:
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
 through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
 pinned prefetching cache (`fs_cache`).
+
+Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
+file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
+existing pinned host-memory pool. With `max_readahead_scans` unset, REST read-ahead
+uses its backend budget; local uring read-ahead remains off by default.
 
 `eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
 pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
@@ -616,6 +620,13 @@ default is narrowed to
 An explicit value for either budget overrides its default. `SET hash_partition_bytes`
 does not re-derive either budget; `RESET` restores each registered startup default.
 
+The per-GPU dynamic-filter Bloom budget is always **4× the query's
+`scan_task_batch_size`**, including YAML scan-size overrides and internal test
+settings. Multiplication saturates at the maximum unsigned 64-bit byte count.
+The budget is engine-owned: `max_dynamic_filter_bloom_bytes_per_gpu` is no longer
+accepted in YAML or registered as a SQL setting. Remove the old key from existing
+configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulation.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
@@ -636,6 +647,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
+| `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
@@ -645,6 +657,8 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
+
+**Note:** admission includes every GPU that holds a Simpatico-compressed chunk of a GPU-tier pin matching a source scanned by the query, even when `topology.gpus_per_query` or `admission_bytes_per_gpu` would admit fewer. Owner discovery matches source identity before pin binding, so it can include owners of a pin that ultimately does not serve the scan. For example, a compressed pin containing only `k` across two GPUs still widens a query selecting unpinned `v` from the same parquet source, even with `topology.gpus_per_query: 1`. A compressed chunk is decoded on the GPU that holds it, so narrowing the query away from that GPU would leave the chunk with nowhere to be decoded; the engine logs `[gpu_alloc] admission widened ...` when this applies. Uncompressed GPU-tier pins and host-tier pins are copied to the admitted GPUs and do not widen the set.
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -767,20 +781,6 @@ per-pool extras.
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
 GPU's CPU topology. `num_threads` must be `> 0` for every pool.
-
-## DuckDB Settings Changed by Sirius
-
-Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
-
-| Setting | DuckDB default | Default with Sirius | Description |
-|---------|----------------|---------------------|-------------|
-| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
-
-DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
-
-```sql
-SET delim_join_as_cte = true;
-```
 
 ## DuckDB SET Variables
 
@@ -909,6 +909,7 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
@@ -956,7 +957,6 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication is unaffected. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |

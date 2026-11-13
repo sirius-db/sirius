@@ -353,17 +353,23 @@ TEST_CASE("eviction_policy round-trips through its YAML spelling",
   CHECK(out == "lru");
 }
 
-TEST_CASE("scan_manager_config defaults to the none cache mode",
+TEST_CASE("scan_manager_config defaults to the cucs cache with LRU eviction",
           "[scan_manager][config][cache_mode]")
 {
   scan_manager_config cfg{};
 
-  CHECK(cfg.cache.mode == cache_mode::none);
+  CHECK(cfg.cache.mode == cache_mode::cucs);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
   CHECK(cfg.uring.use_odirect);
-  CHECK_FALSE(cfg.cache.enabled());
-  CHECK_FALSE(cfg.cache.use_fs_cache());
+  CHECK(cfg.cache.enabled());
+  CHECK(cfg.cache.use_fs_cache());
   CHECK_FALSE(cfg.cache.dispose_on_idle);
+
+  auto const io = cfg.to_io_config();
+  CHECK(io.cache.mode == cache_mode::cucs);
+  CHECK(io.cache.eviction == eviction_policy::lru);
+  CHECK(io.cache.use_fs_cache());
+  CHECK_FALSE(io.cache.dispose_on_idle);
 }
 
 TEST_CASE("apply_cache_mode derives the knobs for every mode", "[scan_manager][config][cache_mode]")
@@ -448,16 +454,40 @@ TEST_CASE("sirius_config accepts the deprecated sirius cache mode as cucs",
   CHECK(cfg.uring.use_odirect);
 }
 
-TEST_CASE("sirius_config defaults the cache mode to none when YAML omits it",
+TEST_CASE("sirius_config defaults the cache mode to cucs when YAML omits it",
           "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_mode_default.yaml",
                                      scan_manager_yaml("      uring_n_reactors: 2\n"));
 
-  CHECK(cfg.cache.mode == cache_mode::none);
+  CHECK(cfg.cache.mode == cache_mode::cucs);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
   CHECK(cfg.uring.use_odirect);
-  CHECK_FALSE(cfg.cache.use_fs_cache());
+  CHECK(cfg.cache.use_fs_cache());
+  CHECK_FALSE(cfg.cache.dispose_on_idle);
+}
+
+TEST_CASE("sirius_config allows disabling the default cache or overriding its eviction",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const off =
+    load_scan_manager("sirius_cache_disabled.yaml", cache_yaml("        mode: none\n"));
+  CHECK(off.cache.mode == cache_mode::none);
+  CHECK_FALSE(off.cache.enabled());
+  CHECK_FALSE(off.cache.use_fs_cache());
+  CHECK(off.uring.use_odirect);
+  CHECK(off.resolve_readahead(7, sirius::scan_manager::prefetch_strategy::eager).budget == 0);
+
+  auto const idle =
+    load_scan_manager("sirius_cache_default_idle.yaml", cache_yaml("        eviction: idle\n"));
+  CHECK(idle.cache.mode == cache_mode::cucs);
+  CHECK(idle.cache.eviction == eviction_policy::idle);
+  CHECK(idle.cache.dispose_on_idle);
+
+  auto const empty =
+    load_scan_manager("sirius_cache_empty.yaml", scan_manager_yaml("      cache: {}\n"));
+  CHECK(empty.cache.mode == cache_mode::cucs);
+  CHECK(empty.cache.eviction == eviction_policy::lru);
 }
 
 TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cache_mode]")
@@ -510,6 +540,7 @@ TEST_CASE("max_readahead_scans overrides the cache-derived readahead budget",
 
   scan_manager_config cfg{};
   // Unset + no cache: nothing to read ahead into.
+  cfg.cache.mode = cache_mode::none;
   CHECK(cfg.resolve_readahead(backend_budget, backend_strategy).budget == 0);
 
   // Unset + a cache on: the backend reactor's own depth.
@@ -593,6 +624,11 @@ TEST_CASE("apply_defaults derives the readahead budgets like the file path does"
   sirius::sirius_config cfg;
   cfg.apply_defaults();
   auto const& scan_manager = cfg.get_scan_manager_config();
+
+  CHECK(scan_manager.cache.mode == cache_mode::cucs);
+  CHECK(scan_manager.cache.eviction == eviction_policy::lru);
+  CHECK(scan_manager.cache.use_fs_cache());
+  CHECK_FALSE(scan_manager.cache.dispose_on_idle);
 
   // Having no sirius.yaml must size the readahead exactly like an empty one.
   // The local (uring) backend stays at 0 (readahead off); the rest backend

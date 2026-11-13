@@ -86,6 +86,17 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    # zstd device code; needs a CUDA 12.4+ driver, below the 12.8 floor.
+    target_compile_options(
+      ${_target}
+      PRIVATE
+        "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+    )
+    if(NOT _target STREQUAL "sirius_objects")
+      target_link_options(
+        ${_target} PRIVATE
+        "$<DEVICE_LINK:-Xfatbin=-compress-all;--compress-mode=size>")
+    endif()
   endif()
 
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's

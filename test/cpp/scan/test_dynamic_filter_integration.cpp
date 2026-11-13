@@ -181,7 +181,8 @@ class resident_ingestible final : public gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<sirius::like_multiliteral_cache const>,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("resident decode outcome test cannot read scan metadata");
   }
@@ -227,7 +228,8 @@ class leading_identity_ingestible final : public gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<sirius::like_multiliteral_cache const>,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("leading identity test ingestible cannot read scan metadata");
   }

@@ -2935,6 +2935,14 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableDelimAggregateReuse(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_delim_aggregate_reuse = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DELIM_AGGREGATE_REUSE to {}",
+                   params->enable_delim_aggregate_reuse);
+}
+
 static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                         = get_operator_params(context, scope);
@@ -2991,22 +2999,6 @@ static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
   params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
                    params->enable_dynamic_filter_multi_partition);
-}
-
-static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
-                                                SetScope scope,
-                                                Value& parameter)
-{
-  auto const bytes = UBigIntValue::Get(parameter);
-  if (bytes == 0) {
-    throw InvalidInputException(
-      "max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero; set "
-      "enable_dynamic_filter_multi_partition = false to disable Bloom accumulation");
-  }
-  auto* params                                   = get_operator_params(context, scope);
-  params->max_dynamic_filter_bloom_bytes_per_gpu = bytes;
-  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
-                   params->max_dynamic_filter_bloom_bytes_per_gpu);
 }
 
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
@@ -3418,6 +3410,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnableDenseCountJoin);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_delim_aggregate_reuse",
+                    "compute decorrelated subquery aggregates from the delim join's outer rows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
+                    SetEnableDelimAggregateReuse);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_exists_minmax_rewrite",
                     "runtime override for the correlated EXISTS MIN/MAX rewrite",
                     LogicalType::BOOLEAN,
@@ -3635,16 +3634,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
     SetEnableDynamicFilterMultiPartition);
 
-  add_sirius_option(
-    config,
-    option_visibility::internal,
-    "max_dynamic_filter_bloom_bytes_per_gpu",
-    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
-    "must be greater than zero",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
-    SetMaxDynamicFilterBloomBytesPerGpu);
-
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
@@ -3756,27 +3745,6 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
-// Make DuckDB keep explicit delim joins when it decorrelates subqueries, unless the database
-// already carries an explicit global value (for example from the connection config or a
-// `SET GLOBAL` before LOAD). A session-level `SET delim_join_as_cte = true` still wins, because
-// DuckDB resolves a session value before the global one.
-//
-// Why: DuckDB v2 defaults `delim_join_as_cte` to true and rewrites each delim join into a
-// materialized CTE. Sirius does not yet plan those CTE shapes well: TPC-H Q21's NOT EXISTS then
-// builds a mixed anti-join hash table over every late lineitem, and Q20/Q22 lose dynamic filters
-// behind mark joins, which made them 1.2-3.5x slower at SF1000 than the delim-join plans. This is a
-// stopgap until Sirius handles the v2 CTE plan shapes. DuckDB already flags the setting as
-// deprecated, so revisit this when DuckDB removes it.
-//
-// The value is written into the global user settings directly rather than through `SET`, which
-// would run DuckDB's deprecation callback and log a warning on every database that loads Sirius.
-static void default_to_explicit_delim_joins(DBConfig& config)
-{
-  constexpr idx_t setting_index = DelimJoinAsCteSetting::SettingIndex;
-  if (config.user_settings.IsSet(setting_index)) { return; }
-  Settings::Set<DelimJoinAsCteSetting>(config, SetScope::GLOBAL, Value::BOOLEAN(false));
-}
-
 // CUDA 12.8+ builds call cudaMemcpyBatchAsync, which older drivers lack. Keep this guard in sync
 // with the `CUDART_VERSION >= 12080` batch-copy paths (device_transfer.cpp,
 // duckdb_native_decoder.cpp, spill_chunked_converters.cpp). The sirius loader checks this too,
@@ -3863,10 +3831,9 @@ static void LoadInternal(ExtensionLoader& loader)
   // Publish the optimizer mask last, only after every initialization step
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
-  // extension binary itself may still be loaded). The delim-join default follows the same rule.
+  // extension binary itself may still be loaded).
   if (!sirius_disabled) {
     publish_transparent_optimizer_mask(config);
-    default_to_explicit_delim_joins(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
 }

@@ -348,7 +348,8 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
   ::cuda::stream_ref stream,
   bool like,
   std::shared_ptr<sirius::like_multiliteral_cache const> cache,
-  expression_query_policy policy)
+  expression_query_policy policy,
+  scan_execution_context /*execution*/)
 {
   impl_->check_stop();
   scan::validate_split_for_gpu(impl_->info.contract_id,

@@ -657,7 +657,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       !gpu_spaces.empty() && !host_spaces.empty() &&
       (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
-                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu > 0));
+                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu() > 0));
     if (discovery_runs) {
       bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
@@ -820,7 +820,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
        .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
-       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
+       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu()}};
 
     auto join = make_hash_join(op,
                                std::move(left),

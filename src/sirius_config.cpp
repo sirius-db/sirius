@@ -454,12 +454,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   }
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
-  r.optional("max_dynamic_filter_bloom_bytes_per_gpu",
-             yaml::bytes(opt.max_dynamic_filter_bloom_bytes_per_gpu));
-  if (opt.max_dynamic_filter_bloom_bytes_per_gpu == 0) {
+  if (r.has("max_dynamic_filter_bloom_bytes_per_gpu")) {
     throw std::runtime_error(
-      "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': must be greater than zero; set "
-      "enable_dynamic_filter_multi_partition to false to disable Bloom accumulation");
+      "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget is "
+      "always 4x scan_task_batch_size; remove this key. Set enable_dynamic_filter_multi_partition "
+      "to false to disable Bloom accumulation");
   }
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
@@ -474,6 +473,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("enable_delim_aggregate_reuse", opt.enable_delim_aggregate_reuse);
   r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);
   // 0 is meaningful here: it selects the share of GPU memory space capacity.
   r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));

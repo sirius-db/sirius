@@ -106,9 +106,11 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
+    test/cpp/integration/test_gpu_execution_decimal_avg.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
+    test/cpp/integration/test_gpu_execution_delim_aggregate_reuse.cpp
     test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
@@ -232,6 +234,7 @@ set(TEST_SOURCES
     test/cpp/operator/window/test_cumulative.cpp
     test/cpp/operator/window/test_ranking.cpp
     test/cpp/operator/window/test_whole_partition.cpp
+    test/cpp/operator/aggregate/test_average_as_double.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_sorted_keys.cpp
@@ -281,6 +284,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
+    test/cpp/planner/test_delim_aggregate_reuse.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
@@ -362,6 +366,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_residual_filter.cpp
     test/cpp/scan/test_scan_execution.cpp
     test/cpp/scan/test_scan_materialization.cpp
+    test/cpp/scan/test_row_lineage.cpp
+    test/cpp/scan/test_shared_materializer.cpp
+    test/cpp/scan/test_field_mapper.cpp
     test/cpp/scan/test_arrow_import_resources.cpp
     test/cpp/scan/test_composite_scan_driver.cpp
     test/cpp/scan/test_arrow_import_driver.cpp

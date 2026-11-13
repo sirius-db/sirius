@@ -45,6 +45,18 @@ namespace sirius::scan_manager {
 /// counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
+/// Sirius keeps read-path chunks in cuCascade's pinned host cache for reuse,
+/// with LRU eviction under memory pressure. Keep this default independent of
+/// cuCascade's library defaults; YAML can still select none, os, or idle eviction.
+[[nodiscard]] inline cucascade::io::cache::config default_cache_config() noexcept
+{
+  auto c     = cucascade::io::cache::config{};
+  c.mode     = cucascade::io::cache::cache_mode::cucs;
+  c.eviction = cucascade::io::cache::eviction_policy::lru;
+  c.apply_mode();
+  return c;
+}
+
 /// Sirius's default uring backend config: cuCascade's struct defaults with
 /// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
 /// 0 as well; the explicit assignment keeps Sirius's choice independent of it.
@@ -290,7 +302,7 @@ struct scan_manager_config {
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
-  cucascade::io::cache::config cache{};
+  cucascade::io::cache::config cache{default_cache_config()};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
