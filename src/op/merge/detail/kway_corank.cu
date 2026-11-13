@@ -1,0 +1,283 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/merge/detail/kway_comparator.cuh"
+#include "op/merge/detail/kway_merge_detail.hpp"
+
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
+
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform_reduce.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace sirius::op::merge::detail {
+
+namespace {
+
+constexpr int kWarpSize = 32;
+
+/// lo + the number of rows in [lo, hi) of window @p input that order before row @p pivot_row of
+/// window @p pivot_input. The rows of a window are sorted, so those rows are a prefix of the range.
+__device__ cudf::size_type lower_bound(const kway_key_device_view& view,
+                                       int32_t input,
+                                       cudf::size_type lo,
+                                       cudf::size_type hi,
+                                       int32_t pivot_input,
+                                       cudf::size_type pivot_row) noexcept
+{
+  while (lo < hi) {
+    const cudf::size_type mid = lo + (hi - lo) / 2;
+    if (view.less(input, mid, pivot_input, pivot_row)) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/**
+ * Multi-sequence selection, one warp (one block of 32 threads) per rank. Lane l owns the inputs
+ * l, l + 32, ...
+ *
+ * Invariant: lo[j] <= c_j <= hi[j], where c_j is the answer. Each iteration takes the middle row
+ * of the widest remaining range as the pivot, counts in every input the rows that order before
+ * the pivot (one binary search per input, restricted to [lo[j], hi[j])) and compares the sum R
+ * with the rank:
+ * - R < rank: the pivot and every row before it are selected, so lo[j] rises to the count;
+ * - R > rank: the pivot and every row after it are unselected, so hi[j] drops to the count;
+ * - R == rank: the counts are the answer.
+ * Restricting the searches keeps the three cases exact: a count clamped to [lo[j], hi[j]] stays
+ * on the same side of c_j as the true count.
+ *
+ * The pivot's range at least halves each iteration, so there are at most k * log2(n) iterations
+ * of k binary searches each (32 at a time); on typical data the other ranges shrink with it and
+ * the iteration count is close to log2(k * n).
+ *
+ * lo lives in the output; hi and count are scratch arrays with the same layout.
+ */
+__global__ void corank_kernel(kway_key_device_view view,
+                              const cudf::size_type* lengths,
+                              const cudf::size_type* ranks,
+                              cudf::size_type* out,
+                              cudf::size_type* hi_scratch,
+                              cudf::size_type* count_scratch)
+{
+  __shared__ cudf::size_type s_width[kWarpSize];
+  __shared__ int32_t s_input[kWarpSize];
+  __shared__ cudf::size_type s_row[kWarpSize];
+  __shared__ int64_t s_lo[kWarpSize];
+  __shared__ int64_t s_hi[kWarpSize];
+  __shared__ int64_t s_count[kWarpSize];
+
+  const int lane             = static_cast<int>(threadIdx.x);
+  const int32_t k            = view.num_inputs;
+  const int64_t rank         = ranks[blockIdx.x];
+  const std::size_t offset   = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(k);
+  cudf::size_type* const lo  = out + offset;
+  cudf::size_type* const hi  = hi_scratch + offset;
+  cudf::size_type* const cnt = count_scratch + offset;
+
+  for (int32_t j = lane; j < k; j += kWarpSize) {
+    lo[j] = 0;
+    hi[j] = lengths[j];
+  }
+
+  while (true) {
+    // Widest remaining range and the sums of the bounds.
+    cudf::size_type width = 0;
+    int32_t pivot_input   = -1;
+    cudf::size_type pivot = 0;
+    int64_t sum_lo        = 0;
+    int64_t sum_hi        = 0;
+    for (int32_t j = lane; j < k; j += kWarpSize) {
+      const cudf::size_type w = hi[j] - lo[j];
+      if (w > width) {
+        width       = w;
+        pivot_input = j;
+        pivot       = lo[j] + w / 2;
+      }
+      sum_lo += lo[j];
+      sum_hi += hi[j];
+    }
+    s_width[lane] = width;
+    s_input[lane] = pivot_input;
+    s_row[lane]   = pivot;
+    s_lo[lane]    = sum_lo;
+    s_hi[lane]    = sum_hi;
+    __syncthreads();
+    width  = 0;
+    sum_lo = 0;
+    sum_hi = 0;
+    for (int l = 0; l < kWarpSize; ++l) {
+      if (s_width[l] > width) {
+        width       = s_width[l];
+        pivot_input = s_input[l];
+        pivot       = s_row[l];
+      }
+      sum_lo += s_lo[l];
+      sum_hi += s_hi[l];
+    }
+    __syncthreads();
+
+    // Every lane computed the same sums, so the whole warp leaves the loop together.
+    // width == 0 only with sum_lo == rank, unless the rank is out of range (> Σ lengths).
+    if (sum_lo == rank || width == 0) { break; }
+    if (sum_hi == rank) {
+      for (int32_t j = lane; j < k; j += kWarpSize) {
+        lo[j] = hi[j];
+      }
+      break;
+    }
+
+    int64_t before = 0;
+    for (int32_t j = lane; j < k; j += kWarpSize) {
+      cnt[j] = j == pivot_input ? pivot : lower_bound(view, j, lo[j], hi[j], pivot_input, pivot);
+      before += cnt[j];
+    }
+    s_count[lane] = before;
+    __syncthreads();
+    before = 0;
+    for (int l = 0; l < kWarpSize; ++l) {
+      before += s_count[l];
+    }
+    __syncthreads();
+
+    if (before == rank) {
+      for (int32_t j = lane; j < k; j += kWarpSize) {
+        lo[j] = cnt[j];
+      }
+      break;
+    }
+    if (before < rank) {
+      for (int32_t j = lane; j < k; j += kWarpSize) {
+        lo[j] = j == pivot_input ? pivot + 1 : cnt[j];
+      }
+    } else {
+      for (int32_t j = lane; j < k; j += kWarpSize) {
+        hi[j] = cnt[j];
+      }
+    }
+  }
+}
+
+/// The two device-side terms of the safe target.
+struct target_bounds {
+  int64_t r_safe;  ///< min over truncated windows of (rank of the window's last row + 1)
+  int64_t total;   ///< Σ lengths
+};
+
+struct window_bounds_fn {
+  kway_key_device_view view;
+  const cudf::size_type* lengths;
+  const std::uint8_t* truncated;
+
+  __device__ target_bounds operator()(int32_t i) const noexcept
+  {
+    const cudf::size_type len = lengths[i];
+    if (truncated[i] == 0) { return {std::numeric_limits<int64_t>::max(), len}; }
+    // Nothing can be emitted before a truncated window with no rows is refilled.
+    if (len == 0) { return {0, 0}; }
+    int64_t rank = len - 1;
+    for (int32_t j = 0; j < view.num_inputs; ++j) {
+      if (j != i) { rank += lower_bound(view, j, 0, lengths[j], i, len - 1); }
+    }
+    return {rank + 1, len};
+  }
+};
+
+struct combine_bounds_fn {
+  __device__ target_bounds operator()(const target_bounds& a, const target_bounds& b) const noexcept
+  {
+    return {a.r_safe < b.r_safe ? a.r_safe : b.r_safe, a.total + b.total};
+  }
+};
+
+void check_lengths(const kway_key_comparator& cmp,
+                   cudf::device_span<const cudf::size_type> lengths,
+                   const char* what)
+{
+  if (lengths.size() != static_cast<std::size_t>(cmp.num_inputs())) {
+    throw std::invalid_argument(std::string(what) + ": one length per key window is required");
+  }
+}
+
+}  // namespace
+
+void corank_split(const kway_key_comparator& cmp,
+                  cudf::device_span<const cudf::size_type> lengths,
+                  cudf::device_span<const cudf::size_type> ranks,
+                  cudf::device_span<cudf::size_type> out,
+                  rmm::cuda_stream_view stream)
+{
+  check_lengths(cmp, lengths, "corank_split");
+  if (out.size() != ranks.size() * lengths.size()) {
+    throw std::invalid_argument("corank_split: out needs ranks.size() * k entries");
+  }
+  if (ranks.empty()) { return; }
+  if (ranks.size() > static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::invalid_argument("corank_split: too many ranks");
+  }
+
+  // hi and count of every (rank, input), laid out like out.
+  rmm::device_uvector<cudf::size_type> scratch(
+    2 * out.size(), stream, cudf::get_current_device_resource_ref());
+  corank_kernel<<<static_cast<unsigned>(ranks.size()), kWarpSize, 0, stream.value()>>>(
+    device_view_of(cmp),
+    lengths.data(),
+    ranks.data(),
+    out.data(),
+    scratch.data(),
+    scratch.data() + out.size());
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+// A truncated window with no rows forces the target to 0: the next row of its run is unknown, so
+// no row of any window is safe to emit. The caller must refill such a window before the round.
+cudf::size_type safe_target(const kway_key_comparator& cmp,
+                            cudf::device_span<const cudf::size_type> lengths,
+                            cudf::device_span<const std::uint8_t> truncated,
+                            cudf::size_type max_rows,
+                            rmm::cuda_stream_view stream)
+{
+  check_lengths(cmp, lengths, "safe_target");
+  if (truncated.size() != lengths.size()) {
+    throw std::invalid_argument("safe_target: one truncated flag per key window is required");
+  }
+
+  // One thread per window, one binary search per (truncated window, other window) pair. The
+  // result of the reduction is the only device-to-host copy.
+  const auto bounds = thrust::transform_reduce(
+    rmm::exec_policy_nosync(stream),
+    thrust::counting_iterator<int32_t>(0),
+    thrust::counting_iterator<int32_t>(cmp.num_inputs()),
+    window_bounds_fn{device_view_of(cmp), lengths.data(), truncated.data()},
+    target_bounds{std::numeric_limits<int64_t>::max(), 0},
+    combine_bounds_fn{});
+  return static_cast<cudf::size_type>(
+    std::min({static_cast<int64_t>(max_rows), bounds.r_safe, bounds.total}));
+}
+
+}  // namespace sirius::op::merge::detail
