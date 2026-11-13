@@ -33,6 +33,7 @@
 #include <memory>
 #include <optional>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -97,6 +98,34 @@ void mark_boundary_restore(policy_state& state, carried_columns const& columns)
 {
   for (auto const& candidate : columns) {
     if (candidate) { state.candidates[*candidate].boundary_restore = true; }
+  }
+}
+
+// The native-boundary aggregate of propagation's admit_dictionary_group_keys: a DICTIONARY32
+// group key read by nothing else enters the aggregate unrestored, which earns transport; every
+// other carried child column is a boundary restore.
+void admit_dictionary_group_keys(policy_state& state,
+                                 sirius::op::sirius_physical_grouped_aggregate const& aggregate,
+                                 carried_columns const& inputs)
+{
+  auto const read_by_values = aggregate.value_read_inputs();
+  std::unordered_set<std::size_t> dictionary_keys;
+  for (auto const key_idx : aggregate.group_idx) {
+    if (key_idx < 0 || static_cast<std::size_t>(key_idx) >= inputs.size()) { continue; }
+    auto const child_idx = static_cast<std::size_t>(key_idx);
+    if (inputs[child_idx] && !read_by_values.contains(child_idx) &&
+        state.candidates[*inputs[child_idx]].carrier.id() == cudf::type_id::DICTIONARY32) {
+      dictionary_keys.insert(child_idx);
+    }
+  }
+  for (std::size_t child_idx = 0; child_idx < inputs.size(); ++child_idx) {
+    if (!inputs[child_idx]) { continue; }
+    auto& candidate = state.candidates[*inputs[child_idx]];
+    if (dictionary_keys.contains(child_idx)) {
+      candidate.transport = true;
+    } else {
+      candidate.boundary_restore = true;
+    }
   }
 }
 
@@ -463,9 +492,10 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       if (op.children.size() != 1) { break; }
       auto const& aggregate = op.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.has_grouping_sets()) { break; }
-      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
-      if (op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
-        break;
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots) ||
+          op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
+        admit_dictionary_group_keys(state, aggregate, child_maps[0]);
+        return carried_columns(op.types.size());
       }
       auto const child_width = op.children[0]->types.size();
       bool consistent        = true;

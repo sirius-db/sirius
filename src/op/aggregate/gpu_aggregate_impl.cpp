@@ -624,7 +624,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     output_cols    = key_table->release();
   }
 
-  // Decode dictionary-encoded group key columns back to STRING
+  // Decode the group key columns encoded above back to STRING. A key that arrived as a dictionary
+  // carrier leaves as one; its restore boundary decodes the grouped output.
   for (size_t i = 0; i < group_idx.size(); i++) {
     if (encoded_key_strings[i]) {
       if (!encoded_keys) {
@@ -634,7 +635,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         encoded_key_strings[i].reset();
         encoded_key_owners[i].reset();
       }
-    } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+    } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32 &&
+               (use_label_keys || !cudf::is_dictionary(input_table.column(group_idx[i]).type()))) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
     }
@@ -957,7 +959,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<bool>& aggregate_is_wide_integer_sum,
   bool split_wide_integer_sums,
   cudf::size_type* num_groups,
-  bool enable_low_cardinality_groupby)
+  bool enable_low_cardinality_groupby,
+  const std::vector<bool>& keep_dictionary_keys)
 {
   auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
                                               group_idx,
@@ -972,6 +975,23 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                               split_wide_integer_sums,
                                               enable_low_cardinality_groupby);
   if (num_groups != nullptr) { *num_groups = output_table->num_rows(); }
+  std::vector<std::size_t> decode_keys;
+  for (std::size_t key = 0; key < group_idx.size(); ++key) {
+    if (output_table->get_column(static_cast<cudf::size_type>(key)).type().id() ==
+          cudf::type_id::DICTIONARY32 &&
+        !(key < keep_dictionary_keys.size() && keep_dictionary_keys[key])) {
+      decode_keys.push_back(key);
+    }
+  }
+  if (!decode_keys.empty()) {
+    auto columns = output_table->release();
+    for (auto const key : decode_keys) {
+      columns[key] = cudf::dictionary::decode(cudf::dictionary_column_view(columns[key]->view()),
+                                              stream,
+                                              memory_space.get_default_allocator());
+    }
+    output_table = std::make_unique<cudf::table>(std::move(columns));
+  }
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
