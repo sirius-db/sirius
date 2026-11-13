@@ -35,9 +35,13 @@ fi
 #     or the decode-time predicate pushdown has no dictionary to answer from and silently no-ops.
 #   expression_evaluator_strategy=ast_jit -> cuDF's JIT expression evaluator instead of the
 #     interpreted AST walker. Worth -4.17% suite on its own. Default is ast_interpret.
+#   parquet_metadata_cache=true -> DuckDB keeps the parsed Parquet footers instead of re-parsing
+#     them at every bind (2-4 ms per query on the short queries). Inputs that are not Parquet
+#     ignore it.
 export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
 SET pin_table_input_compression_plan_dir = '$PLANS'; \
-SET expression_evaluator_strategy = 'ast_jit'"
+SET expression_evaluator_strategy = 'ast_jit'; \
+SET parquet_metadata_cache = true"
 
 # All eight tables pinned GPU-tier compressed. partsupp included: no TPC-H query ever
 # materialises ps_comment, so the union across q2/q9/q11/q16/q20 is 4 narrow columns (~20-25 GB).
