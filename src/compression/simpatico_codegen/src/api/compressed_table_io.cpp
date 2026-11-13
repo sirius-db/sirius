@@ -5,6 +5,7 @@
 
 #include "api/compressed_table_io.hpp"
 
+#include "api/chunk_decode.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
@@ -1065,5 +1066,77 @@ compressed_table read_compressed_table_subset_from_memory(
   }
   return reconstruct_from_records(selected, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
 }
+
+// ─── Header-only description ────────────────────────────────────────────────
+
+namespace detail {
+
+// Backs describe_hpln_header (api/hpln_describe.cpp): runs the reader's own header
+// parser and copies the records out, so the description can never disagree with what
+// read_compressed_table_from_memory fetches. Returns an error message, or empty on
+// success. Touches neither the payload nor the device.
+std::string describe_hpln_header(std::span<const std::uint8_t> header, hpln_description& out)
+{
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  std::string err;
+  if (!parse_hpln_header(r, recs, &err)) return err.empty() ? "malformed header" : err;
+
+  out = hpln_description{};
+  // parse_hpln_header accepts exactly this version.
+  out.version = kVersion;
+  out.columns.reserve(recs.size());
+
+  for (auto& cr : recs) {
+    auto& col = out.columns.emplace_back();
+    if (!cr.name.empty()) col.name = std::move(cr.name);
+    // Same dtype rule as reconstruct_from_records: only decimals carry the scale.
+    auto const dtype_id = tag_to_dtype(cr.dtype_tag).id();
+    col.dtype    = (dtype_id == cudf::type_id::DECIMAL32 || dtype_id == cudf::type_id::DECIMAL64 ||
+                 dtype_id == cudf::type_id::DECIMAL128)
+                     ? cudf::data_type{dtype_id, cr.scale}
+                     : cudf::data_type{dtype_id};
+    col.num_rows = cr.num_rows;
+    col.validity = static_cast<hpln_validity>(cr.validity.kind);
+    col.null_count = cr.validity.null_count;
+    if (cr.validity.kind == validity_kind::mask) {
+      col.validity_size           = cr.validity.size_bytes;
+      col.validity_payload_offset = cr.validity.payload_offset;
+      out.payload_bytes += cr.validity.size_bytes;
+    }
+
+    col.nodes.reserve(cr.tree.nodes.size());
+    for (auto& node : cr.tree.nodes) {
+      auto& described      = col.nodes.emplace_back();
+      described.op         = std::move(node.op);
+      described.is_bitjoin = node.attrs.bitjoin.has_value();
+      described.edges.reserve(node.children.size());
+      for (auto& e : node.children)
+        described.edges.emplace_back(std::move(e.channel), e.child);
+      described.outputs = std::move(node.output_names);
+    }
+
+    col.leaves.reserve(cr.leaf_descs.size());
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      auto& ld        = cr.leaf_descs[li];
+      auto& leaf      = col.leaves.emplace_back();
+      leaf.node_index = ld.node_index;
+      leaf.slot       = ld.slot;
+      leaf.kind       = ld.kind;
+      leaf.type_tag   = ld.type_tag;
+      leaf.meta       = ld.meta;
+      leaf.buffers.reserve(ld.buffers.size());
+      for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+        auto& bd = ld.buffers[bi];
+        leaf.buffers.push_back(hpln_buffer_range{
+          std::move(bd.name), bd.type_tag, bd.size_bytes, cr.buf_offsets[li][bi]});
+        out.payload_bytes += bd.size_bytes;
+      }
+    }
+  }
+  return {};
+}
+
+}  // namespace detail
 
 }  // namespace simpatico
