@@ -39,6 +39,7 @@
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -46,8 +47,11 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
+#include "planner/delim_cte_proof.hpp"
 #include "planner/gpu_admission.hpp"
+#include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
@@ -61,13 +65,22 @@
 #include <catch.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/cte_filter_pusher.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_columnref_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <duckdb/planner/operator/logical_expression_get.hpp>
+#include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_materialized_cte.hpp>
+#include <duckdb/planner/operator/logical_order.hpp>
+#include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
@@ -76,9 +89,12 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -123,8 +139,15 @@ class scoped_temp_db_path {
 /// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
+/// As in production, the generator gets the CTE reader proofs that Sirius's optimizer hooks
+/// captured with the plan, unless `with_cte_reader_proofs` is false.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
-  Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
+  Connection& con,
+  const std::string& query,
+  const std::vector<OptimizerType>& also_disabled = {},
+  bool pre_resolve                                = true,
+  std::string* logical_plan_text                  = nullptr,
+  bool with_cte_reader_proofs                     = true)
 {
   auto& context = *con.context;
 
@@ -157,15 +180,25 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs;
+    if (auto state = duckdb::get_sirius_connection_state(context)) {
+      cte_reader_proofs = state->take_captured_cte_reader_proofs_if_current();
+      state->clear_captured_plan();
+    }
 
-    plan->ResolveOperatorTypes();
+    // Production hands the generator an unresolved plan; the MARK-join conversion needs that.
+    if (pre_resolve) {
+      plan->ResolveOperatorTypes();
 
-    ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver verifier(true);
-    verifier.VisitOperator(*plan);
-    resolver.VisitOperator(*plan);
+      ColumnBindingResolver resolver;
+      duckdb::ColumnBindingResolver verifier(true);
+      verifier.VisitOperator(*plan);
+      resolver.VisitOperator(*plan);
+    }
 
+    if (logical_plan_text) { *logical_plan_text = plan->ToString(); }
     sirius::planner::sirius_physical_plan_generator gen(context);
+    if (with_cte_reader_proofs) { gen.cte_reader_proofs = std::move(cte_reader_proofs); }
     result = gen.create_plan(std::move(plan));
   } catch (...) {
     con.Query("ROLLBACK");
@@ -555,8 +588,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("filter on, unfiltered build: no endpoint wires anywhere")
   {
-    // An unfiltered base-table build supplies neither filter nor opaque-build evidence, and either
-    // kind would arm discovery for both routes -- with neither, no route wires.
+    // An unfiltered base-table build supplies no filter, opaque-build or semi-join evidence, and
+    // any kind would arm discovery for both routes -- with none, no route wires.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
@@ -845,6 +878,36 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
+  SECTION("semi- or anti-join-output build: join evidence wires the outer scan route")
+  {
+    // No table here carries a filter; the build is reduced only by the SEMI or ANTI join.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto const join_keyword = GENERATE(std::string("SEMI"), std::string("ANTI"));
+    CAPTURE(join_keyword);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT r.rid FROM small_right r " +
+                                       join_keyword +
+                                       " JOIN small_c c "
+                                       " ON r.other = c.ckey) j "
+                                       "ON l.id = j.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* outer = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(outer != nullptr);
+    auto const& targets =
+      outer->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets.front().route_class == sirius::op::dynamic_filter_route_class::scan);
+
+    auto endpoints = collect(outer->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
   SECTION(
     "a LIMIT between the join and the scan: the endpoint stays above the LIMIT, the scan "
     "stays bare")
@@ -1037,6 +1100,682 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
   REQUIRE(dedup_builds > 0);
   require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an IN subquery under a delim CTE plans as a SEMI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // TPC-H Q20 shape: an IN predicate inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  for (auto* node : joins) {
+    CHECK(node->Cast<sirius::op::sirius_physical_hash_join>().join_type != duckdb::JoinType::MARK);
+  }
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a NOT EXISTS subquery under a delim CTE plans as an ANTI join",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // A NOT EXISTS predicate (null-safe keys) inside the body of a correlated subquery's delim CTE.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE NOT EXISTS (SELECT 1 FROM parts q WHERE q.pk = i.fk "
+    "  AND q.pname = 'p1') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::CTE) != nullptr);
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE_FALSE(joins.empty());
+  bool has_anti = false;
+  for (auto* node : joins) {
+    auto const type = node->Cast<sirius::op::sirius_physical_hash_join>().join_type;
+    CHECK(type != duckdb::JoinType::MARK);
+    has_anti = has_anti || type == duckdb::JoinType::ANTI || type == duckdb::JoinType::RIGHT_ANTI;
+  }
+  CHECK(has_anti);
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a join above a proven delim CTE filters the scans in its body",
+                 "[plan_tree_shape][isolated_context][dynamic_filter][cte_body]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  auto const with_proofs = GENERATE(true, false);
+  INFO("with proofs: " << with_proofs);
+  // TPC-H Q20 shape: the outer `parts` join sits above the CTE node that holds the correlated
+  // subquery's outer rows.
+  std::string logical_plan;
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    &logical_plan,
+    with_proofs);
+  INFO(logical_plan);
+  INFO(tree_to_string(plan.get()));
+
+  sirius_physical_operator* delim_cte = nullptr;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::CTE)) {
+    auto const& cte = node->Cast<sirius::op::sirius_physical_cte>();
+    if (cte.ctename.starts_with("__duckdb_delim_") &&
+        !cte.ctename.starts_with("__duckdb_delim_dedup_")) {
+      delim_cte = node;
+    }
+  }
+  REQUIRE(delim_cte != nullptr);
+  REQUIRE(delim_cte->children.size() == 2);
+  // A scan target's channel is the one its GPU scan consumes.
+  std::unordered_map<sirius::op::sirius_dynamic_filter_set const*, sirius_physical_operator*>
+    body_scans;
+  for (auto* scan : collect(delim_cte->children[0].get(), SiriusPhysicalOperatorType::GPU_SCAN)) {
+    auto const& consumer = scan->Cast<sirius::op::scan::sirius_gpu_scan_operator>().consumer();
+    if (consumer) { body_scans.emplace(consumer->channel().get(), scan); }
+  }
+
+  std::size_t body_targets_from_above = 0;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+    auto& join = node->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(join.children.size() == 2);
+    bool const above   = contains(join.children[0].get(), delim_cte);
+    bool const in_rest = contains(delim_cte->children[1].get(), node);
+    for (auto const& target : join.dynamic_filter_plan().probe_targets()) {
+      auto const body_scan = body_scans.find(target.filter_set.get());
+      if (body_scan == body_scans.end()) { continue; }
+      // A join inside the CTE's rest, such as the join-back, never reaches into the body.
+      CHECK_FALSE(in_rest);
+      if (!above) { continue; }  // a join inside the body filters its own scans as usual
+      ++body_targets_from_above;
+      CHECK(target.route_class == sirius::op::dynamic_filter_route_class::scan);
+      REQUIRE_FALSE(target.key_bindings.empty());
+      for (auto const& binding : target.key_bindings) {
+        REQUIRE(binding.channel_push_ordinal < body_scan->second->types.size());
+        CHECK(body_scan->second->types[binding.channel_push_ordinal].id() ==
+              sirius::type_id::INTEGER);
+      }
+    }
+  }
+  CHECK(body_targets_from_above == (with_proofs ? 1 : 0));
+  require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - MARK joins DuckDB keeps are not converted under a delim CTE",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each query has a MARK join whose mark is not a bare filter: it is projected, sits inside an
+  // OR, or is negated over keys that are not null-safe (NOT IN, <> ALL).
+  auto const sql =
+    GENERATE(std::string("SELECT p.pk, p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)) FROM parts p"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk NOT IN (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pk <> ALL (SELECT i.fk FROM items i "
+                         "WHERE i.qty > (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"),
+             std::string("SELECT p.pk FROM parts p WHERE p.pname = 'p1' OR p.pk IN (SELECT i.fk "
+                         "FROM items i WHERE i.qty > "
+                         "(SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))"));
+  INFO(sql);
+  auto plan = generate_sirius_plan(*con, sql, /*also_disabled=*/{}, /*pre_resolve=*/false);
+  INFO(tree_to_string(plan.get()));
+
+  auto const joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  CHECK(std::any_of(joins.begin(), joins.end(), [](auto* node) {
+    return node->template Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+           duckdb::JoinType::MARK;
+  }));
+}
+
+namespace {
+
+// One constant row of @p width INTEGER columns, bound to @p table.
+duckdb::unique_ptr<duckdb::LogicalOperator> constant_row(duckdb::TableIndex table,
+                                                         std::size_t width,
+                                                         duckdb::TableIndex dummy)
+{
+  duckdb::vector<duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>> rows(1);
+  duckdb::vector<duckdb::LogicalType> types;
+  for (std::size_t i = 0; i < width; ++i) {
+    rows[0].push_back(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+    types.push_back(duckdb::LogicalType::INTEGER);
+  }
+  auto get =
+    duckdb::make_uniq<duckdb::LogicalExpressionGet>(table, std::move(types), std::move(rows));
+  get->children.push_back(duckdb::make_uniq<duckdb::LogicalDummyScan>(dummy));
+  return get;
+}
+
+duckdb::TableIndex const kLeftRow{1};
+duckdb::TableIndex const kRightRow{2};
+duckdb::TableIndex const kMark{3};
+
+// FILTER(mark) over a MARK join of a two-column row against a one-column row: the conversion's
+// candidate in its smallest form, with bindings unresolved as the pass expects. The filter's
+// output is the join's: the two left columns, then the mark.
+duckdb::unique_ptr<duckdb::LogicalFilter> make_mark_filter(duckdb::LogicalComparisonJoin*& join)
+{
+  auto mark_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  mark_join->mark_index = kMark;
+  mark_join->children.push_back(constant_row(kLeftRow, 2, duckdb::TableIndex{4}));
+  mark_join->children.push_back(constant_row(kRightRow, 1, duckdb::TableIndex{5}));
+  mark_join->conditions.emplace_back(
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(0))),
+    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kRightRow, duckdb::ProjectionIndex(0))),
+    duckdb::ExpressionType::COMPARE_EQUAL);
+  join = mark_join.get();
+  auto filter =
+    duckdb::make_uniq<duckdb::LogicalFilter>(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+      duckdb::LogicalType::BOOLEAN, duckdb::ColumnBinding(kMark, duckdb::ProjectionIndex(0))));
+  filter->children.push_back(std::move(mark_join));
+  return filter;
+}
+
+// A projection of the left row's first column over @p child: a consumer that addresses its input
+// by binding.
+duckdb::unique_ptr<duckdb::LogicalOperator> project_left(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+  select_list.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+    duckdb::LogicalType::INTEGER, duckdb::ColumnBinding(kLeftRow, duckdb::ProjectionIndex(0))));
+  auto projection =
+    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::TableIndex{6}, std::move(select_list));
+  projection->children.push_back(std::move(child));
+  return projection;
+}
+
+}  // namespace
+
+// Converting drops the mark, the last column of the filter's output. That is safe only when nothing
+// between the filter and the next projection reads its input by position, and when the filter's
+// projection map neither keeps the mark nor reorders columns into a projection of its own.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "mark conversion - a positional consumer of the mark filter keeps the join MARK",
+                 "[plan_tree_shape][isolated_context][mark_conversion]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  auto const shape = GENERATE(as<std::string>{},
+                              "projection above",
+                              "identity projection map",
+                              "ORDER BY between filter and projection",
+                              "projection map keeps the mark",
+                              "projection map reorders the columns",
+                              "filter at the plan root");
+  INFO(shape);
+  duckdb::LogicalComparisonJoin* join = nullptr;
+  auto filter                         = make_mark_filter(join);
+  bool expect_converted               = false;
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+  if (shape == "projection above") {
+    expect_converted = true;
+    plan             = project_left(std::move(filter));
+  } else if (shape == "identity projection map") {
+    expect_converted       = true;
+    filter->projection_map = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)};
+    plan                   = project_left(std::move(filter));
+  } else if (shape == "ORDER BY between filter and projection") {
+    auto order =
+      duckdb::make_uniq<duckdb::LogicalOrder>(duckdb::vector<duckdb::BoundOrderByNode>{});
+    order->children.push_back(std::move(filter));
+    plan = project_left(std::move(order));
+  } else if (shape == "projection map keeps the mark") {
+    filter->projection_map = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(2)};
+    plan                   = project_left(std::move(filter));
+  } else if (shape == "projection map reorders the columns") {
+    filter->projection_map = {duckdb::ProjectionIndex(1), duckdb::ProjectionIndex(0)};
+    plan                   = project_left(std::move(filter));
+  } else {
+    plan = std::move(filter);
+  }
+
+  std::size_t const expected_conversions = expect_converted ? 1 : 0;
+  CHECK(sirius::planner::convert_mark_joins(*con->context, plan) == expected_conversions);
+  CHECK(join->join_type == (expect_converted ? duckdb::JoinType::SEMI : duckdb::JoinType::MARK));
+}
+
+namespace {
+
+/// The plan as the binder leaves it, before DuckDB's optimizer (and before its hooks), so it still
+/// carries DuckDB's own `filter_dependency` on native-table delim CTEs.
+duckdb::unique_ptr<duckdb::LogicalOperator> bind_unoptimized(Connection& con,
+                                                             std::string const& sql)
+{
+  duckdb::Parser parser(*con.context);
+  parser.ParseQuery(sql);
+  REQUIRE(parser.statements.size() == 1);
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+  con.context->RunFunctionInTransaction([&] {
+    duckdb::Planner planner(*con.context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    plan = std::move(planner.plan);
+  });
+  REQUIRE(plan);
+  return plan;
+}
+
+/// The proofs, collected inside a transaction as in the pre-optimize hook (resolving a scan's
+/// connector reads the catalog).
+sirius::planner::delim_cte_proofs collect_proofs(Connection& con, duckdb::LogicalOperator& plan)
+{
+  sirius::planner::delim_cte_proofs proofs;
+  con.context->RunFunctionInTransaction(
+    [&] { proofs = sirius::planner::collect_delim_cte_proofs(*con.context, plan); });
+  return proofs;
+}
+
+/// Removes a file when the test leaves scope, including on a failed REQUIRE.
+struct scoped_file_removal {
+  std::string path;
+  ~scoped_file_removal() { std::remove(path.c_str()); }
+};
+
+/// Delim CTEs (`__duckdb_delim_N`, not the dedup CTEs) in the plan, with DuckDB's own proof.
+void collect_delim_ctes(duckdb::LogicalOperator& op,
+                        std::vector<duckdb::LogicalMaterializedCTE*>& found)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+    auto& cte = op.Cast<duckdb::LogicalMaterializedCTE>();
+    if (cte.ctename.StartsWith("__duckdb_delim_") &&
+        !cte.ctename.StartsWith("__duckdb_delim_dedup_")) {
+      found.push_back(&cte);
+    }
+  }
+  for (auto& child : op.children) {
+    collect_delim_ctes(*child, found);
+  }
+}
+
+/// Gives each delim CTE (or each dedup CTE) the name DuckDB's rewrite would give a CTE with another
+/// table index, leaving the plan otherwise unchanged.
+void rename_off_table_index(duckdb::LogicalOperator& op, bool dedup)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+    auto& cte           = op.Cast<duckdb::LogicalMaterializedCTE>();
+    bool const is_dedup = cte.ctename.StartsWith("__duckdb_delim_dedup_");
+    if (cte.ctename.StartsWith("__duckdb_delim_") && is_dedup == dedup) {
+      std::string const prefix = dedup ? "__duckdb_delim_dedup_" : "__duckdb_delim_";
+      cte.ctename = duckdb::Identifier(prefix + std::to_string(cte.table_index.index + 1000));
+    }
+  }
+  for (auto& child : op.children) {
+    rename_off_table_index(*child, dedup);
+  }
+}
+
+std::size_t count_role(sirius::planner::delim_cte_proofs const& proofs,
+                       sirius::op::cte_reader_role role)
+{
+  return static_cast<std::size_t>(
+    std::count_if(proofs.reader_roles.begin(), proofs.reader_roles.end(), [&](auto const& entry) {
+      return entry.second == role;
+    }));
+}
+
+// DuckDB's own test shapes for its pushes into delim CTEs (test/sql/subquery/lateral/
+// lateral_domain_filter.test and lateral_domain_join_filter_semantics.test): a filter outside a
+// view whose subquery holds a recursive CTE, and a user CTE whose keys restrict a delim CTE's outer
+// rows.
+constexpr char const* kJoinedWalkQuery = "SELECT count(*) FROM joined_walk WHERE id = 3";
+constexpr char const* kSelectedPersonQuery =
+  "WITH o AS MATERIALIZED (SELECT * FROM person WHERE selected) "
+  "SELECT count(*), sum(q.m) FROM o JOIN (SELECT p.id, p.tag, "
+  "(SELECT max(x.grp) FROM person x WHERE x.id <= p.id + 1 AND x.tag = p.tag) AS m "
+  "FROM person p) q ON o.id = q.id AND o.tag = q.tag";
+
+// User CTEs named like the ones DuckDB's rewrite generates. Their subqueries are not partitioned
+// by a correlation domain, so filtering a CTE body would change results. In the first, the CTE's
+// second read aggregates over every row; the second imitates the rewrite's dedup CTE and
+// join-back as closely as SQL can (a user's GROUP BY keeps a projection above its aggregate, which
+// the rewrite's DISTINCT lacks).
+std::vector<std::string> named_like_delim_cte_queries()
+{
+  return {
+    "SELECT count(*), sum(s.n), min(s.n), max(s.n) FROM ("
+    "WITH __duckdb_delim_9 AS MATERIALIZED (SELECT b, x FROM t1) "
+    "SELECT d.b, c.n FROM __duckdb_delim_9 d "
+    "JOIN (SELECT (x::BIGINT % 2) AS k, count(*) AS n FROM __duckdb_delim_9 GROUP BY 1) c "
+    "ON (d.x::BIGINT % 2) = c.k) s "
+    "JOIN (SELECT b FROM t3 WHERE g < 2) f ON s.b = f.b",
+    "WITH __duckdb_delim_9 AS MATERIALIZED (SELECT b, x FROM t1), "
+    "__duckdb_delim_dedup_10 AS MATERIALIZED (SELECT x FROM __duckdb_delim_9 GROUP BY x) "
+    "SELECT d.b, c.n FROM __duckdb_delim_9 d "
+    "JOIN (SELECT count(*) AS n FROM __duckdb_delim_dedup_10) c ON d.x = c.n"};
+}
+
+void create_domain_filter_tables(Connection& con)
+{
+  for (auto const* sql :
+       {"CREATE TABLE vertices AS SELECT i::INTEGER AS id FROM range(100) t(i)",
+        "CREATE VIEW joined_walk AS SELECT input.id, expanded.depth FROM vertices input "
+        "CROSS JOIN LATERAL (WITH RECURSIVE walk(depth) AS (SELECT 0 + input.id * 0 UNION ALL "
+        "SELECT depth + 1 FROM walk WHERE depth < 7) SELECT depth FROM walk) expanded "
+        "JOIN vertices target ON target.id = expanded.depth + 1",
+        "CREATE TABLE person(id BIGINT, tag VARCHAR, selected BOOLEAN, grp BIGINT)",
+        "INSERT INTO person SELECT i, (i % 2)::VARCHAR, i IN (3, 17, 51), i % 7 FROM range(1000) "
+        "t(i)"}) {
+    INFO(sql);
+    REQUIRE_FALSE(con.Query(sql)->HasError());
+  }
+}
+
+// Native-table queries with delim CTEs. Each filters its outer rows: without that, DuckDB computes
+// an equality-correlated subquery for every key and keeps no delim CTE.
+std::vector<std::string> native_delim_cte_queries()
+{
+  return {// INNER join-back: a scalar subquery under a NULL-rejecting comparison.
+          "SELECT i.fk FROM items i WHERE i.qty < 20 AND i.qty > "
+          "(SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk)",
+          // LEFT join-back: a scalar subquery in the select list.
+          "SELECT i.fk, (SELECT AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk) FROM items i "
+          "WHERE i.qty < 20",
+          // EXISTS and NOT EXISTS correlated on more than an equality.
+          "SELECT p.pk FROM parts p WHERE EXISTS "
+          "(SELECT 1 FROM items i WHERE i.fk = p.pk AND i.qty > p.pk % 23)",
+          "SELECT p.pk FROM parts p WHERE NOT EXISTS "
+          "(SELECT 1 FROM items i WHERE i.fk = p.pk AND i.qty > p.pk % 23)",
+          // A delim CTE inside an IN subquery (TPC-H Q20 shape).
+          "SELECT p.pk FROM parts p WHERE p.pk IN (SELECT i.fk FROM items i WHERE i.fk IN "
+          "(SELECT pk FROM parts WHERE pname = 'p2') AND i.qty > "
+          "(SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+          kJoinedWalkQuery,
+          kSelectedPersonQuery};
+}
+
+}  // namespace
+
+// DuckDB clears `filter_dependency` before Sirius's pre-optimize hook runs, so the hook re-derives
+// it. On native tables, the binder's output still carries DuckDB's own value: the two must agree,
+// so a DuckDB change to the rule fails here.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - on native tables it matches DuckDB's own filter dependency",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  create_domain_filter_tables(*con);
+  auto const sql = GENERATE(from_range(native_delim_cte_queries()));
+  INFO(sql);
+  auto plan = bind_unoptimized(*con, sql);
+  std::vector<duckdb::LogicalMaterializedCTE*> ctes;
+  collect_delim_ctes(*plan, ctes);
+  REQUIRE_FALSE(ctes.empty());
+
+  auto const proofs         = collect_proofs(*con, *plan);
+  std::size_t duckdb_proved = 0;
+  for (auto* cte : ctes) {
+    if (!cte->filter_dependency) { continue; }
+    ++duckdb_proved;
+    CHECK(proofs.role_of(cte->filter_dependency->row_scan.index) ==
+          sirius::op::cte_reader_role::outer_row);
+    CHECK(proofs.role_of(cte->filter_dependency->domain_scan.index) ==
+          sirius::op::cte_reader_role::key);
+  }
+  REQUIRE(duckdb_proved > 0);
+  // Nothing is proven where DuckDB proves nothing.
+  CHECK(count_role(proofs, sirius::op::cte_reader_role::outer_row) == duckdb_proved);
+  CHECK(count_role(proofs, sirius::op::cte_reader_role::key) == duckdb_proved);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - Parquet scans are proven although DuckDB records nothing",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  scoped_file_removal const parquet{_db_path.path() + ".items.parquet"};
+  REQUIRE_FALSE(con->Query("COPY items TO '" + parquet.path + "' (FORMAT parquet)")->HasError());
+  auto plan = bind_unoptimized(*con,
+                               "SELECT i.fk FROM read_parquet('" + parquet.path +
+                                 "') i WHERE i.qty < 20 AND i.qty > "
+                                 "(SELECT 0.5 * AVG(i2.qty) FROM read_parquet('" +
+                                 parquet.path + "') i2 WHERE i2.fk = i.fk)");
+  std::vector<duckdb::LogicalMaterializedCTE*> ctes;
+  collect_delim_ctes(*plan, ctes);
+  REQUIRE_FALSE(ctes.empty());
+  for (auto* cte : ctes) {
+    CHECK_FALSE(cte->filter_dependency);
+  }
+
+  auto const proofs = collect_proofs(*con, *plan);
+  CHECK(count_role(proofs, sirius::op::cte_reader_role::outer_row) == ctes.size());
+  CHECK(count_role(proofs, sirius::op::cte_reader_role::key) == ctes.size());
+
+  // DuckDB's pushers get the same proof, for the same reads.
+  std::size_t restored = 0;
+  con->context->RunFunctionInTransaction(
+    [&] { restored = sirius::planner::restore_cte_filter_dependencies(*con->context, *plan); });
+  CHECK(restored == ctes.size());
+  for (auto* cte : ctes) {
+    REQUIRE(cte->filter_dependency);
+    CHECK(proofs.role_of(cte->filter_dependency->row_scan.index) ==
+          sirius::op::cte_reader_role::outer_row);
+    CHECK(proofs.role_of(cte->filter_dependency->domain_scan.index) ==
+          sirius::op::cte_reader_role::key);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - user CTEs named like DuckDB's delim CTEs are not proven",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  REQUIRE_FALSE(con
+                  ->Query("CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS b, i::INTEGER AS x "
+                          "FROM range(20000) t(i)")
+                  ->HasError());
+  REQUIRE_FALSE(
+    con
+      ->Query(
+        "CREATE TABLE t3 AS SELECT i::INTEGER AS b, (i % 4)::INTEGER AS g FROM range(10) t(i)")
+      ->HasError());
+  auto const sql = GENERATE(from_range(named_like_delim_cte_queries()));
+  INFO(sql);
+  auto plan = bind_unoptimized(*con, sql);
+  std::vector<duckdb::LogicalMaterializedCTE*> ctes;
+  collect_delim_ctes(*plan, ctes);
+  REQUIRE_FALSE(ctes.empty());
+
+  CHECK(collect_proofs(*con, *plan).reader_roles.empty());
+  std::size_t restored = 0;
+  con->context->RunFunctionInTransaction(
+    [&] { restored = sirius::planner::restore_cte_filter_dependencies(*con->context, *plan); });
+  CHECK(restored == 0);
+}
+
+// SQL cannot rebuild the rewrite's exact shape, so the queries above would be rejected on shape
+// alone. Here only a name changes, and the plan DuckDB generated loses its proof.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - a delim CTE named off its own table index is not proven",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  create_domain_filter_tables(*con);
+  bool const rename_dedup = GENERATE(false, true);
+  INFO((rename_dedup ? "dedup CTE renamed" : "delim CTE renamed"));
+  auto plan = bind_unoptimized(*con, native_delim_cte_queries().front());
+  REQUIRE_FALSE(collect_proofs(*con, *plan).reader_roles.empty());
+
+  rename_off_table_index(*plan, rename_dedup);
+  CHECK(collect_proofs(*con, *plan).reader_roles.empty());
+  std::size_t restored = 0;
+  con->context->RunFunctionInTransaction(
+    [&] { restored = sirius::planner::restore_cte_filter_dependencies(*con->context, *plan); });
+  CHECK(restored == 0);
+}
+
+// What Sirius gives back must be exactly what DuckDB had before it cleared it.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - DuckDB gets back exactly its own filter dependency",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  create_domain_filter_tables(*con);
+  auto const sql = GENERATE(from_range(native_delim_cte_queries()));
+  INFO(sql);
+  auto plan = bind_unoptimized(*con, sql);
+  std::vector<duckdb::LogicalMaterializedCTE*> ctes;
+  collect_delim_ctes(*plan, ctes);
+  REQUIRE_FALSE(ctes.empty());
+  std::vector<std::optional<std::pair<duckdb::idx_t, duckdb::idx_t>>> duckdb_dependencies;
+  std::size_t duckdb_proved = 0;
+  for (auto* cte : ctes) {
+    if (cte->filter_dependency) {
+      duckdb_dependencies.emplace_back(std::pair{cte->filter_dependency->row_scan.index,
+                                                 cte->filter_dependency->domain_scan.index});
+      ++duckdb_proved;
+    } else {
+      duckdb_dependencies.emplace_back(std::nullopt);
+    }
+  }
+  REQUIRE(duckdb_proved > 0);
+
+  duckdb::CTEFilterPusher::ClearDependencies(*plan);
+  std::size_t restored = 0;
+  con->context->RunFunctionInTransaction(
+    [&] { restored = sirius::planner::restore_cte_filter_dependencies(*con->context, *plan); });
+  CHECK(restored == duckdb_proved);
+  for (std::size_t i = 0; i < ctes.size(); ++i) {
+    auto const& dependency = ctes[i]->filter_dependency;
+    if (!duckdb_dependencies[i]) {
+      CHECK_FALSE(dependency);
+      continue;
+    }
+    REQUIRE(dependency);
+    CHECK(dependency->row_scan.index == duckdb_dependencies[i]->first);
+    CHECK(dependency->domain_scan.index == duckdb_dependencies[i]->second);
+  }
+}
+
+// DuckDB's own expectations for its pushes, which loading Sirius used to defeat.
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - DuckDB's pushes into delim CTEs survive loading Sirius",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  create_domain_filter_tables(*con);
+  auto const gpu_execution = GENERATE(true, false);
+  INFO("gpu_execution: " << gpu_execution);
+  sirius::test::scoped_sirius_setting gpu(*con, "gpu_execution", gpu_execution);
+  auto const explain = [&](std::string const& sql) {
+    auto result = con->Query("EXPLAIN " + sql);
+    REQUIRE_FALSE(result->HasError());
+    return result->Collection().GetValue(1, 0).ToString();
+  };
+
+  // CTEFilterPusher: the predicate reaches the CTE's producer, not just its outer-row read.
+  CHECK_THAT(explain(kJoinedWalkQuery), Catch::Matchers::ContainsSubstring("Filters: id = 3"));
+  // CTEJoinFilterPusher: the delim CTE's outer rows are semi-joined with the keys of `o`.
+  CHECK_THAT(explain(kSelectedPersonQuery), Catch::Matchers::ContainsSubstring("Join Type: SEMI"));
+
+  auto const count = con->Query(kJoinedWalkQuery);
+  REQUIRE_FALSE(count->HasError());
+  CHECK(count->Collection().GetValue(0, 0).GetValue<int64_t>() == 8);
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - a subquery DuckDB cannot restrict is not proven",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  auto const sql = GENERATE(
+    // A volatile expression in the subquery.
+    std::string("SELECT p.pk FROM parts p WHERE p.pk IN (SELECT i.fk FROM items i WHERE i.qty > "
+                "(SELECT 0.5 * AVG(i2.qty) + random() * 0 FROM items i2 WHERE i2.fk = i.fk))"),
+    // A table function that is neither a native table nor a Parquet scan.
+    std::string("SELECT i.fk FROM items i WHERE i.qty < 20 AND i.qty > "
+                "(SELECT 0.5 * AVG(i2.qty) FROM items i2, range(3) r WHERE i2.fk = i.fk)"),
+    // A SINGLE join-back (a scalar subquery that may return several rows): dropping an outer row
+    // can drop the "more than one row" error, so the outer row is not the only thing it keeps.
+    std::string("SELECT i.fk, (SELECT i2.qty FROM items i2 WHERE i2.fk = i.fk AND i2.qty > i.qty) "
+                "FROM items i WHERE i.qty < 20"));
+  INFO(sql);
+  auto plan = bind_unoptimized(*con, sql);
+  std::vector<duckdb::LogicalMaterializedCTE*> ctes;
+  collect_delim_ctes(*plan, ctes);
+  REQUIRE_FALSE(ctes.empty());
+  for (auto* cte : ctes) {
+    CHECK_FALSE(cte->filter_dependency);
+  }
+
+  auto const proofs = collect_proofs(*con, *plan);
+  CHECK(proofs.reader_roles.empty());
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "delim CTE proof - the optimizer hooks' proofs mark the delim CTE's two reads",
+                 "[plan_tree_shape][isolated_context][delim_cte_proof]")
+{
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  auto const with_proofs = GENERATE(true, false);
+  INFO("with proofs: " << with_proofs);
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+    "  SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+    "  AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))",
+    /*also_disabled=*/{},
+    /*pre_resolve=*/false,
+    /*logical_plan_text=*/nullptr,
+    with_proofs);
+  INFO(tree_to_string(plan.get()));
+
+  std::size_t delim_ctes = 0;
+  for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::CTE)) {
+    auto& cte = node->Cast<sirius::op::sirius_physical_cte>();
+    if (!cte.ctename.starts_with("__duckdb_delim_") ||
+        cte.ctename.starts_with("__duckdb_delim_dedup_")) {
+      continue;
+    }
+    ++delim_ctes;
+    REQUIRE(cte.children.size() == 2);
+    std::vector<sirius::op::cte_reader_role> roles;
+    for (auto* scan : collect(cte.children[1].get(), SiriusPhysicalOperatorType::CTE_SCAN)) {
+      auto const& reader = scan->Cast<sirius::op::sirius_physical_column_data_scan>();
+      if (reader.cte_index == cte.table_index) { roles.push_back(reader.reader_role); }
+    }
+    REQUIRE(roles.size() == 2);
+    auto const count = [&](sirius::op::cte_reader_role role) {
+      return std::count(roles.begin(), roles.end(), role);
+    };
+    if (with_proofs) {
+      CHECK(count(sirius::op::cte_reader_role::outer_row) == 1);
+      CHECK(count(sirius::op::cte_reader_role::key) == 1);
+    } else {
+      CHECK(count(sirius::op::cte_reader_role::unknown) == 2);
+    }
+  }
+  REQUIRE(delim_ctes > 0);
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE connector_registry.cpp
           decimal_sum_input_bounds.cpp
+          delim_cte_proof.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
@@ -10,6 +11,7 @@ target_sources(
           gpu_admission.cpp
           join_implied_filters.cpp
           join_key_nullability.cpp
+          mark_join_conversion.cpp
           query.cpp
           query_index.cpp
           scan_column_origin.cpp

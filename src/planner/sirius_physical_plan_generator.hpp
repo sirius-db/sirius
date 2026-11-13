@@ -23,6 +23,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/delim_cte_proof.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -307,6 +308,10 @@ class sirius_physical_plan_generator {
   // private:
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
+  //! Delim CTE reads whose rows may be restricted (see planner/delim_cte_proof.hpp). Null when the
+  //! plan was not captured with proofs; then no read is treated as restrictable.
+  std::shared_ptr<delim_cte_proofs const> cte_reader_proofs;
+
   std::size_t delim_index = 0;
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t next_scan_node_id = 0;

@@ -30,6 +30,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -115,6 +116,8 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -169,6 +172,8 @@ class SiriusConnectionState : public ClientContextState {
     ++planning_generation_;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
 
@@ -214,11 +219,32 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
-  /// planning generation.
+  /// planning generation, together with the CTE reader proofs the pre-optimize hook staged for
+  /// the same optimizer run.
   void set_captured_plan(unique_ptr<LogicalOperator> plan)
   {
-    captured_plan_       = std::move(plan);
-    captured_generation_ = planning_generation_;
+    captured_plan_              = std::move(plan);
+    captured_generation_        = planning_generation_;
+    captured_cte_reader_proofs_ = std::move(staged_cte_reader_proofs_);
+    staged_cte_reader_proofs_.reset();
+  }
+
+  /// \brief Stage the CTE reader proofs collected by the pre-optimize hook. They are kept only if
+  /// the optimizer hook captures the plan of the same run (`set_captured_plan`).
+  void stage_cte_reader_proofs(
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> proofs) noexcept
+  {
+    staged_cte_reader_proofs_ = std::move(proofs);
+  }
+
+  /// \brief Consume the proofs captured with the plan iff they belong to the CURRENT planning
+  /// attempt. Without proofs, no CTE read is treated as restrictable.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const>
+  take_captured_cte_reader_proofs_if_current() noexcept
+  {
+    auto proofs = std::move(captured_cte_reader_proofs_);
+    captured_cte_reader_proofs_.reset();
+    return captured_generation_ == planning_generation_ ? std::move(proofs) : nullptr;
   }
 
   void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
@@ -256,6 +282,8 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
   }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
@@ -315,6 +343,9 @@ class SiriusConnectionState : public ClientContextState {
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
+  /// Delim-CTE reader proofs: staged by the pre-optimize hook, captured with the plan.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> staged_cte_reader_proofs_;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> captured_cte_reader_proofs_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;

@@ -18,6 +18,7 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "sirius_context.hpp"
@@ -42,6 +43,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -226,22 +228,32 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
   }
 }
 
-}  // namespace
-
-void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
-                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+// What Sirius needs from the plan before DuckDB optimizes it. Reads the plan and attaches scan
+// statistics; it does not restructure it.
+void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
 {
-  if (!plan) { return; }
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Decide before optimization can remove scans, including when GPU execution is off.
-  (void)should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties());
+  (void)should_use_duckdb(context, &plan, &input.optimizer.binder.GetStatementProperties());
   if (parquet_footer_statistics_enabled(context)) {
-    auto const scans = add_parquet_footer_statistics(context, *plan);
+    auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
+  }
+  // DuckDB clears its delim-CTE restriction proof before this hook runs, and never sets it for
+  // Parquet scans. Re-derive it before the built-in optimizers restructure the delim CTEs; the
+  // optimizer hook keeps it only together with the plan of this same run.
+  conn_state->stage_cte_reader_proofs(nullptr);
+  if (gpu_execution_enabled(context)) {
+    try {
+      conn_state->stage_cte_reader_proofs(std::make_shared<sirius::planner::delim_cte_proofs const>(
+        sirius::planner::collect_delim_cte_proofs(context, plan)));
+    } catch (std::exception& e) {
+      SIRIUS_LOG_DEBUG("Delim CTE reader proofs unavailable: {}", sirius::sanitized_message(e));
+    }
   }
   // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
   // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
@@ -249,6 +261,25 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // missed q19's. Deriving both made every pushed restriction appear twice: TPC-H q19's part scan
   // evaluated each column's OR filter twice and its FILTER carried two copies of the per-branch
   // restriction, which cost about 0.1 s at SF1000. The hook therefore only classifies the query.
+}
+
+}  // namespace
+
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  if (!plan) { return; }
+  prepare_for_sirius(input, *plan);
+  // DuckDB clears every delim CTE's filter_dependency before it calls a pre-optimize hook, because
+  // it cannot vouch for what an extension does to the plan. Without it, DuckDB's CTE filter pushers
+  // skip delim CTEs, in its CPU plans too. This hook leaves the plan's shape alone, so give the
+  // dependency back, re-derived with DuckDB's own rule, for every query, GPU execution on or off.
+  try {
+    sirius::planner::restore_cte_filter_dependencies(input.context, *plan);
+  } catch (std::exception& e) {
+    SIRIUS_LOG_DEBUG("Delim CTE filter dependencies not restored: {}",
+                     sirius::sanitized_message(e));
+  }
 }
 
 bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::LogicalOperator& to)
