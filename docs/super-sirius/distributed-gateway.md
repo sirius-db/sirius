@@ -104,7 +104,7 @@ rank.
 | `sirius_gateway_status()`, `sirius_gateway_log()` | The gateway |
 | `SET` of a setting the gateway sets on each rank (`sirius_distributed_query_id`, `sirius_exchange_*`, `enable_duckdb_fallback`, `gpu_execution`) | Refused |
 | `sirius_gateway_add_rank`, `sirius_gateway_drop_rank`, with `sirius_gateway_allow_join` on (`sirius_gateway.sh` with 0 ranks sets it) | The gateway: a node registers its rank. A client's token already runs any SQL on every rank |
-| Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls at a statement's top level (`CALL f()`, `FROM f()`, `SELECT f()`), and `SET` of such settings | Refused: gateway console only. Calls nested deeper are not checked |
+| Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls anywhere in a `CALL` or `SELECT`, subqueries and CTEs included, and `SET` of such settings | Refused: gateway console only |
 | `PREPARE`, `EXECUTE` | Refused: a prepared plan keeps the query number it was planned with |
 
 ## Ranks
@@ -234,8 +234,8 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 - **Shared rank sessions:** a client's `SET` reaches every client's statements, and is logged and
   replayed. `CREATE TABLE` and `INSERT` give one copy of the rows per rank. `now()` and `random()`
   evaluate on each rank. A `ROLLBACK` does not undo what ran on the ranks.
-- **The router is a deny-list** over top-level statements: a gateway function nested in a subquery
-  reaches the ranks.
+- **A statement that calls a gateway function** runs in the client's gateway session, so it may
+  read nothing else there: a table, a file or another table function in it is refused.
 - **State across gateway restarts:** with `sirius_gateway_state_dir` set (`sirius_gateway.sh`
   sets it), the DDL log is also written to `<state_dir>/ddl.sql`, mode 600, after each statement
   that adds to it. If that write fails, the statement still succeeds, and the status `error`
