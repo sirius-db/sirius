@@ -671,10 +671,12 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE â†
 - `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
+**Publishing the boundaries.** `DONE` makes SORT_PARTITION tasks start on every executor thread of every GPU, so the boundaries must be complete and readable everywhere at that point. `execute()` gathers the boundary rows, copies them to host memory (`cudf::pack` layout) and synchronises its stream before it stores `DONE`. `get_partition_boundaries(space, stream)` then gives each GPU its own device copy, uploaded on first use under a mutex and synchronised before it is returned; `clear_partition_boundaries()` frees each copy with its GPU current. A task never reads a table that lives on another GPU or that another stream may still be writing.
+
 ### `sirius_physical_sort_partition` â€” `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
-Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
+Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op` and asks it for the boundaries on the GPU of each batch (`get_partition_boundaries(space, stream)`).
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.

@@ -226,6 +226,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
+    test/cpp/operator/test_physical_sort_partition_mgpu.cpp
     test/cpp/operator/test_task_scheduler_routing.cpp
     test/cpp/operator/test_physical_union.cpp
     test/cpp/operator/test_physical_union_mgpu.cpp

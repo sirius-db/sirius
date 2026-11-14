@@ -25,6 +25,11 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/contiguous_split.hpp>
+#include <cudf/copying.hpp>
+
+#include <rmm/cuda_device.hpp>
+
 #include <algorithm>
 
 namespace sirius {
@@ -62,6 +67,8 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
 }
 
 }  // namespace
+
+sirius_physical_sort_sample::~sirius_physical_sort_sample() { clear_partition_boundaries(); }
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
                                                          uint64_t sort_sample_bytes,
@@ -292,7 +299,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     if (num_parts <= 1 || total_rows == 0) {
       // Single partition — no boundaries needed
       _num_partitions = 1;
-      _partition_boundaries.reset();
+      clear_partition_boundaries();
     } else {
       // Compute boundary row indices: [total_rows/P, 2*total_rows/P, ..., (P-1)*total_rows/P]
       size_t num_boundaries = num_parts - 1;
@@ -324,16 +331,41 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       cudf::table_view sort_keys_view(sort_key_cols);
 
       // Gather boundary rows
-      _partition_boundaries = cudf::gather(sort_keys_view,
-                                           indices_col->view(),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           space->get_default_allocator());
-      _num_partitions       = num_parts;
+      auto boundaries = cudf::gather(sort_keys_view,
+                                     indices_col->view(),
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     stream,
+                                     space->get_default_allocator());
+
+      // Bring the boundary rows to host memory. SORT_PARTITION tasks run on every GPU and on
+      // streams other than this one as soon as DONE is published, so they must not read a device
+      // table that this stream may still be writing (cudf::gather of fixed-width columns returns
+      // before its kernel has run) or that lives on another GPU. The host copy is complete once
+      // this stream is synchronised; each GPU uploads its own copy from it on first use.
+      auto packed    = cudf::pack(boundaries->view(), stream, space->get_default_allocator());
+      auto host      = std::make_unique<host_boundaries>();
+      host->num_rows = num_boundaries;
+      if (packed.metadata) { host->metadata = *packed.metadata; }
+      if (packed.gpu_data && packed.gpu_data->size() > 0) {
+        host->data.resize(packed.gpu_data->size());
+        CUDF_CUDA_TRY(cudaMemcpyAsync(host->data.data(),
+                                      packed.gpu_data->data(),
+                                      host->data.size(),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.get()));
+      }
+      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+      {
+        std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+        _device_boundaries.clear();
+        _host_boundaries = std::move(host);
+      }
+      _num_partitions = num_parts;
     }
 
-    // sort_partition runs in the same gpu_pipeline_task immediately after this
-    // execute() returns, so _partition_boundaries is visible before partition runs.
+    // SORT_PARTITION runs in this task right after execute() returns, and in tasks on every
+    // other executor thread and GPU as soon as DONE is visible: the host copy of the boundaries
+    // is complete at this point.
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
 
   } catch (...) {
@@ -346,10 +378,53 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Sort sample: computed {} partitions with {} boundaries in {:.2f} ms",
                    _num_partitions,
-                   _partition_boundaries ? _partition_boundaries->num_rows() : 0,
+                   num_boundary_rows(),
                    duration.count() / 1000.0);
 
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+}
+
+cudf::table_view sirius_physical_sort_sample::get_partition_boundaries(
+  cucascade::memory::memory_space& space, ::cuda::stream_ref stream)
+{
+  const int device_id = space.get_device_id();
+  std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+  if (!_host_boundaries) {
+    throw internal_exception("Sort sample: partition boundaries requested but not available");
+  }
+  auto it = _device_boundaries.find(device_id);
+  if (it == _device_boundaries.end()) {
+    auto copy = std::make_unique<device_boundaries>();
+    copy->data =
+      rmm::device_buffer(_host_boundaries->data.size(), stream, space.get_default_allocator());
+    if (!_host_boundaries->data.empty()) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(copy->data.data(),
+                                    _host_boundaries->data.data(),
+                                    _host_boundaries->data.size(),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+    }
+    // Other tasks on this GPU read the copy from their own streams: finish the upload first.
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    // The buffer outlives the task's stream; it is freed on the device's default stream.
+    copy->data.set_stream(rmm::cuda_stream_default);
+    copy->view = cudf::unpack(_host_boundaries->metadata.data(),
+                              static_cast<const uint8_t*>(copy->data.data()));
+    it         = _device_boundaries.emplace(device_id, std::move(copy)).first;
+  }
+  return it->second->view;
+}
+
+void sirius_physical_sort_sample::clear_partition_boundaries()
+{
+  std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+  for (auto& [device_id, copy] : _device_boundaries) {
+    // Free each copy with its own GPU current; this may run on a thread bound to another GPU.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+    copy.reset();
+  }
+  _device_boundaries.clear();
+  _host_boundaries.reset();
 }
 
 }  // namespace op

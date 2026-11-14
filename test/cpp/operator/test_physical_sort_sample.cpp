@@ -20,6 +20,9 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -30,6 +33,7 @@
 #include <sirius_config.hpp>
 
 #include <numeric>
+#include <string>
 #include <vector>
 
 using namespace duckdb;
@@ -300,10 +304,10 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_num_partitions() == 2);
-  REQUIRE(sample_op.get_partition_boundaries().num_rows() == 1);
+  REQUIRE(sample_op.num_boundary_rows() == 1);
 
-  const auto boundary_key =
-    read_int32_column(sample_op.get_partition_boundaries().view().column(0), 0);
+  const auto boundary_key = read_int32_column(
+    sample_op.get_partition_boundaries(*space, cudf::get_default_stream()).column(0), 0);
   REQUIRE(boundary_key == 50);
 }
 
@@ -340,7 +344,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == 2);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
+  CHECK(sample_op.num_boundary_rows() == 1);
 }
 
 TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
@@ -393,5 +397,73 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == rows_per_batch);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
+  CHECK(sample_op.num_boundary_rows() == rows_per_batch - 1);
+}
+
+// A reader on another stream must see complete boundaries as soon as they are published, even
+// while the boundary task's own stream still has work queued.
+TEST_CASE("sirius_physical_sort_sample publishes boundaries that are complete on every stream",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  // The streams must outlive everything allocated on them.
+  rmm::cuda_stream task_stream;
+  rmm::cuda_stream reader_stream;
+
+  constexpr std::size_t rows_per_batch = 3000;
+  std::vector<int32_t> values(rows_per_batch);
+  std::iota(values.begin(), values.end(), 1000);
+  auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  std::size_t batch_bytes;
+  {
+    auto read_only = batch->to_read_only();
+    batch_bytes    = read_only.get_data()->get_size_in_bytes();
+  }
+
+  // Three partitions over the complete input: boundaries are rows 1000 and 2000.
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
+                                    /*max_partition_bytes=*/batch_bytes / 3 + 1);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(std::move(batch), 0);
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+
+  // Give the task's stream a backlog, as the merge of the sample batches does in a real query:
+  // work queued by execute() then runs only after it.
+  rmm::device_buffer scratch(std::size_t{256} << 20, task_stream.view());
+  for (int i = 0; i < 40; ++i) {
+    REQUIRE(cudaMemsetAsync(scratch.data(), i, scratch.size(), task_stream.value()) == cudaSuccess);
+  }
+
+  (void)sample_op.execute(*input, task_stream.view());
+  REQUIRE(sample_op.boundaries_computed());
+  REQUIRE(sample_op.get_num_partitions() == 3);
+  REQUIRE(sample_op.num_boundary_rows() == 2);
+
+  // Read the boundaries the way another task does: at once, on a different stream.
+  auto boundaries = sample_op.get_partition_boundaries(*space, reader_stream.view());
+  REQUIRE(boundaries.num_columns() == 1);
+  REQUIRE(boundaries.num_rows() == 2);
+  std::vector<int32_t> host(2, -1);
+  REQUIRE(cudaMemcpyAsync(host.data(),
+                          boundaries.column(0).data<int32_t>(),
+                          host.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost,
+                          reader_stream.value()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
+  CHECK(host[0] == 2000);
+  CHECK(host[1] == 3000);
+
+  // A second request on the same GPU returns the same device copy.
+  auto again = sample_op.get_partition_boundaries(*space, reader_stream.view());
+  CHECK(again.column(0).data<int32_t>() == boundaries.column(0).data<int32_t>());
+
+  REQUIRE(cudaStreamSynchronize(task_stream.value()) == cudaSuccess);
+  sample_op.clear_partition_boundaries();
+  CHECK(sample_op.num_boundary_rows() == 0);
 }

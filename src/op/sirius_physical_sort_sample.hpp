@@ -21,8 +21,19 @@
 #include "sirius_config.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <rmm/device_buffer.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -52,6 +63,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     uint64_t max_partition_bytes         = 0,
     double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
 
+  ~sirius_physical_sort_sample() override;
+
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
@@ -70,8 +83,27 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //! Get the computed partition boundaries (P-1 rows, sort key columns only)
-  const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
+  /**
+   * @brief The partition boundaries (P-1 rows, sort key columns only) as a table on the caller's
+   * GPU
+   *
+   * The boundaries are computed once, on the GPU that ran the boundary task, and kept in host
+   * memory. Each GPU that partitions batches gets its own device copy, uploaded on first use and
+   * complete (its stream synchronised) before any caller sees it, so the returned view can be read
+   * by kernels on @p space 's device from any stream. The view stays valid until
+   * clear_partition_boundaries().
+   *
+   * Must be called with @p space 's device current, after boundaries_computed() returned true and
+   * only when get_num_partitions() > 1.
+   *
+   * @param space  GPU memory space of the batch being partitioned; the copy is allocated from it
+   * @param stream Stream used for the one-time upload
+   */
+  cudf::table_view get_partition_boundaries(cucascade::memory::memory_space& space,
+                                            ::cuda::stream_ref stream);
+
+  //! Number of boundary rows (get_num_partitions() - 1, or 0 for a single partition)
+  size_t num_boundary_rows() const { return _host_boundaries ? _host_boundaries->num_rows : 0; }
 
   //! Get the computed number of partitions
   size_t get_num_partitions() const { return _num_partitions; }
@@ -82,12 +114,30 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return _boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE;
   }
 
-  //! Release the partition boundaries table to free GPU memory
-  void clear_partition_boundaries() { _partition_boundaries.reset(); }
+  //! Release the host copy of the partition boundaries and every per-GPU copy
+  void clear_partition_boundaries();
 
  private:
-  //! Partition boundary rows (P-1 rows containing sort key column values)
-  std::unique_ptr<cudf::table> _partition_boundaries;
+  //! Host copy of the boundary rows in cudf::pack layout, written once before DONE is published
+  struct host_boundaries {
+    std::vector<uint8_t> metadata;
+    std::vector<uint8_t> data;
+    size_t num_rows = 0;
+  };
+
+  //! One GPU's copy of the boundary rows; `view` points into `data`
+  struct device_boundaries {
+    rmm::device_buffer data;
+    cudf::table_view view;
+  };
+
+  //! Partition boundary rows (P-1 rows containing sort key column values), immutable once
+  //! _boundary_state is DONE and until clear_partition_boundaries()
+  std::unique_ptr<host_boundaries> _host_boundaries;
+
+  //! Per-GPU copies keyed by device id, created lazily under _device_boundaries_mutex
+  std::mutex _device_boundaries_mutex;
+  std::map<int, std::unique_ptr<device_boundaries>> _device_boundaries;
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
