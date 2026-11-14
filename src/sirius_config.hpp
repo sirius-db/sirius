@@ -276,10 +276,10 @@ struct operator_params {
   /// most this fraction of the GPU divided by the GPU executor thread count.
   double sort_coalesce_memory_fraction = config::DEFAULT_SORT_COALESCE_MEMORY_FRACTION;
 
-  /// Whether runs are also coalesced when a sort key is a string. Without sort_key_encoding, cuDF
-  /// sorts string keys with a comparison sort whose cost per row grows with the run size, but a run
-  /// that holds a string column is kept below 2^31 bytes, and at that size the saved merge passes
-  /// outweigh it.
+  /// Whether runs are also coalesced when a sort key is a string. It applies only while
+  /// sort_key_encoding is on: the encoded sort costs the same per row at any run size, while
+  /// cuDF's comparison sort of string keys gets slower per row as a run grows, by more than the
+  /// saved merge passes give back for keys with many distinct values.
   bool sort_coalesce_string_keys = true;
 
   /// Target size (bytes) per hash partition for joins and group-bys.

@@ -1513,7 +1513,9 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! The limits of one coalesced ORDER_BY run, or nullopt when the local sort should stay per batch:
 //! the setting is off, there is no engine context to size a run from, a column is nested (only
 //! fixed-width and string columns are concatenated), a sort key is not a plain column, or a sort
-//! key is a string and `sort_coalesce_string_keys` is off.
+//! key is a string and either `sort_coalesce_string_keys` or `sort_key_encoding` is off (large
+//! runs of string keys pay only with the encoded sort; cuDF's comparison sort gets slower per
+//! row as a run grows).
 std::optional<sirius::op::sort_run_limits> order_by_run_limits(
   sirius::op::sirius_physical_order const& order,
   duckdb::vector<sirius::logical_type> const& input_types,
@@ -1532,7 +1534,8 @@ std::optional<sirius::op::sort_run_limits> order_by_run_limits(
     }
     auto const index = key.expression->Cast<duckdb::BoundReferenceExpression>().Index();
     if (index >= input_types.size()) { return std::nullopt; }
-    if (input_types[index].is_varchar() && !op_params.sort_coalesce_string_keys) {
+    if (input_types[index].is_varchar() &&
+        !(op_params.sort_coalesce_string_keys && op_params.sort_key_encoding)) {
       return std::nullopt;
     }
   }

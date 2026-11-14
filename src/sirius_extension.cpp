@@ -3674,7 +3674,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::DOUBLE(operator_defaults.sort_coalesce_memory_fraction),
     SetSortCoalesceMemoryFraction);
   config.AddExtensionOption("sort_coalesce_string_keys",
-                            "Coalesce ORDER BY runs also when a sort key is a string",
+                            "Coalesce ORDER BY runs also when a sort key is a string (applies "
+                            "only while sort_key_encoding is on)",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(operator_defaults.sort_coalesce_string_keys),
                             SetSortCoalesceStringKeys);

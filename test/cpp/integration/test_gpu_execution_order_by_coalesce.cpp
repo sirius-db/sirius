@@ -120,8 +120,7 @@ class OrderByCoalesceFixture : public sirius::test::GpuExecutionFixture {
       auto const coalesced = run_on_gpu(query);
       REQUIRE(coalesced.rows == cpu);
       CHECK(coalesced.sorts.runs <= coalesced.sorts.input_batches);
-      if (expect_coalesced && std::string(fraction) == "1.0" &&
-          coalesced.sorts.input_batches > 1) {
+      if (expect_coalesced && std::string(fraction) == "1.0" && coalesced.sorts.input_batches > 1) {
         CHECK(coalesced.sorts.runs < coalesced.sorts.input_batches);
         CHECK(coalesced.sorts.concatenated_bytes > 0);
       }
@@ -186,6 +185,26 @@ TEST_CASE_METHOD(OrderByCoalesceFixture,
   check_order("SELECT s, id FROM oc_str ORDER BY s NULLS FIRST, id", false);
   check_order("SELECT k, s, id FROM oc_str ORDER BY k, s DESC NULLS LAST, id", false);
   check_order("SELECT k, s, id FROM oc_str ORDER BY k, id");
+}
+
+TEST_CASE_METHOD(OrderByCoalesceFixture,
+                 "coalesced ORDER BY: string keys are coalesced only with the encoded sort",
+                 "[integration][gpu_execution][order_by_coalesce]")
+{
+  create_table("oc_enc",
+               "SELECT CAST(hash(i) % 5000 AS INTEGER) AS k, "
+               "       CAST(hash(i + 1) % 100000 AS VARCHAR) AS s, "
+               "       CAST(i AS BIGINT) AS id "
+               "FROM range(600000) AS t(i)");
+
+  // Encoded sort on (the default): a string key is coalesced.
+  check_order("SELECT s, id FROM oc_enc ORDER BY s, id");
+  // Encoded sort off: a sort with a string key keeps the local sort per batch, whether the
+  // string is the only key or one of several; a fixed-width key is still coalesced.
+  set("sort_key_encoding", "false");
+  check_order("SELECT s, id FROM oc_enc ORDER BY s, id", false);
+  check_order("SELECT k, s, id FROM oc_enc ORDER BY k, s DESC, id", false);
+  check_order("SELECT k, s, id FROM oc_enc ORDER BY k, id");
 }
 
 TEST_CASE_METHOD(OrderByCoalesceFixture,

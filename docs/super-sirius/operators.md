@@ -482,7 +482,7 @@ It has two modes, chosen by the planner (`order_by_run_limits()` in `wrap_order_
 
 | Mode | Plan | Sort unit |
 |------|------|-----------|
-| per batch (`sort_coalesce_runs = false`, a string sort key with `sort_coalesce_string_keys = false`, a nested column, or an operator built outside the planner) | `… → SORT_SAMPLE → ORDER_BY → input`; ORDER_BY is the sink of its input's pipeline | Each input batch of a task |
+| per batch (`sort_coalesce_runs = false`, a string sort key with `sort_coalesce_string_keys = false` or `sort_key_encoding = false`, a nested column, or an operator built outside the planner) | `… → SORT_SAMPLE → ORDER_BY → input`; ORDER_BY is the sink of its input's pipeline | Each input batch of a task |
 | coalescing (default) | `… → SORT_SAMPLE → ORDER_BY → PASSTHROUGH_SINK → input`; ORDER_BY starts its own pipeline and reads the input's batches from a port (PARTIAL barrier) | A group of parked batches of up to `sort_coalesce_memory_fraction × GPU limit / executor threads` bytes, concatenated |
 
 Why coalesce: SORT_PARTITION cuts every sorted run by range, so each partition holds one run per

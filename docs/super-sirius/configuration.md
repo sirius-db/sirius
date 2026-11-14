@@ -634,7 +634,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY: order string keys and multi-column keys by radix sorts over an encoding of the keys instead of cuDF's comparison sort. `false` is for A/B comparison. |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each, so a range partition receives few large sorted runs instead of one per input batch. See [Sort Run Coalescing](#sort-run-coalescing). |
 | `sort_coalesce_memory_fraction` | 0.25 | Share of one GPU's memory for the inputs of the local sorts running at the same time: one run is at most this fraction of the GPU divided by the GPU executor thread count. In (0, 1]. |
-| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string |
+| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
 | `sort_merge_mode` | `auto` | Merge path of MERGE_SORT: `auto`, `windowed` or `one_shot`. See [Sort Merge](#sort-merge). |
 | `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge |
 | `sort_merge_output_bytes` | 0 (derive) | Output chunk target per windowed merge task; accepts byte suffixes |
@@ -686,7 +686,7 @@ Three settings control which input batches the local sort of ORDER BY sorts toge
 |---------|------|---------|---------|
 | `sort_coalesce_runs` | BOOLEAN | true | On: the local sort concatenates groups of input batches and sorts each group as one run. Off: every input batch is sorted on its own (one run per batch), in the pipeline that produced it. |
 | `sort_coalesce_memory_fraction` | DOUBLE | 0.25 | Size of one run: `fraction × GPU memory limit / GPU executor threads` bytes of input (the smallest GPU when there are several). In (0, 1]. |
-| `sort_coalesce_string_keys` | BOOLEAN | true | On: a sort with a string key is coalesced like any other. Off: it keeps the per-batch sort. |
+| `sort_coalesce_string_keys` | BOOLEAN | true | On: a sort with a string key is coalesced like any other, provided `sort_key_encoding` is on. Off, or with `sort_key_encoding` off: it keeps the per-batch sort. |
 
 Why it matters: every sorted run is cut by range, so each range partition holds as many runs as
 the local sort produced, and MERGE_SORT needs one extra pass over a partition's rows for every
@@ -694,9 +694,10 @@ factor of `sort_merge_max_fan_in` in that count. A sort over fixed-width keys co
 row whatever the run size, so sorting larger runs removes merge passes for free. The run size is
 a memory bound, not a target derived from the data size: a sort task holds its input batches,
 their concatenation, the sort's scratch and the sorted copy. A run is also kept below 2^31 rows
-and, when the schema has a string column, below 2^31 bytes. With `sort_key_encoding` off, cuDF sorts string keys with a
-comparison sort whose cost per row grows with the run size; at the 2^31-byte bound the saved
-merge passes still outweigh it, which is why string keys are coalesced by default.
+and, when the schema has a string column, below 2^31 bytes. A sort with a string key is
+coalesced only while `sort_key_encoding` is on: the encoded sort costs the same per row at any
+run size, while cuDF's comparison sort of string keys gets slower per row as a run grows, by
+more than the saved merge passes give back for keys with many distinct values.
 
 Why 0.25: for a 32 GiB sort under an 80 GiB limit it gives 7 runs per partition, which the
 default `sort_merge_max_fan_in` merges in one pass; 0.125 gives 14 runs and an extra pass, and
@@ -704,7 +705,7 @@ default `sort_merge_max_fan_in` merges in one pass; 0.125 gives 14 runs and an e
 
 Coalescing is not applied (the plan and the behaviour are those of `sort_coalesce_runs = false`)
 when a column of the sort's input is nested, when a sort key is not a plain column, and, when
-`sort_coalesce_string_keys` is off, when a sort key is a string.
+`sort_coalesce_string_keys` or `sort_key_encoding` is off, when a sort key is a string.
 
 ### Sort Merge
 
@@ -1019,7 +1020,7 @@ SET enable_compressed_materialization = false;
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY uses radix sorts over an encoding of string and multi-column keys; `false` uses cuDF's comparison sort (A/B comparison) |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each; see [Sort Run Coalescing](#sort-run-coalescing) |
 | `sort_coalesce_memory_fraction` | 0.25 | One coalesced run is at most this fraction of the GPU memory limit divided by the GPU executor thread count; in (0, 1] |
-| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string |
+| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
 | `sort_merge_mode` | `auto` | MERGE_SORT merge path: `auto`, `windowed` or `one_shot` (kept for A/B testing, slated for removal); see [Sort Merge](#sort-merge) |
 | `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge; 0 or at least 1024 |
 | `sort_merge_output_bytes` | 0 (derive) | Output chunk target per merge task; 0 or at least 1 MiB |
