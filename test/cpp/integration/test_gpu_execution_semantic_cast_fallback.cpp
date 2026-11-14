@@ -299,3 +299,33 @@ TEST_CASE_METHOD(SemanticCastFixture,
   compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 3;");
   compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 99;");
 }
+
+TEST_CASE_METHOD(SemanticCastFixture,
+                 "conditional integer casts check only the selected rows",
+                 "[integration][gpu_execution][conditional_integer_cast]")
+{
+  run_ok(
+    "CREATE TABLE branch_cast AS SELECT id, x::BIGINT AS x, flag FROM "
+    "(VALUES (1, -129, false), (2, 128, false), (3, -128, true), "
+    "(4, 127, true), (5, NULL, NULL), (6, 256, NULL)) t(id,x,flag);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET enable_duckdb_fallback = false;");
+  for (auto strategy : {"materialize", "ast_interpret", "ast_jit"}) {
+    run_ok("SET expression_evaluator_strategy = '" + std::string(strategy) + "';");
+    compare_gpu_vs_cpu(
+      "SELECT id, CASE WHEN flag THEN x::TINYINT ELSE 0 END, "
+      "CASE WHEN flag IS NULL THEN NULL WHEN NOT flag THEN 0 ELSE x::TINYINT END, "
+      "CASE WHEN x NOT BETWEEN -128 AND 127 THEN 0 WHEN x::TINYINT < 0 THEN -1 ELSE 1 END, "
+      "CASE WHEN flag THEN CASE WHEN x < 0 THEN x::TINYINT ELSE x::UTINYINT END ELSE 0 END, "
+      "COALESCE(CASE WHEN flag THEN NULL ELSE 0::TINYINT END, x::TINYINT) FROM branch_cast;");
+
+    for (auto expr : {"CASE WHEN NOT flag THEN x::TINYINT ELSE 0 END",
+                      "CASE WHEN flag THEN 0 ELSE x::TINYINT END",
+                      "COALESCE(CASE WHEN flag THEN 0::TINYINT END, x::TINYINT)"}) {
+      run_ok("SET gpu_execution = true;");
+      auto result = con->Query("SELECT " + std::string(expr) + " FROM branch_cast;");
+      REQUIRE(result->HasError());
+      CHECK(result->GetError().find("out of range") != std::string::npos);
+    }
+  }
+}
