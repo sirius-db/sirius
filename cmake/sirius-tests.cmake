@@ -547,3 +547,32 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# The object-store scope module and its C interface need neither DuckDB nor
+# CUDA; exercise their production sources in an executable that starts no
+# engine.
+find_package(Threads REQUIRED)
+add_executable(
+  sirius_object_store_scope_unittest
+  test/cpp/object_store_scope/allocation_fault.cpp
+  test/cpp/object_store_scope/test_registry.cpp
+  test/cpp/object_store_scope/test_scope.cpp
+  test/cpp/object_store_scope/test_validation.cpp
+  test/cpp/object_store_scope/test_c_object_store_config.cpp
+  src/c_api/error.cpp
+  src/c_api/object_store_config.cpp
+  src/object_store_scope/registry.cpp
+  src/object_store_scope/scope.cpp
+  src/object_store_scope/validation.cpp
+  src/io/s3/scope_policy.cpp
+  src/io/rest/s3/endpoint.cpp)
+target_include_directories(sirius_object_store_scope_unittest
+                           PRIVATE src include cucascade/include)
+target_link_libraries(sirius_object_store_scope_unittest
+                      PRIVATE Catch2::Catch2WithMain Threads::Threads)
+set_target_properties(
+  sirius_object_store_scope_unittest
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")

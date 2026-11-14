@@ -243,6 +243,14 @@ jobs:
             [[ -z "$explicit" ]]
           fi
 
+      - name: Test the object-store scope module without GPU dependencies
+        if: >-
+          matrix.build.compiler == 'gcc' && matrix.build.build-type == 'release'
+          && matrix.build.environment == 'default' && matrix.build.cudf-channel == 'stable'
+        run: |
+          pixi run --locked cmake --build build/${{ matrix.build.build-type }} --target sirius_object_store_scope_unittest
+          pixi run --locked build/${{ matrix.build.build-type }}/test/cpp/sirius_object_store_scope_unittest
+
       # Compile all Rust bindings against the library on one representative entry.
       # The public configuration tests do not initialize GPUs, but sirius-ffi
       # tests do. The full suite runs in the GPU test workflow.
@@ -279,7 +287,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_INSTALLED_DIR="$PWD/build/static-install" -DVCPKG_MANIFEST_INSTALL=OFF
           pixi run --locked -e vcpkg cmake --build build/static-consumer
-          for consumer in consumer c_consumer c_configuration_consumer cpp_configuration_consumer; do
+          for consumer in consumer c_consumer c_configuration_consumer c_object_store_consumer cpp_configuration_consumer; do
             readelf -d "build/static-consumer/$consumer" > "build/static-consumer/$consumer.dynamic.txt"
             while read -r library; do
               case "$library" in

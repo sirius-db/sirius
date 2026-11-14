@@ -2,7 +2,10 @@
 // unit tests include this header directly to make otherwise racy interleavings deterministic.
 #pragma once
 
+#include "object_store_scope/scope.hpp"
+
 #include <functional>
+#include <memory>
 
 namespace sirius::ffi::testing {
 
@@ -19,5 +22,14 @@ void set_capture_pause_hook(std::function<void()> hook);
 /// existing capture. The same installation and callback restrictions as the capture-pause hook
 /// apply. An empty hook clears the installed slot.
 void set_transaction_entry_hook(std::function<void()> hook);
+
+/// Install a process-wide observer that receives the complete scope set produced by each
+/// successful publication: every put_object_store, every drop_object_store that removed an
+/// entry, and the object-store factory (there before the engine is brought up). It runs on the
+/// publishing thread after the registry released its locks, with exactly the set that call
+/// published. Installation and re-entry follow the capture-pause hook; this observer must not
+/// throw. An empty observer clears the installed slot.
+void set_publication_observer(
+  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)> observer);
 
 }  // namespace sirius::ffi::testing
