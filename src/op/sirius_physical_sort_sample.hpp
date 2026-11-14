@@ -44,9 +44,9 @@ namespace op {
  * Set by the plan generator; the defaults describe an operator built without an engine context.
  */
 struct sort_partition_policy {
-  //! false: the previous rule, data bytes over max_sort_partition_memory_fraction of the GPU
-  //! memory free when the boundaries are computed (SET sort_partition_auto_sizing = false)
-  bool auto_sizing = true;
+  //! false: data bytes over max_sort_partition_memory_fraction of the GPU memory free when the
+  //! boundaries are computed (SET sort_partition_auto_sizing = false, the default)
+  bool auto_sizing = config::DEFAULT_SORT_PARTITION_AUTO_SIZING;
   //! Merge tasks one GPU runs at once: the executor threads per GPU (0 = unknown)
   std::size_t merge_concurrency = 0;
   //! Every partition takes the one-shot merge (sort_merge_mode = 'one_shot'), which holds a whole
@@ -245,7 +245,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override for max partition bytes (0 = use GPU memory fraction)
   size_t _max_partition_bytes_override = 0;
 
-  //! Fraction of a GPU's memory limit per partition (from sirius_config operator_params)
+  //! Fraction of GPU memory per partition: of the free memory, or of the limit with auto sizing
+  //! (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   //! Concurrency, merge route and rule selection for the partition count

@@ -483,6 +483,7 @@ sort_partition_sizing_input sizing_input(std::size_t data_gib,
   in.gpu_capacity_bytes       = limit_gib * kGiB;
   in.gpu_available_bytes      = limit_gib * kGiB;
   in.memory_fraction          = 0.33;
+  in.policy.auto_sizing       = true;
   in.policy.merge_concurrency = concurrency;
   in.policy.windowed_only     = true;
   return in;

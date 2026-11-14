@@ -78,15 +78,20 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
-/// Fraction of a GPU's memory limit used per sort partition when max_sort_partition_bytes is 0.
-/// (With sort_partition_auto_sizing off: of the GPU memory free when the boundaries are computed.)
+/// Fraction of GPU memory used per sort partition when max_sort_partition_bytes is 0: of the
+/// GPU memory free when the boundaries are computed, or, with sort_partition_auto_sizing on, of
+/// the GPU's memory limit.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
-/// Default for sort_partition_auto_sizing: SORT_SAMPLE derives the number of range partitions from
-/// the GPU memory limit, the number of merge tasks that can run at once and the cuDF row limit
-/// (op::compute_sort_partition_sizing). Off restores the previous rule: the data size over
+/// Default for sort_partition_auto_sizing. On: SORT_SAMPLE derives the number of range partitions
+/// from the GPU memory limit, the number of merge tasks that can run at once and the cuDF row
+/// limit (op::compute_sort_partition_sizing). Off: the data size over
 /// max_sort_partition_memory_fraction of the GPU memory free at that moment.
-constexpr bool DEFAULT_SORT_PARTITION_AUTO_SIZING = true;
+///
+/// Off by default: the rule keeps a sort that fits the GPU out of small one-shot merges in
+/// sort_merge_mode 'auto', but a sort larger than the GPU gets fewer, larger partitions from the
+/// limit-based memory term than from the free memory, and spills more.
+constexpr bool DEFAULT_SORT_PARTITION_AUTO_SIZING = false;
 
 /// Default for sort_coalesce_memory_fraction: the share of one GPU's memory that the inputs of the
 /// local sorts running at the same time may add up to. One sorted run is at most this fraction
@@ -241,11 +246,12 @@ struct operator_params {
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
 
-  /// Fraction of a GPU's memory limit per sort partition when max_sort_partition_bytes is 0.
+  /// Fraction of GPU memory per sort partition when max_sort_partition_bytes is 0 (of the free
+  /// memory; of the memory limit with sort_partition_auto_sizing).
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
-  /// Automatic choice of the sort partition count (SET sort_partition_auto_sizing); false = the
-  /// previous rule based on the GPU memory free when the boundaries are computed.
+  /// Automatic choice of the sort partition count (SET sort_partition_auto_sizing); false (the
+  /// default) = the rule based on the GPU memory free when the boundaries are computed.
   bool sort_partition_auto_sizing = config::DEFAULT_SORT_PARTITION_AUTO_SIZING;
 
   /// Merge path for MERGE_SORT (SET sort_merge_mode): auto, windowed or one_shot.

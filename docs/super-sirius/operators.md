@@ -680,8 +680,8 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE â†
 
 **Partition count.** `compute_sort_partition_sizing()` (same header) decides it from the estimated input size:
 - `max_sort_partition_bytes` set: `ceil(data / value)`, nothing else applies.
-- `sort_partition_auto_sizing = true` (default), the largest of: `ceil(data / (max_sort_partition_memory_fraction x GPU memory limit))`; where partitions take the one-shot merge (`sort_merge_mode = 'one_shot'`, or `auto` with partitions under its one-shot threshold), `ceil(rows / (0.75 x 2^31))`, so that the partition stays a valid cuDF table; with `sort_merge_mode = 'windowed'`, one partition per executor thread of a GPU (at most 4), as long as partitions stay at or above 2 GiB and the pieces of an input batch at or above 4 MiB (not in `auto` mode, where smaller partitions would switch to the one-shot merge); and, with `sort_merge_mode = 'one_shot'`, `ceil(data / (limit / ((3 + 8 / row width) x 2)))`, because a one-shot merge needs 3 x partition bytes + 8 bytes per row on the GPU.
-- `sort_partition_auto_sizing = false`: the previous rule, `ceil(data / (fraction x GPU memory free at that moment))`.
+- `sort_partition_auto_sizing = true`, the largest of: `ceil(data / (max_sort_partition_memory_fraction x GPU memory limit))`; where partitions take the one-shot merge (`sort_merge_mode = 'one_shot'`, or `auto` with partitions under its one-shot threshold), `ceil(rows / (0.75 x 2^31))`, so that the partition stays a valid cuDF table; with `sort_merge_mode = 'windowed'`, one partition per executor thread of a GPU (at most 4), as long as partitions stay at or above 2 GiB and the pieces of an input batch at or above 4 MiB (not in `auto` mode, where smaller partitions would switch to the one-shot merge); and, with `sort_merge_mode = 'one_shot'`, `ceil(data / (limit / ((3 + 8 / row width) x 2)))`, because a one-shot merge needs 3 x partition bytes + 8 bytes per row on the GPU.
+- `sort_partition_auto_sizing = false` (default): `ceil(data / (fraction x GPU memory free at that moment))`.
 
 The decision is logged at INFO as `[sort_sample][sizing] partitions=... rule=...`.
 
