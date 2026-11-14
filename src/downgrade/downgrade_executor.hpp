@@ -190,6 +190,14 @@ class downgrade_executor {
   bool has_disk_tier() const;
 
   /**
+   * @brief Whether a spill sink is configured: a DISK space, or a REMOTE space with an attached
+   * I/O context (REMOTE has no lazy default context, unlike DISK).
+   *
+   * A HOST source without one can only reclaim cache chunks.
+   */
+  bool has_spill_sink() const;
+
+  /**
    * @brief Number of downgrade requests the monitor loop has issued (test-only).
    *
    * Lets tests observe whether the monitor has gone quiescent (count stops rising)
@@ -235,9 +243,10 @@ class downgrade_executor {
   /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
    *
-   * DISK is an effectively unbounded sink, so if it is configured a downgrade can always make
-   * progress. Otherwise progress is only possible if some HOST space still has capacity to accept
-   * data. Re-evaluated on every monitor cycle so the monitor backs off when stuck and resumes the
+   * GPU/HOST sources can spill to configured DISK spaces or REMOTE spaces with an attached I/O
+   * context. Without a spill sink, GPU progress requires HOST reservation capacity; HOST can still
+   * reclaim a bound fs_cache's staging buffers. DISK/REMOTE are never downgrade sources.
+   * Re-evaluated on every monitor cycle so the monitor backs off when stuck and resumes the
    * instant conditions change -- no latched state, no missed wakeup.
    */
   bool has_viable_downgrade_target() const;

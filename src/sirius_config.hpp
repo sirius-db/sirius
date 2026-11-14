@@ -28,9 +28,12 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -428,6 +431,17 @@ using rest_reactor_cpu_planner =
   std::vector<int> const& allowed,
   std::span<exec::thread_pool_config* const> pools);
 
+/// Transport overrides for remote spill. Credentials and TLS trust remain in the
+/// programmatically supplied object_store_config, never in YAML.
+struct remote_spill_config {
+  std::string endpoint;
+  std::string region;
+  std::optional<cucascade::io::object_store_config::signing_mode> signing_mode;
+  std::size_t n_reactors{2};
+  std::size_t staging_bytes{256UL << 20};  // Per reactor, pinned host memory.
+  std::int64_t shutdown_removal_timeout_ms{10000};
+};
+
 struct sirius_config {
   sirius_config()  = default;
   ~sirius_config() = default;
@@ -465,6 +479,11 @@ struct sirius_config {
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.
   void set_scan_manager_config(scan_manager::scan_manager_config config) noexcept;
+
+  [[nodiscard]] const remote_spill_config& get_remote_spill_config() const noexcept
+  {
+    return _remote_spill_config;
+  }
 
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
@@ -546,6 +565,7 @@ struct sirius_config {
   /// Query admission limit (`sirius.max_concurrent_queries`).
   int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
+  remote_spill_config _remote_spill_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
