@@ -715,9 +715,9 @@ class QueryGenerator:
         else:
             weights = {"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1}
             if max_tables >= 5:
-                weights["5"] = 0.07
+                weights["5"] = 0.035
             if max_tables >= 6:
-                weights["6"] = 0.03
+                weights["6"] = 0.015
             n = self._pick(weights)
             n = min(int(n), max_tables)
             if n >= 5:

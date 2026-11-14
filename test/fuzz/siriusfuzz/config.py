@@ -54,17 +54,21 @@ class Joins:
     )
     inequality: bool = True
     null_safe_keys: bool = True
-    max_tables: int = gap_switch(4, 6)
+    max_tables: int = 6
     cartesian_max_rows: int = 50_000
     any_join: bool = True
-    any_mixed: bool = gap_switch(False)
+    any_mixed: bool = gap_switch(
+        False
+    )  # 5a54110e: mixed arithmetic ANY GPU AST type error
     any_join_share: float = 0.15
-    self_join: bool = gap_switch(False)
+    self_join: bool = True
     self_join_share: float = 0.2
-    grouped_inputs: bool = gap_switch(False)
-    star_share: float = gap_switch(0.0, 0.3)
-    expression_keys: bool = gap_switch(False)
-    on_filters: bool = gap_switch(False)
+    grouped_inputs: bool = True
+    star_share: float = 0.3
+    expression_keys: bool = True
+    on_filters: bool = gap_switch(
+        False
+    )  # outer ON predicates hit arbitrary-join decline
 
 
 @dataclass

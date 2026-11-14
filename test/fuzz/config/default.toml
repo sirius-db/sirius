@@ -34,16 +34,16 @@ intersect = true
 types = ["inner", "left", "right", "semi", "anti"]
 inequality = true
 null_safe_keys = true     # IS NOT DISTINCT FROM keys
-max_tables = 4
+max_tables = 6
 cartesian_max_rows = 50000
 any_join = true
 any_mixed = false
 any_join_share = 0.15
-self_join = false
+self_join = true
 self_join_share = 0.2
-grouped_inputs = false
-star_share = 0.0
-expression_keys = false
+grouped_inputs = true
+star_share = 0.3
+expression_keys = true
 on_filters = false
 
 [features.subqueries]
