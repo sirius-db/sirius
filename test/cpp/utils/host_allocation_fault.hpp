@@ -27,8 +27,8 @@ namespace sirius::test {
  * (`test/cpp/utils/dynamic_filter_host_allocation_fault.cpp`) on the calling thread until
  * destruction.
  *
- * Only `scripts/run_dynamic_filter_host_allocation_fault.py` preloads the helper, for the hidden
- * `[host_allocation_fault]` tests, which must first require `available()`.
+ * Hidden `[host_allocation_fault]` tests preload the helper through the dedicated runner or
+ * an explicit LD_PRELOAD invocation. Tests must first require `available()`.
  */
 class scoped_host_allocation_fault {
  public:
