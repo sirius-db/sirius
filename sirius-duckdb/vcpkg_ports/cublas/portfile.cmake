@@ -34,6 +34,9 @@ file(INSTALL "${SOURCE_PATH}/include/"
 file(INSTALL "${SOURCE_PATH}/lib/libcublas_static.a"
      "${SOURCE_PATH}/lib/libcublasLt_static.a"
      DESTINATION "${CURRENT_PACKAGES_DIR}/lib")
+include("${CMAKE_CURRENT_LIST_DIR}/../cuda_prune.cmake")
+cuda_prune("${CURRENT_PACKAGES_DIR}/lib/libcublas_static.a"
+           "${CURRENT_PACKAGES_DIR}/lib/libcublasLt_static.a")
 file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/${PORT}-config.cmake"
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}")
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
