@@ -53,6 +53,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -74,6 +75,7 @@
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -1067,16 +1069,15 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // Managers are created per execution window (begin_execution_window), not here; the registry
   // starts empty and only ever holds entries for in-flight queries.
 
-  // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
-  // so pointers are available for injection into gpu_pipeline_executors.
-  // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
+  // Create the downgrade executors BEFORE task_scheduler, so pointers are available for
+  // injection into gpu_pipeline_executors: one per GPU memory space (spills GPU -> HOST/DISK)
+  // and one per HOST memory space (spills HOST -> DISK). HOST executors also reclaim local
+  // fs_cache staging buffers, even when no DISK spill tier is configured.
   //
-  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto main PR #579 shape):
-  // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
-  // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
-  // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the
-  // NUMA-local host memory_space via cucascade's
-  // any_memory_space_in_tier_with_preference strategy.
+  // Per-GPU NUMA-aware downgrade: each GPU's downgrade_executor gets its own copy of
+  // downgrade_executor_config with preferred_numa_node populated from
+  // hw_topology().gpus[device_id].numa_node, so processing_loop orders the NUMA-local host
+  // memory_space first in its target list.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
     auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& base_cfg = config_.get_downgrade_executor_config();
@@ -1133,6 +1134,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
   }
+
+  // Only the default local ioctx cache participates in HOST downgrade reclaim. Routed remote
+  // caches are deliberately outside this binding's scope.
+  rebind_fs_cache_on_host_executors();
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
@@ -1332,6 +1337,63 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+void SiriusContext::rebind_fs_cache_on_host_executors()
+{
+  auto* io_ctx = scan_manager_ ? scan_manager_->io_ctx() : nullptr;
+  auto* cache  = io_ctx ? io_ctx->cache() : nullptr;
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+      executor->set_fs_cache(cache);
+    }
+  }
+}
+
+void SiriusContext::reset_caches()
+{
+  throw_if_not_initialized();
+
+  std::vector<sirius::parallel::downgrade_executor*> paused;
+  paused.reserve(downgrade_executors_.size());
+  std::exception_ptr reset_error;
+  try {
+    for (auto& executor : downgrade_executors_) {
+      if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+        // Pause first: both processing and monitoring may still be reading the old cache.
+        executor->pause();
+        paused.push_back(executor.get());
+        executor->set_fs_cache(nullptr);
+      }
+    }
+    scan_manager_->reset_caches();
+  } catch (...) {
+    reset_error = std::current_exception();
+  }
+
+  // A rebuild can fail after destroying the old cache. Restore only borrowers this call
+  // successfully paused: a later pause failure leaves the other executors running, with
+  // their original cache still valid. Attempt every rebind and resume on either path.
+  auto* io_ctx = scan_manager_->io_ctx();
+  auto* cache  = io_ctx ? io_ctx->cache() : nullptr;
+  std::exception_ptr restore_error;
+  for (auto* executor : paused) {
+    try {
+      executor->set_fs_cache(cache);
+    } catch (...) {
+      if (!restore_error) { restore_error = std::current_exception(); }
+    }
+  }
+  for (auto* executor : paused) {
+    try {
+      executor->resume();
+    } catch (...) {
+      if (!restore_error) { restore_error = std::current_exception(); }
+    }
+  }
+  if (restore_error) { mark_runtime_unavailable(); }
+  if (reset_error) { std::rethrow_exception(reset_error); }
+  if (restore_error) { std::rethrow_exception(restore_error); }
+}
+
 sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
 {
   throw_if_not_initialized();
@@ -1439,10 +1501,11 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   const noexcept
 {
   auto snapshot = transparent_execution_stats{
-    .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
-    .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
-    .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
-    .runtime_fallbacks  = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .successful_rebinds     = transparent_rebind_success_count_.load(std::memory_order_relaxed),
+    .fallbacks              = transparent_fallback_count_.load(std::memory_order_relaxed),
+    .executions             = transparent_execution_count_.load(std::memory_order_relaxed),
+    .runtime_fallbacks      = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .exists_minmax_rewrites = exists_minmax_rewrite_count_.load(std::memory_order_relaxed),
     .provider_internal_skips =
       transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
@@ -1647,6 +1710,11 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void SiriusContext::record_exists_minmax_rewrites(uint64_t count) noexcept
+{
+  exists_minmax_rewrite_count_.fetch_add(count, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_certificate_incomplete() noexcept
 {
   transparent_certificate_incomplete_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1768,9 +1836,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // or optimization removes scans. Decide before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs;
   if (conn_state) {
     logical_plan           = conn_state->take_captured_plan_if_current();
     logical_original_views = conn_state->take_captured_original_views_if_current();
+    cte_reader_proofs      = conn_state->take_captured_cte_reader_proofs_if_current();
     if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
         sirius::transparent::decline_reason::none) {
       return RebindQueryInfo::DO_NOT_REBIND;
@@ -1778,6 +1848,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   auto const candidate_source = logical_plan ? sirius::transparent::candidate_origin::copy
                                              : sirius::transparent::candidate_origin::replan;
+  // The proofs describe the captured plan only; a plan replanned from SQL gets none.
+  if (candidate_source != sirius::transparent::candidate_origin::copy) {
+    cte_reader_proofs.reset();
+  }
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
   // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
   // never rewrite the physical plan even if we could.
@@ -1919,6 +1993,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
+
+    planner->cte_reader_proofs = cte_reader_proofs;
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
     // execution window re-checks it and rebuilds if a pin or unpin landed in between.
@@ -1994,7 +2070,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       0,
       std::move(validated_sirius_plan),
       validated_plan_pin_epoch,
-      context.transaction.ActiveTransaction().global_transaction_id);
+      context.transaction.ActiveTransaction().global_transaction_id,
+      std::move(cte_reader_proofs));
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
@@ -2153,17 +2230,19 @@ void install_configured_log_sink(DatabaseInstance* db)
         ? std::nullopt
         : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
     auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-    sink->set_level(lvl);
-    sirius::log::set_sink(std::move(sink));
+    sirius::log::set_sink(std::move(sink), lvl);
     // Warn only once the sink is installed, so the message actually reaches it.
     if (!parsed_level) {
       SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
     }
   } else if (backend == "noop") {
+    // The noop sink accepts nothing, so the mirror mutes cuCascade's gate as well.
     sirius::log::set_sink(sirius::log::make_noop_sink());
   } else if (backend == "duckdb") {
     // Needs a DatabaseInstance; with none, defer and leave the current sink.
-    if (db) { sirius::log::set_sink(sirius::log::make_duckdb_sink(*db)); }
+    // DuckDB applies its own level to Sirius and cuCascade records alike; see
+    // duckdb_sink::min_accepted_level.
+    if (db) { sirius::log::set_sink(sirius::log::make_duckdb_sink(*db), lvl); }
   } else if (db) {
     // Only report a bad backend on the db path; the db-less call is best-effort
     // and must not throw.

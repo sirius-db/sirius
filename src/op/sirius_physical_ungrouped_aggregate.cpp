@@ -26,6 +26,7 @@
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/average.hpp"
 #include "op/aggregate/stddev.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
 #include "op/input_free_operator_data.hpp"
@@ -345,17 +346,8 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
       sum_view, count_view, cudf::binary_operator::DIV, out_type, stream, memory_resource);
   }
 
-  // Non-DECIMAL output (typically DOUBLE): cast both operands to FLOAT64 and divide.
-  auto sum_f64 =
-    cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
-  auto count_f64 =
-    cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, memory_resource);
-  auto avg_f64 = cudf::binary_operation(sum_f64->view(),
-                                        count_f64->view(),
-                                        cudf::binary_operator::DIV,
-                                        cudf::data_type{cudf::type_id::FLOAT64},
-                                        stream,
-                                        memory_resource);
+  // Non-DECIMAL output (typically DOUBLE).
+  auto avg_f64 = average_as_double(sum_view, count_view, stream, memory_resource);
   if (out_type.id() == cudf::type_id::FLOAT64) { return avg_f64; }
   // Defensive: cast to the requested numeric return type if it isn't already FLOAT64.
   return cudf::cast(avg_f64->view(), out_type, stream, memory_resource);

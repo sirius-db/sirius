@@ -14,27 +14,67 @@
  * limitations under the License.
  */
 
+#include "log/cucascade_sink.hpp"
 #include "log/noop_sink.hpp"
 #include "log/sink.hpp"
 
 #include <atomic>
+#include <initializer_list>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <utility>
 
 namespace sirius::log {
+
+std::optional<level> sink::min_accepted_level() const
+{
+  using enum level;
+  for (auto lvl : {trace, debug, info, warn, error, critical}) {
+    if (should_log(lvl)) { return lvl; }
+  }
+  return off;
+}
 
 namespace {
 
 // Global logging state.
 struct logger_state {
   std::atomic<std::shared_ptr<sink>> active{make_noop_sink()};
+  // Serializes the writers (set_sink, set_level) so a sink swap and its cuCascade mirror are
+  // never interleaved with another writer's. Readers (get_sink) never take it.
+  std::mutex writers;
 };
 
 logger_state& state()
 {
-  // Destroyed at exit, so the sink's destructor flushes
-  // This may be gone if logs are emitted from static destructors.
-  static logger_state instance;
+  // Never destroyed: the embedded cuCascade library keeps its own sink registry alive through
+  // exit and forwards into get_sink() (log/cucascade_sink.cpp), so a record from a static
+  // destructor or a late thread must still find a valid slot. The last sink therefore leaks at
+  // exit instead of flushing; spdlog's registry flushes its loggers on its own.
+  static auto& instance = *new logger_state{};
   return instance;
+}
+
+/// Mirrors what `s` currently accepts onto cuCascade's gate, so cuCascade never formats a record
+/// this sink would drop. A sink whose acceptance is decided elsewhere (DuckDB) gets everything.
+void mirror_onto_cucascade(const sink& s)
+{
+  set_cucascade_log_level(s.min_accepted_level().value_or(level::trace));
+}
+
+/// Swaps `new_sink` in and routes cuCascade after it. Caller holds `writers`.
+void install_locked(std::shared_ptr<sink> new_sink)
+{
+  // For good measure, flush the sink being replaced before dropping the last
+  // reference to it.
+  if (auto old_sink = state().active.exchange(new_sink, std::memory_order_acq_rel)) {
+    old_sink->flush();
+  }
+  // cuCascade's records reach the new sink through the bridge, which looks the sink up on every
+  // record; this only installs the bridge the first time.
+  attach_cucascade_logging();
+  mirror_onto_cucascade(*new_sink);
 }
 
 }  // namespace
@@ -42,11 +82,24 @@ logger_state& state()
 void set_sink(std::shared_ptr<sink> sink)
 {
   auto new_sink = sink ? std::move(sink) : make_noop_sink();
-  // For good measure, flush the sink being replaced before dropping the last
-  // reference to it.
-  if (auto old_sink = state().active.exchange(std::move(new_sink), std::memory_order_acq_rel)) {
-    old_sink->flush();
-  }
+  const std::lock_guard lock{state().writers};
+  install_locked(std::move(new_sink));
+}
+
+void set_sink(std::shared_ptr<sink> sink, level lvl)
+{
+  auto new_sink = sink ? std::move(sink) : make_noop_sink();
+  new_sink->set_level(lvl);
+  const std::lock_guard lock{state().writers};
+  install_locked(std::move(new_sink));
+}
+
+void set_level(level lvl)
+{
+  const std::lock_guard lock{state().writers};
+  auto current = get_sink();
+  current->set_level(lvl);
+  mirror_onto_cucascade(*current);
 }
 
 std::shared_ptr<sink> get_sink()

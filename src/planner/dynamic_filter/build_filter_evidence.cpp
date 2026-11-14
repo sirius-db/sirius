@@ -17,6 +17,7 @@
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace sirius::planner {
@@ -74,6 +75,24 @@ bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
              build_relation_is_opaque(*op.children.front());
     default: return false;
   }
+}
+
+bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+      op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+    switch (op.Cast<duckdb::LogicalComparisonJoin>().join_type) {
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI:
+      case duckdb::JoinType::RIGHT_SEMI:
+      case duckdb::JoinType::RIGHT_ANTI: return true;
+      default: break;
+    }
+  }
+  for (auto const& child : op.children) {
+    if (child && build_subtree_has_filtering_join(*child)) { return true; }
+  }
+  return false;
 }
 
 }  // namespace sirius::planner

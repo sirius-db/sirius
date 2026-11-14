@@ -38,6 +38,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
@@ -139,9 +140,6 @@ TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_s
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
-  sirius::exec::thread_pool_config gpu_config{2};
-  gpu_config.cpu_affinity_list = {999};
-
   cucascade::memory::system_topology_info topology;
   topology.num_gpus = 1;
   cucascade::memory::gpu_topology_info gpu;
@@ -149,16 +147,26 @@ TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_s
   gpu.cpu_cores = {3, 7};
   topology.gpus.push_back(std::move(gpu));
 
-  task_scheduler executor(
-    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+  // The GPU's local cores within the pool's affinity; a pool affinity that holds none of them
+  // (e.g. {0,3} once CPU 3 is reserved for REST reactors, leaving {0}) is kept, so a reserved
+  // CPU is never handed back.
+  for (auto const& [pool, expected] : {std::pair{std::vector<int>{}, std::vector<int>{3, 7}},
+                                       std::pair{std::vector<int>{1, 7}, std::vector<int>{7}},
+                                       std::pair{std::vector<int>{0}, std::vector<int>{0}}}) {
+    CAPTURE(pool);
+    sirius::exec::thread_pool_config gpu_config{2};
+    gpu_config.cpu_affinity_list = pool;
+    task_scheduler executor(
+      lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
 
-  std::size_t visited = 0;
-  executor.visit_executors([&](int device_id, auto const& gpu_executor) {
-    REQUIRE(device_id == 0);
-    REQUIRE(gpu_executor.get_effective_config().cpu_affinity_list == std::vector<int>{3, 7});
-    ++visited;
-  });
-  REQUIRE(visited == 1);
+    std::size_t visited = 0;
+    executor.visit_executors([&](int device_id, auto const& gpu_executor) {
+      REQUIRE(device_id == 0);
+      REQUIRE(gpu_executor.get_effective_config().cpu_affinity_list == expected);
+      ++visited;
+    });
+    REQUIRE(visited == 1);
+  }
 }
 
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
@@ -406,7 +414,9 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
           "[task_scheduler][deadlock-1467]")
 {
-  auto manager = initialize_memory_manager(1);
+  auto manager    = initialize_memory_manager(1);
+  auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(sirius::make_query_id(0));
@@ -429,8 +439,8 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
   while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
                                         /*front_to_back=*/false)) {
-    extracted.push_back(
-      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue, lifecycle));
+    extracted.push_back(std::make_unique<sirius::convertible_gpu_pipeline_task>(
+      std::move(*t), *queue, lifecycle, gpu_space));
   }
   REQUIRE(extracted.size() == num_tasks);
 
@@ -529,13 +539,17 @@ TEST_CASE("scheduler and spill return retain submission through rejected task de
   }
   SECTION("spill return enqueue")
   {
+    auto manager    = initialize_memory_manager(1);
+    auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    REQUIRE(gpu_space != nullptr);
     sirius::exec::multi_index_priority_queue<itask> queue(&index_keys_for);
     queue.interrupt();
     {
       sirius::convertible_gpu_pipeline_task spilled(
         std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction),
         queue,
-        lifecycle);
+        lifecycle,
+        gpu_space);
     }
     REQUIRE(queue.empty());
   }
@@ -628,4 +642,20 @@ TEST_CASE("successful retirement reports queued execution work before the work b
   scheduler.discard_query_tasks(q);
   lifecycle.wait_for_work(q);
   lifecycle.close(q);
+}
+
+TEST_CASE("gpu_executor_cpu_affinity intersects a GPU's local cores with the pool affinity",
+          "[task_scheduler][affinity]")
+{
+  using sirius::pipeline::gpu_executor_cpu_affinity;
+  std::vector<int> const local{0, 1, 2, 3};
+  // No pool affinity: the GPU's local cores.
+  CHECK(gpu_executor_cpu_affinity(local, {}) == local);
+  // Overlap: only the local cores the pool may use.
+  CHECK(gpu_executor_cpu_affinity(local, {2, 3, 4, 5}) == std::vector<int>{2, 3});
+  // Pool {0,4} after reserving CPU 0 is {4}: no local core is left, and the reserved CPU 0
+  // must not come back, so the pool's affinity is kept.
+  CHECK(gpu_executor_cpu_affinity(local, {4}) == std::vector<int>{4});
+  // No local cores known: the pool's affinity.
+  CHECK(gpu_executor_cpu_affinity({}, {4, 5}) == std::vector<int>{4, 5});
 }

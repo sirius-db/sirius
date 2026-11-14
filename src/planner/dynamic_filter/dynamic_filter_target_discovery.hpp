@@ -55,6 +55,9 @@ struct descent_step {
 struct route_terminal {
   sirius::op::sirius_physical_operator* node = nullptr;  // Borrowed from the walked subtree.
   std::size_t ordinal                        = 0;
+  // Set for a scan inside the body of a delim CTE whose proven outer-row read the walk reached.
+  // The read's own terminal is reported as well, so an endpoint still filters the read.
+  bool in_cte_body = false;
 };
 
 /**

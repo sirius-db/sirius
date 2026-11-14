@@ -42,6 +42,8 @@
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/connection.hpp>
+#include <duckdb/main/database.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/join_filter_pushdown_optimizer.hpp>
 #include <duckdb/optimizer/optimizer.hpp>

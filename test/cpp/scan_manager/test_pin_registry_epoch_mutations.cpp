@@ -124,6 +124,28 @@ struct epoch_fixture {
                                   std::move(metadata)));
   }
 
+  void insert_parquet(std::vector<std::size_t> const& primary_indices,
+                      cudf::size_type n_rows,
+                      std::size_t n_table_columns,
+                      sirius::scan_manager::pinned_entry_metadata metadata = {},
+                      std::string const& file = "/tmp/sirius_domain_registry.parquet")
+  {
+    cache_entry_info info;
+    info.resolved_file_paths = {file};
+    for (auto const index : primary_indices) {
+      info.column_ids.emplace_back(index);
+      info.names.push_back("c" + std::to_string(index));
+    }
+    static_cast<void>(manager.insert_pinned_entry(kTable,
+                                                  std::move(info),
+                                                  one_chunk(n_table_columns, n_rows),
+                                                  {space},
+                                                  {},
+                                                  {},
+                                                  storage_for(primary_indices.size()),
+                                                  std::move(metadata)));
+  }
+
   [[nodiscard]] std::uint64_t epoch() const { return manager.pin_registry_epoch(); }
 
   [[nodiscard]] std::shared_ptr<const sirius::pin_snapshot_identity> snapshot() const
@@ -326,4 +348,85 @@ TEST_CASE("replacing a pin renews its snapshot without unpinning",
   f.insert({0}, 9, 1);
   REQUIRE(f.snapshot());
   CHECK(f.snapshot() != old_snapshot);
+}
+
+TEST_CASE("domain declarations publish atomically without becoming uniqueness proofs",
+          "[scan_manager][pin_registry_epoch][domain_evidence]")
+{
+  epoch_fixture f;
+  std::vector<std::string> const files{"/tmp/sirius_domain_registry.parquet"};
+  f.insert_parquet(
+    {0, 1}, 8, 2, {.proven_unique_columns = {"c1"}, .declared_unique_columns = {"c0"}});
+  auto previous = f.manager.find_pinned_entry_for_parquet_files(files);
+  REQUIRE(previous);
+  REQUIRE(previous->declared_unique_columns == std::vector<std::string>{"c0"});
+  REQUIRE(previous->proven_unique_columns == std::vector<bool>{false, true});
+  auto const before = f.epoch();
+  REQUIRE_THROWS_AS(f.insert_parquet({0, 1}, 4, 1, {.declared_unique_columns = {"c1"}}),
+                    std::runtime_error);
+  CHECK(f.manager.find_pinned_entry_for_parquet_files(files) == previous);
+  CHECK(previous->declared_unique_columns == std::vector<std::string>{"c0"});
+  CHECK(f.epoch() > before);
+
+  f.insert_parquet({0, 1}, 9, 2);
+  auto current = f.manager.find_pinned_entry_for_parquet_files(files);
+  REQUIRE(current);
+  CHECK(current != previous);
+  CHECK(current->declared_unique_columns.empty());
+  CHECK(current->proven_unique_columns.empty());
+  CHECK(previous->num_rows == 8);
+  CHECK(previous->declared_unique_columns == std::vector<std::string>{"c0"});
+  CHECK(previous->proven_unique_columns == std::vector<bool>{false, true});
+}
+
+TEST_CASE("compatible GPU merges preserve and add independent domain declarations",
+          "[scan_manager][pin_registry_epoch][domain_evidence]")
+{
+  epoch_fixture f;
+  std::vector<std::string> const files{"/tmp/sirius_domain_registry.parquet"};
+  f.insert_parquet({0}, 8, 1, {.declared_unique_columns = {"c0"}});
+  auto const first_snapshot = f.snapshot();
+  f.insert_parquet({1}, 8, 1, {.declared_unique_columns = {"c1"}});
+  auto const merged_snapshot = f.snapshot();
+  REQUIRE(merged_snapshot != first_snapshot);
+  {
+    auto merged = f.manager.find_pinned_entry_for_parquet_files(files);
+    REQUIRE(merged);
+    CHECK(merged->declared_unique_columns == std::vector<std::string>{"c0", "c1"});
+    CHECK(merged->proven_unique_columns.empty());
+  }
+  f.insert_parquet({2}, 8, 1);
+  auto merged = f.manager.find_pinned_entry_for_parquet_files(files);
+  REQUIRE(merged);
+  CHECK(merged->snapshot_identity != merged_snapshot);
+  CHECK(merged->declared_unique_columns == std::vector<std::string>{"c0", "c1"});
+  CHECK(merged->proven_unique_columns.empty());
+
+  auto const copied_declarations = merged->declared_unique_columns;
+  f.manager.remove_pinned_entry(kTable);
+  CHECK_FALSE(f.manager.find_pinned_entry_for_parquet_files(files));
+  f.insert_parquet({0, 1}, 8, 2);
+  auto repinned = f.manager.find_pinned_entry_for_parquet_files(files);
+  REQUIRE(repinned);
+  CHECK(repinned->declared_unique_columns.empty());
+  CHECK(copied_declarations == std::vector<std::string>{"c0", "c1"});
+  CHECK(merged->declared_unique_columns == copied_declarations);
+}
+
+TEST_CASE("a new Parquet source under the same pin name replaces domain declarations",
+          "[scan_manager][pin_registry_epoch][domain_evidence]")
+{
+  epoch_fixture f;
+  std::vector<std::string> const first{"/tmp/sirius_domain_registry.parquet"};
+  std::vector<std::string> const second{"/tmp/sirius_domain_registry_replacement.parquet"};
+  f.insert_parquet({0, 1}, 8, 2, {.declared_unique_columns = {"c0"}});
+  auto previous = f.manager.find_pinned_entry_for_parquet_files(first);
+  REQUIRE(previous);
+  f.insert_parquet({0, 1}, 8, 2, {.declared_unique_columns = {"c1"}}, second.front());
+  CHECK_FALSE(f.manager.find_pinned_entry_for_parquet_files(first));
+  auto current = f.manager.find_pinned_entry_for_parquet_files(second);
+  REQUIRE(current);
+  CHECK(current != previous);
+  CHECK(current->declared_unique_columns == std::vector<std::string>{"c1"});
+  CHECK(previous->declared_unique_columns == std::vector<std::string>{"c0"});
 }

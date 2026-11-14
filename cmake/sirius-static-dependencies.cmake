@@ -11,10 +11,10 @@ find_dependency(yaml-cpp CONFIG)
 find_dependency(roaring CONFIG)
 find_dependency(OpenSSL)
 find_dependency(absl CONFIG)
-find_dependency(kvikio CONFIG)
 find_dependency(nvcomp CONFIG)
 find_dependency(nvrtc CONFIG)
 find_dependency(nvjitlink CONFIG)
+find_dependency(nixl 1.5.2 EXACT CONFIG)
 foreach(target CUDA::cusparse CUDA::cusparse_static)
   if(TARGET ${target})
     get_target_property(cusparse_links ${target} INTERFACE_LINK_LIBRARIES)
@@ -26,16 +26,6 @@ foreach(target CUDA::cusparse CUDA::cusparse_static)
     endif()
   endif()
 endforeach()
-find_dependency(CURL CONFIG)
-# cuCascade's io archive links Curl as PkgConfig::CURL (the pkg-config target
-# its own build creates). The package selects Curl through its config package
-# instead, so give the exported name a target backed by that same library and
-# its dependencies rather than a second, system Curl found by pkg-config.
-if(NOT TARGET PkgConfig::CURL)
-  add_library(PkgConfig::CURL INTERFACE IMPORTED)
-  set_target_properties(PkgConfig::CURL PROPERTIES INTERFACE_LINK_LIBRARIES
-                                                   CURL::libcurl)
-endif()
 find_dependency(PkgConfig)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 if(NOT TARGET cuvs::cuvs)

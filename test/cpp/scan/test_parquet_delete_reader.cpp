@@ -16,7 +16,6 @@
 
 #include <catch.hpp>
 #include <core_functions_extension.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -25,6 +24,7 @@
 #include <op/scan/parquet_delete_reader.hpp>
 #include <parquet_extension.hpp>
 #include <parquet_reader.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/s3_backend.hpp>
 
 #include <algorithm>
@@ -327,7 +327,7 @@ TEST_CASE("Iceberg consumes shared Parquet batches and rejects malformed positio
 {
   delete_fixture f;
   f.write(10000);
-  auto io = std::make_shared<cucascade::io::kvikio_context>();
+  auto io = sirius::test::make_test_local_ioctx();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
   auto result = load_delete_payload(*f.connection.context, "test-table", io, discovery);
@@ -494,7 +494,7 @@ TEST_CASE("Remote Parquet deletes preserve caller context and native filesystem 
   f.path = "delete-remote://bucket/deletes.parquet";
   SECTION("versioned remote object") {}
   SECTION("unversioned remote object remains readable") { remote.versioned = false; }
-  auto io = std::make_shared<cucascade::io::kvikio_context>();
+  auto io = sirius::test::make_test_local_ioctx();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
   auto result = load_delete_payload(*f.connection.context, "remote-table", io, discovery);
@@ -596,7 +596,7 @@ TEST_CASE("HTTP Parquet position deletes match SQL read_parquet", "[.][parquet_d
   auto expected = baseline->Fetch();
   REQUIRE(expected);
   REQUIRE(expected->GetValue(0, 0).GetValue<int64_t>() == 10000);
-  auto io = std::make_shared<cucascade::io::kvikio_context>();
+  auto io = sirius::test::make_test_local_ioctx();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(f.path);
   auto result           = load_delete_payload(*f.connection.context, "remote-table", io, discovery);
@@ -663,7 +663,7 @@ TEST_CASE("S3 Parquet position deletes match SQL and enforce credentials", "[.][
   REQUIRE(expected->GetValue(0, 0).GetValue<int64_t>() == 10000);
   auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
 
-  auto io = std::make_shared<cucascade::io::kvikio_context>();
+  auto io = sirius::test::make_test_local_ioctx();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(uri);
   auto read = [&] { return load_delete_payload(*f.connection.context, "s3-table", io, discovery); };

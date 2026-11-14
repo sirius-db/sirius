@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE connector_registry.cpp
           decimal_sum_input_bounds.cpp
+          delim_cte_proof.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
@@ -10,6 +11,7 @@ target_sources(
           gpu_admission.cpp
           join_implied_filters.cpp
           join_key_nullability.cpp
+          mark_join_conversion.cpp
           query.cpp
           query_index.cpp
           scan_column_origin.cpp
@@ -22,10 +24,12 @@ target_sources(
           sirius_plan_cross_product.cpp
           sirius_plan_cte.cpp
           sirius_plan_delim_get.cpp
+          sirius_plan_delim_aggregate_reuse.cpp
           sirius_plan_delim_join.cpp
           sirius_plan_distinct.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
+          sirius_plan_exists_rewrite.cpp
           sirius_plan_expression_get.cpp
           sirius_plan_filter.cpp
           sirius_plan_get.cpp

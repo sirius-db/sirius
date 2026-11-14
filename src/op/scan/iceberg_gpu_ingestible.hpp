@@ -127,7 +127,8 @@ class iceberg_gpu_ingestible : public gpu_ingestible {
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
-    expression_query_policy policy = {}) override;
+    expression_query_policy policy   = {},
+    scan_execution_context execution = {}) override;
 
  private:
   parquet_scan_core _core;
