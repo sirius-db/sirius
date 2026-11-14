@@ -474,7 +474,8 @@ constexpr std::size_t kGiB = std::size_t{1} << 30;
 
 sort_partition_sizing_input sizing_input(std::size_t data_gib,
                                          std::size_t limit_gib,
-                                         std::size_t concurrency)
+                                         std::size_t concurrency,
+                                         std::size_t gpus = 1)
 {
   sort_partition_sizing_input in;
   in.data_bytes               = data_gib * kGiB;
@@ -483,8 +484,8 @@ sort_partition_sizing_input sizing_input(std::size_t data_gib,
   in.gpu_capacity_bytes       = limit_gib * kGiB;
   in.gpu_available_bytes      = limit_gib * kGiB;
   in.memory_fraction          = 0.33;
-  in.policy.auto_sizing       = true;
   in.policy.merge_concurrency = concurrency;
+  in.policy.num_gpus          = gpus;
   in.policy.windowed_only     = true;
   return in;
 }
@@ -533,53 +534,131 @@ TEST_CASE("sort partition sizing: the previous rule uses the memory free at the 
 TEST_CASE("sort partition sizing: the memory term uses the GPU limit, not the free memory",
           "[physical_sort_sample][sort_partition_sizing]")
 {
-  // No concurrency information: only the memory term.
-  auto in = sizing_input(160, 80, 0);
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 7);
+  // 0.33 x 160 GiB = 52.8 GiB per partition.
+  auto in = sizing_input(64, 160, 0);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 2);
   CHECK(std::string(compute_sort_partition_sizing(in).rule) == "fraction_of_limit");
   // The count does not move with the memory in use when the boundaries are computed.
   in.gpu_available_bytes = 30 * kGiB;
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 7);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 2);
   // The fraction setting still scales it.
   in.memory_fraction = 0.125;
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 16);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 4);
   // Unknown limit: fall back to the free memory.
-  in                    = sizing_input(160, 80, 0);
+  in                    = sizing_input(64, 160, 0);
   in.gpu_capacity_bytes = 0;
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 7);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 2);
 }
 
-TEST_CASE("sort partition sizing: one partition per concurrent merge task when the data is large",
+TEST_CASE("sort partition sizing: smaller partitions when the sort does not fit the GPUs",
+          "[physical_sort_sample][sort_partition_sizing]")
+{
+  // The data and its sorted copy fit an 80 GiB GPU up to 40 GiB.
+  CHECK(compute_sort_partition_sizing(sizing_input(40, 80, 0)).num_partitions == 2);
+  auto sizing = compute_sort_partition_sizing(sizing_input(41, 80, 0));
+  CHECK(sizing.num_partitions == 6);  // ceil(41 / (0.10 x 80))
+  CHECK(std::string(sizing.rule) == "larger_than_gpu");
+  CHECK(compute_sort_partition_sizing(sizing_input(160, 80, 0)).num_partitions == 20);
+  // The free memory of the moment plays no part.
+  auto in                = sizing_input(160, 80, 0);
+  in.gpu_available_bytes = 20 * kGiB;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 20);
+  // Two GPUs hold twice as much before partitions shrink.
+  CHECK(compute_sort_partition_sizing(sizing_input(80, 80, 0, 2)).num_partitions == 4);
+  CHECK(compute_sort_partition_sizing(sizing_input(81, 80, 0, 2)).num_partitions == 11);
+  // A fraction setting below kSortPartitionSpillFraction is kept.
+  in                 = sizing_input(160, 80, 0);
+  in.memory_fraction = 0.05;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 40);
+  CHECK(std::string(compute_sort_partition_sizing(in).rule) == "fraction_of_limit");
+}
+
+TEST_CASE("sort partition sizing: one partition per merge thread on several GPUs",
           "[physical_sort_sample][sort_partition_sizing]")
 {
   // 32 GiB fits one partition of a 160 GiB GPU; four executor threads get four partitions.
-  auto sizing = compute_sort_partition_sizing(sizing_input(32, 160, 4));
+  auto sizing = compute_sort_partition_sizing(sizing_input(32, 160, 4, 2));
   CHECK(sizing.num_partitions == 4);
   CHECK(std::string(sizing.rule) == "merge_concurrency");
+  CHECK(compute_sort_partition_sizing(sizing_input(32, 160, 4, 4)).num_partitions == 4);
+  // Not on one GPU.
+  CHECK(compute_sort_partition_sizing(sizing_input(32, 160, 4)).num_partitions == 1);
+  CHECK(compute_sort_partition_sizing(sizing_input(32, 80, 4)).num_partitions == 2);
   // More threads than kSortPartitionMaxConcurrency do not raise it further; fewer lower it.
-  CHECK(compute_sort_partition_sizing(sizing_input(64, 160, 16)).num_partitions ==
+  CHECK(compute_sort_partition_sizing(sizing_input(64, 160, 16, 2)).num_partitions ==
         kSortPartitionMaxConcurrency);
-  CHECK(compute_sort_partition_sizing(sizing_input(32, 160, 2)).num_partitions == 2);
+  CHECK(compute_sort_partition_sizing(sizing_input(32, 160, 2, 2)).num_partitions == 2);
   // Small sorts are not split: no partition below kSortPartitionMinConcurrencyBytes.
-  CHECK(compute_sort_partition_sizing(sizing_input(1, 80, 4)).num_partitions == 1);
-  CHECK(compute_sort_partition_sizing(sizing_input(3, 80, 4)).num_partitions == 1);
-  CHECK(compute_sort_partition_sizing(sizing_input(4, 80, 4)).num_partitions == 2);
-  CHECK(compute_sort_partition_sizing(sizing_input(8, 80, 4)).num_partitions == 4);
+  CHECK(compute_sort_partition_sizing(sizing_input(1, 80, 4, 2)).num_partitions == 1);
+  CHECK(compute_sort_partition_sizing(sizing_input(3, 80, 4, 2)).num_partitions == 1);
+  CHECK(compute_sort_partition_sizing(sizing_input(4, 80, 4, 2)).num_partitions == 2);
+  CHECK(compute_sort_partition_sizing(sizing_input(8, 80, 4, 2)).num_partitions == 4);
   // Small input batches are not cut into pieces below kSortPartitionMinPieceBytes.
-  auto in            = sizing_input(32, 80, 4);
+  auto in            = sizing_input(32, 80, 4, 2);
   in.avg_batch_bytes = 3 * kSortPartitionMinPieceBytes;
   CHECK(compute_sort_partition_sizing(in).num_partitions == 3);
   in.avg_batch_bytes = kSortPartitionMinPieceBytes / 2;
   CHECK(compute_sort_partition_sizing(in).num_partitions == 2);  // the memory term
   // Only when every partition takes the windowed merge.
-  in                      = sizing_input(32, 160, 4);
+  in                      = sizing_input(32, 160, 4, 2);
   in.policy.windowed_only = false;
   CHECK(compute_sort_partition_sizing(in).num_partitions == 1);
   // A single thread, or an unknown width, adds nothing to the memory term.
-  CHECK(compute_sort_partition_sizing(sizing_input(16, 80, 1)).num_partitions == 1);
-  CHECK(compute_sort_partition_sizing(sizing_input(16, 80, 0)).num_partitions == 1);
+  CHECK(compute_sort_partition_sizing(sizing_input(16, 80, 1, 2)).num_partitions == 1);
+  CHECK(compute_sort_partition_sizing(sizing_input(16, 80, 0, 2)).num_partitions == 1);
   // The memory term still wins when it asks for more.
-  CHECK(compute_sort_partition_sizing(sizing_input(160, 80, 4)).num_partitions == 7);
+  CHECK(compute_sort_partition_sizing(sizing_input(160, 160, 4, 2)).num_partitions == 4);
+  in                 = sizing_input(160, 160, 4, 2);
+  in.memory_fraction = 0.1;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 10);
+}
+
+TEST_CASE(
+  "sort partition sizing: auto mode keeps partitions that cannot be merged whole together "
+  "above the one-shot threshold",
+  "[physical_sort_sample][sort_partition_sizing]")
+{
+  // An 80 GiB GPU whose 'auto' route merges partitions of up to 13.2 GiB whole.
+  auto const auto_input = [](std::size_t data_gib) {
+    auto in                                 = sizing_input(data_gib, 80, 4);
+    in.policy.windowed_only                 = false;
+    in.policy.auto_one_shot_partition_bytes = static_cast<std::size_t>(13.2 * kGiB);
+    return in;
+  };
+
+  // The memory term alone leaves partitions above the threshold.
+  auto in     = auto_input(32);
+  auto sizing = compute_sort_partition_sizing(in);
+  CHECK(sizing.num_partitions == 2);
+  CHECK(std::string(sizing.rule) == "fraction_of_limit");
+
+  // Four 8 GiB partitions would be merged whole, four at a time: 4 x 3.5 x 8 GiB does not fit.
+  in.memory_fraction = 0.125;
+  sizing             = compute_sort_partition_sizing(in);
+  CHECK(sizing.num_partitions == 2);
+  CHECK(std::string(sizing.rule) == "windowed_route");
+  CHECK(static_cast<double>(in.data_bytes / sizing.num_partitions) >=
+        kSortPartitionWindowedRouteMargin *
+          static_cast<double>(in.policy.auto_one_shot_partition_bytes));
+
+  // Partitions whose one-shot merges fit together are kept.
+  in                 = auto_input(16);
+  in.memory_fraction = 0.05;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 4);
+
+  // A sort that does not fit the GPU: as many partitions as stay clear of the threshold.
+  CHECK(compute_sort_partition_sizing(auto_input(64)).num_partitions == 4);
+  sizing = compute_sort_partition_sizing(auto_input(160));
+  CHECK(sizing.num_partitions == 10);
+  CHECK(std::string(sizing.rule) == "windowed_route");
+
+  // Other modes, and an unknown threshold, are not affected.
+  in                      = auto_input(160);
+  in.policy.windowed_only = true;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 20);
+  in                                      = auto_input(160);
+  in.policy.auto_one_shot_partition_bytes = 0;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 20);
 }
 
 TEST_CASE("sort partition sizing: one-shot partitions stay under the cuDF row limit",
@@ -622,13 +701,9 @@ TEST_CASE("sort partition sizing: one-shot partitions stay under the cuDF row li
     CHECK(sizing.num_partitions == 4);
     CHECK(std::string(sizing.rule) == "row_limit");
   }
-  SECTION("windowed mode: only the concurrency term")
+  SECTION("windowed mode: no row limit")
   {
     in.policy.windowed_only = true;
-    auto sizing             = compute_sort_partition_sizing(in);
-    CHECK(sizing.num_partitions == 4);
-    CHECK(std::string(sizing.rule) == "merge_concurrency");
-    in.policy.merge_concurrency = 0;
     CHECK(compute_sort_partition_sizing(in).num_partitions == 1);
   }
 }
@@ -636,22 +711,26 @@ TEST_CASE("sort partition sizing: one-shot partitions stay under the cuDF row li
 TEST_CASE("sort partition sizing: one-shot partitions fit the GPU with their merge temporaries",
           "[physical_sort_sample][sort_partition_sizing]")
 {
-  // 160 GiB of 16-byte rows under 80 GiB: the fraction alone gives 7 partitions of 22.9 GiB,
-  // and 3.5 x 22.9 GiB does not fit. One-shot sizing: 80 / (3.5 x 2) = 11.4 GiB, 15 partitions
-  // (14 would be exactly at the bound).
-  auto in                 = sizing_input(160, 80, 4);
+  // 36 GiB of 16-byte rows under 80 GiB: the fraction alone gives 2 partitions of 18 GiB, and two
+  // one-shot merges of 3.5 x 18 GiB do not fit. One-shot sizing: 80 / (3.5 x 2) = 11.4 GiB.
+  auto in                 = sizing_input(36, 80, 4);
   in.policy.windowed_only = false;
   in.policy.one_shot_only = true;
   auto sizing             = compute_sort_partition_sizing(in);
-  CHECK(sizing.num_partitions == 15);
+  CHECK(sizing.num_partitions == 4);
   CHECK(std::string(sizing.rule) == "one_shot_memory");
   auto const partition_bytes = in.data_bytes / sizing.num_partitions;
   auto const partition_rows  = in.data_rows / sizing.num_partitions;
   CHECK(2 * (3 * partition_bytes + 8 * partition_rows) <= in.gpu_capacity_bytes);
   // Wider rows need less per byte: 3 + 8/64 instead of 3.5.
   in.data_rows = in.data_bytes / 64;
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 13);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 3);
   // Not applied to the windowed and automatic routes.
   in.policy.one_shot_only = false;
-  CHECK(compute_sort_partition_sizing(in).num_partitions == 7);
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 2);
+  // A sort that does not fit the GPU takes the larger of the two counts.
+  in                      = sizing_input(160, 80, 4);
+  in.policy.windowed_only = false;
+  in.policy.one_shot_only = true;
+  CHECK(compute_sort_partition_sizing(in).num_partitions == 20);
 }

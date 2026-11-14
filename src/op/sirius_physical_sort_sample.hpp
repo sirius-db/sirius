@@ -44,18 +44,17 @@ namespace op {
  * Set by the plan generator; the defaults describe an operator built without an engine context.
  */
 struct sort_partition_policy {
-  //! false: data bytes over max_sort_partition_memory_fraction of the GPU memory free when the
-  //! boundaries are computed (SET sort_partition_auto_sizing = false, the default)
-  bool auto_sizing = config::DEFAULT_SORT_PARTITION_AUTO_SIZING;
+  //! false: the previous rule, data bytes over max_sort_partition_memory_fraction of the GPU
+  //! memory free when the boundaries are computed (SET sort_partition_auto_sizing = false)
+  bool auto_sizing = true;
   //! Merge tasks one GPU runs at once: the executor threads per GPU (0 = unknown)
   std::size_t merge_concurrency = 0;
+  //! GPUs the query runs on
+  std::size_t num_gpus = 1;
   //! Every partition takes the one-shot merge (sort_merge_mode = 'one_shot'), which holds a whole
   //! partition, its merge temporaries and its output on one GPU
   bool one_shot_only = false;
-  //! Every partition takes the windowed merge (sort_merge_mode = 'windowed'). Only then does the
-  //! concurrency term apply: in 'auto' mode smaller partitions fall under the one-shot threshold,
-  //! and several one-shot merges at once are slower than fewer windowed ones (they run out of
-  //! GPU memory and retry).
+  //! Every partition takes the windowed merge (sort_merge_mode = 'windowed')
   bool windowed_only = false;
   //! In 'auto' mode, the largest partition (bytes) that takes the one-shot merge; larger ones are
   //! merged in windows (0 = unknown). Set when neither flag above is.
@@ -81,18 +80,27 @@ struct sort_partition_sizing {
   const char* rule                = "single";  ///< the term that decided the count, for the log
 };
 
-//! Largest partition the concurrency term creates: it never cuts the data into partitions
-//! smaller than this just to give every merge thread one. With a single BIGINT key, 8 GiB in 4
-//! partitions merges faster than in 1, while 4 GiB takes the same time in 2, 3 or 5.
+//! Share of a GPU's memory limit per partition when the sort does not fit the GPUs (the data and
+//! its sorted copy exceed their limits, so runs are spilled while the sort is still producing
+//! them). Smaller partitions then keep more of each merge on the GPU: with the limit at half the
+//! data, a tenth of the limit per partition merged faster than a third or a fifth.
+inline constexpr double kSortPartitionSpillFraction = 0.10;
+
+//! How far above the one-shot threshold of 'auto' mode partitions are kept when they are meant to
+//! be merged in windows: range partitions are not equal in size and the data size is an estimate,
+//! so partitions sized just above the threshold would partly fall under it.
+inline constexpr double kSortPartitionWindowedRouteMargin = 1.2;
+
+//! Smallest partition the concurrency term creates: it never cuts the data into partitions
+//! smaller than this just to give every merge thread one.
 inline constexpr std::size_t kSortPartitionMinConcurrencyBytes = std::size_t{2} << 30;
 
 //! Smallest piece (input batch bytes / partitions) the concurrency term accepts: below it every
 //! batch is cut into pieces whose per-piece handling costs more than the merge gains.
 inline constexpr std::size_t kSortPartitionMinPieceBytes = std::size_t{4} << 20;
 
-//! Most partitions the concurrency term asks for. With 4 executor threads per GPU, 4 partitions
-//! were the fastest on 1, 2 and 4 GPUs; 8 were equal or slower and 16 slower than 2 on 4 GPUs, so
-//! the term does not grow with the number of GPUs.
+//! Most partitions the concurrency term asks for: more than one per executor thread of a GPU
+//! (4 by default) did not merge faster on 2 or 4 GPUs.
 inline constexpr std::size_t kSortPartitionMaxConcurrency = 4;
 
 //! Rows per partition the automatic sizing aims below: three quarters of the cuDF column limit
@@ -108,19 +116,27 @@ inline constexpr std::size_t kSortPartitionOneShotConcurrentMerges = 2;
  * max_sort_partition_bytes, when set, decides alone: ceil(data / override). Otherwise, with
  * policy.auto_sizing off, the previous rule applies: ceil(data / (fraction x free GPU memory)).
  * With auto sizing the count is the largest of
- *  - memory: ceil(data / (fraction x GPU memory limit)); the limit, not the free memory of one
- *    moment, so the count does not change from run to run under memory pressure;
+ *  - memory: ceil(data / (fraction x GPU memory limit)) while the data and its sorted copy fit the
+ *    GPUs (2 x data <= limit x policy.num_gpus); beyond that, ceil(data /
+ *    (kSortPartitionSpillFraction x limit)). Both use the limit, not the free memory of one
+ *    moment, so the count does not change from run to run;
  *  - one-shot (policy.one_shot_only): a one-shot merge needs 3 x partition bytes + 8 bytes per row
  *    on the GPU, so partitions are at most limit / ((3 + 8 / row width) x 2 concurrent merges);
  *  - rows, where partitions take the one-shot merge (policy.one_shot_only, or 'auto' mode with
  *    partitions at or below policy.auto_one_shot_partition_bytes): ceil(rows /
- *    kSortPartitionMaxRows), because a one-shot merge makes one cuDF table of the partition. The
- *    windowed merge has no such limit, and cutting its partitions smaller would move them to the
- *    one-shot merge in 'auto' mode;
- *  - concurrency (policy.windowed_only): one partition per merge task a GPU runs at once
- *    (min(policy.merge_concurrency, kSortPartitionMaxConcurrency)), but no partition smaller than
- *    kSortPartitionMinConcurrencyBytes and no piece of an input batch smaller than
- *    kSortPartitionMinPieceBytes.
+ *    kSortPartitionMaxRows), because a one-shot merge makes one cuDF table of the partition;
+ *  - concurrency (policy.windowed_only on more than one GPU): one partition per merge task a GPU
+ *    runs at once (min(policy.merge_concurrency, kSortPartitionMaxConcurrency)), but no partition
+ *    smaller than kSortPartitionMinConcurrencyBytes and no piece of an input batch smaller than
+ *    kSortPartitionMinPieceBytes. On one GPU more partitions than the memory term gives do not
+ *    merge faster.
+ *
+ * In 'auto' mode the count is then lowered, if needed, so that the partitions do not all fall
+ * under the one-shot threshold when their one-shot merges cannot run at once: several partitions
+ * at or below policy.auto_one_shot_partition_bytes are only kept when
+ * min(partitions, policy.merge_concurrency) one-shot merges fit the GPU limit together; otherwise
+ * the count becomes the largest one whose partitions are at least
+ * kSortPartitionWindowedRouteMargin times the threshold, and so are merged in windows.
  */
 [[nodiscard]] sort_partition_sizing compute_sort_partition_sizing(
   const sort_partition_sizing_input& input);
@@ -245,8 +261,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override for max partition bytes (0 = use GPU memory fraction)
   size_t _max_partition_bytes_override = 0;
 
-  //! Fraction of GPU memory per partition: of the free memory, or of the limit with auto sizing
-  //! (from sirius_config operator_params)
+  //! Fraction of a GPU's memory limit per partition (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   //! Concurrency, merge route and rule selection for the partition count

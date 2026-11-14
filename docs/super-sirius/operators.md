@@ -680,8 +680,14 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE â†
 
 **Partition count.** `compute_sort_partition_sizing()` (same header) decides it from the estimated input size:
 - `max_sort_partition_bytes` set: `ceil(data / value)`, nothing else applies.
-- `sort_partition_auto_sizing = true`, the largest of: `ceil(data / (max_sort_partition_memory_fraction x GPU memory limit))`; where partitions take the one-shot merge (`sort_merge_mode = 'one_shot'`, or `auto` with partitions under its one-shot threshold), `ceil(rows / (0.75 x 2^31))`, so that the partition stays a valid cuDF table; with `sort_merge_mode = 'windowed'`, one partition per executor thread of a GPU (at most 4), as long as partitions stay at or above 2 GiB and the pieces of an input batch at or above 4 MiB (not in `auto` mode, where smaller partitions would switch to the one-shot merge); and, with `sort_merge_mode = 'one_shot'`, `ceil(data / (limit / ((3 + 8 / row width) x 2)))`, because a one-shot merge needs 3 x partition bytes + 8 bytes per row on the GPU.
-- `sort_partition_auto_sizing = false` (default): `ceil(data / (fraction x GPU memory free at that moment))`.
+- `sort_partition_auto_sizing = true` (default), the largest of:
+  - memory: `ceil(data / (max_sort_partition_memory_fraction x GPU memory limit))` while the data and its sorted copy fit the GPUs (`2 x data <= limit x GPUs`); beyond that `ceil(data / (0.10 x limit))`, because runs are then spilled before the merge starts and smaller partitions keep more of each merge on the GPU;
+  - where partitions take the one-shot merge (`sort_merge_mode = 'one_shot'`, or `auto` with partitions under its one-shot threshold), `ceil(rows / (0.75 x 2^31))`, so that the partition stays a valid cuDF table;
+  - with `sort_merge_mode = 'windowed'` on more than one GPU, one partition per executor thread of a GPU (at most 4), as long as partitions stay at or above 2 GiB and the pieces of an input batch at or above 4 MiB;
+  - with `sort_merge_mode = 'one_shot'`, `ceil(data / (limit / ((3 + 8 / row width) x 2)))`, because a one-shot merge needs 3 x partition bytes + 8 bytes per row on the GPU.
+
+  In `auto` mode the count is then lowered, if needed, to the largest one whose partitions are at least 1.2 times the one-shot threshold of `merge::choose_route`, unless the one-shot merges of the smaller partitions (one per executor thread) fit the GPU limit together. Several partitions just under the threshold would otherwise each be merged whole at the same time and run out of GPU memory.
+- `sort_partition_auto_sizing = false`: the previous rule, `ceil(data / (fraction x GPU memory free at that moment))`.
 
 The decision is logged at INFO as `[sort_sample][sizing] partitions=... rule=...`.
 

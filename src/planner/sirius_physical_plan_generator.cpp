@@ -1609,9 +1609,9 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
     {
-      // What the partition count is derived from besides the data size: how many merge tasks a
-      // GPU runs at once, and which merge every partition takes (a one-shot merge must hold a
-      // whole partition on one GPU; only windowed merges gain from one partition per thread).
+      // What the partition count is derived from besides the data size: how many GPUs there are
+      // and how many merge tasks each runs at once, and which merge every partition takes (a
+      // one-shot merge must hold a whole partition on one GPU).
       sirius::op::sort_partition_policy policy;
       policy.auto_sizing   = op_params.sort_partition_auto_sizing;
       policy.one_shot_only = op_params.sort_merge_mode_setting == sirius::sort_merge_mode::one_shot;
@@ -1619,6 +1619,11 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       if (sirius_ctx != nullptr && sirius_ctx->is_initialized()) {
         policy.merge_concurrency = static_cast<std::size_t>(
           std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+        policy.num_gpus =
+          std::max<std::size_t>(sirius_ctx->get_memory_manager()
+                                  .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
+                                  .size(),
+                                1);
         if (!policy.one_shot_only && !policy.windowed_only) {
           // 'auto': MERGE_SORT takes the one-shot merge when partition + output fit this share of
           // the GPU (merge::choose_route); the output is as large as the partition.

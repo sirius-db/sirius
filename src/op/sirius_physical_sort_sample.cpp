@@ -104,10 +104,22 @@ sort_partition_sizing compute_sort_partition_sizing(const sort_partition_sizing_
   // Memory: a fraction of the GPU's limit. Without a known limit, fall back to the free memory.
   auto const capacity =
     input.gpu_capacity_bytes > 0 ? input.gpu_capacity_bytes : input.gpu_available_bytes;
+  auto const gpus = std::max<std::size_t>(input.policy.num_gpus, 1);
   result.max_partition_bytes =
     static_cast<std::size_t>(static_cast<double>(capacity) * input.memory_fraction);
+  const char* memory_rule = "fraction_of_limit";
+  // The sort holds the data and its sorted copy. When they do not fit the GPUs, runs are spilled
+  // before the merge starts, and smaller partitions keep more of each merge on the GPU.
+  if (capacity > 0 && bytes > (capacity / 2) * gpus) {
+    auto const spill_bytes =
+      static_cast<std::size_t>(static_cast<double>(capacity) * kSortPartitionSpillFraction);
+    if (spill_bytes > 0 && spill_bytes < result.max_partition_bytes) {
+      result.max_partition_bytes = spill_bytes;
+      memory_rule                = "larger_than_gpu";
+    }
+  }
   if (result.max_partition_bytes > 0) {
-    raise(ceil_div(bytes, result.max_partition_bytes), "fraction_of_limit");
+    raise(ceil_div(bytes, result.max_partition_bytes), memory_rule);
   }
 
   // One-shot merges hold the partition, the merge temporaries and the output on one GPU:
@@ -124,25 +136,45 @@ sort_partition_sizing compute_sort_partition_sizing(const sort_partition_sizing_
   }
 
   // Rows: a one-shot merge makes one cuDF table of its partition. Windowed merges are not
-  // limited, and are left alone: smaller partitions would switch to the one-shot merge in auto
-  // mode.
-  auto const one_shot_route =
-    input.policy.one_shot_only ||
-    (!input.policy.windowed_only && input.policy.auto_one_shot_partition_bytes > 0 &&
-     bytes / result.num_partitions <= input.policy.auto_one_shot_partition_bytes);
-  if (one_shot_route && input.data_rows > kSortPartitionMaxRows * result.num_partitions) {
+  // limited.
+  auto const auto_route = !input.policy.one_shot_only && !input.policy.windowed_only &&
+                          input.policy.auto_one_shot_partition_bytes > 0;
+  auto const takes_one_shot = [&](std::size_t partitions) {
+    return bytes / partitions <= input.policy.auto_one_shot_partition_bytes;
+  };
+  if ((input.policy.one_shot_only || (auto_route && takes_one_shot(result.num_partitions))) &&
+      input.data_rows > kSortPartitionMaxRows * result.num_partitions) {
     raise(ceil_div(input.data_rows, kSortPartitionMaxRows), "row_limit");
   }
 
-  // Concurrency: one partition per merge task a GPU runs at once, while partitions and the
-  // pieces each input batch is cut into stay large enough for that to pay.
-  if (input.policy.windowed_only && input.policy.merge_concurrency > 1) {
+  // Concurrency: on several GPUs, one partition per merge task a GPU runs at once, while
+  // partitions and the pieces each input batch is cut into stay large enough for that to pay.
+  if (input.policy.windowed_only && gpus > 1 && input.policy.merge_concurrency > 1) {
     auto wanted = std::min(input.policy.merge_concurrency, kSortPartitionMaxConcurrency);
     wanted      = std::min(wanted, bytes / kSortPartitionMinConcurrencyBytes);
     if (input.avg_batch_bytes > 0) {
       wanted = std::min(wanted, input.avg_batch_bytes / kSortPartitionMinPieceBytes);
     }
     raise(wanted, "merge_concurrency");
+  }
+
+  // Auto mode: partitions at or below the one-shot threshold are merged whole, as many at once
+  // as there are executor threads. When those merges do not fit the GPU together, keep the
+  // partitions large enough to be merged in windows instead.
+  if (auto_route && result.num_partitions > 1 && takes_one_shot(result.num_partitions)) {
+    auto const partition_bytes = bytes / result.num_partitions;
+    auto const row_bytes =
+      input.data_rows > 0 ? 8 * (input.data_rows / result.num_partitions) : std::size_t{0};
+    auto const concurrent =
+      std::min(result.num_partitions, std::max<std::size_t>(input.policy.merge_concurrency, 1));
+    if (concurrent * (3 * partition_bytes + row_bytes) > capacity) {
+      // The largest count whose partitions stay clear of the threshold.
+      auto const windowed_bytes =
+        static_cast<std::size_t>(static_cast<double>(input.policy.auto_one_shot_partition_bytes) *
+                                 kSortPartitionWindowedRouteMargin);
+      result.num_partitions = std::max<std::size_t>(bytes / windowed_bytes, 1);
+      result.rule           = "windowed_route";
+    }
   }
   return result;
 }
