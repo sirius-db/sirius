@@ -18,6 +18,8 @@
 
 #include <cucascade/data/representation_converter.hpp>
 
+#include <cstdint>
+
 namespace sirius {
 
 /**
@@ -30,5 +32,9 @@ namespace sirius {
  * Called from converter_registry::initialize().
  */
 void register_compression_converters(cucascade::representation_converter_registry& registry);
+
+/// Compressed GPU-tier chunks this process has decoded on a GPU other than the one holding
+/// them, by copying their compressed buffers across. Monotonic; for tests and diagnostics.
+[[nodiscard]] std::uint64_t compressed_chunks_decoded_on_another_gpu() noexcept;
 
 }  // namespace sirius

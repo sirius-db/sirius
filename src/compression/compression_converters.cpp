@@ -19,6 +19,7 @@
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
+#include "device_compressed_blob.hpp"
 #include "spill_compression.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -26,6 +27,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -41,9 +43,11 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
+#include <memory/device_transfer.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -60,6 +64,8 @@
 namespace sirius {
 
 namespace {
+
+std::atomic<std::uint64_t> g_chunks_decoded_on_another_gpu{0};
 
 // Returned batches may outlive the thread that owns the private decode streams.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
@@ -219,10 +225,99 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            stream);
 }
 
-// compressed_device_representation (device memory) → GPU.
+// compressed_device_representation held by another GPU → GPU.
+// The cached compressed_table is views into the owner GPU's memory, so it cannot be decoded
+// from here. Copy the selected columns' compressed buffers to this GPU, rebuild the table from
+// the chunk's header and decode it here, as the host converter does from pinned host memory.
+// The chunk on the owner GPU is only read.
+std::unique_ptr<cucascade::idata_representation> decompress_remote_device_to_gpu(
+  const cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  ::cuda::stream_ref stream,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
+{
+  nvtx_scoped_range nvtx_range{"sirius::compression::remote_device_to_gpu"};
+  auto& rep = source.cast<compressed_device_representation>();
+  auto const& space =
+    gpu_decode_space(target_memory_space, "cross-GPU device decompression", stream);
+  auto const& owner = rep.get_memory_space();
+  // Fail before any copy or kernel: decoding the cached table from this GPU would read the
+  // owner's pool, which faults when the two GPUs have no peer access.
+  auto const* const blob = rep.blob();
+  if (blob == nullptr || blob->header.empty()) {
+    throw std::runtime_error("[compression_converters] compressed pinned chunk is stored on GPU " +
+                             std::to_string(owner.get_device_id()) +
+                             " and carries no layout to copy it to GPU " +
+                             std::to_string(space.get_device_id()));
+  }
+  // The rebuilt leaves are allocated from the current device's resource.
+  if (rmm::get_current_cuda_device().value() != space.get_device_id()) {
+    throw std::logic_error(
+      "decompress_remote_device_to_gpu: the target space is not on the current device");
+  }
+
+  auto const owner_device    = rmm::cuda_device_id{owner.get_device_id()};
+  auto const target_device   = rmm::cuda_device_id{space.get_device_id()};
+  auto const* const staging  = memory::sirius_memory_reservation_manager::host_staging_space(space);
+  std::size_t copied_bytes   = 0;
+  std::size_t copied_buffers = 0;
+  auto route                 = memory::device_transfer_route::none;
+  // The pin synchronized its stream after writing the payload, so the source has no pending
+  // writer. A peer copy is asynchronous on `stream`; a host-staged copy completes before it
+  // returns.
+  simpatico::payload_fetch_fn fetch =
+    [&](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+      auto const* const slice = blob->find_slice(off);
+      if (slice == nullptr || sz > slice->size_bytes) {
+        throw std::runtime_error(
+          "[compression_converters] compressed pinned chunk has no payload buffer of " +
+          std::to_string(sz) + " bytes at header offset " + std::to_string(off));
+      }
+      route = memory::enqueue_device_copy({static_cast<std::byte*>(dst), sz},
+                                          target_device,
+                                          s,
+                                          {slice->data, sz},
+                                          owner_device,
+                                          &owner,
+                                          memory::source_already_complete{},
+                                          staging);
+      copied_bytes += sz;
+      ++copied_buffers;
+    };
+
+  std::unique_ptr<cucascade::idata_representation> decoded;
+  try {
+    decoded = reconstruct_and_decompress_to_gpu(blob->header,
+                                                fetch,
+                                                rep.selected_indices(),
+                                                rep.pushdown_scan().get(),
+                                                rep.visibility_mask(),
+                                                space,
+                                                stream);
+    // The peer copies read the owner's buffers. Finish them before returning, so that the
+    // caller dropping its share of the chunk cannot race them.
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  } catch (...) {
+    // Best effort for the same reason; a second failure must not replace the first.
+    if (cudaStreamSynchronize(stream.get()) != cudaSuccess) { (void)cudaGetLastError(); }
+    throw;
+  }
+
+  g_chunks_decoded_on_another_gpu.fetch_add(1, std::memory_order_relaxed);
+  SIRIUS_LOG_DEBUG(
+    "[compression_converters] copied {} compressed bytes in {} buffers from GPU {} to GPU {} ({})",
+    copied_bytes,
+    copied_buffers,
+    owner.get_device_id(),
+    space.get_device_id(),
+    route == memory::device_transfer_route::peer_copy ? "peer copy" : "host staging");
+  return decoded;
+}
+
+// compressed_device_representation (device memory) → the GPU that holds it.
 // The compressed_table is already cached on device; decompress directly with no
 // re-fetch. When a column projection is set, only the selected columns are decoded.
-std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
+std::unique_ptr<cucascade::idata_representation> decompress_local_device_to_gpu(
   const cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
@@ -324,7 +419,29 @@ std::unique_ptr<cucascade::idata_representation> retryable_decode(
   }
 }
 
+// compressed_device_representation → GPU: decoded in place on the GPU that holds the chunk,
+// copied over and decoded on any other. A cross-GPU decode allocates the compressed buffers as
+// well as the output, so it gets the same out-of-memory reporting as the host and disk decodes.
+std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
+  const cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  ::cuda::stream_ref stream,
+  cucascade::memory::reservation* reservation)
+{
+  if (target_memory_space == nullptr ||
+      target_memory_space->get_id() == source.get_memory_space().get_id()) {
+    return decompress_local_device_to_gpu(source, target_memory_space, stream, reservation);
+  }
+  return retryable_decode<decompress_remote_device_to_gpu>(
+    source, target_memory_space, stream, reservation);
+}
+
 }  // namespace
+
+std::uint64_t compressed_chunks_decoded_on_another_gpu() noexcept
+{
+  return g_chunks_decoded_on_another_gpu.load(std::memory_order_relaxed);
+}
 
 void register_compression_converters(cucascade::representation_converter_registry& registry)
 {

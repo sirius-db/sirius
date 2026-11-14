@@ -3744,49 +3744,6 @@ sirius_scan_manager::find_pinned_entries_for_parquet_files(
   return matches;
 }
 
-std::vector<int> sirius_scan_manager::compressed_gpu_pin_owner_devices(
-  const op::scan::ingestible_table_info& table_info) const
-{
-  // Snapshot owners, then match outside the lock: the parquet matcher canonicalizes paths.
-  std::vector<std::shared_ptr<const pinned_entry>> snapshot;
-  {
-    std::lock_guard pin_lk{_pinned_entries_mutex};
-    snapshot.reserve(_pinned_entries.size());
-    for (auto const& [name, entry] : _pinned_entries) {
-      if (entry->tier == cucascade::memory::Tier::GPU && !entry->device_chunks.empty()) {
-        snapshot.push_back(entry);
-      }
-    }
-  }
-
-  // The same identity calls as cache_entry_info::can_serve_with_columns, without its column
-  // and visibility gates, so every entry try_match_cached_entry can pick is matched here.
-  auto const same_source = [&table_info](cache_entry_info const& cached) {
-    if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_parquet_files(p->resolved_file_paths);
-    }
-    if (auto const* d =
-          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_duckdb_table(
-        d->catalog_name, d->schema_name, d->table_name, d->table_identity);
-    }
-    return false;
-  };
-
-  std::vector<int> owners;
-  for (auto const& entry : snapshot) {
-    if (!same_source(entry->cache_info)) { continue; }
-    for (auto const& chunk : entry->device_chunks) {
-      if (chunk.compressed) {
-        owners.push_back(chunk.compressed->get_memory_space().get_device_id());
-      }
-    }
-  }
-  std::ranges::sort(owners);
-  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
-  return owners;
-}
-
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,
                                    std::size_t expected_chunks,
                                    std::size_t expected_columns,

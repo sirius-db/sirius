@@ -297,6 +297,9 @@ class compressed_device_representation : public simpatico_compressed_representat
   [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
+  /// The shared chunk storage (defined in device_compressed_blob.hpp), or null when the chunk
+  /// carries none (see @ref has_table).
+  [[nodiscard]] const compressed_device_blob* blob() const noexcept { return _blob.get(); }
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {

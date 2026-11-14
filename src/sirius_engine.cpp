@@ -46,7 +46,6 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
-#include <string>
 
 namespace sirius {
 
@@ -63,13 +62,13 @@ void finish_scan_preparation(op::sirius_physical_operator const* plan) noexcept
   });
 }
 
-/// Narrow the fleet for this query: gpus_per_query caps it, and within that cap a non-zero
-/// admission_bytes_per_gpu narrows further by estimated scan bytes. With neither set, every
-/// active GPU is kept.
-std::vector<int> narrow_admission_gpu_ids(const op::sirius_physical_operator& plan,
-                                          std::vector<int> gpu_ids,
-                                          const sirius_config& config,
-                                          const operator_params& op_params)
+/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
+/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
+/// bytes. With neither set, every active GPU is used.
+std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
+                                           std::vector<int> gpu_ids,
+                                           const sirius_config& config,
+                                           const operator_params& op_params)
 {
   auto const bpg = op_params.admission_bytes_per_gpu;
 
@@ -100,58 +99,6 @@ std::vector<int> narrow_admission_gpu_ids(const op::sirius_physical_operator& pl
                   n_gpus);
   gpu_ids.resize(static_cast<size_t>(k));
   return gpu_ids;
-}
-
-/// Devices holding compressed GPU-tier pinned chunks that the plan's scans read in place.
-std::vector<int> compressed_pin_owner_devices(const op::sirius_physical_operator& plan,
-                                              const scan_manager::sirius_scan_manager& pins)
-{
-  std::vector<int> owners;
-  planner::for_each_gpu_scan(plan, [&](const op::sirius_physical_operator& node) {
-    auto const* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&node);
-    if (scan == nullptr) { return; }
-    auto const scan_owners =
-      pins.compressed_gpu_pin_owner_devices(scan->get_ingestible().table_info());
-    owners.insert(owners.end(), scan_owners.begin(), scan_owners.end());
-  });
-  return owners;
-}
-
-std::string format_gpu_ids(const std::vector<int>& gpu_ids)
-{
-  std::string out;
-  for (auto const id : gpu_ids) {
-    if (!out.empty()) { out += ", "; }
-    out += std::to_string(id);
-  }
-  return out;
-}
-
-/// Select the GPU subset this query is admitted with: the narrowed fleet (see
-/// narrow_admission_gpu_ids), plus every GPU that holds a compressed pinned chunk the query
-/// reads. A compressed pin is decoded on the GPU that holds it, so a query narrowed away from
-/// an owner would have a scan no admitted GPU can run. The pin registry is only consulted when
-/// narrowing actually dropped a GPU.
-std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
-                                           std::vector<int> gpu_ids,
-                                           const sirius_config& config,
-                                           const operator_params& op_params,
-                                           const scan_manager::sirius_scan_manager& pins)
-{
-  auto const available = gpu_ids;
-  auto admitted        = narrow_admission_gpu_ids(plan, std::move(gpu_ids), config, op_params);
-  if (admitted.size() >= available.size()) { return admitted; }
-
-  auto const owners = compressed_pin_owner_devices(plan, pins);
-  auto widened      = planner::widen_to_pin_owners(admitted, owners, available);
-  if (widened.size() != admitted.size()) {
-    SIRIUS_LOG_INFO(
-      "[gpu_alloc] admission widened from [{}] to [{}]: the query reads compressed GPU-tier pins, "
-      "which are decoded on the GPUs that hold them",
-      format_gpu_ids(admitted),
-      format_gpu_ids(widened));
-  }
-  return widened;
 }
 
 std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
@@ -407,16 +354,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto query_operator_params      = duckdb::query_operator_options(context);
   auto const full_gpu_count       = gpu_ids.size();
-  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(plan,
-                                                              std::move(gpu_ids),
-                                                              sirius_ctx_ptr->get_config(),
-                                                              *query_operator_params,
-                                                              sirius_ctx_ptr->get_scan_manager());
+  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
+    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
-    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]",
-                    active_gpu_ids.size(),
-                    format_gpu_ids(active_gpu_ids));
+    std::string gpu_list;
+    for (auto id : active_gpu_ids) {
+      if (!gpu_list.empty()) { gpu_list += ", "; }
+      gpu_list += std::to_string(id);
+    }
+    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
   } catch (...) {  // best-effort observability
   }
 

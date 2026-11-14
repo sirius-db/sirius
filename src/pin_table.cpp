@@ -965,6 +965,21 @@ device_pin_result materialize_all_batches_compressed(
               }
               stream.sync();
 
+              // Keep the header and the place of each payload buffer, so a query admitted
+              // without this GPU can copy the buffers it reads to its own GPU and decode
+              // there. The reader asks for a buffer by its header offset; empty buffers are
+              // never fetched.
+              blob->slices.reserve(blob->offsets.size());
+              for (std::size_t k = 0; k < blob->offsets.size(); ++k) {
+                auto const& b = buffers[slot_src[k]];
+                if (b.size_bytes == 0) { continue; }
+                blob->slices.push_back(sirius::compressed_payload_slice{
+                  b.offset,
+                  static_cast<std::byte const*>(blob->payload.data()) + blob->offsets[k],
+                  b.size_bytes});
+              }
+              blob->header = std::move(header);
+
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,
                 std::move(blob),

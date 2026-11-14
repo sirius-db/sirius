@@ -45,6 +45,9 @@ using allocation_tracking_scope = sirius_memory_reservation_manager::allocation_
 struct gpu_tracking_scope_registry {
   std::shared_mutex mutex;
   std::unordered_map<cucascade::memory::memory_space const*, allocation_tracking_scope> scopes;
+  // GPU space -> the HOST space its manager stages cross-GPU copies through (may be null).
+  std::unordered_map<cucascade::memory::memory_space const*, cucascade::memory::memory_space const*>
+    host_staging;
 };
 
 gpu_tracking_scope_registry& gpu_tracking_scopes()
@@ -75,6 +78,9 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   auto& registry = gpu_tracking_scopes();
   try {
     {
+      auto const host_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      cucascade::memory::memory_space const* const staging =
+        host_spaces.empty() ? nullptr : host_spaces.front();
       std::unique_lock lock{registry.mutex};
       for (auto const& config : configs) {
         auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&config);
@@ -83,6 +89,9 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
           get_memory_space(cucascade::memory::Tier::GPU, gpu->device_id),
           gpu->per_stream_reservation ? allocation_tracking_scope::PER_STREAM
                                       : allocation_tracking_scope::PER_THREAD);
+      }
+      for (auto const* space : gpu_spaces) {
+        registry.host_staging.insert_or_assign(space, staging);
       }
     }
     for (const auto* space : gpu_spaces) {
@@ -99,6 +108,7 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
       std::unique_lock lock{registry.mutex};
       for (auto const* space : gpu_spaces) {
         registry.scopes.erase(space);
+        registry.host_staging.erase(space);
       }
     }
     restore_device_resources();
@@ -114,6 +124,7 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
     std::unique_lock lock{registry.mutex};
     for (auto const* space : gpu_spaces) {
       registry.scopes.erase(space);
+      registry.host_staging.erase(space);
     }
   }
   restore_device_resources();
@@ -153,6 +164,15 @@ sirius_memory_reservation_manager::gpu_allocation_tracking_scope(
   auto const found = registry.scopes.find(&space);
   if (found == registry.scopes.end()) { return std::nullopt; }
   return found->second;
+}
+
+cucascade::memory::memory_space const* sirius_memory_reservation_manager::host_staging_space(
+  cucascade::memory::memory_space const& space)
+{
+  auto& registry = gpu_tracking_scopes();
+  std::shared_lock lock{registry.mutex};
+  auto const found = registry.host_staging.find(&space);
+  return found == registry.host_staging.end() ? nullptr : found->second;
 }
 
 }  // namespace memory
