@@ -1754,3 +1754,780 @@ TEST_CASE("FFI object store successful local fragments retain captures through r
   fragment.reset();
   CHECK(retained.expired());
 }
+
+// These guards are appended so the existing suite remains an independent baseline.
+#include "sirius/exception.hpp"
+
+#include <fstream>
+#include <functional>
+#include <typeinfo>
+
+namespace {
+
+template <typename Exception, typename Operation>
+void check_exact_object_store_message(Operation&& operation, std::string_view expected)
+{
+  bool threw = false;
+  try {
+    operation();
+  } catch (std::exception const& error) {
+    threw = true;
+    INFO("expected type: " << typeid(Exception).name() << "; actual: " << typeid(error).name());
+    INFO("exception text: " << error.what());
+    CHECK(typeid(error) == typeid(Exception));
+    CHECK(std::string_view(error.what()) == expected);
+    check_no_sentinels(error.what());
+  } catch (...) {
+    FAIL_CHECK("Expected a standard exception with the pinned dynamic type");
+  }
+  CHECK(threw);
+}
+
+void check_snapshot_identity(std::shared_ptr<ObjectStoreConfig> const& actual,
+                             std::shared_ptr<ObjectStoreConfig> const& expected)
+{
+  CHECK(actual.get() == expected.get());
+  CHECK_FALSE(actual.owner_before(expected));
+  CHECK_FALSE(expected.owner_before(actual));
+}
+
+std::shared_ptr<ObjectStoreConfig> message_snapshot(std::string prefix)
+{
+  object_store_inputs inputs;
+  inputs.uri_prefix = std::move(prefix);
+  return inputs.snapshot();
+}
+
+struct message_registry {
+  explicit message_registry(std::string yaml = memory_config())
+    : config_path(std::move(yaml)),
+      first(object_store_inputs{}.snapshot()),
+      second(message_snapshot("s3://other/prefix/")),
+      context(make_context_from_config(config_path, first))
+  {
+    context->put_object_store(second);
+    check();
+  }
+
+  void check(std::shared_ptr<ObjectStoreConfig> const& fallback = {}) const
+  {
+    check_snapshot_identity(context->object_store_config_for(kFixtureUri), first);
+    check_snapshot_identity(context->object_store_config_for("s3://other/prefix/object"), second);
+    check_snapshot_identity(context->object_store_config_for("s3://missing/object"), fallback);
+    CHECK(first.use_count() == 2);
+    CHECK(second.use_count() == 2);
+  }
+
+  std::string config_path;
+  std::shared_ptr<ObjectStoreConfig> first;
+  std::shared_ptr<ObjectStoreConfig> second;
+  std::unique_ptr<sirius::ffi::Context> context;
+};
+
+void check_rejected_at_both_entries(message_registry const& published,
+                                    object_store_inputs const& inputs,
+                                    std::string_view expected)
+{
+  auto const rejected = inputs.snapshot();
+  // Invalid factory arguments must be rejected before a second engine is brought up.
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { (void)make_context_from_config(published.config_path, rejected); }, expected);
+  published.check();
+  CHECK(rejected.use_count() == 1);
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { published.context->put_object_store(rejected); }, expected);
+  published.check();
+  CHECK(rejected.use_count() == 1);
+}
+
+struct message_mutation {
+  char const* name;
+  std::function<void(object_store_inputs&)> change;
+  char const* expected;
+};
+
+void check_message_matrix(message_registry const& published,
+                          std::vector<message_mutation> const& rows)
+{
+  for (auto const& row : rows) {
+    CAPTURE(row.name);
+    object_store_inputs inputs;
+    row.change(inputs);
+    check_rejected_at_both_entries(published, inputs, row.expected);
+  }
+}
+
+struct message_ca_file {
+  message_ca_file()
+  {
+    auto pattern  = (fs::temp_directory_path() / "sirius-object-store-message-XXXXXX").string();
+    auto const fd = ::mkstemp(pattern.data());
+    if (fd < 0) { throw std::system_error(errno, std::generic_category(), "mkstemp"); }
+    ::close(fd);
+    path = std::move(pattern);
+  }
+  ~message_ca_file()
+  {
+    std::error_code ignored;
+    fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ignored);
+    fs::remove(path, ignored);
+  }
+  fs::path path;
+};
+
+}  // namespace
+
+TEST_CASE("FFI object store messages pin intrinsic reasons at both entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const missing = fixture_path("missing_message_guard_ca.pem");
+  REQUIRE_FALSE(fs::exists(missing));
+  message_registry published;
+  check_message_matrix(
+    published,
+    {{"endpoint required",
+      [](auto& v) { v.endpoint.clear(); },
+      "ObjectStoreConfig.endpoint: required"},
+     {"region required", [](auto& v) { v.region.clear(); }, "ObjectStoreConfig.region: required"},
+     {"access key required",
+      [](auto& v) { v.access_key.clear(); },
+      "ObjectStoreConfig.access_key: required"},
+     {"secret key required",
+      [](auto& v) { v.secret_key.clear(); },
+      "ObjectStoreConfig.secret_key: required"},
+     {"missing scheme",
+      [](auto& v) { v.endpoint = "host:9000"; },
+      "ObjectStoreConfig.endpoint: missing scheme (expected http:// or https://)"},
+     {"bad scheme",
+      [](auto& v) { v.endpoint = "ftp://host"; },
+      "ObjectStoreConfig.endpoint: scheme must be http or https"},
+     {"control byte",
+      [](auto& v) { v.endpoint = "https://host\x01"; },
+      "ObjectStoreConfig.endpoint: must not contain control bytes or spaces"},
+     {"missing host",
+      [](auto& v) { v.endpoint = "https://"; },
+      "ObjectStoreConfig.endpoint: missing host"},
+     {"path",
+      [](auto& v) { v.endpoint = "https://host/path"; },
+      "ObjectStoreConfig.endpoint: must be scheme://host[:port] with no path, query or fragment"},
+     {"user info",
+      [](auto& v) { v.endpoint = "https://" + v.secret_key + "@host"; },
+      "ObjectStoreConfig.endpoint: must not contain user-info"},
+     {"unterminated IPv6",
+      [](auto& v) { v.endpoint = "https://[::1"; },
+      "ObjectStoreConfig.endpoint: unterminated IPv6 literal"},
+     {"malformed IPv6 suffix",
+      [](auto& v) { v.endpoint = "https://[::1]junk"; },
+      "ObjectStoreConfig.endpoint: malformed"},
+     {"bad port",
+      [](auto& v) { v.endpoint = "https://host:65536"; },
+      "ObjectStoreConfig.endpoint: port must be a decimal number in 1..65535"},
+     {"unknown transport",
+      [](auto& v) { v.transport = static_cast<Transport>(3); },
+      "ObjectStoreConfig.transport: must be one of Transport::kAuto, kHttp, kRdma"},
+     {"unknown signing mode",
+      [](auto& v) { v.signing_mode = static_cast<SigningMode>(255); },
+      "ObjectStoreConfig.signing_mode: must be one of SigningMode::kPresigned, kHeader"},
+     {"missing CA",
+      [&](auto& v) { v.ca_bundle_path = missing.string(); },
+      "ObjectStoreConfig.ca_bundle_path: is not a regular file"},
+     {"CA directory",
+      [](auto& v) { v.ca_bundle_path = fixture_path("").string(); },
+      "ObjectStoreConfig.ca_bundle_path: is not a regular file"},
+     {"prefix shape",
+      [](auto& v) { v.uri_prefix = "http://bucket/prefix/"; },
+      "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+     {"prefix terminator",
+      [](auto& v) { v.uri_prefix = "s3://bucket/prefix"; },
+      "ObjectStoreConfig.uri_prefix: must end with '/'"},
+     {"prefix query",
+      [](auto& v) { v.uri_prefix = "s3://bucket/prefix/?token=" + v.session_token + "/"; },
+      "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+     {"prefix segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/%41/"; },
+      "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+      "'.', '..' or percent-encoded)"}});
+}
+
+TEST_CASE("FFI object store messages pin unreadable CA at both entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  if (::geteuid() == 0) { SKIP("Unreadable CA guard requires a non-root process"); }
+  message_ca_file file;
+  fs::permissions(file.path, fs::perms::none, fs::perm_options::replace);
+  REQUIRE(fs::is_regular_file(file.path));
+  if (std::ifstream(file.path).good()) {
+    SKIP("Process can read the permission-denied CA fixture");
+  }
+  message_registry published;
+  object_store_inputs inputs;
+  inputs.ca_bundle_path = file.path.string();
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: file is not readable");
+  inputs.uri_prefix = "http://invalid/";
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: file is not readable");
+}
+
+TEST_CASE("FFI object store messages pin backend reasons and precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  {
+    message_registry published;
+    object_store_inputs inputs;
+    inputs.transport = Transport::kRdma;
+    check_rejected_at_both_entries(
+      published,
+      inputs,
+      "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+  }
+  message_registry published;
+  object_store_inputs inputs;
+  inputs.transport      = Transport::kRdma;
+  inputs.signing_mode   = SigningMode::kHeader;
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  REQUIRE(fs::is_regular_file(inputs.ca_bundle_path));
+  REQUIRE(std::ifstream(inputs.ca_bundle_path).good());
+  inputs.uri_prefix = "http://invalid/";
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/");
+  inputs.uri_prefix = "s3://bucket/prefix/";
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+}
+
+TEST_CASE("FFI object store messages preserve field validation precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  object_store_inputs inputs;
+  inputs.endpoint.clear();
+  inputs.region.clear();
+  inputs.access_key.clear();
+  inputs.secret_key.clear();
+  inputs.transport      = static_cast<Transport>(255);
+  inputs.signing_mode   = static_cast<SigningMode>(255);
+  inputs.ca_bundle_path = fixture_path("missing_message_guard_ca.pem").string();
+  inputs.uri_prefix     = "http://invalid/";
+  REQUIRE_FALSE(fs::exists(inputs.ca_bundle_path));
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.endpoint: required");
+  inputs.endpoint = "https://192.0.2.1:9";
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.region: required");
+  inputs.region = "fixture-region";
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.access_key: required");
+  inputs.access_key = object_store_sentinels[0];
+  check_rejected_at_both_entries(published, inputs, "ObjectStoreConfig.secret_key: required");
+  inputs.secret_key = object_store_sentinels[1];
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: must be one of Transport::kAuto, kHttp, kRdma");
+  inputs.transport = Transport::kRdma;
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.signing_mode: must be one of SigningMode::kPresigned, kHeader");
+  inputs.signing_mode = SigningMode::kHeader;
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.ca_bundle_path: is not a regular file");
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  check_rejected_at_both_entries(
+    published, inputs, "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/");
+  inputs.uri_prefix = "s3://bucket/prefix/";
+  check_rejected_at_both_entries(
+    published,
+    inputs,
+    "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
+  inputs.transport    = Transport::kHttp;
+  auto const accepted = inputs.snapshot();
+  REQUIRE_NOTHROW(published.context->put_object_store(accepted));
+  check_snapshot_identity(published.context->object_store_config_for(kFixtureUri), accepted);
+  check_snapshot_identity(published.context->object_store_config_for("s3://other/prefix/object"),
+                          published.second);
+}
+
+TEST_CASE("FFI object store messages preserve endpoint and prefix validation precedence",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  check_message_matrix(
+    published,
+    {{"empty before missing scheme",
+      [](auto& v) { v.endpoint = ""; },
+      "ObjectStoreConfig.endpoint: required"},
+     {"missing delimiter before bad scheme and space",
+      [](auto& v) { v.endpoint = "ftp: bad@host/path"; },
+      "ObjectStoreConfig.endpoint: missing scheme (expected http:// or https://)"},
+     {"bad scheme before control and authority",
+      [](auto& v) { v.endpoint = "ftp:// :@host/path"; },
+      "ObjectStoreConfig.endpoint: scheme must be http or https"},
+     {"control before missing host",
+      [](auto& v) { v.endpoint = "https://:\x7f"; },
+      "ObjectStoreConfig.endpoint: must not contain control bytes or spaces"},
+     {"missing host before path and user info",
+      [](auto& v) { v.endpoint = "https://:9/path@host"; },
+      "ObjectStoreConfig.endpoint: missing host"},
+     {"path before user info and IPv6",
+      [](auto& v) { v.endpoint = "https://[user@host/path"; },
+      "ObjectStoreConfig.endpoint: must be scheme://host[:port] with no path, query or fragment"},
+     {"user info before unterminated IPv6",
+      [](auto& v) { v.endpoint = "https://[user@host"; },
+      "ObjectStoreConfig.endpoint: must not contain user-info"},
+     {"unterminated IPv6 before port",
+      [](auto& v) { v.endpoint = "https://[::1:bad"; },
+      "ObjectStoreConfig.endpoint: unterminated IPv6 literal"},
+     {"bad suffix before port",
+      [](auto& v) { v.endpoint = "https://[::1]suffix:bad"; },
+      "ObjectStoreConfig.endpoint: malformed"},
+     {"bad port",
+      [](auto& v) { v.endpoint = "https://[::1]:bad"; },
+      "ObjectStoreConfig.endpoint: port must be a decimal number in 1..65535"},
+     {"prefix shape before terminator and query",
+      [](auto& v) { v.uri_prefix = "http://bucket/../object?query"; },
+      "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+     {"prefix terminator before query and segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../object?query"; },
+      "ObjectStoreConfig.uri_prefix: must end with '/'"},
+     {"prefix query before segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../?query/"; },
+      "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+     {"prefix segment",
+      [](auto& v) { v.uri_prefix = "s3://bucket/../"; },
+      "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+      "'.', '..' or percent-encoded)"}});
+}
+
+TEST_CASE("FFI object store messages pin null publication without changing membership",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  check_exact_object_store_message<std::invalid_argument>(
+    [&] { published.context->put_object_store(nullptr); },
+    "object_store: put_object_store requires a snapshot");
+  published.check();
+}
+
+TEST_CASE("FFI object store messages pin drop errors and empty default semantics",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  message_registry published;
+  struct row {
+    char const* prefix;
+    char const* expected;
+  };
+  for (auto const& item : std::vector<row>{
+         {"S3://bucket/prefix/",
+          "ObjectStoreConfig.uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
+         {"s3://bucket/prefix", "ObjectStoreConfig.uri_prefix: must end with '/'"},
+         {"s3://bucket/prefix/?token/",
+          "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+         {"s3://bucket/prefix/#fragment/",
+          "ObjectStoreConfig.uri_prefix: must not contain a query or fragment"},
+         {"s3://bucket//",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/./",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/../",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"},
+         {"s3://bucket/%41/",
+          "ObjectStoreConfig.uri_prefix: contains a segment no key can match byte-for-byte (empty, "
+          "'.', '..' or percent-encoded)"}}) {
+    CAPTURE(item.prefix);
+    check_exact_object_store_message<std::invalid_argument>(
+      [&] { published.context->drop_object_store(item.prefix); }, item.expected);
+    published.check();
+  }
+  REQUIRE_NOTHROW(published.context->drop_object_store(""));
+  published.check();
+  REQUIRE_NOTHROW(published.context->drop_object_store("s3://missing/prefix/"));
+  published.check();
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  published.check(fallback);
+  REQUIRE_NOTHROW(published.context->drop_object_store(""));
+  published.check();
+  CHECK(fallback.use_count() == 1);
+}
+
+TEST_CASE("FFI object store messages pin lookup refusal and empty registry miss",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const uri = "s3://user:" + std::string(object_store_sentinels[3]) +
+                   "@bucket/prefix/../object" + authentication_suffix();
+  {
+    auto context = make_context_from_config(memory_config());
+    CHECK(context->object_store_config_for(uri) == nullptr);
+    CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
+    CHECK(context->object_store_config_for("s3://other/prefix/object") == nullptr);
+  }
+  message_registry published;
+  auto const expected =
+    "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be matched "
+    "byte-for-byte against the published uri_prefix set";
+  check_exact_object_store_message<sirius::invalid_input_exception>(
+    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+  published.check();
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  check_exact_object_store_message<sirius::invalid_input_exception>(
+    [&] { (void)published.context->object_store_config_for(uri); }, expected);
+  published.check(fallback);
+}
+
+TEST_CASE("FFI object store messages pin all remote refusals at both execution entries",
+          "[isolated_context][ffi][object_store][object_store_messages]")
+{
+  auto const auth     = "s3://user:" + std::string(object_store_sentinels[3]) + "@";
+  auto const ordinary = auth + "bucket/prefix/object" + authentication_suffix();
+  auto const unstable = auth + "bucket/prefix/../object" + authentication_suffix();
+  {
+    auto context    = make_context_from_config(memory_config());
+    auto const plan = read_plan({{ordinary}});
+    for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+      CAPTURE(entry == entry_point::execute);
+      check_exact_object_store_message<sirius::invalid_input_exception>(
+        [&] { invoke_plan(*context, entry, plan); },
+        "object_store_unconfigured: the plan reads 's3://bucket/prefix/object' from an object "
+        "store or through an Iceberg metadata path, but this Context has no object-store snapshot "
+        "(Context::put_object_store)");
+      CHECK(context->object_store_config_for(kFixtureUri) == nullptr);
+      CHECK(context->object_store_config_for("s3://other/prefix/object") == nullptr);
+      CHECK(context->object_store_config_for("s3://missing/object") == nullptr);
+    }
+  }
+  message_registry published;
+  for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+    CAPTURE(entry == entry_point::execute);
+    auto const bad_key_plan = read_plan({{unstable}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, bad_key_plan); },
+      "object_store_scope: 's3://bucket/prefix/../object' names a key segment that cannot be "
+      "matched byte-for-byte against the published uri_prefix set");
+    published.check();
+    // A matched first item must not hide a later item outside the published set.
+    auto const outside_plan =
+      read_plan({{kFixtureUri}, {auth + "outside/object" + authentication_suffix()}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, outside_plan); },
+      "object_store_scope: the plan reads 's3://outside/object', outside every published "
+      "uri_prefix");
+    published.check();
+  }
+  // User-info changes raw prefix matching. A default scope serves that literal URI.
+  auto const fallback = message_snapshot("");
+  published.context->put_object_store(fallback);
+  for (auto entry : {entry_point::execute, entry_point::fragment_build}) {
+    CAPTURE(entry == entry_point::execute);
+    auto const plan = read_plan({{ordinary}});
+    check_exact_object_store_message<sirius::invalid_input_exception>(
+      [&] { invoke_plan(*published.context, entry, plan); },
+      "object_store_route_unavailable: the plan reads 's3://bucket/prefix/object' from an "
+      "object store; native object-store reads are not yet served on the FFI path");
+    published.check(fallback);
+  }
+}
+
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
+
+#include <optional>
+
+namespace {
+
+using published_scopes = std::shared_ptr<const sirius::object_store_scope::scope_set>;
+
+struct publication_events {
+  void collect(published_scopes set) noexcept
+  {
+    try {
+      std::lock_guard lock(mutex);
+      if (count == sets.size()) {
+        failed.store(true);
+        return;
+      }
+      threads[count] = std::this_thread::get_id();
+      sets[count++]  = std::move(set);
+    } catch (...) {
+      failed.store(true);
+    }
+  }
+
+  std::mutex mutex;
+  std::array<published_scopes, 8> sets;
+  std::array<std::thread::id, 8> threads;
+  std::size_t count{};
+  std::atomic<bool> failed{false};
+};
+
+struct publication_observer_guard {
+  explicit publication_observer_guard(publication_events& events)
+  {
+    sirius::ffi::testing::set_publication_observer(
+      [&events](published_scopes set) noexcept { events.collect(std::move(set)); });
+  }
+  ~publication_observer_guard() { sirius::ffi::testing::set_publication_observer({}); }
+};
+
+struct observer_environment {
+  observer_environment(char const* key, std::string const& value) : key(key)
+  {
+    if (auto const* previous = std::getenv(key)) { saved = previous; }
+    if (::setenv(key, value.c_str(), 1) != 0) {
+      throw std::system_error(errno, std::generic_category(), "setenv");
+    }
+  }
+  ~observer_environment()
+  {
+    if (saved) {
+      ::setenv(key, saved->c_str(), 1);
+    } else {
+      ::unsetenv(key);
+    }
+  }
+  char const* key;
+  std::optional<std::string> saved;
+};
+
+object_store_inputs observer_inputs(unsigned combination)
+{
+  object_store_inputs inputs;
+  inputs.endpoint       = "https://observer-endpoint.example.invalid:443";
+  inputs.region         = "observer-region";
+  inputs.access_key     = "OBSERVER_ACCESS_SENTINEL";
+  inputs.secret_key     = "OBSERVER_SECRET_SENTINEL";
+  inputs.session_token  = "OBSERVER_TOKEN_SENTINEL";
+  inputs.ca_bundle_path = fixture_path("ffi_object_store_test_ca.pem").string();
+  inputs.uri_prefix     = "s3://observer-bucket/scope/";
+  inputs.transport      = combination == 0 ? Transport::kHttp : Transport::kAuto;
+  inputs.signing_mode   = combination == 0 ? SigningMode::kPresigned : SigningMode::kHeader;
+  return inputs;
+}
+
+void check_observed_settings(published_scopes const& set,
+                             object_store_inputs const& expected,
+                             unsigned combination,
+                             std::shared_ptr<ObjectStoreConfig> const& publisher)
+{
+  REQUIRE(set);
+  REQUIRE(set->size() == 1);
+  auto const& entry = set->front();
+  REQUIRE(entry);
+  REQUIRE(entry->value);
+  auto const& value = *entry->value;
+  CHECK(value.endpoint == expected.endpoint);
+  CHECK(value.region == expected.region);
+  CHECK(value.access_key == expected.access_key);
+  CHECK(value.secret_key == expected.secret_key);
+  CHECK(value.session_token == expected.session_token);
+  CHECK(value.ca_bundle_path == expected.ca_bundle_path);
+  CHECK(value.uri_prefix == expected.uri_prefix);
+  CHECK(value.transport == (combination == 0 ? 1U : 0U));
+  CHECK(value.signing_mode == (combination == 0 ? 0U : 1U));
+  CHECK(entry->owner.get() == publisher.get());
+  CHECK_FALSE(entry->owner.owner_before(publisher));
+  CHECK_FALSE(publisher.owner_before(entry->owner));
+  std::array<std::string, 7> const strings{expected.endpoint,
+                                           expected.region,
+                                           expected.access_key,
+                                           expected.secret_key,
+                                           expected.session_token,
+                                           expected.ca_bundle_path,
+                                           expected.uri_prefix};
+  for (std::size_t i = 0; i < strings.size(); ++i) {
+    CHECK_FALSE(strings[i].empty());
+    for (std::size_t j = 0; j < i; ++j) {
+      CHECK(strings[i] != strings[j]);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("FFI object store observer receives all put fields",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  auto context = make_context_from_config(memory_config());
+  publication_events events;
+  publication_observer_guard guard(events);
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    auto const inputs = observer_inputs(combination);
+    auto const config = inputs.snapshot();
+    context->put_object_store(config);
+    REQUIRE(events.count == combination + 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[combination] == std::this_thread::get_id());
+    check_observed_settings(events.sets[combination], inputs, combination, config);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"), config);
+  }
+}
+
+TEST_CASE("FFI object store observer receives all factory fields",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    publication_events events;
+    publication_observer_guard guard(events);
+    auto const inputs = observer_inputs(combination);
+    auto const config = inputs.snapshot();
+    auto context      = make_context_from_config(memory_config(), config);
+    REQUIRE(context);
+    REQUIRE(events.count == 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[0] == std::this_thread::get_id());
+    check_observed_settings(events.sets[0], inputs, combination, config);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"), config);
+  }
+}
+
+TEST_CASE("FFI object store observer sees derived credentials only after publication",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  for (unsigned combination = 0; combination < 2; ++combination) {
+    auto inputs         = observer_inputs(combination);
+    auto const original = inputs.snapshot();
+    auto context        = make_context_from_config(memory_config(), original);
+    publication_events events;
+    publication_observer_guard guard(events);
+    inputs.access_key    = "DERIVED_ACCESS_SENTINEL";
+    inputs.secret_key    = "DERIVED_SECRET_SENTINEL";
+    inputs.session_token = "DERIVED_TOKEN_SENTINEL";
+    auto const derived =
+      original->with_credentials(inputs.access_key, inputs.secret_key, inputs.session_token);
+    CHECK(events.count == 0);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"),
+                            original);
+    context->put_object_store(derived);
+    REQUIRE(events.count == 1);
+    CHECK_FALSE(events.failed.load());
+    CHECK(events.threads[0] == std::this_thread::get_id());
+    check_observed_settings(events.sets[0], inputs, combination, derived);
+    check_snapshot_identity(context->object_store_config_for(inputs.uri_prefix + "object"),
+                            derived);
+    CHECK(original->access_key == "OBSERVER_ACCESS_SENTINEL");
+    CHECK(original->secret_key == "OBSERVER_SECRET_SENTINEL");
+    CHECK(original->session_token == "OBSERVER_TOKEN_SENTINEL");
+  }
+}
+
+TEST_CASE("FFI object store observer ignores refused writes and absent publications",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  publication_events events;
+  publication_observer_guard guard(events);
+  auto context = make_context_from_config(memory_config(), nullptr);
+  CHECK(events.count == 0);
+  auto inputs         = observer_inputs(0);
+  auto const original = inputs.snapshot();
+  context->put_object_store(original);
+  REQUIRE(events.count == 1);
+  inputs.region.clear();
+  CHECK_THROWS_AS(context->put_object_store(inputs.snapshot()), std::invalid_argument);
+  CHECK_THROWS_AS(context->put_object_store(nullptr), std::invalid_argument);
+  CHECK_THROWS_AS(make_context_from_config(memory_config(), inputs.snapshot()),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(context->drop_object_store("invalid"), std::invalid_argument);
+  CHECK_NOTHROW(context->drop_object_store("s3://observer-bucket/absent/"));
+  CHECK_NOTHROW(context->drop_object_store(""));
+  CHECK(events.count == 1);
+  check_snapshot_identity(context->object_store_config_for(original->uri_prefix + "object"),
+                          original);
+  CHECK_NOTHROW(context->drop_object_store(original->uri_prefix));
+  REQUIRE(events.count == 2);
+  REQUIRE(events.sets[1]);
+  CHECK(events.sets[1]->empty());
+  CHECK(events.sets[0]->size() == 1);
+  CHECK_NOTHROW(context->drop_object_store(original->uri_prefix));
+  CHECK(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+}
+
+TEST_CASE("FFI object store observer receives its call's set after a reentrant writer",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  operation_deadline deadline("publication observer after retired-owner reentry");
+  auto context = std::shared_ptr<sirius::ffi::Context>(make_context_from_config(memory_config()));
+  auto outer_inputs    = observer_inputs(0);
+  outer_inputs.region  = "outer-observer-region";
+  auto const outer     = outer_inputs.snapshot();
+  auto nested_inputs   = observer_inputs(1);
+  nested_inputs.region = "nested-observer-region";
+  auto const nested    = nested_inputs.snapshot();
+  struct cleanup_result {
+    unsigned calls{};
+    std::exception_ptr error;
+  };
+  auto cleanup                                     = std::make_shared<cleanup_result>();
+  std::weak_ptr<sirius::ffi::Context> weak_context = context;
+  auto retired                                     = std::shared_ptr<ObjectStoreConfig>(
+    new ObjectStoreConfig(*outer),
+    [weak_context, nested, cleanup](ObjectStoreConfig* pointer) noexcept {
+      ++cleanup->calls;
+      try {
+        if (auto current = weak_context.lock()) { current->put_object_store(nested); }
+      } catch (...) {
+        cleanup->error = std::current_exception();
+      }
+      delete pointer;
+    });
+  context->put_object_store(retired);
+  retired.reset();
+  publication_events events;
+  publication_observer_guard guard(events);
+  context->put_object_store(outer);
+  CHECK(cleanup->calls == 1);
+  CHECK_FALSE(cleanup->error);
+  REQUIRE(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+  // Retirement runs before the outer publish returns. A fresh capture at notification
+  // time would incorrectly report the nested writer's set for both events.
+  check_observed_settings(events.sets[0], nested_inputs, 1, nested);
+  check_observed_settings(events.sets[1], outer_inputs, 0, outer);
+  CHECK(events.sets[0] != events.sets[1]);
+  check_snapshot_identity(context->object_store_config_for(outer_inputs.uri_prefix + "object"),
+                          nested);
+}
+
+TEST_CASE("FFI object store factory notifies before engine bring-up can fail",
+          "[isolated_context][ffi][object_store][object_store_observer]")
+{
+  operation_deadline deadline("factory publication before failing log-sink installation");
+  message_ca_file not_a_directory;
+  REQUIRE(fs::is_regular_file(not_a_directory.path));
+  auto const inputs = observer_inputs(0);
+  auto const config = inputs.snapshot();
+  publication_events events;
+  publication_observer_guard guard(events);
+  std::string error;
+  bool returned = false;
+  {
+    // Sink installation is the first operation in bring_up. A regular file as LOG_DIR
+    // makes it fail before constructing an engine, while using the normal memory YAML.
+    observer_environment backend("SIRIUS_LOG_BACKEND", "spdlog");
+    observer_environment directory("SIRIUS_LOG_DIR", not_a_directory.path.string());
+    observer_environment level("SIRIUS_LOG_LEVEL", "info");
+    try {
+      auto context = make_context_from_config(memory_config(), config);
+      returned     = bool(context);
+    } catch (std::exception const& failure) {
+      error = failure.what();
+    }
+  }
+  CHECK_FALSE(returned);
+  CHECK(error.find(not_a_directory.path.string()) != std::string::npos);
+  CHECK(error.find("ObjectStoreConfig.") == std::string::npos);
+  REQUIRE(events.count == 1);
+  CHECK_FALSE(events.failed.load());
+  check_observed_settings(events.sets[0], inputs, 0, config);
+  // Notification of the failed attempt did not promise that a usable Context existed.
+  auto recovered = make_context_from_config(memory_config(), config);
+  REQUIRE(recovered);
+  REQUIRE(events.count == 2);
+  CHECK_FALSE(events.failed.load());
+  check_observed_settings(events.sets[1], inputs, 0, config);
+  CHECK(events.sets[0] != events.sets[1]);
+}
