@@ -25,7 +25,11 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/table/table.hpp>
+
 #include <algorithm>
+#include <memory>
 
 namespace sirius {
 namespace op {
@@ -324,16 +328,21 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       cudf::table_view sort_keys_view(sort_key_cols);
 
       // Gather boundary rows
-      _partition_boundaries = cudf::gather(sort_keys_view,
-                                           indices_col->view(),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           space->get_default_allocator());
-      _num_partitions       = num_parts;
+      auto boundary_rows = cudf::gather(sort_keys_view,
+                                        indices_col->view(),
+                                        cudf::out_of_bounds_policy::DONT_CHECK,
+                                        stream,
+                                        space->get_default_allocator());
+      // Synchronizes the stream, so the merge and gather above have finished when the rows are
+      // published below.
+      _partition_boundaries =
+        std::make_unique<sort_boundaries>(boundary_rows->view(), *space, stream);
+      _num_partitions = num_parts;
     }
 
-    // sort_partition runs in the same gpu_pipeline_task immediately after this
-    // execute() returns, so _partition_boundaries is visible before partition runs.
+    // Once DONE is visible the task creator starts one task per remaining batch, on the GPU that
+    // holds each batch and on its own stream. Those SORT_PARTITION tasks read the boundaries, so
+    // they must be complete by now; sort_boundaries gives each GPU its own copy.
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
 
   } catch (...) {
@@ -346,7 +355,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Sort sample: computed {} partitions with {} boundaries in {:.2f} ms",
                    _num_partitions,
-                   _partition_boundaries ? _partition_boundaries->num_rows() : 0,
+                   get_num_partition_boundaries(),
                    duration.count() / 1000.0);
 
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
