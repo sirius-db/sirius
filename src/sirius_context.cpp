@@ -39,6 +39,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "op/discard_copy_function.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/connection_provenance.hpp"
@@ -75,15 +76,18 @@
 #include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace duckdb {
 
@@ -959,8 +963,52 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
   }
 
+  // A spill directory that is missing or not writable fails every write to the disk tier
+  // while the run goes on without one; refuse to start instead.
+  for (auto const& space : config_.get_memory_space_configs()) {
+    if (auto const* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space)) {
+      sirius::validate_spill_directory(disk->mount_paths);
+    }
+  }
+  sirius::pipeline::gpu_pipeline_executor::set_reservation_policy(
+    config_.get_reservation_wait_policy());
+
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+
+  // The usage limit bounds what Sirius allocates, not what the device's memory pool reserves:
+  // under spilling the pool can hold up to 1.4 times the limit and not give it back, and
+  // allocations then fail below the limit
+  // (OOM retry storms). Say so at startup when the device cannot supply that much.
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    auto const* adaptor = gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (adaptor == nullptr) { continue; }
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{gpu_space->get_device_id()}};
+    std::size_t device_free  = 0;
+    std::size_t device_total = 0;
+    if (cudaMemGetInfo(&device_free, &device_total) != cudaSuccess) { continue; }
+    std::uint64_t pool_reserved = 0;
+    if (auto pool = adaptor->pool_handle(); pool != nullptr) {
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+    }
+    auto const limit       = gpu_space->get_max_memory();
+    auto const available   = device_free + pool_reserved;  // what the pool has or can still get
+    auto const recommended = static_cast<std::size_t>(static_cast<double>(available) / 1.4);
+    if (limit > recommended) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: GPU {} memory limit of {} bytes is close to what the device can supply "
+        "({} of {} bytes available). The device memory pool can hold up to 1.4 times the limit "
+        "when data is spilled, so allocations may fail below the limit and tasks retry (slow, "
+        "not wrong). A limit of at most {} bytes (sirius.memory.gpu.usage_limit_bytes, or "
+        "usage_limit_fraction 0.7) avoids it.",
+        gpu_space->get_device_id(),
+        limit,
+        available,
+        device_total,
+        recommended);
+    }
+  }
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.
@@ -981,23 +1029,36 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     }
   }
 
-  // Verify cucascade built one host memory space per NUMA node. Warn rather
-  // than throw — non-NUMA CI hosts legitimately report num_numa_nodes == 0.
+  // One host memory space is expected per NUMA node that carries a configured GPU. The
+  // machine's NUMA node count is not the yardstick: it includes CPU-less nodes (GPU memory
+  // exposed as NUMA nodes) and empty ones, none of which backs a host space.
   {
-    auto const mgpu05_host_spaces =
+    auto const host_spaces =
       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    SIRIUS_LOG_INFO("SiriusContext: {} host memory space(s) created for {} NUMA node(s)",
-                    mgpu05_host_spaces.size(),
-                    topo.num_numa_nodes);
-    if (topo.num_numa_nodes > 0 &&
-        mgpu05_host_spaces.size() != static_cast<size_t>(topo.num_numa_nodes)) {
-      SIRIUS_LOG_WARN(
-        "SiriusContext: host space count ({}) != NUMA node count ({}) — "
-        "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
-        "configuration.",
-        mgpu05_host_spaces.size(),
-        topo.num_numa_nodes);
+    std::set<int> gpu_numa_nodes;
+    for (auto const* gpu_space :
+         memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      auto const it = std::ranges::find_if(topo.gpus, [&](auto const& gpu) {
+        return static_cast<int>(gpu.id) == gpu_space->get_device_id();
+      });
+      gpu_numa_nodes.insert(it != topo.gpus.end() ? it->numa_node : -1);
+    }
+    SIRIUS_LOG_INFO(
+      "SiriusContext: {} host memory space(s) created for {} NUMA node(s) carrying a "
+      "configured GPU ({} NUMA node(s) reported by the machine)",
+      host_spaces.size(),
+      gpu_numa_nodes.size(),
+      topo.num_numa_nodes);
+    for (auto const* host_space : host_spaces) {
+      auto const* node = topo.find_numa_node(host_space->get_device_id());
+      if (node != nullptr && node->is_device_memory) {
+        SIRIUS_LOG_WARN(
+          "SiriusContext: host memory space {} is on NUMA node {}, which has memory but no "
+          "CPUs (device memory); host data must not be placed there. Check the host space "
+          "configuration.",
+          host_space->get_device_id(),
+          node->id);
+      }
     }
   }
 

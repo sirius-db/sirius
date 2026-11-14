@@ -32,13 +32,18 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -66,6 +71,10 @@ struct downgrade_request {
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
   bool is_monitor_request{false};
+  /// Wakes the processing loop for a request waiting in the reserve-path queue; carries no work.
+  bool is_wakeup{false};
+  /// Issued by request_downgrade(): a task is waiting for its reservation.
+  bool is_reserve_request{false};
 };
 
 /**
@@ -174,6 +183,16 @@ class downgrade_executor {
   bool has_disk_tier() const;
 
   /**
+   * @brief The first conversion error since spilling from this space last succeeded, if its
+   *        conversions are failing for a reason other than memory (I/O error, bad spill
+   *        directory). Empty while spilling works.
+   */
+  [[nodiscard]] std::optional<std::string> spill_failure() const;
+
+  /// Number of reserve-path requests waiting to be processed (test-only).
+  [[nodiscard]] std::size_t pending_reserve_requests_for_testing() const;
+
+  /**
    * @brief Number of downgrade requests the monitor loop has issued (test-only).
    *
    * Lets tests observe whether the monitor has gone quiescent (count stops rising)
@@ -201,8 +220,21 @@ class downgrade_executor {
   void maybe_fail_stream_acquisition(stream_acquisition_site site);
 
   void processing_loop();
+  void process_request(downgrade_request& request);
   void monitor_loop();
   void cancel_pending_requests();
+
+  /// Completes every waiting reserve-path request whose predicate holds now. Called between
+  /// conversions of the request in progress and by the monitor thread, so a waiting reservation
+  /// is served as soon as the memory is there instead of when its turn in the queue comes.
+  void serve_ready_reserve_requests() noexcept;
+  /// Next waiting reserve-path request, if any.
+  std::unique_ptr<downgrade_request> pop_reserve_request();
+  /// GPU tier, under pressure, once a second: what Sirius tracks against what the device's
+  /// memory pool and the device itself hold ("[memory][accounting]").
+  void log_device_accounting() noexcept;
+  void record_convert_failure(std::string_view what) noexcept;
+  void record_convert_success() noexcept;
 
   /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
@@ -223,6 +255,20 @@ class downgrade_executor {
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
+
+  /// Reserve-path requests, served ahead of _request_queue (see prioritize_reserve_requests).
+  mutable std::mutex _reserve_requests_mutex;
+  std::deque<std::unique_ptr<downgrade_request>> _reserve_requests;
+
+  /// Spill failure state: first error text since the last success, how many failed since, and
+  /// the monitor's back-off after requests that freed nothing because of them.
+  mutable std::mutex _spill_failure_mutex;
+  std::optional<std::string> _spill_failure;
+  std::atomic<std::size_t> _convert_failures_since_success{0};
+  std::atomic<std::int64_t> _monitor_not_before_ns{0};
+  std::chrono::milliseconds _failure_backoff{0};
+  /// Monitor thread only.
+  std::chrono::steady_clock::time_point _last_accounting_log{};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
   std::mutex _monitor_cv_mutex;

@@ -44,6 +44,7 @@ set(TEST_SOURCES
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
     test/cpp/config/test_topology_config.cpp
+    test/cpp/config/test_memory_defaults.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/memory/test_pool_peer_access.cpp
@@ -347,6 +348,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
+    test/cpp/pipeline/test_reservation_wait.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp

@@ -29,8 +29,13 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <thread>
+#include <utility>
 
 namespace sirius::op {
 class sirius_physical_operator;
@@ -54,6 +59,10 @@ namespace pipeline {
 
 struct executor_metrics {
   size_t tasks_executed{0};
+  /// Tasks whose reservation was not granted at once and that waited for it on their worker.
+  size_t reservation_waits{0};
+  /// Tasks dispatched while at least one other task was waiting for its reservation.
+  size_t bypass_dispatches{0};
 };
 
 /**
@@ -124,6 +133,11 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
+  /// Set how every GPU pipeline executor of the process waits for a reservation that is not
+  /// granted at once (read per task). SiriusContext installs the configured policy.
+  static void set_reservation_policy(const exec::reservation_wait_policy& policy);
+  [[nodiscard]] static exec::reservation_wait_policy reservation_policy();
+
   /**
    * @brief Return the effective executor configuration after scheduler derivation.
    */
@@ -165,6 +179,48 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   void process_task(std::unique_ptr<sirius::parallel::itask> pipeline_task,
                     exec::bounded_thread_pool::slot slot,
                     quent::Handle<quent::TaskManagerLoopThread>& manager_thread_handle) noexcept;
+
+  /// What a task waiting for its reservation needs to know, on the manager or on a worker.
+  struct reservation_wait {
+    std::size_t bytes_needs{0};
+    sirius::query_id_t query_id{};
+    decltype(std::declval<quent::Handle<quent::TaskManagerLoopThread>&>().id()) manager_thread;
+  };
+
+  /**
+   * @brief Get the reservation of a task whose non-blocking attempt failed: wait for running
+   *        tasks to release memory, then ask the downgrade executor to evict, then take what is
+   *        left.
+   *
+   * @param on_worker true on the task's worker thread (the manager keeps dispatching), false on
+   * the manager loop (it blocks; the behaviour before reservation_wait_policy::wait_on_worker).
+   * @return The reservation, possibly partial; null when the failure was reported to the task's
+   * completion handler or its query no longer accepts work.
+   */
+  std::unique_ptr<cucascade::memory::reservation> acquire_reservation(gpu_pipeline_task& task,
+                                                                      const reservation_wait& wait,
+                                                                      bool on_worker);
+
+  /// Hands the reservation to the task's local state; reports and returns false if it has none.
+  bool attach_reservation(gpu_pipeline_task& task,
+                          std::unique_ptr<cucascade::memory::reservation> reservation,
+                          const reservation_size_info& reservation_info);
+
+  struct waiter_state {
+    std::chrono::steady_clock::time_point since;
+    std::size_t bypassed{0};
+  };
+  class waiter_registration;
+  /// Counts a dispatch against every waiting task.
+  void note_bypass();
+  /// Blocks the manager while a waiting task is past its bypass limits.
+  void wait_for_starving_waiters();
+
+  std::mutex _waiters_mutex;
+  std::condition_variable _waiters_cv;
+  std::list<waiter_state> _waiters;
+  std::atomic<size_t> _reservation_waits{0};
+  std::atomic<size_t> _bypass_dispatches{0};
 
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;

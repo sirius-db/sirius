@@ -151,8 +151,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
-| `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.95 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. What is evicted between the two fractions is usually read back, so a wide band costs traffic: a sort of twice the GPU limit took 33 s at 0.8/0.6 and 21 s at 0.95/0.9. |
+| `downgrade_stop_fraction` | double (0,1] | 0.9 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+
+**Keep the limit well below the device size.** The limit bounds the bytes Sirius allocates; the device's CUDA memory pool reserves more than that. Under a sort of twice the limit it has been measured to hold 1.16 to 1.41 times the limit (100-121 GB for an 85.9 GB limit; 45-75 GB of it reserved but unused at the peak) and it does not give the excess back (trimming the pool released under 1.2 GB of 18 GB). When the device cannot supply that, allocations fail although the tracked usage is below the limit, and tasks retry: a 160 GiB sort under an 80 GiB limit took 39-70 s with 274-803 OOM retries instead of 33 s with none when only 96 and 88 GiB of the device were available, and 263 s with a 176 GiB limit on a 184 GiB device. Sirius warns at startup when the device has less than 1.4 times the limit available. The default `usage_limit_fraction` of 0.95 is above that bound: set `usage_limit_fraction: 0.7` (or the equivalent bytes) for workloads that spill.
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level
@@ -160,11 +162,13 @@ diagnostic control remains available only through the explicit low-level
 
 ### Host Memory (`sirius.memory.host`)
 
-Controls pinned host memory pools. One pool group is created per NUMA node (auto-detected from hardware topology).
+Controls pinned host memory pools. One pool group is created per NUMA node that carries a configured GPU (auto-detected from hardware topology); CPU-less NUMA nodes (GPU memory exposed as NUMA nodes) are never used. The pools are allocated with `numa_alloc_onnode`, whose policy is a strict bind to the node.
+
+When neither capacity key is set, each host space gets **one third of its NUMA node's RAM per configured GPU on that node, for at most two GPUs**: a node carrying one GPU gives one third to the host tier, a node carrying two or more gives two thirds, and one third always stays free for everything else (including the page cache that buffered spill files use).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
+| `capacity_fraction` | double (0,1] | — (see above) | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
@@ -173,6 +177,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+| `prepin_fraction` | double [0,1] | 0 | Share of the host capacity to pin at startup: raises `initial_number_pools` to cover it. Pools created on demand are pinned on the spill path at about 20 GB/s, against 60 GB/s and more into pools that already exist, so a sort that spills tens of GB finishes sooner with the pools pinned up front (measured: 14.5-16.8 s to 7.9-9.7 s for 160 GiB under an 80 GiB limit); pinning costs about 25 ms per GiB at load and commits the memory. |
 
 ### Disk Memory (`sirius.memory.disk`)
 
@@ -182,7 +187,7 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
-| `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+| `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). The directory is checked at startup: a missing one is created, and Sirius refuses to start when it cannot be created, is not a directory or is not writable (it used to start and fail every spill to disk). |
 
 ### Input-table compression (`sirius.compression`)
 
@@ -329,7 +334,12 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`). No extra keys.
+Thread pool (default `num_threads: 4`) plus:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wait_for_memory_on_worker` | bool | false | `true`: a task whose memory reservation cannot be granted at once waits for it on its own worker thread, so the executor keeps dispatching the tasks that fit. A waiting task is overtaken by at most 16 later tasks and for at most 1 s; after that nothing new is dispatched until it is served. `false` waits on the executor's manager loop: one waiting task holds back every other task of the device. Off by default: with `prioritize_reserve_requests` it removed most of the time in which no task computed, but not wall time (the runs are bound by spill I/O), and it needs MERGE_SORT windows that do not depend on the memory free when a partition is armed. |
+| `fail_fast_on_full_gpu_oom` | bool | true | Fail a task the second time it runs out of memory while its reservation already covers the whole GPU memory limit and its input cannot shrink (for example a one-shot merge of a partition that is too large): a retry gets the same memory. `false` retries up to the retry limit (100). |
 
 ### `sirius.executor.downgrade`
 
@@ -338,6 +348,9 @@ Thread pool (default `num_threads: 1`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+| `prioritize_reserve_requests` | bool | false | `true`: complete the eviction request of a task waiting for a reservation as soon as its memory is available, also while another request (the monitor's bulk eviction) is being processed, and process the ones still unsatisfied before the next queued request. `false` processes requests strictly in arrival order: a waiting task then waits for every request ahead of its own to finish. |
+
+A request stops after 8 conversions in a row fail for a reason other than memory (an I/O error, a spill directory that went away) with none succeeding; a waiting task then fails with that error, and the monitor backs off (100 ms, doubling to 5 s) instead of re-issuing the failing request every period. While the GPU tier is above its downgrade stop threshold the monitor logs one `[memory][accounting]` line every five seconds: the bytes Sirius tracks against what the device's memory pool and the device hold.
 
 ## Scan Manager & IO Configuration
 

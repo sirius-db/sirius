@@ -577,6 +577,13 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
+  /// How GPU pipeline executors wait for a reservation that is not granted at once
+  /// (`sirius.executor.pipeline.wait_for_memory_on_worker`, `fail_fast_on_full_gpu_oom`).
+  [[nodiscard]] const exec::reservation_wait_policy& get_reservation_wait_policy() const noexcept
+  {
+    return _reservation_wait_policy;
+  }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -637,10 +644,16 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
+  exec::reservation_wait_policy _reservation_wait_policy;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
 };
+
+/// Checks that @p directory can take spill files: it is a directory (created if it is missing)
+/// and a file can be created in it. Throws std::runtime_error naming the directory and the
+/// reason otherwise. An empty path is not checked (no disk tier is built from it).
+void validate_spill_directory(const std::string& directory);
 
 /// Validated configuration intent. Construction and parsing never discover hardware.
 /// Resolution produces a separate value and leaves the specification unchanged.

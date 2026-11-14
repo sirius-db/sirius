@@ -27,15 +27,21 @@
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <variant>
 #include <vector>
@@ -598,6 +604,19 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
   r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
+  r.optional("prioritize_reserve_requests", opt.prioritize_reserve_requests);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node,
+                      exec::thread_pool_config& pool,
+                      exec::reservation_wait_policy& policy)
+{
+  // Named like the plain thread pool reader: the pipeline pool's keys are a superset of it.
+  yaml::reader r(node, "thread_pool");
+  r.optional("num_threads", pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("wait_for_memory_on_worker", policy.wait_on_worker);
+  r.optional("fail_fast_on_full_gpu_oom", policy.fail_fast_on_full_space_oom);
   r.reject_unknown();
 }
 
@@ -654,8 +673,11 @@ size_t resolve_num_gpus(size_t requested, const cucascade::memory::system_topolo
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit{0.95};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
-  double downgrade_trigger_fraction{0.8};
-  double downgrade_stop_fraction{0.6};
+  // A narrow band close to the limit: what is evicted between trigger and stop is read back
+  // later, so a wide band (0.8 / 0.6) moves a fifth of the GPU per request and makes a sort
+  // of twice the GPU limit about a third slower, with no difference for inputs that fit.
+  double downgrade_trigger_fraction{0.95};
+  double downgrade_stop_fraction{0.9};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -680,6 +702,14 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
+    // A configuration that names only a trigger at or below the default stop (the former
+    // default trigger was 0.8) keeps working: the stop follows it at the default ratio.
+    if (!r.has_value("downgrade_stop_fraction") && r.has_value("downgrade_trigger_fraction") &&
+        opt.downgrade_trigger_fraction <= opt.downgrade_stop_fraction) {
+      opt.downgrade_stop_fraction =
+        opt.downgrade_trigger_fraction *
+        (gpu_mem_config{}.downgrade_stop_fraction / gpu_mem_config{}.downgrade_trigger_fraction);
+    }
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -710,9 +740,21 @@ struct gpu_mem_config {
   }
 };
 
+/// Default host tier size: this share of a GPU's CPU NUMA node per selected GPU on that node,
+/// for at most this many GPUs, so a node carrying two GPUs gives two thirds to the host tier and
+/// keeps one third for everything else (the page cache of the spill files included).
+constexpr double default_host_capacity_fraction_per_gpu   = 1.0 / 3.0;
+constexpr std::size_t default_host_capacity_gpus_per_node = 2;
+
 struct host_mem_config {
-  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
-  std::variant<double, std::uint64_t> capacity{0.9};
+  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node. Unless
+  // one of the capacity keys is set, the fraction is per selected GPU on the node (see
+  // apply_host_defaults()).
+  std::variant<double, std::uint64_t> capacity{default_host_capacity_fraction_per_gpu};
+  bool capacity_is_default{true};
+  /// Share of the capacity to pin when the host space is created (raises
+  /// initial_number_pools to cover it). 0 keeps initial_number_pools as given.
+  double prepin_fraction{0.0};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
   // needs a configured downgrade_root_dirs; without one the executor warns and skips.
@@ -736,10 +778,15 @@ struct host_mem_config {
                                std::to_string(*cap_frac));
     }
     if (cap_bytes) {
-      opt.capacity = *cap_bytes;
+      opt.capacity            = *cap_bytes;
+      opt.capacity_is_default = false;
     } else if (cap_frac) {
-      opt.capacity = *cap_frac;
+      opt.capacity            = *cap_frac;
+      opt.capacity_is_default = false;
     }
+    r.optional("prepin_fraction", opt.prepin_fraction, [](double value) {
+      return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+    });
     std::optional<std::uint64_t> res_bytes;
     double res_frac = 1.0;
     reject_mutually_exclusive(
@@ -787,6 +834,58 @@ struct host_mem_config {
     // cucascade config field — the names line up with the resulting config struct, not with the
     // setter's parameter names.
     builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
+  }
+
+  /// Finish the host spaces the configurator built: scale the default capacity by the number
+  /// of selected GPUs on each space's NUMA node, and apply prepin_fraction.
+  void apply_host_defaults(std::vector<cucascade::memory::memory_space_config>& spaces,
+                           const cucascade::memory::system_topology_info& hw) const
+  {
+    std::vector<int> gpu_numa_nodes;
+    for (auto const& space : spaces) {
+      if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+        auto const it = std::ranges::find_if(
+          hw.gpus, [&](auto const& info) { return static_cast<int>(info.id) == gpu->device_id; });
+        gpu_numa_nodes.push_back(it != hw.gpus.end() ? it->numa_node : -1);
+      }
+    }
+    for (auto& space : spaces) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (host == nullptr) { continue; }
+      if (capacity_is_default) {
+        auto const gpus_on_node =
+          static_cast<std::size_t>(std::ranges::count(gpu_numa_nodes, host->numa_id));
+        auto const counted =
+          std::clamp<std::size_t>(gpus_on_node, 1, default_host_capacity_gpus_per_node);
+        if (counted > 1 && host->memory_capacity > 0) {
+          auto const one_gpu = host->memory_capacity;
+          host->memory_capacity =
+            sirius::memory::saturating_mul(one_gpu, static_cast<std::uint64_t>(counted));
+          if (std::holds_alternative<std::uint64_t>(reservation_limit)) {
+            // The byte limit was turned into a fraction of the one-GPU capacity.
+            host->reservation_limit_fraction *=
+              static_cast<double>(one_gpu) / static_cast<double>(host->memory_capacity);
+          }
+        }
+        SIRIUS_LOG_INFO(
+          "sirius_config: host memory capacity defaulted to {} bytes on NUMA node {} ({} "
+          "selected GPU(s) on the node, one third of the node per GPU for at most {} GPUs); set "
+          "sirius.memory.host.capacity_bytes or capacity_fraction to override",
+          host->memory_capacity,
+          host->numa_id,
+          gpus_on_node,
+          default_host_capacity_gpus_per_node);
+      }
+      if (prepin_fraction > 0.0) {
+        auto const pool_bytes = sirius::memory::saturating_mul(host->block_size, host->pool_size);
+        if (pool_bytes > 0) {
+          auto const pools = static_cast<std::size_t>(
+            std::ceil(prepin_fraction * static_cast<double>(host->memory_capacity) /
+                      static_cast<double>(pool_bytes)));
+          host->initial_number_pools = std::max(host->initial_number_pools, pools);
+        }
+      }
+    }
   }
 };
 
@@ -990,7 +1089,7 @@ try {
     if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
     if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
     if (auto n = er.optional_node("pipeline"))
-      from_yaml(*n, settings._gpu_pipeline_executor_config);
+      from_yaml(*n, settings._gpu_pipeline_executor_config, settings._reservation_wait_policy);
     if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
     er.reject_unknown();
   }
@@ -1095,6 +1194,7 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    host_cfg.apply_host_defaults(settings._memory_space_configs, hw_topology);
   }
 
   const auto defaults =
@@ -1185,6 +1285,36 @@ void sirius_config::enforce_native_backend_for_multi_gpu()
       num_gpus);
     _scan_manager_config.backend = scan_manager::io_backend::native;
   }
+}
+
+void validate_spill_directory(const std::string& directory)
+{
+  if (directory.empty()) { return; }
+  auto const fail = [&](const std::string& why) {
+    throw std::runtime_error(
+      "sirius.memory.disk.downgrade_root_dirs: spill directory '" + directory + "' " + why +
+      ". Spilling to disk cannot work with it; create the directory, make it writable, or "
+      "remove the setting to run without a disk tier.");
+  };
+  std::error_code ec;
+  auto status = std::filesystem::status(directory, ec);
+  if (status.type() == std::filesystem::file_type::not_found) {
+    ec.clear();
+    // A missing directory is created (configurations name directories under /tmp that nothing
+    // else creates); one that cannot be created is the error.
+    std::filesystem::create_directories(directory, ec);
+    if (ec) { fail("does not exist and cannot be created (" + ec.message() + ")"); }
+    SIRIUS_LOG_INFO("sirius_config: created spill directory '{}'", directory);
+    status = std::filesystem::status(directory, ec);
+  }
+  if (ec) { fail("cannot be accessed (" + ec.message() + ")"); }
+  if (!std::filesystem::is_directory(status)) { fail("is not a directory"); }
+  // The spill files are created with mkstemps in this directory; do the same once.
+  std::string probe = (std::filesystem::path(directory) / "sirius_probe_XXXXXX.tmp").string();
+  int const fd      = ::mkstemps(probe.data(), 4);
+  if (fd < 0) { fail(std::string("is not writable (") + std::strerror(errno) + ")"); }
+  ::close(fd);
+  ::unlink(probe.c_str());
 }
 
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()

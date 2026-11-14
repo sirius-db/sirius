@@ -37,11 +37,14 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -74,6 +77,11 @@ struct downgrade_executor_test_access {
   static bool monitor_request_enqueued(downgrade_executor const& executor)
   {
     return executor._monitor_request_enqueued.load(std::memory_order_relaxed);
+  }
+
+  static std::chrono::milliseconds failure_backoff(downgrade_executor const& executor)
+  {
+    return executor._failure_backoff;
   }
 
   static std::future<size_t> request_as_monitor(downgrade_executor& executor,
@@ -482,4 +490,267 @@ TEST_CASE("Downgrade stop and drain wait for workers after acquisition failure",
   auto next = f.executor->request_free_memory(2 * batch_bytes);
   REQUIRE(next.wait_for(5s) == std::future_status::ready);
   CHECK(next.get() == batch_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Reserve-path requests (a task waiting for its reservation) are served ahead of the monitor's
+// background request, and a request whose conversions keep failing for a reason other than
+// memory stops and reports the error instead of failing on every candidate forever.
+// ---------------------------------------------------------------------------
+namespace {
+
+class simple_gate {
+ public:
+  void wait()
+  {
+    std::unique_lock lock(mutex_);
+    entered_ = true;
+    cv_.notify_all();
+    cv_.wait_for(lock, 20s, [&] { return open_; });
+  }
+  bool wait_until_entered()
+  {
+    std::unique_lock lock(mutex_);
+    return cv_.wait_for(lock, 5s, [&] { return entered_; });
+  }
+  void open()
+  {
+    std::lock_guard lock(mutex_);
+    open_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_{false};
+  bool open_{false};
+};
+
+struct reserve_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  // Declared before the repositories: batches left on the GPU are freed on this stream when
+  // the repositories go away.
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  sirius::data::data_repository_manager_registry repositories;
+  std::unique_ptr<sirius::parallel::downgrade_executor> executor;
+  std::vector<std::unique_ptr<cucascade::memory::reservation>> held_host;
+
+  /// @param spill_dir when set, a disk tier on that directory and a host tier that is full, so
+  /// every conversion goes to disk.
+  explicit reserve_fixture(sirius::exec::downgrade_executor_config config,
+                           std::optional<std::string> spill_dir = std::nullopt)
+  {
+    sirius::converter_registry::reset_for_testing();
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(256ull << 20)
+      .set_reservation_fraction_per_gpu(0.9)
+      .set_per_numa_region_capacity(spill_dir ? (2ull << 20) : (64ull << 20))
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(0.75);
+    if (spill_dir) {
+      builder.set_disk_mounting_point(0, 1ull << 30, *spill_dir);
+    } else {
+      builder.set_host_pool_features(1ull << 20, 4, 1);
+    }
+    memory = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    sirius::converter_registry::initialize();
+    lifecycle.open_query(query_id);
+    repositories.create_for_query(query_id);
+    if (spill_dir) {
+      auto* host = memory->get_memory_space(Tier::HOST, 0);
+      while (auto reservation = host->make_reservation_or_null(1ull << 20)) {
+        held_host.push_back(std::move(reservation));
+      }
+    }
+    auto* gpu = memory->get_memory_space(Tier::GPU, 0);
+    executor  = std::make_unique<sirius::parallel::downgrade_executor>(
+      lifecycle, std::move(config), repositories, gpu->get_id(), gpu, *memory);
+    executor->start();
+  }
+
+  ~reserve_fixture()
+  {
+    if (executor) { executor->stop(); }
+  }
+
+  std::shared_ptr<cucascade::data_batch> add_batch(uint64_t id)
+  {
+    auto* gpu   = memory->get_memory_space(Tier::GPU, 0);
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            128,
+                                            cudf::mask_state::UNALLOCATED,
+                                            producer,
+                                            gpu->get_default_allocator());
+    REQUIRE(cudaMemsetAsync(
+              column->mutable_view().data<int32_t>(), 0x2a, batch_bytes, producer.value()) ==
+            cudaSuccess);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    auto representation =
+      cucascade::gpu_table_representation::make_written_on(std::move(table), *gpu, producer);
+    producer.synchronize();
+    auto batch      = cucascade::data_batch::make(id, std::move(representation));
+    auto repository = std::make_unique<cucascade::shared_data_repository>();
+    repository->add_data_batch(batch);
+    repositories.get(query_id)->add_new_repository(id, "out", std::move(repository));
+    return batch;
+  }
+};
+
+Tier tier_of(cucascade::data_batch& batch)
+{
+  return batch.to_read_only().get_memory_space()->get_tier();
+}
+
+sirius::exec::downgrade_executor_config make_config(bool prioritize,
+                                                    std::chrono::milliseconds monitor_period)
+{
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "reserve_req"},
+    .monitor_period = monitor_period};
+  config.prioritize_reserve_requests = prioritize;
+  return config;
+}
+
+}  // namespace
+
+TEST_CASE("A waiting reserve request completes as soon as its predicate holds",
+          "[downgrade][reserve_requests]")
+{
+  // The monitor thread runs (and finds no pressure); it is what polls waiting requests while
+  // the processing loop is busy.
+  reserve_fixture f(make_config(true, 5ms));
+  auto first = f.add_batch(1);
+  simple_gate in_progress;
+
+  // A request in progress, stuck in its predicate: it stands for the monitor's long eviction.
+  auto slow = test_access::request_as_monitor(*f.executor, [&] {
+    in_progress.wait();
+    return true;
+  });
+  REQUIRE(in_progress.wait_until_entered());
+
+  std::atomic<bool> memory_available{false};
+  auto waiting = f.executor->request_downgrade([&] { return memory_available.load(); });
+  CHECK(waiting.wait_for(100ms) == std::future_status::timeout);
+  CHECK(f.executor->pending_reserve_requests_for_testing() == 1);
+
+  // Its memory arrives while the other request is still running: it is served at once and
+  // spilled nothing.
+  memory_available.store(true);
+  REQUIRE(waiting.wait_for(5s) == std::future_status::ready);
+  CHECK(waiting.get() == 0);
+  CHECK(slow.wait_for(0ms) == std::future_status::timeout);
+  CHECK(f.executor->pending_reserve_requests_for_testing() == 0);
+  CHECK(tier_of(*first) == Tier::GPU);
+
+  in_progress.open();
+  REQUIRE(slow.wait_for(5s) == std::future_status::ready);
+  slow.get();
+}
+
+TEST_CASE("Reserve requests left unsatisfied are processed before a queued monitor request",
+          "[downgrade][reserve_requests]")
+{
+  bool const prioritize = GENERATE(true, false);
+  // No monitor thread: only the processing loop touches the requests, in its own order.
+  reserve_fixture f(make_config(prioritize, 0ms));
+  auto batch = f.add_batch(1);
+  simple_gate in_progress;
+  // Hold the processing loop on a first request so the next two are both queued behind it.
+  auto holder = test_access::request_as_monitor(*f.executor, [&] {
+    in_progress.wait();
+    return true;
+  });
+  REQUIRE(in_progress.wait_until_entered());
+
+  std::mutex order_mutex;
+  std::vector<std::string> order;
+  auto record = [&](std::string name) {
+    return [&, name] {
+      std::lock_guard lock(order_mutex);
+      if (order.empty() || order.back() != name) { order.push_back(name); }
+      return true;  // satisfied before anything is spilled
+    };
+  };
+  auto monitor = test_access::request_as_monitor(*f.executor, record("monitor"));
+  auto reserve = f.executor->request_downgrade(record("reserve"));
+  in_progress.open();
+  REQUIRE(holder.wait_for(5s) == std::future_status::ready);
+  REQUIRE(monitor.wait_for(5s) == std::future_status::ready);
+  REQUIRE(reserve.wait_for(5s) == std::future_status::ready);
+
+  std::lock_guard lock(order_mutex);
+  REQUIRE(order.size() == 2);
+  CHECK(order.front() == (prioritize ? "reserve" : "monitor"));
+  CHECK(tier_of(*batch) == Tier::GPU);
+}
+
+TEST_CASE("A request stops after repeated non-memory conversion failures and reports them",
+          "[downgrade][reserve_requests][spill_failure]")
+{
+  // The spill directory does not exist: every write to the disk tier fails.
+  auto const missing =
+    (std::filesystem::temp_directory_path() / "sirius_test_missing_spill_dir_exec").string();
+  std::filesystem::remove_all(missing);
+  {
+    auto config                             = make_config(true, 0ms);
+    config.max_consecutive_convert_failures = 3;
+    config.failure_backoff_initial          = 50ms;
+    config.failure_backoff_max              = 200ms;
+    reserve_fixture f(config, missing);
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    for (uint64_t id = 1; id <= 10; ++id) {
+      batches.push_back(f.add_batch(id));
+    }
+    CHECK_FALSE(f.executor->spill_failure().has_value());
+
+    // A waiting task gets the error instead of a count of zero bytes.
+    std::atomic<int> evaluations{0};
+    auto reserve = f.executor->request_downgrade([&] {
+      evaluations.fetch_add(1);
+      return false;
+    });
+    REQUIRE(reserve.wait_for(10s) == std::future_status::ready);
+    try {
+      reserve.get();
+      FAIL("the request reported success");
+    } catch (std::runtime_error const& error) {
+      std::string const message = error.what();
+      CHECK(message.find("spilling from GPU:0 is failing") != std::string::npos);
+      CHECK(message.find("mkstemps") != std::string::npos);
+    }
+    // It gave up after three failures instead of trying all ten batches.
+    CHECK(evaluations.load() <= 5);
+    REQUIRE(f.executor->spill_failure().has_value());
+    CHECK(f.executor->spill_failure()->find("mkstemps") != std::string::npos);
+    for (auto const& batch : batches) {
+      CHECK(tier_of(*batch) == Tier::GPU);
+    }
+
+    // The monitor's request backs off, doubling up to the maximum.
+    for (auto expected : {50ms, 100ms, 200ms, 200ms}) {
+      auto request = test_access::request_as_monitor(*f.executor, [] { return false; });
+      REQUIRE(request.wait_for(10s) == std::future_status::ready);
+      CHECK(request.get() == 0);
+      CHECK(test_access::failure_backoff(*f.executor) == expected);
+    }
+
+    // Once the directory exists spilling works again and the failure state clears.
+    std::filesystem::create_directories(missing);
+    // Every batch is moved: a batch whose conversion failed frees its GPU memory on a stream of
+    // this executor, so none may be left on the GPU when the executor stops.
+    auto retry = f.executor->request_free_memory(batches.size() * batch_bytes);
+    REQUIRE(retry.wait_for(10s) == std::future_status::ready);
+    CHECK(retry.get() == batches.size() * batch_bytes);
+    CHECK_FALSE(f.executor->spill_failure().has_value());
+    for (auto const& batch : batches) {
+      CHECK(tier_of(*batch) == Tier::DISK);
+    }
+  }
+  std::filesystem::remove_all(missing);
 }
