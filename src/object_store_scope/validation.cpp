@@ -81,7 +81,35 @@ std::optional<violation> check_endpoint(const std::string& endpoint)
   return std::nullopt;
 }
 
+// The checks every entry point starts with: endpoint, required fields, selector membership.
+std::optional<violation> check_leading_fields(const settings& value)
+{
+  if (auto refused = check_endpoint(value.endpoint)) { return refused; }
+  if (value.region.empty()) { return refuse("region", reason::required); }
+  if (value.access_key.empty()) { return refuse("access_key", reason::required); }
+  if (value.secret_key.empty()) { return refuse("secret_key", reason::required); }
+  // A value outside the declared set (a C++ cast or a raw bridge representation) is refused
+  // here, before backend support is consulted.
+  if (!is_declared_transport(value.transport)) {
+    return refuse("transport", reason::transport_unknown);
+  }
+  if (!is_declared_signing_mode(value.signing_mode)) {
+    return refuse("signing_mode", reason::signing_mode_unknown);
+  }
+  return std::nullopt;
+}
+
 }  // namespace
+
+bool is_declared_transport(std::uint32_t value) noexcept
+{
+  return value == transport_auto || value == transport_http || value == transport_rdma;
+}
+
+bool is_declared_signing_mode(std::uint32_t value) noexcept
+{
+  return value == signing_presigned || value == signing_header;
+}
 
 // "s3://bucket/" or "s3://bucket/prefix/": scheme s3, a bucket, a trailing slash, no query. The
 // same rule admits a scope key to publication (put/set) and to removal (drop). A prefix no key
@@ -114,19 +142,7 @@ std::optional<violation> check_uri_prefix(std::string_view uri_prefix)
 
 std::optional<violation> check_settings(const settings& value, const capabilities& backend)
 {
-  if (auto refused = check_endpoint(value.endpoint)) { return refused; }
-  if (value.region.empty()) { return refuse("region", reason::required); }
-  if (value.access_key.empty()) { return refuse("access_key", reason::required); }
-  if (value.secret_key.empty()) { return refuse("secret_key", reason::required); }
-  // A value outside the declared set (a C++ cast or a raw bridge representation) is refused
-  // here, before backend support is consulted.
-  if (value.transport != transport_auto && value.transport != transport_http &&
-      value.transport != transport_rdma) {
-    return refuse("transport", reason::transport_unknown);
-  }
-  if (value.signing_mode != signing_presigned && value.signing_mode != signing_header) {
-    return refuse("signing_mode", reason::signing_mode_unknown);
-  }
+  if (auto refused = check_leading_fields(value)) { return refused; }
   if (!value.ca_bundle_path.empty()) {
     // ifstream opens a directory on Linux; require a regular file before the readability probe.
     std::error_code ec;
@@ -147,6 +163,12 @@ std::optional<violation> check_settings(const settings& value, const capabilitie
     return refuse("ca_bundle_path", reason::ca_bundle_unsupported);
   }
   return std::nullopt;
+}
+
+std::optional<violation> check_settings_intrinsic(const settings& value)
+{
+  if (auto refused = check_leading_fields(value)) { return refused; }
+  return check_uri_prefix(value.uri_prefix);
 }
 
 std::string describe(const violation& refused, const capabilities& backend)

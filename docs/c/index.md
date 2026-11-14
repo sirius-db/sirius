@@ -7,6 +7,7 @@ The public C API provides a C ABI for embedding Sirius. Include the headers unde
 
 - `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
 - `<sirius-c/context/config_builder.h>` builds immutable context configurations.
+- `<sirius-c/object_store/config_builder.h>` builds immutable object-store configurations.
 - `<sirius-c/context/context.h>` creates and owns an engine context.
 - `<sirius-c/error.h>` defines fixed-width status codes and owned diagnostics.
 - `<sirius-c/version.h>` declares the library's ABI revision.
@@ -57,6 +58,43 @@ Use sirius_context_config_builder_from_yaml() to load the
 [YAML configuration schema](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md).
 The file is read once; builders and built configurations retain its settings independently.
 Hardware availability and capacity are checked when initializing an engine.
+
+## Object-store configuration
+
+Describe an S3-compatible object store without contacting it: an endpoint, a region,
+credentials, a transport, a signing mode, a CA bundle path and the URI prefix the settings
+apply to. Builders are immutable. Each `with` function returns a new builder with one field
+replaced; release the input once the result replaces it:
+
+```c
+#include <sirius-c/object_store/config_builder.h>
+#include <string.h>
+
+static sirius_status set_region(sirius_object_store_config_builder **builder,
+                                const char *region)
+{
+    sirius_object_store_config_builder *next = NULL;
+    sirius_status status = sirius_object_store_config_builder_with_region(
+        *builder, region, strlen(region), &next, NULL);
+    if (status == SIRIUS_SUCCESS) {
+        sirius_object_store_config_builder_release(*builder);
+        *builder = next;
+    }
+    return status;
+}
+```
+
+Text fields are byte ranges: they are copied as given and need no terminator.
+sirius_object_store_config_builder_build() checks the endpoint, the region, the keys and the
+URI prefix, and returns SIRIUS_INVALID_CONFIGURATION for the first one it refuses. It reads no
+file and consults no I/O backend: the CA bundle path is not opened, and every declared
+transport and signing mode is accepted. Diagnostics never contain a field's value; a
+diagnostic for SIRIUS_INVALID_CONFIGURATION names the field and the reason. No function
+returns a field. See the
+[complete C example](https://github.com/sirius-db/sirius/blob/main/test/cmake/installed_consumer/object_store.c).
+
+An engine context does not accept these configurations yet; registration is a separate
+addition.
 
 ## Engine context
 
