@@ -1,6 +1,7 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #pragma once
 #include "exec/cuda_event_completion_poll.hpp"
+#include "op/scan/arrow/arrow_input_profile.hpp"
 #include "op/scan/materialization_contract.hpp"
 
 #include <duckdb/common/arrow/arrow.hpp>
@@ -18,18 +19,16 @@ namespace sirius::op::scan {
 // Trusted readable lengths, keyed by the exact metadata buffer in the schema tree.
 using arrow_metadata_lengths = std::unordered_map<char const*, std::size_t>;
 
-// Ownership of the entire schema/array tree is transferred here. The producer must
-// detach any statement-affine release callbacks before publication. Capacity retains
-// the producer's input/staging reservation until the last asynchronous input read.
+// Owns the C Data tree and capacity through readiness and the final async read.
+// Release callbacks must be thread-neutral. See scan.md#arrow-input-contract.
 class owned_arrow_batch {
  public:
-  // Every non-null metadata pointer requires its own trusted byte length.
-  // Arrow C Data itself carries no metadata lengths.
   owned_arrow_batch(ArrowSchema& schema,
                     ArrowArray& array,
                     std::shared_ptr<void> capacity,
                     std::pmr::memory_resource& staging_resource,
-                    arrow_metadata_lengths metadata_lengths = {});
+                    arrow_metadata_lengths metadata_lengths            = {},
+                    std::shared_ptr<arrow_source_profile const> source = {});
   ~owned_arrow_batch();
   owned_arrow_batch(owned_arrow_batch const&)            = delete;
   owned_arrow_batch& operator=(owned_arrow_batch const&) = delete;
@@ -38,6 +37,11 @@ class owned_arrow_batch {
   std::vector<cudf::data_type> input_types() const;
   void validate_for(materialization_program const&) const;
   std::size_t estimated_device_bytes() const;
+  arrow_input_estimate estimate() const;
+  arrow_source_profile const* source_profile() const noexcept { return source.get(); }
+  // Called before publication; keeps admitted staging and the engine claim alive.
+  void bind_staging(std::shared_ptr<void>, std::pmr::memory_resource&);
+  void bind_credit(std::shared_ptr<void> credit);
 
  private:
   friend materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
@@ -46,26 +50,32 @@ class owned_arrow_batch {
                                               rmm::device_async_resource_ref);
   ArrowSchema schema{};
   ArrowArray array{};
+  // Destroyed last, after root callbacks, leases, staging and backing owners.
+  std::shared_ptr<void> credit;
+  std::shared_ptr<void> staging_owner;
   std::shared_ptr<void> capacity;
-  // The producer's capacity owner must keep this resource alive through retirement.
-  // It must support allocation here and deallocation on the lane's host drainer.
-  std::pmr::memory_resource& staging_resource;
+  // Capacity keeps the PMR alive, including deallocation on the host drainer.
+  std::pmr::memory_resource* staging_resource;
   arrow_metadata_lengths metadata_lengths;
+  std::shared_ptr<arrow_source_profile const> source;
 };
+
+// Metadata and declared extents only: never dereferences device/pending payloads.
+arrow_input_estimate validate_arrow_source(ArrowSchema const&,
+                                           ArrowArray const&,
+                                           arrow_source_profile const&,
+                                           arrow_bound_schema const&,
+                                           arrow_metadata_lengths const& = {});
+void validate_arrow_binding(arrow_bound_schema const&, materialization_program const&);
 
 std::vector<cudf::data_type> validate_arrow_host_flat(
   ArrowSchema const&, ArrowArray const&, arrow_metadata_lengths const& metadata_lengths = {});
 // Conservative PMR storage for a validated flat input, including allocation alignment.
 std::size_t arrow_import_staging_bytes(ArrowArray const&, std::span<cudf::data_type const>);
-// The caller owns/drains the completion lane and its stream for the entire attempt.
-// Output device reservations are the same task reservation used for Parquet decode.
-// Producer buffers must be readable to their declared Arrow extents. All host
-// normalization uses the input's staging resource and stays retained on the lane.
-// Neither return nor an exception establishes full-attempt completion. Keep the
-// output MR/backing reservation alive through output destruction and a subsequent
-// lane.quiesce(), even if lane.idle(): commit recovery can precede queued output
-// frees during unwinding. drain()/input retirement alone is not that barrier and
-// does not authorize replay. Failed quiescence retains unconfirmed input ownership.
+// The caller keeps the lane, stream and output MR/backing alive through output
+// destruction and a subsequent lane.quiesce(), even if idle(): commit recovery can
+// precede output frees during unwinding. drain() alone does not authorize replay;
+// failed quiescence retains unconfirmed ownership.
 materialized_batch import_arrow_host(std::shared_ptr<owned_arrow_batch>,
                                      materialization_program const&,
                                      exec::retire_lane&,
@@ -97,9 +107,7 @@ struct arrow_stream_result {
 
 using arrow_batch_sink = std::function<void(materialized_batch&&)>;
 
-// Sequentially verifies and materializes a bounded source of owned Arrow batches.
-// The source owns cursor progress and backpressure; this function never creates an
-// unbounded queue and treats std::nullopt as EOS (a zero-row batch remains data).
+// Sequential bounded verification; only nullopt means EOS, not a zero-row batch.
 arrow_stream_result materialize_arrow_stream(arrow_batch_source&,
                                              materialization_program const&,
                                              exec::retire_lane&,
