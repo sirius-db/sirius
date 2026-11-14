@@ -138,6 +138,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_nested_loop_join_batches.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_order_by_coalesce.cpp
     test/cpp/integration/test_gpu_execution_order_by_windowed.cpp
     test/cpp/integration/test_gpu_execution_order_by_key_encoding.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp

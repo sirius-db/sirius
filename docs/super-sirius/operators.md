@@ -452,9 +452,10 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 ### `sirius_physical_order` — `ORDER_BY`
 **File:** `src/op/sirius_physical_order.hpp`
 
-Local sort of each data batch.
+Local sort: turns its input into sorted runs for SORT_SAMPLE, SORT_PARTITION and MERGE_SORT.
 
-- **GPU execution:** `gpu_order_impl::local_order_by()`: a row order, then one `cudf::gather()`.
+- **GPU execution:** `gpu_order_impl::local_order_by()` per sort unit: a row order, then one
+  `cudf::gather()`.
 - **Row order:** `cudf::sorted_order()` for a single fixed-width key (cuDF radix-sorts it). String
   keys and multi-column keys use `order::encoded_sorted_order()`
   (`src/op/order/encoded_sort_order.hpp`) when `sort_key_encoding` is true (the default):
@@ -471,6 +472,48 @@ Local sort of each data batch.
     fixed-width and STRING, strings longer than 256 bytes, and when its working memory (up to
     about 40 bytes per row) cannot be allocated.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
+
+It has two modes, chosen by the planner (`order_by_run_limits()` in `wrap_order_by()`):
+
+| Mode | Plan | Sort unit |
+|------|------|-----------|
+| per batch (`sort_coalesce_runs = false`, a string sort key with `sort_coalesce_string_keys = false`, a nested column, or an operator built outside the planner) | `… → SORT_SAMPLE → ORDER_BY → input`; ORDER_BY is the sink of its input's pipeline | Each input batch of a task |
+| coalescing (default) | `… → SORT_SAMPLE → ORDER_BY → PASSTHROUGH_SINK → input`; ORDER_BY starts its own pipeline and reads the input's batches from a port (PARTIAL barrier) | A group of parked batches of up to `sort_coalesce_memory_fraction × GPU limit / executor threads` bytes, concatenated |
+
+Why coalesce: SORT_PARTITION cuts every sorted run by range, so each partition holds one run per
+sort unit, however small the partition. MERGE_SORT reads at most `sort_merge_max_fan_in` runs per
+task and rewrites a partition once for every extra factor of the fan-in in its run count, while
+the sort itself costs the same per row at any run size for fixed-width keys. Coalescing changes
+which rows share a run; it changes neither the rows nor how a unit is sorted.
+
+Coalescing mode:
+
+- **Group planning** (`plan_next_run()`, used by both `get_next_task_hint()` and
+  `get_next_task_input_data()` under the operator mutex). Parked batches are grouped per GPU
+  device, so a run is built from batches already on the GPU that will sort it; batches that are
+  not on a GPU (spilled, or being moved) form one more group. A group is complete when the next
+  batch of its device would take it past the byte limit or 2^31 - 1 rows, or when it reaches the
+  byte limit; a batch larger than the limit is a group of one. With a string column in the
+  schema a group also stays below 2^31 decoded bytes, which bounds every string column. Until a
+  group is complete the hint is WAITING on the producer. When the producer has finished, the
+  remainder is packed in repository order regardless of device.
+- **Task.** The input is a plain `pipelineable_operator_data`: the task creator places it by data
+  locality and `prepare_for_processing()` brings spilled batches back to the GPU. `execute()`
+  splits the task's batches into sort units again from the real tables (row count, bytes of each
+  string column, same memory space, same cuDF column types), so the cuDF limits hold whatever
+  the batch metadata said. A unit of one batch is sorted directly; a larger unit is concatenated
+  (`gpu_merge_impl::concat()`), sorted, and the concatenation is freed.
+- **Memory.** A coalesced task holds its input batches, their concatenation, the sort's scratch
+  and the sorted copy. The first task of the pipeline reserves three times its input
+  (`no_history_peak_memory_estimate()`); later tasks use the pipeline's memory history. An
+  out-of-memory error is retried by the executor like any other task's.
+- **Counters and log.** `counters()` / `process_counters()` (`order_by_counters`) count tasks,
+  input batches, runs and concatenated bytes. When its pipeline finishes the operator logs one
+  line at INFO:
+
+```
+[order_by][stats] op=<id> coalesce=<0|1> max_run_bytes=… tasks=… batches_in=… runs_out=… concat_bytes=…
+```
 
 ### `sirius_physical_top_n` — `TOP_N`
 **File:** `src/op/sirius_physical_top_n.hpp`

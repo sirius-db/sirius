@@ -410,6 +410,13 @@ TEST_CASE_METHOD(merge_fusion_fixture,
   // Total-input sinks can accept fusion because they already buffer their input.
   SECTION("ORDER BY after GROUP BY fuses MERGE_GROUP_BY into ORDER_BY")
   {
+    // The per-batch local sort: ORDER_BY is the sink of its input's pipeline. With run
+    // coalescing a PASSTHROUGH_SINK takes that place; see the next section.
+    con->Query("SET sort_coalesce_runs = false;");
+    struct reset_coalescing {
+      duckdb::Connection& con;
+      ~reset_coalescing() { con.Query("RESET sort_coalesce_runs;"); }
+    } reset{*con};
     sirius::test::with_initialized_engine(
       *con,
       "SELECT n_regionkey, count(*) AS c FROM nation GROUP BY n_regionkey ORDER BY c DESC",
@@ -437,6 +444,34 @@ TEST_CASE_METHOD(merge_fusion_fixture,
 
         // Global sort chain stays above the local ORDER_BY pipeline.
         CHECK(merge != merge_sort);
+      });
+  }
+
+  SECTION("ORDER BY with run coalescing fuses MERGE_GROUP_BY into the PASSTHROUGH_SINK below it")
+  {
+    sirius::test::with_initialized_engine(
+      *con,
+      "SELECT n_regionkey, count(*) AS c FROM nation GROUP BY n_regionkey ORDER BY c DESC",
+      [&](sirius::sirius_engine& engine) {
+        INFO(dump_pipeline_shapes(engine.new_scheduled));
+
+        const auto* merge =
+          pipeline_containing(engine.new_scheduled, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+        const auto* order =
+          pipeline_containing(engine.new_scheduled, SiriusPhysicalOperatorType::ORDER_BY);
+
+        REQUIRE(merge != nullptr);
+        REQUIRE(order != nullptr);
+
+        // The merge still fuses into the sink that consumes it, which now feeds ORDER_BY's port.
+        REQUIRE(merge->get_sink());
+        CHECK(merge->get_sink()->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+        // ORDER_BY starts its own pipeline, so one task can claim several of the merge's batches.
+        CHECK(merge != order);
+        REQUIRE(order->get_source());
+        CHECK(order->get_source()->type == SiriusPhysicalOperatorType::ORDER_BY);
+        REQUIRE(order->get_sink());
+        CHECK(order->get_sink()->type == SiriusPhysicalOperatorType::ORDER_BY);
       });
   }
 

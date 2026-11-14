@@ -471,6 +471,13 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error("'operator_params.sort_merge_max_fan_in': must be at least 2");
   }
   r.optional("sort_key_encoding", opt.sort_key_encoding);
+  r.optional("sort_coalesce_runs", opt.sort_coalesce_runs);
+  r.optional("sort_coalesce_memory_fraction", opt.sort_coalesce_memory_fraction);
+  // Written so that NaN is rejected too.
+  if (!(opt.sort_coalesce_memory_fraction > 0.0 && opt.sort_coalesce_memory_fraction <= 1.0)) {
+    throw std::runtime_error("'operator_params.sort_coalesce_memory_fraction': must be in (0, 1]");
+  }
+  r.optional("sort_coalesce_string_keys", opt.sort_coalesce_string_keys);
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   if (opt.hash_partition_bytes == 0) {
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");

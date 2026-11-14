@@ -173,6 +173,17 @@ CONCAT flag after its first successful claim throws, since already emitted parti
 be combined retroactively. Normal producer completion and task retirement govern readiness;
 there is no separate repository completion protocol.
 
+### ORDER_BY (coalescing mode)
+
+| Method | Behavior |
+|--------|----------|
+| `get_next_task_hint()` | If the producer finished: READY if batches remain. Otherwise READY when `plan_next_run()` finds a complete group among the parked batches, else WAITING on the producer. |
+| `get_next_task_input_data()` | Claims the next group under the same policy as the hint and returns it as `pipelineable_operator_data`. After the producer finished, the remainder is packed into groups in repository order. |
+| Why custom | One task sorts a group of input batches as a single run; see [Operators](operators.md#sirius_physical_order--order_by) |
+
+In per-batch mode (`sort_coalesce_runs = false`) ORDER_BY has no input port and uses the base
+class.
+
 ### SORT_SAMPLE
 
 | Method | Behavior |
@@ -221,6 +232,7 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 | HASH_JOIN (STANDARD) | Base class | Cartesian product walk | Multi-partition iteration |
 | PARTITION | Resolves the bound input policy, then checks port readiness | Resolves once before claiming | Shared exchange layout |
 | CONCAT | Byte-threshold check | Accumulate until threshold | Batching + blocking mode |
+| ORDER_BY (coalescing) | Group-complete check | Claim one group of batches | One sorted run per group |
 | SORT_SAMPLE | Wait for N batches | Base class | Two-phase sampling |
 | MERGE_SORT | Base class, READY only while a partition has runs and no task in flight | Drain all from one partition (one-shot) or one cursor-based task per partition at a time (windowed) | Per-partition merge; windowed continuation tasks |
 | GROUPED_AGGREGATE_MERGE | Base class | Drain all from one partition | Per-partition merge |

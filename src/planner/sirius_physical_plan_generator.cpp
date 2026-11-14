@@ -1510,8 +1510,56 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
+//! The limits of one coalesced ORDER_BY run, or nullopt when the local sort should stay per batch:
+//! the setting is off, there is no engine context to size a run from, a column is nested (only
+//! fixed-width and string columns are concatenated), a sort key is not a plain column, or a sort
+//! key is a string and `sort_coalesce_string_keys` is off.
+std::optional<sirius::op::sort_run_limits> order_by_run_limits(
+  sirius::op::sirius_physical_order const& order,
+  duckdb::vector<sirius::logical_type> const& input_types,
+  const sirius::operator_params& op_params,
+  duckdb::SiriusContext* sirius_ctx)
+{
+  if (!op_params.sort_coalesce_runs || sirius_ctx == nullptr || !sirius_ctx->is_initialized()) {
+    return std::nullopt;
+  }
+  for (auto const& type : input_types) {
+    if (!type.is_fixed_width() && !type.is_varchar()) { return std::nullopt; }
+  }
+  for (auto const& key : order.orders) {
+    if (key.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+      return std::nullopt;
+    }
+    auto const index = key.expression->Cast<duckdb::BoundReferenceExpression>().Index();
+    if (index >= input_types.size()) { return std::nullopt; }
+    if (input_types[index].is_varchar() && !op_params.sort_coalesce_string_keys) {
+      return std::nullopt;
+    }
+  }
+  // A task may land on any GPU: size a run for the smallest one.
+  std::size_t gpu_bytes = 0;
+  for (auto const* space : sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(
+         cucascade::memory::Tier::GPU)) {
+    if (gpu_bytes == 0 || space->get_max_memory() < gpu_bytes) {
+      gpu_bytes = space->get_max_memory();
+    }
+  }
+  auto const threads = static_cast<std::size_t>(
+    std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+  auto const run_bytes = static_cast<std::size_t>(static_cast<double>(gpu_bytes) *
+                                                  op_params.sort_coalesce_memory_fraction) /
+                         threads;
+  if (run_bytes == 0) { return std::nullopt; }
+  sirius::op::sort_run_limits limits;
+  limits.max_run_bytes = run_bytes;
+  return limits;
+}
+
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
-//! original_input`. Destructive: ORDER_BY's
+//! original_input`. When runs are coalesced (see `order_by_run_limits`) the input is terminated
+//! with a PASSTHROUGH_SINK, `… → ORDER_BY → PASSTHROUGH_SINK → original_input`: ORDER_BY then
+//! starts its own pipeline and reads its producer's batches from a port, which is what lets one
+//! sort task claim several of them. Destructive: ORDER_BY's
 //! `projections`/`types` are overwritten with the identity over the input's types so every
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
@@ -1537,6 +1585,19 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     }
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
+
+    if (auto const limits = order_by_run_limits(*order_ptr, child_types, op_params, sirius_ctx)) {
+      order_ptr->enable_run_coalescing(*limits);
+      wrap_child(*order_ptr, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
+        auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+          child->types, child->estimated_cardinality, "default");
+        if (child->has_physical_overrides()) {
+          sink->set_physical_types(child->get_physical_types());
+        }
+        sink->children.push_back(std::move(child));
+        return sink;
+      });
+    }
 
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,

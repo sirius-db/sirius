@@ -73,8 +73,10 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
     // The smallest window and output chunk the settings accept: many rounds and many tasks.
     set("sort_merge_window_rows", "1024");
     set("sort_merge_output_bytes", "1048576");
-    // Small scan batches: each one becomes a sorted run, so a partition merges many runs.
+    // Small scan batches: each one becomes a sorted run, so a partition merges many runs. Run
+    // coalescing would sort these small tables as a single run and leave the merge nothing to do.
     set("scan_task_batch_size", "2097152");
+    set("sort_coalesce_runs", "false");
     set("sort_merge_mode", "windowed");
     // More than any case's runs per partition, so a case merges in one pass unless it lowers
     // the cap itself (the checks below require zero intermediate tasks otherwise).

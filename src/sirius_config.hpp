@@ -81,6 +81,17 @@ constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  /
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
+/// Default for sort_coalesce_memory_fraction: the share of one GPU's memory that the inputs of the
+/// local sorts running at the same time may add up to. One sorted run is at most this fraction
+/// of the GPU's memory divided by the number of GPU executor threads.
+///
+/// Why 0.25: a coalesced sort task holds its input batches, their concatenation, the sort's
+/// scratch and the sorted copy, about 3.3 times the run. With four executor threads a run is
+/// 1/16 of the GPU and the four sorts together stay near 80% of it at their peak only while every
+/// thread sorts a full run; runs of 5% of the GPU limit sorted without an out-of-memory retry
+/// and runs of 10% did not.
+inline constexpr double DEFAULT_SORT_COALESCE_MEMORY_FRACTION = 0.25;
+
 /// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
 /// more runs is merged in passes.
 ///
@@ -245,6 +256,19 @@ struct operator_params {
   /// Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix
   /// sorts over an encoding of the keys (SET sort_key_encoding) instead of cuDF's comparison sort.
   bool sort_key_encoding = true;
+
+  /// Whether ORDER BY sorts groups of input batches as one run each, so a range partition
+  /// receives few large runs instead of one per input batch (SET sort_coalesce_runs).
+  bool sort_coalesce_runs = true;
+
+  /// Share of one GPU's memory for the inputs of concurrently running local sorts; one run is at
+  /// most this fraction of the GPU divided by the GPU executor thread count.
+  double sort_coalesce_memory_fraction = config::DEFAULT_SORT_COALESCE_MEMORY_FRACTION;
+
+  /// Whether runs are also coalesced when a sort key is a string. Without sort_key_encoding, cuDF sorts string keys with a
+  /// comparison sort whose cost per row grows with the run size, but a run that holds a string
+  /// column is kept below 2^31 bytes, and at that size the saved merge passes outweigh it.
+  bool sort_coalesce_string_keys = true;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;

@@ -2770,6 +2770,35 @@ static void SetSortKeyEncoding(ClientContext& context, SetScope scope, Value& pa
   SIRIUS_LOG_DEBUG("Updated config sort_key_encoding to {}", params->sort_key_encoding);
 }
 
+static void SetSortCoalesceRuns(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params               = get_operator_params(context, scope);
+  params->sort_coalesce_runs = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_runs to {}", params->sort_coalesce_runs);
+}
+
+static void SetSortCoalesceMemoryFraction(ClientContext& context, SetScope scope, Value& parameter)
+{
+  const double fraction = parameter.GetValue<double>();
+  // Written so that NaN is rejected too.
+  if (!(fraction > 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException("sort_coalesce_memory_fraction must be in (0, 1], got %f",
+                                fraction);
+  }
+  auto* params                          = get_operator_params(context, scope);
+  params->sort_coalesce_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_memory_fraction to {}",
+                   params->sort_coalesce_memory_fraction);
+}
+
+static void SetSortCoalesceStringKeys(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->sort_coalesce_string_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_string_keys to {}",
+                   params->sort_coalesce_string_keys);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3615,6 +3644,26 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.sort_key_encoding),
     SetSortKeyEncoding);
+  config.AddExtensionOption(
+    "sort_coalesce_runs",
+    "Sort groups of input batches as one run each in ORDER BY, so each range partition receives "
+    "few large sorted runs instead of one per input batch",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_coalesce_runs),
+    SetSortCoalesceRuns);
+  config.AddExtensionOption(
+    "sort_coalesce_memory_fraction",
+    "Share of one GPU's memory for the inputs of concurrently running local sorts: one coalesced "
+    "run is at most this fraction of the GPU divided by the GPU executor thread count (in (0, 1])",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.sort_coalesce_memory_fraction),
+    SetSortCoalesceMemoryFraction);
+  config.AddExtensionOption(
+    "sort_coalesce_string_keys",
+    "Coalesce ORDER BY runs also when a sort key is a string",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_coalesce_string_keys),
+    SetSortCoalesceStringKeys);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",
