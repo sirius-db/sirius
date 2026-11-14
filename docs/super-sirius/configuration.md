@@ -179,8 +179,20 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+
+Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
+The default is adopted lazily on first conversion and shared process-wide through a weak
+cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uring**, then
+**cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
+private staging and reactor teardown; see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+
+The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
+layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
+settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
+reactor counts and cache settings configure independent scan contexts, not this spill
+default. The removed kvikIO backend is not available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -207,7 +219,9 @@ With spill compression on, a GPU batch the downgrade executor moves to the host 
 stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
 from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
 involved. A batch that does not qualify, saves too little, or fails to encode spills
-uncompressed.
+uncompressed. Compressed DISK spills use the same per-space ioctx as raw spills, with
+unchanged `.hpln` layout. This I/O transport change does not change the settings below or
+the process-wide SQL `spill_compression` semantics.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
@@ -285,7 +299,10 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
-| `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
+| `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
+
+These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
+independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
 
 ```yaml
 sirius:
@@ -337,8 +354,8 @@ Thread pool (default `num_threads: 1`) plus:
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
 
-HOST downgrade executors synchronously reclaim idle staging chunks from the default local
-ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+HOST downgrade executors synchronously reclaim idle staging chunks from the scan manager's
+default local ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them. That
 includes the chunks of a `pin_table(..., tier => 'parquet')` pin, whatever the eviction settings:
@@ -355,12 +372,12 @@ reservation, it backs off like any other non-viable executor. If the cache holds
 monitor request frees nothing (every chunk above the reservation is pinned by a reader or still
 loading), the monitor waits before its next request: the wait starts at `monitor_period` and
 doubles up to `max(monitor_period, 1 s)`. It resets as soon as a request frees memory or the
-pressure clears. GPU executors and routed remote ioctx caches do not participate. This adds no
-configuration keys.
+pressure clears. GPU executors, independent DISK spill contexts and routed remote ioctx caches
+do not participate. This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `cufile/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
@@ -368,15 +385,20 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
+| `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. cuFile is single-GPU only: a multi-GPU configuration forces `native` with a warning. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
+| `cufile_n_reactors` | int (**> 0**) | 4 | Number of cuFile reactors for local reads, each with one worker thread. Single-GPU only. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
-sub-config below.
+sub-config below. cuFile cannot use `fs_cache` for scan readahead.
+Neither `cache.mode: cucs` nor an explicit positive `max_readahead_scans`
+creates a readahead manager without an eligible advertised backend. This also
+excludes empty queries, cuFile-only queries and requested pinned caches that failed to build.
+The readahead policies below apply only to eligible backends; routed REST reads retain their own policy.
 
 `max_readahead_scans` has three states:
 
@@ -384,7 +406,7 @@ sub-config below.
 |-------|--------|
 | unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
-| `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
+| `n > 0` | An eligible advertised backend runs readahead with a budget of `n`, whatever the cache mode. |
 
 `readahead_strategy` works the same way, deferring to the backend rather than to the cache:
 
@@ -404,7 +426,7 @@ A runtime budget additionally accounts for every backend touched by each split a
 queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
 routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
-Five optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
+Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
 ### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
@@ -605,6 +627,78 @@ sirius:
           recv_placement: automatic
 ```
 
+### `scan_manager.cufile` — local cuFile reads (`io/cufile/config.hpp`)
+
+Select cuFile with the existing `backend` key. The default remains `native`.
+This backend reads local regular files only; `s3://` reads, listing and globs still use
+native REST. The existing multi-GPU guard forces `backend: native` with a warning
+when more than one GPU is configured; this does not add multi-GPU cuFile placement.
+
+```yaml
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    scan_manager:
+      backend: cufile
+      cufile_n_reactors: 4
+      cache: { mode: none }
+      cufile:
+        max_inflight: 32
+        max_op_bytes: 64MiB
+        gds_threshold: 256KiB
+        use_odirect: true
+        compat_mode: auto
+        poll_interval_us: 200
+        low_service_interval: 4
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_inflight` | int (**> 0**) | 32 | Per-reactor bound on asynchronous items awaiting CUDA events (stream gates and fallback H2D copies), not concurrent `cuFileRead` calls. |
+| `max_op_bytes` | bytes (**>= 4KiB**) | 64MiB | Largest synchronous `cuFileRead` issued by a worker; larger device reads are chunked. |
+| `gds_threshold` | bytes | 256KiB | Device reads below this size use POSIX reads and pinned H2D staging rather than cuFile. `0` is legal. |
+| `use_odirect` | bool | true | Open the direct-I/O descriptor needed for cuFile. `false` skips cuFile registration and uses buffered POSIX reads; it conflicts with `compat_mode: off`. Independent of `cache.mode`. |
+| `compat_mode` | enum: `auto`, `on`, `off` | `auto` | Per-file policy: `auto` tries cuFile and permits POSIX fallback, `on` forces POSIX, `off` requires a usable cuFile handle and fails the open rather than falling back if it cannot be registered. Values are lowercase. |
+| `poll_interval_us` | int (**>= 0**, µs) | 200 | Idle polling interval while fallback CUDA copies await completion; not a delay before dispatching ready work. |
+| `low_service_interval` | int (**>= 0**) | 4 | High-priority requests started while low work is waiting before granting the low tier a turn. `0` restores strict priority. |
+
+cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
+or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor
+`readahead_strategy` enables it. These are read-only settings; no write or
+per-transfer buffer-registration controls are exposed.
+`cufile.n_max_concurrent_scans` is intentionally not a YAML setting: cuFile cannot
+publish a usable cache/readahead budget. Tune read concurrency with
+`cufile_n_reactors` and `cufile.max_inflight` instead.
+
+**Capability and fallback.** cuFile availability depends on the runtime library, GPU,
+filesystem/mount, storage stack, alignment and cuFile configuration. A per-path
+capability report combines that evidence with direct-open/handle-registration results;
+`direct_candidate` is advisory, **not proof of direct DMA**. Unknown evidence is not
+proof of unsupported storage. Successful registration (including `compat_mode: off`)
+does not prove that cuFile itself avoided compatibility mode. With `auto`, reads can
+remain correct through host/POSIX fallback on a compatibility-only host, including a
+host without `nvidia-fs`; conversely, absence of `nvidia-fs` alone does not rule out
+supported P2PDMA. Small reads and unaligned tails can use host staging. An explicit
+cuFile context initialization failure is reported, not silently rerouted to another backend.
+
+**cuFile logging.** `libcufile` can create `cufile.log` in the working directory.
+Configure its `logging.level` and `logging.dir` in a cuFile JSON file, selected with
+`CUFILE_ENV_PATH_JSON` **before starting the process / first cuFile initialization**
+(otherwise cuFile uses `/etc/cufile.json` and its defaults). For example, save this as
+`/absolute/path/to/cufile.json`:
+
+```json
+{"logging": {"level": "ERROR", "dir": "/tmp"}}
+```
+
+```bash
+export CUFILE_ENV_PATH_JSON=/absolute/path/to/cufile.json
+```
+
+Use a more verbose level such as `TRACE` only when diagnosing transfer mode; verbose
+logging can affect performance. This is cuFile configuration, not a Sirius YAML setting.
+
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
 Everything about read-path caching lives in this one block — rather than a mode on the
@@ -626,9 +720,12 @@ sirius:
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
-`mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
-through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
-pinned prefetching cache (`fs_cache`).
+For the native local backend, `mode: none` bypasses every cache (`O_DIRECT`, no
+prefetching cache), `mode: os` reads through the kernel page cache, and `mode: cucs`
+reads `O_DIRECT` into cuCascade's pinned prefetching cache (`fs_cache`). REST can also
+use `fs_cache` under `cucs`. cuFile never attaches `fs_cache` or runs scan
+readahead, regardless of this mode; cuFile's direct-open policy is set by
+`cufile.use_odirect`, not derived from the cache mode.
 
 Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
 file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
@@ -645,7 +742,7 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | Derived setting | Derived from |
 |-----------------|--------------|
 | `uring.use_odirect` | `mode` — true for everything but `os` |
-| whether the prefetching cache is armed | `mode` — only under `cucs` |
+| whether the prefetching cache is armed | `mode` — only under `cucs`, and only for a backend that supports `fs_cache` (not cuFile) |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
@@ -910,7 +1007,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`, `cufile_n_reactors`) |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
