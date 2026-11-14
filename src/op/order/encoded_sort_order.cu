@@ -19,7 +19,6 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/bit.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -49,6 +48,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -82,11 +82,11 @@ enum class field_kind : std::uint8_t {
 /// One bit field of the encoded key: an unsigned value of `bits` bits whose order over the rows
 /// is the order of (a part of) one key column. Trivially copyable; used on the device.
 struct field {
-  const void* data{nullptr};  ///< element 0 of the column's values (strings: of its offsets)
-  const char* chars{nullptr};                ///< strings: the character buffer
-  const cudf::bitmask_type* mask{nullptr};   ///< nullptr when the column has no nulls
-  std::uint64_t base{0};  ///< ascending: the column minimum; descending: its maximum
-  std::int64_t chunk{0};  ///< str_chunk: byte offset of the chunk inside the string
+  const void* data{nullptr};   ///< element 0 of the column's values (strings: of its offsets)
+  const char* chars{nullptr};  ///< strings: the character buffer
+  const cudf::bitmask_type* mask{nullptr};  ///< nullptr when the column has no nulls
+  std::uint64_t base{0};           ///< ascending: the column minimum; descending: its maximum
+  std::int64_t chunk{0};           ///< str_chunk: byte offset of the chunk inside the string
   cudf::size_type mask_offset{0};  ///< bit of row 0 in `mask`
   field_kind kind{field_kind::i64};
   std::uint8_t bits{0};   ///< width of the field; inside a word: of the part the word holds
@@ -155,9 +155,9 @@ __device__ inline std::uint64_t ascending_key(field const& f, cudf::size_type ro
       const std::int64_t begin = string_begin(f, row);
       const std::int64_t rest  = string_begin(f, row + 1) - begin - f.chunk;
       if (rest <= 0) { return 0; }
-      const auto* p = reinterpret_cast<const unsigned char*>(f.chars) + begin + f.chunk;
-      const int count  = rest < 8 ? static_cast<int>(rest) : 8;
-      std::uint64_t w  = 0;
+      const auto* p   = reinterpret_cast<const unsigned char*>(f.chars) + begin + f.chunk;
+      const int count = rest < 8 ? static_cast<int>(rest) : 8;
+      std::uint64_t w = 0;
       for (int i = 0; i < count; ++i) {
         w |= static_cast<std::uint64_t>(p[i]) << (56 - 8 * i);
       }
@@ -317,15 +317,10 @@ void radix_sort_pairs(rmm::device_uvector<K>& keys,
                nullptr, temp_bytes, key_buffers, value_buffers, count, 0, end_bit, stream.value()),
              "radix sort sizing");
   rmm::device_buffer temp(temp_bytes, stream, mr);
-  check_cuda(cub::DeviceRadixSort::SortPairs(temp.data(),
-                                             temp_bytes,
-                                             key_buffers,
-                                             value_buffers,
-                                             count,
-                                             0,
-                                             end_bit,
-                                             stream.value()),
-             "radix sort");
+  check_cuda(
+    cub::DeviceRadixSort::SortPairs(
+      temp.data(), temp_bytes, key_buffers, value_buffers, count, 0, end_bit, stream.value()),
+    "radix sort");
   if (key_buffers.selector != 0) { std::swap(keys, keys_alt); }
   if (value_buffers.selector != 0) { std::swap(values, values_alt); }
 }
@@ -374,8 +369,8 @@ std::optional<std::vector<field>> build_fields(cudf::table_view const& keys,
                                                encoded_sort_options const& options,
                                                rmm::cuda_stream_view stream)
 {
-  const auto rows   = keys.num_rows();
-  const auto policy = rmm::exec_policy_nosync(stream);
+  const auto rows     = keys.num_rows();
+  const auto policy   = rmm::exec_policy_nosync(stream);
   const auto range_of = [&](field const& f) {
     return thrust::transform_reduce(policy,
                                     thrust::make_counting_iterator<cudf::size_type>(0),
@@ -429,11 +424,11 @@ std::optional<std::vector<field>> build_fields(cudf::table_view const& keys,
       const cudf::strings_column_view strings(col);
       const auto offsets = strings.offsets();
       proto.offsets64    = offsets.type().id() == cudf::type_id::INT64;
-      proto.data         = offsets.head<std::uint8_t>() +
-                   (static_cast<std::size_t>(offsets.offset()) + col.offset()) *
-                     cudf::size_of(offsets.type());
-      proto.chars = strings.chars_begin(stream);
-      proto.kind  = field_kind::str_len;
+      proto.data =
+        offsets.head<std::uint8_t>() +
+        (static_cast<std::size_t>(offsets.offset()) + col.offset()) * cudf::size_of(offsets.type());
+      proto.chars        = strings.chars_begin(stream);
+      proto.kind         = field_kind::str_len;
       const auto lengths = range_of(proto);
       if (lengths.lo > lengths.hi) { continue; }
       if (lengths.hi > static_cast<std::uint64_t>(options.max_string_bytes)) {
@@ -505,7 +500,10 @@ struct tied_rows {
   rmm::device_uvector<std::uint32_t> group;       ///< 1-based group number, ascending
 
   tied_rows(cudf::size_type rows, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
-    : count(rows), position(0, stream, mr), row(0, stream, mr), head(0, stream, mr),
+    : count(rows),
+      position(0, stream, mr),
+      row(0, stream, mr),
+      head(0, stream, mr),
       group(0, stream, mr)
   {
   }
@@ -552,7 +550,7 @@ void regroup(tied_rows& tied,
         stays);
     }
   }
-  sorted_rows.release();
+  sorted_rows = rmm::device_uvector<cudf::size_type>(0, stream, mr);
 
   tied.initial  = false;
   tied.count    = kept;
@@ -575,11 +573,35 @@ void regroup(tied_rows& tied,
   tied.groups = tied.group.back_element(stream);
 }
 
+/// The sort keys of the tied rows, made from their words; frees @p words. 64-bit keys reuse the
+/// words' buffer.
+template <typename K>
+rmm::device_uvector<K> make_keys(rmm::device_uvector<std::uint64_t>&& words,
+                                 group_word_key_fn<K> const& key_of,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
+{
+  const auto policy = rmm::exec_policy_nosync(stream, mr);
+  const auto first  = thrust::make_counting_iterator<cudf::size_type>(0);
+  const auto last   = first + static_cast<cudf::size_type>(words.size());
+  if constexpr (std::is_same_v<K, std::uint64_t>) {
+    // In place: key k reads only word k.
+    thrust::transform(policy, first, last, words.begin(), key_of);
+    return std::move(words);
+  } else {
+    rmm::device_uvector<K> keys(words.size(), stream, mr);
+    thrust::transform(policy, first, last, keys.begin(), key_of);
+    words = rmm::device_uvector<std::uint64_t>(0, stream, mr);
+    return keys;
+  }
+}
+
 /// One refinement step: a stable radix sort of the tied rows by (group, word bits [lo, lo + wbits))
-/// packed into one key of type K, then regrouping.
+/// packed into one key of type K, then regrouping. Consumes @p words and the group numbers and
+/// row list of @p tied, so that the sort's two buffers per array are all that is held.
 template <typename K>
 void sort_packed(tied_rows& tied,
-                 rmm::device_uvector<std::uint64_t> const& words,
+                 rmm::device_uvector<std::uint64_t>&& words,
                  int lo,
                  int wbits,
                  int gbits,
@@ -590,23 +612,23 @@ void sort_packed(tied_rows& tied,
   const auto policy = rmm::exec_policy_nosync(stream, mr);
   const auto first  = thrust::make_counting_iterator<cudf::size_type>(0);
   const auto last   = first + tied.count;
-  rmm::device_uvector<K> keys(tied.count, stream, mr);
-  thrust::transform(
-    policy,
-    first,
-    last,
-    keys.begin(),
-    group_word_key_fn<K>{words.data(), gbits > 0 ? tied.group.data() : nullptr, lo, wbits});
-  rmm::device_uvector<cudf::size_type> rows(tied.count, stream, mr);
+  auto keys         = make_keys<K>(
+    std::move(words),
+    group_word_key_fn<K>{words.data(), gbits > 0 ? tied.group.data() : nullptr, lo, wbits},
+    stream,
+    mr);
+  tied.group = rmm::device_uvector<std::uint32_t>(0, stream, mr);
+  rmm::device_uvector<cudf::size_type> rows(0, stream, mr);
   if (tied.initial) {
+    rows = rmm::device_uvector<cudf::size_type>(tied.count, stream, mr);
     thrust::sequence(policy, rows.begin(), rows.end(), 0);
   } else {
-    thrust::copy(policy, tied.row.begin(), tied.row.end(), rows.begin());
+    rows = std::move(tied.row);
   }
   radix_sort_pairs(keys, rows, gbits + wbits, stream, mr);
   rmm::device_uvector<std::uint8_t> head(tied.count, stream, mr);
   thrust::transform(policy, first, last, head.begin(), head_of_keys_fn<K>{keys.data()});
-  keys.release();
+  keys = rmm::device_uvector<K>(0, stream, mr);
   regroup(tied, std::move(rows), head, out, stream, mr);
 }
 
@@ -623,6 +645,10 @@ std::unique_ptr<cudf::column> encoded_sorted_order(
 {
   const auto rows = keys.num_rows();
   if (keys.num_columns() == 0 || rows < 2 || rows < options.min_rows) { return nullptr; }
+  if (options.max_working_bytes != 0 &&
+      encoded_sort_working_bytes(rows) > options.max_working_bytes) {
+    return nullptr;
+  }
   if (column_order.size() != static_cast<std::size_t>(keys.num_columns()) ||
       null_precedence.size() != static_cast<std::size_t>(keys.num_columns())) {
     return nullptr;
@@ -639,8 +665,9 @@ std::unique_ptr<cudf::column> encoded_sorted_order(
   if (!fields) { return nullptr; }
   auto words = pack_words(*fields);
 
-  // Temporaries come from the current device resource, as cuDF's do; only the result uses mr.
-  const auto temp_mr = cudf::get_current_device_resource_ref();
+  // The result and all temporaries come from mr: the caller's memory space sees, and its
+  // reservation covers, everything this function holds.
+  const auto temp_mr = mr;
   const auto policy  = rmm::exec_policy_nosync(stream, temp_mr);
   const auto first   = thrust::make_counting_iterator<cudf::size_type>(0);
   rmm::device_uvector<cudf::size_type> result(rows, stream, mr);
@@ -667,6 +694,8 @@ std::unique_ptr<cudf::column> encoded_sorted_order(
         if (first_round) { ++local.words_skipped; }
         break;
       }
+      // The group heads were only needed for diff; regrouping rebuilds them.
+      tied.head       = rmm::device_uvector<cudf::size_type>(0, stream, temp_mr);
       const int hi    = 64 - std::countl_zero(diff);
       const int wbits = hi - std::countr_zero(diff);
       const int gbits = tied.groups > 1 ? std::bit_width(tied.groups - 1) : 0;
@@ -675,10 +704,10 @@ std::unique_ptr<cudf::column> encoded_sorted_order(
       local.rows_sorted += tied.count;
       if (gbits + take <= 32) {
         sort_packed<std::uint32_t>(
-          tied, values, hi - take, take, gbits, result.data(), stream, temp_mr);
+          tied, std::move(values), hi - take, take, gbits, result.data(), stream, temp_mr);
       } else {
         sort_packed<std::uint64_t>(
-          tied, values, hi - take, take, gbits, result.data(), stream, temp_mr);
+          tied, std::move(values), hi - take, take, gbits, result.data(), stream, temp_mr);
       }
       if (take == wbits) { break; }
     }

@@ -33,6 +33,8 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -47,6 +49,7 @@
 
 using sirius::op::order::encoded_sort_options;
 using sirius::op::order::encoded_sort_stats;
+using sirius::op::order::encoded_sort_working_bytes;
 using sirius::op::order::encoded_sorted_order;
 
 namespace {
@@ -413,7 +416,7 @@ void require_matches_cudf(const cudf::table_view& keys,
   REQUIRE(encoded->type().id() == cudf::type_id::INT32);
   REQUIRE(encoded->null_count() == 0);
 
-  auto expected = cudf::stable_sorted_order(keys, column_order, null_precedence, stream, mr);
+  auto expected   = cudf::stable_sorted_order(keys, column_order, null_precedence, stream, mr);
   const auto got  = to_host(encoded->view());
   const auto want = to_host(expected->view());
   for (std::size_t i = 0; i < want.size(); ++i) {
@@ -460,7 +463,7 @@ void check_random(const std::vector<kind>& kinds,
 
 TEST_CASE("encoded sort order: one string key, every order option", "[encoded_sort_order]")
 {
-  const auto shape = GENERATE(string_shape::shared_prefix,
+  const auto shape            = GENERATE(string_shape::shared_prefix,
                               string_shape::nested,
                               string_shape::random,
                               string_shape::utf8,
@@ -480,12 +483,10 @@ TEST_CASE("encoded sort order: one string key, every order option", "[encoded_so
 TEST_CASE("encoded sort order: a shared prefix costs one sort", "[encoded_sort_order]")
 {
   std::mt19937 rng(7);
-  const auto column =
-    random_column(kind::string, 50000, 0.0, rng, 0, string_shape::shared_prefix);
-  auto table = make_table({column});
+  const auto column = random_column(kind::string, 50000, 0.0, rng, 0, string_shape::shared_prefix);
+  auto table        = make_table({column});
   encoded_sort_stats stats;
-  require_matches_cudf(
-    table->view(), {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}, &stats);
+  require_matches_cudf(table->view(), {cudf::order::ASCENDING}, {cudf::null_order::BEFORE}, &stats);
   // Three 8-byte chunks, no length field (all strings have 18 bytes): the two chunks of the
   // shared prefix separate nothing and the third orders all rows in one radix sort.
   CHECK(stats.words == 3);
@@ -556,8 +557,18 @@ TEST_CASE("encoded sort order: multi-column keys of every type", "[encoded_sort_
     {kind::decimal128, kind::timestamp_us, kind::decimal64},
     {kind::uint8, kind::int8, kind::int16, kind::uint64},
     {kind::uint16, kind::uint32, kind::decimal32, kind::timestamp_days, kind::duration_ns},
-    {kind::bool8, kind::bool8, kind::int8, kind::uint8, kind::bool8, kind::int16, kind::bool8,
-     kind::int8, kind::bool8, kind::uint8, kind::bool8, kind::string},
+    {kind::bool8,
+     kind::bool8,
+     kind::int8,
+     kind::uint8,
+     kind::bool8,
+     kind::int16,
+     kind::bool8,
+     kind::int8,
+     kind::bool8,
+     kind::uint8,
+     kind::bool8,
+     kind::string},
     {kind::int64, kind::int64, kind::int64},
     {kind::decimal128, kind::decimal128}};
   const auto shape_index = GENERATE_COPY(range(std::size_t{0}, shapes.size()));
@@ -592,7 +603,7 @@ TEST_CASE("encoded sort order: sliced input and row counts around block sizes",
           "[encoded_sort_order]")
 {
   std::mt19937 rng(4242);
-  const cudf::size_type rows = GENERATE(2, 3, 17, 255, 257, 70001);
+  const cudf::size_type rows             = GENERATE(2, 3, 17, 255, 257, 70001);
   const std::vector<host_column> columns = {
     random_column(kind::int32, rows + 11, 0.1, rng, 6),
     random_column(kind::string, rows + 11, 0.1, rng, 0, string_shape::nested),
@@ -671,8 +682,8 @@ TEST_CASE("encoded sort order: key shapes left to cuDF", "[encoded_sort_order]")
   }
   SECTION("a string longer than the limit")
   {
-    auto column = random_column(kind::string, 5000, 0.0, rng);
-    auto table  = make_table({column});
+    auto column                  = random_column(kind::string, 5000, 0.0, rng);
+    auto table                   = make_table({column});
     encoded_sort_options options = no_minimum();
     options.max_string_bytes     = 20;
     CHECK(encoded_sorted_order(table->view(), ascending, before, stream, mr, options) != nullptr);
@@ -691,4 +702,85 @@ TEST_CASE("encoded sort order: key shapes left to cuDF", "[encoded_sort_order]")
           nullptr);
     CHECK(encoded_sorted_order(cudf::table_view{}, {}, {}, stream, mr, no_minimum()) == nullptr);
   }
+}
+
+TEST_CASE("encoded sort order: working memory is bounded and freed", "[encoded_sort_order]")
+{
+  const auto stream = cudf::get_default_stream();
+  // Counts every allocation the sort makes: it must take all its memory from the resource it is
+  // given.
+  rmm::mr::statistics_resource_adaptor counted{cudf::get_current_device_resource_ref()};
+  const rmm::device_async_resource_ref mr{counted};
+  std::mt19937 rng(31);
+  const cudf::size_type rows = 300000;
+  // Histograms and other per-sort scratch of the radix sort, not proportional to the rows.
+  const std::int64_t slack = 4 << 20;
+
+  struct shape {
+    const char* name;
+    std::vector<host_column> columns;
+    bool later_steps;  ///< the first word leaves rows tied
+  };
+  std::vector<shape> shapes;
+  shapes.push_back({"shared prefix",
+                    {random_column(kind::string, rows, 0.0, rng, 0, string_shape::shared_prefix)},
+                    false});
+  shapes.push_back({"close to unique strings",
+                    {random_column(kind::string, rows, 0.0, rng, 0, string_shape::random)},
+                    false});
+  shapes.push_back({"nested strings, many ties",
+                    {random_column(kind::string, rows, 0.1, rng, 0, string_shape::nested),
+                     random_column(kind::int64, rows, 0.1, rng)},
+                    true});
+  shapes.push_back(
+    {"two wide fixed-width keys",
+     {random_column(kind::int64, rows, 0.0, rng, 1000), random_column(kind::int64, rows, 0.0, rng)},
+     true});
+  shapes.push_back({"DECIMAL128 with ties, then a string",
+                    {random_column(kind::decimal128, rows, 0.0, rng, 50),
+                     random_column(kind::string, rows, 0.0, rng, 0, string_shape::long_prefix)},
+                    true});
+
+  for (const auto& s : shapes) {
+    INFO(s.name);
+    auto table = make_table(s.columns);
+    const std::vector<cudf::order> column_order(s.columns.size(), cudf::order::ASCENDING);
+    const std::vector<cudf::null_order> null_precedence(s.columns.size(), cudf::null_order::AFTER);
+    stream.sync();
+    const auto before = counted.get_bytes_counter();
+    encoded_sort_stats stats;
+    auto order = encoded_sorted_order(
+      table->view(), column_order, null_precedence, stream, mr, no_minimum(), &stats);
+    REQUIRE(order != nullptr);
+    stream.sync();
+    const auto after = counted.get_bytes_counter();
+    if (s.later_steps) { CHECK(stats.radix_sorts >= 2); }
+    // Peak above what was held before the call: within the documented bound.
+    CHECK(after.peak - before.value <=
+          static_cast<std::int64_t>(encoded_sort_working_bytes(rows)) + slack);
+    // On return only the result (4 bytes per row, padded) is still held.
+    CHECK(after.value - before.value >= static_cast<std::int64_t>(rows) * 4);
+    CHECK(after.value - before.value <= static_cast<std::int64_t>(rows) * 4 + 4096);
+    order.reset();
+    stream.sync();
+    CHECK(counted.get_bytes_counter().value == before.value);
+  }
+}
+
+TEST_CASE("encoded sort order: inputs over the working memory limit are left to cuDF",
+          "[encoded_sort_order]")
+{
+  const auto stream = cudf::get_default_stream();
+  const auto mr     = cudf::get_current_device_resource_ref();
+  std::mt19937 rng(77);
+  const cudf::size_type rows = 10000;
+  auto table                 = make_table({random_column(kind::string, rows, 0.0, rng)});
+  const std::vector<cudf::order> ascending   = {cudf::order::ASCENDING};
+  const std::vector<cudf::null_order> before = {cudf::null_order::BEFORE};
+  encoded_sort_options options               = no_minimum();
+  options.max_working_bytes                  = encoded_sort_working_bytes(rows);
+  CHECK(encoded_sorted_order(table->view(), ascending, before, stream, mr, options) != nullptr);
+  options.max_working_bytes = encoded_sort_working_bytes(rows) - 1;
+  CHECK(encoded_sorted_order(table->view(), ascending, before, stream, mr, options) == nullptr);
+  CHECK(encoded_sort_working_bytes(rows) == std::size_t{320000});
 }

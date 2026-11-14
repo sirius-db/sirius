@@ -17,14 +17,18 @@
 #include "op/order/gpu_order_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
-#include "log/logging.hpp"
 #include "op/order/encoded_sort_order.hpp"
 
 #include <cudf/sorting.hpp>
 
-#include <new>
+#include <cstddef>
 namespace sirius {
 namespace op {
+
+namespace {
+/// The encoded sort is used while its working memory is at most 1/N of the memory space.
+constexpr std::size_t kEncodedSortMaxSpaceFraction = 4;
+}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   const cucascade::read_only_data_batch& input,
@@ -55,15 +59,21 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   if (sort_key_encoding) {
     // String keys and multi-column keys: radix sorts over an encoding of the keys. Returns
     // nullptr for the key shapes it leaves to cuDF.
-    try {
-      sorted_order = order::encoded_sorted_order(
-        sort_keys, column_order, null_precedence, stream, memory_space.get_default_allocator());
-    } catch (const std::bad_alloc& e) {
-      // The encoded path needs more working memory than cuDF's comparison sort (up to about 40
-      // bytes per row against 8): under memory pressure take the smaller one.
-      SIRIUS_LOG_DEBUG("local_order_by: encoded sort ran out of memory ({}), using cudf", e.what());
-      sorted_order.reset();
-    }
+    //
+    // Memory: it allocates only from the memory space's allocator, at most
+    // order::encoded_sort_working_bytes(rows) at a time (32 bytes per row, against about 8 for
+    // cuDF's comparison sort), and frees its temporaries before returning. An input whose sort
+    // would need more than a quarter of the memory space is left to cuDF. An allocation failure
+    // is not caught here: like any operator's, it reaches the executor, which records the peak
+    // and retries the task with a larger reservation.
+    order::encoded_sort_options options;
+    options.max_working_bytes = memory_space.get_max_memory() / kEncodedSortMaxSpaceFraction;
+    sorted_order              = order::encoded_sorted_order(sort_keys,
+                                               column_order,
+                                               null_precedence,
+                                               stream,
+                                               memory_space.get_default_allocator(),
+                                               options);
   }
   if (!sorted_order) {
     sorted_order = cudf::sorted_order(

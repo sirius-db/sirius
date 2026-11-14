@@ -469,8 +469,13 @@ Local sort: turns its input into sorted runs for SORT_SAMPLE, SORT_PARTITION and
   - The result is the order of `cudf::stable_sorted_order()`: the same row comparator as the
     merge (`kway_comparator.cuh`), equal keys in input order.
   - It falls back to `cudf::sorted_order()` for batches under 4,096 rows, key types other than
-    fixed-width and STRING, strings longer than 256 bytes, and when its working memory (up to
-    about 40 bytes per row) cannot be allocated.
+    fixed-width and STRING, strings longer than 256 bytes, and inputs whose encoded sort would
+    need more than a quarter of the GPU memory space.
+  - Memory: the result and all temporaries come from the task's memory space, at most 32 bytes
+    per row at a time (`order::encoded_sort_working_bytes()`; cuDF's comparison sort needs
+    about 8, its single-key radix sort about 24), and the temporaries are freed before the
+    gather. An allocation failure is not caught: the executor records the peak and retries the
+    task with a larger reservation.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
 
 It has two modes, chosen by the planner (`order_by_run_limits()` in `wrap_order_by()`):

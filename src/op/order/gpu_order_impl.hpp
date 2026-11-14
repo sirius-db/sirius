@@ -57,7 +57,9 @@ class gpu_order_impl {
    * @param sort_key_encoding Whether string keys and multi-column keys are ordered by
    * `order::encoded_sorted_order()` (radix sorts over an encoding of the keys) instead of
    * `cudf::sorted_order()`. Both give a valid order of the same keys; the encoded one is stable.
-   * Key shapes the encoded path does not take always use `cudf::sorted_order()`.
+   * Key shapes the encoded path does not take always use `cudf::sorted_order()`, and so does an
+   * input whose encoded sort would need more than a quarter of @p memory_space
+   * (`order::encoded_sort_working_bytes()`, 32 bytes per row).
    *
    * @return The output data batch.
    */
