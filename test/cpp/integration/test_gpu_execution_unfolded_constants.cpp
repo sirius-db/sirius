@@ -49,10 +49,7 @@ class UnfoldedConstantsFixture : public sirius::test::GpuExecutionFixture {
   /// GPU with an all-constant call.
   void require_coalesce_removed(std::string const& query)
   {
-    auto result = con->Query("EXPLAIN " + query);
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-    auto plan = result->ToString();
+    auto plan = cpu_plan_text(query);
     std::transform(plan.begin(), plan.end(), plan.begin(), [](unsigned char c) {
       return static_cast<char>(std::tolower(c));
     });

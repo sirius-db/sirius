@@ -20,7 +20,8 @@
  *
  * DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself. The
  * hook used to derive them as well, so every pushed restriction appeared twice. On TPC-H q19's
- * shape the plan with GPU execution on must therefore be the plan DuckDB builds on its own.
+ * shape the optimized plan with GPU execution on must therefore be the plan DuckDB builds on its
+ * own.
  */
 
 #include "utils/gpu_execution_fixture.hpp"
@@ -67,22 +68,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     "((range % 11) / 100)::DECIMAL(15,2) AS l_discount FROM range(200000);");
   run_ok("CHECKPOINT;");
 
-  auto const plan_text = [&](bool gpu) {
-    run_ok(std::string("SET gpu_execution = ") + (gpu ? "true;" : "false;"));
-    auto result = con->Query(std::string("EXPLAIN ") + q19_shape);
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-    std::string text;
-    for (auto const& row : collect_rows(*result, /*sort=*/false)) {
-      for (auto const& cell : row) {
-        text += cell;
-      }
-    }
-    return text;
-  };
-  auto const cpu_plan = plan_text(false);
-  auto const gpu_plan = plan_text(true);
-  run_ok("SET gpu_execution = true;");
+  auto const cpu_plan = optimized_plan_text(q19_shape, /*gpu=*/false);
+  auto const gpu_plan = optimized_plan_text(q19_shape, /*gpu=*/true);
   INFO(gpu_plan);
   CHECK(gpu_plan == cpu_plan);
   // DuckDB derives the part-only restriction by itself; the hook adds no second copy.
