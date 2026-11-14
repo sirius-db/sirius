@@ -943,8 +943,20 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   }
 
   std::size_t num_batches = 0;
+  std::optional<std::size_t> input_rows;
   if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
     num_batches = pd->get_data_batches().size();
+    // Row counts come from representation metadata in any tier, without touching column data.
+    input_rows = std::size_t{0};
+    for (const auto& ro : pd->get_read_only_batches()) {
+      if (!ro.get_data()) { continue; }
+      auto const rows = representation_num_rows(ro.get_data());
+      if (!rows) {
+        input_rows.reset();
+        break;
+      }
+      input_rows = memory::saturating_add(*input_rows, *rows);
+    }
   }
   const op::input_stats stats{
     .num_batches                  = num_batches,
@@ -953,7 +965,8 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     .resident                     = input_resident,
     .working_set_bytes            = working_set_bytes,
     .needs_carrier_conversion     = input_needs_scan_carrier_conversion,
-    .conversion_destination_bytes = input_scan_conversion_destination_bytes};
+    .conversion_destination_bytes = input_scan_conversion_destination_bytes,
+    .rows                         = input_rows};
 
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;

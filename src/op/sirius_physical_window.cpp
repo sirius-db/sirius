@@ -167,8 +167,10 @@ std::size_t sirius_physical_window::workspace_bytes(std::size_t rows, std::size_
 
 std::size_t sirius_physical_window::no_history_peak_memory_estimate(input_stats const& stats) const
 {
-  // Each nonempty prepared row has at least one byte per column, even with narrow carriers.
-  auto rows = stats.bytes / std::max<std::size_t>(_prepared_types.size(), 1);
+  // Prefer the measured row count. The fallback bound assumes one byte per column, so for wide
+  // rows it overstates the workspace by orders of magnitude.
+  auto const rows =
+    stats.rows.value_or(stats.bytes / std::max<std::size_t>(_prepared_types.size(), 1));
   return workspace_bytes(rows, stats.bytes);
 }
 

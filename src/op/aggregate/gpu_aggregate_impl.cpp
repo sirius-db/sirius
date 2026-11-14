@@ -150,9 +150,33 @@ bool lowcard_groupby_enabled()
   return enabled;
 }
 
+/// The strings of the INT32 dictionary @p codes of a key, whose distinct values are @p strings.
+/// Rows that are NULL in @p codes are NULL in the result.
+std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view codes,
+                                               cudf::column_view strings,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  cudf::column_view const code_values(
+    codes.type(), codes.size(), codes.head(), nullptr, 0, codes.offset());
+  cudf::column_view const dictionary(cudf::data_type{cudf::type_id::DICTIONARY32},
+                                     codes.size(),
+                                     nullptr,
+                                     codes.null_mask(),
+                                     codes.null_count(),
+                                     codes.offset(),
+                                     {code_values, strings});
+  return cudf::dictionary::decode(cudf::dictionary_column_view(dictionary), stream, mr);
+}
+
 /// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
 /// `[keys..., aggregates..., carried...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for
 /// the parameters.
+///
+/// A STRING key whose batch is dictionary-encoded is grouped on its INT32 codes. Without
+/// @p encoded_keys, its result column is decoded back to STRING. With @p encoded_keys, the result
+/// column holds the codes, and `(*encoded_keys)[i]` owns the DICTIONARY32 column whose keys are the
+/// strings of key `i` (null for a key that is not encoded); see decode_key_codes().
 std::unique_ptr<cudf::table> grouped_aggregate_table(
   cudf::table_view input_table,
   const std::vector<int>& group_idx,
@@ -164,7 +188,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   cucascade::memory::memory_space& memory_space,
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
   const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
-  bool split_wide_integer_sums                                             = false)
+  bool split_wide_integer_sums                                             = false,
+  std::vector<std::unique_ptr<cudf::column>>* encoded_keys                 = nullptr)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -304,7 +329,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // expensive HLL-based NDV estimate.
   constexpr double dict_encode_min_avg_len = 8.0;
   constexpr double dict_encode_max_ratio   = 0.10;
-  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
+  // The DICTIONARY32 column of each encoded key, by key position; the group-by runs on its codes.
+  std::vector<std::unique_ptr<cudf::column>> encoded_key_owners(group_idx.size());
+  std::vector<std::optional<cudf::column_view>> encoded_key_strings(group_idx.size());
   std::vector<cudf::column_view> group_cols;
   group_cols.reserve(group_idx.size());
   for (int idx : group_idx) {
@@ -324,8 +351,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
         if (ratio < dict_encode_max_ratio) {
           auto encoded =
             cudf::dictionary::encode(col, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-          group_cols.push_back(encoded->view());
-          encoded_key_owners.push_back(std::move(encoded));
+          // Group on the INT32 codes, with the key's nulls. cuDF hashes and compares a
+          // DICTIONARY32 key through its strings, so only the codes give integer hashing.
+          cudf::dictionary_column_view const dictionary(encoded->view());
+          encoded_key_strings[group_cols.size()] = dictionary.keys();
+          encoded_key_owners[group_cols.size()]  = std::move(encoded);
+          group_cols.push_back(dictionary.get_indices_annotated());
           SIRIUS_LOG_DEBUG(
             "local_grouped_agg: dict-encoding key col {} (avg_len={:.1f}, ndv={}, rows={})",
             idx,
@@ -362,7 +393,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // The order is verified per batch, so unsorted batches keep the hash path.
   bool keys_sorted = false;
   if (!has_collect_set && group_cols.size() == 1 && key_is_radix_sortable(group_cols[0]) &&
-      !cudf::is_dictionary(group_cols[0].type())) {
+      !cudf::is_dictionary(group_cols[0].type()) && !encoded_key_strings[0]) {
     keys_sorted = keys_ascending(group_cols[0], stream);
     SIRIUS_LOG_DEBUG(
       "local_grouped_agg: sorted-key check rows={} sorted={}", input_table.num_rows(), keys_sorted);
@@ -598,7 +629,12 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
 
   // Decode dictionary-encoded group key columns back to STRING
   for (size_t i = 0; i < group_idx.size(); i++) {
-    if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+    if (encoded_key_strings[i]) {
+      if (!encoded_keys) {
+        output_cols[i] =
+          decode_key_codes(output_cols[i]->view(), *encoded_key_strings[i], stream, mr);
+      }
+    } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
       output_cols[i] = cudf::dictionary::decode(dict_view, stream, mr);
     }
@@ -672,6 +708,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     }
   }
 
+  if (encoded_keys) { *encoded_keys = std::move(encoded_key_owners); }
   return std::make_unique<cudf::table>(std::move(output_cols));
 }
 
@@ -742,25 +779,46 @@ std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
 
 /// Expand the partial aggregate @p partial, grouped by all @p num_keys keys, into one block of
 /// rows per grouping set. See `gpu_aggregate_impl::local_grouping_sets_aggregate()`.
+///
+/// @p encoded_keys is empty, or has one entry per key: the DICTIONARY32 column of a key that
+/// @p partial holds as INT32 codes (see grouped_aggregate_table()), or null. Such keys are
+/// re-aggregated on their codes and decoded to STRING only in the output.
 std::unique_ptr<cudf::table> expand_grouping_sets(
   cudf::table_view partial,
   std::size_t num_keys,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<std::set<std::size_t>>& grouping_sets,
   const std::vector<std::vector<std::size_t>>& grouping_functions,
+  const std::vector<std::unique_ptr<cudf::column>>& encoded_keys,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  std::vector<std::optional<cudf::column_view>> key_strings(num_keys);
+  for (std::size_t k = 0; k < encoded_keys.size() && k < num_keys; ++k) {
+    if (encoded_keys[k]) { key_strings[k] = cudf::dictionary_column_view(*encoded_keys[k]).keys(); }
+  }
+
   std::vector<cudf::size_type> aggregate_col_ids(aggregates.size());
   std::iota(aggregate_col_ids.begin(), aggregate_col_ids.end(), static_cast<int>(num_keys));
   auto const partial_aggregates = partial.select(aggregate_col_ids);
 
   // Owners of the columns that the per-set views below reference.
   std::vector<std::vector<std::unique_ptr<cudf::column>>> owned(grouping_sets.size());
-  std::vector<cudf::table_view> set_views;
-  set_views.reserve(grouping_sets.size());
+  std::vector<cudf::table_view> set_views(grouping_sets.size());
+  // Each computed set in the layout of `partial`: every key (NULL where the set leaves it out)
+  // followed by the aggregates. A set can be computed from any computed set whose keys contain its
+  // own, because re-aggregating a re-aggregated partial is still exact.
+  std::vector<std::optional<cudf::table_view>> results(grouping_sets.size());
 
-  for (std::size_t set_idx = 0; set_idx < grouping_sets.size(); ++set_idx) {
+  // Sets with more keys first, so a coarser set can start from a smaller, finer result rather
+  // than the partial (each ROLLUP level from the one above it).
+  std::vector<std::size_t> order(grouping_sets.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::ranges::stable_sort(order, [&](std::size_t lhs, std::size_t rhs) {
+    return grouping_sets[lhs].size() > grouping_sets[rhs].size();
+  });
+
+  for (auto const set_idx : order) {
     auto const& set = grouping_sets[set_idx];
     auto& owner     = owned[set_idx];
     owner.reserve(num_keys + aggregates.size() + 1 + grouping_functions.size());
@@ -779,20 +837,31 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       }
       num_rows = partial.num_rows();
     } else {
+      // The smallest computed result grouped by a superset of this set's keys.
+      cudf::table_view source = partial;
+      for (std::size_t other = 0; other < grouping_sets.size(); ++other) {
+        auto const& candidate = grouping_sets[other];
+        if (results[other] && results[other]->num_rows() < source.num_rows() &&
+            std::ranges::includes(candidate, set)) {
+          source = *results[other];
+        }
+      }
+      auto const source_aggregates = source.select(aggregate_col_ids);
+
       std::vector<cudf::column_view> set_keys;
       set_keys.reserve(set.empty() ? 1 : set.size());
       std::unique_ptr<cudf::column> constant_key;
       if (set.empty()) {
-        constant_key = make_constant_column<int8_t>(0, partial.num_rows(), stream, mr);
+        constant_key = make_constant_column<int8_t>(0, source.num_rows(), stream, mr);
         set_keys.push_back(constant_key->view());
       }
       for (auto const k : set) {
-        set_keys.push_back(partial.column(static_cast<cudf::size_type>(k)));
+        set_keys.push_back(source.column(static_cast<cudf::size_type>(k)));
       }
       cudf::groupby::groupby grouper(cudf::table_view(set_keys), cudf::null_policy::INCLUDE);
       std::vector<cudf::groupby::aggregation_request> requests(aggregates.size());
       for (std::size_t i = 0; i < aggregates.size(); ++i) {
-        requests[i].values = partial_aggregates.column(static_cast<cudf::size_type>(i));
+        requests[i].values = source_aggregates.column(static_cast<cudf::size_type>(i));
         requests[i].aggregations.push_back(make_reaggregation(aggregates[i]));
       }
       auto [grouped_keys, results] = grouper.aggregate(requests, stream, mr);
@@ -833,6 +902,19 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       }
     }
 
+    std::vector<cudf::column_view> result_cols(keys.begin(), keys.end());
+    result_cols.insert(result_cols.end(), values.begin(), values.end());
+    results[set_idx] = cudf::table_view(result_cols);
+
+    // The output holds the strings of encoded keys; `results` keeps their codes.
+    for (std::size_t k = 0; k < num_keys; ++k) {
+      if (!key_strings[k]) { continue; }
+      auto strings = set.contains(k) ? decode_key_codes(keys[k], *key_strings[k], stream, mr)
+                                     : make_null_column(*key_strings[k], num_rows, stream, mr);
+      keys[k]      = strings->view();
+      owner.push_back(std::move(strings));
+    }
+
     std::vector<cudf::column_view> cols;
     cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
     cols.assign(keys.begin(), keys.end());
@@ -852,7 +934,7 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       owner.push_back(std::move(col));
     }
     cols.insert(cols.end(), values.begin(), values.end());
-    set_views.emplace_back(cols);
+    set_views[set_idx] = cudf::table_view(cols);
   }
 
   return cudf::concatenate(set_views, stream, mr);
@@ -904,6 +986,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
   const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs,
   const std::vector<bool>& aggregate_is_wide_integer_sum)
 {
+  // Encoded STRING keys stay as codes through every re-aggregation, decoded once per set.
+  std::vector<std::unique_ptr<cudf::column>> encoded_keys;
   auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
                                          group_idx,
                                          aggregates,
@@ -913,12 +997,15 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_a
                                          stream,
                                          memory_space,
                                          aggregate_input_max_abs,
-                                         aggregate_is_wide_integer_sum);
+                                         aggregate_is_wide_integer_sum,
+                                         false,
+                                         &encoded_keys);
   auto output_table = expand_grouping_sets(partial->view(),
                                            group_idx.size(),
                                            aggregates,
                                            grouping_sets,
                                            grouping_functions,
+                                           encoded_keys,
                                            stream,
                                            memory_space.get_default_allocator());
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
