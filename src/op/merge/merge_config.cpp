@@ -43,8 +43,12 @@ constexpr double kTaskBudgetFraction = 0.5;
 constexpr std::size_t kWindowCopies = 3;
 /// A task's windows together stay under 1/kWindowCeilingDivisor of the available GPU memory.
 constexpr std::size_t kWindowCeilingDivisor = 16;
-/// The output chunk target is 1/kOutputBudgetDivisor of the task budget.
+/// The output chunk target is 1/kOutputBudgetDivisor of the task budget: a round is then no
+/// larger than a window, which is what bounds it without the round_rows rule.
 constexpr std::size_t kOutputBudgetDivisor = 16;
+/// The same with the round_rows rule, where one round fills the output and so the target is
+/// also the round size: fewer, larger rounds save the fixed cost of a round (about 0.56 ms).
+constexpr std::size_t kRoundOutputBudgetDivisor = 8;
 
 using sirius::memory::saturating_add;
 using sirius::memory::saturating_mul;
@@ -73,7 +77,12 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
                                          std::size_t num_runs,
                                          std::size_t row_width)
 {
-  auto const g = budget.gpu_available_bytes;
+  auto g = budget.gpu_available_bytes;
+  if (settings.enabled(merge_rule::budget_floor)) {
+    g = std::max(
+      g,
+      static_cast<std::size_t>(static_cast<double>(budget.gpu_total_bytes) * kBudgetFloorFraction));
+  }
   auto const t = std::max<std::size_t>(budget.concurrent_tasks, 1);
   auto const w = std::max<std::size_t>(row_width, 1);
   auto const b = static_cast<std::size_t>(static_cast<double>(g) * kTaskBudgetFraction) / t;
@@ -97,10 +106,12 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
   window_rows = std::min<std::size_t>(
     window_rows, static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
 
+  auto const output_divisor =
+    settings.enabled(merge_rule::round_rows) ? kRoundOutputBudgetDivisor : kOutputBudgetDivisor;
   auto const output_target_bytes =
     settings.output_bytes != 0
       ? static_cast<std::size_t>(settings.output_bytes)
-      : std::clamp(b / kOutputBudgetDivisor, kMinOutputTargetBytes, kMaxOutputTargetBytes);
+      : std::clamp(b / output_divisor, kMinOutputTargetBytes, kMaxOutputTargetBytes);
 
   auto const one_shot_fraction = settings.one_shot_max_fraction != 0
                                    ? settings.one_shot_max_fraction
@@ -109,7 +120,7 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
   SIRIUS_LOG_DEBUG(
     "sort merge config: window_rows={} output_target_bytes={} fan_in={} one_shot_fraction={} "
     "(gpu_available_bytes={} gpu_total_bytes={} concurrent_tasks={} task_budget_bytes={} "
-    "num_runs={} row_width={})",
+    "num_runs={} row_width={} gpu_free_or_reserved_bytes={} disabled_rules={})",
     window_rows,
     output_target_bytes,
     fan_in,
@@ -119,7 +130,9 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
     t,
     b,
     num_runs,
-    w);
+    w,
+    budget.gpu_available_bytes,
+    settings.disabled_rules);
 
   return {.window_rows         = window_rows,
           .output_target_bytes = output_target_bytes,
@@ -130,7 +143,8 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
 merge_route choose_route(sort_merge_mode mode,
                          double one_shot_fraction,
                          std::size_t gpu_total_bytes,
-                         const route_inputs& inputs)
+                         const route_inputs& inputs,
+                         bool row_count_guard)
 {
   // The windowed path handles neither nested columns nor late-materialized ones.
   if (inputs.has_nested || inputs.has_late_mat) { return merge_route::one_shot; }
@@ -140,12 +154,16 @@ merge_route choose_route(sort_merge_mode mode,
     case sort_merge_mode::automatic: break;
   }
   if (inputs.any_non_gpu) { return merge_route::windowed; }
+  // cudf::merge writes one table: a one-shot merge of this many rows fails as soon as it starts.
+  if (row_count_guard && inputs.partition_rows >= kOneShotRowLimit) {
+    return merge_route::windowed;
+  }
   auto const needed    = saturating_add(inputs.partition_bytes, inputs.output_bytes);
   auto const threshold = one_shot_fraction * static_cast<double>(gpu_total_bytes);
   return static_cast<double>(needed) > threshold ? merge_route::windowed : merge_route::one_shot;
 }
 
-pass_plan plan_pass(std::span<const run_summary> runs, std::size_t fan_in)
+pass_plan plan_pass(std::span<const run_summary> runs, std::size_t fan_in, bool short_first_merge)
 {
   pass_plan plan;
   plan.runs.resize(runs.size());
@@ -155,12 +173,68 @@ pass_plan plan_pass(std::span<const run_summary> runs, std::size_t fan_in)
   if (runs.size() <= f) { return plan; }
 
   plan.final_pass = false;
+  // The k-ary Huffman rule: a merge of f runs lowers the run count by f - 1, so only a count
+  // with (R - 1) mod (f - 1) == 0 ends in a final pass of exactly f runs. Any other count is
+  // brought there by one short merge of the smallest runs, now, instead of by a short final pass
+  // behind a merge that rewrote nearly every row.
+  auto take = f;
+  if (short_first_merge && (runs.size() - 1) % (f - 1) != 0) {
+    take = (runs.size() - 2) % (f - 1) + 2;
+  }
   std::stable_sort(plan.runs.begin(), plan.runs.end(), [&](std::size_t a, std::size_t b) {
     return runs[a].bytes < runs[b].bytes;
   });
-  plan.runs.resize(f);
+  plan.runs.resize(take);
   std::sort(plan.runs.begin(), plan.runs.end());
   return plan;
+}
+
+std::size_t round_rows_for(std::size_t window_rows,
+                           std::size_t output_target_bytes,
+                           std::size_t row_width)
+{
+  auto const w    = std::max<std::size_t>(row_width, 1);
+  auto const rows = output_target_bytes / w + (output_target_bytes % w != 0 ? 1 : 0);
+  return std::min<std::size_t>(std::max(window_rows, rows), kMaxRoundRows);
+}
+
+std::size_t estimate_window_slot_bytes(std::size_t window_rows,
+                                       std::size_t row_width,
+                                       std::size_t fetch_columns,
+                                       std::size_t string_columns,
+                                       std::size_t string_row_width)
+{
+  // A validity mask per column: cudf pads the mask to a multiple of 64 bytes.
+  auto const masks = saturating_mul(fetch_columns, window_rows / 8 + 64);
+  if (string_columns == 0) { return saturating_add(saturating_mul(window_rows, row_width), masks); }
+
+  if (string_row_width == 0 || string_row_width > row_width) {
+    // The chars share of row_width is not known: the 25% slack is taken on the whole row, and
+    // 8-byte offsets are counted on top of the row.
+    auto const window_bytes = saturating_mul(window_rows, row_width);
+    auto const per_string =
+      saturating_add(saturating_mul(saturating_add(window_rows, 1), 8),    // offsets
+                     saturating_add(saturating_mul(window_rows, 2), 64));  // the + 1 and minimum
+    auto slot = saturating_add(window_bytes, masks);
+    slot      = saturating_add(slot, window_bytes / 4);
+    return saturating_add(slot, saturating_mul(string_columns, per_string));
+  }
+
+  // What window_buffer's constructor allocates. The merger asks for each STRING column's chars
+  // at its bytes per row plus one; summed over the columns that is string_row_width plus one
+  // byte per column. window_buffer adds a quarter and allocates at least 64 bytes per column.
+  auto const fixed = saturating_mul(window_rows, row_width - string_row_width);
+  auto const chars_exact =
+    saturating_mul(window_rows, saturating_add(string_row_width, string_columns));
+  auto const chars = saturating_add(saturating_add(chars_exact, chars_exact / 4),
+                                    saturating_mul(string_columns, 64));
+  // int32 offsets unless a column's chars could pass 2 GiB; no column's can while their sum
+  // does not.
+  auto const offset_width =
+    chars_exact > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ? 8U : 4U;
+  auto const offsets =
+    saturating_mul(string_columns, saturating_mul(saturating_add(window_rows, 1), offset_width));
+  return saturating_add(saturating_add(fixed, masks), saturating_add(chars, offsets));
 }
 
 std::size_t estimate_task_bytes(std::size_t k,
@@ -171,35 +245,28 @@ std::size_t estimate_task_bytes(std::size_t k,
                                 std::size_t output_target_bytes,
                                 std::size_t fallback_runs_bytes,
                                 std::size_t fetch_columns,
-                                std::size_t string_columns)
+                                std::size_t string_columns,
+                                std::size_t round_rows,
+                                std::size_t string_row_width)
 {
   auto const buffered_runs = k - std::min(gpu_runs, k);
-  auto const window_bytes  = saturating_mul(window_rows, row_width);
+  auto const round         = round_rows == 0 ? window_rows : round_rows;
+  auto const round_bytes   = saturating_mul(round, row_width);
 
-  // One slot of a window buffer (see window_buffer's constructor): the rows, a validity mask per
-  // column and, per STRING column, 8-byte offsets and chars sized at (estimate + 1) * 1.25. The
-  // chars share of row_width is not known here, so the 25% slack is taken on the whole row.
-  auto slot = window_bytes;
-  slot      = saturating_add(slot, saturating_mul(fetch_columns, window_rows / 8 + 64));
-  if (string_columns != 0) {
-    auto const per_string =
-      saturating_add(saturating_mul(saturating_add(window_rows, 1), 8),    // offsets
-                     saturating_add(saturating_mul(window_rows, 2), 64));  // the + 1 and minimum
-    slot = saturating_add(slot, window_bytes / 4);
-    slot = saturating_add(slot, saturating_mul(string_columns, per_string));
-  }
   // Two slots for each run that is not sliced in place.
+  auto const slot = estimate_window_slot_bytes(
+    window_rows, row_width, fetch_columns, string_columns, string_row_width);
   auto total = saturating_mul(saturating_mul(2, buffered_runs), slot);
 
   // The round outputs, up to the target plus one round, and their concatenation into one table.
   total =
-    saturating_add(total, saturating_mul(2, saturating_add(output_target_bytes, window_bytes)));
+    saturating_add(total, saturating_mul(2, saturating_add(output_target_bytes, round_bytes)));
 
   // Scratch of one bounded merge: 8-byte gather-map entries per output row and, per tile boundary,
   // its rank plus three 4-byte values per run (the co-rank and corank_split's two scratch values).
   auto const boundaries =
-    saturating_add(window_rows / static_cast<std::size_t>(detail::kDefaultTileRows), 2);
-  total = saturating_add(total, saturating_mul(window_rows, 8));
+    saturating_add(round / static_cast<std::size_t>(detail::kDefaultTileRows), 2);
+  total = saturating_add(total, saturating_mul(round, 8));
   total =
     saturating_add(total, saturating_mul(boundaries, saturating_add(4, saturating_mul(12, k))));
 

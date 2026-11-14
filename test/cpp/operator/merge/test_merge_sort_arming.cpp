@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -240,8 +241,12 @@ std::size_t expected_task_bytes(const merge::windowed_merge_input& input,
                                     input.config().output_target_bytes,
                                     fallback_bytes,
                                     row_width / sizeof(int64_t),
-                                    0);
+                                    0,
+                                    input.config().round_rows);
 }
+
+/// sort_merge_disabled_rules with only @p rule switched off.
+constexpr std::uint64_t without(merge::merge_rule rule) { return static_cast<std::uint64_t>(rule); }
 
 /// Runs the task of @p input on @p space, as a GPU pipeline task does, and drops its output.
 void run_task(sirius_physical_merge_sort& merge,
@@ -665,9 +670,27 @@ TEST_CASE("merge sort no-history estimate of a windowed task is its input's size
     .num_batches = 3, .bytes = 12345, .type = operator_data_type::WINDOWED_MERGE};
   REQUIRE(merge->no_history_peak_memory_estimate(windowed) == 12345);
 
-  // Any other input keeps the base operator's estimate.
+  // By default a one-shot input keeps the base operator's estimate too: the rule is off.
   input_stats pipelineable{
     .num_batches = 3, .bytes = 12345, .type = operator_data_type::PIPELINEABLE};
+  merge->set_merge_settings({.mode = sirius::sort_merge_mode::automatic});
+  REQUIRE(merge->no_history_peak_memory_estimate(pipelineable) == 2 * 12345);
+
+  // With the rule: a one-shot merge of several batches peaks at 2.5 x its input on top of it.
+  merge->set_merge_settings({.mode = sirius::sort_merge_mode::automatic, .disabled_rules = 0});
+  REQUIRE(merge->no_history_peak_memory_estimate(pipelineable) == 2 * 12345 + 12345 / 2);
+  input_stats huge{.num_batches = 2,
+                   .bytes       = std::numeric_limits<std::size_t>::max() / 2,
+                   .type        = operator_data_type::PIPELINEABLE};
+  REQUIRE(merge->no_history_peak_memory_estimate(huge) == std::numeric_limits<std::size_t>::max());
+
+  // A single batch is forwarded: the base operator's estimate.
+  input_stats single{.num_batches = 1, .bytes = 12345, .type = operator_data_type::PIPELINEABLE};
+  REQUIRE(merge->no_history_peak_memory_estimate(single) == 2 * 12345);
+
+  // Without the rule every one-shot input keeps the base operator's estimate.
+  merge->set_merge_settings({.mode           = sirius::sort_merge_mode::automatic,
+                             .disabled_rules = without(merge::merge_rule::one_shot_estimate)});
   REQUIRE(merge->no_history_peak_memory_estimate(pipelineable) == 2 * 12345);
 }
 
@@ -931,7 +954,9 @@ TEST_CASE("merge sort without a budget provider sizes its windows from the GPU h
   merge->set_merge_settings(settings);
   REQUIRE_FALSE(merge->has_device_budget_provider());
 
-  auto const tasks      = static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads);
+  // The default executor width, lowered to the two partitions the operator has.
+  auto const tasks = std::min<std::size_t>(
+    static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads), 2);
   auto const from_space = [&] {
     return merge::derive_merge_config(
       settings,
@@ -988,9 +1013,8 @@ TEST_CASE("merge sort without a budget provider or a GPU run assumes an 8 GiB de
 
   auto const expected = merge::derive_merge_config(
     settings,
-    {.gpu_available_bytes = 8 * kGiB,
-     .gpu_total_bytes     = 8 * kGiB,
-     .concurrent_tasks = static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads)},
+    // One partition: it has the device's budget to itself, whatever the executor width.
+    {.gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 1},
     2,
     sizeof(int64_t));
   auto input     = merge->get_next_task_input_data();
@@ -1013,11 +1037,282 @@ TEST_CASE("merge sort reserves window buffers for the runs that are on the GPU w
   repo.add_data_batch(make_sorted_batch(*space, 200));
   auto merge = make_windowed_merge(repo);
 
-  // The runs stay spillable until the task reads them, so none is counted as sliced in place.
+  // Both runs are tables on the task's device: it slices them in place. They stay spillable
+  // until the task locks them, so the window buffers of one of them are reserved as a spare.
   auto input     = merge->get_next_task_input_data();
   auto& windowed = require_windowed_input(input);
-  REQUIRE(windowed.get_estimated_size_in_bytes() == expected_task_bytes(windowed, 0, 0));
+  REQUIRE(windowed.gpu_runs() == 2);
+  REQUIRE(windowed.get_estimated_size_in_bytes() == expected_task_bytes(windowed, 1, 0));
   REQUIRE(windowed.get_estimated_size_in_bytes() > expected_task_bytes(windowed, 2, 0));
+  REQUIRE(windowed.get_estimated_size_in_bytes() < expected_task_bytes(windowed, 0, 0));
+  // A round is sized from the output target, not from the window.
+  REQUIRE(windowed.config().round_rows ==
+          merge::round_rows_for(
+            windowed.config().window_rows, windowed.config().output_target_bytes, sizeof(int64_t)));
+
+  // A retry after an OOM charges both runs, at the same sizes.
+  auto const sizes = windowed.config();
+  REQUIRE(windowed.shrink_for_retry());
+  REQUIRE(windowed.gpu_runs() == 0);
+  REQUIRE(windowed.config().same_sizes(sizes));
+  REQUIRE(windowed.get_estimated_size_in_bytes() == expected_task_bytes(windowed, 0, 0));
+  REQUIRE(merge->counters().recharges == 1);
+  REQUIRE(merge->counters().shrinks == 0);
+}
+
+TEST_CASE("merge sort charges every run its window buffers without the in-place reservation",
+          "[merge_sort_arming]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  data_repository repo;
+  repo.add_data_batch(make_sorted_batch(*space, 100));
+  repo.add_data_batch(make_sorted_batch(*space, 200));
+  auto merge =
+    make_windowed_merge(repo,
+                        {.mode           = sirius::sort_merge_mode::windowed,
+                         .disabled_rules = without(merge::merge_rule::in_place_reservation)});
+
+  auto input     = merge->get_next_task_input_data();
+  auto& windowed = require_windowed_input(input);
+  REQUIRE(windowed.gpu_runs() == 0);
+  REQUIRE(windowed.get_estimated_size_in_bytes() == expected_task_bytes(windowed, 0, 0));
+}
+
+TEST_CASE("merge sort counts a run in place only when every batch it has left is a GPU table",
+          "[merge_sort_arming]")
+{
+  merge_utils::tiers_fixture fx;
+  data_repository repo;
+  auto on_gpu  = make_sorted_batch(*fx.gpu, 500);
+  auto on_gpu2 = make_sorted_batch(*fx.gpu, 700);
+  auto on_host = make_sorted_batch(*fx.gpu, 600);
+  merge_utils::place_batch(fx, on_host, merge_utils::placement::host);
+  for (auto const& batch : {on_gpu, on_gpu2, on_host}) {
+    repo.add_data_batch(batch);
+  }
+  auto merge = make_windowed_merge(repo);
+
+  auto input     = merge->get_next_task_input_data();
+  auto& windowed = require_windowed_input(input);
+  REQUIRE(windowed.cursors().size() == 3);
+  // Two runs in place (one of them the spare) and the host run: two runs are charged.
+  REQUIRE(windowed.gpu_runs() == 2);
+  REQUIRE(windowed.get_estimated_size_in_bytes() == expected_task_bytes(windowed, 1, 0));
+  REQUIRE(windowed.get_preferred_device_id() == fx.gpu->get_device_id());
+
+  input.reset();
+  merge.reset();
+  drain(repo);
+}
+
+TEST_CASE("merge sort shares the window budget among the partitions it has", "[merge_sort_arming]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  // An executor of eight threads on an 8 GiB device.
+  auto const eight_threads = [](const memory_space*) {
+    return merge::device_budget{
+      .gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 8};
+  };
+  auto const window_with = [&](std::size_t partitions, std::uint64_t disabled_rules) {
+    data_repository repo;
+    repo.set_num_partitions(partitions + 2);  // the last two stay empty
+    for (std::size_t partition = 0; partition < partitions; ++partition) {
+      repo.add_data_batch(make_sorted_batch(*space, 100), partition);
+      repo.add_data_batch(make_sorted_batch(*space, 100), partition);
+    }
+    auto merge = make_windowed_merge(
+      repo, {.mode = sirius::sort_merge_mode::windowed, .disabled_rules = disabled_rules});
+    merge->set_device_budget_provider(eight_threads);
+    std::vector<std::unique_ptr<operator_data>> inputs;
+    std::vector<std::size_t> windows;
+    while (auto input = merge->get_next_task_input_data()) {
+      windows.push_back(require_windowed_input(input).config().window_rows);
+      inputs.push_back(std::move(input));
+    }
+    // Every partition is sized alike, whenever it is armed, and all of them may be open.
+    REQUIRE(windows.size() == std::min<std::size_t>(partitions, 8));
+    REQUIRE(std::all_of(windows.begin(), windows.end(), [&](auto w) { return w == windows[0]; }));
+    inputs.clear();
+    merge.reset();
+    drain(repo);
+    return windows[0];
+  };
+  auto const derived = [](std::size_t tasks) {
+    return merge::derive_merge_config({},
+                                      {.gpu_available_bytes = 8 * kGiB,
+                                       .gpu_total_bytes     = 8 * kGiB,
+                                       .concurrent_tasks    = tasks},
+                                      2,
+                                      sizeof(int64_t))
+      .window_rows;
+  };
+  // T = 1 is bounded by the ceiling, so the comparisons use two partitions and more.
+  REQUIRE(derived(2) > derived(4));
+  REQUIRE(derived(4) > derived(8));
+
+  // Two partitions under eight threads are sized for two open partitions, not for eight.
+  REQUIRE(window_with(2, 0) == derived(2));
+  REQUIRE(window_with(4, 0) == derived(4));
+  // More partitions than threads: the executor width, as before.
+  REQUIRE(window_with(12, 0) == derived(8));
+  // Without the rule the width is the divisor whatever the partition count.
+  REQUIRE(window_with(2, without(merge::merge_rule::partition_budget)) == derived(8));
+}
+
+TEST_CASE("merge sort opens no more partitions than the budget was shared among",
+          "[merge_sort_arming]")
+{
+  // Three partitions of host runs under an executor of two threads: sized for two open
+  // partitions, and no third one opens while two keep their mergers.
+  merge_utils::tiers_fixture fx;
+  data_repository repo;
+  repo.set_num_partitions(3);
+  for (std::size_t partition = 0; partition < 3; ++partition) {
+    for (int run = 0; run < 2; ++run) {
+      auto batch = make_sorted_batch(*fx.gpu, 3000);
+      merge_utils::place_batch(fx, batch, merge_utils::placement::host);
+      repo.add_data_batch(batch, partition);
+    }
+  }
+  auto merge = make_windowed_merge(
+    repo, {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 1024});
+  merge->set_device_budget_provider(two_task_budget);
+
+  auto first  = merge->get_next_task_input_data();
+  auto second = merge->get_next_task_input_data();
+  REQUIRE(require_windowed_input(first).partition() == 0);
+  REQUIRE(require_windowed_input(second).partition() == 1);
+  REQUIRE_FALSE(merge->get_next_task_input_data());
+  REQUIRE_FALSE(merge->get_next_task_hint().has_value());
+
+  // With one partition per thread and a thread to spare, every partition opens.
+  data_repository small;
+  small.set_num_partitions(2);
+  for (std::size_t partition = 0; partition < 2; ++partition) {
+    for (int run = 0; run < 2; ++run) {
+      auto batch = make_sorted_batch(*fx.gpu, 3000);
+      merge_utils::place_batch(fx, batch, merge_utils::placement::host);
+      small.add_data_batch(batch, partition);
+    }
+  }
+  auto roomy = make_windowed_merge(
+    small, {.mode = sirius::sort_merge_mode::windowed, .window_rows = 1024, .output_bytes = 1024});
+  roomy->set_device_budget_provider([](const memory_space*) {
+    return merge::device_budget{
+      .gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 8 * kGiB, .concurrent_tasks = 16};
+  });
+  auto a = roomy->get_next_task_input_data();
+  auto b = roomy->get_next_task_input_data();
+  REQUIRE(require_windowed_input(a).partition() == 0);
+  REQUIRE(require_windowed_input(b).partition() == 1);
+
+  first.reset();
+  second.reset();
+  a.reset();
+  b.reset();
+  merge.reset();
+  roomy.reset();
+  drain(repo);
+  drain(small);
+}
+
+TEST_CASE("merge sort in automatic mode forwards a partition whose only run is on the GPU",
+          "[merge_sort_arming]")
+{
+  merge_utils::tiers_fixture fx;
+  // A threshold no partition fits under: the automatic mode would window every partition.
+  const merge::merge_settings always_windowed{.mode = sirius::sort_merge_mode::automatic,
+                                              .one_shot_max_fraction = 1e-12};
+
+  SECTION("one GPU run: the one-shot route gets the batch alone, the empty ones are dropped")
+  {
+    data_repository repo;
+    auto empty_a = make_sorted_batch(*fx.gpu, 0);
+    auto run     = make_sorted_batch(*fx.gpu, 500);
+    auto empty_b = make_sorted_batch(*fx.gpu, 0);
+    for (auto const& batch : {empty_a, run, empty_b}) {
+      repo.add_data_batch(batch);
+    }
+    auto merge = make_windowed_merge(repo, always_windowed);
+
+    auto input = merge->get_next_task_input_data();
+    require_one_shot_input(input, {run}, merge::make_merge_chunk_position(0, 0));
+    REQUIRE(repo.total_size() == 0);
+    REQUIRE(merge->counters().one_shot_partitions == 1);
+    REQUIRE(merge->counters().windowed_partitions == 0);
+
+    // The task forwards the batch itself: no row is copied.
+    input->prepare_for_processing(fx.gpu, fx.stream_ref());
+    auto const output = merge->execute(*input, fx.stream_ref());
+    REQUIRE(output);
+    auto const& data = dynamic_cast<const pipelineable_operator_data&>(*output);
+    REQUIRE(data.get_data_batches().size() == 1);
+    REQUIRE(data.get_data_batches()[0] == run);
+    REQUIRE(data.get_position() == merge::make_merge_chunk_position(0, 0));
+    REQUIRE_FALSE(merge->get_next_task_input_data());
+  }
+
+  SECTION("a run on another tier is read window by window")
+  {
+    data_repository repo;
+    auto run = make_sorted_batch(*fx.gpu, 500);
+    merge_utils::place_batch(fx, run, merge_utils::placement::host);
+    repo.add_data_batch(run);
+    auto merge = make_windowed_merge(repo, always_windowed);
+
+    auto input = merge->get_next_task_input_data();
+    REQUIRE(require_windowed_input(input).cursors().size() == 1);
+    REQUIRE(repo.size(0) == 1);
+    input.reset();
+    merge.reset();
+    drain(repo);
+  }
+
+  SECTION("two runs are merged")
+  {
+    data_repository repo;
+    repo.add_data_batch(make_sorted_batch(*fx.gpu, 500));
+    repo.add_data_batch(make_sorted_batch(*fx.gpu, 500));
+    auto merge = make_windowed_merge(repo, always_windowed);
+    auto input = merge->get_next_task_input_data();
+    REQUIRE(require_windowed_input(input).cursors().size() == 2);
+    input.reset();
+    merge.reset();
+    drain(repo);
+  }
+
+  SECTION("windowed mode means a windowed task, also for a single run")
+  {
+    data_repository repo;
+    auto run = make_sorted_batch(*fx.gpu, 500);
+    repo.add_data_batch(run);
+    auto merge = make_windowed_merge(repo);
+    auto input = merge->get_next_task_input_data();
+    REQUIRE(require_windowed_input(input).cursors().size() == 1);
+    REQUIRE(merge->counters().windowed_partitions == 1);
+    REQUIRE(merge->counters().one_shot_partitions == 0);
+    input.reset();
+    merge.reset();
+    drain(repo);
+  }
+
+  SECTION("without the rule the single run takes a windowed task in automatic mode too")
+  {
+    data_repository repo;
+    auto run = make_sorted_batch(*fx.gpu, 500);
+    repo.add_data_batch(run);
+    auto settings           = always_windowed;
+    settings.disabled_rules = without(merge::merge_rule::single_run_passthrough);
+    auto merge              = make_windowed_merge(repo, settings);
+    auto input              = merge->get_next_task_input_data();
+    REQUIRE(require_windowed_input(input).cursors().size() == 1);
+    REQUIRE(merge->counters().windowed_partitions == 1);
+    input.reset();
+    merge.reset();
+    drain(repo);
+  }
 }
 
 TEST_CASE("merge sort reserves the sum of the batches its runs may convert whole",

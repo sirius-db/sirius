@@ -57,6 +57,9 @@ struct merge_sort_counters {
   std::size_t mergers_built{0};        ///< windowed mergers constructed
   merge::merge_round_stats rounds;     ///< merge counters summed over the committed tasks
   std::size_t shrinks{0};  ///< windowed inputs that shrank their window for an OOM retry
+  /// Windowed inputs whose OOM retry reserved window buffers for the runs they had planned to
+  /// slice in place, at unchanged sizes. Not part of the statistics line.
+  std::size_t recharges{0};
 };
 
 /**
@@ -73,7 +76,14 @@ struct merge_sort_counters {
  *    allocated between two tasks, outside any reservation; the next task's estimate leaves them
  *    out, and on_finalize_operator() frees them. The window budget assumes one such merger per
  *    concurrent task of a device, so a partition without a merger gets its next task only while
- *    fewer windowed partitions than that are open (see at_open_partition_cap()).
+ *    fewer windowed partitions than that are open (see at_open_partition_cap()). That number is
+ *    the executor width, or the number of partitions the operator has when that is lower: the
+ *    budget is then shared among the partitions that can really be open.
+ *
+ * In automatic mode a partition whose only run is on the GPU has nothing to merge and is
+ * forwarded on the one-shot route, whatever its size; in windowed mode it is still read by a
+ * windowed task. The merge_rule values (sort_merge_disabled_rules) switch this and the other
+ * sizing and planning rules off one by one.
  */
 class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
@@ -125,7 +135,11 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::string_view port_id) const override;
 
   /// A windowed task needs its window working set, which is already what its input reports.
-  /// With history, gpu_pipeline_task keeps the reservation at or above that working set.
+  /// With history, gpu_pipeline_task keeps the reservation at or above that working set. A
+  /// one-shot merge of several batches peaks at 2.5 x its input on top of the materialised
+  /// input (the pairwise merge's intermediates, its 8-byte row index and the output); with the
+  /// one_shot_estimate rule, which is off by default, that is its cold-start estimate. A
+  /// single batch is forwarded and keeps the default.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -165,7 +179,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   }
 
   /// A provider that reports the memory of the space it is given, or of the smallest GPU space
-  /// of @p memory_manager when it is given none, with @p concurrent_tasks tasks per device.
+  /// of @p memory_manager when it is given none, with @p concurrent_tasks tasks per device (the
+  /// executor width; arming lowers it to the operator's partition count).
   /// Its available bytes include the bytes reserved by the tasks in flight.
   /// @p memory_manager must outlive the provider.
   [[nodiscard]] static device_budget_provider make_device_budget_provider(
@@ -257,7 +272,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     /// A task of the final pass has been planned.
     bool final_pass_started{false};
     /// device_budget::concurrent_tasks those sizes were derived with: the mergers the window
-    /// budget allows on one device at a time.
+    /// budget allows on one device at a time. With the partition_budget rule it is the executor
+    /// width lowered to the number of partitions the operator had when this one was armed.
     std::size_t concurrent_tasks{1};
     /// The GPU memory space the task in flight runs in; null until it starts.
     ::cucascade::memory::memory_space* task_space{nullptr};
@@ -299,6 +315,11 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     std::size_t row_width{0};       ///< estimated bytes per row of the fetched columns
     std::size_t key_row_width{0};   ///< estimated bytes per row of the key columns
     std::size_t string_columns{0};  ///< how many of the fetched columns are STRING
+    /// Estimated bytes per row of the STRING fetched columns together; 0 without the
+    /// string_slot_estimate rule.
+    std::size_t string_row_width{0};
+    /// config.round_rows was sized from the output target (the round_rows rule).
+    bool round_follows_output{false};
   };
 
   /// What a task's commit leaves to do once _drain_mutex is released.
@@ -381,6 +402,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
 
   /// The input columns a final-pass task emits, in output order.
   [[nodiscard]] std::vector<std::size_t> output_columns(std::size_t num_input_columns) const;
+
+  /// Partitions of @p repo that hold batches or have been armed: the most windowed partitions
+  /// that can be open. Needs _drain_mutex.
+  [[nodiscard]] std::size_t count_partitions(::cucascade::shared_data_repository& repo) const;
 
   //! Final projection to apply after merge (empty = no extra projection)
   duckdb::vector<std::size_t> _final_projections;

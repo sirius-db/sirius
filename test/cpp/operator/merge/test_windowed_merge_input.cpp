@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/merge/detail/window_buffer.hpp"
 #include "op/merge/merge_chunk_position.hpp"
 #include "op/merge/merge_config.hpp"
 #include "op/merge/windowed_merge_input.hpp"
@@ -43,10 +44,12 @@ using sirius::test::operator_utils::tiered_memory_fixture;
 
 namespace {
 
-constexpr std::size_t kMiB              = std::size_t{1} << 20;
-constexpr std::size_t kRowWidth         = 32;
-constexpr std::size_t kKeyRowWidth      = 8;
-constexpr std::size_t kGpuRuns          = 1;
+constexpr std::size_t kMiB         = std::size_t{1} << 20;
+constexpr std::size_t kRowWidth    = 32;
+constexpr std::size_t kKeyRowWidth = 8;
+// No run sliced in place: every run is charged its window buffers (the in-place cases build
+// their inputs themselves).
+constexpr std::size_t kGpuRuns          = 0;
 constexpr std::size_t kLargestFallback  = 3 * kMiB;
 constexpr std::size_t kOutputBytesFloor = 16 * kMiB;
 
@@ -304,6 +307,221 @@ TEST_CASE("a windowed merge task reserves at least its working set when the hist
   REQUIRE(estimate.had_history);
   REQUIRE(estimate.peak_memory_estimate == working_set);
   REQUIRE(estimate.reservation_size == working_set);
+}
+
+TEST_CASE("windowed_merge_input charges no window buffer for the runs sliced in place but one",
+          "[windowed_merge_input]")
+{
+  const window_config cfg{.window_rows = 65536, .output_target_bytes = 64 * kMiB};
+  const auto num_runs   = make_cursors().size();
+  const auto input_with = [&](std::size_t gpu_runs) {
+    return windowed_merge_input(
+      5, make_cursors(), false, 9, cfg, kRowWidth, kKeyRowWidth, gpu_runs, kLargestFallback);
+  };
+
+  // One run in place: it is the spare, so every run is still charged.
+  REQUIRE(input_with(1).get_estimated_size_in_bytes() == expected_estimate(cfg, 0));
+  REQUIRE(input_with(1).gpu_runs() == 1);
+  // Two and three in place: all but one of them are left out.
+  REQUIRE(input_with(2).get_estimated_size_in_bytes() == expected_estimate(cfg, 1));
+  REQUIRE(input_with(num_runs).get_estimated_size_in_bytes() ==
+          expected_estimate(cfg, num_runs - 1));
+  REQUIRE(input_with(num_runs).get_estimated_size_in_bytes() < expected_estimate(cfg, 0));
+  // What is left with every run in place: the spare's two slots, the output and the scratch.
+  REQUIRE(input_with(num_runs).get_estimated_size_in_bytes() ==
+          expected_estimate(cfg, num_runs) + 2 * cfg.window_rows * kRowWidth);
+
+  SECTION("a kept merger's runs are left out on top of them")
+  {
+    auto input = input_with(2);
+    input.set_kept_buffer_runs(1);
+    REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg, 2));
+  }
+
+  SECTION("the first retry charges every run at unchanged sizes, later ones shrink")
+  {
+    auto input = input_with(num_runs);
+    input.set_kept_buffer_runs(1);
+    int shrinks = 0, recharges = 0;
+    input.set_shrink_observer([&shrinks] { ++shrinks; });
+    input.set_recharge_observer([&recharges] { ++recharges; });
+
+    REQUIRE(input.shrink_for_retry());
+    REQUIRE(recharges == 1);
+    REQUIRE(shrinks == 0);
+    REQUIRE(input.gpu_runs() == 0);
+    REQUIRE(input.config().window_rows == cfg.window_rows);
+    REQUIRE(input.config().output_target_bytes == cfg.output_target_bytes);
+    // Every run, the kept merger's too (the failed task destroyed it).
+    REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(cfg, 0));
+
+    REQUIRE(input.shrink_for_retry());
+    REQUIRE(recharges == 1);
+    REQUIRE(shrinks == 1);
+    REQUIRE(input.config().window_rows == cfg.window_rows / 2);
+    REQUIRE(input.config().output_target_bytes == cfg.output_target_bytes / 2);
+    REQUIRE(input.get_estimated_size_in_bytes() == expected_estimate(input.config(), 0));
+  }
+
+  SECTION("the recharge happens at the shrink floors too")
+  {
+    windowed_merge_input at_floor(
+      5,
+      make_cursors(),
+      false,
+      9,
+      {.window_rows = kShrinkWindowRowsFloor, .output_target_bytes = kOutputBytesFloor},
+      kRowWidth,
+      kKeyRowWidth,
+      2,
+      kLargestFallback);
+    const auto before = at_floor.get_estimated_size_in_bytes();
+    REQUIRE(at_floor.shrink_for_retry());
+    REQUIRE(at_floor.get_estimated_size_in_bytes() > before);
+    REQUIRE_FALSE(at_floor.shrink_for_retry());
+  }
+}
+
+TEST_CASE("windowed_merge_input sizes its output and scratch from the round",
+          "[windowed_merge_input]")
+{
+  // 64 MiB of 32-byte rows: a round of 2,097,152 rows over windows of 65,536.
+  window_config cfg{.window_rows = 65536, .output_target_bytes = 64 * kMiB};
+  cfg.round_rows = round_rows_for(cfg.window_rows, cfg.output_target_bytes, kRowWidth);
+  REQUIRE(cfg.round_rows == 64 * kMiB / kRowWidth);
+  REQUIRE(cfg.effective_round_rows() == cfg.round_rows);
+  REQUIRE(window_config{.window_rows = 7}.effective_round_rows() == 7);
+  REQUIRE(cfg.same_sizes(cfg));
+  REQUIRE_FALSE(cfg.same_sizes({.window_rows = 65536, .output_target_bytes = 64 * kMiB}));
+  REQUIRE(window_config{.window_rows = 7, .output_target_bytes = 9}.same_sizes(
+    {.window_rows = 7, .output_target_bytes = 9, .round_rows = 7}));
+
+  const auto estimate_of = [](const windowed_merge_input& input) {
+    return estimate_task_bytes(make_cursors().size(),
+                               0,
+                               input.config().window_rows,
+                               kRowWidth,
+                               kKeyRowWidth,
+                               input.config().output_target_bytes,
+                               kLargestFallback,
+                               0,
+                               0,
+                               input.config().round_rows);
+  };
+  windowed_merge_input input(5,
+                             make_cursors(),
+                             false,
+                             9,
+                             cfg,
+                             kRowWidth,
+                             kKeyRowWidth,
+                             0,
+                             kLargestFallback,
+                             0,
+                             0,
+                             0,
+                             0,
+                             true);
+  REQUIRE(input.get_estimated_size_in_bytes() == estimate_of(input));
+  REQUIRE(input.get_estimated_size_in_bytes() >
+          make_input({.window_rows = 65536, .output_target_bytes = 64 * kMiB})
+            .get_estimated_size_in_bytes());
+
+  // A shrink halves the window and the target, and the round follows the target.
+  REQUIRE(input.shrink_for_retry());
+  REQUIRE(input.config().window_rows == 32768);
+  REQUIRE(input.config().output_target_bytes == 32 * kMiB);
+  REQUIRE(input.config().round_rows == 32 * kMiB / kRowWidth);
+  REQUIRE(input.config().round_rows == round_rows_for(input.config().window_rows,
+                                                      input.config().output_target_bytes,
+                                                      kRowWidth));
+  REQUIRE(input.get_estimated_size_in_bytes() == estimate_of(input));
+
+  SECTION("a round that does not follow the output is halved, down to the window")
+  {
+    windowed_merge_input fixed(
+      5,
+      make_cursors(),
+      false,
+      9,
+      {.window_rows = 4096, .output_target_bytes = 64 * kMiB, .round_rows = 6000},
+      kRowWidth,
+      kKeyRowWidth,
+      0,
+      kLargestFallback);
+    REQUIRE(fixed.shrink_for_retry());
+    REQUIRE(fixed.config().window_rows == 2048);
+    REQUIRE(fixed.config().round_rows == 3000);
+    REQUIRE(fixed.shrink_for_retry());
+    REQUIRE(fixed.config().window_rows == 1024);
+    REQUIRE(fixed.config().round_rows == 1500);
+  }
+
+  SECTION("a config without round rows keeps none")
+  {
+    auto plain = make_input({.window_rows = 4096, .output_target_bytes = 64 * kMiB});
+    REQUIRE(plain.shrink_for_retry());
+    REQUIRE(plain.config().round_rows == 0);
+    REQUIRE(plain.config().effective_round_rows() == 2048);
+  }
+}
+
+TEST_CASE("the STRING slot estimate covers what a window buffer allocates",
+          "[windowed_merge_input][window_buffer]")
+{
+  tiered_memory_fixture f;
+  REQUIRE(f.setup());
+  rmm::cuda_stream stream;
+  const rmm::cuda_stream_view stream_view{stream.value()};
+  const auto mr = sirius::test::operator_utils::get_resource_ref(*f.gpu0);
+  const cudf::data_type int64{cudf::type_id::INT64};
+  const cudf::data_type int32{cudf::type_id::INT32};
+  const cudf::data_type string{cudf::type_id::STRING};
+
+  struct schema {
+    std::vector<cudf::data_type> types;
+    std::vector<std::size_t> string_widths;  ///< row width of each STRING column, offsets included
+  };
+  // The widths are what estimate_column_widths gives a STRING column: its chars per row plus
+  // its 4-byte offset. few_distinct-strings of the benchmark is the second schema.
+  const auto s    = GENERATE_COPY(schema{{string}, {24}},
+                               schema{{string, int64, int64}, {20}},
+                               schema{{int64, string, int32, string}, {12, 40}},
+                               schema{{string, string, string}, {5, 9, 300}});
+  const auto rows = GENERATE(std::size_t{1000}, std::size_t{65536}, std::size_t{200'000});
+  CAPTURE(s.types.size(), rows);
+
+  std::size_t row_width = 0, string_row_width = 0, strings = 0;
+  std::vector<std::size_t> chars_estimates;
+  for (const auto& type : s.types) {
+    if (type.id() == cudf::type_id::STRING) {
+      const auto width = s.string_widths[strings++];
+      row_width += width;
+      string_row_width += width;
+      // What windowed_merger asks for when a batch has no column metadata: the column's share
+      // of the row plus one.
+      chars_estimates.push_back(width + 1);
+    } else {
+      row_width += cudf::size_of(type);
+      chars_estimates.push_back(0);
+    }
+  }
+  const sirius::op::merge::detail::window_buffer buffer(
+    s.types, rows, chars_estimates, stream_view, mr);
+  const auto allocated = buffer.device_bytes();
+
+  const auto estimate =
+    2 * estimate_window_slot_bytes(rows, row_width, s.types.size(), strings, string_row_width);
+  // Covers the two slots, and by no more than the padding of the masks and of the minimum chars.
+  REQUIRE(estimate >= allocated);
+  REQUIRE(estimate - allocated <= 2 * (s.types.size() + strings) * 64);
+
+  // The estimate without the STRING width is the over-reservation the rule removes.
+  const auto legacy = 2 * estimate_window_slot_bytes(rows, row_width, s.types.size(), strings);
+  REQUIRE(legacy > estimate);
+  if (strings == 1 && rows >= 65536) {
+    REQUIRE(static_cast<double>(legacy) > 1.1 * static_cast<double>(allocated));
+  }
 }
 
 TEST_CASE("windowed_merge_input shrinks by halving down to both floors", "[windowed_merge_input]")

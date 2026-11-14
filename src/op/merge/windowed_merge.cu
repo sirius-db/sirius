@@ -288,11 +288,14 @@ struct windowed_merger::impl {
     run.gpu_lock.emplace(std::move(lock));
   }
 
+  /// A slice costs no memory, so it is as long as a round can emit: with fewer rows the window
+  /// would be truncated and could stop the round before its output is full.
   void slice_gpu_window(run_window& run) const
   {
     const auto batch_rows = run.cursor.run.batch_rows[run.cursor.batch];
     const auto begin      = run.cursor.row;
-    run.window = slice_rows(run.gpu_view, begin, std::min(begin + cfg.window_rows, batch_rows));
+    run.window =
+      slice_rows(run.gpu_view, begin, std::min(begin + cfg.effective_round_rows(), batch_rows));
   }
 
   /// True when the rows buffered for @p run's current batch make this round's window: no copy
@@ -315,7 +318,8 @@ struct windowed_merger::impl {
     held.start = 0;
   }
 
-  /// Sets run.window to at most window_rows rows of the run's current batch, from the cursor on.
+  /// Sets run.window to rows of the run's current batch, from the cursor on: at most
+  /// effective_round_rows() of a batch sliced in place, at most window_rows of a buffered one.
   void fill_window(run_window& run,
                    std::size_t run_idx,
                    rmm::cuda_stream_view stream,
@@ -579,8 +583,12 @@ struct windowed_merger::impl {
       }
       if (active.empty()) { break; }
 
-      auto merged = merge(
-        round_views, keys, truncated, static_cast<cudf::size_type>(cfg.window_rows), stream, mr);
+      auto merged = merge(round_views,
+                          keys,
+                          truncated,
+                          static_cast<cudf::size_type>(cfg.effective_round_rows()),
+                          stream,
+                          mr);
       ++local.rounds;
       if (!merged.output || merged.consumed.size() != active.size()) {
         throw sirius::internal_exception(
@@ -695,6 +703,9 @@ windowed_merger::windowed_merger(
   if (cfg.window_rows == 0 ||
       cfg.window_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::invalid_argument("windowed_merger: window_rows must be in [1, 2^31)");
+  }
+  if (cfg.round_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
+    throw std::invalid_argument("windowed_merger: round_rows must be in [0, 2^31)");
   }
   if (!merge) { throw std::invalid_argument("windowed_merger: no merge function"); }
 

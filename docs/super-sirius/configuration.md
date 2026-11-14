@@ -640,6 +640,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `sort_merge_output_bytes` | 0 (derive) | Output chunk target per windowed merge task; accepts byte suffixes |
 | `sort_merge_one_shot_max_fraction` | 0 (derive) | In `auto` mode, the fraction of GPU memory above which a partition takes the windowed path |
 | `sort_merge_max_fan_in` | 8 | Most sorted runs one merge task reads |
+| `sort_merge_disabled_rules` | 64 | Bit set of merge sizing and planning rules to switch off. See [Sort Merge](#sort-merge). |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
@@ -711,17 +712,33 @@ when a column of the sort's input is nested, when a sort key is not a plain colu
 
 **Files:** `src/sirius_config.hpp`, `src/sirius_config.cpp`, `src/sirius_extension.cpp`, `src/op/merge/merge_config.cpp`
 
-Five settings control how MERGE_SORT merges the sorted runs of a partition (see
+Six settings control how MERGE_SORT merges the sorted runs of a partition (see
 [Operators](operators.md#sirius_physical_merge_sort--merge_sort)). Each is a key under
 `sirius.operator_params` and a session `SET` variable of the same name.
 
 | Setting | Type | Default | Meaning |
 |---------|------|---------|---------|
 | `sort_merge_mode` | VARCHAR | `auto` | `auto`: windowed merge for a partition that has a batch off the GPU tier, or whose bytes plus output exceed `sort_merge_one_shot_max_fraction` of the GPU; otherwise one-shot. `windowed`: always the windowed k-way merge. `one_shot`: always the concat-then-merge path. Case-insensitive. |
-| `sort_merge_window_rows` | UBIGINT | 0 | `n`: maximum rows per input window, and the most rows one merge round emits. 0 derives it. |
+| `sort_merge_window_rows` | UBIGINT | 0 | `n`: maximum rows per window of a run read through a window buffer. An explicit value also bounds the rows one merge round emits; a derived one does not (see `round rows` below). 0 derives it. |
 | `sort_merge_output_bytes` | UBIGINT | 0 | Output chunk target per merge task. 0 derives it. |
 | `sort_merge_one_shot_max_fraction` | DOUBLE | 0 | The `auto` threshold, as a fraction of the device's total GPU memory. 0 derives it. |
 | `sort_merge_max_fan_in` | UBIGINT | 8 | Most runs one merge task reads. A partition with more runs is merged in passes. |
+| `sort_merge_disabled_rules` | UBIGINT | 64 | Bit set of the rules below to switch off; 0 puts all of them in force. Meant for measuring each rule. |
+
+The rules of `sort_merge_disabled_rules` (`merge::merge_rule`); a set bit restores the behaviour
+from before the rule:
+
+| Bit | Rule | Default |
+|-----|------|---------|
+| 1 | Pass plan: a short first merge, so every later merge and the final pass read `fan_in` runs | on |
+| 2 | Budget floor: `G` is at least a quarter of the device's GPU memory | on |
+| 4 | Budget per open partition: `T = clamp(partitions, 1, executor threads)`, also the open-partition cap | on |
+| 8 | In-place reservation: no window buffers reserved for runs sliced in place, but one spare | on |
+| 16 | Output-sized rounds: `round rows` below, and an output target of `B / 8` instead of `B / 16` | on |
+| 32 | Row-count guard: in `auto` mode a partition of 2^31 - 1 rows or more is windowed | on |
+| 64 | One-shot cold-start estimate of 2.5 × the input instead of 2 × | off |
+| 128 | In `auto` mode a partition whose only run is on the GPU is forwarded without a merge | on |
+| 256 | STRING slot estimate from the STRING columns' own width | on |
 
 `one_shot` is kept for A/B testing against the windowed path and is slated for removal once the
 windowed path is proven (measurements and the conditions for the removal:
@@ -731,8 +748,10 @@ one-shot route in every mode.
 **Derivation.** A value left at 0 is derived for each partition when its first merge task is
 created (`merge::derive_merge_config()`), from:
 
-- `G`: GPU memory available on the device, and the device's total GPU memory;
-- `T`: merge tasks that can run at once on the device;
+- `G`: GPU memory available on the device (free plus reserved by tasks in flight), at least a
+  quarter of the device's total GPU memory;
+- `T`: windowed partitions that can be open at once on the device: the partitions the operator
+  has, at most `executor.pipeline.num_threads`;
 - `w`: estimated row width in bytes (fixed widths, plus an equal share of the rest of the average
   row for each variable-width column);
 - `k`: the fan-in, `min(runs in the partition, fan-in cap)`.
@@ -743,11 +762,12 @@ The per-task budget is `B = 0.5 × G / T`.
 |-------|-----------|
 | Fan-in cap | `clamp(B / (3 × 65536 × w), 2, sort_merge_max_fan_in)`: the most runs whose windows fit `B` with `n` at its floor |
 | `sort_merge_window_rows` | `n = min(max(B / (3 × k × w), 65536), G / (16 × k × w))`, at least 1. The ceiling is applied last, so it wins when it is below the 65,536-row floor. |
-| `sort_merge_output_bytes` | `clamp(B / 16, 64 MiB, 1 GiB)` |
+| `sort_merge_output_bytes` | `clamp(B / 8, 64 MiB, 1 GiB)` |
+| round rows | `max(n, output target / w)`, at most 2^30 - 1: the most rows one round emits, and the rows a run sliced in place offers a round. Equal to `n` when `sort_merge_window_rows` is set. |
 | `sort_merge_one_shot_max_fraction` | 0.20 below 16 GiB of total GPU memory, 0.25 below 64 GiB, otherwise 0.33 |
 
 For a planned query, `G` comes from the GPU memory space that holds most of the partition's bytes
-(the smallest GPU space when no run is on a GPU) and `T` is the configured
+(the smallest GPU space when no run is on a GPU) and `T` is bounded by the configured
 `executor.pipeline.num_threads`. A MERGE_SORT built without the plan generator has no budget
 provider: it uses the default executor width, and a partition with no batch on the GPU reuses the
 last GPU space the

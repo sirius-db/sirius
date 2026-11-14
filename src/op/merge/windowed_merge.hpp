@@ -104,8 +104,27 @@ struct merge_input_cursor {
  * @brief Sizes of one windowed merge task.
  */
 struct window_config {
-  std::size_t window_rows{0};          ///< n: maximum rows per input window
+  /// n: maximum rows per window of a run read through a window buffer (and its row capacity).
+  std::size_t window_rows{0};
   std::size_t output_target_bytes{0};  ///< stop a task once its output reaches this size
+  /// Rows one round emits at most, and the most rows a run sliced in place offers a round;
+  /// 0 = window_rows. Sized from the output target (round_rows_for) a round fills the task's
+  /// output in one bounded merge when its runs are GPU-resident.
+  std::size_t round_rows{0};
+
+  /// round_rows, or window_rows when it is 0.
+  [[nodiscard]] std::size_t effective_round_rows() const noexcept
+  {
+    return round_rows == 0 ? window_rows : round_rows;
+  }
+
+  /// Whether two configs size a merger alike (a merger is continued only by a task of the same
+  /// sizes).
+  [[nodiscard]] bool same_sizes(const window_config& other) const noexcept
+  {
+    return window_rows == other.window_rows && output_target_bytes == other.output_target_bytes &&
+           effective_round_rows() == other.effective_round_rows();
+  }
 };
 
 /**
@@ -175,12 +194,14 @@ using run_fallback_fn = std::function<bool(
 /**
  * @brief Runs rounds of a bounded k-way merge over the runs of one partition, one task per run().
  *
- * Each round merges one window per run: at most window_rows rows of the run's current batch,
- * from its cursor on. A window never spans two batches of a run (a short window at a batch end
- * is "truncated"). A batch that is an uncompressed table in the task's GPU space is windowed in
- * place, as a view of its rows under a read lock held until the batch is finished or run()
- * ends. Any other batch is read through its row-range reader into a detail::window_buffer of
- * the run, read-locked only during each refill; a batch without a reader goes through
+ * Each round merges one window per run: rows of the run's current batch, from its cursor on, and
+ * emits at most cfg.effective_round_rows() rows. A window never spans two batches of a run (a
+ * short window at a batch end is "truncated"). A batch that is an uncompressed table in the
+ * task's GPU space is windowed in place, as a view of at most effective_round_rows() of its rows
+ * under a read lock held until the batch is finished or run() ends: the view costs no memory, so
+ * its size follows the round, not n. Any other batch is read through its row-range reader into a
+ * detail::window_buffer of the run, at most window_rows rows at a time, read-locked only during
+ * each refill; a batch without a reader goes through
  * detail::convert_run_batch_to_gpu once. The null count of a window's columns is an upper bound
  * (exact only when 0): the merge kernel must read the masks.
  *
@@ -218,7 +239,7 @@ class windowed_merger {
    * @param fetch_cols Source column indices: keys + projected payload.
    * @param fetch_types Types of the fetched columns, in fetch_cols order.
    * @param keys Sort keys; key_cols index into fetch_cols order.
-   * @param cfg Window rows and output target of this task.
+   * @param cfg Window rows, round rows and output target of this task.
    * @param readers Row-range reader registry; must outlive the merger.
    * @param gpu_space The task's GPU memory space; must outlive the merger. Batches are converted
    *        to it when they cannot be read by row range, and the readers allocate from its default

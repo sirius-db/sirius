@@ -2771,6 +2771,21 @@ static void SetSortMergeMaxFanIn(ClientContext& context, SetScope scope, Value& 
   SIRIUS_LOG_DEBUG("Updated config sort_merge_max_fan_in to {}", params->sort_merge_max_fan_in);
 }
 
+static void SetSortMergeDisabledRules(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rules = UBigIntValue::Get(parameter);
+  if ((rules & ~sirius::config::sort_merge_rule::ALL) != 0) {
+    throw InvalidInputException(
+      "sort_merge_disabled_rules has an unknown rule bit: got %s, the valid bits are %s",
+      std::to_string(rules),
+      std::to_string(sirius::config::sort_merge_rule::ALL));
+  }
+  auto* params                      = get_operator_params(context, scope);
+  params->sort_merge_disabled_rules = rules;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_disabled_rules to {}",
+                   params->sort_merge_disabled_rules);
+}
+
 static void SetSortKeyEncoding(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params              = get_operator_params(context, scope);
@@ -3651,6 +3666,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.sort_merge_max_fan_in),
     SetSortMergeMaxFanIn);
+  config.AddExtensionOption(
+    "sort_merge_disabled_rules",
+    "Bit set of merge sizing and planning rules to switch off, for measuring each one (0 = all in "
+    "force; default 64): 1 Huffman pass plan, 2 budget floor, 4 budget per open partition, 8 "
+    "in-place reservation, 16 output-sized rounds, 32 row-count guard, 64 one-shot cold-start "
+    "estimate, 128 single-run passthrough, 256 STRING slot estimate",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_disabled_rules),
+    SetSortMergeDisabledRules);
   config.AddExtensionOption(
     "sort_key_encoding",
     "Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix "

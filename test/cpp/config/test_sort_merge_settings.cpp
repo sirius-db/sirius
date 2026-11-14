@@ -377,3 +377,88 @@ TEST_CASE("sort_merge config-file values are the DuckDB setting defaults",
   CHECK(params.sort_merge_output_bytes == 4 * mib);
   CHECK(params.sort_merge_one_shot_max_fraction == Approx(0.2));
 }
+
+TEST_CASE(
+  "sort_merge_disabled_rules defaults to the one-shot estimate off, and takes only known bits",
+  "[sort_merge_settings][isolated_context]")
+{
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto const& params = duckdb::session_operator_params(*con.context);
+  constexpr auto all = config::sort_merge_rule::ALL;
+
+  constexpr auto by_default = config::DEFAULT_SORT_MERGE_DISABLED_RULES;
+  CHECK(by_default == config::sort_merge_rule::ONE_SHOT_ESTIMATE);
+  CHECK(current_setting(con, "sort_merge_disabled_rules").GetValue<uint64_t>() == by_default);
+  CHECK(params.sort_merge_disabled_rules == by_default);
+
+  // 0 puts every rule in force.
+  require_ok(con, "SET sort_merge_disabled_rules = 0");
+  CHECK(params.sort_merge_disabled_rules == 0);
+
+  require_ok(con, "SET sort_merge_disabled_rules = 17");
+  CHECK(params.sort_merge_disabled_rules ==
+        (config::sort_merge_rule::HUFFMAN_PLAN | config::sort_merge_rule::ROUND_ROWS));
+  CHECK(current_setting(con, "sort_merge_disabled_rules").GetValue<uint64_t>() == 17);
+
+  require_ok(con, "SET sort_merge_disabled_rules = " + std::to_string(all));
+  CHECK(params.sort_merge_disabled_rules == all);
+
+  // A bit that names no rule is rejected, and the previous value stays.
+  require_rejected(con,
+                   "SET sort_merge_disabled_rules = " + std::to_string(all + 1),
+                   "sort_merge_disabled_rules has an unknown rule bit");
+  require_rejected(con,
+                   "SET sort_merge_disabled_rules = 4096",
+                   "sort_merge_disabled_rules has an unknown rule bit");
+  CHECK(params.sort_merge_disabled_rules == all);
+
+  require_ok(con, "RESET sort_merge_disabled_rules");
+  CHECK(params.sort_merge_disabled_rules == by_default);
+  CHECK(current_setting(con, "sort_merge_disabled_rules").GetValue<uint64_t>() == by_default);
+}
+
+TEST_CASE("sort_merge_disabled_rules is a config-file key", "[sort_merge_settings][config_opt]")
+{
+  SECTION("read")
+  {
+    temp_config_file const file(operator_params_yaml("    sort_merge_disabled_rules: 12\n"));
+    sirius_config cfg;
+    cfg.load_from_file(file.path());
+    CHECK(
+      cfg.get_operator_params().sort_merge_disabled_rules ==
+      (config::sort_merge_rule::PARTITION_BUDGET | config::sort_merge_rule::IN_PLACE_RESERVATION));
+  }
+
+  SECTION("omitted: the default")
+  {
+    temp_config_file const file(operator_params_yaml("    max_sort_partition_bytes: 0\n"));
+    sirius_config cfg;
+    cfg.load_from_file(file.path());
+    CHECK(cfg.get_operator_params().sort_merge_disabled_rules ==
+          config::DEFAULT_SORT_MERGE_DISABLED_RULES);
+  }
+
+  SECTION("0 puts every rule in force")
+  {
+    temp_config_file const file(operator_params_yaml("    sort_merge_disabled_rules: 0\n"));
+    sirius_config cfg;
+    cfg.load_from_file(file.path());
+    CHECK(cfg.get_operator_params().sort_merge_disabled_rules == 0);
+  }
+
+  SECTION("rejected")
+  {
+    auto const [line, message] =
+      GENERATE(std::pair{"sort_merge_disabled_rules: 512", "unknown rule bit"},
+               std::pair{"sort_merge_disabled_rules: -1", "must be non-negative"});
+    CAPTURE(line);
+    temp_config_file const file(operator_params_yaml("    " + std::string(line) + "\n"));
+    sirius_config cfg;
+    CHECK_THROWS_WITH(cfg.load_from_file(file.path()), Catch::Matchers::ContainsSubstring(message));
+    CHECK_THROWS_WITH(cfg.load_from_file(file.path()),
+                      Catch::Matchers::ContainsSubstring("sort_merge_disabled_rules"));
+  }
+}

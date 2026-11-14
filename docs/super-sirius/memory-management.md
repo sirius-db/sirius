@@ -128,7 +128,10 @@ pipeline executor's reschedule path calls it, on OOM only, on the input that wil
 - When it returns `false` (the default), the raised floor is inherited as usual.
 - The retry count increments either way, so the retry limit bounds a run of shrinks.
 
-`merge::windowed_merge_input` is the one override. Each call halves `window_rows` down to 1024
+`merge::windowed_merge_input` is the one override. A task that left window buffers out of its
+estimate for runs sliced in place answers its first OOM by charging them (same sizes, a larger
+estimate; see [Window reservations](#window-reservations)) and returns `true`. Otherwise each
+call halves `window_rows` down to 1024
 rows and `output_target_bytes` down to 16 MiB, and returns `false` once both are at their floors.
 From then on a further OOM raises the floor like any other task's. The shrunk sizes hold for the
 later tasks of the same pass of the partition, which continue the task's merger; the next pass
@@ -254,13 +257,13 @@ memory by its windows, not by the partition.
 working set:
 
 ```
-slot = n × w + cols × (n / 8 + 64)            // rows of one window + a validity mask per column
-     + n × w / 4                              // with a STRING column: 25% chars slack
-     + str_cols × (8 × (n + 1) + 2 × n + 64)  // per STRING column: offsets and the chars minimum
+slot = n × (w − ws) + cols × (n / 8 + 64)     // fixed-width rows of one window + a validity mask per column
+     + 1.25 × n × (ws + str_cols)             // STRING chars: each column's width + 1, plus 25% slack
+     + str_cols × (4 × (n + 1) + 64)          // per STRING column: int32 offsets and the chars minimum
 
 estimate_task_bytes = 2 × (k − g) × slot                // two slots per run read through a window buffer
-                    + 2 × (output_target_bytes + n × w) // accumulated rounds + the concatenated chunk
-                    + 8 × n + (n / 2048 + 2) × (4 + 12 × k)  // gather map and tile co-ranks of one merge
+                    + 2 × (output_target_bytes + r × w) // accumulated rounds + the concatenated chunk
+                    + 8 × r + (r / 2048 + 2) × (4 + 12 × k)  // gather map and tile co-ranks of one merge
                     + fallback bytes                    // runs with a batch that has no row-range reader
 
 estimate_reader_state_bytes = c × (cols × 16 × (n + 2048)  // decode scratch per fetched column
@@ -268,10 +271,27 @@ estimate_reader_state_bytes = c × (cols × 16 × (n + 2048)  // decode scratch 
 ```
 
 `k` is the number of runs the task reads and `g` how many of them need no new window buffer: runs
-of uncompressed GPU tables only (they are windowed in place; a compressed batch on the GPU is read
-into a window buffer like a host or disk batch) and runs whose buffers the partition's kept merger
-already holds. `n` is `window_rows`, `w` the estimated row width of the fetched columns, `cols`
-the number of fetched columns and `str_cols` how many of them are STRING. `c` is the number of
+whose remaining batches are all uncompressed GPU tables on the task's device (they are windowed in
+place; a compressed batch on the GPU is read into a window buffer like a host or disk batch), less
+one, and runs whose buffers the partition's kept merger already holds. `n` is `window_rows`, `r`
+the rows of one round (`round_rows`), `w` the estimated row width of the fetched columns, `ws` the
+part of it that belongs to STRING columns (offsets go to 8 bytes when the chars could pass 2 GiB),
+`cols` the number of fetched columns and `str_cols` how many of them are STRING.
+
+**Runs sliced in place.** A run on the GPU when its task is planned stays in the repository, which
+is spilled first, so it can be on another tier by the time the task locks it. The estimate
+therefore keeps the window buffers of one such run as a spare. If more of them moved, the task
+allocates their buffers beyond its reservation, which succeeds while the device has room. If it
+runs out of memory instead, its first retry keeps its sizes and reserves for every run
+(`windowed_merge_input::shrink_for_retry()` resets the in-place count; counted as a *recharge*,
+not a shrink); only a further OOM halves the sizes. A batch is read-locked for as long as a task
+reads it, so it cannot move during a round.
+
+**Rounds and output.** A round emits at most `r = max(n, output_target_bytes / w)` rows, so one
+round can fill the task's chunk; a round that a batch boundary of a run cuts short is followed by
+another, so a task's output stays below `output_target_bytes + r × w`, and concatenating the
+rounds doubles that for a moment. With rounds sized from the output this is up to twice the
+output target (measured: 2.0 GiB of output and a 4.0 GiB task peak for a 1 GiB target). `c` is the number of
 runs that hold a Simpatico-compressed batch: a compressed run is read through one decode cursor
 per fetched column, which keeps its scratch between refills. The dictionary keys a cursor also
 keeps depend on the data and are not estimated. The fallback term adds, per run, its largest batch

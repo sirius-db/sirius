@@ -747,6 +747,17 @@ constructed operator has no
 provider: it uses the majority space (or the last one it saw, or 8 GiB with a warning when it has
 seen none) and the default GPU executor width.
 
+Two rules apply to that budget at arming:
+
+- **Floor.** The derivation uses at least a quarter of the device's GPU memory
+  (`merge::kBudgetFloorFraction`). The runs are spilled first, so on a full device the free bytes
+  at arming are whatever a downgrade had freed at that instant; without the floor the same query
+  ran with windows several times smaller or larger from one execution to the next.
+- **Divisor.** The budget is divided by the partitions that can be open, not by the executor
+  width: `clamp(partitions that hold batches or are armed, 1, executor threads)`. The same number
+  is the open-partition cap (below), so two partitions under sixteen threads are sized, and
+  opened, as two.
+
 #### Continuation tasks
 
 `_partitions` maps each partition to a `partition_merge_state`, guarded by `_drain_mutex`. It holds
@@ -890,8 +901,12 @@ co-rank and the launch-shape rule off for A/B measurements; no switch changes a 
 One task reads at most `fan_in` runs: the largest count whose windows fit the task budget with `n`
 at its 65,536-row floor, capped by `sort_merge_max_fan_in` and never below 2.
 
-- With more runs than the cap, `merge::plan_pass()` selects the `fan_in` smallest runs by bytes
-  for an **intermediate pass**. Its tasks fetch every column, add their output batches to the same
+- With more runs than the cap, `merge::plan_pass()` selects the smallest runs by bytes for an
+  **intermediate pass**: `fan_in` of them, except that with `R` runs and `(R - 1) mod (fan_in - 1)
+  != 0` the first merge takes `((R - 2) mod (fan_in - 1)) + 2`. After that one short merge every
+  later merge and the final pass read exactly `fan_in` runs (the k-ary Huffman plan, which
+  writes the fewest rows; without it the shortfall lands in the final pass, behind a merge that
+  rewrote nearly every row). Its tasks fetch every column, add their output batches to the same
   partition of the input repository, and publish nothing downstream.
 - The selected runs stay in the pass until they are exhausted. The batches the pass wrote then
   join the partition as one run, and the next pass is planned.

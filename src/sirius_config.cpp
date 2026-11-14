@@ -471,6 +471,13 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (opt.sort_merge_max_fan_in < 2) {
     throw std::runtime_error("'operator_params.sort_merge_max_fan_in': must be at least 2");
   }
+  read_count("sort_merge_disabled_rules", opt.sort_merge_disabled_rules);
+  if ((opt.sort_merge_disabled_rules & ~config::sort_merge_rule::ALL) != 0) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_disabled_rules': unknown rule bit (the "
+      "valid bits are " +
+      std::to_string(config::sort_merge_rule::ALL) + ")");
+  }
   r.optional("sort_key_encoding", opt.sort_key_encoding);
   r.optional("sort_coalesce_runs", opt.sort_coalesce_runs);
   r.optional("sort_coalesce_memory_fraction", opt.sort_coalesce_memory_fraction);

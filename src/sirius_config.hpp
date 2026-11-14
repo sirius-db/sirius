@@ -116,6 +116,27 @@ inline constexpr double DEFAULT_SORT_COALESCE_MEMORY_FRACTION = 0.25;
 /// window-row floor, and clamps it to the kernel's limit (op::merge::kMaxKwayMergeInputs).
 inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 8;
 
+/// Bits of sort_merge_disabled_rules: the sizing and planning rules of the MERGE_SORT merge that
+/// can be switched off one by one (op::merge::merge_rule documents each). A set bit restores the
+/// behaviour from before the rule; the setting exists to measure each rule's effect.
+namespace sort_merge_rule {
+inline constexpr uint64_t HUFFMAN_PLAN           = uint64_t{1} << 0;
+inline constexpr uint64_t BUDGET_FLOOR           = uint64_t{1} << 1;
+inline constexpr uint64_t PARTITION_BUDGET       = uint64_t{1} << 2;
+inline constexpr uint64_t IN_PLACE_RESERVATION   = uint64_t{1} << 3;
+inline constexpr uint64_t ROUND_ROWS             = uint64_t{1} << 4;
+inline constexpr uint64_t ROW_COUNT_GUARD        = uint64_t{1} << 5;
+inline constexpr uint64_t ONE_SHOT_ESTIMATE      = uint64_t{1} << 6;
+inline constexpr uint64_t SINGLE_RUN_PASSTHROUGH = uint64_t{1} << 7;
+inline constexpr uint64_t STRING_SLOT_ESTIMATE   = uint64_t{1} << 8;
+/// Every rule bit.
+inline constexpr uint64_t ALL = (uint64_t{1} << 9) - 1;
+}  // namespace sort_merge_rule
+
+/// Default for sort_merge_disabled_rules: every rule is in force but the one-shot cold-start
+/// estimate, which measured slower (see op::merge::merge_rule::one_shot_estimate).
+inline constexpr uint64_t DEFAULT_SORT_MERGE_DISABLED_RULES = sort_merge_rule::ONE_SHOT_ESTIMATE;
+
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
 /// wins when the left side is much smaller than the right (probe) side.
@@ -269,6 +290,10 @@ struct operator_params {
 
   /// Most runs one merge task reads; a partition with more runs is merged in passes.
   uint64_t sort_merge_max_fan_in = config::DEFAULT_SORT_MERGE_MAX_FAN_IN;
+
+  /// Bit set of config::sort_merge_rule values: the merge rules that are switched off (0 = all
+  /// in force; the default switches off the one-shot cold-start estimate only).
+  uint64_t sort_merge_disabled_rules = config::DEFAULT_SORT_MERGE_DISABLED_RULES;
 
   /// Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix
   /// sorts over an encoding of the keys (SET sort_key_encoding) instead of cuDF's comparison sort.

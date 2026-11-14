@@ -50,7 +50,9 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
                                            std::size_t fallback_bytes,
                                            std::size_t compressed_runs,
                                            std::size_t fetch_columns,
-                                           std::size_t string_columns)
+                                           std::size_t string_columns,
+                                           std::size_t string_row_width,
+                                           bool round_follows_output)
   : _partition(partition),
     _cursors(std::move(cursors)),
     _final_pass(final_pass),
@@ -62,7 +64,9 @@ windowed_merge_input::windowed_merge_input(std::size_t partition,
     _fallback_bytes(fallback_bytes),
     _compressed_runs(compressed_runs),
     _fetch_columns(fetch_columns),
-    _string_columns(string_columns)
+    _string_columns(string_columns),
+    _string_row_width(string_row_width),
+    _round_follows_output(round_follows_output)
 {
 }
 
@@ -75,17 +79,21 @@ void windowed_merge_input::prepare_for_processing(
 std::size_t windowed_merge_input::get_estimated_size_in_bytes() const
 {
   // A run whose window buffers the kept merger holds allocates none, like a run sliced in place.
-  auto const task =
-    estimate_task_bytes(_cursors.size(),
-                        sirius::memory::saturating_add(_gpu_runs, _kept_buffer_runs),
-                        _cfg.window_rows,
-                        _row_width,
-                        _key_row_width,
-                        _cfg.output_target_bytes,
-                        _fallback_bytes,
-                        _fetch_columns,
-                        _string_columns);
-  auto const reader = estimate_reader_state_bytes(
+  // One of the runs sliced in place is charged all the same: the spare for a run that is
+  // spilled between the planning of the task and its read lock.
+  auto const in_place = _gpu_runs > 0 ? _gpu_runs - 1 : std::size_t{0};
+  auto const task     = estimate_task_bytes(_cursors.size(),
+                                        sirius::memory::saturating_add(in_place, _kept_buffer_runs),
+                                        _cfg.window_rows,
+                                        _row_width,
+                                        _key_row_width,
+                                        _cfg.output_target_bytes,
+                                        _fallback_bytes,
+                                        _fetch_columns,
+                                        _string_columns,
+                                        _cfg.round_rows,
+                                        _string_row_width);
+  auto const reader   = estimate_reader_state_bytes(
     _compressed_runs, _fetch_columns, _string_columns, _cfg.window_rows);
   return sirius::memory::saturating_add(task, reader);
 }
@@ -97,14 +105,34 @@ std::size_t windowed_merge_input::get_estimated_working_set_size_in_bytes() cons
 
 bool windowed_merge_input::shrink_for_retry()
 {
-  _kept_buffer_runs        = 0;
+  _kept_buffer_runs = 0;
+  if (_gpu_runs > 0) {
+    // The estimate left out the window buffers of the runs that were on the GPU when the task
+    // was planned. If they were spilled since, that is what the task ran short of: the retry
+    // keeps its sizes and reserves for every run.
+    _gpu_runs = 0;
+    if (_recharge_observer) { _recharge_observer(); }
+    return true;
+  }
   const bool window_shrunk = halve_to_floor(_cfg.window_rows, kShrinkWindowRowsFloor);
   const bool output_shrunk =
     halve_to_floor(_cfg.output_target_bytes, kShrinkOutputTargetBytesFloor);
   if (!window_shrunk && !output_shrunk) { return false; }
+  if (_cfg.round_rows != 0) {
+    _cfg.round_rows = _round_follows_output
+                        ? round_rows_for(_cfg.window_rows, _cfg.output_target_bytes, _row_width)
+                        : std::max(_cfg.round_rows / 2, _cfg.window_rows);
+  }
   if (_shrink_observer) { _shrink_observer(); }
   return true;
 }
+
+void windowed_merge_input::set_recharge_observer(std::function<void()> observer)
+{
+  _recharge_observer = std::move(observer);
+}
+
+std::size_t windowed_merge_input::gpu_runs() const noexcept { return _gpu_runs; }
 
 void windowed_merge_input::set_shrink_observer(std::function<void()> observer)
 {

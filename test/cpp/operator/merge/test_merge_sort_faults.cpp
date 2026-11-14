@@ -98,6 +98,10 @@ namespace utils = sirius::test::operator_utils;
 constexpr std::size_t kMiB = std::size_t{1} << 20;
 constexpr std::size_t kGiB = std::size_t{1} << 30;
 
+/// sort_merge_disabled_rules with only the in-place reservation switched off.
+constexpr std::uint64_t kNoInPlaceReservation =
+  static_cast<std::uint64_t>(merge::merge_rule::in_place_reservation);
+
 // ---------------------------------------------------------------------------
 // Memory: one GPU space with a software limit, a host space and a disk space
 // ---------------------------------------------------------------------------
@@ -1142,10 +1146,13 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   constexpr std::size_t round_bytes  = window_rows * 16;
   constexpr std::size_t free_room    = 4 * kMiB;
   constexpr std::size_t oom_attempts = 2;
+  // Without the in-place reservation every run is charged from the start, so the first retry
+  // shrinks (with it, the first retry charges the runs planned in place: see the tests below).
   oom_scenario s(rows_per_run,
-                 {.mode         = sirius::sort_merge_mode::windowed,
-                  .window_rows  = window_rows,
-                  .output_bytes = output_bytes});
+                 {.mode           = sirius::sort_merge_mode::windowed,
+                  .window_rows    = window_rows,
+                  .output_bytes   = output_bytes,
+                  .disabled_rules = kNoInPlaceReservation});
   scheduler_fixture scheduler(s.fx);
 
   // The first task completes untouched, so the faulted one starts from cursors inside the runs.
@@ -1212,6 +1219,193 @@ TEST_CASE("merge sort task that runs out of memory is retried with smaller windo
   s.require_exact_output();
 }
 
+TEST_CASE("merge sort task that planned runs in place reserves for every run when it is retried",
+          "[merge_sort_faults][oom_reschedule]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  constexpr std::size_t window_rows  = 8192;
+  constexpr std::size_t output_bytes = 32 * kMiB;
+  constexpr std::size_t rows_per_run = 650'000;
+  // Two of the four runs are on the GPU: the task plans to slice them in place.
+  oom_scenario s(rows_per_run,
+                 {.mode         = sirius::sort_merge_mode::windowed,
+                  .window_rows  = window_rows,
+                  .output_bytes = output_bytes});
+  scheduler_fixture scheduler(s.fx);
+
+  auto first          = s.op->get_next_task_input_data();
+  auto const& input   = as_windowed(first);
+  auto const snapshot = input.cursors();
+  REQUIRE(input.gpu_runs() == 2);
+  // One of the two is the spare: three runs are charged, the fourth is not.
+  auto const planned = input.get_estimated_size_in_bytes();
+  REQUIRE(planned == merge::estimate_task_bytes(4, 1, window_rows, 16, 8, output_bytes, 0, 2, 0));
+
+  // Three attempts are starved. The first retry keeps the sizes and charges every run; only the
+  // ones after it shrink.
+  constexpr std::size_t oom_attempts = 3;
+  auto probe                         = s.make_probe(oom_attempts, 4 * kMiB);
+  REQUIRE(scheduler.run(probe, std::move(first)));
+  REQUIRE_FALSE(scheduler.completion->has_error());
+
+  auto const attempts = probe->observed();
+  REQUIRE(attempts.size() == oom_attempts + 1);
+  const std::vector<std::size_t> expected_windows{
+    window_rows, window_rows, window_rows / 2, window_rows / 4};
+  for (std::size_t i = 0; i < attempts.size(); ++i) {
+    CAPTURE(i);
+    CHECK(attempts[i].oom == (i < oom_attempts));
+    CHECK(attempts[i].retry_count == i);
+    CHECK(attempts[i].config.window_rows == expected_windows[i]);
+    // The input changed its own estimate each time, so the reservation floor was not raised.
+    CHECK(attempts[i].retry_floor == 0);
+    CHECK(same_cursors(attempts[i].cursors, snapshot));
+  }
+  auto const counters = s.op->counters();
+  CHECK(counters.recharges == 1);
+  CHECK(counters.shrinks == 2);
+  CHECK(counters.windowed_tasks == 1);
+  CHECK(s.output.num_chunks() == 1);
+
+  s.finish(scheduler);
+  REQUIRE_FALSE(scheduler.completion->has_error());
+  CHECK(s.repo.total_size() == 0);
+  CHECK(s.op->counters().rounds.rows_out == 4 * rows_per_run);
+  CHECK(s.op->counters().recharges == 1);
+  s.require_exact_output();
+}
+
+TEST_CASE("merge sort task completes when the runs it planned in place are spilled before it runs",
+          "[merge_sort_faults][oom_reschedule]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  fault_fixture fx;
+  cucascade::shared_data_repository repo;
+  std::vector<test_run> runs;
+  for (std::size_t i = 0; i < 4; ++i) {
+    runs.push_back(add_sorted_run(
+      repo,
+      *fx.gpu,
+      random_rows(
+        40000, 100000, static_cast<std::int64_t>(i * 40000), static_cast<std::uint32_t>(71 + i))
+        ->view()));
+  }
+  auto op = make_merge(
+    repo,
+    {.mode = sirius::sort_merge_mode::windowed, .window_rows = 2048, .output_bytes = 256 * 1024});
+  merge_output output;
+
+  // Planned with every run on the GPU: no window buffer but the spare run's is reserved.
+  auto first        = op->get_next_task_input_data();
+  auto const& input = as_windowed(first);
+  REQUIRE(input.gpu_runs() == 4);
+  REQUIRE(input.get_estimated_size_in_bytes() ==
+          merge::estimate_task_bytes(4, 3, 2048, 16, 8, 256 * 1024, 0, 2, 0));
+  REQUIRE(input.get_estimated_size_in_bytes() <
+          merge::estimate_task_bytes(4, 0, 2048, 16, 8, 256 * 1024, 0, 2, 0));
+
+  // Before the task locks them, three of the four are spilled: two to the host, one to disk.
+  convert_unlocked_batch<cucascade::host_data_representation>(fx, *runs[0].batches[0], fx.host);
+  convert_unlocked_batch<cucascade::host_data_representation>(fx, *runs[2].batches[0], fx.host);
+  convert_unlocked_batch<cucascade::host_data_representation>(fx, *runs[3].batches[0], fx.host);
+  convert_unlocked_batch<cucascade::disk_data_representation>(fx, *runs[3].batches[0], fx.disk);
+
+  // The task reads them through window buffers it did not reserve; the space has the room.
+  run_task_inline(*op, *first, *fx.gpu, fx.stream_ref(), output);
+  REQUIRE(output.num_chunks() == 1);
+  auto const after_first = op->counters();
+  CHECK(after_first.rounds.refill_rows > 0);
+  CHECK(after_first.rounds.refill_bytes_host > 0);
+  CHECK(after_first.rounds.refill_bytes_disk > 0);
+  CHECK(after_first.rounds.fallback_conversions == 0);
+  CHECK(after_first.recharges == 0);
+
+  // The next task is planned from what the runs are now: one in place, three buffered.
+  auto second = op->get_next_task_input_data();
+  REQUIRE(as_windowed(second).gpu_runs() == 1);
+  // While that task waits, the last GPU run is spilled too, and a spilled one comes back.
+  convert_unlocked_batch<cucascade::host_data_representation>(fx, *runs[1].batches[0], fx.host);
+  convert_unlocked_batch<cucascade::gpu_table_representation>(fx, *runs[0].batches[0], fx.gpu);
+  run_task_inline(*op, *second, *fx.gpu, fx.stream_ref(), output);
+
+  for (std::size_t task = 0;; ++task) {
+    REQUIRE(task < 1000);
+    auto next = op->get_next_task_input_data();
+    if (!next) { break; }
+    // Keep moving a run between two tasks, in both directions.
+    auto& moving = *runs[task % 4].batches[0];
+    if (auto mut = moving.try_to_mutable(); mut.has_value()) {
+      if (mut->get_current_tier() == Tier::GPU) {
+        mut->convert_to<cucascade::host_data_representation>(
+          sirius::converter_registry::get(), fx.host, fx.stream_ref());
+      } else if (mut->get_current_tier() == Tier::HOST) {
+        mut->convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), fx.gpu, fx.stream_ref());
+      }
+    }
+    fx.stream.synchronize();
+    run_task_inline(*op, *next, *fx.gpu, fx.stream_ref(), output);
+  }
+  CHECK(output.num_chunks() > 3);
+  CHECK(repo.total_size() == 0);
+  CHECK(op->counters().rounds.rows_out == 4 * 40000);
+
+  auto const expected = expected_full_sort(runs, ascending_key());
+  auto const merged   = output.partition_table(0);
+  REQUIRE(merged->num_rows() == expected->num_rows());
+  REQUIRE(tables_equal(merged->view(), expected->view()));
+}
+
+TEST_CASE("merge sort with in-place reservations stays exact while the downgrade executor spills",
+          "[merge_sort_faults][oom_reschedule]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  // Derived sizes (no explicit window): tasks plan their GPU runs in place while the sweep moves
+  // runs between planning and execution. Seven runs under a fan-in of three, so that every
+  // partition takes several tasks; with a derived window a partition of this size that fits
+  // the fan-in is merged by one task, which leaves the sweep nothing to race.
+  constexpr std::size_t num_partitions = 3;
+  constexpr std::uint64_t fan_in       = 3;
+  downgrade_race<intermediate_run_repository> race({
+    .num_partitions = num_partitions,
+    .runs_per_part  = 7,
+    .rows_per_run   = 30000,
+    .merge          = {.mode         = sirius::sort_merge_mode::windowed,
+                       .output_bytes = 256 * 1024,
+                       .max_fan_in   = fan_in},
+    .workers        = 3,
+  });
+
+  race.run();
+
+  INFO("merge error: " << race.error);
+  REQUIRE(race.error.empty());
+  CHECK(race.tasks_done.load() > num_partitions);
+  CHECK(race.requests_during_merge.load() > 0);
+  CHECK(race.repo->total_size() == 0);
+  REQUIRE_FALSE(race.op->get_next_task_input_data());
+  auto const counters = race.op->counters();
+  CHECK(counters.windowed_partitions == num_partitions);
+  // Seven runs at fan-in 3 are merged 3 + 3 + 3: two intermediate merges and the final pass.
+  CHECK(counters.intermediate_tasks >= 2 * num_partitions);
+
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    CAPTURE(p);
+    auto const merged = race.output.partition_table(p);
+    auto const keys   = cudf::table_view{{merged->view().column(0)}};
+    REQUIRE(cudf::is_sorted(keys, {cudf::order::ASCENDING}, {cudf::null_order::AFTER}));
+    std::vector<cudf::table_view> inputs;
+    for (auto const& run : race.runs[p]) {
+      inputs.push_back(run.rows->view());
+    }
+    auto const all      = cudf::concatenate(inputs);
+    auto const expected = cudf::sort(all->view());
+    auto const actual   = cudf::sort(merged->view());
+    REQUIRE(actual->num_rows() == expected->num_rows());
+    REQUIRE(tables_equal(actual->view(), expected->view()));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 5. OOM at the shrink floor
 // ---------------------------------------------------------------------------
@@ -1224,9 +1418,10 @@ TEST_CASE("merge sort task at its shrink floor escalates the reservation floor a
   constexpr std::size_t window_rows  = 2 * merge::kShrinkWindowRowsFloor;
   constexpr std::size_t output_floor = 16 * kMiB;
   oom_scenario s(150'000,
-                 {.mode         = sirius::sort_merge_mode::windowed,
-                  .window_rows  = window_rows,
-                  .output_bytes = output_floor});
+                 {.mode           = sirius::sort_merge_mode::windowed,
+                  .window_rows    = window_rows,
+                  .output_bytes   = output_floor,
+                  .disabled_rules = kNoInPlaceReservation});
   scheduler_fixture scheduler(s.fx);
 
   auto input = s.op->get_next_task_input_data();
@@ -1265,9 +1460,10 @@ TEST_CASE("merge sort task that keeps running out of memory fails at the retry l
   if (!has_gpu()) { SKIP("No GPU available"); }
   constexpr std::size_t retry_limit = 3;
   oom_scenario s(150'000,
-                 {.mode         = sirius::sort_merge_mode::windowed,
-                  .window_rows  = merge::kShrinkWindowRowsFloor,
-                  .output_bytes = 16 * kMiB});
+                 {.mode           = sirius::sort_merge_mode::windowed,
+                  .window_rows    = merge::kShrinkWindowRowsFloor,
+                  .output_bytes   = 16 * kMiB,
+                  .disabled_rules = kNoInPlaceReservation});
   scheduler_fixture scheduler(s.fx);
   auto injections                       = std::make_shared<sirius::op::scan::test_injections>();
   injections->gpu_task_retry_limit      = retry_limit;

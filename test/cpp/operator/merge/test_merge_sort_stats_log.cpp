@@ -317,10 +317,15 @@ TEST_CASE("merge sort counts the window shrinks of its tasks retried after an OO
 {
   // One halving away from the window floor, and already at the 16 MiB output floor.
   constexpr std::size_t window_rows = 2 * merge::kShrinkWindowRowsFloor;
-  stats_log_fixture test({.mode         = sirius::sort_merge_mode::windowed,
-                          .window_rows  = window_rows,
-                          .output_bytes = 16 * kMiB},
-                         1);
+  // Every run is charged its window buffers from the start (the in-place reservation is off),
+  // so the first retry shrinks. With it on, the first retry of a task that planned runs in
+  // place keeps its sizes and is counted as a recharge, not as a shrink.
+  stats_log_fixture test(
+    {.mode           = sirius::sort_merge_mode::windowed,
+     .window_rows    = window_rows,
+     .output_bytes   = 16 * kMiB,
+     .disabled_rules = static_cast<std::uint64_t>(merge::merge_rule::in_place_reservation)},
+    1);
   for (std::size_t r = 0; r < 4; ++r) {
     test.add_run(0, 5000, static_cast<std::uint32_t>(60 + r));
   }
