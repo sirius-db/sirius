@@ -153,7 +153,7 @@ TEST_CASE("sort_boundaries serves the owner GPU from the copy it was built with"
 TEST_CASE("sort_boundaries gives a second GPU its own copy, once", "[sort_boundaries][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
-  auto manager = initialize_memory_manager(2);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager(2);
   auto* space0 = manager->get_memory_space(Tier::GPU, 0);
   auto* space1 = manager->get_memory_space(Tier::GPU, 1);
   REQUIRE(space0 != nullptr);
@@ -198,7 +198,7 @@ TEST_CASE("SORT_PARTITION splits a batch on a GPU other than the one that sample
           "[sort_boundaries][physical_sort_partition][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
-  auto manager = initialize_memory_manager(2);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager(2);
   auto* space0 = manager->get_memory_space(Tier::GPU, 0);
   auto* space1 = manager->get_memory_space(Tier::GPU, 1);
   REQUIRE(space0 != nullptr);
