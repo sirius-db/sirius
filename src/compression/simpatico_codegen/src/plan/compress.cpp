@@ -21,6 +21,7 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/plan/validity.hpp"
 #include "codegen/util/nvtx.hpp"
+#include "operators/onpair_representation.hpp"
 
 #include <cudf/column/column_factories.hpp>
 
@@ -499,6 +500,26 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
       return;
     }
     col_to_compress = temp_col->view();
+  }
+
+  // A string-aligned OnPair parse reads the strings' offsets from str_split's offsets
+  // channel: the str_split rep stays alive until its chars, being compressed here, are.
+  std::vector<compressible_output> parent_channels;
+  if (auto* onpair = dynamic_cast<onpair_compressor*>(compressor.get());
+      onpair && onpair->config.string_aligned) {
+    PlanNode const& parent           = tree.nodes[input_val.node];
+    auto const rep_it                = reprs_by_input.find(ValueId{input_val.node, 0});
+    cudf::column_view const* offsets = nullptr;
+    if (parent.op == "str_split" && input_val.channel < parent.output_names.size() &&
+        parent.output_names[input_val.channel] == "chars" && rep_it != reprs_by_input.end()) {
+      parent_channels = rep_it->second->named_channels(stream);
+      offsets         = find_named_channel(parent_channels, "offsets");
+    }
+    if (!offsets) {
+      set_error("compressor '" + node.op + "' needs str_split's chars as its input");
+      return;
+    }
+    onpair->string_offsets = *offsets;
   }
 
   auto repr = compressor->compress(col_to_compress, stream, mr);

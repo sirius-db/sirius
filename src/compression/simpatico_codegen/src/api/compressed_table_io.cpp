@@ -89,6 +89,7 @@ struct Reader {
 // ---------------------------------------------------------------------------
 // leaf_meta_v ↔ binary encoding
 // meta_kind tags: 0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
+// 8=onpair
 // ---------------------------------------------------------------------------
 enum : std::uint8_t {
   META_NONE     = 0,
@@ -99,6 +100,7 @@ enum : std::uint8_t {
   META_SNAPPY   = 5,
   META_LZ4      = 6,
   META_DEFLATE  = 7,
+  META_ONPAIR   = 8,
 };
 
 static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
@@ -152,6 +154,16 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, META_DEFLATE);
       push_le(v, d.uncompressed_size);
       push_le(v, d.original_type_id);
+    }
+    void operator()(leaf_meta::onpair const& o)
+    {
+      push_le(v, META_ONPAIR);
+      push_le(v, o.uncompressed_size);
+      push_le(v, o.original_type_id);
+      push_le(v, o.n_tokens);
+      push_le(v, o.code_bits);
+      push_le(v, o.w);
+      push_le(v, o.string_aligned);
     }
   };
   std::visit(Visitor{v}, m);
@@ -214,6 +226,15 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
       std::int32_t ti;
       if (!r.read_le(us) || !r.read_le(ti)) return false;
       out = leaf_meta::deflate{us, ti};
+      return true;
+    }
+    case META_ONPAIR: {
+      leaf_meta::onpair o;
+      if (!r.read_le(o.uncompressed_size) || !r.read_le(o.original_type_id) ||
+          !r.read_le(o.n_tokens) || !r.read_le(o.code_bits) || !r.read_le(o.w) ||
+          !r.read_le(o.string_aligned))
+        return false;
+      out = o;
       return true;
     }
     default: return false;
@@ -343,7 +364,10 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 15: a ZigZag output no fused op consumes is stored like Delta's and FOR's, as a Raw
 //     passthrough {data, offsets} parked on the ZigZag node, instead of as a "zigzag"
 //     buffer on the ZigZag node's own rep.
-static constexpr std::uint8_t kVersion = 15;
+//
+// 16: an OnPair leaf (META_ONPAIR) records its uncompressed size, original type, code
+//     count and width, dictionary plane layout and whether it is string-aligned.
+static constexpr std::uint8_t kVersion = 16;
 
 // Per-column validity record, written right after num_rows:
 //

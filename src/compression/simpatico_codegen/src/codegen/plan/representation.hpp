@@ -106,7 +106,9 @@ struct compressible_output {
 /// This exists so a dictionary-compressed column consumed only by an equality /
 /// IN predicate never pays the decode gather: the predicate is resolved against
 /// the (tiny) key set and mapped over the indices. See
-/// @c dictionary_compressed_representation::decompress_predicate. Every other
+/// @c dictionary_compressed_representation::decompress_predicate. String-aligned
+/// OnPair chars under str_split (`onpair_strings`) compare codes instead, see
+/// @c onpair_compressed_representation::equal_any. Every other
 /// representation falls back to "decode, then compare", which is correct but
 /// buys nothing — so callers should gate the pushdown on
 /// @c plan_supports_predicate_decode.
