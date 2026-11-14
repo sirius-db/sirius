@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sirius Fuzz and Fix"
+  short_description: "Fuzz on a GPU host and fix confirmed SQL defects"
+  default_prompt: "Use $sirius-fuzz-fix to run a bounded SQL correctness campaign on an available GPU, fix distinct confirmed defects, validate the saved findings, and prepare contributor-fork PRs for review. Check with me before any publication that I have not already approved."
