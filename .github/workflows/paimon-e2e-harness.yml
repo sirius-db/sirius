@@ -1,0 +1,37 @@
+name: Paimon E2E harness
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/paimon-e2e-harness.yml
+      - test/paimon_e2e/**
+      - test/cpp/integration/data/paimon_conformance/*.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/paimon-e2e-harness.yml
+      - test/paimon_e2e/**
+      - test/cpp/integration/data/paimon_conformance/*.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paimon-e2e-harness-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  runner-protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
+        with:
+          pixi-version: v0.81.0
+          manifest-path: test/paimon_e2e/pixi.toml
+          locked: true
+          cache: false
+      - name: Exercise launcher and offline checker paths (CPU only)
+        run: pixi run --locked --manifest-path test/paimon_e2e/pixi.toml test
