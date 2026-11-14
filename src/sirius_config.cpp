@@ -434,6 +434,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
              yaml::fraction<double>{});
+  r.optional("sort_partition_auto_sizing", opt.sort_partition_auto_sizing);
   if (std::string mode; r.optional("sort_merge_mode", mode), !mode.empty()) {
     auto const parsed = parse_sort_merge_mode(mode);
     if (!parsed) {

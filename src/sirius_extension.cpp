@@ -2698,6 +2698,14 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                    params->max_sort_partition_memory_fraction);
 }
 
+static void SetSortPartitionAutoSizing(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->sort_partition_auto_sizing = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_partition_auto_sizing to {}",
+                   params->sort_partition_auto_sizing);
+}
+
 static void SetSortMergeMode(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const value  = StringValue::Get(parameter);
@@ -3594,10 +3602,17 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetMaxSortPartitionBytes);
   config.AddExtensionOption(
     "max_sort_partition_memory_fraction",
-    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
+    "Fraction of a GPU's memory limit per sort partition when max_sort_partition_bytes is 0",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
+  config.AddExtensionOption(
+    "sort_partition_auto_sizing",
+    "Choose the number of sort partitions from the GPU memory limit, the merge tasks that can run "
+    "at once and the cuDF row limit (false = from the GPU memory free when the sort is sampled)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_partition_auto_sizing),
+    SetSortPartitionAutoSizing);
 
   // Add in config options for the MERGE_SORT merge path
   config.AddExtensionOption(
@@ -3658,12 +3673,11 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.sort_coalesce_memory_fraction),
     SetSortCoalesceMemoryFraction);
-  config.AddExtensionOption(
-    "sort_coalesce_string_keys",
-    "Coalesce ORDER BY runs also when a sort key is a string",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.sort_coalesce_string_keys),
-    SetSortCoalesceStringKeys);
+  config.AddExtensionOption("sort_coalesce_string_keys",
+                            "Coalesce ORDER BY runs also when a sort key is a string",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(operator_defaults.sort_coalesce_string_keys),
+                            SetSortCoalesceStringKeys);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",

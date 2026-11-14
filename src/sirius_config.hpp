@@ -78,8 +78,15 @@ constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
-/// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
+/// Fraction of a GPU's memory limit used per sort partition when max_sort_partition_bytes is 0.
+/// (With sort_partition_auto_sizing off: of the GPU memory free when the boundaries are computed.)
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
+
+/// Default for sort_partition_auto_sizing: SORT_SAMPLE derives the number of range partitions from
+/// the GPU memory limit, the number of merge tasks that can run at once and the cuDF row limit
+/// (op::compute_sort_partition_sizing). Off restores the previous rule: the data size over
+/// max_sort_partition_memory_fraction of the GPU memory free at that moment.
+constexpr bool DEFAULT_SORT_PARTITION_AUTO_SIZING = true;
 
 /// Default for sort_coalesce_memory_fraction: the share of one GPU's memory that the inputs of the
 /// local sorts running at the same time may add up to. One sorted run is at most this fraction
@@ -234,8 +241,12 @@ struct operator_params {
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
 
-  /// Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0.
+  /// Fraction of a GPU's memory limit per sort partition when max_sort_partition_bytes is 0.
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  /// Automatic choice of the sort partition count (SET sort_partition_auto_sizing); false = the
+  /// previous rule based on the GPU memory free when the boundaries are computed.
+  bool sort_partition_auto_sizing = config::DEFAULT_SORT_PARTITION_AUTO_SIZING;
 
   /// Merge path for MERGE_SORT (SET sort_merge_mode): auto, windowed or one_shot.
   sort_merge_mode sort_merge_mode_setting = sort_merge_mode::automatic;
@@ -265,9 +276,10 @@ struct operator_params {
   /// most this fraction of the GPU divided by the GPU executor thread count.
   double sort_coalesce_memory_fraction = config::DEFAULT_SORT_COALESCE_MEMORY_FRACTION;
 
-  /// Whether runs are also coalesced when a sort key is a string. Without sort_key_encoding, cuDF sorts string keys with a
-  /// comparison sort whose cost per row grows with the run size, but a run that holds a string
-  /// column is kept below 2^31 bytes, and at that size the saved merge passes outweigh it.
+  /// Whether runs are also coalesced when a sort key is a string. Without sort_key_encoding, cuDF
+  /// sorts string keys with a comparison sort whose cost per row grows with the run size, but a run
+  /// that holds a string column is kept below 2^31 bytes, and at that size the saved merge passes
+  /// outweigh it.
   bool sort_coalesce_string_keys = true;
 
   /// Target size (bytes) per hash partition for joins and group-bys.

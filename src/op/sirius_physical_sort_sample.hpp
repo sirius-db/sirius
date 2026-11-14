@@ -38,6 +38,93 @@
 namespace sirius {
 namespace op {
 
+/**
+ * @brief What SORT_SAMPLE derives the number of range partitions from, besides the data size
+ *
+ * Set by the plan generator; the defaults describe an operator built without an engine context.
+ */
+struct sort_partition_policy {
+  //! false: the previous rule, data bytes over max_sort_partition_memory_fraction of the GPU
+  //! memory free when the boundaries are computed (SET sort_partition_auto_sizing = false)
+  bool auto_sizing = true;
+  //! Merge tasks one GPU runs at once: the executor threads per GPU (0 = unknown)
+  std::size_t merge_concurrency = 0;
+  //! Every partition takes the one-shot merge (sort_merge_mode = 'one_shot'), which holds a whole
+  //! partition, its merge temporaries and its output on one GPU
+  bool one_shot_only = false;
+  //! Every partition takes the windowed merge (sort_merge_mode = 'windowed'). Only then does the
+  //! concurrency term apply: in 'auto' mode smaller partitions fall under the one-shot threshold,
+  //! and several one-shot merges at once are slower than fewer windowed ones (they run out of
+  //! GPU memory and retry).
+  bool windowed_only = false;
+  //! In 'auto' mode, the largest partition (bytes) that takes the one-shot merge; larger ones are
+  //! merged in windows (0 = unknown). Set when neither flag above is.
+  std::size_t auto_one_shot_partition_bytes = 0;
+};
+
+//! Inputs of compute_sort_partition_sizing()
+struct sort_partition_sizing_input {
+  std::size_t data_bytes          = 0;  ///< estimated bytes of the whole sort input
+  std::size_t data_rows           = 0;  ///< estimated rows of the whole sort input (0 = unknown)
+  std::size_t avg_batch_bytes     = 0;  ///< average bytes of one sorted input batch (0 = unknown)
+  std::size_t gpu_capacity_bytes  = 0;  ///< memory limit of one GPU
+  std::size_t gpu_available_bytes = 0;  ///< GPU memory free right now (previous rule only)
+  std::size_t max_partition_bytes_override = 0;  ///< max_sort_partition_bytes (0 = automatic)
+  double memory_fraction                   = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+  sort_partition_policy policy;
+};
+
+//! Result of compute_sort_partition_sizing()
+struct sort_partition_sizing {
+  std::size_t num_partitions      = 1;
+  std::size_t max_partition_bytes = 0;         ///< the byte bound applied (0 = none)
+  const char* rule                = "single";  ///< the term that decided the count, for the log
+};
+
+//! Largest partition the concurrency term creates: it never cuts the data into partitions
+//! smaller than this just to give every merge thread one. With a single BIGINT key, 8 GiB in 4
+//! partitions merges faster than in 1, while 4 GiB takes the same time in 2, 3 or 5.
+inline constexpr std::size_t kSortPartitionMinConcurrencyBytes = std::size_t{2} << 30;
+
+//! Smallest piece (input batch bytes / partitions) the concurrency term accepts: below it every
+//! batch is cut into pieces whose per-piece handling costs more than the merge gains.
+inline constexpr std::size_t kSortPartitionMinPieceBytes = std::size_t{4} << 20;
+
+//! Most partitions the concurrency term asks for. With 4 executor threads per GPU, 4 partitions
+//! were the fastest on 1, 2 and 4 GPUs; 8 were equal or slower and 16 slower than 2 on 4 GPUs, so
+//! the term does not grow with the number of GPUs.
+inline constexpr std::size_t kSortPartitionMaxConcurrency = 4;
+
+//! Rows per partition the automatic sizing aims below: three quarters of the cuDF column limit
+//! (2^31 - 1 rows), leaving room for partitions that come out larger than the sample predicts.
+inline constexpr std::size_t kSortPartitionMaxRows = (std::size_t{1} << 31) / 4 * 3;
+
+//! One-shot merges the automatic sizing leaves room for on one GPU at the same time
+inline constexpr std::size_t kSortPartitionOneShotConcurrentMerges = 2;
+
+/**
+ * @brief Number of range partitions for a sort of the given size
+ *
+ * max_sort_partition_bytes, when set, decides alone: ceil(data / override). Otherwise, with
+ * policy.auto_sizing off, the previous rule applies: ceil(data / (fraction x free GPU memory)).
+ * With auto sizing the count is the largest of
+ *  - memory: ceil(data / (fraction x GPU memory limit)); the limit, not the free memory of one
+ *    moment, so the count does not change from run to run under memory pressure;
+ *  - one-shot (policy.one_shot_only): a one-shot merge needs 3 x partition bytes + 8 bytes per row
+ *    on the GPU, so partitions are at most limit / ((3 + 8 / row width) x 2 concurrent merges);
+ *  - rows, where partitions take the one-shot merge (policy.one_shot_only, or 'auto' mode with
+ *    partitions at or below policy.auto_one_shot_partition_bytes): ceil(rows /
+ *    kSortPartitionMaxRows), because a one-shot merge makes one cuDF table of the partition. The
+ *    windowed merge has no such limit, and cutting its partitions smaller would move them to the
+ *    one-shot merge in 'auto' mode;
+ *  - concurrency (policy.windowed_only): one partition per merge task a GPU runs at once
+ *    (min(policy.merge_concurrency, kSortPartitionMaxConcurrency)), but no partition smaller than
+ *    kSortPartitionMinConcurrencyBytes and no piece of an input batch smaller than
+ *    kSortPartitionMinPieceBytes.
+ */
+[[nodiscard]] sort_partition_sizing compute_sort_partition_sizing(
+  const sort_partition_sizing_input& input);
+
 class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
@@ -67,6 +154,10 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
+
+  //! How the partition count is chosen; set by the plan generator before execution
+  void set_partition_policy(const sort_partition_policy& policy) { _partition_policy = policy; }
+  [[nodiscard]] const sort_partition_policy& partition_policy() const { return _partition_policy; }
 
  public:
   bool is_source() const override { return true; }
@@ -154,8 +245,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override for max partition bytes (0 = use GPU memory fraction)
   size_t _max_partition_bytes_override = 0;
 
-  //! Fraction of available GPU memory per partition (from sirius_config operator_params)
+  //! Fraction of a GPU's memory limit per partition (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  //! Concurrency, merge route and rule selection for the partition count
+  sort_partition_policy _partition_policy;
 };
 
 }  // namespace op

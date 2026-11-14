@@ -66,7 +66,86 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
   return false;
 }
 
+std::size_t ceil_div(std::size_t numerator, std::size_t denominator)
+{
+  return denominator == 0 ? 1 : (numerator + denominator - 1) / denominator;
+}
+
 }  // namespace
+
+sort_partition_sizing compute_sort_partition_sizing(const sort_partition_sizing_input& input)
+{
+  sort_partition_sizing result;
+  auto const bytes = input.data_bytes;
+  auto raise       = [&result](std::size_t partitions, const char* rule) {
+    if (partitions > result.num_partitions) {
+      result.num_partitions = partitions;
+      result.rule           = rule;
+    }
+  };
+
+  // An explicit partition size decides alone.
+  if (input.max_partition_bytes_override > 0) {
+    result.max_partition_bytes = input.max_partition_bytes_override;
+    raise(ceil_div(bytes, result.max_partition_bytes), "max_sort_partition_bytes");
+    return result;
+  }
+
+  if (!input.policy.auto_sizing) {
+    // Previous rule: a fraction of the GPU memory free at this moment.
+    result.max_partition_bytes = static_cast<std::size_t>(
+      static_cast<double>(input.gpu_available_bytes) * input.memory_fraction);
+    if (result.max_partition_bytes > 0) {
+      raise(ceil_div(bytes, result.max_partition_bytes), "fraction_of_free");
+    }
+    return result;
+  }
+
+  // Memory: a fraction of the GPU's limit. Without a known limit, fall back to the free memory.
+  auto const capacity =
+    input.gpu_capacity_bytes > 0 ? input.gpu_capacity_bytes : input.gpu_available_bytes;
+  result.max_partition_bytes =
+    static_cast<std::size_t>(static_cast<double>(capacity) * input.memory_fraction);
+  if (result.max_partition_bytes > 0) {
+    raise(ceil_div(bytes, result.max_partition_bytes), "fraction_of_limit");
+  }
+
+  // One-shot merges hold the partition, the merge temporaries and the output on one GPU:
+  // 3 x bytes + 8 bytes per row, for kSortPartitionOneShotConcurrentMerges merges at once.
+  if (input.policy.one_shot_only && capacity > 0 && input.data_rows > 0 && bytes > 0) {
+    auto const row_width      = static_cast<double>(bytes) / static_cast<double>(input.data_rows);
+    auto const one_shot_bytes = static_cast<std::size_t>(
+      static_cast<double>(capacity) /
+      ((3.0 + 8.0 / row_width) * static_cast<double>(kSortPartitionOneShotConcurrentMerges)));
+    if (one_shot_bytes > 0 && one_shot_bytes < result.max_partition_bytes) {
+      result.max_partition_bytes = one_shot_bytes;
+    }
+    if (one_shot_bytes > 0) { raise(ceil_div(bytes, one_shot_bytes), "one_shot_memory"); }
+  }
+
+  // Rows: a one-shot merge makes one cuDF table of its partition. Windowed merges are not
+  // limited, and are left alone: smaller partitions would switch to the one-shot merge in auto
+  // mode.
+  auto const one_shot_route =
+    input.policy.one_shot_only ||
+    (!input.policy.windowed_only && input.policy.auto_one_shot_partition_bytes > 0 &&
+     bytes / result.num_partitions <= input.policy.auto_one_shot_partition_bytes);
+  if (one_shot_route && input.data_rows > kSortPartitionMaxRows * result.num_partitions) {
+    raise(ceil_div(input.data_rows, kSortPartitionMaxRows), "row_limit");
+  }
+
+  // Concurrency: one partition per merge task a GPU runs at once, while partitions and the
+  // pieces each input batch is cut into stay large enough for that to pay.
+  if (input.policy.windowed_only && input.policy.merge_concurrency > 1) {
+    auto wanted = std::min(input.policy.merge_concurrency, kSortPartitionMaxConcurrency);
+    wanted      = std::min(wanted, bytes / kSortPartitionMinConcurrencyBytes);
+    if (input.avg_batch_bytes > 0) {
+      wanted = std::min(wanted, input.avg_batch_bytes / kSortPartitionMinPieceBytes);
+    }
+    raise(wanted, "merge_concurrency");
+  }
+  return result;
+}
 
 sirius_physical_sort_sample::~sirius_physical_sort_sample() { clear_partition_boundaries(); }
 
@@ -267,32 +346,36 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
         bytes_for_sizing  = avg_batch_bytes * total_batch_count;
       }
-      size_t available_memory    = space->get_available_memory(stream);
-      size_t max_partition_bytes = _max_partition_bytes_override > 0
-                                     ? _max_partition_bytes_override
-                                     : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           _max_partition_memory_fraction);
+      sort_partition_sizing_input sizing_input;
+      sizing_input.data_bytes          = bytes_for_sizing;
+      sizing_input.data_rows           = complete_input ? total_rows : estimated_cardinality;
+      sizing_input.avg_batch_bytes     = avg_batch_bytes;
+      sizing_input.gpu_capacity_bytes  = space->get_max_memory();
+      sizing_input.gpu_available_bytes = space->get_available_memory(stream);
+      sizing_input.max_partition_bytes_override = _max_partition_bytes_override;
+      sizing_input.memory_fraction              = _max_partition_memory_fraction;
+      sizing_input.policy                       = _partition_policy;
+      auto const sizing                         = compute_sort_partition_sizing(sizing_input);
+      // One boundary row is needed per partition after the first.
+      num_parts = std::min(sizing.num_partitions, std::max<size_t>(1, total_rows));
 
-      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
-        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
-      }
-      num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
-
-      SIRIUS_LOG_DEBUG(
-        "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
-        "avg_rows_per_batch={}, "
-        "avg_batch_bytes={}, total_batch_count={}, "
-        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
-        complete_input,
-        estimated_cardinality,
-        total_rows,
-        avg_rows_per_batch,
-        avg_batch_bytes,
-        total_batch_count,
-        bytes_for_sizing,
-        available_memory,
-        max_partition_bytes,
-        num_parts);
+      SIRIUS_LOG_INFO(
+        "[sort_sample][sizing] partitions={} rule={} max_partition_bytes={} data_bytes={} "
+        "data_rows={} avg_batch_bytes={} gpu_limit_bytes={} gpu_free_bytes={} "
+        "merge_concurrency={} merge_mode={} auto_sizing={} complete_input={}",
+        num_parts,
+        sizing.rule,
+        sizing.max_partition_bytes,
+        sizing_input.data_bytes,
+        sizing_input.data_rows,
+        sizing_input.avg_batch_bytes,
+        sizing_input.gpu_capacity_bytes,
+        sizing_input.gpu_available_bytes,
+        _partition_policy.merge_concurrency,
+        _partition_policy.one_shot_only ? "one_shot"
+                                        : (_partition_policy.windowed_only ? "windowed" : "auto"),
+        _partition_policy.auto_sizing ? 1 : 0,
+        complete_input ? 1 : 0);
     }
 
     // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)

@@ -108,7 +108,7 @@ sirius:
     task_creator: { num_threads: 1 }
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
-    max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
+    max_sort_partition_bytes:   0           # 0 = auto (see sort_partition_auto_sizing)
     sort_merge_mode:            auto        # auto | windowed | one_shot (see Sort Merge)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
@@ -621,7 +621,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
-| `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
+| `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. 0 = chosen automatically, see `sort_partition_auto_sizing`. A non-zero value fixes the count at data bytes / this value. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
@@ -629,7 +629,8 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
-| `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_memory_fraction` | 0.33 | Largest sort partition as a fraction of one GPU's memory limit when `max_sort_partition_bytes` is 0 |
+| `sort_partition_auto_sizing` | true | How the number of ORDER BY range partitions is chosen when `max_sort_partition_bytes` is 0. true: enough partitions to keep each one under `max_sort_partition_memory_fraction` of a GPU's memory limit (and, where the one-shot merge is used, under the cuDF row limit and its GPU memory need), and, with `sort_merge_mode = 'windowed'`, one partition per executor thread of a GPU (at most 4) once the data is large enough for that to pay (no partition under 2 GiB). false: the previous rule, data bytes over the fraction of the GPU memory free at the moment the sort is sampled. |
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY: order string keys and multi-column keys by radix sorts over an encoding of the keys instead of cuDF's comparison sort. `false` is for A/B comparison. |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each, so a range partition receives few large sorted runs instead of one per input batch. See [Sort Run Coalescing](#sort-run-coalescing). |
 | `sort_coalesce_memory_fraction` | 0.25 | Share of one GPU's memory for the inputs of the local sorts running at the same time: one run is at most this fraction of the GPU divided by the GPU executor thread count. In (0, 1]. |
@@ -1013,7 +1014,8 @@ SET enable_compressed_materialization = false;
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
-| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction (of a GPU's memory limit) when `max_sort_partition_bytes` is 0 |
+| `sort_partition_auto_sizing` | true | Automatic sort partition count from the GPU memory limit, merge concurrency and the cuDF row limit; false = previous rule (free GPU memory at sampling time) |
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY uses radix sorts over an encoding of string and multi-column keys; `false` uses cuDF's comparison sort (A/B comparison) |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each; see [Sort Run Coalescing](#sort-run-coalescing) |
 | `sort_coalesce_memory_fraction` | 0.25 | One coalesced run is at most this fraction of the GPU memory limit divided by the GPU executor thread count; in (0, 1] |

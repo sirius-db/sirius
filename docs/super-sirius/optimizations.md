@@ -41,7 +41,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_sort_partition.cpp` — range partitioning
 - `src/op/sirius_physical_merge_sort.cpp` — multi-way merge
 
-**Config:** `max_sort_partition_bytes` (default: auto, 33% of GPU memory)
+**Config:** `max_sort_partition_bytes` (default: auto), `max_sort_partition_memory_fraction`, `sort_partition_auto_sizing`; the automatic partition count is described under [SORT_SAMPLE](operators.md#sirius_physical_sort_sample--sort_sample)
 
 ### SORT_SAMPLE Byte-Based Merge Sampling (PRs #876, #886)
 

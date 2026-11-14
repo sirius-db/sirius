@@ -1538,8 +1538,8 @@ std::optional<sirius::op::sort_run_limits> order_by_run_limits(
   }
   // A task may land on any GPU: size a run for the smallest one.
   std::size_t gpu_bytes = 0;
-  for (auto const* space : sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(
-         cucascade::memory::Tier::GPU)) {
+  for (auto const* space :
+       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
     if (gpu_bytes == 0 || space->get_max_memory() < gpu_bytes) {
       gpu_bytes = space->get_max_memory();
     }
@@ -1605,6 +1605,30 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       op_params.max_sort_partition_bytes,
       op_params.max_sort_partition_memory_fraction);
     auto* sample_ptr = sample.get();
+    {
+      // What the partition count is derived from besides the data size: how many merge tasks a
+      // GPU runs at once, and which merge every partition takes (a one-shot merge must hold a
+      // whole partition on one GPU; only windowed merges gain from one partition per thread).
+      sirius::op::sort_partition_policy policy;
+      policy.auto_sizing   = op_params.sort_partition_auto_sizing;
+      policy.one_shot_only = op_params.sort_merge_mode_setting == sirius::sort_merge_mode::one_shot;
+      policy.windowed_only = op_params.sort_merge_mode_setting == sirius::sort_merge_mode::windowed;
+      if (sirius_ctx != nullptr && sirius_ctx->is_initialized()) {
+        policy.merge_concurrency = static_cast<std::size_t>(
+          std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+        if (!policy.one_shot_only && !policy.windowed_only) {
+          // 'auto': MERGE_SORT takes the one-shot merge when partition + output fit this share of
+          // the GPU (merge::choose_route); the output is as large as the partition.
+          auto const budget = sirius::op::sirius_physical_merge_sort::make_device_budget_provider(
+            sirius_ctx->get_memory_manager(), policy.merge_concurrency)(nullptr);
+          auto const merge_config = sirius::op::merge::derive_merge_config(
+            sirius::op::merge::merge_settings::from(op_params), budget, 1, 1);
+          policy.auto_one_shot_partition_bytes = static_cast<std::size_t>(
+            merge_config.one_shot_fraction * static_cast<double>(budget.gpu_total_bytes) / 2.0);
+        }
+      }
+      sample->set_partition_policy(policy);
+    }
     sample->children.push_back(std::move(order_op));
 
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
