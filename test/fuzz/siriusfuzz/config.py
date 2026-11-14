@@ -55,6 +55,7 @@ class Joins:
     inequality: bool = True
     null_safe_keys: bool = True
     max_tables: int = 4
+    cartesian_max_rows: int = 50_000
 
 
 @dataclass
@@ -63,6 +64,7 @@ class Subqueries:
     in_: bool = True
     scalar: bool = True
     correlated: bool = True
+    correlated_in_share: float = gap_switch(0.2, 1.0)
     uncorrelated_scalar: bool = True
     uncorrelated_exists: bool = True
     max_depth: int = 2
@@ -385,6 +387,12 @@ class FuzzConfig:
 
     def validate(self) -> None:
         f = self.features
+        if not 0 <= f.subqueries.correlated_in_share <= 1:
+            raise ConfigError(
+                "features.subqueries.correlated_in_share must be between 0 and 1"
+            )
+        if f.joins.cartesian_max_rows < 1:
+            raise ConfigError("features.joins.cartesian_max_rows must be positive")
         large = self.data.large
         for name in (
             "fraction",

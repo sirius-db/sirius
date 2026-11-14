@@ -9,3 +9,9 @@ sql_pattern = "count\\(DISTINCT"
 issue = "sirius-db/sirius#1218"
 note = "ungrouped COUNT(DISTINCT) is not supported by the GPU runtime (thrown by sirius_physical_ungrouped_aggregate)"
 verdicts = ["runtime_fallback"]
+
+[[issue]]
+pattern = "^MARK join mixing a null-safe \\(IS NOT DISTINCT FROM\\) key with a plain key not supported in GPU$"
+issue = "sirius-db/sirius#1886"
+note = "7d92beaa: correlated IN becomes a MARK join with mixed null-safe and plain keys"
+verdicts = ["plan_fallback"]

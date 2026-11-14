@@ -159,6 +159,13 @@ respawns marks the run `incomplete`.
 
 ## Configuration
 
+Join sampling uses `features.subqueries.correlated_in_share` (0.2 by default,
+1.0 in gaps mode) to retain correlated `IN` while limiting repeated mixed-key
+MARK declines. `features.joins.cartesian_max_rows` bounds cross and inequality-only
+joins by the product of their input row counts; derived inputs require a `LIMIT`.
+Negated subqueries are counted separately as `subquery:not_in` and
+`subquery:not_exists`.
+
 There is one configuration file, `config/default.toml`; every command loads it unless `--config`
 names another. Its `[features]` flags mark what Sirius runs on the GPU today: every enabled
 feature is expected to stay on the GPU, so a plan-time fallback is a finding. When Sirius gains a

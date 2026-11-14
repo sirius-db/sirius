@@ -96,6 +96,7 @@ class ScopeTable:
     alias: str
     columns: list[ColumnRef]
     table_name: str | None = None
+    row_upper_bound: int | None = None
 
 
 @dataclass
@@ -467,7 +468,12 @@ class QueryGenerator:
 
         r = rng.random()
         if r < 0.35 and self.aggs:
-            self._gen_grouped(sel, scope, depth)
+            try:
+                self._gen_grouped(sel, scope, depth)
+            except GenerationFailed:
+                # A fact key may be the only visible column, and grouping on it
+                # is intentionally excluded for large datasets.
+                self._gen_ungrouped_agg(sel, scope, depth)
         elif r < 0.45 and self.aggs:
             self._gen_ungrouped_agg(sel, scope, depth)
         else:
@@ -703,6 +709,7 @@ class QueryGenerator:
         )
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
+        left_rows = first_scope.row_upper_bound
         for _ in range(n - 1):
             right, right_scope = self._gen_from_item(
                 depth, ctes, None, allow_fact=outer is None and depth == 0
@@ -718,25 +725,33 @@ class QueryGenerator:
                 # product, especially on the intentionally skewed hot keys.
                 continue
             jt = rng.choice(self.join_types) if self.join_types else "inner"
-            # Cross products and inequality-only (nested-loop) joins multiply row counts;
-            # confine them to two-table FROM clauses so results stay bounded.
-            if jt == "cross" and n != 2:
+            right_rows = right_scope.row_upper_bound
+            cartesian_ok = (
+                left_rows is not None
+                and right_rows is not None
+                and max(1, left_rows) * max(1, right_rows)
+                <= self.f.joins.cartesian_max_rows
+            )
+            # Bound Cartesian work by the complete input sizes, including joins
+            # nested inside a larger FROM clause. Unknown derived inputs are ineligible.
+            if jt == "cross" and not cartesian_ok:
                 jt = "inner"
-            if jt == "cross" and (right_scope.table_name or "").startswith("f"):
-                continue
-            if jt == "cross" and any(
-                (t.table_name or "").startswith("f") for t in scope.tables
-            ):
-                continue
             cond = (
                 None
                 if jt == "cross"
-                else self._gen_join_cond(scope, right_scope, jt, allow_ineq_only=n == 2)
+                else self._gen_join_cond(
+                    scope, right_scope, jt, allow_ineq_only=cartesian_ok
+                )
             )
             if cond is None and jt != "cross":
                 continue  # no joinable pair; skip this table
             self._note(f"join:{jt}")
             tree = Join(tree, right, jt, cond)
+            left_rows = (
+                max(1, left_rows) * max(1, right_rows)
+                if left_rows is not None and right_rows is not None
+                else None
+            )
             if jt not in ("semi", "anti"):
                 scope.tables.append(right_scope)
         return tree, scope
@@ -759,7 +774,9 @@ class QueryGenerator:
         ):
             table = rng.choice([t for t in self.ds.tables if t.name.startswith("f")])
             cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
-            return TableRef(table.name, alias), ScopeTable(alias, cols, table.name)
+            return TableRef(table.name, alias), ScopeTable(
+                alias, cols, table.name, len(table.rows)
+            )
         if force_cte is not None or (ctes and rng.random() < 0.4):
             name = force_cte or rng.choice(list(ctes))
             cols = [
@@ -776,7 +793,9 @@ class QueryGenerator:
                 cols = []  # a nested grouping may have no legal keys; use a base table
             if cols:
                 self._note("derived_table")
-                return Derived(sub, alias), ScopeTable(alias, cols)
+                return Derived(sub, alias), ScopeTable(
+                    alias, cols, row_upper_bound=sub.limit
+                )
         candidates = (
             self.ds.tables
             if allow_fact
@@ -784,7 +803,9 @@ class QueryGenerator:
         )
         table = rng.choice(candidates)
         cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
-        return TableRef(table.name, alias), ScopeTable(alias, cols, table.name)
+        return TableRef(table.name, alias), ScopeTable(
+            alias, cols, table.name, len(table.rows)
+        )
 
     def _output_columns(self, sel: Select, alias: str) -> list[ColumnRef]:
         cols = []
@@ -892,6 +913,10 @@ class QueryGenerator:
         if scope.outer is None:
             return None
         sq = self.f.subqueries
+        # 7d92beaa: correlated IN commonly becomes a mixed null-safe/plain MARK
+        # join. Keep it in the default sample, but spend most queries elsewhere.
+        if mode == "in" and self.rng.random() >= sq.correlated_in_share:
+            return None
         must = (mode == "scalar" and not sq.uncorrelated_scalar) or (
             mode == "exists" and not sq.uncorrelated_exists
         )
@@ -1190,7 +1215,11 @@ class QueryGenerator:
         if what == "cast_boundary":
             return self._gen_cast_boundary(kind, scope, depth)
         if what == "try":
-            return Try(self._gen_expr(kind, scope, depth + 1))
+            child = self._gen_expr(kind, scope, depth + 1)
+            if any(isinstance(n, ScalarSubquery) for n in walk(child)):
+                # DuckDB does not bind TRY around a scalar subquery.
+                raise GenerationFailed("TRY with scalar subquery")
+            return Try(child)
         if what == "scalar_subquery":
             return self._gen_scalar_subquery(kind, scope, depth)
         raise GenerationFailed(what)
@@ -1644,7 +1673,10 @@ class QueryGenerator:
             except GenerationFailed:
                 return self._gen_bool(scope, depth)
             self._note("subquery:exists")
-            return Exists(sub, negated=rng.random() < 0.4)
+            negated = rng.random() < 0.4
+            if negated:
+                self._note("subquery:not_exists")
+            return Exists(sub, negated=negated)
         if what == "in_subquery":
             kind = rng.choice(["int", "varchar", "date"])
             probe = self._gen_expr(kind, scope, depth + 1)
@@ -1655,7 +1687,10 @@ class QueryGenerator:
             except GenerationFailed:
                 return self._gen_bool(scope, depth)
             self._note("subquery:in")
-            return InSubquery(probe, sub, negated=rng.random() < 0.3)
+            negated = rng.random() < 0.3
+            if negated:
+                self._note("subquery:not_in")
+            return InSubquery(probe, sub, negated=negated)
         if what == "bool_column":
             return rng.choice(scope.columns("bool"))
         if what == "case":

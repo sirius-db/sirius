@@ -35,12 +35,14 @@ types = ["inner", "left", "right", "semi", "anti"]
 inequality = true
 null_safe_keys = true     # IS NOT DISTINCT FROM keys
 max_tables = 4
+cartesian_max_rows = 50000
 
 [features.subqueries]
 exists = true
 in = true
 scalar = true
 correlated = true
+correlated_in_share = 0.2   # preserve correlated IN without spending the default budget on one MARK gap
 uncorrelated_scalar = true
 uncorrelated_exists = true
 max_depth = 2

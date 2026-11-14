@@ -102,6 +102,57 @@ class Phase2cQuarantine(unittest.TestCase):
             self.assertEqual(seen_float, enabled)
 
 
+class Phase2dJoinBudget(unittest.TestCase):
+    def test_correlated_in_share_does_not_change_exists(self):
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.query_gen import Scope, ScopeTable
+
+        outer = Scope([ScopeTable("a", [ColumnRef("a", "k", st.INTEGER)])])
+        inner = Scope([ScopeTable("b", [ColumnRef("b", "k", st.INTEGER)])], outer=outer)
+        for share in (0.0, 1.0):
+            cfg = load_config(
+                None, [f"features.subqueries.correlated_in_share={share}"]
+            )
+            dg = DataGenerator(cfg, random.Random(5))
+            qg = QueryGenerator(cfg, dg.generate(5), random.Random(5), dg)
+            self.assertEqual(qg._correlation(inner, "in") is not None, share == 1.0)
+            self.assertIsNotNone(qg._correlation(inner, "exists"))
+
+    def test_cross_join_respects_row_product(self):
+        for limit, expected in ((1, False), (100_000, True)):
+            cfg = load_config(
+                None,
+                [
+                    "features.cross_join=true",
+                    "features.joins.max_tables=4",
+                    f"features.joins.cartesian_max_rows={limit}",
+                    "features.complexity.query=0",
+                    "data.tables=[3,3]",
+                    "data.rows=[30,30]",
+                ],
+            )
+            dg = DataGenerator(cfg, random.Random(11))
+            qg = QueryGenerator(cfg, dg.generate(11), random.Random(11), dg)
+            qg.join_types = ["cross"]
+            queries = [qg.generate() for _ in range(150)]
+            cross = [
+                n
+                for q in queries
+                for n in walk(q)
+                if isinstance(n, Join) and n.join_type == "cross"
+            ]
+            self.assertEqual(bool(cross), expected)
+
+    def test_negated_subqueries_have_separate_tags(self):
+        cfg = load_config(None)
+        dg = DataGenerator(cfg, random.Random(12))
+        qg = QueryGenerator(cfg, dg.generate(12), random.Random(12), dg)
+        for _ in range(1500):
+            qg.generate()
+        self.assertGreater(qg.stats["subquery:not_in"], 0)
+        self.assertGreater(qg.stats["subquery:not_exists"], 0)
+
+
 class Phase2cEdgeValues(unittest.TestCase):
     def test_single_long_string_on_small_tier(self):
         cfg = load_config(
