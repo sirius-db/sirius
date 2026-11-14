@@ -29,10 +29,15 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -49,7 +54,83 @@ bool is_supported_key_type(cudf::data_type type)
   return cudf::is_fixed_width(type) || type.id() == cudf::type_id::STRING;
 }
 
+/// How kway_fixed_key_device_view loads a first key column of @p type; generic when the type is
+/// not specialised.
+key_storage storage_of(cudf::data_type type)
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8: return key_storage::i8;
+    case cudf::type_id::INT16: return key_storage::i16;
+    case cudf::type_id::INT32:
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DURATION_DAYS:
+    case cudf::type_id::DECIMAL32: return key_storage::i32;
+    case cudf::type_id::INT64:
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+    case cudf::type_id::DURATION_SECONDS:
+    case cudf::type_id::DURATION_MILLISECONDS:
+    case cudf::type_id::DURATION_MICROSECONDS:
+    case cudf::type_id::DURATION_NANOSECONDS:
+    case cudf::type_id::DECIMAL64: return key_storage::i64;
+    case cudf::type_id::DECIMAL128: return key_storage::i128;
+    // BOOL8 is one byte holding 0 or 1.
+    case cudf::type_id::BOOL8:
+    case cudf::type_id::UINT8: return key_storage::u8;
+    case cudf::type_id::UINT16: return key_storage::u16;
+    case cudf::type_id::UINT32: return key_storage::u32;
+    case cudf::type_id::UINT64: return key_storage::u64;
+    case cudf::type_id::FLOAT32: return key_storage::f32;
+    case cudf::type_id::FLOAT64: return key_storage::f64;
+    default: return key_storage::generic;
+  }
+}
+
+// --- kway_tuning ---------------------------------------------------------------------------
+
+std::mutex tuning_mutex;
+std::optional<kway_tuning> tuning_override;  // set_kway_tuning_for_test
+
+/// The switches of SIRIUS_KWAY_TUNING; unknown names and malformed values are ignored.
+kway_tuning tuning_from_environment()
+{
+  kway_tuning tuning;
+  const char* const text = std::getenv("SIRIUS_KWAY_TUNING");
+  if (text == nullptr) { return tuning; }
+  std::string_view rest{text};
+  while (!rest.empty()) {
+    const auto end  = rest.find(';');
+    const auto item = rest.substr(0, end);
+    rest            = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+    const auto eq   = item.find('=');
+    if (eq == std::string_view::npos) { continue; }
+    const auto digits  = item.substr(eq + 1);
+    std::int32_t value = 0;
+    const auto parsed  = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) { continue; }
+    set_kway_tuning_field(tuning, item.substr(0, eq), value);
+  }
+  return tuning;
+}
+
 }  // namespace
+
+/// compare_pairs_for_test: less() of one pair through the view of type View.
+template <typename View>
+struct less_pairs_fn {
+  View view;
+  const int32_t* ia;
+  const cudf::size_type* ra;
+  const int32_t* ib;
+  const cudf::size_type* rb;
+
+  __device__ uint8_t operator()(std::size_t i) const noexcept
+  {
+    return view.less(ia[i], ra[i], ib[i], rb[i]) ? 1 : 0;
+  }
+};
 
 struct kway_key_comparator::impl {
   /// Pinned host image of `views`. The copy to the device is asynchronous and may read it when
@@ -62,7 +143,55 @@ struct kway_key_comparator::impl {
   rmm::device_uvector<cudf::null_order> null_precedence;
   int32_t num_inputs;
   cudf::size_type num_columns;
+  /// Specialised first key column: the host image of `fixed_inputs` (its copy to the device is
+  /// asynchronous, as that of `staging`), the device entries and the view's flags.
+  std::vector<fixed_key_input> fixed_staging{};
+  std::optional<rmm::device_uvector<fixed_key_input>> fixed_inputs{};
+  fixed_key_parts fixed{};
 };
+
+kway_tuning current_kway_tuning()
+{
+  static const kway_tuning from_environment = tuning_from_environment();
+  const std::lock_guard lock(tuning_mutex);
+  return tuning_override.value_or(from_environment);
+}
+
+bool set_kway_tuning_field(kway_tuning& tuning, std::string_view name, std::int32_t value)
+{
+  if (name == "specialized_keys") {
+    tuning.specialized_keys = value;
+  } else if (name == "warp_corank") {
+    tuning.warp_corank = value;
+  } else if (name == "tile_rows") {
+    tuning.tile_rows = value;
+  } else if (name == "baseline_shape") {
+    tuning.baseline_shape = value;
+  } else if (name == "threads_per_sm") {
+    tuning.threads_per_sm = value;
+  } else if (name == "max_block_threads") {
+    tuning.max_block_threads = value;
+  } else if (name == "min_sub_tile_rows") {
+    tuning.min_sub_tile_rows = value;
+  } else if (name == "sub_tiles") {
+    tuning.sub_tiles = value;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void set_kway_tuning_for_test(const kway_tuning& tuning)
+{
+  const std::lock_guard lock(tuning_mutex);
+  tuning_override = tuning;
+}
+
+void reset_kway_tuning_for_test()
+{
+  const std::lock_guard lock(tuning_mutex);
+  tuning_override.reset();
+}
 
 // Nothing here waits on the stream: the column views of all windows are laid out in one pinned
 // host buffer and go to the device in one asynchronous copy, whatever the number of windows.
@@ -144,7 +273,39 @@ kway_key_comparator kway_key_comparator::create(std::span<const cudf::table_view
       stream,
       mr),
     static_cast<int32_t>(key_windows.size()),
-    num_columns});
+    num_columns,
+    {},
+    std::nullopt,
+    {}});
+
+  // The specialised view of a fixed-width first key column: one entry per window, in one more
+  // asynchronous copy.
+  const auto storage     = storage_of(key_windows.front().column(0).type());
+  const auto specialize  = current_kway_tuning().specialized_keys;
+  const bool wanted_here = specialize >= 2 || (specialize == 1 && num_columns == 1);
+  if (storage != key_storage::generic && wanted_here) {
+    state->fixed_staging.reserve(key_windows.size());
+    bool any_nullable = false;
+    for (const auto& window : key_windows) {
+      const auto& column = window.column(0);
+      const auto* const first =
+        column.head<std::uint8_t>() +
+        static_cast<std::size_t>(column.offset()) * cudf::size_of(column.type());
+      state->fixed_staging.push_back(fixed_key_input{
+        first, column.nullable() ? column.null_mask() : nullptr, column.offset()});
+      any_nullable = any_nullable || column.nullable();
+    }
+    state->fixed_inputs.emplace(cudf::detail::make_device_uvector_async(
+      cudf::host_span<const fixed_key_input>{state->fixed_staging.data(),
+                                             state->fixed_staging.size()},
+      stream,
+      mr));
+    const bool descending = column_order.front() == cudf::order::DESCENDING;
+    // A null orders first when nulls are BEFORE and the column ascends, or AFTER and it descends.
+    const bool nulls_first = (null_precedence.front() == cudf::null_order::BEFORE) != descending;
+    state->fixed =
+      fixed_key_parts{storage, state->fixed_inputs->data(), descending, nulls_first, any_nullable};
+  }
   return kway_key_comparator(std::move(state));
 }
 
@@ -155,6 +316,13 @@ kway_key_comparator& kway_key_comparator::operator=(kway_key_comparator&&) noexc
 kway_key_comparator::~kway_key_comparator()                                         = default;
 
 int32_t kway_key_comparator::num_inputs() const noexcept { return _impl->num_inputs; }
+
+bool kway_key_comparator::specialized() const noexcept
+{
+  return _impl->fixed.storage != key_storage::generic;
+}
+
+fixed_key_parts fixed_key_parts_of(const kway_key_comparator& cmp) { return cmp._impl->fixed; }
 
 kway_key_device_view device_view_of(const kway_key_comparator& cmp)
 {
@@ -178,14 +346,14 @@ void compare_pairs_for_test(const kway_key_comparator& cmp,
       rb.size() != out.size()) {
     throw std::invalid_argument("compare_pairs_for_test: spans differ in size");
   }
-  const auto view = device_view_of(cmp);
-  thrust::transform(
-    rmm::exec_policy_nosync(stream),
-    thrust::counting_iterator<std::size_t>(0),
-    thrust::counting_iterator<std::size_t>(out.size()),
-    out.begin(),
-    [view, ia = ia.data(), ra = ra.data(), ib = ib.data(), rb = rb.data()] __device__(
-      std::size_t i) -> uint8_t { return view.less(ia[i], ra[i], ib[i], rb[i]) ? 1 : 0; });
+  with_key_view(cmp, [&](auto view) {
+    thrust::transform(
+      rmm::exec_policy_nosync(stream),
+      thrust::counting_iterator<std::size_t>(0),
+      thrust::counting_iterator<std::size_t>(out.size()),
+      out.begin(),
+      less_pairs_fn<decltype(view)>{view, ia.data(), ra.data(), ib.data(), rb.data()});
+  });
 }
 
 }  // namespace sirius::op::merge::detail

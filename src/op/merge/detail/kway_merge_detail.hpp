@@ -27,11 +27,51 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 
 namespace sirius::op::merge::detail {
 
 /// Device view of a kway_key_comparator; defined in detail/kway_comparator.cuh (CUDA sources only).
 struct kway_key_device_view;
+/// What the specialised device views are built from; defined in detail/kway_comparator.cuh.
+struct fixed_key_parts;
+
+/**
+ * @brief Switches of the k-way merge kernels, for A/B measurements and tests.
+ *
+ * The defaults are what production runs. The process reads `SIRIUS_KWAY_TUNING` once, a list of
+ * `name=value` pairs separated by ';' (for example `specialized_keys=0;tile_rows=2048`); a test
+ * replaces the whole set with set_kway_tuning_for_test. None of the switches changes a result:
+ * every combination produces the same rows in the same order.
+ */
+struct kway_tuning {
+  /// Compare a fixed-width first key column through the specialised device view: 0: never (the
+  /// generic comparator); 1: when it is the only key column; 2: also when more key columns
+  /// follow it (they are compared by the generic comparator after a tie on the first).
+  std::int32_t specialized_keys{1};
+  /// Co-rank with the one-warp kernel that keeps its state in registers, at a fan-in of at most
+  /// 32: 0: never (the general kernel); 1: with a specialised comparator; 2: with every
+  /// comparator.
+  std::int32_t warp_corank{1};
+  /// Tile size and launch shape of the tile merge: 0: chosen by tile_merge_policy_for and
+  /// bounded_merge_tile_rows from the device, the fan-in and the comparator; 1: always the
+  /// baseline shape (2048-row tiles, 256 merge threads per SM, blocks of at most 64 threads).
+  std::int32_t baseline_shape{0};
+  /// Overrides of the chosen tile size and shape, for measurements; 0: not overridden.
+  std::int32_t tile_rows{0};
+  std::int32_t threads_per_sm{0};
+  std::int32_t max_block_threads{0};
+  std::int32_t min_sub_tile_rows{0};
+  std::int32_t sub_tiles{0};
+};
+
+/// The switches in effect.
+kway_tuning current_kway_tuning();
+/// Sets one switch by name; false when @p name is not a switch.
+bool set_kway_tuning_field(kway_tuning& tuning, std::string_view name, std::int32_t value);
+/// Test-only: replaces the switches in effect, and restores the environment's with no argument.
+void set_kway_tuning_for_test(const kway_tuning& tuning);
+void reset_kway_tuning_for_test();
 
 /**
  * @brief Host owner of the device state needed to compare rows across k key windows (pimpl).
@@ -65,6 +105,8 @@ class kway_key_comparator {
 
   /// Number of key windows (k) the comparator was created with.
   [[nodiscard]] int32_t num_inputs() const noexcept;
+  /// True when the first key column is compared through a specialised device view.
+  [[nodiscard]] bool specialized() const noexcept;
 
   /// Device state; defined by the comparator's CUDA source.
   struct impl;
@@ -73,6 +115,7 @@ class kway_key_comparator {
   explicit kway_key_comparator(std::unique_ptr<impl>);
   std::unique_ptr<impl> _impl;
   friend struct kway_key_device_view device_view_of(const kway_key_comparator&);
+  friend struct fixed_key_parts fixed_key_parts_of(const kway_key_comparator&);
 };
 
 /**
@@ -113,6 +156,10 @@ cudf::size_type safe_target(const kway_key_comparator& cmp,
 
 /// Default output rows per tile of tile_merge.
 inline constexpr cudf::size_type kDefaultTileRows = 2048;
+/// Output rows per tile where the dense launch shape applies (see tile_merge_policy_for).
+inline constexpr cudf::size_type kDenseTileRows = 4096;
+/// The largest fan-in the dense launch shape was measured to help at.
+inline constexpr std::int32_t kDenseShapeMaxInputs = 32;
 
 /**
  * @brief Merge each output tile independently, producing an (input, row) gather map.
@@ -150,6 +197,46 @@ struct tile_merge_shape {
   std::size_t shared_bytes;    ///< shared memory per block
 };
 
+/// What tile_merge_launch_shape aims for.
+struct tile_merge_policy {
+  /// Merge threads per SM that the sub-tiles of a tile are chosen for.
+  std::int64_t threads_per_sm{256};
+  /// Most threads per block.
+  std::int32_t max_block_threads{64};
+  /// Fewest output rows of a sub-tile: below this the selection outweighs the merge it saves.
+  cudf::size_type min_sub_tile_rows{32};
+  /// Hold a block to 32 KiB of shared memory when there are more blocks than SMs.
+  bool dense_shared_cap{true};
+};
+
+/**
+ * @brief The policy tile_merge launches with: a host computation, exposed for tests.
+ *
+ * Two shapes. The default one is the shape measured on an RTX PRO 6000 (188 SMs). The
+ * dense one (384 merge threads per SM, blocks of up to 128 threads, used with 4096-row tiles) was
+ * measured on a GB200 (152 SMs, compute capability 10.0) with one and with two concurrent merge
+ * streams: it is faster there when the first key column is specialised and the fan-in is at
+ * most kDenseShapeMaxInputs, and slower or no better with the generic comparator or a larger
+ * fan-in. A device of another compute-capability major version keeps the default shape until it
+ * is measured.
+ *
+ * @param specialized_key The comparator compares its first key column through a specialised view.
+ * @param num_inputs Fan-in k.
+ * @param compute_capability_major Major compute capability of the device.
+ */
+tile_merge_policy tile_merge_policy_for(bool specialized_key,
+                                        std::int32_t num_inputs,
+                                        int compute_capability_major);
+
+/// True when tile_merge_policy_for chooses the dense shape.
+bool dense_tile_shape_applies(bool specialized_key,
+                              std::int32_t num_inputs,
+                              int compute_capability_major);
+
+/// Output rows per tile bounded_kway_merge uses for @p cmp on the calling thread's current
+/// device: kDenseTileRows with the dense shape, else kDefaultTileRows (kway_tuning can override).
+cudf::size_type bounded_merge_tile_rows(const kway_key_comparator& cmp);
+
 /**
  * @brief The launch shape of tile_merge: a host computation, exposed for tests.
  *
@@ -162,12 +249,15 @@ struct tile_merge_shape {
  * @param sm_count SMs of the device.
  * @param requested_sub_tiles Sub-tiles per tile instead of the count chosen from the device
  *        (0: choose); capped like the chosen count.
+ * @param policy Thread density, block size and shared-memory cap to aim for; the default is the
+ *        shape measured on 188 SMs.
  */
 tile_merge_shape tile_merge_launch_shape(cudf::size_type tiles,
                                          cudf::size_type tile_rows,
                                          std::int32_t num_inputs,
                                          int sm_count,
-                                         std::int32_t requested_sub_tiles = 0);
+                                         std::int32_t requested_sub_tiles = 0,
+                                         const tile_merge_policy& policy  = {});
 
 /// A small device array that gather_kway copies to the host in the same wait on the stream as
 /// its own counts. `source` and `destination` have the same number of entries.

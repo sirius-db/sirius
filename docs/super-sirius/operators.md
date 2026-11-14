@@ -789,14 +789,19 @@ With `n` = `window_rows`, each round does the following:
    the emitted prefix is final.
 3. **Co-rank.** `detail::corank_split()` finds, for an output rank `r`, how many rows of each
    window are among the first `r` rows of the merged order. It is evaluated at every tile boundary
-   (`kDefaultTileRows` = 2048 output rows) and at `target`.
+   (`detail::bounded_merge_tile_rows()`: 2048 output rows, or 4096 with the dense launch shape
+   below) and at `target`. With a specialised comparator and a fan-in of at most 32 one warp per
+   rank keeps a lane per input and its bounds in registers; otherwise the general kernel runs.
 4. **Tile merge.** `detail::tile_merge()` merges each tile independently and writes an
    `(input, row)` gather map of `target` entries. A tile is split into sub-tiles, one thread
    each with a tournament tree in shared memory; the split is chosen from the tile count, the
    device's SM count and the shared memory the fan-in needs: a block uses at most 40 KiB, and at
    most 32 KiB when there are more blocks than SMs, because above that fewer blocks fit an SM
-   (`detail::tile_merge_launch_shape()`). It accepts at most
-   `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
+   (`detail::tile_merge_launch_shape()`). The thread density is a policy
+   (`detail::tile_merge_policy_for()`): 256 merge threads per SM in blocks of at most 64 threads
+   by default, and 384 per SM in blocks of up to 128 with 4096-row tiles where that was measured
+   to be faster (a specialised first key, a fan-in of at most 32, compute capability 10.x). It
+   accepts at most `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
 5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
    masks and STRING data, into the round's output table. The null counts, the STRING sizes and
    the consumed counts come back to the host in one read.
@@ -808,6 +813,20 @@ index and then row, so the result matches a stable merge. Nested key types are n
 The key comparator copies the column views of all windows to the device in one asynchronous
 copy, so a call waits on the stream twice (the target, then the gather's read-back), three times
 with a STRING column, whatever the fan-in.
+
+When the key is a single fixed-width column (integers, BOOL8, floating point, timestamps,
+durations, decimals), the three kernels compare it through `kway_fixed_key_device_view<T>`: one small entry
+per window (data pointer, null mask, bit offset), a load of the storage type and one unsigned
+compare of the normalised value, instead of the column views and the type dispatch. The order is
+the generic comparator's, tie order included (nulls by the null order, NaN equal to NaN and after
+every value, -0.0 equal to 0.0). Every other key (STRING, several key columns) uses the generic
+comparator; `specialized_keys=2` also specialises a fixed-width first column of a multi-column
+key, with a tie on it continuing in the generic comparison from the second column on (measured
+on INTEGER + BIGINT + VARCHAR keys: 2 to 7% faster at fan-in 4, 8 and 64, 2% slower at 16, so it
+is off by default).
+`detail::kway_tuning` (environment `SIRIUS_KWAY_TUNING`, for example
+`specialized_keys=0;warp_corank=0;baseline_shape=1`) switches the specialised view, the one-warp
+co-rank and the launch-shape rule off for A/B measurements; no switch changes a result.
 
 #### Fan-in cap and intermediate runs
 

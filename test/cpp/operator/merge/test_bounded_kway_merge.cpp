@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "op/merge/bounded_kway_merge.hpp"
+#include "op/merge/detail/kway_merge_detail.hpp"
 #include "operator/merge/merge_test_utils.hpp"
 #include "operator/operator_test_utils.hpp"
 
@@ -51,6 +52,7 @@
 #include <vector>
 
 using namespace sirius::op::merge;
+namespace kway_detail = sirius::op::merge::detail;
 using namespace sirius::test;
 
 namespace {
@@ -361,7 +363,266 @@ std::vector<std::int32_t> host_ints(const bounded_merge_result& result)
   return operator_utils::copy_column_to_host<std::int32_t>(result.output->view().column(0));
 }
 
+/// A non-nullable column of @p type whose storage type is T, holding @p values narrowed to T.
+template <typename T, typename Source>
+std::unique_ptr<cudf::column> storage_column(cudf::data_type type, const std::vector<Source>& values)
+{
+  std::vector<T> typed;
+  typed.reserve(values.size());
+  for (const auto v : values) {
+    typed.push_back(static_cast<T>(v));
+  }
+  return std::make_unique<cudf::column>(
+    type,
+    static_cast<cudf::size_type>(typed.size()),
+    rmm::device_buffer(typed.data(),
+                       typed.size() * sizeof(T),
+                       cudf::get_default_stream(),
+                       cudf::get_current_device_resource_ref()),
+    rmm::device_buffer{},
+    0);
+}
+
+/// A key column of @p type: integer-backed types take @p ints, floating-point types @p doubles.
+std::unique_ptr<cudf::column> typed_key_column(cudf::data_type type,
+                                               const std::vector<std::int64_t>& ints,
+                                               const std::vector<double>& doubles)
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8: return storage_column<std::int8_t>(type, ints);
+    case cudf::type_id::INT16: return storage_column<std::int16_t>(type, ints);
+    case cudf::type_id::INT32:
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DURATION_DAYS:
+    case cudf::type_id::DECIMAL32: return storage_column<std::int32_t>(type, ints);
+    case cudf::type_id::INT64:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::DURATION_NANOSECONDS:
+    case cudf::type_id::DECIMAL64: return storage_column<std::int64_t>(type, ints);
+    case cudf::type_id::DECIMAL128: return storage_column<__int128_t>(type, ints);
+    case cudf::type_id::BOOL8:
+    case cudf::type_id::UINT8: return storage_column<std::uint8_t>(type, ints);
+    case cudf::type_id::UINT16: return storage_column<std::uint16_t>(type, ints);
+    case cudf::type_id::UINT32: return storage_column<std::uint32_t>(type, ints);
+    case cudf::type_id::UINT64: return storage_column<std::uint64_t>(type, ints);
+    case cudf::type_id::FLOAT32: return storage_column<float>(type, doubles);
+    case cudf::type_id::FLOAT64: return storage_column<double>(type, doubles);
+    default: throw std::invalid_argument("typed_key_column: unsupported type");
+  }
+}
+
+/// k sorted windows of (key of @p type, unique INT64 row id), consecutive slices of one table.
+/// The keys come from a small domain that includes the extremes of the storage type; windows with
+/// an odd index have no nulls.
+struct typed_case {
+  std::unique_ptr<cudf::table> all;  ///< (window, key, row id), sorted by (window, key)
+  std::vector<cudf::table_view> windows;
+  merge_key_spec keys;
+};
+
+typed_case make_typed_case(cudf::data_type type,
+                           const std::vector<cudf::size_type>& lengths,
+                           cudf::order order,
+                           cudf::null_order null_order,
+                           std::uint32_t seed)
+{
+  std::mt19937 rng(seed);
+  const std::vector<std::int64_t> int_domain =
+    type.id() == cudf::type_id::BOOL8
+      ? std::vector<std::int64_t>{0, 1}
+      : std::vector<std::int64_t>{std::numeric_limits<std::int64_t>::min(),
+                                  std::numeric_limits<std::int32_t>::min(),
+                                  std::numeric_limits<std::int8_t>::min(),
+                                  -3,
+                                  -1,
+                                  0,
+                                  1,
+                                  2,
+                                  std::numeric_limits<std::int8_t>::max(),
+                                  std::numeric_limits<std::uint16_t>::max(),
+                                  std::numeric_limits<std::int32_t>::max(),
+                                  std::numeric_limits<std::int64_t>::max()};
+  const std::vector<double> double_domain{-std::numeric_limits<double>::infinity(),
+                                          -1.5,
+                                          0.0,
+                                          2.25,
+                                          3.0e38,
+                                          std::numeric_limits<double>::infinity(),
+                                          std::numeric_limits<double>::quiet_NaN()};
+  std::vector<std::int32_t> window_ids;
+  std::vector<std::int64_t> ints;
+  std::vector<double> doubles;
+  std::vector<std::uint8_t> valids;
+  std::vector<std::int64_t> row_ids;
+  for (std::size_t w = 0; w < lengths.size(); ++w) {
+    for (cudf::size_type r = 0; r < lengths[w]; ++r) {
+      window_ids.push_back(static_cast<std::int32_t>(w));
+      ints.push_back(int_domain[rng() % int_domain.size()]);
+      doubles.push_back(double_domain[rng() % double_domain.size()]);
+      valids.push_back(w % 2 == 1 || rng() % 8 != 0 ? 1 : 0);
+      row_ids.push_back(static_cast<std::int64_t>(row_ids.size()));
+    }
+  }
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(fixed_column(window_ids, cudf::type_id::INT32));
+  columns.push_back(typed_key_column(type, ints, doubles));
+  set_nulls(*columns.back(), valids);
+  columns.push_back(fixed_column(row_ids, cudf::type_id::INT64));
+  const cudf::table unsorted(std::move(columns));
+
+  typed_case out;
+  out.keys = merge_key_spec{.key_cols = {0}, .column_order = {order}, .null_precedence = {null_order}};
+  out.all  = cudf::stable_sort_by_key(unsorted.view(),
+                                     unsorted.view().select({0, 1}),
+                                     {cudf::order::ASCENDING, order},
+                                     {cudf::null_order::BEFORE, null_order});
+  std::vector<cudf::size_type> bounds;
+  cudf::size_type begin = 0;
+  for (const auto length : lengths) {
+    bounds.push_back(begin);
+    bounds.push_back(begin + length);
+    begin += length;
+  }
+  out.windows = cudf::slice(out.all->view().select({1, 2}), bounds);
+  return out;
+}
+
+/// Replaces the kernel switches for a scope.
+class tuning_guard {
+ public:
+  explicit tuning_guard(const kway_detail::kway_tuning& tuning)
+  {
+    kway_detail::set_kway_tuning_for_test(tuning);
+  }
+  tuning_guard(const tuning_guard&)            = delete;
+  tuning_guard& operator=(const tuning_guard&) = delete;
+  ~tuning_guard() { kway_detail::reset_kway_tuning_for_test(); }
+};
+
+/// The switches of the baseline kernels: generic comparator, general co-rank kernel, 2048-row
+/// tiles and the baseline launch shape.
+kway_detail::kway_tuning baseline_tuning()
+{
+  kway_detail::kway_tuning tuning;
+  tuning.specialized_keys = 0;
+  tuning.warp_corank      = 0;
+  tuning.tile_rows        = 2048;
+  tuning.baseline_shape     = 1;
+  return tuning;
+}
+
 }  // namespace
+
+TEST_CASE("bounded_kway_merge with a specialised key equals the generic kernels and the oracle",
+          "[bounded_kway_merge][kway_specialized]")
+{
+  const auto type_id = GENERATE(cudf::type_id::INT8,
+                                cudf::type_id::INT16,
+                                cudf::type_id::INT32,
+                                cudf::type_id::INT64,
+                                cudf::type_id::UINT8,
+                                cudf::type_id::UINT16,
+                                cudf::type_id::UINT32,
+                                cudf::type_id::UINT64,
+                                cudf::type_id::FLOAT32,
+                                cudf::type_id::FLOAT64,
+                                cudf::type_id::BOOL8,
+                                cudf::type_id::TIMESTAMP_DAYS,
+                                cudf::type_id::TIMESTAMP_MICROSECONDS,
+                                cudf::type_id::DURATION_DAYS,
+                                cudf::type_id::DURATION_NANOSECONDS,
+                                cudf::type_id::DECIMAL32,
+                                cudf::type_id::DECIMAL64,
+                                cudf::type_id::DECIMAL128);
+  const auto order      = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  const auto null_order = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
+  const bool decimal    = type_id == cudf::type_id::DECIMAL32 ||
+                          type_id == cudf::type_id::DECIMAL64 || type_id == cudf::type_id::DECIMAL128;
+  const cudf::data_type type = decimal ? cudf::data_type{type_id, -2} : cudf::data_type{type_id};
+  CAPTURE(static_cast<int>(type_id), static_cast<int>(order), static_cast<int>(null_order));
+
+  const auto seed = static_cast<std::uint32_t>(9000 + static_cast<int>(type_id) * 4 +
+                                               static_cast<int>(order) * 2 +
+                                               static_cast<int>(null_order));
+  // Fan-ins on both sides of the one-warp co-rank kernel's limit; one window is empty.
+  for (const std::vector<cudf::size_type>& lengths :
+       {std::vector<cudf::size_type>{2500, 0, 4100, 3000, 1},
+        std::vector<cudf::size_type>(40, 300)}) {
+    const auto input = make_typed_case(type, lengths, order, null_order, seed);
+    const auto k     = lengths.size();
+    const auto total = static_cast<cudf::size_type>(input.all->num_rows());
+    const auto stream = cudf::get_default_stream();
+    const auto mr     = cudf::get_current_device_resource_ref();
+    for (const cudf::size_type max_rows : {2048, 4097, total}) {
+      for (const std::uint8_t flag : {0, 1}) {
+        CAPTURE(k, max_rows, static_cast<int>(flag));
+        const std::vector<std::uint8_t> truncated(k, flag);
+        const auto expected = merge_utils::reference_bounded_merge(
+          input.windows, input.keys, truncated, max_rows, stream, mr);
+        const auto actual =
+          bounded_kway_merge(input.windows, input.keys, truncated, max_rows, stream, mr);
+        bounded_merge_result generic;
+        {
+          const tuning_guard guard(baseline_tuning());
+          generic = bounded_kway_merge(input.windows, input.keys, truncated, max_rows, stream, mr);
+        }
+        REQUIRE(actual.consumed == expected.consumed);
+        REQUIRE(actual.consumed == generic.consumed);
+        REQUIRE(merge_utils::tables_equal(actual.output->view(), expected.output->view()));
+        REQUIRE(merge_utils::tables_equal(actual.output->view(), generic.output->view()));
+      }
+    }
+  }
+}
+
+TEST_CASE("bounded_kway_merge treats -0.0 and 0.0, and every NaN, as equal keys",
+          "[bounded_kway_merge][kway_specialized]")
+{
+  const auto type_id = GENERATE(cudf::type_id::FLOAT32, cudf::type_id::FLOAT64);
+  const auto order   = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  // Every window holds only zeros of both signs (or only NaNs of both signs), so it is sorted
+  // whatever the order of its rows, and the merge must emit the rows by (window, row).
+  const double negative_nan = -std::numeric_limits<double>::quiet_NaN();
+  for (const auto& values : {std::vector<double>{0.0, -0.0, -0.0, 0.0, -0.0},
+                             std::vector<double>{std::numeric_limits<double>::quiet_NaN(),
+                                                 negative_nan,
+                                                 negative_nan,
+                                                 std::numeric_limits<double>::quiet_NaN()}}) {
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    std::vector<cudf::table_view> views;
+    std::vector<std::int64_t> expected_ids;
+    for (std::int64_t w = 0; w < 3; ++w) {
+      std::vector<std::int64_t> ids;
+      for (std::size_t r = 0; r < values.size(); ++r) {
+        ids.push_back(w * 100 + static_cast<std::int64_t>(r));
+        expected_ids.push_back(ids.back());
+      }
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(typed_key_column(cudf::data_type{type_id}, {}, values));
+      columns.push_back(fixed_column(ids, cudf::type_id::INT64));
+      tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+      views.push_back(tables.back()->view());
+    }
+    const merge_key_spec keys{
+      .key_cols = {0}, .column_order = {order}, .null_precedence = {cudf::null_order::AFTER}};
+    const std::vector<std::uint8_t> none(views.size(), 0);
+    const auto run = [&] {
+      return bounded_kway_merge(views,
+                                keys,
+                                none,
+                                std::numeric_limits<cudf::size_type>::max(),
+                                cudf::get_default_stream(),
+                                cudf::get_current_device_resource_ref());
+    };
+    const auto actual = run();
+    REQUIRE(operator_utils::copy_column_to_host<std::int64_t>(actual.output->view().column(1)) ==
+            expected_ids);
+    const tuning_guard guard(baseline_tuning());
+    const auto generic = run();
+    REQUIRE(operator_utils::copy_column_to_host<std::int64_t>(generic.output->view().column(1)) ==
+            expected_ids);
+  }
+}
 
 TEST_CASE("bounded_kway_merge matches the stable-sort oracle for random windows",
           "[bounded_kway_merge]")

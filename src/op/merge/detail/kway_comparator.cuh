@@ -29,6 +29,15 @@
 // Nulls: a row is null when its bit in the column's null mask is clear. The null count of a
 // window's column is never read, so it may be an upper bound.
 //
+// Specialised first key column: when the key is one fixed-width column (and, with
+// kway_tuning::specialized_keys = 2, when a fixed-width column is the first of several), less() of
+// kway_fixed_key_device_view<T> compares it without the column views and the type dispatch: one
+// small entry per window (data pointer, null mask, bit offset), a load of the storage type T and
+// one unsigned compare of the normalised value. It orders rows exactly as the generic view does
+// (same null rule, NaN rule, -0.0 == 0.0, same tie-break); with more key columns a tie on the
+// first one continues in the generic comparison from the second column on. Every other first key
+// type (STRING) uses the generic view only. with_key_view() picks the view of a comparator.
+//
 // Supported key types: fixed-width (integers, floating point, BOOL8, timestamps, durations,
 // decimals) and STRING. Ordering follows cuDF's row comparator, so a merge through less() orders
 // rows as cudf::merge / cudf::sorted_order do for the same (column_order, null_precedence):
@@ -46,10 +55,13 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <cudf/utilities/bit.hpp>
+
 #include <cuda/std/cmath>
 
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace sirius::op::merge::detail {
 
@@ -99,11 +111,21 @@ struct kway_key_device_view {
                               int32_t ib,
                               cudf::size_type rb) const noexcept
   {
+    return compare_keys_from(0, ia, ra, ib, rb);
+  }
+
+  /// compare_keys over the key columns @p first_column, first_column + 1, ...
+  __device__ int compare_keys_from(cudf::size_type first_column,
+                                   int32_t ia,
+                                   cudf::size_type ra,
+                                   int32_t ib,
+                                   cudf::size_type rb) const noexcept
+  {
     const cudf::column_device_view* const ta =
       columns + static_cast<std::int64_t>(ia) * num_columns;
     const cudf::column_device_view* const tb =
       columns + static_cast<std::int64_t>(ib) * num_columns;
-    for (cudf::size_type c = 0; c < num_columns; ++c) {
+    for (cudf::size_type c = first_column; c < num_columns; ++c) {
       const cudf::column_device_view& ca = ta[c];
       const cudf::column_device_view& cb = tb[c];
       const bool a_null                  = ca.is_null(ra);
@@ -134,8 +156,146 @@ struct kway_key_device_view {
   }
 };
 
+/// How the values of a specialised first key column are stored.
+enum class key_storage : std::int8_t {
+  generic = 0,  ///< not specialised: the generic view compares every column
+  i8,
+  i16,
+  i32,
+  i64,
+  i128,
+  u8,
+  u16,
+  u32,
+  u64,
+  f32,
+  f64
+};
+
+/// The first key column of one window.
+struct fixed_key_input {
+  const void* data;                ///< value of row 0 (the column's offset is applied)
+  const cudf::bitmask_type* mask;  ///< nullptr when the column has no null mask
+  cudf::size_type offset;          ///< bit of row 0 in `mask`
+};
+
+/// A value of storage type T as an unsigned integer that orders as the generic comparison of two
+/// non-null elements does: integers by value; floating point with -0.0 equal to 0.0, every NaN
+/// equal to every NaN and greater than every other value.
+template <typename T>
+__device__ inline auto normalized_key(T value) noexcept
+{
+  if constexpr (std::is_floating_point_v<T>) {
+    // float -> double is exact and keeps the order.
+    const double wide = static_cast<double>(value);
+    if (cuda::std::isnan(wide)) { return ~std::uint64_t{0}; }
+    // -0.0 == 0.0 is true, so both zeros become +0.0.
+    const double canonical   = wide == 0.0 ? 0.0 : wide;
+    const std::uint64_t bits = static_cast<std::uint64_t>(__double_as_longlong(canonical));
+    return (bits >> 63) != 0 ? ~bits : bits ^ (std::uint64_t{1} << 63);
+  } else if constexpr (sizeof(T) == 16) {
+    return static_cast<unsigned __int128>(value) ^ (static_cast<unsigned __int128>(1) << 127);
+  } else if constexpr (std::is_signed_v<T>) {
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(value)) ^ (std::uint64_t{1} << 63);
+  } else {
+    return static_cast<std::uint64_t>(value);
+  }
+}
+
+/// Trivially copyable device view with a specialised first key column of storage type T. less()
+/// is the same strict weak order as kway_key_device_view::less.
+template <typename T>
+struct kway_fixed_key_device_view {
+  const fixed_key_input* inputs{nullptr};  ///< one per window
+  kway_key_device_view rest{};             ///< every key column; compared from column 1 on
+  int32_t num_inputs{0};
+  bool descending{false};    ///< order of the first key column
+  bool nulls_first{false};   ///< a null first key orders before a value, the order applied
+  bool any_nullable{false};  ///< some window's first key column has a null mask
+  bool has_rest{false};      ///< there is more than one key column
+
+  __device__ bool less(int32_t ia,
+                       cudf::size_type ra,
+                       int32_t ib,
+                       cudf::size_type rb) const noexcept
+  {
+    const fixed_key_input a = inputs[ia];
+    const fixed_key_input b = inputs[ib];
+    bool first_ties         = false;
+    if (any_nullable) {
+      const bool a_null = a.mask != nullptr && !cudf::bit_is_set(a.mask, a.offset + ra);
+      const bool b_null = b.mask != nullptr && !cudf::bit_is_set(b.mask, b.offset + rb);
+      if (a_null || b_null) {
+        if (a_null != b_null) { return a_null == nulls_first; }
+        first_ties = true;
+      }
+    }
+    if (!first_ties) {
+      const auto ka = normalized_key(static_cast<const T*>(a.data)[ra]);
+      const auto kb = normalized_key(static_cast<const T*>(b.data)[rb]);
+      if (ka != kb) { return (ka < kb) != descending; }
+    }
+    if (has_rest) {
+      const int cmp = rest.compare_keys_from(1, ia, ra, ib, rb);
+      if (cmp != 0) { return cmp < 0; }
+    }
+    if (ia != ib) { return ia < ib; }
+    return ra < rb;
+  }
+};
+
+/// What a kway_fixed_key_device_view is built from; `storage` is key_storage::generic when the
+/// comparator is not specialised (the other members are then unset).
+struct fixed_key_parts {
+  key_storage storage{key_storage::generic};
+  const fixed_key_input* inputs{nullptr};
+  bool descending{false};
+  bool nulls_first{false};
+  bool any_nullable{false};
+};
+
 /// The device view of @p cmp; valid while @p cmp is alive. The device state it points at is
 /// filled by a copy queued on the stream @p cmp was created with: use the view on that stream.
 kway_key_device_view device_view_of(const kway_key_comparator& cmp);
+
+/// The parts of the specialised view of @p cmp; same lifetime and stream rule as device_view_of.
+fixed_key_parts fixed_key_parts_of(const kway_key_comparator& cmp);
+
+template <typename T>
+kway_fixed_key_device_view<T> make_fixed_view(const fixed_key_parts& parts,
+                                              const kway_key_device_view& rest)
+{
+  return kway_fixed_key_device_view<T>{parts.inputs,
+                                       rest,
+                                       rest.num_inputs,
+                                       parts.descending,
+                                       parts.nulls_first,
+                                       parts.any_nullable,
+                                       rest.num_columns > 1};
+}
+
+/// Calls @p fn with the device view to compare the rows of @p cmp with: a
+/// kway_fixed_key_device_view<T> when the comparator is specialised, else the generic view.
+/// @p fn must accept every view type (a generic callable).
+template <typename Fn>
+void with_key_view(const kway_key_comparator& cmp, Fn&& fn)
+{
+  const auto rest  = device_view_of(cmp);
+  const auto parts = fixed_key_parts_of(cmp);
+  switch (parts.storage) {
+    case key_storage::i8: fn(make_fixed_view<std::int8_t>(parts, rest)); break;
+    case key_storage::i16: fn(make_fixed_view<std::int16_t>(parts, rest)); break;
+    case key_storage::i32: fn(make_fixed_view<std::int32_t>(parts, rest)); break;
+    case key_storage::i64: fn(make_fixed_view<std::int64_t>(parts, rest)); break;
+    case key_storage::i128: fn(make_fixed_view<__int128_t>(parts, rest)); break;
+    case key_storage::u8: fn(make_fixed_view<std::uint8_t>(parts, rest)); break;
+    case key_storage::u16: fn(make_fixed_view<std::uint16_t>(parts, rest)); break;
+    case key_storage::u32: fn(make_fixed_view<std::uint32_t>(parts, rest)); break;
+    case key_storage::u64: fn(make_fixed_view<std::uint64_t>(parts, rest)); break;
+    case key_storage::f32: fn(make_fixed_view<float>(parts, rest)); break;
+    case key_storage::f64: fn(make_fixed_view<double>(parts, rest)); break;
+    case key_storage::generic: fn(rest); break;
+  }
+}
 
 }  // namespace sirius::op::merge::detail

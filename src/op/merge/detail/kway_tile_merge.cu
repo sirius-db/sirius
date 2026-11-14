@@ -50,14 +50,8 @@ constexpr std::size_t kTileMergeSharedBytes = 40 * 1024;
 /// Measured on 188 SMs at fan-in 64 (640 B per thread), rounds of 1.94M and 1.92M rows:
 /// 51 threads, 32,640 B per CTA: 3.47 s; 52 threads, 33,280 B: 4.33 s; flat on either side.
 constexpr std::size_t kTileMergeDenseSharedBytes = 32 * 1024;
-/// Most threads per CTA.
-constexpr std::int32_t kTileMergeMaxBlockThreads = 64;
-/// Fewest output rows of a sub-tile: below this the selection outweighs the merge it saves.
-constexpr cudf::size_type kTileMergeMinSubTileRows = 32;
 /// A tile is split only when the sub-range of an input fits the 16-bit selection scratch.
 constexpr cudf::size_type kTileMergeMaxSplitTileRows = 65535;
-/// Merge threads per SM that tile_merge aims for when it chooses the sub-tiles of a tile.
-constexpr std::int64_t kTileMergeThreadsPerSm = 256;
 
 /// Shared-memory bytes of one thread: lo and hi (32-bit, k entries) and the tree (16-bit, kp).
 constexpr std::size_t thread_state_bytes(std::int32_t padded_inputs)
@@ -74,7 +68,8 @@ static_assert(kMaxKwayMergeInputs <= UINT16_MAX);
 /// Thread `threadIdx.x` of block `blockIdx.x` merges sub-tile `threadIdx.x % sub_tiles` of tile
 /// `blockIdx.x * (blockDim.x / sub_tiles) + threadIdx.x / sub_tiles`. The shared memory holds
 /// blockDim.x * (2 * padded_inputs 32-bit words + padded_inputs 16-bit words).
-__global__ void tile_merge_kernel(kway_key_device_view keys,
+template <typename View>
+__global__ void tile_merge_kernel(View keys,
                                   const cudf::size_type* tile_coranks,
                                   std::int32_t num_inputs,
                                   std::int32_t padded_inputs,
@@ -237,23 +232,34 @@ __global__ void tile_merge_kernel(kway_key_device_view keys,
   }
 }
 
-/// SM count of the calling thread's current device. The attribute is queried once per device.
-int current_device_sm_count()
+/// What the launch shape depends on, of the calling thread's current device.
+struct device_traits {
+  int sm_count{0};                  ///< 0: not queried yet
+  int compute_capability_major{0};
+};
+
+/// The traits of the calling thread's current device. The attributes are queried once per device.
+device_traits current_device_traits()
 {
   static std::mutex mutex;
-  static std::vector<int> sm_counts;  // by device ordinal; 0: not queried yet
+  static std::vector<device_traits> traits;  // by device ordinal
   int device = 0;
   CUDF_CUDA_TRY(cudaGetDevice(&device));
   const auto slot = static_cast<std::size_t>(device);
   const std::lock_guard lock(mutex);
-  if (sm_counts.size() <= slot) { sm_counts.resize(slot + 1, 0); }
-  if (sm_counts[slot] == 0) {
+  if (traits.size() <= slot) { traits.resize(slot + 1); }
+  if (traits[slot].sm_count == 0) {
     int sm_count = 0;
+    int major    = 0;
     CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-    sm_counts[slot] = std::max(sm_count, 1);
+    CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    traits[slot] = device_traits{std::max(sm_count, 1), major};
   }
-  return sm_counts[slot];
+  return traits[slot];
 }
+
+/// Compute capability major version of the devices the dense shape was measured on (GB200).
+constexpr int kDenseShapeComputeCapabilityMajor = 10;
 
 /// The launch shape whose CTAs use at most @p shared_limit bytes of shared memory; a single
 /// thread whose state is larger keeps it.
@@ -262,22 +268,25 @@ tile_merge_shape shape_within(std::size_t shared_limit,
                               cudf::size_type tile_rows,
                               std::int32_t padded_inputs,
                               int sm_count,
-                              std::int32_t requested_sub_tiles)
+                              std::int32_t requested_sub_tiles,
+                              const tile_merge_policy& policy)
 {
   const std::size_t state_bytes = thread_state_bytes(padded_inputs);
-  const auto max_block_threads  = static_cast<std::int32_t>(
-    std::clamp<std::size_t>(shared_limit / state_bytes, 1, kTileMergeMaxBlockThreads));
+  const auto block_limit        = static_cast<std::size_t>(std::max(policy.max_block_threads, 1));
+  const auto max_block_threads  =
+    static_cast<std::int32_t>(std::clamp<std::size_t>(shared_limit / state_bytes, 1, block_limit));
 
-  // Sub-tiles per tile that bring the merge threads to about kTileMergeThreadsPerSm per SM.
-  const std::int64_t threads  = sm_count * kTileMergeThreadsPerSm;
+  // Sub-tiles per tile that bring the merge threads to about policy.threads_per_sm per SM.
+  const std::int64_t threads  = sm_count * std::max<std::int64_t>(policy.threads_per_sm, 1);
   const auto device_sub_tiles = static_cast<std::int32_t>(
-    std::min<std::int64_t>((threads - 1) / tiles + 1, kTileMergeMaxBlockThreads));
+    std::min<std::int64_t>((threads - 1) / tiles + 1, static_cast<std::int64_t>(block_limit)));
 
   // A short last tile keeps the sub-tile size of the full tiles and leaves its last threads idle.
   const std::int32_t max_sub_tiles =
     tile_rows > kTileMergeMaxSplitTileRows
       ? 1
-      : std::clamp(tile_rows / kTileMergeMinSubTileRows, 1, max_block_threads);
+      : std::clamp(
+          tile_rows / std::max<cudf::size_type>(policy.min_sub_tile_rows, 1), 1, max_block_threads);
   tile_merge_shape shape{};
   shape.sub_tiles =
     std::clamp(requested_sub_tiles > 0 ? requested_sub_tiles : device_sub_tiles, 1, max_sub_tiles);
@@ -291,11 +300,43 @@ tile_merge_shape shape_within(std::size_t shared_limit,
 
 }  // namespace
 
+bool dense_tile_shape_applies(bool specialized_key,
+                              std::int32_t num_inputs,
+                              int compute_capability_major)
+{
+  return specialized_key && num_inputs <= kDenseShapeMaxInputs &&
+         compute_capability_major == kDenseShapeComputeCapabilityMajor;
+}
+
+tile_merge_policy tile_merge_policy_for(bool specialized_key,
+                                        std::int32_t num_inputs,
+                                        int compute_capability_major)
+{
+  tile_merge_policy policy{};
+  if (dense_tile_shape_applies(specialized_key, num_inputs, compute_capability_major)) {
+    policy.threads_per_sm    = 384;
+    policy.max_block_threads = 128;
+  }
+  return policy;
+}
+
+cudf::size_type bounded_merge_tile_rows(const kway_key_comparator& cmp)
+{
+  const auto tuning = current_kway_tuning();
+  if (tuning.tile_rows > 0) { return tuning.tile_rows; }
+  if (tuning.baseline_shape != 0) { return kDefaultTileRows; }
+  return dense_tile_shape_applies(
+           cmp.specialized(), cmp.num_inputs(), current_device_traits().compute_capability_major)
+           ? kDenseTileRows
+           : kDefaultTileRows;
+}
+
 tile_merge_shape tile_merge_launch_shape(cudf::size_type tiles,
                                          cudf::size_type tile_rows,
                                          std::int32_t num_inputs,
                                          int sm_count,
-                                         std::int32_t requested_sub_tiles)
+                                         std::int32_t requested_sub_tiles,
+                                         const tile_merge_policy& policy)
 {
   std::int32_t padded_inputs = 2;
   while (padded_inputs < num_inputs) {
@@ -303,17 +344,50 @@ tile_merge_shape tile_merge_launch_shape(cudf::size_type tiles,
   }
   sm_count   = std::max(sm_count, 1);
   auto shape = shape_within(
-    kTileMergeSharedBytes, tiles, tile_rows, padded_inputs, sm_count, requested_sub_tiles);
+    kTileMergeSharedBytes, tiles, tile_rows, padded_inputs, sm_count, requested_sub_tiles, policy);
   // With an SM for every CTA no CTA waits for another, whatever its shared memory.
-  if (shape.shared_bytes > kTileMergeDenseSharedBytes &&
+  if (policy.dense_shared_cap && shape.shared_bytes > kTileMergeDenseSharedBytes &&
       shape.blocks > static_cast<std::uint32_t>(sm_count)) {
-    shape = shape_within(
-      kTileMergeDenseSharedBytes, tiles, tile_rows, padded_inputs, sm_count, requested_sub_tiles);
+    shape = shape_within(kTileMergeDenseSharedBytes,
+                         tiles,
+                         tile_rows,
+                         padded_inputs,
+                         sm_count,
+                         requested_sub_tiles,
+                         policy);
   }
   return shape;
 }
 
 namespace {
+
+template <typename View>
+void launch_tile_merge(View view,
+                       const tile_merge_shape& shape,
+                       const cudf::size_type* tile_coranks,
+                       std::int32_t k,
+                       std::int32_t padded_inputs,
+                       cudf::size_type tiles,
+                       cudf::size_type target,
+                       cudf::size_type tile_rows,
+                       std::int32_t* out_input,
+                       cudf::size_type* out_row,
+                       rmm::cuda_stream_view stream)
+{
+  tile_merge_kernel<View>
+    <<<shape.blocks, static_cast<unsigned int>(shape.block_threads), shape.shared_bytes,
+       stream.value()>>>(view,
+                         tile_coranks,
+                         k,
+                         padded_inputs,
+                         tiles,
+                         target,
+                         tile_rows,
+                         shape.sub_tiles,
+                         shape.sub_rows,
+                         out_input,
+                         out_row);
+}
 
 /// tile_merge with @p requested_sub_tiles sub-tiles per tile (0: chosen from the device); the
 /// count is capped as in tile_merge_launch_shape.
@@ -353,23 +427,32 @@ void tile_merge_impl(const kway_key_comparator& cmp,
   while (padded_inputs < k) {
     padded_inputs *= 2;
   }
+  const auto tuning = current_kway_tuning();
+  const auto device = current_device_traits();
+  auto policy       = tuning.baseline_shape != 0
+                        ? tile_merge_policy{}
+                        : tile_merge_policy_for(cmp.specialized(), k, device.compute_capability_major);
+  // Measurement overrides of the policy.
+  if (tuning.threads_per_sm > 0) { policy.threads_per_sm = tuning.threads_per_sm; }
+  if (tuning.max_block_threads > 0) { policy.max_block_threads = tuning.max_block_threads; }
+  if (tuning.min_sub_tile_rows > 0) { policy.min_sub_tile_rows = tuning.min_sub_tile_rows; }
+  if (requested_sub_tiles == 0 && tuning.sub_tiles > 0) { requested_sub_tiles = tuning.sub_tiles; }
   const auto shape =
-    tile_merge_launch_shape(tiles, tile_rows, k, current_device_sm_count(), requested_sub_tiles);
+    tile_merge_launch_shape(tiles, tile_rows, k, device.sm_count, requested_sub_tiles, policy);
 
-  tile_merge_kernel<<<shape.blocks,
-                      static_cast<unsigned int>(shape.block_threads),
-                      shape.shared_bytes,
-                      stream.value()>>>(device_view_of(cmp),
-                                        tile_coranks.data(),
-                                        k,
-                                        padded_inputs,
-                                        tiles,
-                                        target,
-                                        tile_rows,
-                                        shape.sub_tiles,
-                                        shape.sub_rows,
-                                        out_input.data(),
-                                        out_row.data());
+  with_key_view(cmp, [&](auto view) {
+    launch_tile_merge(view,
+                      shape,
+                      tile_coranks.data(),
+                      k,
+                      padded_inputs,
+                      tiles,
+                      target,
+                      tile_rows,
+                      out_input.data(),
+                      out_row.data(),
+                      stream);
+  });
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

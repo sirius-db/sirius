@@ -367,6 +367,54 @@ tile_merge_shape shape_within_40k(cudf::size_type tiles,
 
 }  // namespace
 
+TEST_CASE("tile merge policy is dense only where it was measured", "[kway_tile_merge]")
+{
+  const tile_merge_policy baseline{};
+  CHECK(baseline.threads_per_sm == 256);
+  CHECK(baseline.max_block_threads == 64);
+  CHECK(baseline.min_sub_tile_rows == 32);
+  CHECK(baseline.dense_shared_cap);
+
+  const auto same = [](const tile_merge_policy& a, const tile_merge_policy& b) {
+    return a.threads_per_sm == b.threads_per_sm && a.max_block_threads == b.max_block_threads &&
+           a.min_sub_tile_rows == b.min_sub_tile_rows && a.dense_shared_cap == b.dense_shared_cap;
+  };
+  // A specialised key at a fan-in of at most 32 on compute capability 10 (GB200).
+  for (const std::int32_t k : {1, 2, 8, 16, 32}) {
+    CAPTURE(k);
+    const auto dense = tile_merge_policy_for(true, k, 10);
+    CHECK(dense_tile_shape_applies(true, k, 10));
+    CHECK(dense.threads_per_sm == 384);
+    CHECK(dense.max_block_threads == 128);
+    CHECK(dense.min_sub_tile_rows == baseline.min_sub_tile_rows);
+    CHECK(dense.dense_shared_cap);
+    // The generic comparator, and any other device class, keep the baseline shape.
+    CHECK(same(tile_merge_policy_for(false, k, 10), baseline));
+    CHECK(same(tile_merge_policy_for(true, k, 12), baseline));
+    CHECK(same(tile_merge_policy_for(true, k, 9), baseline));
+    CHECK_FALSE(dense_tile_shape_applies(false, k, 10));
+    CHECK_FALSE(dense_tile_shape_applies(true, k, 12));
+  }
+  for (const std::int32_t k : {33, 64, 4096}) {
+    CAPTURE(k);
+    CHECK(same(tile_merge_policy_for(true, k, 10), baseline));
+    CHECK_FALSE(dense_tile_shape_applies(true, k, 10));
+  }
+
+  // The dense policy on 152 SMs: a 16.8M-row round of 4096-row tiles at fan-in 8.
+  const auto shape = tile_merge_launch_shape(4102, 4096, 8, 152, 0, tile_merge_policy_for(true, 8, 10));
+  CHECK(shape.sub_tiles == 15);
+  CHECK(shape.sub_rows == 274);
+  CHECK(shape.block_tiles == 8);
+  CHECK(shape.block_threads == 120);
+  CHECK(shape.blocks == 513);
+  CHECK(shape.shared_bytes == 120 * 80);
+  // The same round with the default policy is the baseline shape.
+  const auto before = tile_merge_launch_shape(8204, 2048, 8, 152);
+  CHECK(before.sub_tiles == 5);
+  CHECK(before.block_threads == 60);
+}
+
 TEST_CASE("tile merge launch shape keeps blocks that share an SM within 32 KiB",
           "[kway_tile_merge][tile_merge_shape]")
 {

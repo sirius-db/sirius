@@ -133,7 +133,7 @@ bounded_merge_result bounded_kway_merge(std::span<const cudf::table_view> window
   }
 
   // Co-ranks at every tile boundary and, in the last row, at target.
-  constexpr auto tile_rows = detail::kDefaultTileRows;
+  const auto tile_rows = detail::bounded_merge_tile_rows(cmp);
   const auto tiles         = static_cast<std::size_t>((target - 1) / tile_rows + 1);
   rmm::device_uvector<cudf::size_type> ranks(tiles + 1, stream, temp_mr);
   thrust::tabulate(

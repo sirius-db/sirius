@@ -39,7 +39,8 @@ constexpr int kWarpSize = 32;
 
 /// lo + the number of rows in [lo, hi) of window @p input that order before row @p pivot_row of
 /// window @p pivot_input. The rows of a window are sorted, so those rows are a prefix of the range.
-__device__ cudf::size_type lower_bound(const kway_key_device_view& view,
+template <typename View>
+__device__ cudf::size_type lower_bound(const View& view,
                                        int32_t input,
                                        cudf::size_type lo,
                                        cudf::size_type hi,
@@ -77,7 +78,8 @@ __device__ cudf::size_type lower_bound(const kway_key_device_view& view,
  *
  * lo lives in the output; hi and count are scratch arrays with the same layout.
  */
-__global__ void corank_kernel(kway_key_device_view view,
+template <typename View>
+__global__ void corank_kernel(View view,
                               const cudf::size_type* lengths,
                               const cudf::size_type* ranks,
                               cudf::size_type* out,
@@ -182,6 +184,72 @@ __global__ void corank_kernel(kway_key_device_view view,
   }
 }
 
+/**
+ * The same selection for a fan-in of at most 32, one warp (one block of 32 threads) per rank:
+ * lane l owns input l and keeps its bounds in registers, and the warp agrees on the pivot and on
+ * the sums with shuffles, so an iteration touches no memory but the keys it compares. The lanes
+ * past the fan-in own an empty range. The answer is the co-rank vector of the rank, which is
+ * unique, so it does not depend on the pivots chosen.
+ */
+template <typename View>
+__global__ void corank_warp_kernel(View view,
+                                   const cudf::size_type* lengths,
+                                   const cudf::size_type* ranks,
+                                   cudf::size_type* out)
+{
+  constexpr unsigned kAllLanes = 0xFFFF'FFFFu;
+  const int lane               = static_cast<int>(threadIdx.x);
+  const int32_t k              = view.num_inputs;
+  const int64_t rank           = ranks[blockIdx.x];
+  const bool owner             = lane < k;
+  cudf::size_type lo           = 0;
+  cudf::size_type hi           = owner ? lengths[lane] : 0;
+
+  while (true) {
+    // The widest range (the lowest lane among equals) and the sums of the bounds.
+    std::uint64_t widest =
+      (static_cast<std::uint64_t>(hi - lo) << 32) | static_cast<std::uint32_t>(kWarpSize - 1 - lane);
+    int64_t sum_lo = lo;
+    int64_t sum_hi = hi;
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      const std::uint64_t other = __shfl_xor_sync(kAllLanes, widest, offset);
+      widest                    = other > widest ? other : widest;
+      sum_lo += __shfl_xor_sync(kAllLanes, sum_lo, offset);
+      sum_hi += __shfl_xor_sync(kAllLanes, sum_hi, offset);
+    }
+    const auto width        = static_cast<cudf::size_type>(widest >> 32);
+    const int32_t pivot_input =
+      kWarpSize - 1 - static_cast<int32_t>(widest & static_cast<std::uint64_t>(kWarpSize - 1));
+
+    // Every lane holds the same sums, so the whole warp leaves the loop together.
+    // width == 0 only with sum_lo == rank, unless the rank is out of range (> Σ lengths).
+    if (sum_lo == rank || width == 0) { break; }
+    if (sum_hi == rank) {
+      lo = hi;
+      break;
+    }
+
+    const cudf::size_type pivot = __shfl_sync(kAllLanes, lo + (hi - lo) / 2, pivot_input);
+    const cudf::size_type count =
+      !owner ? 0 : lane == pivot_input ? pivot : lower_bound(view, lane, lo, hi, pivot_input, pivot);
+    int64_t before = count;
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      before += __shfl_xor_sync(kAllLanes, before, offset);
+    }
+
+    if (before == rank) {
+      lo = count;
+      break;
+    }
+    if (before < rank) {
+      lo = lane == pivot_input ? pivot + 1 : count;
+    } else {
+      hi = count;
+    }
+  }
+  if (owner) { out[static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(k) + lane] = lo; }
+}
+
 /// The two device-side terms of the safe target.
 struct target_bounds {
   int64_t r_safe;  ///< min over truncated windows of (rank of the window's last row + 1)
@@ -191,7 +259,8 @@ struct target_bounds {
 /// One warp (one block of 32 threads) per window i. Lane l counts, in the inputs l, l + 32, ...,
 /// the rows that order before the last row of window i; the warp adds the counts up. A window
 /// that is not truncated does not bound the target.
-__global__ void window_bounds_kernel(kway_key_device_view view,
+template <typename View>
+__global__ void window_bounds_kernel(View view,
                                      const cudf::size_type* lengths,
                                      const std::uint8_t* truncated,
                                      target_bounds* out)
@@ -236,6 +305,43 @@ void check_lengths(const kway_key_comparator& cmp,
   }
 }
 
+template <typename View>
+void launch_corank(View view,
+                   cudf::device_span<const cudf::size_type> lengths,
+                   cudf::device_span<const cudf::size_type> ranks,
+                   cudf::device_span<cudf::size_type> out,
+                   bool warp_kernel,
+                   rmm::cuda_stream_view stream)
+{
+  const auto blocks = static_cast<unsigned>(ranks.size());
+  if (warp_kernel) {
+    corank_warp_kernel<View>
+      <<<blocks, kWarpSize, 0, stream.value()>>>(view, lengths.data(), ranks.data(), out.data());
+    CUDF_CUDA_TRY(cudaPeekAtLastError());
+    return;
+  }
+  // hi and count of every (rank, input), laid out like out.
+  rmm::device_uvector<cudf::size_type> scratch(
+    2 * out.size(), stream, cudf::get_current_device_resource_ref());
+  corank_kernel<View>
+    <<<blocks, kWarpSize, 0, stream.value()>>>(
+      view, lengths.data(), ranks.data(), out.data(), scratch.data(), scratch.data() + out.size());
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename View>
+void launch_window_bounds(View view,
+                          cudf::device_span<const cudf::size_type> lengths,
+                          cudf::device_span<const std::uint8_t> truncated,
+                          target_bounds* out,
+                          rmm::cuda_stream_view stream)
+{
+  window_bounds_kernel<View>
+    <<<static_cast<unsigned>(lengths.size()), kWarpSize, 0, stream.value()>>>(
+      view, lengths.data(), truncated.data(), out);
+  CUDF_CUDA_TRY(cudaPeekAtLastError());
+}
+
 }  // namespace
 
 void corank_split(const kway_key_comparator& cmp,
@@ -253,17 +359,13 @@ void corank_split(const kway_key_comparator& cmp,
     throw std::invalid_argument("corank_split: too many ranks");
   }
 
-  // hi and count of every (rank, input), laid out like out.
-  rmm::device_uvector<cudf::size_type> scratch(
-    2 * out.size(), stream, cudf::get_current_device_resource_ref());
-  corank_kernel<<<static_cast<unsigned>(ranks.size()), kWarpSize, 0, stream.value()>>>(
-    device_view_of(cmp),
-    lengths.data(),
-    ranks.data(),
-    out.data(),
-    scratch.data(),
-    scratch.data() + out.size());
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  // The warp kernel has one lane per input. It was measured with specialised comparators; the
+  // generic comparator keeps the general kernel unless the switch asks for it.
+  const auto warp_switch = current_kway_tuning().warp_corank;
+  const bool warp_kernel = lengths.size() <= static_cast<std::size_t>(kWarpSize) &&
+                           (warp_switch >= 2 || (warp_switch == 1 && cmp.specialized()));
+  with_key_view(
+    cmp, [&](auto view) { launch_corank(view, lengths, ranks, out, warp_kernel, stream); });
 }
 
 // A truncated window with no rows forces the target to 0: the next row of its run is unknown, so
@@ -283,9 +385,9 @@ cudf::size_type safe_target(const kway_key_comparator& cmp,
   // result of the reduction is the only device-to-host copy.
   const auto temp_mr = cudf::get_current_device_resource_ref();
   rmm::device_uvector<target_bounds> window_bounds(lengths.size(), stream, temp_mr);
-  window_bounds_kernel<<<static_cast<unsigned>(lengths.size()), kWarpSize, 0, stream.value()>>>(
-    device_view_of(cmp), lengths.data(), truncated.data(), window_bounds.data());
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  with_key_view(cmp, [&](auto view) {
+    launch_window_bounds(view, lengths, truncated, window_bounds.data(), stream);
+  });
   const auto bounds = thrust::reduce(rmm::exec_policy_nosync(stream, temp_mr),
                                      window_bounds.begin(),
                                      window_bounds.end(),

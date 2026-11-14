@@ -45,10 +45,31 @@ using namespace sirius::op::merge::detail;
 
 namespace {
 
-enum class kind { int32, int64, float64, string, decimal64, timestamp, decimal128, float32, bool8 };
+enum class kind {
+  int32,
+  int64,
+  float64,
+  string,
+  decimal64,
+  timestamp,
+  decimal128,
+  float32,
+  bool8,
+  // Integer-backed kinds whose values come from wide_int_domain, narrowed to the storage type.
+  int8,
+  int16,
+  uint8,
+  uint16,
+  uint32,
+  uint64,
+  decimal32,
+  timestamp_days,
+  duration_ns,
+  duration_days
+};
 
 /// One key column of one window, on the host. `ints` holds the values of the integer-backed
-/// kinds (int32, int64, decimal64, timestamp, decimal128, bool8) and `doubles` those of both
+/// kinds (every kind but the floating-point ones and string) and `doubles` those of both
 /// floating-point kinds.
 struct host_column {
   kind type{kind::int64};
@@ -74,6 +95,16 @@ cudf::data_type cudf_type(kind type)
     case kind::decimal128: return cudf::data_type{cudf::type_id::DECIMAL128, -2};
     case kind::float32: return cudf::data_type{cudf::type_id::FLOAT32};
     case kind::bool8: return cudf::data_type{cudf::type_id::BOOL8};
+    case kind::int8: return cudf::data_type{cudf::type_id::INT8};
+    case kind::int16: return cudf::data_type{cudf::type_id::INT16};
+    case kind::uint8: return cudf::data_type{cudf::type_id::UINT8};
+    case kind::uint16: return cudf::data_type{cudf::type_id::UINT16};
+    case kind::uint32: return cudf::data_type{cudf::type_id::UINT32};
+    case kind::uint64: return cudf::data_type{cudf::type_id::UINT64};
+    case kind::decimal32: return cudf::data_type{cudf::type_id::DECIMAL32, -2};
+    case kind::timestamp_days: return cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+    case kind::duration_ns: return cudf::data_type{cudf::type_id::DURATION_NANOSECONDS};
+    case kind::duration_days: return cudf::data_type{cudf::type_id::DURATION_DAYS};
   }
   throw std::logic_error("unknown kind");
 }
@@ -107,6 +138,21 @@ std::vector<T> to_host(const T* device, std::size_t count)
   return out;
 }
 
+/// A column of @p col's type whose storage type is T: the host values narrowed to T.
+template <typename T>
+std::unique_ptr<cudf::column> make_narrowed_column(const host_column& col,
+                                                   rmm::device_buffer&& mask,
+                                                   cudf::size_type null_count)
+{
+  std::vector<T> values;
+  values.reserve(col.ints.size());
+  for (const auto v : col.ints) {
+    values.push_back(static_cast<T>(v));
+  }
+  return std::make_unique<cudf::column>(
+    cudf_type(col.type), col.size(), to_device_buffer(values), std::move(mask), null_count);
+}
+
 std::unique_ptr<cudf::column> make_column(const host_column& col)
 {
   const auto size = col.size();
@@ -136,6 +182,18 @@ std::unique_ptr<cudf::column> make_column(const host_column& col)
     case kind::timestamp:
       return std::make_unique<cudf::column>(
         cudf_type(col.type), size, to_device_buffer(col.ints), std::move(mask), null_count);
+    case kind::int8: return make_narrowed_column<int8_t>(col, std::move(mask), null_count);
+    case kind::int16: return make_narrowed_column<int16_t>(col, std::move(mask), null_count);
+    case kind::uint8: return make_narrowed_column<uint8_t>(col, std::move(mask), null_count);
+    case kind::uint16: return make_narrowed_column<uint16_t>(col, std::move(mask), null_count);
+    case kind::uint32: return make_narrowed_column<uint32_t>(col, std::move(mask), null_count);
+    case kind::uint64: return make_narrowed_column<uint64_t>(col, std::move(mask), null_count);
+    case kind::decimal32:
+    case kind::timestamp_days:
+    case kind::duration_days:
+      return make_narrowed_column<int32_t>(col, std::move(mask), null_count);
+    case kind::duration_ns:
+      return make_narrowed_column<int64_t>(col, std::move(mask), null_count);
     case kind::float64:
       return std::make_unique<cudf::column>(
         cudf_type(col.type), size, to_device_buffer(col.doubles), std::move(mask), null_count);
@@ -214,6 +272,24 @@ host_column random_column(kind type,
     "", "a", "ab", "abc", "b", "ba", "B", "\xC3\xA9", "a longer string value", "a longer string"};
   static const std::vector<int64_t> int_domain = {
     std::numeric_limits<int64_t>::min(), -7, -1, 0, 1, 2, 7, std::numeric_limits<int64_t>::max()};
+  // The extremes of every storage width, signed and unsigned: narrowed to a storage type they
+  // give its smallest and largest values, values around zero and wrapped duplicates.
+  static const std::vector<int64_t> wide_int_domain = {std::numeric_limits<int64_t>::min(),
+                                                       std::numeric_limits<int32_t>::min(),
+                                                       std::numeric_limits<int16_t>::min(),
+                                                       std::numeric_limits<int8_t>::min(),
+                                                       -7,
+                                                       -1,
+                                                       0,
+                                                       1,
+                                                       7,
+                                                       std::numeric_limits<int8_t>::max(),
+                                                       std::numeric_limits<uint8_t>::max(),
+                                                       std::numeric_limits<int16_t>::max(),
+                                                       std::numeric_limits<uint16_t>::max(),
+                                                       std::numeric_limits<int32_t>::max(),
+                                                       std::numeric_limits<uint32_t>::max(),
+                                                       std::numeric_limits<int64_t>::max()};
 
   host_column col;
   col.type = type;
@@ -229,6 +305,18 @@ host_column random_column(kind type,
       case kind::float32: col.doubles.push_back(float_domain[rng() % float_domain.size()]); break;
       case kind::decimal128: col.ints.push_back(static_cast<int64_t>(rng() % 9) - 4); break;
       case kind::bool8: col.ints.push_back(static_cast<int64_t>(rng() % 2)); break;
+      case kind::int8:
+      case kind::int16:
+      case kind::uint8:
+      case kind::uint16:
+      case kind::uint32:
+      case kind::uint64:
+      case kind::decimal32:
+      case kind::timestamp_days:
+      case kind::duration_ns:
+      case kind::duration_days:
+        col.ints.push_back(wide_int_domain[rng() % wide_int_domain.size()]);
+        break;
       case kind::string: col.strings.push_back(string_domain[rng() % string_domain.size()]); break;
     }
   }
@@ -327,6 +415,23 @@ void check_all_pairs(const std::vector<host_window>& windows,
   }
   const auto result = run_less(cmp, pairs);
 
+  // A fixed-width first key column takes the specialised device view, which must order every
+  // pair as the generic comparator does.
+  const auto tuning      = current_kway_tuning();
+  const bool fixed_first = windows.front().front().type != kind::string;
+  const bool wanted      =
+    tuning.specialized_keys >= 2 || (tuning.specialized_keys == 1 && windows.front().size() == 1);
+  CHECK(cmp.specialized() == (fixed_first && wanted));
+  {
+    auto generic_only             = tuning;
+    generic_only.specialized_keys = 0;
+    set_kway_tuning_for_test(generic_only);
+    auto generic_cmp = make_comparator(views, orders, null_orders);
+    set_kway_tuning_for_test(tuning);
+    CHECK_FALSE(generic_cmp.specialized());
+    CHECK(run_less(generic_cmp, pairs) == result);
+  }
+
   std::size_t cudf_mismatches = 0;
   for (std::size_t a = 0; a < rows.size(); ++a) {
     for (std::size_t b = 0; b < rows.size(); ++b) {
@@ -375,7 +480,17 @@ TEST_CASE("kway comparator matches the stable sort for single-column keys", "[kw
                              kind::int32,
                              kind::decimal128,
                              kind::float32,
-                             kind::bool8);
+                             kind::bool8,
+                             kind::int8,
+                             kind::int16,
+                             kind::uint8,
+                             kind::uint16,
+                             kind::uint32,
+                             kind::uint64,
+                             kind::decimal32,
+                             kind::timestamp_days,
+                             kind::duration_ns,
+                             kind::duration_days);
   const auto order      = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
   const auto null_order = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
 
@@ -397,6 +512,37 @@ TEST_CASE("kway comparator orders multi-column keys lexicographically", "[kway_c
                    static_cast<unsigned>(second_order) * 2 + static_cast<unsigned>(null_order));
   const auto windows = random_windows({kind::int32, kind::string}, {33, 28, 30}, rng);
   check_all_pairs(windows, {first_order, second_order}, {null_order, null_order});
+}
+
+TEST_CASE("kway comparator continues past a tie on a specialised first key", "[kway_comparator]")
+{
+  // The first column is fixed-width (specialised) and draws from a small domain; the second
+  // decides most pairs through the generic comparison.
+  const auto types        = GENERATE(std::vector<kind>{kind::bool8, kind::float64},
+                              std::vector<kind>{kind::float32, kind::int32},
+                              std::vector<kind>{kind::int32, kind::uint64, kind::string},
+                              std::vector<kind>{kind::decimal128, kind::bool8},
+                              std::vector<kind>{kind::string, kind::int32});
+  const auto first_order  = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  const auto second_order = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  const auto null_order   = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
+
+  std::mt19937 rng(4242 + static_cast<unsigned>(types.front()) * 8 +
+                   static_cast<unsigned>(first_order) * 4 +
+                   static_cast<unsigned>(second_order) * 2 + static_cast<unsigned>(null_order));
+  const auto windows = random_windows(types, {29, 0, 26, 31}, rng);
+  // Specialise the first column although more key columns follow it.
+  auto first_of_several             = current_kway_tuning();
+  first_of_several.specialized_keys = 2;
+  set_kway_tuning_for_test(first_of_several);
+  std::vector<cudf::order> orders{first_order, second_order};
+  std::vector<cudf::null_order> null_orders{null_order, cudf::null_order::AFTER};
+  while (orders.size() < types.size()) {
+    orders.push_back(first_order);
+    null_orders.push_back(null_order);
+  }
+  check_all_pairs(windows, orders, null_orders);
+  reset_kway_tuning_for_test();
 }
 
 TEST_CASE("kway comparator breaks ties by input, then by row", "[kway_comparator]")
