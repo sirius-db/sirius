@@ -1,0 +1,48 @@
+diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
+index f26dcad..c44a82e 100644
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -63,6 +63,12 @@ option(BUILD_C_LIBRARY "Build cuVS C API library" ON)
+ option(BUILD_CUVS_BENCH "Build cuVS ann benchmarks" OFF)
+ option(BUILD_CAGRA_HNSWLIB "Build CAGRA+hnswlib interface" ON)
+ option(BUILD_MG_ALGOS "Build with multi-GPU support" ON)
++set(CUVS_EXCLUDE_SOURCES_REGEX
++    ""
++    CACHE
++      STRING
++      "Skip cuvs_objs sources whose path, relative to the source or build directory, matches this regex"
++)
+ option(BUILD_MNMG_TESTS
+        "Build multi-node multi-GPU (MNMG) tests that require distributed (UCXX) dependencies" OFF
+ )
+@@ -1551,6 +1557,30 @@ if(NOT BUILD_CPU_ONLY)
+     )
+   endif()
+ 
++  if(NOT CUVS_EXCLUDE_SOURCES_REGEX STREQUAL "")
++    get_target_property(cuvs_all_sources cuvs_objs SOURCES)
++    set(cuvs_kept_sources)
++    foreach(source IN LISTS cuvs_all_sources)
++      set(relative_source "${source}")
++      # Match the path inside conditional entries such as $<$<BOOL:...>:src/x.cu>.
++      if(relative_source MATCHES "^\\$<.*:([^:>]+)>$")
++        set(relative_source "${CMAKE_MATCH_1}")
++      endif()
++      foreach(prefix IN ITEMS "${CMAKE_CURRENT_BINARY_DIR}/" "${CMAKE_CURRENT_SOURCE_DIR}/")
++        string(FIND "${relative_source}" "${prefix}" prefix_pos)
++        if(prefix_pos EQUAL 0)
++          string(LENGTH "${prefix}" prefix_len)
++          string(SUBSTRING "${relative_source}" ${prefix_len} -1 relative_source)
++          break()
++        endif()
++      endforeach()
++      if(NOT relative_source MATCHES "${CUVS_EXCLUDE_SOURCES_REGEX}")
++        list(APPEND cuvs_kept_sources "${source}")
++      endif()
++    endforeach()
++    set_property(TARGET cuvs_objs PROPERTY SOURCES "${cuvs_kept_sources}")
++  endif()
++
+   set_target_properties(
+     cuvs_objs
+     PROPERTIES CXX_STANDARD 20

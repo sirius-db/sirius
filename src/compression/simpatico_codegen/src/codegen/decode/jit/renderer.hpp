@@ -120,6 +120,7 @@ inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballo
 inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::write_column};
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
+inline constexpr DecodeShape kShapePlainDictGather{Enumerator::all_rows, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
 inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer::write_column};
 inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};
@@ -195,6 +196,9 @@ struct DecodeKernelSpec {
   // Launch geometry.  The launcher computes grid_x = ceil(num_chunks_for(n) / chunks_per_block).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
   int shared_bytes = 0;    // dynamic shared workspace peak (RLE boundaries)
+  // chunks_per_block(shape), or kTBSize / 32 where the renderer maps one chunk per warp for a
+  // shape that otherwise maps one per block (the full decode of a Bitpack/FOR/Zigzag/Delta chain).
+  int chunks_per_block = 1;
 
   std::string note;  // human-readable diagnostic
 };

@@ -2217,23 +2217,31 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
     char const* plan;
     bool strings;
     bool observes_host;  ///< Needs a host readback, so its stream cannot stay gated.
+    bool temporaries;    ///< Allocates device temporaries besides its output.
   };
   std::array<fixture, 6> const fixtures{{
-    {"input -> bitpack\n", false, false},
-    {"input -> rle -> values, runs\nrle.values -> bitpack\nrle.runs -> bitpack\n", false, false},
-    {"input -> for -> deltas, references\nfor.deltas -> bitpack\nfor.references -> bitpack\n",
+    // An encoded bitpack rep keeps its word offsets, so its decode needs no temporaries.
+    {"input -> bitpack\n", false, false, false},
+    {"input -> rle -> values, runs\nrle.values -> bitpack\nrle.runs -> bitpack\n",
+     false,
      false,
      false},
+    {"input -> for -> deltas, references\nfor.deltas -> bitpack\nfor.references -> bitpack\n",
+     false,
+     false,
+     true},
     {"input -> dictionary -> keys_offsets, keys_chars, indices\ndictionary.indices -> bitpack\n",
+     true,
      true,
      true},
     {"input -> str_split -> offsets, chars\nstr_split.offsets -> delta -> differences\n"
      "str_split.offsets.differences -> bitpack\n",
      true,
+     true,
      true},
     // ANS, like LZ4, exercises nvCOMP's metadata and scratch uploads; nvCOMP's LZ4 path also tries
     // a hardware decompression call that compute-sanitizer reports independently of this code.
-    {"input -> ans\n", false, true},
+    {"input -> ans\n", false, true, true},
   }};
   constexpr int rows = 65549;
   auto const numbers = make_int32_table(1, rows, 113);
@@ -2279,8 +2287,8 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
     }
     solo_peak[i]    = ledger.observations->peak_live_bytes;
     output_bytes[i] = ledger.observations->live_bytes;
-    expect(output_bytes[i] > 0 && solo_peak[i] > output_bytes[i],
-           "temporary fixture has no decode temporaries");
+    expect(output_bytes[i] > 0 && (solo_peak[i] > output_bytes[i]) == fixtures[i].temporaries,
+           "temporary fixture's decode temporaries differ from what it declares");
     outputs.clear();
     ledger.check();
     ledger.reset();
@@ -2800,7 +2808,15 @@ void test_scan_filter_phase_lanes(rmm::device_async_resource_ref upstream)
 
 void test_resources_and_failures(rmm::device_async_resource_ref upstream)
 {
-  decode_fixture fixture(upstream, "input -> bitpack\n", 8, 65549, 71, 4);
+  // A FOR cascade: an encoded bitpack leaf keeps its word offsets, so alone it allocates no
+  // scratch.
+  decode_fixture fixture(upstream,
+                         "input -> for -> deltas, references\nfor.deltas -> bitpack\n"
+                         "for.references -> bitpack\n",
+                         8,
+                         65549,
+                         71,
+                         4);
   auto& [input, compressed, pool, explicit_resource] = fixture;
   checked_resource default_resource(upstream);
   current_resource_guard current(default_resource);

@@ -28,6 +28,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -157,4 +159,33 @@ TEST_CASE("current_thread_id names a live kernel TID", "[exec][thread_util]")
   t.join();
   CHECK(other_tid != 0);
   CHECK(other_tid != self_tid);
+}
+
+TEST_CASE("run_with_affinity runs work under the given mask and rethrows", "[exec][thread_util]")
+{
+  auto const allowed = get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  if (allowed.size() < 2) { SKIP("needs two allowed CPUs"); }
+
+  // A thread restricted to one CPU builds from the wider mask, as a lazy REST build must.
+  std::vector<int> seen_inside;
+  std::vector<int> seen_child;
+  std::vector<int> caller_after;
+  std::thread restricted([&] {
+    REQUIRE(set_current_thread_affinity(std::span{allowed}.first(1)));
+    sirius::exec::run_with_affinity(allowed, [&] {
+      seen_inside = get_current_thread_affinity();
+      std::thread child([&] { seen_child = get_current_thread_affinity(); });
+      child.join();
+    });
+    caller_after = get_current_thread_affinity();
+  });
+  restricted.join();
+  CHECK(seen_inside == allowed);
+  CHECK(seen_child == allowed);
+  CHECK(caller_after == std::vector<int>{allowed.front()});
+
+  CHECK_THROWS_WITH(
+    sirius::exec::run_with_affinity(allowed, [] { throw std::runtime_error("build failed"); }),
+    "build failed");
 }

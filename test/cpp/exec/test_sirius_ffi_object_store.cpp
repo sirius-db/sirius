@@ -624,31 +624,18 @@ TEST_CASE("FFI object store accepts IPv6 literals and decimal endpoint ports",
   }
 }
 
-TEST_CASE("FFI object store backend policy rejects RDMA and kvikIO options",
+TEST_CASE("FFI object store backend policy rejects the RDMA transport",
           "[isolated_context][ffi][object_store]")
 {
-  auto const ca = fixture_path("ffi_object_store_test_ca.pem");
-  REQUIRE(fs::is_regular_file(ca));
-  for (auto const field : {"transport", "signing_mode", "ca_bundle_path"}) {
-    CAPTURE(field);
-    auto const config = std::string_view(field) == "transport"
-                          ? memory_config()
-                          : fixture_path("ffi_object_store_kvikio.yaml").string();
-    object_store_inputs inputs;
-    auto const original = inputs.snapshot();
-    if (std::string_view(field) == "transport") {
-      inputs.transport = Transport::kRdma;
-    } else if (std::string_view(field) == "signing_mode") {
-      inputs.signing_mode = SigningMode::kHeader;
-    } else {
-      inputs.ca_bundle_path = ca.string();
-    }
-    auto const rejected = inputs.snapshot();
-    check_invalid([&] { (void)make_context_from_config(config, rejected); }, field);
-    auto context = make_context_from_config(config, original);
-    check_invalid([&] { context->put_object_store(rejected); }, field);
-    CHECK(context->object_store_config_for(kFixtureUri).get() == original.get());
-  }
+  auto const config = memory_config();
+  object_store_inputs inputs;
+  auto const original = inputs.snapshot();
+  inputs.transport    = Transport::kRdma;
+  auto const rejected = inputs.snapshot();
+  check_invalid([&] { (void)make_context_from_config(config, rejected); }, "transport");
+  auto context = make_context_from_config(config, original);
+  check_invalid([&] { context->put_object_store(rejected); }, "transport");
+  CHECK(context->object_store_config_for(kFixtureUri).get() == original.get());
 }
 
 TEST_CASE("FFI object store factories preserve pointers without network access",
@@ -1994,8 +1981,7 @@ TEST_CASE("FFI object store messages pin backend reasons and precedence",
       inputs,
       "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
   }
-  // This fixture has memory_config()'s exact budgets, plus the backend selector.
-  message_registry published(fixture_path("ffi_object_store_kvikio.yaml").string());
+  message_registry published;
   object_store_inputs inputs;
   inputs.transport      = Transport::kRdma;
   inputs.signing_mode   = SigningMode::kHeader;
@@ -2010,16 +1996,6 @@ TEST_CASE("FFI object store messages pin backend reasons and precedence",
     published,
     inputs,
     "ObjectStoreConfig.transport: no S3-over-RDMA backend is registered in this build");
-  inputs.transport = Transport::kHttp;
-  check_rejected_at_both_entries(
-    published,
-    inputs,
-    "ObjectStoreConfig.signing_mode: the configured kvikio backend does not honor a signing mode");
-  inputs.signing_mode = SigningMode::kPresigned;
-  check_rejected_at_both_entries(
-    published,
-    inputs,
-    "ObjectStoreConfig.ca_bundle_path: the configured kvikio backend does not honor a CA bundle");
 }
 
 TEST_CASE("FFI object store messages preserve field validation precedence",

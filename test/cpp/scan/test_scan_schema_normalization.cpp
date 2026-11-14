@@ -76,6 +76,7 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
+#include <transparent/replay_admission.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
 #include <atomic>
@@ -241,7 +242,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("stub_ingestible: a resident split never decodes scan metadata");
   }
@@ -1502,8 +1504,8 @@ TEST_CASE("resident Parquet checkpoint counts a program it cannot prepare as mis
   CHECK(counts.cached_declined_no_membership == 1);
 }
 
-TEST_CASE("resident Parquet split on another device passes the checkpoint without a decline",
-          "[scan_normalization][cached_scan]")
+TEST_CASE("resident Parquet split on another device is refused before assembly",
+          "[scan_normalization][cached_scan][multi_gpu]")
 {
   int devices = 0;
   int current = -1;
@@ -1518,8 +1520,8 @@ TEST_CASE("resident Parquet split on another device passes the checkpoint withou
   columns.push_back(resident_column<std::int64_t>({901, 404, 208}, cudf::type_id::INT64));
   auto source = resident_columns(std::move(columns));
   auto input  = f.split(source, false);
-  // Names the other GPU but allocates on this one, so only the device the program is prepared for
-  // differs.
+  // Deliberately mislabel the prepared input's GPU space. The allocation stays local;
+  // the guard must refuse before assembly uses this space.
   cucascade::memory::memory_space elsewhere(cucascade::memory::gpu_memory_space_config{
     .device_id       = current == 0 ? 1 : 0,
     .memory_capacity = f.e.gpu_space->get_max_memory(),
@@ -1528,13 +1530,19 @@ TEST_CASE("resident Parquet split on another device passes the checkpoint withou
         f.e.gpu_space->get_default_allocator()};
     }});
   input->gpu_memory_space = &elsewhere;
-  auto output             = f.op.execute(*input, f.e.stream());
-  auto const& scanned     = dynamic_cast<scan::scan_output_operator_data const&>(*output);
-  CHECK(scanned.receipt().applied.empty());
-  auto leases = scanned.get_read_only_batches();
-  CHECK(sirius::get_cudf_table_view(leases.at(0)).num_rows() == 3);
+  // Refuse before entering the optional cached-filter checkpoint.
+  bool refused = false;
+  try {
+    (void)f.op.execute(*input, f.e.stream());
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    refused = true;
+    CHECK(error.cause == sirius::transparent::late_failure_cause::gpu_error);
+    CHECK(error.reason.empty());
+    CHECK_THAT(error.what(), Catch::Matchers::ContainsSubstring("but the scan executes on GPU"));
+  }
+  REQUIRE(refused);
   auto const counts = f.stats.snapshot();
-  CHECK(counts.applications_skipped_other_device == 1);
+  CHECK(counts.applications_skipped_other_device == 0);
   CHECK(counts.cached_placements == 0);
   CHECK(counts.cached_declined_no_membership == 0);
 }
@@ -2091,4 +2099,156 @@ TEST_CASE("scan forwards its pipeline expression policy to residual filtering",
     CHECK(ingestible->observed_policy->regex_jit == options.enable_regex_jit);
     e.stream().sync();
   }
+}
+
+TEST_CASE("resident and stolen Parquet facts preserve actual legacy decisions",
+          "[scan_normalization][execution_record][cached_scan]")
+{
+  auto& e           = env();
+  bool const stolen = GENERATE(false, true);
+  int const mode    = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
+  CAPTURE(stolen, mode);
+  auto info = resident_parquet_info({0, 1}, 1, mode ? std::optional<std::size_t>{1} : std::nullopt);
+  bool const answered = mode == 3 || mode == 4 || mode == 5;
+  if (answered) {
+    // Dictionary equality answers are offered only for pure-filter string columns.
+    info->returned_types[1] = sirius::logical_type::make(sirius::type_id::VARCHAR);
+    info->table_filters     = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value("keep")));
+  }
+  auto counters            = std::make_shared<scan::physical_check_counters>();
+  counters->track_units    = true;
+  info->profiles->counters = counters;
+  std::vector<bool> decisions;
+  counters->scan_execution_for_testing = [&](bool authority, auto const&) {
+    decisions.push_back(authority);
+  };
+  auto ingestible      = scan::make_ingestible(std::move(info));
+  bool const complete  = mode == 2 || mode == 7;
+  bool const qualified = mode != 5 && mode != 6;
+  std::vector<std::int64_t> expected{41, 29, 53};
+  if (mode == 1 || mode == 5 || mode == 6) expected = {41, 53};
+  if (mode == 3) expected = {41};
+  for (bool authority : {false, true}) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(resident_column<std::int64_t>({41, 29, 53}, cudf::type_id::INT64));
+    if (mode != 7) {
+      if (answered)
+        columns.push_back(resident_column<std::int8_t>(
+          mode == 4 ? std::vector<std::int8_t>{0, 0, 0} : std::vector<std::int8_t>{1, 0, 1},
+          cudf::type_id::BOOL8,
+          mode == 3 ? std::optional<cudf::size_type>{2} : std::nullopt));
+      else
+        columns.push_back(resident_column<std::int64_t>(
+          complete ? std::vector<std::int64_t>{0, 0, 0} : std::vector<std::int64_t>{1, 0, 1},
+          cudf::type_id::INT64));
+    }
+    auto table = std::make_unique<cudf::table>(std::move(columns));
+    auto source =
+      sirius::make_data_batch(std::make_unique<cudf::table>(
+                                table->view(), e.stream(), e.gpu_space->get_default_allocator()),
+                              *e.gpu_space,
+                              e.stream(),
+                              {});
+    scan::scan_operator_input input(source);
+    input.gpu_memory_space                     = e.gpu_space;
+    input.execution                            = {4, 45, {}};
+    input.pushdown_row_filtered                = complete;
+    input.pushdown_filter_only_columns_dropped = mode == 7;
+    if (answered)
+      input.pushdown_predicate_columns =
+        mode == 5 ? std::vector<std::size_t>{1, 1} : std::vector<std::size_t>{1};
+    if (mode == 6) input.pushdown_predicate_columns = {99};
+    input.pushdown_predicates_enforced = mode == 4;
+    if (stolen) input.stolen_table = std::move(table);
+    auto batch = ingestible->materialize_table(input, e.stream());
+    REQUIRE(batch.execution);
+    auto const& facts = *batch.execution;
+    CHECK(facts.producer == scan::execution_record_producer::resident);
+    CHECK(batch.attempt == 4);
+    CHECK(batch.logical_input == 45);
+    CHECK(facts.authoritative == qualified);
+    CHECK(facts.whole_static_complete == (mode == 0 || complete));
+    CHECK_FALSE(facts.projection_complete);
+    CHECK(facts.visibility_applied.empty());
+    CHECK_FALSE(batch.row_positions);
+    CHECK_FALSE(batch.lineage_record);
+    if (answered) {
+      REQUIRE(facts.predicates.size() == 1);
+      CHECK(facts.predicates.front().answer_slot == 1);
+      CHECK(facts.predicates.front().stage == (mode == 4 ? sirius::op::predicate_stage::enforced
+                                                         : sirius::op::predicate_stage::answer));
+    }
+    // Compare the real producer boundary and the legacy consumer using independent batches.
+    batch.execution->authoritative = authority && qualified;
+    auto output                    = ingestible->post_filter_and_project(
+      std::move(batch), *e.gpu_space, e.stream(), false, nullptr, nullptr, {});
+    REQUIRE(output->num_columns() == 1);
+    require_resident_values<std::int64_t>(output->view().column(0), cudf::type_id::INT64, expected);
+    CHECK(input.stolen_table_consumed == stolen);
+    if (stolen) REQUIRE_THROWS(ingestible->materialize_table(input, e.stream()));
+  }
+  CHECK(decisions == std::vector<bool>{false, qualified});
+}
+
+TEST_CASE("Parquet consumes actual decompression outcome before shared remaining work",
+          "[scan_normalization][execution_record][cached_scan]")
+{
+  auto& e             = env();
+  int const mode      = GENERATE(0, 1, 2, 3);
+  auto info           = resident_parquet_info({0, 1}, 1, 1);
+  bool const answered = mode >= 2;
+  if (answered) {
+    info->returned_types[1] = sirius::logical_type::make(sirius::type_id::VARCHAR);
+    info->table_filters     = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(1),
+      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value("keep")));
+  }
+  auto ingestible                   = scan::make_ingestible(std::move(info));
+  std::vector<std::int64_t> payload = mode == 1 || mode == 3
+                                        ? std::vector<std::int64_t>{41, 53}
+                                        : std::vector<std::int64_t>{41, 29, 53};
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(resident_column(payload, cudf::type_id::INT64));
+  if (mode == 0) columns.push_back(resident_column<std::int64_t>({1, 0, 1}, cudf::type_id::INT64));
+  if (answered)
+    columns.push_back(resident_column<std::int8_t>(
+      mode == 3 ? std::vector<std::int8_t>{0, 0} : std::vector<std::int8_t>{1, 0, 1},
+      cudf::type_id::BOOL8,
+      mode == 2 ? std::optional<cudf::size_type>{2} : std::nullopt));
+  sirius::pushdown_outcome outcome;
+  outcome.row_filtered                = mode == 1;
+  outcome.filter_only_columns_dropped = mode == 1;
+  outcome.predicates_enforced         = mode == 3;
+  if (answered) outcome.predicate_columns = {1};
+  auto source = cucascade::data_batch::make(
+    sirius::get_next_batch_id(),
+    std::make_unique<sirius::decompression_pushdown_batch_representation>(
+      std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream(), outcome));
+  scan::scan_operator_input input(source);
+  input.prepare_for_processing(e.gpu_space, e.stream());
+  CHECK(input.pushdown_row_filtered == outcome.row_filtered);
+  CHECK(input.pushdown_predicate_columns == outcome.predicate_columns);
+  CHECK(input.pushdown_predicates_enforced == outcome.predicates_enforced);
+  auto decoded = ingestible->materialize_table(input, e.stream());
+  REQUIRE(decoded.execution);
+  CHECK(decoded.execution->authoritative);
+  CHECK(decoded.execution->producer == scan::execution_record_producer::resident);
+  CHECK(decoded.execution->whole_static_complete == (mode == 1));
+  CHECK(decoded.execution->visibility_applied.empty());
+  if (answered) {
+    REQUIRE(decoded.execution->predicates.size() == 1);
+    CHECK(
+      decoded.execution->predicates.front().stage ==
+      (mode == 3 ? sirius::op::predicate_stage::enforced : sirius::op::predicate_stage::answer));
+  }
+  auto output = ingestible->post_filter_and_project(
+    std::move(decoded), *e.gpu_space, e.stream(), false, nullptr, nullptr, {});
+  require_resident_values<std::int64_t>(
+    output->view().column(0),
+    cudf::type_id::INT64,
+    mode == 2 ? std::vector<std::int64_t>{41} : std::vector<std::int64_t>{41, 53});
 }

@@ -55,71 +55,13 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-namespace duckdb {
-
-namespace {
-
-std::mutex& recorded_calls_mutex()
-{
-  static std::mutex m;
-  return m;
-}
-
-std::vector<PinTableArgs>& recorded_calls_storage()
-{
-  static std::vector<PinTableArgs> calls;
-  return calls;
-}
-
-std::vector<std::string>& recorded_unpin_calls_storage()
-{
-  static std::vector<std::string> calls;
-  return calls;
-}
-
-}  // namespace
-
-void pin_table_to(const PinTableArgs& args)
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_calls_storage().push_back(args);
-}
-
-void unpin_table_to(const std::string& name)
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_unpin_calls_storage().push_back(name);
-}
-
-namespace pin_table_testing {
-
-const std::vector<PinTableArgs>& recorded_calls() { return recorded_calls_storage(); }
-
-void clear_recorded_calls()
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_calls_storage().clear();
-}
-
-const std::vector<std::string>& recorded_unpin_calls() { return recorded_unpin_calls_storage(); }
-
-void clear_recorded_unpin_calls()
-{
-  std::lock_guard<std::mutex> lock(recorded_calls_mutex());
-  recorded_unpin_calls_storage().clear();
-}
-
-}  // namespace pin_table_testing
-
-}  // namespace duckdb
 
 namespace sirius {
 
@@ -1010,13 +952,24 @@ device_pin_result materialize_all_batches_compressed(
               if (!read_err.empty()) {
                 throw std::runtime_error("[materialize_all_batches_compressed] " + read_err);
               }
+              // The kept offsets live outside the slab, so they are added to the chunk's sizes.
+              auto const kept = simpatico::keep_bitpack_word_offsets(
+                blob->table, stream, src_space->get_default_allocator());
+              std::size_t const kept_bytes =
+                std::accumulate(kept.begin(), kept.end(), std::size_t{0});
+              if (column_sizes && kept_bytes > 0) {
+                auto sizes = std::make_shared<sirius::per_column_byte_sizes>(*column_sizes);
+                for (std::size_t c = 0; c < kept.size() && c < sizes->compressed.size(); ++c)
+                  sizes->compressed[c] += kept[c];
+                column_sizes = std::move(sizes);
+              }
               stream.sync();
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,
                 std::move(blob),
                 compression.column_names,
-                static_cast<std::size_t>(payload_bytes),
+                static_cast<std::size_t>(payload_bytes) + kept_bytes,
                 uncompressed_bytes,
                 chunk_rows,
                 std::move(column_sizes));

@@ -30,6 +30,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -115,6 +116,8 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -169,6 +172,8 @@ class SiriusConnectionState : public ClientContextState {
     ++planning_generation_;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
 
@@ -214,11 +219,32 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
-  /// planning generation.
+  /// planning generation, together with the CTE reader proofs the pre-optimize hook staged for
+  /// the same optimizer run.
   void set_captured_plan(unique_ptr<LogicalOperator> plan)
   {
-    captured_plan_       = std::move(plan);
-    captured_generation_ = planning_generation_;
+    captured_plan_              = std::move(plan);
+    captured_generation_        = planning_generation_;
+    captured_cte_reader_proofs_ = std::move(staged_cte_reader_proofs_);
+    staged_cte_reader_proofs_.reset();
+  }
+
+  /// \brief Stage the CTE reader proofs collected by the pre-optimize hook. They are kept only if
+  /// the optimizer hook captures the plan of the same run (`set_captured_plan`).
+  void stage_cte_reader_proofs(
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> proofs) noexcept
+  {
+    staged_cte_reader_proofs_ = std::move(proofs);
+  }
+
+  /// \brief Consume the proofs captured with the plan iff they belong to the CURRENT planning
+  /// attempt. Without proofs, no CTE read is treated as restrictable.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const>
+  take_captured_cte_reader_proofs_if_current() noexcept
+  {
+    auto proofs = std::move(captured_cte_reader_proofs_);
+    captured_cte_reader_proofs_.reset();
+    return captured_generation_ == planning_generation_ ? std::move(proofs) : nullptr;
   }
 
   void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
@@ -256,6 +282,8 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
   }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
@@ -315,6 +343,9 @@ class SiriusConnectionState : public ClientContextState {
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
+  /// Delim-CTE reader proofs: staged by the pre-optimize hook, captured with the plan.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> staged_cte_reader_proofs_;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> captured_cte_reader_proofs_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -374,6 +405,8 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
+    uint64_t exists_minmax_rewrites = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
     uint64_t provider_internal_skips          = 0;
     uint64_t hidden_catalog_skips             = 0;
@@ -759,6 +792,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Rebuild scan caches with HOST downgrade borrowers quiesced, then rebind and resume them.
+  /// The caller must hold exclusive maintenance admission, as for scan-manager cache resets.
+  void reset_caches();
+
   /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
@@ -828,6 +865,9 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
+  void record_exists_minmax_rewrites(uint64_t count) noexcept;
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -869,6 +909,7 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  void rebind_fs_cache_on_host_executors();
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring
   /// (and before returning) re-checks BOTH runtime health and the acquiring
@@ -963,9 +1004,11 @@ class SiriusContext : public ClientContextState {
   // stops and destroys them before resetting the scheduler. Member declaration order
   // preserves that lifetime relationship during destruction as well.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
+  // HOST downgrade executors borrow the default ioctx's cache. Declare its owner before
+  // them so initialize() failure also stops/destroys the borrowers before the cache.
+  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
-  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
   std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
     std::make_shared<sirius::event::query_event_publisher>()};
@@ -974,6 +1017,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =

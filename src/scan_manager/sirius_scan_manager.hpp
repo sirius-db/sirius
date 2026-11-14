@@ -64,6 +64,7 @@ class fixed_size_host_memory_resource;
 #include <atomic>
 #include <concepts>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -192,6 +193,8 @@ struct pinned_entry_metadata {
   std::optional<duckdb_mvcc_metadata> mvcc;
   // Proofs describe incoming data. Merges apply them only to columns actually stored.
   std::vector<std::string> proven_unique_columns;
+  // Usefulness hints for the incoming cached columns, independent of the proofs above.
+  std::vector<std::string> declared_unique_columns;
 };
 
 /**
@@ -279,6 +282,10 @@ struct pinned_entry {
   /// path appends columns and a positional attach would then describe the wrong
   /// ones.
   std::vector<bool> proven_unique_columns;
+  /// Sorted, distinct column names declared independently unique for dynamic-filter usefulness
+  /// only. These are not correctness proofs for late materialization, distinct joins, or
+  /// deduplication.
+  std::vector<std::string> declared_unique_columns;
   /// Generation-checked handle for late materialization. It points weakly back
   /// to this exact entry, so an unpin/replacement hides it from new queries
   /// without revoking a query that already co-owns it. Null unless the late-mat
@@ -492,7 +499,7 @@ class sirius_scan_manager {
    * @brief Construct a new scan manager.
    *
    * The scan_manager owns a default ioctx for local paths (@c uring_ioctx with
-   * backend=native, @c kvikio_context with backend=kvikio), built by the
+   * backend=native), built by the
    * @c cucascade::io::io_context_registry from @p config, plus the backends other
    * paths route to (e.g. the REST ioctx for @c s3://), built lazily on first use.
    * Each ioctx carries its own prefetching cache when @c cache.mode is @c cucs.
@@ -629,6 +636,11 @@ class sirius_scan_manager {
   /// pins ARE chunks in the cache being destroyed, so none of them can survive
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
+
+  /// Test-only: the next @ref reset_caches throws @p error after it destroys the
+  /// default local context's cache and before it builds the new one, as a failed
+  /// rebuild would. Set only while no reset can run.
+  void fail_next_reset_for_testing(std::exception_ptr error) { _reset_fault = std::move(error); }
 
   /// Retain a checkpoint key until this execution window is reset. Pinning may hold
   /// keys without registering scan providers, so their lifetime is tracked separately.
@@ -846,6 +858,22 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 
+  /// Every pinned entry whose parquet identity matches @p resolved_file_paths, in registry
+  /// order. OWNING, like find_pinned_entry_for_parquet_files. One file set may be pinned under
+  /// several names with different column sets, and the serve-time matcher may use any of them.
+  [[nodiscard]] std::vector<std::shared_ptr<const pinned_entry>>
+  find_pinned_entries_for_parquet_files(std::span<std::string const> resolved_file_paths) const;
+
+  /// Device ids of the GPUs that hold Simpatico-compressed GPU-tier chunks of any pinned
+  /// entry over the same source as @p table_info (same parquet file set or same DuckDB table
+  /// incarnation), sorted and duplicate-free. Matches on source identity alone, so it can
+  /// name the owners of a pin that ends up not serving the scan, but never misses the owners
+  /// of one that does.
+  /// Read by query admission: a compressed chunk is decoded on the GPU that holds it, so
+  /// these GPUs must stay in the query's admitted set.
+  [[nodiscard]] std::vector<int> compressed_gpu_pin_owner_devices(
+    const op::scan::ingestible_table_info& table_info) const;
+
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.
@@ -859,7 +887,13 @@ class sirius_scan_manager {
   /// @c cache_handle -- alive under @p name until @ref remove_pinned_entry
   /// drops it. That is load-bearing rather than incidental: the evictor only
   /// considers a request's chunks once its consumer is disposed, so a live
-  /// handle is what keeps them out of the reclaim sweep entirely.
+  /// handle keeps them out of the evictor's and the idle reclaim's sweeps.
+  ///
+  /// Residency is still best-effort: under HOST memory pressure, a HOST downgrade
+  /// executor's forced reclaim (@c reclaim_mode::forced) also takes subscribed chunks
+  /// above the prefetch reservation, whatever the eviction settings. The pin stays
+  /// registered and later scans re-read the missing ranges from storage. The gpu and
+  /// host tiers hold their own memory and are not subject to it.
   ///
   /// Does not survive @ref reset_caches: that destroys the cache holding the
   /// chunks, so it drops these datasources (and warns) rather than leave a pin
@@ -875,8 +909,7 @@ class sirius_scan_manager {
                                  std::optional<std::vector<std::string>> const& cols);
 
   /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
-  ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
-  ///        was configured with @c backend=kvikio.
+  ///        Holds the configured local @c uring_ioctx.
   [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers
@@ -1078,7 +1111,8 @@ class sirius_scan_manager {
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
+  /// is uring.  Returns nullptr when no backend supports the path.
+  /// @throws std::invalid_argument for a raw `http://` / `https://` URL (use `s3://`).
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
@@ -1123,8 +1157,7 @@ class sirius_scan_manager {
   /// was called for (built or not).
   bool init_cache_for(cucascade::io::ioctx& io_ctx);
 
-  /// The REST ioctx, which owns LIST / glob regardless of which backend serves
-  /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
+  /// The REST ioctx, which owns object-store LIST / glob (and serves `s3://` reads).
   /// Returns nullptr when the object store is not configured, i.e. the REST
   /// backend cannot be built. The caller shares ownership for the full LIST so
   /// credential rotation cannot retire the context while a request is in flight.
@@ -1149,7 +1182,7 @@ class sirius_scan_manager {
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.
   std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
-  /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
+  /// REST context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so
   /// credentials/endpoints can differ by path. `_routed_io_ctxs_build_mtx` serializes construction
   /// (reactor threads + cache allocation happen outside the map mutex), while
@@ -1217,9 +1250,11 @@ class sirius_scan_manager {
   };
   /// Datasources retained by @ref pin_parquet_ranges, keyed by pin name. Holding
   /// them is the pin: each owns the cache_handle whose live consumer keeps
-  /// its chunks out of the evictor's reach.
+  /// its chunks out of the evictor's reach (but not a forced HOST reclaim's).
   std::unordered_map<std::string, std::vector<std::shared_ptr<cucascade::io::datasource>>>
     _pinned_parquet_sources;
+  /// Consumed by the next @ref reset_caches; see @ref fail_next_reset_for_testing.
+  std::exception_ptr _reset_fault;
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};

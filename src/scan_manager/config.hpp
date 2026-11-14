@@ -23,12 +23,6 @@
 
 #include <cucascade/io/config.hpp>
 
-// cuCascade declares kvikio_config (scan_manager_config::kvikio, which to_io_config()
-// copies) only when built with cuDF, and so kvikIO; Sirius always is.
-#ifndef CUCASCADE_HAS_KVIKIO
-#error "Sirius requires cuCascade built with kvikIO (CUCASCADE_HAS_KVIKIO)"
-#endif
-
 #include <algorithm>
 #include <cstddef>
 #include <optional>
@@ -37,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::scan_manager {
 
@@ -44,6 +39,18 @@ namespace sirius::scan_manager {
 /// one worker thread each);
 /// counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
+
+/// Sirius keeps read-path chunks in cuCascade's pinned host cache for reuse,
+/// with LRU eviction under memory pressure. Keep this default independent of
+/// cuCascade's library defaults; YAML can still select none, os, or idle eviction.
+[[nodiscard]] inline cucascade::io::cache::config default_cache_config() noexcept
+{
+  auto c     = cucascade::io::cache::config{};
+  c.mode     = cucascade::io::cache::cache_mode::cucs;
+  c.eviction = cucascade::io::cache::eviction_policy::lru;
+  c.apply_mode();
+  return c;
+}
 
 /// Sirius's default uring backend config: cuCascade's struct defaults with
 /// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
@@ -118,8 +125,6 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
@@ -127,9 +132,7 @@ enum class io_backend {
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
-    {"native", io_backend::native},
-    {"sirius", io_backend::native},  // deprecated alias
-    {"kvikio", io_backend::kvikio},
+    {"native", io_backend::native}, {"sirius", io_backend::native},  // deprecated alias
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -144,7 +147,6 @@ inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
     case io_backend::native: s = "native"; return true;
-    case io_backend::kvikio: s = "kvikio"; return true;
   }
   return false;
 }
@@ -213,12 +215,11 @@ struct memory_prefetcher_config {
  * @brief Configuration for the scan_manager.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes local paths AND @c s3:// reads to @c kvikio_context (kvikIO's own remote
- * file support); object-store LIST / glob stays on the REST backend either way.
- * Reads go through @c cucascade::io::datasource either way; the kvikio backend
- * drives @c kvikio::FileHandle / @c kvikio::RemoteHandle directly. Multi-GPU forces
- * @ref io_backend::native.
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend (cuCascade's native
+ * io_uring HTTP/1.1 transport with kTLS or user-space TLS). Object-store LIST
+ * and glob use the same REST backend. Reads go through
+ * @c cucascade::io::datasource. Raw HTTP(S) URLs are unsupported; use @c s3://
+ * paths with an object-store endpoint instead.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.
@@ -230,7 +231,6 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO backend tunables (backend=kvikio: local and s3:// reads).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -238,8 +238,6 @@ struct scan_manager_config {
   preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
-  /// Admission limit, also accepted through the legacy scan-manager configuration path.
-  int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
@@ -247,9 +245,30 @@ struct scan_manager_config {
   /// and one ring; each allocates its pinned staging at @c ioctx::start()).
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
-  /// Number of REST reactors for the S3/object-store IO path (each its own
-  /// libcurl event loop + connection pool).
+  /// Number of REST reactors for the S3/object-store IO path (each one worker
+  /// thread with its own io_uring ring and HTTP/1.1 connection pool), per routed
+  /// REST context and shared by all GPUs.  Each distinct resolved object-store
+  /// configuration (endpoint or credentials) builds its own context, so N
+  /// resident configurations hold N pools of this size, each with up to
+  /// @c rest.max_connections slots per reactor.  0 sizes each pool from the
+  /// egress NIC: one reactor per NIC queue IRQ CPU, pinned to it
+  /// (@c rest.pin_to_irq_cpus), when the IRQs are steered to a strict subset of
+  /// the NIC's NUMA-node cores; 2 unpinned reactors otherwise.
   std::size_t rest_n_reactors{2};
+
+  /// Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator,
+  /// downgrade) off the CPUs the REST reactors pin to (cuCascade's
+  /// @c planned_reactor_cpus: the NIC's steered IRQ CPUs when
+  /// @c rest.pin_to_irq_cpus is on), so those CPUs carry only the NIC's
+  /// interrupts and the reactors.  No effect when the reactors run unpinned.
+  bool reserve_rest_reactor_cpus{true};
+
+  /// Engine-owned (not YAML): the CPU mask REST contexts are built and started
+  /// from, set to the configuring thread's affinity when the reactor CPUs are
+  /// reserved.  A routed REST context built lazily on a pool thread (whose mask
+  /// excludes the reserved CPUs) is built on a helper thread with this mask, so
+  /// it plans and pins exactly as at startup.  Empty: the caller's own mask.
+  std::vector<int> rest_placement_cpus;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -279,20 +298,16 @@ struct scan_manager_config {
   /// to @ref default_uring_config (readahead off).
   cucascade::io::uring::config uring{default_uring_config()};
 
-  /// REST (S3/object-store) reactor configuration — timeouts, TLS, logical
-  /// merge hints, retry policy, and connection limits. Physical GET sizing is
-  /// worker-owned.
+  /// REST (S3/object-store) reactor configuration — timeouts, TLS policy,
+  /// logical merge hints, retry policy, connection pool, transport and reactor
+  /// placement. Physical GET sizing is worker-owned, bounded by
+  /// @c min_segment_bytes / @c max_segment_bytes.
   cucascade::io::rest::config rest{};
-
-  /// kvikIO backend tunables (backend=kvikio serves local and @c s3:// reads with
-  /// it).  Every field is optional; unset leaves kvikIO's own env-seeded default
-  /// in place.
-  cucascade::io::kvikio_config kvikio{};
 
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
-  cucascade::io::cache::config cache{};
+  cucascade::io::cache::config cache{default_cache_config()};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
@@ -315,13 +330,13 @@ struct scan_manager_config {
   [[nodiscard]] cucascade::io::io_config to_io_config() const
   {
     cucascade::io::io_config out{};
-    out.backend          = backend == io_backend::kvikio ? cucascade::io::io_backend::kvikio
-                                                         : cucascade::io::io_backend::native;
+    switch (backend) {
+      case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
+    }
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
     out.uring            = uring;
     out.rest             = rest;
-    out.kvikio           = kvikio;
     out.cache            = cache;
     out.object_store     = object_store;
     out.apply_cache_mode();

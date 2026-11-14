@@ -99,8 +99,8 @@ class scoped_recording_log_sink {
   explicit scoped_recording_log_sink(std::string_view level = "trace")
     : _sink(std::make_shared<recording_log_sink>())
   {
-    _sink->set_level(sirius::log::string_to_enum(level).value_or(sirius::log::level::info));
-    sirius::log::set_sink(_sink);
+    sirius::log::set_sink(_sink,
+                          sirius::log::string_to_enum(level).value_or(sirius::log::level::info));
   }
 
   ~scoped_recording_log_sink()
@@ -112,8 +112,7 @@ class scoped_recording_log_sink {
         ? std::nullopt
         : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
     auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-    sink->set_level(lvl);
-    sirius::log::set_sink(std::move(sink));
+    sirius::log::set_sink(std::move(sink), lvl);
   }
 
   scoped_recording_log_sink(const scoped_recording_log_sink&)            = delete;

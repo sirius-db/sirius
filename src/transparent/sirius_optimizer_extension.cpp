@@ -18,6 +18,9 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/delim_cte_proof.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
@@ -36,10 +39,14 @@
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <memory>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::transparent {
@@ -58,6 +65,52 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
   duckdb::Value setting;
   auto lookup_result = context.TryGetCurrentSetting("parquet_footer_statistics", setting);
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides:
+/// those snapshot the global configuration, which would stop the session from seeing later
+/// changes to it.
+bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_delim_aggregate_reuse;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_delim_aggregate_reuse;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_exists_minmax_rewrite;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_exists_minmax_rewrite;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+}
+
+/// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
+/// off it. 0 when no GPU capacity is configured.
+std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
+{
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) { return 0; }
+  std::uint64_t budget = 0;
+  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
+    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
+  }
+  return budget;
 }
 
 using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
@@ -175,22 +228,32 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
   }
 }
 
-}  // namespace
-
-void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
-                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+// What Sirius needs from the plan before DuckDB optimizes it. Reads the plan and attaches scan
+// statistics; it does not restructure it.
+void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
 {
-  if (!plan) { return; }
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Decide before optimization can remove scans, including when GPU execution is off.
-  (void)should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties());
+  (void)should_use_duckdb(context, &plan, &input.optimizer.binder.GetStatementProperties());
   if (parquet_footer_statistics_enabled(context)) {
-    auto const scans = add_parquet_footer_statistics(context, *plan);
+    auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
+  }
+  // DuckDB clears its delim-CTE restriction proof before this hook runs, and never sets it for
+  // Parquet scans. Re-derive it before the built-in optimizers restructure the delim CTEs; the
+  // optimizer hook keeps it only together with the plan of this same run.
+  conn_state->stage_cte_reader_proofs(nullptr);
+  if (gpu_execution_enabled(context)) {
+    try {
+      conn_state->stage_cte_reader_proofs(std::make_shared<sirius::planner::delim_cte_proofs const>(
+        sirius::planner::collect_delim_cte_proofs(context, plan)));
+    } catch (std::exception& e) {
+      SIRIUS_LOG_DEBUG("Delim CTE reader proofs unavailable: {}", sirius::sanitized_message(e));
+    }
   }
   // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
   // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
@@ -198,6 +261,25 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // missed q19's. Deriving both made every pushed restriction appear twice: TPC-H q19's part scan
   // evaluated each column's OR filter twice and its FILTER carried two copies of the per-branch
   // restriction, which cost about 0.1 s at SF1000. The hook therefore only classifies the query.
+}
+
+}  // namespace
+
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  if (!plan) { return; }
+  prepare_for_sirius(input, *plan);
+  // DuckDB clears every delim CTE's filter_dependency before it calls a pre-optimize hook, because
+  // it cannot vouch for what an extension does to the plan. Without it, DuckDB's CTE filter pushers
+  // skip delim CTEs, in its CPU plans too. This hook leaves the plan's shape alone, so give the
+  // dependency back, re-derived with DuckDB's own rule, for every query, GPU execution on or off.
+  try {
+    sirius::planner::restore_cte_filter_dependencies(input.context, *plan);
+  } catch (std::exception& e) {
+    SIRIUS_LOG_DEBUG("Delim CTE filter dependencies not restored: {}",
+                     sirius::sanitized_message(e));
+  }
 }
 
 bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::LogicalOperator& to)
@@ -212,10 +294,56 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
   return matched;
 }
 
+namespace {
+
+// A plan copy re-binds every Parquet scan, re-parsing the footers DuckDB's metadata cache would
+// hold. The re-bound data is replaced by `preserve_parquet_bindings`, so only the cost matters.
+// Enables the cache for the copy and restores the connection's own setting afterwards.
+class scoped_parquet_metadata_cache {
+ public:
+  explicit scoped_parquet_metadata_cache(duckdb::ClientContext& context) : _context(context)
+  {
+    auto& db_config = duckdb::DBConfig::GetConfig(context);
+    duckdb::optional_ptr<duckdb::ConfigurationOption const> option;
+    auto const index = db_config.TryGetSettingIndex("parquet_metadata_cache", option);
+    if (!index.IsValid()) { return; }
+    _index   = index.GetIndex();
+    _was_set = context.config.user_settings.IsSet(_index);
+    if (_was_set) {
+      context.config.user_settings.TryGetSetting(db_config.user_settings, _index, _previous);
+    }
+    context.config.user_settings.SetUserSetting(_index, duckdb::Value::BOOLEAN(true));
+    _active = true;
+  }
+  ~scoped_parquet_metadata_cache()
+  {
+    if (!_active) { return; }
+    if (_was_set) {
+      _context.config.user_settings.SetUserSetting(_index, _previous);
+    } else {
+      _context.config.user_settings.ClearSetting(_index);
+    }
+  }
+  scoped_parquet_metadata_cache(scoped_parquet_metadata_cache const&)            = delete;
+  scoped_parquet_metadata_cache& operator=(scoped_parquet_metadata_cache const&) = delete;
+
+ private:
+  duckdb::ClientContext& _context;
+  duckdb::idx_t _index = 0;
+  duckdb::Value _previous;
+  bool _was_set = false;
+  bool _active  = false;
+};
+
+}  // namespace
+
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  auto copy = plan.Copy(context);
+  auto copy = [&] {
+    scoped_parquet_metadata_cache const cache{context};
+    return plan.Copy(context);
+  }();
   preserve_parquet_bindings(plan, *copy, context);
   // Serialization omits runtime state. Reconnect the original bindings with
   // independent, uninitialized filters for this execution.
@@ -262,7 +390,31 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    auto copy = copy_logical_plan(*captured, context);
+    // Runs before the EXISTS rewrite, whose recorded count a failure here would otherwise discard.
+    if (delim_aggregate_reuse_enabled(context)) {
+      try {
+        sirius::planner::reuse_delim_rows_for_subquery_aggregates(
+          context, input.optimizer.binder, copy);
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy = copy_logical_plan(*captured, context);
+      }
+    }
+    if (exists_minmax_rewrite_enabled(context)) {
+      try {
+        ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context)));
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy = copy_logical_plan(*captured, context);
+      }
+    }
+    conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

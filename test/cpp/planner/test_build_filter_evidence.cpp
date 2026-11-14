@@ -22,6 +22,7 @@
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 
 #include <catch.hpp>
+#include <duckdb/common/enum_util.hpp>
 #include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
@@ -48,6 +49,7 @@
 namespace {
 
 using sirius::planner::build_relation_is_opaque;
+using sirius::planner::build_subtree_has_filtering_join;
 using sirius::planner::build_subtree_is_filtering;
 
 // Minimal constructible scan; the evidence walk never invokes its table function.
@@ -126,6 +128,16 @@ duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join_over(
   auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
   join->children.push_back(std::move(left));
   join->children.push_back(std::move(right));
+  return join;
+}
+
+duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_typed_join(
+  duckdb::JoinType join_type,
+  duckdb::LogicalOperatorType type = duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN)
+{
+  auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type, type);
+  join->children.push_back(make_get());
+  join->children.push_back(make_get());
   return join;
 }
 
@@ -219,6 +231,65 @@ TEST_CASE("a childless non-filtering operator carries no evidence", "[dynamic_fi
     duckdb::TableIndex(/*table_index=*/1),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   REQUIRE_FALSE(build_subtree_is_filtering(*projection));
+}
+
+TEST_CASE("a semi or anti join carries join evidence", "[dynamic_filter][evidence]")
+{
+  auto const join_type = GENERATE(duckdb::JoinType::SEMI,
+                                  duckdb::JoinType::ANTI,
+                                  duckdb::JoinType::RIGHT_SEMI,
+                                  duckdb::JoinType::RIGHT_ANTI);
+  CAPTURE(duckdb::EnumUtil::ToString(join_type));
+
+  SECTION("as the build itself")
+  {
+    auto const join = make_typed_join(join_type);
+    REQUIRE(build_subtree_has_filtering_join(*join));
+    // DuckDB's mirrored test still sees no filter in the same subtree.
+    REQUIRE_FALSE(build_subtree_is_filtering(*join));
+  }
+
+  SECTION("as a DELIM_JOIN")
+  {
+    REQUIRE(build_subtree_has_filtering_join(
+      *make_typed_join(join_type, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN)));
+  }
+
+  SECTION("below a projection and an inner join")
+  {
+    auto const outer = make_join_over(make_get(), make_projection_over(make_typed_join(join_type)));
+    REQUIRE(build_subtree_has_filtering_join(*outer));
+  }
+}
+
+TEST_CASE("joins that can keep every row carry no join evidence", "[dynamic_filter][evidence]")
+{
+  SECTION("a bare GET") { REQUIRE_FALSE(build_subtree_has_filtering_join(*make_get())); }
+
+  SECTION("a filtered GET is filter evidence, not join evidence")
+  {
+    REQUIRE_FALSE(build_subtree_has_filtering_join(*make_filtered_get()));
+  }
+
+  SECTION("other join types")
+  {
+    auto const join_type = GENERATE(duckdb::JoinType::INNER,
+                                    duckdb::JoinType::LEFT,
+                                    duckdb::JoinType::RIGHT,
+                                    duckdb::JoinType::OUTER,
+                                    duckdb::JoinType::MARK,
+                                    duckdb::JoinType::SINGLE);
+    CAPTURE(duckdb::EnumUtil::ToString(join_type));
+    REQUIRE_FALSE(build_subtree_has_filtering_join(*make_typed_join(join_type)));
+  }
+
+  SECTION("a semi-typed ANY_JOIN")
+  {
+    auto join = duckdb::make_uniq<duckdb::LogicalAnyJoin>(duckdb::JoinType::SEMI);
+    join->children.push_back(make_get());
+    join->children.push_back(make_get());
+    REQUIRE_FALSE(build_subtree_has_filtering_join(*join));
+  }
 }
 
 TEST_CASE("opaque build leaves carry fallback evidence", "[dynamic_filter][evidence]")

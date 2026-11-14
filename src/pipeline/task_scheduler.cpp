@@ -46,6 +46,19 @@
 namespace sirius {
 namespace pipeline {
 
+std::vector<int> gpu_executor_cpu_affinity(std::vector<int> const& local_cores,
+                                           std::vector<int> const& pool_affinity)
+{
+  if (pool_affinity.empty()) { return local_cores; }
+  std::vector<int> cores;
+  for (int const cpu : local_cores) {
+    if (std::find(pool_affinity.begin(), pool_affinity.end(), cpu) != pool_affinity.end()) {
+      cores.push_back(cpu);
+    }
+  }
+  return cores.empty() ? pool_affinity : cores;
+}
+
 task_scheduler::task_scheduler(
   sirius::exec::query_lifecycle_registry& lifecycle,
   const exec::thread_pool_config& gpu_executor_config,
@@ -83,7 +96,12 @@ task_scheduler::task_scheduler(
                                return std::cmp_equal(dev.id, device_id);
                              });
 
-      if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
+      if (it != sys_topology->gpus.end()) {
+        // The pool's own affinity is a configured list, or the CPUs left after sirius_config
+        // reserved the REST reactors' CPUs.
+        config.cpu_affinity_list =
+          gpu_executor_cpu_affinity(it->cpu_cores, config.cpu_affinity_list);
+      }
     }
     // Find matching downgrade executor for this GPU space
     sirius::parallel::downgrade_executor* dg_exec = nullptr;

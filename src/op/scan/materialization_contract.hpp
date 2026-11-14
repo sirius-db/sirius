@@ -3,8 +3,10 @@
 
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/parquet_batch_layout.hpp"
+#include "op/scan/row_lineage.hpp"
 #include "op/scan/scan_execution_record.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
+#include "op/scan/static_predicate_catalogue.hpp"
 
 #include <functional>
 #include <optional>
@@ -28,6 +30,7 @@ struct materialization_program {
   std::shared_ptr<visibility_bindings const> required_visibility;
   std::shared_ptr<void const> input_layout;
   std::shared_ptr<void const> output_layout;
+  std::shared_ptr<static_predicate_catalogue const> catalogue;
 };
 
 struct row_origin {
@@ -46,6 +49,10 @@ struct row_domain {
   [[nodiscard]] bool available() const { return positions.has_value() || !runs.empty(); }
 };
 
+// Explicit compatibility view. Compact selections stay interval-based; per-row
+// host materialization is paid only by a legacy consumer that requests this view.
+row_domain legacy_row_domain(row_lineage const&, ::cuda::stream_ref);
+
 struct materialized_batch {
   owning_table_view table;
   uint64_t contract            = 0;
@@ -60,6 +67,7 @@ struct materialized_batch {
   bool whole_static_complete = false;
   visibility_bindings visibility_applied;
   std::shared_ptr<void const> layout;
+  std::shared_ptr<row_lineage const> lineage_record;
 };
 
 // Each step consumes/updates the owned batch on the caller's task stream. Row-changing
@@ -70,6 +78,7 @@ struct materialization_steps {
   materialization_step visibility;
   materialization_step residual;
   materialization_step projection;
+  std::function<bool(std::span<applied_visibility const>)> visibility_requires_positions;
   std::function<void(materialized_batch&, std::span<applied_visibility const>)> bound_visibility;
 };
 
@@ -77,6 +86,10 @@ void validate_materialized_batch(materialized_batch const&, materialization_prog
 materialized_batch finish_materialization(materialized_batch,
                                           materialization_program const&,
                                           materialization_steps const&);
+// Keep owners in task state across validation failures and asynchronous work.
+void finish_materialization_in_place(materialized_batch&,
+                                     materialization_program const&,
+                                     materialization_steps const&);
 // A zero-column cudf table cannot carry a positive cardinality. Preserve it with an
 // internal carrier until the consumer that understands zero projected columns runs.
 void ensure_row_count_carrier(materialized_batch&,

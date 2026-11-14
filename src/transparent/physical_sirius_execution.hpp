@@ -18,6 +18,7 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/read_view_registry.hpp"
 
@@ -26,6 +27,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstdint>
+#include <memory>
 
 namespace duckdb {
 class PreparedStatementData;
@@ -59,7 +61,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::idx_t estimated_cardinality,
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr,
     std::uint64_t validated_plan_pin_epoch                                         = 0,
-    std::optional<uint64_t> captured_transaction_id                                = std::nullopt);
+    std::optional<uint64_t> captured_transaction_id                                = std::nullopt,
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs     = nullptr);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -87,6 +90,10 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   /// Copying a SQL-replanned template cannot restore hook-original correspondence.
   candidate_origin logical_plan_origin_;
+
+  /// Delim-CTE reader proofs captured with `logical_plan_`; they hold for its copies too, and for
+  /// nothing replanned from SQL. Null when the capture had none.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs_;
 
   /// Optimizer-hook originals, generation-stamped and keyed by LogicalGet table index.
   /// Execution rebuilds compare candidates against this retained capture.

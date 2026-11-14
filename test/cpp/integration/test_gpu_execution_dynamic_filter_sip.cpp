@@ -22,6 +22,7 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -453,6 +454,182 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE(deltas.rows.size() == 222);
   dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
   compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - MARK joins converted to SEMI or ANTI keep results on NULL keys",
+                 "[integration][gpu_execution][dynamic_filter][mark_conversion]")
+{
+  run_ok("SET gpu_execution = false;");
+  run_ok(
+    "CREATE TABLE parts AS SELECT (range % 50)::INTEGER AS pk, "
+    "concat('p', range % 3) AS pname FROM range(100);");
+  run_ok("INSERT INTO parts VALUES (NULL, 'p1'), (NULL, 'p2'), (1, NULL);");
+  run_ok(
+    "CREATE TABLE items AS SELECT range::INTEGER AS id, (range % 60)::INTEGER AS fk, "
+    "(range % 5)::INTEGER AS qty FROM range(3000);");
+  run_ok("INSERT INTO items VALUES (3000, NULL, 1), (3001, 1, NULL), (3002, NULL, NULL);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  // Each outer query filters its rows so that DuckDB keeps the delim CTE.
+  std::string query;
+
+  SECTION("IN inside a delim CTE becomes SEMI")
+  {
+    query =
+      "SELECT p.pk FROM parts p WHERE p.pname = 'p1' AND p.pk IN ("
+      "SELECT i.fk FROM items i WHERE i.fk IN (SELECT pk FROM parts WHERE pname = 'p2') "
+      "AND i.qty > (SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))";
+  }
+
+  SECTION("a correlated IN with a plain and a null-safe key")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND "
+      "i.qty IN (SELECT p.pk % 5 FROM parts p WHERE p.pk = i.fk)";
+  }
+
+  SECTION("a correlated > ANY")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND "
+      "i.qty > ANY (SELECT p.pk % 5 FROM parts p WHERE p.pname = 'p1' AND p.pk = i.fk)";
+  }
+
+  SECTION("NOT EXISTS on nullable keys inside a delim CTE becomes ANTI")
+  {
+    query =
+      "SELECT p.pk FROM parts p WHERE p.pk IN (SELECT i.fk FROM items i WHERE NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk = i.fk AND q.pname = 'p1') AND i.qty > "
+      "(SELECT 0.5 * AVG(i2.qty) FROM items i2 WHERE i2.fk = i.fk))";
+  }
+
+  SECTION("NOT EXISTS correlated with IS NOT DISTINCT FROM")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk IS NOT DISTINCT FROM i.fk AND q.pname = 'p1')";
+  }
+
+  SECTION("NOT EXISTS correlated with IS DISTINCT FROM")
+  {
+    query =
+      "SELECT i.id FROM items i WHERE i.qty < 4 AND NOT EXISTS "
+      "(SELECT 1 FROM parts q WHERE q.pk IS DISTINCT FROM i.fk AND q.pname = 'p0')";
+  }
+
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - DuckDB's semi join into a delim CTE keeps results",
+                 "[integration][gpu_execution][dynamic_filter][delim_cte_proof]")
+{
+  // With the delim CTE's filter dependency given back to DuckDB, its CTEJoinFilterPusher
+  // semi-joins the delim CTE's outer rows with the keys of `o`; the GPU must run that shape.
+  run_ok("SET gpu_execution = false;");
+  run_ok("CREATE TABLE person(id BIGINT, tag VARCHAR, selected BOOLEAN, grp BIGINT);");
+  run_ok(
+    "INSERT INTO person SELECT i, (i % 2)::VARCHAR, i IN (3, 17, 51), i % 7 "
+    "FROM range(1000) t(i);");
+  run_ok("INSERT INTO person VALUES (NULL, '1', true, 3), (17, NULL, true, NULL);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  compare_gpu_vs_cpu(
+    "WITH o AS MATERIALIZED (SELECT * FROM person WHERE selected) "
+    "SELECT count(*), sum(q.m) FROM o JOIN (SELECT p.id, p.tag, "
+    "(SELECT max(x.grp) FROM person x WHERE x.id <= p.id + 1 AND x.tag = p.tag) AS m "
+    "FROM person p) q ON o.id = q.id AND o.tag = q.tag");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a user CTE named like a delim CTE keeps all its rows",
+                 "[integration][gpu_execution][dynamic_filter][delim_cte_proof]")
+{
+  // The CTE's second read aggregates over every row, so a join filter pushed into the CTE body
+  // would change count(*). Only CTEs that DuckDB's rewrite generated may be proven.
+  run_ok("SET gpu_execution = false;");
+  run_ok(
+    "CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS b, i::INTEGER AS x FROM range(400000) t(i);");
+  run_ok("CREATE TABLE t3 AS SELECT i::INTEGER AS b, (i % 4)::INTEGER AS g FROM range(10) t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  compare_gpu_vs_cpu(
+    "SELECT count(*), sum(s.n), min(s.n), max(s.n) FROM ("
+    "WITH __duckdb_delim_9 AS MATERIALIZED (SELECT b, x FROM t1) "
+    "SELECT d.b, c.n FROM __duckdb_delim_9 d "
+    "JOIN (SELECT (x::BIGINT % 2) AS k, count(*) AS n FROM __duckdb_delim_9 GROUP BY 1) c "
+    "ON (d.x::BIGINT % 2) = c.k) s "
+    "JOIN (SELECT b FROM t3 WHERE g < 2) f ON s.b = f.b");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - DuckDB's pushes into delim CTEs over Parquet keep results",
+                 "[integration][gpu_execution][dynamic_filter][delim_cte_proof]")
+{
+  // DuckDB never proves a Parquet subquery restrictable; Sirius gives its CTE filter pushers the
+  // proof anyway, since a Parquet file does not change while a query reads it.
+  struct removed_on_exit {
+    std::vector<std::string> paths;
+    ~removed_on_exit()
+    {
+      for (auto const& path : paths) {
+        std::remove(path.c_str());
+      }
+    }
+  } files;
+  auto const parquet_path = [&](std::string const& table) {
+    files.paths.push_back(temp_db_path + "." + table + ".parquet");
+    return files.paths.back();
+  };
+  run_ok("SET gpu_execution = false;");
+  run_ok("CREATE TABLE vertex_rows AS SELECT i::INTEGER AS id FROM range(100) t(i);");
+  run_ok("CREATE TABLE person_rows(id BIGINT, tag VARCHAR, selected BOOLEAN, grp BIGINT);");
+  run_ok(
+    "INSERT INTO person_rows SELECT i, (i % 2)::VARCHAR, i IN (3, 17, 51), i % 7 "
+    "FROM range(1000) t(i);");
+  run_ok("INSERT INTO person_rows VALUES (NULL, '1', true, 3), (17, NULL, true, NULL);");
+  auto const vertices = parquet_path("vertices");
+  auto const person   = parquet_path("person");
+  run_ok("COPY vertex_rows TO '" + vertices + "' (FORMAT parquet);");
+  run_ok("COPY person_rows TO '" + person + "' (FORMAT parquet);");
+  run_ok("CREATE VIEW vertices AS SELECT * FROM read_parquet('" + vertices + "');");
+  run_ok("CREATE VIEW person AS SELECT * FROM read_parquet('" + person + "');");
+  run_ok(
+    "CREATE VIEW joined_walk AS SELECT input.id, expanded.depth FROM vertices input "
+    "CROSS JOIN LATERAL (WITH RECURSIVE walk(depth) AS (SELECT 0 + input.id * 0 UNION ALL "
+    "SELECT depth + 1 FROM walk WHERE depth < 7) SELECT depth FROM walk) expanded "
+    "JOIN vertices target ON target.id = expanded.depth + 1;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  std::string const walk = "SELECT count(*) FROM joined_walk WHERE id = 3";
+  std::string const selected =
+    "WITH o AS MATERIALIZED (SELECT * FROM person WHERE selected) "
+    "SELECT count(*), sum(q.m) FROM o JOIN (SELECT p.id, p.tag, "
+    "(SELECT max(x.grp) FROM person x WHERE x.id <= p.id + 1 AND x.tag = p.tag) AS m "
+    "FROM person p) q ON o.id = q.id AND o.tag = q.tag";
+
+  // CTEFilterPusher: the predicate reaches the Parquet scan in the CTE's body.
+  auto explained = con->Query("EXPLAIN " + walk);
+  REQUIRE_FALSE(explained->HasError());
+  CHECK_THAT(explained->Collection().GetValue(1, 0).ToString(),
+             Catch::Matchers::ContainsSubstring("Filters: id = 3"));
+
+  // Neither push changes a result: compare with DuckDB's CTE filter pusher turned off.
+  for (auto const& sql : {walk, selected}) {
+    INFO(sql);
+    auto pushed = con->Query(sql);
+    REQUIRE_FALSE(pushed->HasError());
+    auto const with_push = collect_rows(*pushed, true);
+    sirius::test::disabled_optimizers_guard no_push{*con, "cte_filter_pusher"};
+    auto unpushed = con->Query(sql);
+    REQUIRE_FALSE(unpushed->HasError());
+    CHECK(with_push == collect_rows(*unpushed, true));
+  }
+  compare_gpu_vs_cpu(selected);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
