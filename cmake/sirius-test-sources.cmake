@@ -145,6 +145,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
+    test/cpp/integration/test_gpu_execution_table_function.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_required_null_scan.cpp
