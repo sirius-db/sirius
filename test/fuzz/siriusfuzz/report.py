@@ -32,6 +32,7 @@ class QueryRecord:
     reason: str = ""  # short classification text (error reason / setting name)
     detail: str = ""  # comparator detail or full error
     labels: list[str] = field(default_factory=list)
+    generator_tags: list[str] = field(default_factory=list)
     reduced_sql: str | None = None
     reduced_labels: list[str] = field(default_factory=list)
     reduced_reason: str = ""  # error reason reported by the reduced query

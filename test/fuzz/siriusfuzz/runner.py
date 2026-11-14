@@ -620,6 +620,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 try:
                     session.begin_query(sql)
                     rec = evaluator.evaluate(query, sql, w, stem, ds_seed)
+                    rec.generator_tags = sorted(new_stats)
                     rec.evidence = dict(session.evidence)
                     send({"type": "result", "record": asdict(rec)})
                     if (

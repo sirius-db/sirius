@@ -170,6 +170,8 @@ and `on_filters` add those shapes when enabled. `max_tables` permits rare five
 and six table chains, and `star_share` chooses joins back to the first table.
 `any_join_share` controls the share of eligible INNER joins that use an ANY
 condition, so a focused acceptance run can collect enough samples.
+Each `queries.jsonl` record includes `generator_tags`, allowing per-shape
+verdict and fallback rates to be counted without inferring them from SQL text.
 
 There is one configuration file, `config/default.toml`; every command loads it unless `--config`
 names another. Its `[features]` flags mark what Sirius runs on the GPU today: every enabled

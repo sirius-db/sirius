@@ -192,9 +192,12 @@ class QueryGenerator:
         self._alias_n = 0
         self._cte_n = 0
         for _ in range(8):
+            before = self.stats.copy()
             try:
                 return self._generate_once()
             except GenerationFailed:
+                # Only report tags carried by a successfully emitted query.
+                self.stats = before
                 continue
         # Degenerate fallback: a single-table projection is always constructible.
         return self._gen_select(depth=0, outer=None)

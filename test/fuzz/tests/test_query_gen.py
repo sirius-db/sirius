@@ -105,6 +105,27 @@ class Phase2cQuarantine(unittest.TestCase):
 
 
 class Phase2dJoinBudget(unittest.TestCase):
+    def test_failed_generation_does_not_report_join_tag(self):
+        from siriusfuzz.query_gen import GenerationFailed
+
+        cfg = load_config(None)
+        dg = DataGenerator(cfg, random.Random(4))
+        qg = QueryGenerator(cfg, dg.generate(4), random.Random(4), dg)
+        original = qg._generate_once
+        attempts = 0
+
+        def fail_once():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                qg._note("join:discarded")
+                raise GenerationFailed("discard this attempt")
+            return original()
+
+        qg._generate_once = fail_once
+        qg.generate()
+        self.assertEqual(qg.stats["join:discarded"], 0)
+
     def test_correlated_in_share_does_not_change_exists(self):
         from siriusfuzz import sqltypes as st
         from siriusfuzz.query_gen import Scope, ScopeTable
