@@ -697,12 +697,28 @@ class QueryGenerator:
         mode: str,
     ) -> tuple[Join | TableRef | Derived, Scope]:
         rng = self.rng
+        if (
+            mode == "full"
+            and outer is None
+            and force_cte is None
+            and not ctes
+            and self.f.joins.grouped_inputs
+            and rng.random() < 0.12
+        ):
+            return self._gen_grouped_inputs_join()
         max_tables = max(1, self.f.joins.max_tables)
         if mode != "full":
             n = 1 if rng.random() < 0.8 else 2
         else:
-            n = self._pick({"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1})
+            weights = {"1": 0.4, "2": 0.35, "3": 0.15, "4": 0.1}
+            if max_tables >= 5:
+                weights["5"] = 0.07
+            if max_tables >= 6:
+                weights["6"] = 0.03
+            n = self._pick(weights)
             n = min(int(n), max_tables)
+            if n >= 5:
+                self._note("join:long_chain")
         allow_fact = outer is None and depth == 0
         first, first_scope = self._gen_from_item(
             depth, ctes, force_cte, allow_fact=allow_fact, prefer_fact=allow_fact
@@ -710,10 +726,50 @@ class QueryGenerator:
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
         left_rows = first_scope.row_upper_bound
-        for _ in range(n - 1):
-            right, right_scope = self._gen_from_item(
-                depth, ctes, None, allow_fact=outer is None and depth == 0
-            )
+        star = (
+            n >= 3
+            and self.f.joins.star_share > 0
+            and rng.random() < self.f.joins.star_share
+        )
+        for join_index in range(n - 1):
+            self_variant = None
+            if (
+                join_index == 0
+                and self.f.joins.self_join
+                and first_scope.table_name is not None
+                and rng.random() < 0.2
+            ):
+                table = self.ds.table(first_scope.table_name)
+                alias = self._alias()
+                right = TableRef(table.name, alias)
+                right_scope = ScopeTable(
+                    alias,
+                    [ColumnRef(alias, c.name, c.type) for c in table.columns],
+                    table.name,
+                    len(table.rows),
+                )
+                nonkeys = [
+                    c
+                    for c in first_scope.columns
+                    if c.name != "k" and c.kind in ("int", "varchar", "date")
+                ]
+                if (
+                    not table.name.startswith("f")
+                    and nonkeys
+                    and len(table.rows) ** 2 <= self.f.joins.cartesian_max_rows
+                    and rng.random() < 0.5
+                ):
+                    self_variant = "nonkey"
+                    key = rng.choice(nonkeys)
+                else:
+                    self_variant = "key"
+                    key = next(c for c in first_scope.columns if c.name == "k")
+                other_key = next(c for c in right_scope.columns if c.name == key.name)
+                self_cond = Compare("=", key, other_key)
+            else:
+                right, right_scope = self._gen_from_item(
+                    depth, ctes, None, allow_fact=outer is None and depth == 0
+                )
             if (
                 (right_scope.table_name or "").startswith("f")
                 and any(
@@ -724,7 +780,11 @@ class QueryGenerator:
                 # A second fact reached through a dimension creates a many-to-many
                 # product, especially on the intentionally skewed hot keys.
                 continue
-            jt = rng.choice(self.join_types) if self.join_types else "inner"
+            jt = (
+                "inner"
+                if self_variant
+                else (rng.choice(self.join_types) if self.join_types else "inner")
+            )
             right_rows = right_scope.row_upper_bound
             cartesian_ok = (
                 left_rows is not None
@@ -737,15 +797,27 @@ class QueryGenerator:
             if jt == "cross" and not cartesian_ok:
                 jt = "inner"
             cond = (
-                None
-                if jt == "cross"
-                else self._gen_join_cond(
-                    scope, right_scope, jt, allow_ineq_only=cartesian_ok
+                self_cond
+                if self_variant
+                else (
+                    None
+                    if jt == "cross"
+                    else self._gen_join_cond(
+                        Scope([first_scope], outer=outer) if star else scope,
+                        right_scope,
+                        jt,
+                        allow_ineq_only=cartesian_ok,
+                    )
                 )
             )
             if cond is None and jt != "cross":
                 continue  # no joinable pair; skip this table
             self._note(f"join:{jt}")
+            if self_variant:
+                self._note("join:self")
+                self._note(f"join:self_{self_variant}")
+            if star and join_index >= 1:
+                self._note("join:star")
             tree = Join(tree, right, jt, cond)
             left_rows = (
                 max(1, left_rows) * max(1, right_rows)
@@ -755,6 +827,58 @@ class QueryGenerator:
             if jt not in ("semi", "anti"):
                 scope.tables.append(right_scope)
         return tree, scope
+
+    def _gen_grouped_inputs_join(self) -> tuple[Join, Scope]:
+        tables = [t for t in self.ds.tables if not t.name.startswith("f")]
+        if not tables:
+            raise GenerationFailed("no dimension tables for grouped join")
+        first_table = self.rng.choice(tables)
+        first_key_type = next(c.type for c in first_table.columns if c.name == "k")
+        same_type = [
+            t
+            for t in tables
+            if next(c.type for c in t.columns if c.name == "k") == first_key_type
+        ]
+        second_table = self.rng.choice(same_type)
+        sides: list[Derived] = []
+        scopes: list[ScopeTable] = []
+        for table in (first_table, second_table):
+            inner_alias = self._alias()
+            outer_alias = self._alias()
+            key_type = next(c.type for c in table.columns if c.name == "k")
+            key = ColumnRef(inner_alias, "k", key_type)
+            grouped = Select(
+                items=[
+                    SelectItem(key, "g"),
+                    SelectItem(Agg("count_star", None, kind="int"), "agg"),
+                ],
+                from_=TableRef(table.name, inner_alias),
+                group_by=[key],
+            )
+            sides.append(Derived(grouped, outer_alias))
+            scopes.append(
+                ScopeTable(
+                    outer_alias,
+                    [
+                        ColumnRef(outer_alias, "g", key_type),
+                        ColumnRef(outer_alias, "agg", st.BIGINT),
+                    ],
+                )
+            )
+        join_column = (
+            "agg"
+            if len(first_table.rows) * len(second_table.rows)
+            <= self.f.joins.cartesian_max_rows
+            and self.rng.random() < 0.3
+            else "g"
+        )
+        left = next(c for c in scopes[0].columns if c.name == join_column)
+        right = next(c for c in scopes[1].columns if c.name == join_column)
+        self._note("join:grouped_inputs")
+        self._note("join:inner")
+        return Join(sides[0], sides[1], "inner", Compare("=", left, right)), Scope(
+            scopes
+        )
 
     def _gen_from_item(
         self,
@@ -837,6 +961,32 @@ class QueryGenerator:
         ]
         if not pairs:
             return None
+        any_pairs = [(l, r) for l, r in pairs if l.type == r.type]
+        if (
+            self.f.joins.any_join
+            and allow_ineq_only
+            and jt == "inner"
+            and len(any_pairs) >= 2
+            and rng.random() < self.f.joins.any_join_share
+        ):
+            l1, r1 = rng.choice(any_pairs)
+            second = [(a, b) for a, b in any_pairs if a is not l1 and b is not r1]
+            integer = [
+                (a, b) for a, b in any_pairs if a.kind == "int" and a.type.signed
+            ]
+            if integer and rng.random() < 0.5:
+                a, b = rng.choice(integer)
+                cond = Compare("=", Arith("+", a, b, kind="int"), Literal(10, a.type))
+                self._note("join:any_mixed")
+            elif second:
+                l2, r2 = rng.choice(second)
+                cond = Logical("OR", [Compare("=", l1, r1), Compare("=", l2, r2)])
+                self._note("join:any_or")
+            else:
+                cond = None
+            if cond is not None:
+                self._note("join:any")
+                return cond
         if self.ds.has_facts:
             names = {table.alias: table.table_name for table in scope.tables + [right]}
             fact_pairs = []
@@ -879,6 +1029,22 @@ class QueryGenerator:
             if key_pairs and rng.random() < 0.7
             else rng.choice(pairs)
         )
+        if self.f.joins.expression_keys and l.type == r.type and rng.random() < 0.15:
+            if l.kind == "varchar" and self._func_enabled("upper"):
+                self._note("join:expression_keys")
+                self._note("join:expression_upper")
+                return Compare(
+                    "=", Func("upper", [l], "varchar"), Func("upper", [r], "varchar")
+                )
+            if l.kind == "int" and l.type.signed:
+                self._note("join:expression_keys")
+                if rng.random() < 0.5:
+                    self._note("join:expression_arith")
+                    return Compare(
+                        "=", Arith("+", l, Literal(1, l.type), kind="int"), r
+                    )
+                self._note("join:expression_cast")
+                return Compare("=", Cast(l, st.BIGINT), Cast(r, st.BIGINT))
         if self.f.joins.inequality and allow_ineq_only and rng.random() < 0.08:
             self._note("join:inequality_only")
             return Compare(rng.choice(["<", ">", "<=", ">="]), l, r)
@@ -906,6 +1072,29 @@ class QueryGenerator:
             l2, r2 = rng.choice(others)
             self._note("join:multi_key")
             cond = Logical("AND", [cond, Compare("=", l2, r2)])
+        if (
+            self.f.joins.on_filters
+            and jt in ("inner", "left", "right", "full")
+            and rng.random() < 0.2
+        ):
+            side = rng.choice([scope.columns("int"), right.columns])
+            used = {(n.alias, n.name) for n in walk(cond) if isinstance(n, ColumnRef)}
+            ints = [
+                c
+                for c in side
+                if c.kind == "int" and c.type.signed and (c.alias, c.name) not in used
+            ]
+            constant = rng.random() < 0.1
+            if ints or constant:
+                if constant:
+                    pred: Expr = Literal(False, st.BOOLEAN)
+                    self._note("join:on_filters_constant")
+                else:
+                    col = rng.choice(ints)
+                    pred = Compare(">", col, Literal(5, col.type))
+                cond = Logical("AND", [cond, pred])
+                self._note("join:on_filters")
+                self._note(f"join:on_filters_{jt}")
         return cond
 
     def _correlation(self, scope: Scope, mode: str) -> Expr | None:

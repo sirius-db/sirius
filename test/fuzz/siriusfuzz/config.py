@@ -54,8 +54,15 @@ class Joins:
     )
     inequality: bool = True
     null_safe_keys: bool = True
-    max_tables: int = 4
+    max_tables: int = gap_switch(4, 6)
     cartesian_max_rows: int = 50_000
+    any_join: bool = gap_switch(False)
+    any_join_share: float = 0.15
+    self_join: bool = gap_switch(False)
+    grouped_inputs: bool = gap_switch(False)
+    star_share: float = gap_switch(0.0, 0.3)
+    expression_keys: bool = gap_switch(False)
+    on_filters: bool = gap_switch(False)
 
 
 @dataclass
@@ -217,7 +224,7 @@ class Features:
     distinct: bool = True
     grouping_sets: bool = True
     full_join: bool = gap_switch(False)
-    cross_join: bool = gap_switch(False)
+    cross_join: bool = True
     set_ops: SetOps = field(default_factory=SetOps)
     joins: Joins = field(default_factory=Joins)
     subqueries: Subqueries = field(default_factory=Subqueries)
@@ -393,6 +400,12 @@ class FuzzConfig:
             )
         if f.joins.cartesian_max_rows < 1:
             raise ConfigError("features.joins.cartesian_max_rows must be positive")
+        if not 0 <= f.joins.star_share <= 1:
+            raise ConfigError("features.joins.star_share must be between 0 and 1")
+        if not 0 <= f.joins.any_join_share <= 1:
+            raise ConfigError("features.joins.any_join_share must be between 0 and 1")
+        if not 1 <= f.joins.max_tables <= 6:
+            raise ConfigError("features.joins.max_tables must be between 1 and 6")
         large = self.data.large
         for name in (
             "fraction",

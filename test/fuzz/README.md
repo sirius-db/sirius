@@ -165,6 +165,11 @@ MARK declines. `features.joins.cartesian_max_rows` bounds cross and inequality-o
 joins by the product of their input row counts; derived inputs require a `LIMIT`.
 Negated subqueries are counted separately as `subquery:not_in` and
 `subquery:not_exists`.
+The join switches `any_join`, `self_join`, `grouped_inputs`, `expression_keys`,
+and `on_filters` add those shapes when enabled. `max_tables` permits rare five
+and six table chains, and `star_share` chooses joins back to the first table.
+`any_join_share` controls the share of eligible INNER joins that use an ANY
+condition, so a focused acceptance run can collect enough samples.
 
 There is one configuration file, `config/default.toml`; every command loads it unless `--config`
 names another. Its `[features]` flags mark what Sirius runs on the GPU today: every enabled

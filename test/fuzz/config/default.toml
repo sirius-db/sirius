@@ -17,8 +17,8 @@ window_gaps = false
 float_exact_keys = false
 distinct = true
 grouping_sets = true
-full_join = false
-cross_join = false
+full_join = false  # f564c820; join truth table also found FULL ON TRUE/OR/one-table planner declines
+cross_join = true  # 53/55 focused tagged queries OK; Cartesian input product is capped
 types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
          "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
          "FLOAT", "DOUBLE", "DECIMAL", "DATE",
@@ -36,6 +36,13 @@ inequality = true
 null_safe_keys = true     # IS NOT DISTINCT FROM keys
 max_tables = 4
 cartesian_max_rows = 50000
+any_join = false
+any_join_share = 0.15
+self_join = false
+grouped_inputs = false
+star_share = 0.0
+expression_keys = false
+on_filters = false
 
 [features.subqueries]
 exists = true

@@ -20,6 +20,7 @@ from siriusfuzz.sqlast import (
     Agg,
     ColumnRef,
     Compare,
+    Derived,
     Exists,
     Func,
     SimpleCase,
@@ -29,6 +30,7 @@ from siriusfuzz.sqlast import (
     Logical,
     Select,
     SetOp,
+    TableRef,
     Window,
     has_computed_float,
 )
@@ -151,6 +153,61 @@ class Phase2dJoinBudget(unittest.TestCase):
             qg.generate()
         self.assertGreater(qg.stats["subquery:not_in"], 0)
         self.assertGreater(qg.stats["subquery:not_exists"], 0)
+
+    def test_new_join_shapes_and_admission_rules(self):
+        cfg = load_config(
+            None,
+            [
+                "features.joins.any_join=true",
+                "features.joins.self_join=true",
+                "features.joins.grouped_inputs=true",
+                "features.joins.expression_keys=true",
+                "features.joins.on_filters=true",
+                "features.joins.max_tables=6",
+                "features.joins.star_share=0.5",
+                "features.complexity.query=0",
+                "data.rows=[20,40]",
+            ],
+        )
+        dg = DataGenerator(cfg, random.Random(19))
+        qg = QueryGenerator(cfg, dg.generate(19), random.Random(19), dg)
+        queries = [qg.generate() for _ in range(2500)]
+        for tag in (
+            "join:any",
+            "join:any_or",
+            "join:any_mixed",
+            "join:self",
+            "join:self_key",
+            "join:self_nonkey",
+            "join:grouped_inputs",
+            "join:long_chain",
+            "join:star",
+            "join:expression_keys",
+            "join:on_filters",
+        ):
+            self.assertGreater(qg.stats[tag], 0, tag)
+        joins = [n for q in queries for n in walk(q) if isinstance(n, Join)]
+        self.assertTrue(
+            any(
+                isinstance(j.left, Derived)
+                and isinstance(j.right, Derived)
+                and j.left.select.group_by
+                and j.right.select.group_by
+                for j in joins
+            )
+        )
+        for j in joins:
+            if isinstance(j.cond, Logical) and j.cond.op == "OR":
+                self.assertEqual(j.join_type, "inner")
+            if (
+                isinstance(j.left, TableRef)
+                and isinstance(j.right, TableRef)
+                and j.left.table == j.right.table
+                and isinstance(j.cond, Compare)
+                and isinstance(j.cond.left, ColumnRef)
+                and j.cond.left.name != "k"
+            ):
+                self.assertFalse(j.left.table.startswith("f"))
 
 
 class Phase2cEdgeValues(unittest.TestCase):

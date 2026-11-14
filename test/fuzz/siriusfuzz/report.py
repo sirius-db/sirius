@@ -584,6 +584,17 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
         claimed.append("join:full")
     if f.cross_join:
         claimed.append("join:cross")
+    for switch, tag in (
+        (f.joins.any_join, "join:any"),
+        (f.joins.self_join, "join:self"),
+        (f.joins.grouped_inputs, "join:grouped_inputs"),
+        (f.joins.expression_keys, "join:expression_keys"),
+        (f.joins.on_filters, "join:on_filters"),
+        (f.joins.max_tables >= 5, "join:long_chain"),
+        (f.joins.star_share > 0, "join:star"),
+    ):
+        if switch:
+            claimed.append(tag)
     if f.grouping_sets:
         claimed.append("grouping_sets")
     if f.order_by.enabled:
@@ -604,8 +615,10 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
             claimed.append(f"setop:{op}")
     if f.subqueries.exists:
         claimed.append("subquery:exists")
+        claimed.append("subquery:not_exists")
     if f.subqueries.in_:
         claimed.append("subquery:in")
+        claimed.append("subquery:not_in")
     if f.subqueries.scalar:
         claimed.append("subquery:scalar")
     if f.window_functions:
