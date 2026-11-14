@@ -24,6 +24,7 @@ target_sources(
           merge/detail/window_buffer.cu
           discard_copy_function.cpp
           order/gpu_order_impl.cpp
+          order/encoded_sort_order.cu
           partition/gpu_partition_impl.cpp
           partition/partition_exchange.cpp
           partition/consumer_partition_policy.cpp

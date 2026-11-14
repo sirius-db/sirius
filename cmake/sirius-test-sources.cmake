@@ -139,6 +139,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_order_by_windowed.cpp
+    test/cpp/integration/test_gpu_execution_order_by_key_encoding.cpp
     test/cpp/integration/test_gpu_execution_regexp_replace.cpp
     test/cpp/integration/test_gpu_execution_size_estimation.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
@@ -284,6 +285,7 @@ set(TEST_SOURCES
     test/cpp/operator/merge/test_merger_stats.cpp
     test/cpp/operator/merge/test_merge_sort_stats_log.cpp
     test/cpp/operator/test_physical_order.cpp
+    test/cpp/operator/order/test_encoded_sort_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_replicate.cpp

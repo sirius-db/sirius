@@ -113,7 +113,7 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     CHECK(current_setting(con, "sort_merge_one_shot_max_fraction").GetValue<double>() == 0.0);
     CHECK(current_setting(con, "sort_merge_max_fan_in").GetValue<uint64_t>() ==
           config::DEFAULT_SORT_MERGE_MAX_FAN_IN);
-    CHECK(config::DEFAULT_SORT_MERGE_MAX_FAN_IN == 64);
+    CHECK(config::DEFAULT_SORT_MERGE_MAX_FAN_IN == 8);
 
     CHECK(params.sort_merge_mode_setting == sort_merge_mode::automatic);
     CHECK(params.sort_merge_window_rows == 0);
@@ -128,20 +128,20 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     require_ok(con, "SET sort_merge_window_rows = 1048576");
     require_ok(con, "SET sort_merge_output_bytes = 67108864");
     require_ok(con, "SET sort_merge_one_shot_max_fraction = 0.5");
-    require_ok(con, "SET sort_merge_max_fan_in = 8");
+    require_ok(con, "SET sort_merge_max_fan_in = 12");
 
     CHECK(current_setting(con, "sort_merge_mode").ToString() == "windowed");
     CHECK(current_setting(con, "sort_merge_window_rows").GetValue<uint64_t>() == 1048576);
     CHECK(current_setting(con, "sort_merge_output_bytes").GetValue<uint64_t>() == 64 * mib);
     CHECK(current_setting(con, "sort_merge_one_shot_max_fraction").GetValue<double>() ==
           Approx(0.5));
-    CHECK(current_setting(con, "sort_merge_max_fan_in").GetValue<uint64_t>() == 8);
+    CHECK(current_setting(con, "sort_merge_max_fan_in").GetValue<uint64_t>() == 12);
 
     CHECK(params.sort_merge_mode_setting == sort_merge_mode::windowed);
     CHECK(params.sort_merge_window_rows == 1048576);
     CHECK(params.sort_merge_output_bytes == 64 * mib);
     CHECK(params.sort_merge_one_shot_max_fraction == Approx(0.5));
-    CHECK(params.sort_merge_max_fan_in == 8);
+    CHECK(params.sort_merge_max_fan_in == 12);
 
     // The merge operator reads the settings through this snapshot.
     auto const settings = op::merge::merge_settings::from(params);
@@ -149,7 +149,7 @@ TEST_CASE("sort_merge settings default, SET and RESET", "[sort_merge_settings][i
     CHECK(settings.window_rows == 1048576);
     CHECK(settings.output_bytes == 64 * mib);
     CHECK(settings.one_shot_max_fraction == Approx(0.5));
-    CHECK(settings.max_fan_in == 8);
+    CHECK(settings.max_fan_in == 12);
 
     require_ok(con, "RESET sort_merge_mode");
     require_ok(con, "RESET sort_merge_window_rows");
@@ -211,7 +211,7 @@ TEST_CASE("sort_merge settings reject invalid SET values and keep the previous v
   require_ok(con, "SET sort_merge_window_rows = 4096");
   require_ok(con, "SET sort_merge_output_bytes = 2097152");
   require_ok(con, "SET sort_merge_one_shot_max_fraction = 0.5");
-  require_ok(con, "SET sort_merge_max_fan_in = 8");
+  require_ok(con, "SET sort_merge_max_fan_in = 12");
 
   for (auto const* value : {"'oneshot'", "'window'", "''", "'auto '"}) {
     require_rejected(
@@ -243,10 +243,10 @@ TEST_CASE("sort_merge settings reject invalid SET values and keep the previous v
   CHECK(params.sort_merge_window_rows == 4096);
   CHECK(params.sort_merge_output_bytes == 2 * mib);
   CHECK(params.sort_merge_one_shot_max_fraction == Approx(0.5));
-  CHECK(params.sort_merge_max_fan_in == 8);
+  CHECK(params.sort_merge_max_fan_in == 12);
   CHECK(current_setting(con, "sort_merge_mode").ToString() == "windowed");
   CHECK(current_setting(con, "sort_merge_window_rows").GetValue<uint64_t>() == 4096);
-  CHECK(current_setting(con, "sort_merge_max_fan_in").GetValue<uint64_t>() == 8);
+  CHECK(current_setting(con, "sort_merge_max_fan_in").GetValue<uint64_t>() == 12);
 }
 
 TEST_CASE("sort_merge config-file keys parse", "[sort_merge_settings][config_opt]")

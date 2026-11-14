@@ -53,6 +53,11 @@ class gpu_order_impl {
    * @param projections The columns to construct output based on the sorted order.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Telemetry attached to the output data batch.
+   * @param sort_key_encoding Whether string keys and multi-column keys are ordered by
+   * `order::encoded_sorted_order()` (radix sorts over an encoding of the keys) instead of
+   * `cudf::sorted_order()`. Both give a valid order of the same keys; the encoded one is stable.
+   * Key shapes the encoded path does not take always use `cudf::sorted_order()`.
    *
    * @return The output data batch.
    */
@@ -64,7 +69,8 @@ class gpu_order_impl {
     const std::vector<int>& projections,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    bool sort_key_encoding                                = true);
 };
 
 }  // namespace op

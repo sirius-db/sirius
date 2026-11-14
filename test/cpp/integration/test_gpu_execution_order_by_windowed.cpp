@@ -76,6 +76,9 @@ class OrderByWindowedFixture : public sirius::test::GpuExecutionFixture {
     // Small scan batches: each one becomes a sorted run, so a partition merges many runs.
     set("scan_task_batch_size", "2097152");
     set("sort_merge_mode", "windowed");
+    // More than any case's runs per partition, so a case merges in one pass unless it lowers
+    // the cap itself (the checks below require zero intermediate tasks otherwise).
+    set("sort_merge_max_fan_in", "64");
   }
 
   ~OrderByWindowedFixture()

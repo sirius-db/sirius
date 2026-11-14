@@ -663,7 +663,10 @@ TEST_CASE("windowed merge sort reads each HOST row once across the tasks of a pa
   constexpr std::size_t num_runs     = 8;
   constexpr std::size_t rows_per_run = 3000;
   merge_harness test;
-  test.configure(small_window_params());
+  // One pass over all the runs, whatever the default fan-in cap is.
+  auto params                  = small_window_params();
+  params.sort_merge_max_fan_in = num_runs;
+  test.configure(params);
   std::vector<host_rows> runs;
   for (std::size_t run = 0; run < num_runs; ++run) {
     runs.push_back(test.add_run(0, run, rows_per_run));

@@ -454,7 +454,22 @@ DISTINCT lowering's grouped aggregate over the union itself, keyed on every colu
 
 Local sort of each data batch.
 
-- **GPU execution:** `gpu_order_impl::local_order_by()` using `cudf::order_by()`
+- **GPU execution:** `gpu_order_impl::local_order_by()`: a row order, then one `cudf::gather()`.
+- **Row order:** `cudf::sorted_order()` for a single fixed-width key (cuDF radix-sorts it). String
+  keys and multi-column keys use `order::encoded_sorted_order()`
+  (`src/op/order/encoded_sort_order.hpp`) when `sort_key_encoding` is true (the default):
+  - Each key column becomes bit fields whose unsigned order is the column's order: a null flag,
+    the value minus the column minimum (or the maximum minus the value for DESC), and for a
+    string its 8-byte big-endian chunks followed by its length. The fields are packed, as one
+    bit string, into 64-bit words.
+  - The words are applied most-significant first. Each step radix-sorts only the rows still tied
+    on the earlier words, by (tie group, word), over only the bits that differ inside a group. A
+    word that is constant inside every group (a shared string prefix) costs one pass and no sort.
+  - The result is the order of `cudf::stable_sorted_order()`: the same row comparator as the
+    merge (`kway_comparator.cuh`), equal keys in input order.
+  - It falls back to `cudf::sorted_order()` for batches under 4,096 rows, key types other than
+    fixed-width and STRING, strings longer than 256 bytes, and when its working memory (up to
+    about 40 bytes per row) cannot be allocated.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
 
 ### `sirius_physical_top_n` — `TOP_N`

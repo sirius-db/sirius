@@ -87,7 +87,8 @@ TEST_CASE("derive_merge_config sizes a 16-run merge of 32-byte rows at T = 4",
                           row{80, 7.0e6, 640 * kMiB, 0.33},
                           row{128, 11.2e6, 1 * kGiB, 0.33});
 
-  auto const cfg = derive_merge_config(merge_settings{}, device(r.gpu_gib * kGiB), 16, 32);
+  auto const cfg =
+    derive_merge_config(merge_settings{.max_fan_in = 16}, device(r.gpu_gib * kGiB), 16, 32);
 
   CHECK(cfg.fan_in == 16);
   CHECK(static_cast<double>(cfg.window_rows) == Approx(r.window_rows).epsilon(0.01));
@@ -102,7 +103,14 @@ TEST_CASE("derive_merge_config caps the fan-in so the window stays at its floor"
   // 4096 runs of 32-byte rows on a 24 GiB device: B = 3 GiB.
   SECTION("the max_fan_in setting caps it")
   {
-    auto const cfg = derive_merge_config(merge_settings{}, device(24 * kGiB), 4096, 32);
+    // The default cap, and an explicit one.
+    auto const by_default = derive_merge_config(merge_settings{}, device(24 * kGiB), 4096, 32);
+    CHECK(by_default.fan_in == sirius::config::DEFAULT_SORT_MERGE_MAX_FAN_IN);
+    CHECK(by_default.window_rows ==
+          3 * kGiB / (3 * sirius::config::DEFAULT_SORT_MERGE_MAX_FAN_IN * 32));
+
+    auto const cfg =
+      derive_merge_config(merge_settings{.max_fan_in = 64}, device(24 * kGiB), 4096, 32);
     CHECK(cfg.fan_in == 64);
     CHECK(cfg.window_rows == 3 * kGiB / (3 * 64 * 32));
     CHECK(cfg.window_rows >= kWindowRowsFloor);
@@ -160,8 +168,9 @@ TEST_CASE("derive_merge_config caps the fan-in so the window stays at its floor"
 TEST_CASE("derive_merge_config splits the budget among concurrent tasks", "[merge_config][unit]")
 {
   // 80 GiB, k = 16, w = 32: B = 40 GiB / T.
-  auto const one  = derive_merge_config(merge_settings{}, device(80 * kGiB, 1), 16, 32);
-  auto const four = derive_merge_config(merge_settings{}, device(80 * kGiB, 4), 16, 32);
+  merge_settings const settings{.max_fan_in = 16};
+  auto const one  = derive_merge_config(settings, device(80 * kGiB, 1), 16, 32);
+  auto const four = derive_merge_config(settings, device(80 * kGiB, 4), 16, 32);
   // With T = 1 the fit (~28 M rows) exceeds the ceiling G / (16 * k * w) = 10.5 M rows.
   CHECK(one.window_rows == 80 * kGiB / (16 * 16 * 32));
   CHECK(four.window_rows == 10 * kGiB / (3 * 16 * 32));
@@ -169,7 +178,7 @@ TEST_CASE("derive_merge_config splits the budget among concurrent tasks", "[merg
   CHECK(four.output_target_bytes == 640 * kMiB);
 
   // Zero concurrent tasks is treated as one.
-  auto const zero = derive_merge_config(merge_settings{}, device(80 * kGiB, 0), 16, 32);
+  auto const zero = derive_merge_config(settings, device(80 * kGiB, 0), 16, 32);
   CHECK(zero.window_rows == one.window_rows);
   CHECK(zero.output_target_bytes == one.output_target_bytes);
 }
@@ -194,13 +203,13 @@ TEST_CASE("derive_merge_config keeps explicit settings", "[merge_config][unit]")
   settings.window_rows           = 1'000'000;
   settings.output_bytes          = 123 * kMiB;
   settings.one_shot_max_fraction = 0.5;
-  settings.max_fan_in            = 8;
+  settings.max_fan_in            = 4;
 
   auto const cfg = derive_merge_config(settings, device(24 * kGiB), 16, 32);
   CHECK(cfg.window_rows == 1'000'000);
   CHECK(cfg.output_target_bytes == 123 * kMiB);
   CHECK(cfg.one_shot_fraction == 0.5);
-  CHECK(cfg.fan_in == 8);
+  CHECK(cfg.fan_in == 4);
 
   SECTION("an explicit window below the accepted minimum is clamped up")
   {

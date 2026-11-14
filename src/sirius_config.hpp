@@ -84,14 +84,14 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
 /// more runs is merged in passes.
 ///
-/// The value trades two costs. A task's window budget is shared by the runs it reads, so a higher
-/// fan-in means fewer rows per window and more refills per run. A lower fan-in means more
-/// partitions need an intermediate pass, which rewrites their rows (and may spill them again).
-/// 64 is a conservative choice, not a tuned one: two passes cover 64 * 64 = 4096 runs. It is only
-/// an upper bound: op::merge::derive_merge_config lowers the fan-in further when the task budget
-/// cannot hold that many windows at the window-row floor, and clamps it to the kernel's limit
-/// (op::merge::kMaxKwayMergeInputs).
-inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 64;
+/// Why 8: the k-way tile merge's cost per row grows about linearly with the fan-in, while a
+/// higher fan-in only saves a logarithmic number of passes, and a task's window budget is shared
+/// by the runs it reads, so a higher fan-in also means smaller merge rounds. Measured, the extra
+/// passes of a low fan-in (which rewrite a partition's rows and may spill them again) cost less
+/// than merging many runs at once. It is only an upper bound: op::merge::derive_merge_config
+/// lowers the fan-in further when the task budget cannot hold that many windows at the
+/// window-row floor, and clamps it to the kernel's limit (op::merge::kMaxKwayMergeInputs).
+inline constexpr uint64_t DEFAULT_SORT_MERGE_MAX_FAN_IN = 8;
 
 /// Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
 /// left/output side) instead of cudf::filtered_join (build on the right side). mark_join only
@@ -241,6 +241,10 @@ struct operator_params {
 
   /// Most runs one merge task reads; a partition with more runs is merged in passes.
   uint64_t sort_merge_max_fan_in = config::DEFAULT_SORT_MERGE_MAX_FAN_IN;
+
+  /// Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix
+  /// sorts over an encoding of the keys (SET sort_key_encoding) instead of cuDF's comparison sort.
+  bool sort_key_encoding = true;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;

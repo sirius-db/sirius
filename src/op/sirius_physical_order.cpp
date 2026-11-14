@@ -19,7 +19,9 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
 namespace sirius {
@@ -64,6 +66,9 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   }
 
   std::vector<int> proj_idx(projections.begin(), projections.end());
+  const bool sort_key_encoding =
+    _pipeline != nullptr ? _pipeline->get_operator_params().sort_key_encoding
+                         : sirius::operator_params{}.sort_key_encoding;
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
@@ -79,7 +84,8 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                        proj_idx,
                                                        stream,
                                                        *space,
-                                                       batch_telemetry());
+                                                       batch_telemetry(),
+                                                       sort_key_encoding);
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
 

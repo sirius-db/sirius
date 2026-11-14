@@ -88,6 +88,8 @@ Compression was really applied: 25,011–138,867 runs were read from compressed 
 
 **Windowed behaviour.** Every partition took the windowed path with no fallback conversions.
 Every run needed intermediate fan-in passes, so the merge wrote 1.99–2.69 rows per input row.
+These runs used `sort_merge_max_fan_in` = 64, the default when they were taken; the default is
+now 8, which takes more passes (more rows written per input row) and less time per pass.
 Uncompressed runs moved 489–977 GB to disk for 505 GB of input. The smallest round emitted
 14–58 rows on three of the five datasets; the mean round is 0.27–1.24 million rows.
 

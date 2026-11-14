@@ -2763,6 +2763,13 @@ static void SetSortMergeMaxFanIn(ClientContext& context, SetScope scope, Value& 
   SIRIUS_LOG_DEBUG("Updated config sort_merge_max_fan_in to {}", params->sort_merge_max_fan_in);
 }
 
+static void SetSortKeyEncoding(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params              = get_operator_params(context, scope);
+  params->sort_key_encoding = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_key_encoding to {}", params->sort_key_encoding);
+}
+
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3600,6 +3607,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.sort_merge_max_fan_in),
     SetSortMergeMaxFanIn);
+  config.AddExtensionOption(
+    "sort_key_encoding",
+    "Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix "
+    "sorts over an encoding of the keys instead of cuDF's comparison sort (false: for A/B "
+    "comparison)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_key_encoding),
+    SetSortKeyEncoding);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",

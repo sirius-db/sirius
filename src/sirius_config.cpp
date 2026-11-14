@@ -470,6 +470,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (opt.sort_merge_max_fan_in < 2) {
     throw std::runtime_error("'operator_params.sort_merge_max_fan_in': must be at least 2");
   }
+  r.optional("sort_key_encoding", opt.sort_key_encoding);
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   if (opt.hash_partition_bytes == 0) {
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
