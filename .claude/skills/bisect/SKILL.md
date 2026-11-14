@@ -10,87 +10,95 @@ disable-model-invocation: true
 
 # Commit Comparison / Bisect Tool
 
-Find which commit introduced a bug using `git bisect` with automated build+test. Compare query output across commits against DuckDB CPU baseline.
+Find which commit introduced a regression using an isolated checkout and a repeatable test. For
+build presets and SQL invocation, consult `.claude/skills/_shared/build-and-query.md`, adapting
+paths to the isolated worktree. Do not follow its checkout or checkpoint instructions, create
+commits, or modify the user's checkout for this investigation.
 
-**Reference:** See `.claude/skills/_shared/build-and-query.md` for shared infrastructure (build modes, query execution, result comparison, change tracking).
+## Prepare
 
-## Workflow
+Resolve the supplied good and bad commits (bad defaults to the original `HEAD`; resolve "N commits
+ago" against that same `HEAD`) to commit IDs before starting. Show the range and estimate the
+number of bisect steps. Define the precise regression predicate and the evidence that distinguishes
+it from unrelated failures. Establish the exact test, inputs and expected good/bad behavior; ask for
+missing details when a meaningful test cannot be inferred. For performance regressions, define a
+measurement procedure and threshold that distinguish the endpoints, accounting for run-to-run
+variation.
 
-### Mode 1: Automated Bisect (commit range)
+Create a unique working directory under a user-selected parent if provided, otherwise choose a
+writable location with sufficient space for a full build and its Pixi environment; it need not be under `/tmp`. Create a
+detached Git worktree inside it. Resolve dataset, database and configuration paths to absolute paths
+before switching checkouts. Run all checkouts, builds, tests and `git bisect` commands in that
+worktree. Keep the original checkout, including staged, unstaged and untracked files, untouched;
+never stash or commit the user's work. Use a separate build directory in the worktree, and do not
+clean or overwrite the original build. Use the requested build preset if specified; otherwise choose
+the appropriate default rather than requiring a prompt. Keep scripts, baseline and logs outside the
+worktree so checkouts cannot overwrite them.
 
-1. **Parse arguments:**
-   - `$ARGUMENTS[0]` = good commit (SHA, tag, or "N commits ago" e.g., "10 commits ago")
-   - `$ARGUMENTS[1]` = bad commit (default: HEAD)
-   - `$ARGUMENTS[2]` = test command or SQL query
-   - If "N commits ago" syntax used, resolve: `git rev-parse HEAD~N`
+For SQL, preserve the source dataset. Use read-only access when possible; for state-changing
+tests, use a disposable copy or resettable fixture restored to identical initial state before the
+CPU baseline and each revision test. Never run mutations against the user's database.
+Run the same query and initial data against DuckDB CPU once to capture a baseline, explicitly
+using `SIRIUS_DISABLE=1` for the CPU process. The wrapper's DuckDB CLI has the Sirius
+extension built in regardless of `SIRIUS_DUCKDB_LINKAGE`; omitting `LOAD` is insufficient. Preserve types,
+NULLs, duplicates and any meaningful order; normalize row order only when SQL semantics permit it.
+Use bounded, repeatable inputs and runs, and record the command, data, baseline and comparison
+method. Establish that the good endpoint passes and the bad endpoint reproduces the reported
+regression before bisecting. For a GPU-result regression, verify that the relevant query actually
+runs on the GPU using applicable logs or execution evidence: successful SQL alone can be CPU
+fallback. Evaluate the specified regression predicate first: when the target is a query crash or
+unexpected CPU fallback, observed evidence of that crash or fallback is a bad result, not a skip.
+Likewise, a build failure matching a requested build-regression predicate is bad. Skip a revision
+only when an unrelated build or infrastructure failure, inconclusive GPU evidence,
+or unusable query result prevents evaluating the predicate. Stop and report if either endpoint
+cannot be established or the test cannot distinguish them.
 
-2. **Pre-flight checks:**
-   - Warn about uncommitted changes: `git status --porcelain`
-   - If dirty, ask user to stash or commit first
-   - Show commit range: `git log --oneline <good>..<bad>`
-   - Estimate bisect steps: approximately `log2(N)` where N is number of commits
+## Automated bisect
 
-3. **Establish CPU baseline** (if test is a SQL query):
-   Run the query via DuckDB CPU to get the expected correct result. Save to a temp file.
+Write a test script in the working directory. At every bisect step it must update the worktree's
+required submodules to the checked-out revision before building, then run the selected test and
+classify the result deliberately. Use `pixi run --locked` to preserve each revision's lockfile;
+an unrelated environment-install or submodule-update failure that prevents testing is a skip.
+If a broken dependency pin is the target regression, matching evidence is bad, not a skip:
 
-4. **Create bisect test script** at `/tmp/claude-1000/sirius_bisect_test.sh`.
-   Ask the user which build preset to use: `release` (fastest), `relwithdebinfo` (with debug symbols), or `clang-debug` (full debug):
-   ```bash
-   #!/bin/bash
-   set -e
-   # Build  (look in Claude.md)
+- `0`: good; `1`: the specified regression is reproduced; `125`: untestable, including build
+  failures or inconclusive evidence that prevents evaluating the target predicate. A reproduced
+  target build failure, crash or unexpected fallback is `1`.
+- Return a status of at least `128` to abort for a harness or configuration error that makes
+  continued testing meaningless. Do not let `set -e` turn build or infrastructure failures into
+  bad results. For an external test command, define how its exit statuses map to these outcomes.
 
-   # Run test
-   <test_command>
-   ```
-   For SQL queries, the script also:
-   - Captures GPU output
-   - Compares against the saved CPU baseline
-   - Exits 0 if match (good), 1 if mismatch (bad), 125 if build fails (skip)
+For example, the build step must explicitly classify failure before running the query or test. The
+predicate below checks captured build evidence and is false unless that failure is the target:
 
-5. **Execute automated bisect:**
-   ```bash
-   git bisect start <bad> <good>
-   git bisect run /tmp/claude-1000/sirius_bisect_test.sh
-   ```
-   Show progress updates during bisect (current step / total estimated steps).
+```bash
+build_log="<absolute-log-dir>/build-$(git rev-parse HEAD).log"
+if ! <build-command> >"$build_log" 2>&1; then
+  if <target-build-failure-predicate>; then
+    exit 1
+  fi
+  exit 125
+fi
+# Run the test and explicitly classify its result as 0, 1, 125, or an abort status.
+```
 
-6. **Report the first bad commit:**
-   - Show commit message, author, date
-   - Show the diff: `git show <bad-commit>`
-   - Analyze the changes and explain what likely caused the regression
+From the isolated worktree, run `git bisect start <bad-oid> <good-oid>` and
+`git bisect run <absolute-path-to-test-script>`. Report progress and keep the per-revision evidence.
+If skipped commits prevent a unique answer, report the remaining candidate range rather than
+claiming a first bad commit. Otherwise report the commit, author, date, relevant diff and the
+supported explanation, distinguishing evidence from hypothesis. Optionally compare pipeline logs
+from the last good and first bad commits when available.
 
-7. **Pipeline-level comparison** (optional):
-   Run `tools/parse_pipeline_log.py` on logs from the last good commit and first bad commit to compare per-operator row counts.
+## Manual comparison
 
-8. **Cleanup:**
-   ```bash
-   git bisect reset
-   ```
+For a request to compare two specific commits, use the same isolated worktree and test procedure:
+check out each pinned commit there, update its required submodules, build and capture results and
+logs, then compare behavior and any meaningful performance measurements. Apply the same target
+predicate to failures and GPU execution; report unrelated or inconclusive observations separately.
 
-### Mode 2: Manual Comparison (two specific commits)
+## Cleanup
 
-If the user provides just two specific commits (not a range for bisect):
-
-1. **Checkout commit A**, build, run query, capture output + logs
-2. **Checkout commit B**, build, run query, capture output + logs
-3. **Diff both** the query outputs and the logs, highlighting:
-   - Result differences (wrong values, missing/extra rows)
-   - Code path differences (different operators used, different pipeline stages)
-   - Performance differences (timing, memory usage from logs)
-4. **Return to original branch:** `git checkout <original-branch>`
-
-## Key Design Decisions
-
-- Exit code 125 skips commits that don't build (common in CUDA projects where intermediate commits may break)
-- Support both SQL query tests and unit test invocations
-- Warn about uncommitted changes before starting bisect (bisect changes HEAD)
-- CPU baseline captured once before bisect starts, reused for all steps
-- For SQL queries, results are sorted before comparison to handle ordering differences
-
-## Important Notes
-
-- `git bisect` changes HEAD -- the user should not have uncommitted work
-- Each bisect step requires a full rebuild, which can be slow for large codebases
-- If many commits don't build, bisect may take longer than expected due to skips
-- The user can interrupt bisect at any time with `git bisect reset`
+On completion, failure or interruption, reset an active bisect in the isolated worktree and remove
+the worktree with `git worktree remove` before deleting the working directory. Preserve any
+requested logs or results outside it first. Initialized submodules or leftover build files may
+require `--force`; use it only for this investigation's disposable worktree after preserving evidence. If cleanup cannot finish, report the worktree path and cleanup commands. The original checkout remains on its original branch and retains its changes.
