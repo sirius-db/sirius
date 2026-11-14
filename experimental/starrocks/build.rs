@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use heck::{ToShoutySnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
@@ -23,11 +27,14 @@ const STARROCKS_PROTOS: &[&str] = &[
     "types.proto",
 ];
 
-/// Generates StarRocks protobuf bindings, BRPC metadata bindings, and the BRPC service facade.
+/// Generates StarRocks protobuf bindings, BRPC metadata bindings, and the BRPC service facade,
+/// and records the StarRocks release the CN is built against.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let brpc_dir = manifest_dir.join("brpc");
     let proto_dir = manifest_dir.join("starrocks/gensrc/proto");
+
+    emit_starrocks_release(&manifest_dir.join("starrocks"));
 
     println!("cargo:rerun-if-changed={}", brpc_dir.display());
     println!("cargo:rerun-if-changed={}", proto_dir.display());
@@ -53,6 +60,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.compile_fds(file_descriptors)?;
 
     Ok(())
+}
+
+/// Sets `SIRIUS_CN_STARROCKS_RELEASE` (e.g. `4.1.3`) and `SIRIUS_CN_STARROCKS_COMMIT` (e.g.
+/// `8a8e186`) from the StarRocks submodule checkout, for the heartbeat version string. The
+/// release is the commit's tag, else the FE's Maven version (a shallow clone has no tags).
+/// Either is `unknown` when it can't be read, so a build without git still succeeds.
+fn emit_starrocks_release(starrocks_dir: &Path) {
+    // Ask git only when the submodule is its own checkout: otherwise `git -C` would answer for
+    // an enclosing repository.
+    let has_git = starrocks_dir.join(".git").exists();
+    let git = |args: &[&str]| -> Option<String> {
+        if !has_git {
+            return None;
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(starrocks_dir)
+            .args(args)
+            .output()
+            .ok()?;
+        let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (output.status.success() && !text.is_empty()).then_some(text)
+    };
+
+    // A submodule bump moves the submodule's HEAD.
+    if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    }
+    let fe_pom = starrocks_dir.join("fe/pom.xml");
+    if fe_pom.exists() {
+        println!("cargo:rerun-if-changed={}", fe_pom.display());
+    }
+
+    let release = git(&["describe", "--tags", "--exact-match"])
+        .or_else(|| fe_pom_version(&fe_pom))
+        .unwrap_or_else(|| "unknown".to_string());
+    let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SIRIUS_CN_STARROCKS_RELEASE={release}");
+    println!("cargo:rustc-env=SIRIUS_CN_STARROCKS_COMMIT={commit}");
+}
+
+/// Reads the project version of the StarRocks FE (`starrocks-fe`) from its `pom.xml`.
+fn fe_pom_version(pom: &Path) -> Option<String> {
+    let pom = std::fs::read_to_string(pom).ok()?;
+    let after_artifact = pom.split_once("<artifactId>starrocks-fe</artifactId>")?.1;
+    let version = after_artifact
+        .split_once("<version>")?
+        .1
+        .split_once("</version>")?
+        .0;
+    Some(version.trim().to_string())
 }
 
 /// Emits an async BRPC/Tower service facade from StarRocks' protobuf service
