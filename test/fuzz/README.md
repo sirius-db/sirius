@@ -175,6 +175,8 @@ and six table chains, and `star_share` chooses joins back to the first table.
 condition, so a focused acceptance run can collect enough samples.
 `self_join_share` similarly controls explicit self joins. Grouped joins carry
 `join:grouped_g` or `join:grouped_agg` for their exact join key.
+`aggregates.float_division_minmax` is gaps-only: finite inputs can produce NaN
+through division, and signature `c6aae63a` shows divergent MIN/MAX results.
 Each `queries.jsonl` record includes `generator_tags`, allowing per-shape
 verdict and fallback rates to be counted without inferring them from SQL text.
 

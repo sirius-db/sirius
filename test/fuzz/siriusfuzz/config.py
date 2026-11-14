@@ -97,6 +97,9 @@ class Aggregates:
     filter: bool = True
     filter_subquery: bool = gap_switch(False)
     expression_args: bool = gap_switch(False)
+    float_division_minmax: bool = gap_switch(
+        False
+    )  # c6aae63a: NaN from finite division
 
 
 @dataclass

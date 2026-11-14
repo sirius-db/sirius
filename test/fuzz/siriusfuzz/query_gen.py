@@ -1957,9 +1957,33 @@ class QueryGenerator:
         if name in ("min", "max", "first"):
             kind = self._pick_kind_in_scope(scope)
             self._note(f"agg:{name}")
-            agg = Agg(name, self._gen_expr(kind, scope, depth + 1), kind=kind)
+            arg = (
+                self._minmax_arg(kind, scope, depth + 1)
+                if name in ("min", "max")
+                else self._gen_expr(kind, scope, depth + 1)
+            )
+            agg = Agg(name, arg, kind=kind)
             return self._maybe_filter_agg(agg, scope, depth)
         raise GenerationFailed(name)
+
+    def _minmax_arg(self, kind: str, scope: Scope, depth: int) -> Expr:
+        arg = self._gen_expr(kind, scope, depth)
+        # c6aae63a: finite input can still yield NaN through 0.0/0.0; GPU MIN/MAX
+        # orders that NaN differently from DuckDB. Preserve this shape in gaps mode.
+        if any(
+            isinstance(node, Arith) and node.op == "/" and node.kind == "float"
+            for node in walk(arg)
+        ):
+            if self.f.aggregates.float_division_minmax:
+                self._note("agg:minmax_float_division")
+            else:
+                cols = scope.columns(kind)
+                arg = (
+                    self.rng.choice(cols)
+                    if cols
+                    else self._literal(kind, CONCRETE[kind])
+                )
+        return arg
 
     def _maybe_filter_agg(self, agg: Agg, scope: Scope, depth: int) -> Agg:
         if (
@@ -2011,7 +2035,12 @@ class QueryGenerator:
         arg_kind = "int" if (name == "sum" and kind == "int") else kind
         if name == "avg":
             arg_kind = rng.choice(["int", "float", "decimal"])
-        agg = Agg(name, self._gen_expr(arg_kind, scope, depth + 1), kind=kind)
+        arg = (
+            self._minmax_arg(arg_kind, scope, depth + 1)
+            if name in ("min", "max")
+            else self._gen_expr(arg_kind, scope, depth + 1)
+        )
+        agg = Agg(name, arg, kind=kind)
         if name == "sum" and kind == "int":
             # sum(int) is HUGEINT; narrow so the scalar can be compared like other ints.
             return Cast(agg, st.BIGINT)

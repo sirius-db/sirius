@@ -18,6 +18,7 @@ from siriusfuzz.schema_gen import DataGenerator
 from siriusfuzz.session import Session
 from siriusfuzz.sqlast import (
     Agg,
+    Arith,
     ColumnRef,
     Compare,
     Derived,
@@ -271,6 +272,35 @@ class Phase2cOracle(unittest.TestCase):
 
 
 class Phase2cShapes(unittest.TestCase):
+    def test_float_division_stays_out_of_default_minmax(self):
+        for enabled in (False, True):
+            cfg = load_config(
+                None,
+                [
+                    f"features.aggregates.float_division_minmax={str(enabled).lower()}",
+                    "features.complexity.scalar=0.6",
+                ],
+            )
+            dg = DataGenerator(cfg, random.Random(20261114))
+            qg = QueryGenerator(cfg, dg.generate(20261114), random.Random(20261114), dg)
+            queries = [qg.generate() for _ in range(4000)]
+            exposed = [
+                agg
+                for query in queries
+                for agg in walk(query)
+                if isinstance(agg, Agg)
+                and agg.name in ("min", "max")
+                and agg.arg is not None
+                and any(
+                    isinstance(node, Arith) and node.op == "/" and node.kind == "float"
+                    for node in walk(agg.arg)
+                )
+            ]
+            if enabled:
+                self.assertGreater(len(exposed), 0)
+            else:
+                self.assertEqual(exposed, [])
+
     def test_cast_boundaries_use_enabled_families(self):
         cfg = load_config(
             None,
