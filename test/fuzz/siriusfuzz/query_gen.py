@@ -749,7 +749,7 @@ class QueryGenerator:
                     alias,
                     [ColumnRef(alias, c.name, c.type) for c in table.columns],
                     table.name,
-                    len(table.rows),
+                    table.row_count,
                 )
                 nonkeys = [
                     c
@@ -759,7 +759,7 @@ class QueryGenerator:
                 if (
                     not table.name.startswith("f")
                     and nonkeys
-                    and len(table.rows) ** 2 <= self.f.joins.cartesian_max_rows
+                    and table.row_count**2 <= self.f.joins.cartesian_max_rows
                     and rng.random() < 0.5
                 ):
                     self_variant = "nonkey"
@@ -870,7 +870,7 @@ class QueryGenerator:
             )
         join_column = (
             "agg"
-            if len(first_table.rows) * len(second_table.rows)
+            if first_table.row_count * second_table.row_count
             <= self.f.joins.cartesian_max_rows
             and self.rng.random() < 0.3
             else "g"
@@ -903,7 +903,7 @@ class QueryGenerator:
             table = rng.choice([t for t in self.ds.tables if t.name.startswith("f")])
             cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
             return TableRef(table.name, alias), ScopeTable(
-                alias, cols, table.name, len(table.rows)
+                alias, cols, table.name, table.row_count
             )
         if force_cte is not None or (ctes and rng.random() < 0.4):
             name = force_cte or rng.choice(list(ctes))
@@ -932,7 +932,7 @@ class QueryGenerator:
         table = rng.choice(candidates)
         cols = [ColumnRef(alias, c.name, c.type) for c in table.columns]
         return TableRef(table.name, alias), ScopeTable(
-            alias, cols, table.name, len(table.rows)
+            alias, cols, table.name, table.row_count
         )
 
     def _output_columns(self, sel: Select, alias: str) -> list[ColumnRef]:

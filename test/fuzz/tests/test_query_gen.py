@@ -167,6 +167,36 @@ class Phase2dJoinBudget(unittest.TestCase):
             ]
             self.assertEqual(bool(cross), expected)
 
+    def test_generated_fact_rows_count_toward_cartesian_budget(self):
+        cfg = load_config(
+            None,
+            [
+                "features.cross_join=true",
+                "features.joins.max_tables=2",
+                "features.joins.grouped_inputs=false",
+                "features.joins.cartesian_max_rows=50000",
+                "features.complexity.query=0",
+                "data.large.fraction=1.0",
+                "data.large.fact_tables=[1,1]",
+                "data.large.fact_rows=[200000,200000]",
+                "data.large.fact_bias=1.0",
+            ],
+        )
+        dg = DataGenerator(cfg, random.Random(13))
+        ds = dg.generate(13)
+        fact = next(t for t in ds.tables if t.name.startswith("f"))
+        self.assertEqual(len(fact.rows), 0)
+        self.assertEqual(fact.row_count, 200000)
+        qg = QueryGenerator(cfg, ds, random.Random(13), dg)
+        _, first = qg._gen_from_item(0, {}, None, prefer_fact=True)
+        self.assertEqual(first.row_upper_bound, 200000)
+        qg.join_types = ["cross"]
+        for _ in range(100):
+            tree, _ = qg._gen_from(0, None, {}, None, "full")
+            self.assertFalse(
+                any(isinstance(n, Join) and n.join_type == "cross" for n in walk(tree))
+            )
+
     def test_negated_subqueries_have_separate_tags(self):
         cfg = load_config(None)
         dg = DataGenerator(cfg, random.Random(12))
