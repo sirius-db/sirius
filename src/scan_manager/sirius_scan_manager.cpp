@@ -61,6 +61,9 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/placement.hpp>
+#include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/staging.hpp>
 #endif
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -1487,13 +1490,12 @@ sirius_scan_manager::sirius_scan_manager(
 #ifdef CUCASCADE_HAS_CUFILE
     if (type == cucascade::io::io_context_type::cufile) {
       // The registry's noexcept factory discards construction exceptions. This
-      // configured local context is mandatory: construct it through the same
-      // public count/config API so its actual failure reaches the caller.
+      // configured local context is mandatory: build it with the factory's throwing
+      // twin so its actual failure reaches the caller.  It logs the pool plan (INFO)
+      // and the GDS setup problems it found (WARN) through the cuCascade log bridge.
       try {
-        auto context =
-          std::make_shared<cucascade::io::cufile::cufile_reactor::reactor_context>(_config.cufile);
-        return std::make_shared<cucascade::io::cufile::cufile_ioctx>(_config.cufile_n_reactors,
-                                                                     std::move(context));
+        return cucascade::io::cufile::make_cufile_ioctx(
+          _config.cufile_n_reactors, _config.resolved_cufile(_topology_index->gpu_ids()));
       } catch (std::exception const& e) {
         throw std::runtime_error(std::string{"[sirius_scan_manager] failed to create cufile "
                                              "io_context: "} +
@@ -1528,8 +1530,11 @@ sirius_scan_manager::sirius_scan_manager(
       break;
     case scan_manager::io_backend::cufile:
       _io_ctx = make_default_ioctx(cucascade::io::io_context_type::cufile);
-      SIRIUS_LOG_DEBUG("[sirius_scan_manager] default io context: cufile n_reactors={}",
-                       _config.cufile_n_reactors);
+#ifdef CUCASCADE_HAS_CUFILE
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager] default io context: cufile n_reactors={}",
+        static_cast<cucascade::io::cufile::cufile_ioctx const&>(*_io_ctx).plan().total_reactors());
+#endif
       break;
   }
 
@@ -1565,6 +1570,33 @@ sirius_scan_manager::~sirius_scan_manager()
       // Diagnostics must not prevent shutdown during exception unwinding.
     }
   }
+#ifdef CUCASCADE_HAS_CUFILE
+  // Which path the cuFile reads took.  On a GDS host, device reads should land in
+  // the staged (or direct) counters; growing POSIX device bytes or cuFile failures
+  // mean GPUDirect Storage is not serving them.
+  if (auto const* cufile =
+        dynamic_cast<cucascade::io::cufile::cufile_ioctx const*>(_io_ctx.get())) {
+    try {
+      auto const s = cufile->stats();
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] cufile reads: staged {} ({} MiB, {} early), direct {} ({} MiB), "
+        "posix device {} ({} MiB), host {} ({} MiB), cufile failures {}, parked slices {}",
+        s.staged_reads,
+        s.staged_bytes >> 20,
+        s.early_staged_reads,
+        s.direct_reads,
+        s.direct_bytes >> 20,
+        s.posix_device_reads,
+        s.posix_device_bytes >> 20,
+        s.host_reads,
+        s.host_bytes >> 20,
+        s.cufile_failures,
+        s.parked_slices);
+    } catch (...) {
+      // Diagnostics must not prevent shutdown during exception unwinding.
+    }
+  }
+#endif
   // Drain the dispatcher (and the worker pool) first so no in-flight
   // metadata-scan / sequencer task can still be reaching into the
   // cache via _io_ctx when we tear it down below.
@@ -2736,8 +2768,9 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
     case cucascade::io::io_context_type::cufile:
       return {.cause =
                 "cuFile reader could not be constructed (requires cuCascade built with "
-                "CUCASCADE_HAS_CUFILE; check cufile_n_reactors, cufile.max_inflight, "
-                "cufile.max_op_bytes, cufile.use_odirect and cufile.compat_mode). "
+                "CUCASCADE_HAS_CUFILE; check cufile_n_reactors, cufile.reactors_per_device, "
+                "cufile.devices, cufile.max_inflight, cufile.max_op_bytes, "
+                "cufile.staging_piece_bytes, cufile.use_odirect and cufile.compat_mode). "
                 "Direct reads require libcufile and a compatible GDS path; compat_mode=on "
                 "uses POSIX fallback without requiring GDS availability",
               .by_configuration = false};
@@ -4602,6 +4635,39 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     }
   }
   return std::nullopt;
+}
+
+void reserve_cufile_staging(scan_manager_config const& config,
+                            std::span<int const> gpu_ids,
+                            cucascade::memory::system_topology_info const& topology)
+{
+#ifdef CUCASCADE_HAS_CUFILE
+  namespace cufile = cucascade::io::cufile;
+  // Only a planned pool reserves its staging at start; a flat pool (a positive
+  // count) leases slots as its reactors first stage a read.
+  if (config.backend != io_backend::cufile || config.cufile_n_reactors != 0) { return; }
+  auto cfg        = config.resolved_cufile(gpu_ids);
+  auto const plan = cufile::plan_cufile_pool(cfg, &topology, cufile::probe_platform());
+  // The slot size the pool's reactors lease (make_cufile_ioctx applies the same
+  // piece size), so the pool's start() finds these slots instead of allocating more.
+  if (plan.staging_piece_bytes != 0) { cfg.staging_piece_bytes = plan.staging_piece_bytes; }
+  for (auto const& group : plan.groups) {
+    if (group.staging_slots == 0) { continue; }
+    cfg.max_staging_bytes_per_device = group.staging_cap_bytes;
+    auto const reserved = cufile::reserve_staging(group.device, group.staging_slots, cfg);
+    SIRIUS_LOG_INFO(
+      "[sirius_scan_manager] reserved {} of {} cuFile staging slots ({} MiB) on GPU {} ahead of "
+      "its memory pool",
+      reserved,
+      group.staging_slots,
+      (reserved * cfg.staging_slot_bytes()) >> 20,
+      group.device);
+  }
+#else
+  (void)config;
+  (void)gpu_ids;
+  (void)topology;
+#endif
 }
 
 }  // namespace sirius::scan_manager

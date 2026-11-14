@@ -935,21 +935,43 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   scan_manager_config cfg{};
 
   CHECK(cfg.backend == io_backend::native);
-  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile_n_reactors == 0);  // planned per GPU
   CHECK(cfg.cufile.max_inflight == 32);
   CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
   CHECK(cfg.cufile.gds_threshold == (256UL << 10));
   CHECK(cfg.cufile.use_odirect);
   CHECK_FALSE(cfg.cufile.compat_mode.has_value());
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::automatic);
+  CHECK(cfg.cufile.staging_piece_bytes == (8UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 2);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == (1UL << 30));
+  CHECK(cfg.cufile.reactors_per_device == 0);
+  CHECK(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices.empty());
+  CHECK(cfg.cufile.storage_hint_path.empty());
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
+}
+
+TEST_CASE("the default cuFile pool serves the GPUs Sirius reads into",
+          "[scan_manager][config][backend][cufile]")
+{
+  scan_manager_config cfg{};
+  std::vector<int> const sirius_gpus{1};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == sirius_gpus);
+  // An explicit list is kept as configured.
+  cfg.cufile.devices = {0, 2};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{0, 2});
 }
 
 TEST_CASE("cuFile C++ config is validated before starting the scan manager",
           "[scan_manager][config][backend][cufile]")
 {
   scan_manager_config cfg{};
-  SECTION("reactor count") { cfg.cufile_n_reactors = 0; }
   SECTION("inflight window") { cfg.cufile.max_inflight = 0; }
   SECTION("operation bytes") { cfg.cufile.max_op_bytes = 4095; }
+  SECTION("zero staging piece") { cfg.cufile.staging_piece_bytes = 0; }
+  SECTION("unaligned staging piece") { cfg.cufile.staging_piece_bytes = (8UL << 20) + 512; }
+  SECTION("staging slots") { cfg.cufile.staging_slots_per_reactor = 0; }
   SECTION("direct policy")
   {
     cfg.cufile.use_odirect = false;
@@ -1033,8 +1055,16 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
                                                    "        gds_threshold: 128 KiB\n"
                                                    "        use_odirect: false\n"
                                                    "        compat_mode: on\n"
-                                                   "        poll_interval_us: 50\n"
-                                                   "        low_service_interval: 0\n"));
+                                                   "        poll_interval_us: 75\n"
+                                                   "        low_service_interval: 0\n"
+                                                   "        staging_mode: always\n"
+                                                   "        staging_piece_bytes: 4 MiB\n"
+                                                   "        staging_slots_per_reactor: 1\n"
+                                                   "        max_staging_bytes_per_device: 0\n"
+                                                   "        reactors_per_device: 24\n"
+                                                   "        pin_to_device_cpus: false\n"
+                                                   "        devices: [1]\n"
+                                                   "        storage_hint_path: /gpfs/fs1\n"));
   CHECK(cfg.backend == io_backend::cufile);
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::cufile);
@@ -1044,8 +1074,16 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.cufile.gds_threshold == (128UL << 10));
   CHECK_FALSE(cfg.cufile.use_odirect);
   CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::on);
-  CHECK(cfg.cufile.poll_interval_us == 50);
+  CHECK(cfg.cufile.poll_interval_us == 75);
   CHECK(cfg.cufile.low_service_interval == 0);
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::always);
+  CHECK(cfg.cufile.staging_piece_bytes == (4UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 1);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == 0);
+  CHECK(cfg.cufile.reactors_per_device == 24);
+  CHECK_FALSE(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices == std::vector<int>{1});
+  CHECK(cfg.cufile.storage_hint_path == "/gpfs/fs1");
 #ifdef CUCASCADE_HAS_CUFILE
   CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
   CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
@@ -1055,6 +1093,11 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(io.cufile.compat_mode == cfg.cufile.compat_mode);
   CHECK(io.cufile.poll_interval_us == cfg.cufile.poll_interval_us);
   CHECK(io.cufile.low_service_interval == cfg.cufile.low_service_interval);
+  CHECK(io.cufile.staging_mode == cfg.cufile.staging_mode);
+  CHECK(io.cufile.staging_piece_bytes == cfg.cufile.staging_piece_bytes);
+  CHECK(io.cufile.reactors_per_device == cfg.cufile.reactors_per_device);
+  CHECK(io.cufile.devices == cfg.cufile.devices);
+  CHECK(io.cufile.storage_hint_path == cfg.cufile.storage_hint_path);
 #endif
 
   for (auto const& [spelling, expected] :
@@ -1067,14 +1110,27 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
                           std::string{"      cufile:\n        compat_mode: "} + spelling + "\n"));
     CHECK(parsed.cufile.compat_mode == expected);
   }
+  for (auto const& [spelling, expected] :
+       {std::pair{"automatic", cucascade::io::cufile::staging::automatic},
+        std::pair{"always", cucascade::io::cufile::staging::always},
+        std::pair{"never", cucascade::io::cufile::staging::never}}) {
+    auto const parsed =
+      load_scan_manager("sirius_cufile_staging.yaml",
+                        single_gpu_scan_manager_yaml(
+                          std::string{"      cufile:\n        staging_mode: "} + spelling + "\n"));
+    CHECK(parsed.cufile.staging_mode == expected);
+  }
+  // 0 plans the pool per GPU.
+  CHECK(load_scan_manager("sirius_cufile_planned.yaml",
+                          single_gpu_scan_manager_yaml("      cufile_n_reactors: 0\n"))
+          .cufile_n_reactors == 0);
 }
 
 TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
           "[scan_manager][config][backend][cufile]")
 {
   for (auto const& [body, key] :
-       {std::pair{"      cufile_n_reactors: 0\n", "scan_manager.cufile_n_reactors"},
-        std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
+       {std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
         std::pair{"      cufile:\n        max_inflight: 0\n", "cufile.max_inflight"},
         std::pair{"      cufile:\n        max_inflight: -1\n", "cufile.max_inflight"},
         std::pair{"      cufile:\n        max_op_bytes: 4095\n", "cufile.max_op_bytes"},
@@ -1088,6 +1144,23 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
                   "cufile.low_service_interval"},
         std::pair{"      cufile:\n        compat_mode: ON\n", "cufile.compat_mode"},
         std::pair{"      cufile:\n        compat_mode: ''\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        staging_mode: auto\n", "cufile.staging_mode"},
+        std::pair{"      cufile:\n        staging_piece_bytes: 0\n", "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_piece_bytes: 6000\n",
+                  "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_piece_bytes: -4096\n",
+                  "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_slots_per_reactor: 0\n",
+                  "cufile.staging_slots_per_reactor"},
+        std::pair{"      cufile:\n        max_staging_bytes_per_device: -1\n",
+                  "cufile.max_staging_bytes_per_device"},
+        std::pair{"      cufile:\n        reactors_per_device: -1\n", "cufile.reactors_per_device"},
+        std::pair{"      cufile:\n        pin_to_device_cpus: maybe\n",
+                  "cufile.pin_to_device_cpus"},
+        std::pair{"      cufile:\n        devices: [-1]\n", "cufile.devices"},
+        std::pair{"      cufile:\n        devices: [0, 0]\n", "cufile.devices"},
+        std::pair{"      cufile:\n        devices: 0\n", "cufile.devices"},
+        std::pair{"      cufile:\n        storage_hint_path: /\n", "cufile.storage_hint_path"},
         std::pair{"      cufile:\n        use_odirect: false\n        compat_mode: off\n",
                   "cufile.use_odirect"},
         std::pair{"      cufile:\n        write_split_bytes: 4096\n", "write_split_bytes"},

@@ -282,8 +282,11 @@ struct scan_manager_config {
   /// Independent of the metadata pool's explicit cpu_affinity override.
   std::vector<int> worker_startup_cpus;
 
-  /// Number of local cuFile reader workers (single-GPU only).
-  std::size_t cufile_n_reactors{4};
+  /// Local cuFile reactors (single-GPU only).  0 (the default) plans a pinned
+  /// group of @c cufile.reactors_per_device reactors for each GPU in
+  /// @c cufile.devices (see @ref resolved_cufile); a positive count runs one
+  /// flat, unpinned pool of that many reactors instead.
+  std::size_t cufile_n_reactors{0};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -367,6 +370,16 @@ struct scan_manager_config {
     return out;
   }
 
+  /// The cuFile configuration the default cufile pool is built with: @ref cufile,
+  /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
+  /// into), so the plan spawns reactors and reserves staging only on those.
+  [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
+  {
+    auto out = cufile;
+    if (out.devices.empty()) { out.devices.assign(gpu_ids.begin(), gpu_ids.end()); }
+    return out;
+  }
+
   /// Resolve what the readahead should run with, or a budget of 0 to not run
   /// it at all.  @p backend_budget and @p backend_strategy come from the
   /// backend serving the scans — its @c n_max_concurrent_scans and the
@@ -421,14 +434,19 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
-  if (config.cufile_n_reactors == 0) {
-    throw std::invalid_argument("'scan_manager.cufile_n_reactors': must be positive");
-  }
   if (config.cufile.max_inflight == 0) {
     throw std::invalid_argument("'cufile.max_inflight': must be positive");
   }
   if (config.cufile.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
     throw std::invalid_argument("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  if (config.cufile.staging_piece_bytes == 0 ||
+      config.cufile.staging_piece_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::invalid_argument(
+      "'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
+  }
+  if (config.cufile.staging_slots_per_reactor == 0) {
+    throw std::invalid_argument("'cufile.staging_slots_per_reactor': must be positive");
   }
   if (!config.cufile.use_odirect &&
       config.cufile.compat_mode == cucascade::io::cufile::compat::off) {

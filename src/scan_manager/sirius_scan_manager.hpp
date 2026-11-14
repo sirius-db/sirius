@@ -86,6 +86,7 @@ class fixed_size_host_memory_resource;
 namespace cucascade::memory {
 class memory_reservation_manager;
 class topology_index;
+struct system_topology_info;
 }  // namespace cucascade::memory
 
 namespace sirius::memory {
@@ -1406,5 +1407,25 @@ class sirius_scan_manager {
 
   cucascade::io::io_context_registry _ioctx_registry;
 };
+
+/**
+ * @brief Reserve the registered cuFile staging the default cufile pool will use,
+ *        before the GPU memory pools claim the devices.
+ *
+ * cuFile staging slots are allocated with @c cudaMalloc outside RMM and kept for the
+ * life of the process.  The pool reserves them when it starts, which is after the
+ * memory manager's pools took their share of each GPU; called first, this takes the
+ * slots the pool plans for @p gpu_ids while the memory is still free, and the pool
+ * then reuses them.  Does nothing unless @c backend is @c cufile with a planned pool
+ * (@c cufile_n_reactors == 0) and the plan stages (see @c cufile.staging_mode): on a
+ * host without GPUDirect Storage, @c automatic reserves nothing.
+ *
+ * @param config The scan manager configuration the default context is built from.
+ * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).
+ * @param topology The discovered hardware topology.
+ */
+void reserve_cufile_staging(scan_manager_config const& config,
+                            std::span<int const> gpu_ids,
+                            cucascade::memory::system_topology_info const& topology);
 
 }  // namespace sirius::scan_manager

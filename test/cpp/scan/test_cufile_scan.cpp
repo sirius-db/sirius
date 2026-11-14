@@ -35,9 +35,13 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
+#include <cucascade/io/cufile/placement.hpp>
+#include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <algorithm>
 #include <array>
@@ -48,9 +52,11 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -359,9 +365,7 @@ TEST_CASE("mandatory cuFile construction preserves the actual exception cause",
   config.cufile_n_reactors = std::numeric_limits<std::size_t>::max();
   std::string cause;
   try {
-    auto context =
-      std::make_shared<cucascade::io::cufile::cufile_reactor::reactor_context>(config.cufile);
-    cucascade::io::cufile::cufile_ioctx impossible{config.cufile_n_reactors, std::move(context)};
+    std::ignore = cucascade::io::cufile::make_cufile_ioctx(config.cufile_n_reactors, config.cufile);
   } catch (std::exception const& e) {
     cause = e.what();
   }
@@ -371,6 +375,131 @@ TEST_CASE("mandatory cuFile construction preserves the actual exception cause",
   REQUIRE_THROWS_WITH(
     (sirius_scan_manager{lifecycle, config, *memory, single_gpu_index()}),
     Catch::Matchers::ContainsSubstring("failed to create cufile io_context: " + cause));
+}
+
+TEST_CASE("the default cuFile pool is planned for Sirius's GPU and reads correct bytes",
+          "[cufile][scan]")
+{
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_planned_scan");
+  write_parquet(directory);
+
+  auto config              = reader_config(io_backend::cufile);
+  config.cufile_n_reactors = 0;  // the default: a pinned group of reactors per GPU
+  // Let cuFile register the file, so device reads go through cuFileRead.
+  config.cufile.compat_mode.reset();
+  config.cufile.use_odirect = true;
+  bool forced               = false;
+  SECTION("automatic staging") {}
+  SECTION("forced staging")
+  {
+    // No GDS on most CI hosts: automatic staging stays off there, so force it.
+    config.cufile.staging_mode = cufile::staging::always;
+    forced                     = true;
+  }
+
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager reader{lifecycle, config, *memory, topology};
+  sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+
+  auto const* ioctx = dynamic_cast<cufile::cufile_ioctx const*>(reader.io_ctx());
+  REQUIRE(ioctx != nullptr);
+  // cufile.devices is empty: the plan covers the GPU Sirius reads into, not every
+  // visible GPU, and sizes it for unknown storage (no storage_hint_path).
+  auto const& plan = ioctx->plan();
+  REQUIRE(plan.groups.size() == 1);
+  CHECK(plan.groups.front().device == 0);
+  CHECK(plan.groups.front().n_reactors == cufile::default_reactors_per_device);
+  CHECK(plan.total_reactors() == plan.groups.front().n_reactors);
+
+  auto const path = directory.file("input.parquet");
+  auto source     = reader.create_datasource(path);
+  auto baseline   = native.create_datasource(path);
+  REQUIRE(source);
+  REQUIRE(baseline);
+  REQUIRE(source->io_ctx().get() == reader.io_ctx());
+
+  auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+  auto footer  = cudf::io::parquet::fetch_footer_to_host(*baseline);
+  cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+  auto const metadata = footer_reader.parquet_metadata();
+  std::vector<cudf::size_type> groups(metadata.row_groups.size());
+  std::iota(groups.begin(), groups.end(), 0);
+  auto const ranges = sirius::op::scan::column_chunk_ranges(metadata, options, groups);
+  // Above gds_threshold, so they are cuFile reads rather than POSIX ones.
+  REQUIRE(std::any_of(
+    ranges.begin(), ranges.end(), [](auto const& range) { return range.size() > (256 << 10); }));
+
+  rmm::cuda_stream caller(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream observer(rmm::cuda_stream::flags::non_blocking);
+  auto const expected = read_chunks(*baseline, ranges, caller, observer, false);
+  auto const actual   = read_chunks(*source, ranges, caller, observer, true);
+  for (std::size_t i = 0; i < ranges.size(); ++i) {
+    CAPTURE(i, ranges[i].offset(), ranges[i].size());
+    auto const& got  = actual.observed_bytes[i];
+    auto const& want = expected.observed_bytes[i];
+    CHECK(std::equal(got.begin(), got.end(), want.begin(), want.end()));
+  }
+
+  auto const stats = ioctx->stats();
+  CHECK(stats.cufile_failures == 0);
+  if (!ioctx->path_capability(source->get_io_object()).registered) {
+    SKIP("cuFile did not register the file here; its device reads used POSIX");
+  }
+  if (forced) {
+    CHECK(stats.staged_bytes > 0);
+    // Every read went to GPU 0's group.
+    CHECK(ioctx->stats(0).staged_bytes == stats.staged_bytes);
+  } else if (!cufile::gds_available()) {
+    CHECK(stats.staged_bytes == 0);
+  }
+}
+
+TEST_CASE("cuFile staging is reserved only on the GPUs Sirius reads into",
+          "[cufile][scan][scan_manager]")
+{
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile staging requires a CUDA device"); }
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover());
+
+  auto config                = reader_config(io_backend::cufile);
+  config.cufile_n_reactors   = 0;
+  config.cufile.staging_mode = cufile::staging::always;
+  std::vector<int> const gpu_0{0};
+  auto const other_before =
+    device_count > 1 ? cufile::staging_usage_of(1).allocated_bytes : std::size_t{0};
+
+  // Not for a flat pool, which leases its slots lazily, nor for another backend.
+  auto const before = cufile::staging_usage_of(0).registered_bytes;
+  for (auto const& skipped : {[&] {
+                                auto flat              = config;
+                                flat.cufile_n_reactors = 4;
+                                return flat;
+                              }(),
+                              reader_config(io_backend::native)}) {
+    sirius::scan_manager::reserve_cufile_staging(skipped, gpu_0, discovery.get_topology());
+  }
+  CHECK(cufile::staging_usage_of(0).registered_bytes == before);
+
+  sirius::scan_manager::reserve_cufile_staging(config, gpu_0, discovery.get_topology());
+  if (device_count > 1) { CHECK(cufile::staging_usage_of(1).allocated_bytes == other_before); }
+  auto const plan = cufile::plan_cufile_pool(
+    config.resolved_cufile(gpu_0), &discovery.get_topology(), cufile::probe_platform());
+  REQUIRE(plan.groups.size() == 1);
+  auto const reserved = cufile::staging_usage_of(0).registered_bytes;
+  if (reserved == 0) { SKIP("cuFile cannot register device memory here"); }
+  CHECK(cufile::staging_usage_of(0).free_slots + cufile::staging_usage_of(0).leased_slots >=
+        plan.groups.front().staging_slots);
 }
 
 #endif  // CUCASCADE_HAS_CUFILE
