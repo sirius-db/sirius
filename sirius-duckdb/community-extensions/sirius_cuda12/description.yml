@@ -1,0 +1,270 @@
+extension:
+  name: sirius_cuda12
+  description: CUDA 12 backend of Sirius, a GPU-native SQL engine that transparently runs DuckDB queries on NVIDIA GPUs; install it through the core extension with `INSTALL sirius; LOAD sirius;`, which picks the right backend for your driver.
+  version: 0.0.0
+  language: C++
+  build: cmake
+  license: Apache-2.0
+  maintainers:
+    - mbrobbel
+  requires_toolchains: "cuda;rust"
+  excluded_platforms: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads"
+  cuda_archs: "80-real"
+  cuda_version: "12"
+  test_config: '{"test_env_variables":{"VCPKG_CUDA_ARCHITECTURES":"80-real"}}'
+  skip_tests: true
+  vcpkg_commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+  extra_extension_config: |-
+    set(SIRIUS_DUCKDB_LINKAGE static CACHE STRING "Sirius library linkage")
+    duckdb_extension_load(
+      sirius_cuda12
+      SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
+      INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/include)
+
+repo:
+  github: sirius-db/sirius
+  ref: a1d2f068922b26df3da913672503d2e9cc8e4bd5
+  build_directory: sirius-duckdb
+
+docs:
+  hello_world: |
+    -- Install and load the core loader, not this backend. The first LOAD downloads
+    -- the backend that matches your NVIDIA driver, printing a line on stderr when
+    -- the download starts and when it finishes.
+    INSTALL sirius;
+    LOAD sirius;
+    SELECT * FROM sirius_status();
+    ┌──────────────┬─────────────────────┬───────────────┬────────────────┬───────────────┬─────────────────┐
+    │ driver_found │ cuda_driver_version │    backend    │ backend_loaded │ gpu_execution │ fallback_reason │
+    │   boolean    │       varchar       │    varchar    │    boolean     │    boolean    │     varchar     │
+    ├──────────────┼─────────────────────┼───────────────┼────────────────┼───────────────┼─────────────────┤
+    │ true         │ 12.8                │ sirius_cuda12 │ true           │ true          │ NULL            │
+    └──────────────┴─────────────────────┴───────────────┴────────────────┴───────────────┴─────────────────┘
+
+    -- Plain SQL: Sirius runs what it supports on the GPU, the rest on DuckDB's CPU engine.
+    COPY (SELECT range AS id, range % 7 AS store, (range % 1000) * 0.01 AS price
+          FROM range(10_000_000)) TO 'sales.parquet';
+    SELECT store, count(*) AS orders, sum(price) AS revenue
+    FROM 'sales.parquet'
+    GROUP BY store
+    ORDER BY store;
+    ┌───────┬─────────┬───────────────┐
+    │ store │ orders  │    revenue    │
+    │ int64 │  int64  │ decimal(38,2) │
+    ├───────┼─────────┼───────────────┤
+    │     0 │ 1428572 │    7135711.42 │
+    │     1 │ 1428572 │    7135717.14 │
+    │     2 │ 1428572 │    7135722.86 │
+    │     3 │ 1428571 │    7135718.58 │
+    │     4 │ 1428571 │    7135714.29 │
+    │     5 │ 1428571 │    7135710.00 │
+    │     6 │ 1428571 │    7135705.71 │
+    └───────┴─────────┴───────────────┘
+
+    -- Run the rest of this session on DuckDB's CPU engine.
+    SET gpu_execution = false;
+  extended_description: |
+    [Sirius](https://github.com/sirius-db/sirius) is a GPU-native SQL engine for DuckDB, built on
+    NVIDIA CUDA-X libraries such as cuDF and cuVS. Once loaded, it intercepts ordinary SQL: queries
+    it supports run on the GPU, and everything else runs on DuckDB's CPU engine as before. No query
+    changes are needed.
+
+    `sirius_cuda12` is the CUDA 12 build of the Sirius engine. **Do not install it directly, and
+    ignore the generic `INSTALL sirius_cuda12 FROM community` instructions on this page.** Install
+    and load the `sirius` core extension instead. It selects, installs and loads the backend that
+    matches your NVIDIA driver:
+
+    ```sql
+    INSTALL sirius;
+    LOAD sirius;
+    ```
+
+    ## Requirements
+
+    - Linux on x86_64 or arm64 with glibc 2.28 or newer. macOS, Windows, musl, WebAssembly and
+      NVIDIA Jetson are not supported.
+    - An NVIDIA GPU with compute capability 7.5 or newer: Turing, Ampere, Ada Lovelace, Hopper or
+      Blackwell. `sirius_cuda12` contains GPU code for `sm_75`, `sm_80`, `sm_86`, `sm_89`,
+      `sm_90a`, `sm_100` and `sm_120`.
+    - An NVIDIA driver that supports CUDA 12.8 or newer (driver 570.26 or newer). Drivers that
+      support CUDA 13 (580.65.06 or newer) get `sirius_cuda13` instead.
+    - `io_uring` enabled in the kernel. Containers must allow the `io_uring_setup`,
+      `io_uring_enter` and `io_uring_register` system calls.
+
+    ## How `LOAD sirius` picks a backend
+
+    `sirius` is a small core extension with no CUDA dependency. `LOAD sirius` opens
+    `libcuda.so.1`, asks the driver which CUDA version it supports, and loads:
+
+    | Driver supports | Backend |
+    | --- | --- |
+    | CUDA 12.8 or a later 12.x | `sirius_cuda12` |
+    | CUDA 13.0 or newer | `sirius_cuda13` |
+
+    If that backend is not installed yet and `autoinstall_known_extensions` is enabled (the
+    default), the first `LOAD sirius` downloads it from the community repository. The download is
+    large (up to about 1 GB), so the loader prints a line to stderr when it starts and when it
+    finishes. Later loads reuse the installed backend. `UPDATE EXTENSIONS;` updates the loader and
+    the installed backend; restart DuckDB afterwards to load them.
+
+    If no usable driver is found, or the backend cannot be installed or loaded, `LOAD sirius` still
+    succeeds and every query keeps running on DuckDB's CPU engine: the `gpu_execution` setting
+    defaults to `false`, and `SET gpu_execution = true` or a `gpu_execution(...)` call fails with
+    the reason. The driver is probed once per process, so after installing or upgrading a driver,
+    restart the process; a failed backend install can be retried with a new database instance.
+    If the backend fails after its own initialization started, for example on a GPU error or an
+    invalid `sirius.yaml`, `LOAD sirius` fails instead.
+
+    `SELECT * FROM sirius_status();` shows the outcome:
+
+    | Column | Meaning |
+    | --- | --- |
+    | `driver_found` | `libcuda.so.1` could be opened |
+    | `cuda_driver_version` | CUDA version the driver supports, such as `12.8`; `NULL` if unknown |
+    | `backend` | Selected backend; `NULL` without a usable driver |
+    | `backend_loaded` | The backend is loaded |
+    | `gpu_execution` | GPU execution is active for this session |
+    | `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
+
+    `LOAD sirius_cuda12` also works, but then a missing driver makes the load fail instead of
+    falling back to the CPU, and `sirius_status()` is not available.
+
+    ## Transparent GPU execution and CPU fallback
+
+    The backend registers a DuckDB optimizer hook. When Sirius can run an optimized plan, it
+    replaces the plan with a GPU operator; otherwise DuckDB runs the query on its CPU engine
+    unchanged. Sirius scans data sources including Parquet files (local or `s3://`), Iceberg
+    tables read through DuckDB's `iceberg` extension, and tables stored in DuckDB database
+    files; tables in in-memory or encrypted databases are not read on the GPU. Execution is
+    out-of-core: data that does not fit in GPU memory spills to host memory, or to disk when a
+    disk tier is configured.
+
+    - `SET gpu_execution = false;` turns interception off for the current session;
+      `SET GLOBAL gpu_execution = false;` changes the default for the database.
+    - `enable_duckdb_fallback` (default `true`) decides what happens when the GPU cannot plan or
+      run a query: run it on DuckDB's CPU engine, or, when `false`, fail with the GPU error.
+      Queries that read `s3://` through Sirius never fall back to the CPU.
+    - `FROM gpu_execution('SELECT ...');` runs one query through Sirius explicitly, even when the
+      `gpu_execution` setting is off. The optional `query_label => '...'` names it in telemetry.
+
+    To keep plans in shapes it can run, `LOAD` also adds several optimizers to DuckDB's
+    `disabled_optimizers` and, unless it was set explicitly, sets `delim_join_as_cte` to `false`
+    for the whole database. These changes also apply to queries that run on the CPU.
+
+    ## Functions
+
+    Pin hot tables in GPU memory (`tier => 'gpu'`) or pinned host memory (`tier => 'host'`).
+    Later queries over the same Parquet files or DuckDB table read the pinned copy and skip file
+    I/O and decoding, without query changes. `cols => [...]` pins a subset of columns.
+
+    ```sql
+    -- Parquet: name is the key for unpin_table; queries match the pin by its files.
+    CALL pin_table('sales.parquet', name => 'sales', tier => 'gpu');
+    -- DuckDB table: needs a database file and a CHECKPOINT before pinning.
+    CALL pin_table(name => 'orders', format => 'duckdb', tier => 'host');
+    CALL unpin_table('sales');
+    ```
+
+    `UPDATE`, `MERGE ... UPDATE` and `INSERT ... ON CONFLICT DO UPDATE` are rejected on a pinned
+    DuckDB table; unpin it first.
+
+    Vector search runs on a `FLOAT[N]` column of a DuckDB table pinned on the GPU, with an
+    IVF-Flat index (`metric => 'l2'` or `'cosine'`) or, with `use_index => false`, an exact search:
+
+    ```sql
+    ATTACH 'vectors.db' AS v;
+    USE v;
+    CREATE TABLE items AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);
+    CHECKPOINT;
+    CALL pin_table(name => 'items', format => 'duckdb', tier => 'gpu');
+    CALL sirius_create_ann_index('items', 'vec', metric => 'l2', n_lists => 16);
+    SELECT id, distance
+    FROM sirius_knn_search('items', 'vec', [0.0, 0.0, 0.0]::FLOAT[3], k => 3, output_columns => ['id']);
+    CALL sirius_drop_ann_index('items', 'vec');
+    ```
+
+    Other functions:
+
+    - `SELECT files FROM sirius_analyze_parquet('data/*.parquet');` reads the footer statistics
+      of the matching Parquet files ahead of the first query and returns the number of files
+      whose statistics it cached.
+    - `CALL reset_sirius_cache();` drops Sirius's I/O caches so the next query reads from storage,
+      for cold-run benchmarks. Pins in GPU and host memory are kept.
+    - `CALL sirius_set_query_label('q1');` names the next query on this connection in telemetry;
+      `CALL sirius_set_session_label('nightly');` groups all following queries on it until the
+      label changes; `''` restores the default group.
+    - `SELECT * FROM sirius_licenses();` lists the third-party components bundled in the backend
+      and their licenses.
+
+    ## Settings
+
+    Key settings (`SET name = value;`); the
+    [configuration reference](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md)
+    lists the rest.
+
+    | Setting | Default | Purpose |
+    | --- | --- | --- |
+    | `gpu_execution` | `true` | Run supported queries on the GPU |
+    | `enable_duckdb_fallback` | `true` | Run queries the GPU cannot handle on the CPU instead of failing |
+    | `parquet_footer_statistics` | `true` | Give DuckDB's optimizer statistics merged from all footers of a multi-file Parquet scan |
+    | `hash_partition_bytes` | 2.5% of the smallest GPU's memory, 512 MiB to 5 GiB | Target size of one partition in GPU joins and aggregations |
+    | `expression_evaluator_strategy` | `'ast_interpret'` | How the GPU evaluates expressions: `'ast_interpret'`, `'ast_jit'` or `'materialize'` |
+    | `pin_table_compression` | `false` | Compress pinned tables with Simpatico when `pin_table_input_compression_plan_dir` has a plan for them |
+    | `spill_compression` | `false` | Compress data spilled from GPU memory (whole process) |
+    | `sirius_log_backend` | `'spdlog'` | Log destination: `'spdlog'` (files), `'duckdb'` (DuckDB's log) or `'noop'` (whole process) |
+    | `sirius_log_level` | `'info'` | Minimum log level (whole process) |
+    | `sirius_log_dir` | `'log'` | Directory of the `spdlog` log files (whole process) |
+
+    ## Configuration file
+
+    Memory tiers, thread pools, concurrency and telemetry are configured in a YAML file read when
+    the backend loads, from the first of:
+
+    1. the path in the `SIRIUS_CONFIG_FILE` environment variable (an error if the file is missing),
+    2. `./sirius.yaml` in the working directory,
+    3. `~/.sirius/sirius.yaml`.
+
+    Without one, built-in defaults sized from the detected hardware apply. By default Sirius
+    writes daily log files to `log/` and query telemetry to `telemetry_data/`, both under the
+    working directory. Change the log destination with the `sirius_log_*` settings or the
+    `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_LEVEL` and `SIRIUS_LOG_DIR` environment variables, and turn
+    telemetry off in `sirius.yaml`:
+
+    ```yaml
+    sirius:
+      telemetry:
+        enable_quent: false
+    ```
+
+    ## Reading from S3
+
+    Sirius reads `s3://` Parquet on the GPU without DuckDB's `httpfs` extension. Provide
+    credentials with a `SIRIUS_S3` secret (static keys; `httpfs` `TYPE S3` secrets also work):
+
+    ```sql
+    CREATE SECRET analytics (
+        TYPE SIRIUS_S3,
+        KEY_ID 'AKIA...',
+        SECRET '...',
+        REGION 'us-west-2',
+        SCOPE 's3://analytics-bucket/'
+    );
+    SELECT count(*) FROM read_parquet('s3://analytics-bucket/events/*.parquet');
+    ```
+
+    `ENDPOINT`, `SESSION_TOKEN`, `USE_SSL` and `VERIFY_SSL` are also accepted; only
+    `URL_STYLE 'path'` is supported. S3 reads need `gpu_execution` on and do not fall back to the
+    CPU.
+
+    ## More information
+
+    - [Sirius documentation](https://github.com/sirius-db/sirius/blob/main/docs/README.md)
+    - [Loader and backends](https://github.com/sirius-db/sirius/blob/main/sirius-duckdb/README.md)
+    - [Configuration reference](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md)
+    - [Issues](https://github.com/sirius-db/sirius/issues)
+
+    Sirius is licensed under Apache-2.0. The backend bundles third-party components, including
+    NVIDIA CUDA libraries, under their own licenses; `SELECT * FROM sirius_licenses();` lists them.
+  hardware_requirements: |
+    Linux (glibc 2.28+) on x86-64 or arm64 with an NVIDIA GPU of compute capability 7.5 or newer
+    and a driver supporting CUDA 12.8 or newer. Install through the core `sirius` extension.
