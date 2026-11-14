@@ -32,6 +32,7 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <dlfcn.h>
@@ -47,6 +48,13 @@ constexpr char const* gpu_execution_setting = "gpu_execution";
 // Set by the backend entry point (sirius-duckdb/src/sirius/sirius_extension.cpp).
 constexpr char const* backend_init_started_key = "sirius_backend_init_started";
 constexpr char const* runtime_ready_key        = "sirius_runtime_ready";
+
+constexpr char const* extension_description =
+  "Runs supported SQL queries on NVIDIA GPUs with Sirius, leaving the rest to DuckDB's CPU engine. "
+  "LOAD sirius loads, and if needed installs, sirius_cuda12 or sirius_cuda13 to match the NVIDIA "
+  "driver, which must support CUDA 12.8 or newer; without such a driver, or when the backend "
+  "cannot be installed, queries run on DuckDB's CPU engine. SELECT * FROM sirius_status() shows "
+  "the outcome.";
 
 /// Outcome of looking for a CUDA 12.8+ driver. Probed once per process.
 struct cuda_driver {
@@ -151,11 +159,26 @@ struct status_function {
     bool done = false;
   };
 
-  static duckdb::TableFunction create(loader_status_ptr status)
+  static duckdb::CreateTableFunctionInfo create(loader_status_ptr status)
   {
     duckdb::TableFunction function("sirius_status", {}, scan, bind, init);
     function.function_info = duckdb::make_shared_ptr<status_function_info>(std::move(status));
-    return function;
+    duckdb::CreateTableFunctionInfo info(std::move(function));
+    duckdb::FunctionDescription description;
+    description.description =
+      "Returns one row describing how LOAD sirius set up GPU execution: driver_found (whether "
+      "libcuda.so.1 could be opened), cuda_driver_version (the CUDA version the driver reports, "
+      "such as 13.0, or NULL if unknown), backend (the selected CUDA backend, sirius_cuda12 or "
+      "sirius_cuda13, or NULL without a usable driver), backend_loaded (whether that backend is "
+      "loaded), gpu_execution (whether supported queries in this session run on the GPU "
+      "transparently) and fallback_reason (why GPU execution is unavailable, or NULL once the "
+      "backend is loaded).";
+    description.examples   = {"SELECT * FROM sirius_status();",
+                              "SELECT fallback_reason FROM sirius_status();"};
+    description.categories = {"diagnostics"};
+    info.descriptions.push_back(std::move(description));
+    info.on_conflict = duckdb::OnCreateConflict::ALTER_ON_CONFLICT;
+    return info;
   }
 
  private:
@@ -231,12 +254,25 @@ struct status_function {
 
 /// gpu_execution(sql): the explicit GPU entry point. Without a backend it explains why.
 struct fallback_gpu_execution_function {
-  static duckdb::TableFunction create(loader_status_ptr status)
+  static duckdb::CreateTableFunctionInfo create(loader_status_ptr status)
   {
-    duckdb::TableFunction function("gpu_execution", {duckdb::LogicalType::VARCHAR}, nullptr, bind);
-    function.GetSignature().AddKwargs("options", duckdb::LogicalType::ANY);
+    duckdb::TableFunction function("gpu_execution",
+                                   duckdb::FunctionSignature()
+                                     .AddPositionalOnly("sql", duckdb::LogicalType::VARCHAR)
+                                     .AddKwargs("options", duckdb::LogicalType::ANY),
+                                   nullptr,
+                                   bind);
     function.function_info = duckdb::make_shared_ptr<status_function_info>(std::move(status));
-    return function;
+    duckdb::CreateTableFunctionInfo info(std::move(function));
+    duckdb::FunctionDescription description;
+    description.description =
+      "Runs a SQL query on the GPU when a Sirius CUDA backend is loaded. No backend is loaded in "
+      "this database, so every call fails with the reason GPU execution is unavailable; "
+      "sirius_status() shows it too.";
+    description.categories = {"execution"};
+    info.descriptions.push_back(std::move(description));
+    info.on_conflict = duckdb::OnCreateConflict::ALTER_ON_CONFLICT;
+    return info;
   }
 
  private:
@@ -263,6 +299,7 @@ class sirius_loader {
       throw duckdb::InvalidInputException(
         "Cannot load sirius under a CUDA backend name; use LOAD sirius instead");
     }
+    loader_.SetDescription(extension_description);
     auto status    = duckdb::make_shared_ptr<loader_status>();
     status->driver = cuda_driver::get();
     if (status->driver.usable()) {
@@ -408,7 +445,8 @@ class sirius_loader {
       fallback_gpu_execution_option::reject_enable(*status, configured->second);
     }
     duckdb::ExtensionOption option(
-      "Whether to transparently intercept SQL queries and execute them on GPU",
+      "Whether to transparently run supported queries on the GPU. No Sirius CUDA backend is "
+      "loaded, so it defaults to false and setting it to true fails; sirius_status() shows why.",
       duckdb::LogicalType::BOOLEAN,
       nullptr,
       duckdb::Value::BOOLEAN(false),

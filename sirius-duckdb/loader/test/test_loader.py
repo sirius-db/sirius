@@ -169,6 +169,14 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(self.rows(result), [{"stubs": 0}])
 
+    def test_extension_description_with_backend(self):
+        result = self.query(
+            f"INSTALL {quote(self.backend(13))}; LOAD {quote(self.loader)};"
+            "SELECT description LIKE 'Runs supported SQL queries on NVIDIA GPUs%' AS described"
+            " FROM duckdb_extensions() WHERE extension_name = 'sirius';"
+        )
+        self.assertEqual(self.rows(result), [{"described": True}])
+
     def test_unsupported_driver(self):
         for version in [0, 11080, 11999, 12000, 12070]:
             with self.subTest(version=version):
