@@ -740,7 +740,7 @@ class QueryGenerator:
                 join_index == 0
                 and self.f.joins.self_join
                 and first_scope.table_name is not None
-                and rng.random() < 0.2
+                and rng.random() < self.f.joins.self_join_share
             ):
                 table = self.ds.table(first_scope.table_name)
                 alias = self._alias()
@@ -878,6 +878,7 @@ class QueryGenerator:
         left = next(c for c in scopes[0].columns if c.name == join_column)
         right = next(c for c in scopes[1].columns if c.name == join_column)
         self._note("join:grouped_inputs")
+        self._note(f"join:grouped_{join_column}")
         self._note("join:inner")
         return Join(sides[0], sides[1], "inner", Compare("=", left, right)), Scope(
             scopes
@@ -977,7 +978,7 @@ class QueryGenerator:
             integer = [
                 (a, b) for a, b in any_pairs if a.kind == "int" and a.type.signed
             ]
-            if integer and rng.random() < 0.5:
+            if self.f.joins.any_mixed and integer and rng.random() < 0.5:
                 a, b = rng.choice(integer)
                 cond = Compare("=", Arith("+", a, b, kind="int"), Literal(10, a.type))
                 self._note("join:any_mixed")

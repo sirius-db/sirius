@@ -180,6 +180,7 @@ class Phase2dJoinBudget(unittest.TestCase):
             None,
             [
                 "features.joins.any_join=true",
+                "features.joins.any_mixed=true",
                 "features.joins.self_join=true",
                 "features.joins.grouped_inputs=true",
                 "features.joins.expression_keys=true",
@@ -201,6 +202,8 @@ class Phase2dJoinBudget(unittest.TestCase):
             "join:self_key",
             "join:self_nonkey",
             "join:grouped_inputs",
+            "join:grouped_g",
+            "join:grouped_agg",
             "join:long_chain",
             "join:star",
             "join:expression_keys",

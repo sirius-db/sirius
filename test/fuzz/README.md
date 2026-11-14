@@ -165,11 +165,13 @@ MARK declines. `features.joins.cartesian_max_rows` bounds cross and inequality-o
 joins by the product of their input row counts; derived inputs require a `LIMIT`.
 Negated subqueries are counted separately as `subquery:not_in` and
 `subquery:not_exists`.
-The join switches `any_join`, `self_join`, `grouped_inputs`, `expression_keys`,
+The join switches `any_join`, `any_mixed`, `self_join`, `grouped_inputs`, `expression_keys`,
 and `on_filters` add those shapes when enabled. `max_tables` permits rare five
 and six table chains, and `star_share` chooses joins back to the first table.
 `any_join_share` controls the share of eligible INNER joins that use an ANY
 condition, so a focused acceptance run can collect enough samples.
+`self_join_share` similarly controls explicit self joins. Grouped joins carry
+`join:grouped_g` or `join:grouped_agg` for their exact join key.
 Each `queries.jsonl` record includes `generator_tags`, allowing per-shape
 verdict and fallback rates to be counted without inferring them from SQL text.
 

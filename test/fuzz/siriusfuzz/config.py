@@ -56,9 +56,11 @@ class Joins:
     null_safe_keys: bool = True
     max_tables: int = gap_switch(4, 6)
     cartesian_max_rows: int = 50_000
-    any_join: bool = gap_switch(False)
+    any_join: bool = True
+    any_mixed: bool = gap_switch(False)
     any_join_share: float = 0.15
     self_join: bool = gap_switch(False)
+    self_join_share: float = 0.2
     grouped_inputs: bool = gap_switch(False)
     star_share: float = gap_switch(0.0, 0.3)
     expression_keys: bool = gap_switch(False)
@@ -404,6 +406,8 @@ class FuzzConfig:
             raise ConfigError("features.joins.star_share must be between 0 and 1")
         if not 0 <= f.joins.any_join_share <= 1:
             raise ConfigError("features.joins.any_join_share must be between 0 and 1")
+        if not 0 <= f.joins.self_join_share <= 1:
+            raise ConfigError("features.joins.self_join_share must be between 0 and 1")
         if not 1 <= f.joins.max_tables <= 6:
             raise ConfigError("features.joins.max_tables must be between 1 and 6")
         large = self.data.large
