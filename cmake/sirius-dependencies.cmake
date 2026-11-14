@@ -88,7 +88,6 @@ if(VCPKG_BUILD)
       "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig:${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/pkgconfig:$ENV{PKG_CONFIG_PATH}"
   )
 endif()
-pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 # The engine no longer calls libcurl (cuCascade's REST transport is io_uring
 # based); only the S3 test fixture uploader (test/cpp/utils/s3_backend.cpp)

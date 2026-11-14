@@ -52,7 +52,6 @@ set(SIRIUS_LINK_LIBRARIES
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
-    PkgConfig::NUMA
     PkgConfig::LIBURING
     OpenSSL::Crypto
     absl::any_invocable)

@@ -8,7 +8,6 @@
     "nixl",
     "yaml-cpp",
     "abseil",
-    "numactl",
     "liburing",
     "openssl",
     "xxhash",
