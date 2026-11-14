@@ -680,7 +680,7 @@ One `grouped_coordinator` owns the future of a logical read across all its group
 |---------|---------|--------|-------|
 | io_uring | `uring::uring_ioctx` (a `templated_ioctx<uring_reactor>`) | local files | `uring_n_reactors` reactors, each one worker thread with one ring and a 64 MiB pinned staging budget. A reactor chooses 256 KiB–16 MiB operations; compatible operations use `O_DIRECT`, with buffered fallback for unsupported or misaligned remainders (and buffered reads throughout under `cache.mode: os`). |
 | REST / object store | `rest::rest_ioctx` (a `templated_ioctx<rest_reactor>`) | `s3://` | `rest_n_reactors` reactors (`0` = NIC-sized), each one worker thread with its own io_uring ring and up to `rest.max_connections` HTTP/1.1 connections; physical GETs of 4–16 MiB by default (`rest.min_segment_bytes` / `rest.max_segment_bytes`). See [S3 / Object-Store Backend](#s3--object-store-backend). |
-| cuFile | `cufile::cufile_ioctx` | local regular files | `cufile_n_reactors` workers (default 4), synchronous chunked `cuFileRead` with compatibility/POSIX fallback and pinned H2D staging. No `fs_cache` or scan readahead, regardless of cache mode. Single-GPU only. |
+| cuFile | `cufile::cufile_ioctx` | local regular files | A planned group of `cufile.reactors_per_device` reactors for Sirius's GPU, pinned to its CPUs (`cufile_n_reactors: 0`, the default), or a flat pool of `cufile_n_reactors`. Each worker issues synchronous `cuFileRead` calls, staged through registered GPU slots on a GDS host, with compatibility/POSIX fallback and pinned H2D staging. No `fs_cache` or scan readahead, regardless of cache mode. Single-GPU only. |
 
 A new backend is added in cuCascade (a reactor satisfying its `io_reactor_c` concept, plus a registry entry); on the Sirius side it then needs a case in the switches over `io_context_type`.
 
@@ -693,14 +693,34 @@ backends back to `native` with a warning, so this path is single-GPU only.
 See [cuFile configuration](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)
 for a YAML example and all read tunables.
 
-Each worker issues synchronous `cuFileRead` calls in bounded pieces (default
-`max_op_bytes: 64MiB`). Device reads park until prior work on the caller's stream
-is ready, and completion is host-observed: the read future settles only when the
-destination is ready. Host reads, small device reads
-(default threshold 256KiB), and alignment/compatibility fallbacks use POSIX reads;
-device fallback stages through pinned host scratch and H2D copies. This staging
-is not `fs_cache`, and neither cache mode nor an explicit readahead budget enables
-cuFile scan readahead.
+The scan manager builds the context with cuCascade's `cufile::make_cufile_ioctx`.
+With `cufile_n_reactors: 0` (the default) it plans one group of reactors per GPU in
+`cufile.devices`, which defaults to the GPU Sirius reads into rather than every
+visible GPU. The group has `cufile.reactors_per_device` reactors (auto: 32 on a network
+filesystem, 8 on local NVMe, 16 unknown, judged from `cufile.storage_hint_path`), pinned
+to that GPU's CPUs. Each reactor keeps one synchronous `cuFileRead` in flight, so the
+group size is the GPU's queue depth. A positive `cufile_n_reactors` runs one flat,
+unpinned pool instead. The plan is logged at INFO and the GDS setup problems the planner
+sees at WARN.
+
+On a host where cuFile reports a GDS mode (or with `staging_mode: always`), a device
+read of a registered file is widened to 4 KiB boundaries, read in pieces of up to
+`staging_piece_bytes` (8 MiB) into registered, aligned GPU slots, and copied
+device-to-device into the destination. Otherwise cuFile reads straight into the
+destination, bouncing unaligned reads through its own buffers (pieces of at most
+`max_op_bytes`). Staging slots live outside RMM for the life of the process. For a
+planned pool, `SiriusContext::initialize` reserves them (`reserve_cufile_staging`)
+before the GPU memory pools claim the device. See
+[cuFile configuration](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp).
+
+A device read is ordered after the work already queued on the caller's stream, through
+an event recorded on the submitting thread. Completion is host-observed: the read future
+settles only when the destination is ready. Host reads, small device reads (default
+threshold 256KiB), and compatibility/failure fallbacks use POSIX reads; device fallback
+stages through pinned host scratch and H2D copies. None of this staging is `fs_cache`,
+and neither cache mode nor an explicit readahead budget enables cuFile scan readahead.
+At shutdown the scan manager logs how many reads and bytes went staged, direct, POSIX
+device and host, plus the cuFile failures (`cufile_ioctx::stats()`).
 
 `compat_mode: auto` permits host/POSIX fallback when cuFile is unavailable for a
 file, including on a compatibility-only host without `nvidia-fs`. `on` forces POSIX;

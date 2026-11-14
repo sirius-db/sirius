@@ -1202,14 +1202,20 @@ TEST_CASE("the documented cuFile configuration example loads",
   scan_manager_config cfg;
   REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
   CHECK(cfg.backend == io_backend::cufile);
-  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile_n_reactors == 0);
+  CHECK(cfg.cufile.storage_hint_path == "/gpfs/fs1/warehouse/lineitem/part-0.parquet");
+  CHECK(cfg.cufile.reactors_per_device == 0);
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::automatic);
+  CHECK(cfg.cufile.staging_piece_bytes == (8UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 2);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == (1UL << 30));
+  CHECK(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices.empty());
   CHECK(cfg.cufile.max_inflight == 32);
   CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
   CHECK(cfg.cufile.gds_threshold == (256UL << 10));
   CHECK(cfg.cufile.use_odirect);
   CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
-  CHECK(cfg.cufile.poll_interval_us == 200);
-  CHECK(cfg.cufile.low_service_interval == 4);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
