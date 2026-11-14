@@ -462,44 +462,51 @@ TEST_CASE("the default cuFile pool is planned for Sirius's GPU and reads correct
   }
 }
 
-TEST_CASE("cuFile staging is reserved only on the GPUs Sirius reads into",
+TEST_CASE("cuFile staging is reserved ahead of the pool, on Sirius's GPU only",
           "[cufile][scan][scan_manager]")
 {
   namespace cufile = cucascade::io::cufile;
   int device_count = 0;
   REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
   if (device_count == 0) { SKIP("cuFile staging requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
   cucascade::memory::topology_discovery discovery;
   REQUIRE(discovery.discover());
+  auto const& topology = discovery.get_topology();
 
   auto config                = reader_config(io_backend::cufile);
   config.cufile_n_reactors   = 0;
   config.cufile.staging_mode = cufile::staging::always;
   std::vector<int> const gpu_0{0};
+  // Staging is process-wide: start from none, so slots earlier tests left behind
+  // cannot satisfy the checks below.
+  std::ignore = cufile::release_staging(0);
+  REQUIRE(cufile::staging_usage_of(0).leased_slots == 0);
+  REQUIRE(cufile::staging_usage_of(0).allocated_bytes == 0);
   auto const other_before =
     device_count > 1 ? cufile::staging_usage_of(1).allocated_bytes : std::size_t{0};
 
-  // Not for a flat pool, which leases its slots lazily, nor for another backend.
-  auto const before = cufile::staging_usage_of(0).registered_bytes;
-  for (auto const& skipped : {[&] {
-                                auto flat              = config;
-                                flat.cufile_n_reactors = 4;
-                                return flat;
-                              }(),
-                              reader_config(io_backend::native)}) {
-    sirius::scan_manager::reserve_cufile_staging(skipped, gpu_0, discovery.get_topology());
-  }
-  CHECK(cufile::staging_usage_of(0).registered_bytes == before);
+  // Nothing for a flat pool, which leases its slots lazily, nor for another backend.
+  auto flat              = config;
+  flat.cufile_n_reactors = 4;
+  sirius::scan_manager::reserve_cufile_staging(flat, gpu_0, topology);
+  sirius::scan_manager::reserve_cufile_staging(reader_config(io_backend::native), gpu_0, topology);
+  CHECK(cufile::staging_usage_of(0).allocated_bytes == 0);
 
-  sirius::scan_manager::reserve_cufile_staging(config, gpu_0, discovery.get_topology());
+  sirius::scan_manager::reserve_cufile_staging(config, gpu_0, topology);
   if (device_count > 1) { CHECK(cufile::staging_usage_of(1).allocated_bytes == other_before); }
-  auto const plan = cufile::plan_cufile_pool(
-    config.resolved_cufile(gpu_0), &discovery.get_topology(), cufile::probe_platform());
+  auto const reserved = cufile::staging_usage_of(0);
+  if (reserved.registered_bytes == 0) { SKIP("cuFile cannot register device memory here"); }
+  auto const plan =
+    cufile::plan_cufile_pool(config.resolved_cufile(gpu_0), &topology, cufile::probe_platform());
   REQUIRE(plan.groups.size() == 1);
-  auto const reserved = cufile::staging_usage_of(0).registered_bytes;
-  if (reserved == 0) { SKIP("cuFile cannot register device memory here"); }
-  CHECK(cufile::staging_usage_of(0).free_slots + cufile::staging_usage_of(0).leased_slots >=
-        plan.groups.front().staging_slots);
+  CHECK(reserved.free_slots == plan.groups.front().staging_slots);
+
+  // The pool built afterwards starts on the reserved slots instead of allocating more.
+  auto ioctx = cufile::make_cufile_ioctx(0, config.resolved_cufile(gpu_0));
+  ioctx->start();
+  CHECK(cufile::staging_usage_of(0).allocated_bytes == reserved.allocated_bytes);
+  ioctx->shutdown();
 }
 
 #endif  // CUCASCADE_HAS_CUFILE

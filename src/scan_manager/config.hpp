@@ -373,10 +373,23 @@ struct scan_manager_config {
   /// The cuFile configuration the default cufile pool is built with: @ref cufile,
   /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
   /// into), so the plan spawns reactors and reserves staging only on those.
+  ///
+  /// @throws std::invalid_argument when @c cufile.devices names a GPU outside
+  ///         @p gpu_ids: its reactors and staging would serve no read, while reads
+  ///         into Sirius's GPU would have none.
   [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
   {
     auto out = cufile;
-    if (out.devices.empty()) { out.devices.assign(gpu_ids.begin(), gpu_ids.end()); }
+    if (out.devices.empty()) {
+      out.devices.assign(gpu_ids.begin(), gpu_ids.end());
+      return out;
+    }
+    for (int const device : out.devices) {
+      if (std::ranges::find(gpu_ids, device) == gpu_ids.end()) {
+        throw std::invalid_argument("'cufile.devices': GPU " + std::to_string(device) +
+                                    " is not one Sirius reads into");
+      }
+    }
     return out;
   }
 

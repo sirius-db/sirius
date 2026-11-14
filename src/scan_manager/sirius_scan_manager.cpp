@@ -1570,10 +1570,14 @@ sirius_scan_manager::~sirius_scan_manager()
       // Diagnostics must not prevent shutdown during exception unwinding.
     }
   }
+  // Drain the dispatcher (and the worker pool) first so no in-flight
+  // metadata-scan / sequencer task can still be reaching into the
+  // cache via _io_ctx when we tear it down below.
+  stop();
 #ifdef CUCASCADE_HAS_CUFILE
-  // Which path the cuFile reads took.  On a GDS host, device reads should land in
-  // the staged (or direct) counters; growing POSIX device bytes or cuFile failures
-  // mean GPUDirect Storage is not serving them.
+  // Which path the cuFile reads took, once the readers have drained.  On a GDS
+  // host, device reads should land in the staged (or direct) counters; growing
+  // POSIX device bytes or cuFile failures mean GPUDirect Storage is not serving them.
   if (auto const* cufile =
         dynamic_cast<cucascade::io::cufile::cufile_ioctx const*>(_io_ctx.get())) {
     try {
@@ -1597,10 +1601,6 @@ sirius_scan_manager::~sirius_scan_manager()
     }
   }
 #endif
-  // Drain the dispatcher (and the worker pool) first so no in-flight
-  // metadata-scan / sequencer task can still be reaching into the
-  // cache via _io_ctx when we tear it down below.
-  stop();
   // Tear down the cache (which owns its buffer_pool).  shutdown_cache drains
   // in-flight IO before the pool is destroyed, so callbacks release their
   // chunks safely.
@@ -4655,13 +4655,21 @@ void reserve_cufile_staging(scan_manager_config const& config,
     if (group.staging_slots == 0) { continue; }
     cfg.max_staging_bytes_per_device = group.staging_cap_bytes;
     auto const reserved = cufile::reserve_staging(group.device, group.staging_slots, cfg);
-    SIRIUS_LOG_INFO(
-      "[sirius_scan_manager] reserved {} of {} cuFile staging slots ({} MiB) on GPU {} ahead of "
-      "its memory pool",
-      reserved,
-      group.staging_slots,
-      (reserved * cfg.staging_slot_bytes()) >> 20,
-      group.device);
+    if (reserved < group.staging_slots) {
+      SIRIUS_LOG_WARN(
+        "[sirius_scan_manager] reserved only {} of {} cuFile staging slots on GPU {} ahead of its "
+        "memory pool; reactors without a slot read directly through cuFile's bounce buffers",
+        reserved,
+        group.staging_slots,
+        group.device);
+    } else {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] reserved {} cuFile staging slots ({} MiB) on GPU {} ahead of its "
+        "memory pool",
+        reserved,
+        (reserved * cfg.staging_slot_bytes()) >> 20,
+        group.device);
+    }
   }
 #else
   (void)config;

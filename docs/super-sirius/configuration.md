@@ -713,8 +713,8 @@ sirius:
 Select cuFile with the existing `backend` key. The default remains `native`.
 This backend reads local and network-filesystem regular files (for example IBM Storage
 Scale / GPFS) into GPU memory through cuFile (GPUDirect Storage). `s3://` reads, listing
-and globs still use native REST. cuFile is single-GPU only: the scan manager refuses to
-start a non-native backend when more than one GPU is configured.
+and globs still use native REST. cuFile is single-GPU only: the existing multi-GPU guard
+forces `backend: native` with a warning when more than one GPU is configured.
 
 The example below is for a GPFS deployment. Point `storage_hint_path` at a file on the
 data filesystem so the pool is sized for network storage:
@@ -746,7 +746,7 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `reactors_per_device` | int (**>= 0**) | 0 | Reactors per GPU in a planned pool (`cufile_n_reactors: 0`). Each reactor keeps one synchronous `cuFileRead` in flight, so this is the GPU's queue depth (Little's law: depth ≈ throughput × latency / read size). `0` sizes it from `storage_hint_path`: 32 on a network filesystem (GPFS, NFS, Lustre, ...), 8 on local block storage, 16 when unknown. |
-| `devices` | list of CUDA ordinals | empty | GPUs the planned pool serves, a group of reactors and reserved staging each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative and unique. |
+| `devices` | list of CUDA ordinals | empty | GPUs the planned pool serves, a group of reactors and reserved staging each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and GPUs Sirius reads into; startup fails otherwise. |
 | `storage_hint_path` | string | empty | A file (not a directory) on the storage Sirius mostly reads, used only to size the pool. Empty = unknown storage. |
 | `pin_to_device_cpus` | bool | true | Pin each GPU's reactors to the CPUs local to that GPU (NVML affinity intersected with the process affinity). |
 | `staging_mode` | enum: `automatic`, `always`, `never` | `automatic` | Stage device reads of a cuFile-registered file through registered, aligned GPU slots, then scatter the wanted bytes with a device-to-device copy. `automatic` stages only when cuFile reports a real GDS mode; `always` forces it (tests, diagnostics); `never` reads straight into the destination through cuFile's bounce buffers. |
@@ -772,7 +772,7 @@ publish a usable cache/readahead budget. Tune read concurrency with
 
 **Staging memory.** Staging slots are `cudaMalloc`ed outside RMM, registered with cuFile
 once, and kept for the life of the process. With the defaults on GPFS that is about
-32 reactors × 2 slots × 8.06 MiB ≈ 516 MiB per GPU, capped by
+32 reactors × 2 slots × (8 MiB + 128 KiB of alignment) ≈ 520 MiB per GPU, capped by
 `max_staging_bytes_per_device`. For a planned pool, Sirius reserves the slots at startup
 **before** the GPU memory pools are created, so they come on top of
 `sirius.memory.gpu.usage_limit_*`; on a small GPU, lower the usage limit or
@@ -800,8 +800,8 @@ list and the tuning sweep that measures `reactors_per_device`, `staging_piece_by
 2. Cluster: `mmchconfig verbsRdma=enable,verbsRdmaSend=yes,verbsGPUDirectStorage=yes`
    and `verbsPorts` naming the client's RDMA ports.
 3. `cufile.json`: a non-empty `rdma_dev_addr_list`, `use_poll_mode: false`, and
-   `max_direct_io_size_kb` at least `staging_piece_bytes` (16384, i.e. 16 MiB, is its
-   maximum and default).
+   `max_direct_io_size_kb` at least `staging_piece_bytes`; otherwise the planner shrinks
+   the pieces to it. 16384 (16 MiB) is its maximum and default.
 4. `nvidia_peermem` is loaded, or DMA-BUF is enabled.
 5. **CPU architecture:** IBM documents Storage Scale GDS clients as x86 only. On an
    aarch64 node (Grace / GB200), confirm support first. Otherwise every GPFS read runs

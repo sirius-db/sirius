@@ -956,11 +956,15 @@ TEST_CASE("the default cuFile pool serves the GPUs Sirius reads into",
           "[scan_manager][config][backend][cufile]")
 {
   scan_manager_config cfg{};
-  std::vector<int> const sirius_gpus{1};
+  std::vector<int> const sirius_gpus{0, 1};
   CHECK(cfg.resolved_cufile(sirius_gpus).devices == sirius_gpus);
-  // An explicit list is kept as configured.
-  cfg.cufile.devices = {0, 2};
-  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{0, 2});
+  // An explicit list is kept as configured when Sirius reads into those GPUs...
+  cfg.cufile.devices = {1};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{1});
+  // ...and refused when it names another one.
+  cfg.cufile.devices = {1, 2};
+  CHECK_THROWS_WITH(cfg.resolved_cufile(sirius_gpus),
+                    Catch::Matchers::ContainsSubstring("'cufile.devices': GPU 2"));
 }
 
 TEST_CASE("cuFile C++ config is validated before starting the scan manager",
@@ -1045,26 +1049,27 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
 {
   auto const cfg =
     load_scan_manager("sirius_backend_cufile.yaml",
-                      single_gpu_scan_manager_yaml("      backend: cufile\n"
-                                                   "      cufile_n_reactors: 3\n"
-                                                   "      cache:\n"
-                                                   "        mode: cucs\n"
-                                                   "      cufile:\n"
-                                                   "        max_inflight: 7\n"
-                                                   "        max_op_bytes: 8 MiB\n"
-                                                   "        gds_threshold: 128 KiB\n"
-                                                   "        use_odirect: false\n"
-                                                   "        compat_mode: on\n"
-                                                   "        poll_interval_us: 75\n"
-                                                   "        low_service_interval: 0\n"
-                                                   "        staging_mode: always\n"
-                                                   "        staging_piece_bytes: 4 MiB\n"
-                                                   "        staging_slots_per_reactor: 1\n"
-                                                   "        max_staging_bytes_per_device: 0\n"
-                                                   "        reactors_per_device: 24\n"
-                                                   "        pin_to_device_cpus: false\n"
-                                                   "        devices: [1]\n"
-                                                   "        storage_hint_path: /gpfs/fs1\n"));
+                      single_gpu_scan_manager_yaml(
+                        "      backend: cufile\n"
+                        "      cufile_n_reactors: 3\n"
+                        "      cache:\n"
+                        "        mode: cucs\n"
+                        "      cufile:\n"
+                        "        max_inflight: 7\n"
+                        "        max_op_bytes: 8 MiB\n"
+                        "        gds_threshold: 128 KiB\n"
+                        "        use_odirect: false\n"
+                        "        compat_mode: on\n"
+                        "        poll_interval_us: 75\n"
+                        "        low_service_interval: 0\n"
+                        "        staging_mode: always\n"
+                        "        staging_piece_bytes: 4 MiB\n"
+                        "        staging_slots_per_reactor: 1\n"
+                        "        max_staging_bytes_per_device: 0\n"
+                        "        reactors_per_device: 24\n"
+                        "        pin_to_device_cpus: false\n"
+                        "        devices: [1]\n"
+                        "        storage_hint_path: /nonexistent/sirius/lineitem.parquet\n"));
   CHECK(cfg.backend == io_backend::cufile);
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::cufile);
@@ -1083,7 +1088,7 @@ TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][back
   CHECK(cfg.cufile.reactors_per_device == 24);
   CHECK_FALSE(cfg.cufile.pin_to_device_cpus);
   CHECK(cfg.cufile.devices == std::vector<int>{1});
-  CHECK(cfg.cufile.storage_hint_path == "/gpfs/fs1");
+  CHECK(cfg.cufile.storage_hint_path == "/nonexistent/sirius/lineitem.parquet");
 #ifdef CUCASCADE_HAS_CUFILE
   CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
   CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
