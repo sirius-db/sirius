@@ -315,7 +315,8 @@ TEST_CASE("derive_merge_config sizes from at least a quarter of the device", "[m
   {
     device_budget const unknown{
       .gpu_available_bytes = 24 * kGiB, .gpu_total_bytes = 0, .concurrent_tasks = 4};
-    CHECK(derive_merge_config(merge_settings{}, unknown, 16, 32).window_rows ==
+    // 16 runs in one merge: above the default fan-in, so the cap is set to it.
+    CHECK(derive_merge_config(merge_settings{.max_fan_in = 16}, unknown, 16, 32).window_rows ==
           3 * kGiB / (3 * 16 * 32));
   }
 }
