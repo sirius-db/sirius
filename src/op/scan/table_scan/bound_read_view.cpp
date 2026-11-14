@@ -545,16 +545,18 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   if (view.selector_evidence_required && input.named_parameters) {
     auto evidence                = selector_evidence(input.parameters, *input.named_parameters);
     auto const explicit_snapshot = input.named_parameters->find("snapshot_from_id");
-    if (source->function_name == "iceberg_scan" &&
-        (explicit_snapshot == input.named_parameters->end() ||
-         explicit_snapshot->second.IsNull())) {
-      // Rebinding the same arguments can select a new snapshot with the same data files.
-      if (auto snapshot = capture_iceberg_snapshot(input.function, input.bind_data, context)) {
+    if (source->function_name == "iceberg_scan") {
+      // Rebinding the same arguments can select another table or snapshot with the same data
+      // files.
+      auto const snapshot = capture_iceberg_snapshot(input.function, input.bind_data, context);
+      if (snapshot) {
         append(evidence, 'i', snapshot->table_uuid);
         number(evidence, snapshot->snapshot_id);
         number(evidence, snapshot->schema_id);
-        view.logical_selector_evidence = std::move(evidence);
       }
+      bool const pinned =
+        explicit_snapshot != input.named_parameters->end() && !explicit_snapshot->second.IsNull();
+      if (snapshot || pinned) view.logical_selector_evidence = std::move(evidence);
     } else {
       view.logical_selector_evidence = std::move(evidence);
     }
