@@ -264,6 +264,8 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     bool header_parsed{false};
     std::optional<std::vector<cudf::data_type>> header_schema;
     merge::merge_route route{merge::merge_route::one_shot};
+    /// Bytes and rows of the partition's runs when it was armed.
+    merge::run_summary input_size{};
     /// Sizes of the partition's windowed tasks: derived_config, less what a task of the pass in
     /// progress shrank after an OOM.
     merge::derived_merge_config config{};
@@ -406,6 +408,12 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   /// Partitions of @p repo that hold batches or have been armed: the most windowed partitions
   /// that can be open. Needs _drain_mutex.
   [[nodiscard]] std::size_t count_partitions(::cucascade::shared_data_repository& repo) const;
+
+  /// Bytes and rows of the runs of every partition of the sort: as recorded at arming for an
+  /// armed partition, from the batches in @p repo for the others. A batch that was never sized
+  /// and is locked by a tier move is left out. Never waits for a batch lock. Needs _drain_mutex.
+  [[nodiscard]] std::vector<merge::run_summary> sort_partition_sizes(
+    ::cucascade::shared_data_repository& repo);
 
   //! Final projection to apply after merge (empty = no extra projection)
   duckdb::vector<std::size_t> _final_projections;

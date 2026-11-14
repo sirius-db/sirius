@@ -452,7 +452,7 @@ TEST_CASE("sort_merge_disabled_rules is a config-file key", "[sort_merge_setting
   SECTION("rejected")
   {
     auto const [line, message] =
-      GENERATE(std::pair{"sort_merge_disabled_rules: 512", "unknown rule bit"},
+      GENERATE(std::pair{"sort_merge_disabled_rules: 1024", "unknown rule bit"},
                std::pair{"sort_merge_disabled_rules: -1", "must be non-negative"});
     CAPTURE(line);
     temp_config_file const file(operator_params_yaml("    " + std::string(line) + "\n"));

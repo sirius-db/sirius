@@ -722,7 +722,18 @@ The `sort_merge_mode` setting selects the route (see
 |-------------------|-------|
 | `one_shot` | Always one-shot. Output position is the partition index. |
 | `windowed` | Windowed, unless the partition is one of the exceptions below. |
-| `auto` (default) | Windowed when any batch of the partition is not on the GPU tier, or when the partition's bytes plus its output (the same bytes again) exceed `sort_merge_one_shot_max_fraction` of the device's total GPU memory. Otherwise one-shot. |
+| `auto` (default) | Windowed when any batch of the partition is not on the GPU tier, when the partition's bytes plus its output (the same bytes again) exceed `sort_merge_one_shot_max_fraction` of the device's total GPU memory, or when the one-shot merges of the sort do not fit the device together (below). Otherwise one-shot. |
+
+A partition under the threshold is not merged alone: merge tasks of several partitions run at the
+same time, next to the runs of the partitions that wait. `merge::one_shot_peak_bytes()` adds up
+what the device then holds: its share of the runs of the whole sort (the bytes of every partition,
+divided by the number of GPUs) plus, for the largest partitions under the threshold, one per
+merge task the device runs at once, twice the partition's bytes and 8 bytes per row for the merge
+temporaries and the output. When that exceeds the device's total GPU memory, the partitions under
+the threshold are windowed too. So every partition of a sort larger than the device is windowed,
+whether or not its own runs are on the GPU when it is armed, and the route of a partition does
+not depend on which runs a downgrade happened to move. `sort_merge_disabled_rules` bit 512
+switches this off.
 
 In `auto` and `windowed` mode these partitions take the one-shot route:
 

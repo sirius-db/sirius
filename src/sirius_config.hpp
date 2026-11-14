@@ -124,8 +124,9 @@ inline constexpr uint64_t ROW_COUNT_GUARD        = uint64_t{1} << 5;
 inline constexpr uint64_t ONE_SHOT_ESTIMATE      = uint64_t{1} << 6;
 inline constexpr uint64_t SINGLE_RUN_PASSTHROUGH = uint64_t{1} << 7;
 inline constexpr uint64_t STRING_SLOT_ESTIMATE   = uint64_t{1} << 8;
+inline constexpr uint64_t ONE_SHOT_FIT           = uint64_t{1} << 9;
 /// Every rule bit.
-inline constexpr uint64_t ALL = (uint64_t{1} << 9) - 1;
+inline constexpr uint64_t ALL = (uint64_t{1} << 10) - 1;
 }  // namespace sort_merge_rule
 
 /// Default for sort_merge_disabled_rules: every rule is in force but the one-shot cold-start

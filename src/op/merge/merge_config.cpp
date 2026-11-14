@@ -24,8 +24,11 @@
 #include <cudf/types.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <vector>
 
 namespace sirius::op::merge {
 
@@ -68,6 +71,21 @@ double derive_one_shot_fraction(std::size_t gpu_total_bytes) noexcept
   if (gpu_total_bytes < 16 * kGiB) { return 0.20; }
   if (gpu_total_bytes < 64 * kGiB) { return 0.25; }
   return 0.33;
+}
+
+/// Whether a partition alone is small enough for the one-shot merge of the automatic mode.
+bool within_one_shot_threshold(std::size_t input_bytes,
+                               std::size_t output_bytes,
+                               std::size_t rows,
+                               double one_shot_fraction,
+                               std::size_t gpu_total_bytes,
+                               bool row_count_guard) noexcept
+{
+  // cudf::merge writes one table: a one-shot merge of this many rows fails as soon as it starts.
+  if (row_count_guard && rows >= kOneShotRowLimit) { return false; }
+  auto const needed    = saturating_add(input_bytes, output_bytes);
+  auto const threshold = one_shot_fraction * static_cast<double>(gpu_total_bytes);
+  return static_cast<double>(needed) <= threshold;
 }
 
 }  // namespace
@@ -140,6 +158,45 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
           .one_shot_fraction   = one_shot_fraction};
 }
 
+std::size_t one_shot_working_bytes(const run_summary& partition) noexcept
+{
+  return saturating_add(saturating_mul(2, partition.bytes), saturating_mul(8, partition.rows));
+}
+
+std::size_t one_shot_peak_bytes(std::span<const run_summary> partitions,
+                                std::size_t concurrent_tasks,
+                                std::size_t num_devices,
+                                double one_shot_fraction,
+                                std::size_t gpu_total_bytes,
+                                bool row_count_guard)
+{
+  std::size_t sort_bytes = 0;
+  std::vector<std::size_t> working;
+  working.reserve(partitions.size());
+  for (auto const& partition : partitions) {
+    sort_bytes = saturating_add(sort_bytes, partition.bytes);
+    if (partition.bytes > 0 && within_one_shot_threshold(partition.bytes,
+                                                         partition.bytes,
+                                                         partition.rows,
+                                                         one_shot_fraction,
+                                                         gpu_total_bytes,
+                                                         row_count_guard)) {
+      working.push_back(one_shot_working_bytes(partition));
+    }
+  }
+  // The largest merges that can be in flight together.
+  auto const at_once = std::min(working.size(), std::max<std::size_t>(concurrent_tasks, 1));
+  std::partial_sort(working.begin(),
+                    working.begin() + static_cast<std::ptrdiff_t>(at_once),
+                    working.end(),
+                    std::greater<>{});
+  auto peak = sort_bytes / std::max<std::size_t>(num_devices, 1);
+  for (std::size_t i = 0; i < at_once; ++i) {
+    peak = saturating_add(peak, working[i]);
+  }
+  return peak;
+}
+
 merge_route choose_route(sort_merge_mode mode,
                          double one_shot_fraction,
                          std::size_t gpu_total_bytes,
@@ -154,13 +211,22 @@ merge_route choose_route(sort_merge_mode mode,
     case sort_merge_mode::automatic: break;
   }
   if (inputs.any_non_gpu) { return merge_route::windowed; }
-  // cudf::merge writes one table: a one-shot merge of this many rows fails as soon as it starts.
-  if (row_count_guard && inputs.partition_rows >= kOneShotRowLimit) {
+  if (!within_one_shot_threshold(inputs.partition_bytes,
+                                 inputs.output_bytes,
+                                 inputs.partition_rows,
+                                 one_shot_fraction,
+                                 gpu_total_bytes,
+                                 row_count_guard)) {
     return merge_route::windowed;
   }
-  auto const needed    = saturating_add(inputs.partition_bytes, inputs.output_bytes);
-  auto const threshold = one_shot_fraction * static_cast<double>(gpu_total_bytes);
-  return static_cast<double>(needed) > threshold ? merge_route::windowed : merge_route::one_shot;
+  if (inputs.sort_partitions.empty()) { return merge_route::one_shot; }
+  auto const peak = one_shot_peak_bytes(inputs.sort_partitions,
+                                        inputs.concurrent_tasks,
+                                        inputs.num_devices,
+                                        one_shot_fraction,
+                                        gpu_total_bytes,
+                                        row_count_guard);
+  return peak > gpu_total_bytes ? merge_route::windowed : merge_route::one_shot;
 }
 
 pass_plan plan_pass(std::span<const run_summary> runs, std::size_t fan_in, bool short_first_merge)

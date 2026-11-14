@@ -359,6 +359,82 @@ TEST_CASE("merge sort automatic mode goes windowed when the partition exceeds th
   REQUIRE(repo.size(0) == 2);
 }
 
+TEST_CASE("merge sort automatic mode windows a small partition of a sort that does not fit",
+          "[merge_sort_arming]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  // 1024 INT64 rows are 8 KiB. On a 128 KiB device the one-shot threshold is 25.6 KiB, so the
+  // partition of 8 KiB is under it and one of 16 KiB or more is not.
+  auto const small_device = [](const memory_space*) {
+    return merge::device_budget{
+      .gpu_available_bytes = 8 * kGiB, .gpu_total_bytes = 128 * 1024, .concurrent_tasks = 4};
+  };
+  auto const fill = [&](data_repository& repo, std::size_t large_runs) {
+    repo.set_num_partitions(2);
+    repo.add_data_batch(make_sorted_batch(*space, 512), 0);
+    repo.add_data_batch(make_sorted_batch(*space, 512), 0);
+    for (std::size_t i = 0; i < large_runs; ++i) {
+      repo.add_data_batch(make_sorted_batch(*space, 1024), 1);
+    }
+  };
+
+  SECTION("the runs of the sort and the small partition's merge exceed the device")
+  {
+    // 120 KiB of runs, and 16 KiB + 8 bytes per row for the merge of the small partition.
+    data_repository repo;
+    fill(repo, 14);
+    auto merge = make_merge(repo);
+    merge->set_merge_settings({.mode = sirius::sort_merge_mode::automatic});
+    merge->set_device_budget_provider(small_device);
+
+    auto input  = merge->get_next_task_input_data();
+    auto& first = require_windowed_input(input);
+    REQUIRE(first.partition() == 0);
+    REQUIRE(first.cursors().size() == 2);
+    REQUIRE(repo.size(0) == 2);
+    REQUIRE(merge->counters().one_shot_partitions == 0);
+    drain(repo);
+  }
+
+  SECTION("they fit: the small partition is merged one-shot")
+  {
+    // 24 KiB of runs.
+    data_repository repo;
+    fill(repo, 2);
+    auto merge = make_merge(repo);
+    merge->set_merge_settings({.mode = sirius::sort_merge_mode::automatic});
+    merge->set_device_budget_provider(small_device);
+
+    auto first = merge->get_next_task_input_data();
+    REQUIRE(first);
+    REQUIRE(first->get_type() == operator_data_type::PIPELINEABLE);
+    REQUIRE(repo.size(0) == 0);
+    // The large partition is windowed by its own size, also after the small one left.
+    auto input   = merge->get_next_task_input_data();
+    auto& second = require_windowed_input(input);
+    REQUIRE(second.partition() == 1);
+    REQUIRE(merge->counters().one_shot_partitions == 1);
+    drain(repo);
+  }
+
+  SECTION("without the rule the small partition is judged alone")
+  {
+    data_repository repo;
+    fill(repo, 14);
+    auto merge = make_merge(repo);
+    merge->set_merge_settings({.mode           = sirius::sort_merge_mode::automatic,
+                               .disabled_rules = without(merge::merge_rule::one_shot_fit)});
+    merge->set_device_budget_provider(small_device);
+
+    auto first = merge->get_next_task_input_data();
+    REQUIRE(first);
+    REQUIRE(first->get_type() == operator_data_type::PIPELINEABLE);
+    REQUIRE(merge->counters().one_shot_partitions == 1);
+    drain(repo);
+  }
+}
+
 TEST_CASE("merge sort automatic mode goes windowed when a run is not on the GPU",
           "[merge_sort_arming]")
 {

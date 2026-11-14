@@ -50,6 +50,8 @@ using sirius::op::merge::make_merge_chunk_position;
 using sirius::op::merge::merge_route;
 using sirius::op::merge::merge_rule;
 using sirius::op::merge::merge_settings;
+using sirius::op::merge::one_shot_peak_bytes;
+using sirius::op::merge::one_shot_working_bytes;
 using sirius::op::merge::plan_pass;
 using sirius::op::merge::round_rows_for;
 using sirius::op::merge::route_inputs;
@@ -645,6 +647,153 @@ TEST_CASE("choose_route windows a partition a one-shot merge cannot hold in one 
   CHECK(kOneShotRowLimit == static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
 }
 
+TEST_CASE("one_shot_peak_bytes adds the merges that run at once to the runs of the sort",
+          "[merge_config][unit]")
+{
+  constexpr std::size_t total = 80 * kGiB;
+  constexpr double fraction   = 0.33;
+  constexpr std::size_t rows  = 1'000'000;
+
+  // Temporaries and output: twice the bytes, and 8 bytes per row.
+  CHECK(one_shot_working_bytes({.bytes = 4 * kGiB, .rows = rows}) == 8 * kGiB + 8 * rows);
+  CHECK(one_shot_working_bytes({.bytes = kMax, .rows = rows}) == kMax);
+
+  SECTION("no partition") { CHECK(one_shot_peak_bytes({}, 4, 1, fraction, total) == 0); }
+
+  SECTION("only the partitions under the one-shot threshold add working memory")
+  {
+    // 2 x 14 GiB is over a third of 80 GiB: that partition is windowed and adds its runs only.
+    std::vector<run_summary> const partitions{{.bytes = 14 * kGiB, .rows = rows},
+                                              {.bytes = 4 * kGiB, .rows = rows},
+                                              {.bytes = 2 * kGiB, .rows = rows}};
+    CHECK(one_shot_peak_bytes(partitions, 4, 1, fraction, total) ==
+          20 * kGiB + 12 * kGiB + 16 * rows);
+    // With one merge at a time, the largest candidate.
+    CHECK(one_shot_peak_bytes(partitions, 1, 1, fraction, total) ==
+          20 * kGiB + 8 * kGiB + 8 * rows);
+    // A width of 0 counts as 1.
+    CHECK(one_shot_peak_bytes(partitions, 0, 1, fraction, total) ==
+          20 * kGiB + 8 * kGiB + 8 * rows);
+  }
+
+  SECTION("a partition over the row limit is no candidate while the guard is on")
+  {
+    std::vector<run_summary> const partitions{{.bytes = 4 * kGiB, .rows = kOneShotRowLimit},
+                                              {.bytes = 2 * kGiB, .rows = rows}};
+    CHECK(one_shot_peak_bytes(partitions, 4, 1, fraction, total) == 6 * kGiB + 4 * kGiB + 8 * rows);
+    CHECK(one_shot_peak_bytes(partitions, 4, 1, fraction, total, false) ==
+          6 * kGiB + 12 * kGiB + 8 * kOneShotRowLimit + 8 * rows);
+  }
+
+  SECTION("each device holds its share of the runs")
+  {
+    std::vector<run_summary> const partitions{{.bytes = 4 * kGiB, .rows = rows},
+                                              {.bytes = 4 * kGiB, .rows = rows}};
+    CHECK(one_shot_peak_bytes(partitions, 4, 2, fraction, total) ==
+          4 * kGiB + 16 * kGiB + 16 * rows);
+    CHECK(one_shot_peak_bytes(partitions, 4, 0, fraction, total) ==
+          8 * kGiB + 16 * kGiB + 16 * rows);
+  }
+
+  SECTION("sizes that overflow saturate")
+  {
+    std::vector<run_summary> const partitions{{.bytes = kMax, .rows = rows},
+                                              {.bytes = kMax, .rows = rows}};
+    CHECK(one_shot_peak_bytes(partitions, 4, 1, 1.0, kMax) == kMax);
+  }
+}
+
+TEST_CASE("choose_route windows a partition whose one-shot merge does not fit beside the others",
+          "[merge_config][unit]")
+{
+  constexpr std::size_t total = 80 * kGiB;
+  constexpr double fraction   = 0.33;
+  constexpr std::size_t rows  = 100'000'000;
+  auto const route            = [&](const run_summary& partition,
+                         std::span<const run_summary> sort_partitions,
+                         std::size_t concurrent_tasks,
+                         std::size_t num_devices = 1) {
+    route_inputs const inputs{.partition_bytes  = partition.bytes,
+                                         .output_bytes     = partition.bytes,
+                                         .partition_rows   = partition.rows,
+                                         .sort_partitions  = sort_partitions,
+                                         .concurrent_tasks = concurrent_tasks,
+                                         .num_devices      = num_devices};
+    return choose_route(sort_merge_mode::automatic, fraction, total, inputs);
+  };
+
+  SECTION("a small partition of a sort larger than the device is windowed")
+  {
+    // Nine partitions of 18 GiB and one of 9 GiB: 171 GiB of runs on an 80 GiB device. The
+    // small one is under the threshold and may have every run on the GPU when it is armed.
+    std::vector<run_summary> partitions(9, run_summary{.bytes = 18 * kGiB, .rows = 2 * rows});
+    run_summary const small{.bytes = 9 * kGiB, .rows = rows};
+    partitions.push_back(small);
+    CHECK(route(small, partitions, 4) == merge_route::windowed);
+    // Judged alone it is merged one-shot.
+    CHECK(route(small, {}, 4) == merge_route::one_shot);
+  }
+
+  SECTION("partitions that fit alone but not together are windowed")
+  {
+    // Three partitions of 11 GiB: each is under the threshold of 26.4 GiB, but three merges at
+    // once hold 33 GiB of runs and 66 GiB of temporaries and output.
+    std::vector<run_summary> const partitions(3, run_summary{.bytes = 11 * kGiB, .rows = rows});
+    CHECK(route(partitions[0], partitions, 4) == merge_route::windowed);
+    // One merge at a time fits: 33 GiB of runs and 22 GiB for the merge.
+    CHECK(route(partitions[0], partitions, 1) == merge_route::one_shot);
+    // Three of 9 GiB do not fit one device at once either, but they do when two devices share
+    // the runs.
+    std::vector<run_summary> const smaller(3, run_summary{.bytes = 9 * kGiB, .rows = rows});
+    CHECK(route(smaller[0], smaller, 4) == merge_route::windowed);
+    CHECK(route(smaller[0], smaller, 4, 2) == merge_route::one_shot);
+  }
+
+  SECTION("a sort that fits with its one-shot merges keeps them")
+  {
+    // 16 GiB in two partitions: 16 GiB of runs and 32 GiB for the two merges.
+    std::vector<run_summary> const partitions(2, run_summary{.bytes = 8 * kGiB, .rows = rows});
+    CHECK(route(partitions[0], partitions, 4) == merge_route::one_shot);
+    // A small partition beside a large windowed one: only the small merge is added.
+    std::vector<run_summary> const mixed{{.bytes = 30 * kGiB, .rows = 4 * rows},
+                                         {.bytes = 2 * kGiB, .rows = rows}};
+    CHECK(route(mixed[1], mixed, 4) == merge_route::one_shot);
+    CHECK(route(mixed[0], mixed, 4) == merge_route::windowed);
+  }
+
+  SECTION("exactly the device's memory still fits")
+  {
+    // One merge at a time, no rows counted: 40 GiB of runs and 2 x 20 GiB for one merge.
+    constexpr double half = 0.5;
+    std::vector<run_summary> partitions{{.bytes = 20 * kGiB}, {.bytes = 20 * kGiB}};
+    route_inputs const inputs{.partition_bytes  = 20 * kGiB,
+                              .output_bytes     = 20 * kGiB,
+                              .sort_partitions  = partitions,
+                              .concurrent_tasks = 1};
+    CHECK(choose_route(sort_merge_mode::automatic, half, total, inputs) == merge_route::one_shot);
+    partitions[1].bytes += 1;
+    CHECK(choose_route(sort_merge_mode::automatic, half, total, inputs) == merge_route::windowed);
+  }
+
+  SECTION("the other modes and the forced one-shot cases ignore the sort's size")
+  {
+    std::vector<run_summary> const partitions(10, run_summary{.bytes = 18 * kGiB, .rows = rows});
+    route_inputs inputs{.partition_bytes  = 9 * kGiB,
+                        .output_bytes     = 9 * kGiB,
+                        .sort_partitions  = partitions,
+                        .concurrent_tasks = 4};
+    CHECK(choose_route(sort_merge_mode::one_shot, fraction, total, inputs) ==
+          merge_route::one_shot);
+    inputs.has_nested = true;
+    CHECK(choose_route(sort_merge_mode::automatic, fraction, total, inputs) ==
+          merge_route::one_shot);
+    inputs.has_nested   = false;
+    inputs.has_late_mat = true;
+    CHECK(choose_route(sort_merge_mode::automatic, fraction, total, inputs) ==
+          merge_route::one_shot);
+  }
+}
+
 TEST_CASE("round_rows_for sizes a round from the output target", "[merge_config][unit]")
 {
   // 512 MiB of 16-byte rows.
@@ -755,7 +904,8 @@ TEST_CASE("merge_settings switches each rule off by its bit", "[merge_config][un
                     merge_rule::round_rows,
                     merge_rule::row_count_guard,
                     merge_rule::single_run_passthrough,
-                    merge_rule::string_slot_estimate}) {
+                    merge_rule::string_slot_estimate,
+                    merge_rule::one_shot_fit}) {
     CHECK(settings.enabled(rule));
   }
   CHECK_FALSE(settings.enabled(merge_rule::one_shot_estimate));
@@ -767,7 +917,8 @@ TEST_CASE("merge_settings switches each rule off by its bit", "[merge_config][un
                     merge_rule::row_count_guard,
                     merge_rule::one_shot_estimate,
                     merge_rule::single_run_passthrough,
-                    merge_rule::string_slot_estimate}) {
+                    merge_rule::string_slot_estimate,
+                    merge_rule::one_shot_fit}) {
     settings.disabled_rules = 0;
     CHECK(settings.enabled(rule));
     settings.disabled_rules = static_cast<std::uint64_t>(rule);

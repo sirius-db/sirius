@@ -731,7 +731,7 @@ Six settings control how MERGE_SORT merges the sorted runs of a partition (see
 
 | Setting | Type | Default | Meaning |
 |---------|------|---------|---------|
-| `sort_merge_mode` | VARCHAR | `auto` | `auto`: windowed merge for a partition that has a batch off the GPU tier, or whose bytes plus output exceed `sort_merge_one_shot_max_fraction` of the GPU; otherwise one-shot. `windowed`: always the windowed k-way merge. `one_shot`: always the concat-then-merge path. Case-insensitive. |
+| `sort_merge_mode` | VARCHAR | `auto` | `auto`: windowed merge for a partition that has a batch off the GPU tier, or whose bytes plus output exceed `sort_merge_one_shot_max_fraction` of the GPU, or whose one-shot merge does not fit the GPU beside the rest of the sort; otherwise one-shot. `windowed`: always the windowed k-way merge. `one_shot`: always the concat-then-merge path. Case-insensitive. |
 | `sort_merge_window_rows` | UBIGINT | 0 | `n`: maximum rows per window of a run read through a window buffer. An explicit value also bounds the rows one merge round emits; a derived one does not (see `round rows` below). 0 derives it. |
 | `sort_merge_output_bytes` | UBIGINT | 0 | Output chunk target per merge task. 0 derives it. |
 | `sort_merge_one_shot_max_fraction` | DOUBLE | 0 | The `auto` threshold, as a fraction of the device's total GPU memory. 0 derives it. |
@@ -752,6 +752,7 @@ from before the rule:
 | 64 | One-shot cold-start estimate of 2.5 × the input instead of 2 × | off |
 | 128 | In `auto` mode a partition whose only run is on the GPU is forwarded without a merge | on |
 | 256 | STRING slot estimate from the STRING columns' own width | on |
+| 512 | One-shot fit: in `auto` mode a partition under the threshold is still windowed when the one-shot merges that run at once do not fit the GPU together with the runs of the whole sort | on |
 
 `one_shot` is kept for A/B testing against the windowed path and is slated for removal once the
 windowed path is proven (measurements and the conditions for the removal:

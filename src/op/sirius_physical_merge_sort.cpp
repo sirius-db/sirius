@@ -388,10 +388,11 @@ sirius_physical_merge_sort::make_device_budget_provider(
   return [&memory_manager, concurrent_tasks](const cucascade::memory::memory_space* space) {
     merge::device_budget budget;
     budget.concurrent_tasks = std::max<std::size_t>(concurrent_tasks, 1);
+    auto const gpu_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    budget.num_devices    = std::max<std::size_t>(gpu_spaces.size(), 1);
     if (space == nullptr) {
       // The task may land on any GPU: size its windows for the smallest one.
-      for (auto const* candidate :
-           memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      for (auto const* candidate : gpu_spaces) {
         if (space == nullptr || candidate->get_max_memory() < space->get_max_memory()) {
           space = candidate;
         }
@@ -491,6 +492,43 @@ std::size_t sirius_physical_merge_sort::count_partitions(
     if (repo.size(p) > 0 || (it != _partitions.end() && it->second.armed)) { ++count; }
   }
   return count;
+}
+
+std::vector<merge::run_summary> sirius_physical_merge_sort::sort_partition_sizes(
+  ::cucascade::shared_data_repository& repo)
+{
+  auto const num_partitions = repo.num_partitions();
+  std::vector<merge::run_summary> sizes;
+  sizes.reserve(num_partitions);
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    if (auto const it = _partitions.find(p); it != _partitions.end() && it->second.armed) {
+      sizes.push_back(it->second.input_size);
+      continue;
+    }
+    merge::run_summary summary;
+    for (auto id : repo.get_batch_ids(p)) {
+      std::optional<batch_size> size;
+      {
+        std::lock_guard<std::mutex> lg(_pushed_mutex);
+        if (auto const it = _pushed_sizes.find(id); it != _pushed_sizes.end()) {
+          size = it->second;
+        }
+      }
+      if (!size.has_value()) {
+        // Read, not recorded: the partition's own arming decides what an unsized batch means.
+        auto batch = repo.get_data_batch_by_id(id, p);
+        if (!batch) { continue; }
+        auto const ro = batch->try_to_read_only();
+        if (!ro.has_value() || ro->get_data() == nullptr) { continue; }
+        size = batch_size{.rows  = sirius::representation_num_rows(*ro->get_data()),
+                          .bytes = ro->get_data()->get_uncompressed_data_size_in_bytes()};
+      }
+      summary.bytes += size->bytes;
+      summary.rows += size->rows.value_or(0);
+    }
+    sizes.push_back(summary);
+  }
+  return sizes;
 }
 
 merge::merge_key_spec sirius_physical_merge_sort::input_key_spec() const
@@ -781,7 +819,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
     busy = unsized_locked ? std::move(unsized_locked) : std::move(first_locked);
     return nullptr;
   }
-  state.armed = true;
+  state.armed      = true;
+  state.input_size = {.bytes = total_bytes, .rows = total_rows};
   {
     std::lock_guard<std::mutex> lg(_pushed_mutex);
     for (auto id : ids) {
@@ -858,6 +897,15 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::arm_partition(
                              .any_non_gpu     = any_non_gpu,
                              .has_nested      = false,
                              .has_late_mat    = has_late_materialization()};
+  // The other partitions' merges run next to this one, and their runs wait on the same GPUs.
+  std::vector<merge::run_summary> sort_partitions;
+  if (_merge_settings.mode == sort_merge_mode::automatic &&
+      _merge_settings.enabled(merge::merge_rule::one_shot_fit)) {
+    sort_partitions         = sort_partition_sizes(repo);
+    inputs.sort_partitions  = sort_partitions;
+    inputs.concurrent_tasks = budget.concurrent_tasks;
+    inputs.num_devices      = budget.num_devices;
+  }
   if (supported) {
     // A fan-in pass rewrites every column, so with more runs than the cap a nested column
     // counts even when the output does not carry it.

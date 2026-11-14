@@ -58,6 +58,9 @@ enum class merge_rule : std::uint64_t {
   single_run_passthrough = config::sort_merge_rule::SINGLE_RUN_PASSTHROUGH,
   /// The STRING part of a window buffer slot is estimated from the STRING columns' own width.
   string_slot_estimate = config::sort_merge_rule::STRING_SLOT_ESTIMATE,
+  /// In automatic mode a partition is merged one-shot only when the one-shot merges that can
+  /// run at once fit the device together with the runs of the whole sort.
+  one_shot_fit = config::sort_merge_rule::ONE_SHOT_FIT,
 };
 
 /**
@@ -99,6 +102,7 @@ struct device_budget {
   /// Windowed partitions that can be open at once on the device: the executor width, lowered to
   /// the number of partitions the operator has when the partition_budget rule is in force.
   std::size_t concurrent_tasks{1};
+  std::size_t num_devices{1};  ///< GPUs the runs of the sort are spread over
 };
 
 /**
@@ -165,6 +169,14 @@ derived_merge_config derive_merge_config(const merge_settings& settings,
 enum class merge_route : uint8_t { one_shot, windowed };
 
 /**
+ * @brief Size of one run, or of the runs of one partition.
+ */
+struct run_summary {
+  std::size_t bytes{0};
+  std::size_t rows{0};
+};
+
+/**
  * @brief What choose_route needs to know about a partition.
  */
 struct route_inputs {
@@ -174,7 +186,40 @@ struct route_inputs {
   bool any_non_gpu{false};         ///< some input batch is not on the GPU tier
   bool has_nested{false};          ///< some fetched column has a nested type
   bool has_late_mat{false};        ///< the sort carries late-materialized columns
+  /// Size of every partition of the sort, this one included. Empty when it is not known or the
+  /// one_shot_fit rule is off: the partition is then judged alone.
+  std::span<const run_summary> sort_partitions{};
+  std::size_t concurrent_tasks{1};  ///< merge tasks the device runs at once
+  std::size_t num_devices{1};       ///< GPUs the runs of the sort are spread over
 };
+
+/**
+ * @brief GPU memory a one-shot merge holds besides its runs: the merge temporaries and the
+ * output, 2 x the partition's bytes + 8 bytes per row.
+ */
+[[nodiscard]] std::size_t one_shot_working_bytes(const run_summary& partition) noexcept;
+
+/**
+ * @brief GPU memory a device holds while the one-shot merges of a sort run at once.
+ *
+ * The device's share of the runs of the whole sort (they are on the GPU, as runs or as merged
+ * output, unless they were spilled) plus one_shot_working_bytes() of the largest
+ * @p concurrent_tasks partitions that pass the one-shot threshold and, with @p row_count_guard,
+ * the row limit. A sort none of whose partitions passes holds its runs only.
+ *
+ * @param partitions Size of every partition of the sort.
+ * @param concurrent_tasks Merge tasks the device runs at once.
+ * @param num_devices GPUs the runs of the sort are spread over.
+ * @param one_shot_fraction The derived auto threshold (derived_merge_config::one_shot_fraction).
+ * @param gpu_total_bytes Total GPU memory of the device.
+ * @param row_count_guard Whether the row_count_guard rule is in force.
+ */
+[[nodiscard]] std::size_t one_shot_peak_bytes(std::span<const run_summary> partitions,
+                                              std::size_t concurrent_tasks,
+                                              std::size_t num_devices,
+                                              double one_shot_fraction,
+                                              std::size_t gpu_total_bytes,
+                                              bool row_count_guard = true);
 
 /**
  * @brief Choose the merge path for one partition.
@@ -182,13 +227,19 @@ struct route_inputs {
  * Nested or late-materialized columns always take the one-shot path, whatever @p mode says. In
  * automatic mode a partition with a batch off the GPU is windowed, and so is one with
  * kOneShotRowLimit rows or more when @p row_count_guard is set (a one-shot merge of it fails at
- * once); otherwise it is windowed when its input plus output bytes exceed one_shot_fraction of
- * gpu_total_bytes.
+ * once), and one whose input plus output bytes exceed one_shot_fraction of gpu_total_bytes.
+ *
+ * A partition that passes those tests is still windowed when inputs.sort_partitions is given
+ * and one_shot_peak_bytes() of it exceeds gpu_total_bytes. Merge tasks of several partitions run
+ * at the same time next to the runs of the partitions that wait, so a partition that would fit
+ * alone does not fit then: its one-shot merge runs out of GPU memory and is retried while the
+ * other runs are spilled to make room. In particular every partition of a sort larger than the
+ * device is windowed, whether or not its own runs happen to be on the GPU when it is armed.
  *
  * @param mode The sort_merge_mode setting.
  * @param one_shot_fraction The derived auto threshold (derived_merge_config::one_shot_fraction).
  * @param gpu_total_bytes Total GPU memory of the device.
- * @param inputs Size and shape of the partition.
+ * @param inputs Size and shape of the partition, and the sizes of the sort's partitions.
  * @param row_count_guard Whether the row_count_guard rule is in force.
  */
 merge_route choose_route(sort_merge_mode mode,
@@ -196,14 +247,6 @@ merge_route choose_route(sort_merge_mode mode,
                          std::size_t gpu_total_bytes,
                          const route_inputs& inputs,
                          bool row_count_guard = true);
-
-/**
- * @brief Size of one run, for pass planning.
- */
-struct run_summary {
-  std::size_t bytes{0};
-  std::size_t rows{0};
-};
 
 /**
  * @brief The runs one merge task of a pass reads.
