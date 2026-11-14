@@ -18,6 +18,7 @@
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/config.hpp>
@@ -39,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using cucascade::io::cache::cache_mode;
@@ -885,6 +887,9 @@ TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][confi
   REQUIRE(string_to_enum("native", b));
   CHECK(b == io_backend::native);
 
+  REQUIRE(string_to_enum("cufile", b));
+  CHECK(b == io_backend::cufile);
+
   // Deprecated spelling of `native`, still accepted.
   REQUIRE(string_to_enum("sirius", b));
   CHECK(b == io_backend::native);
@@ -909,6 +914,8 @@ TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][conf
 
   REQUIRE(enum_to_string(io_backend::native, out));
   CHECK(out == "native");
+  REQUIRE(enum_to_string(io_backend::cufile, out));
+  CHECK(out == "cufile");
 }
 
 TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][config][backend]")
@@ -916,6 +923,27 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   scan_manager_config cfg{};
 
   CHECK(cfg.backend == io_backend::native);
+  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK_FALSE(cfg.cufile.compat_mode.has_value());
+}
+
+TEST_CASE("cuFile C++ config is validated before starting the scan manager",
+          "[scan_manager][config][backend][cufile]")
+{
+  scan_manager_config cfg{};
+  SECTION("reactor count") { cfg.cufile_n_reactors = 0; }
+  SECTION("inflight window") { cfg.cufile.max_inflight = 0; }
+  SECTION("operation bytes") { cfg.cufile.max_op_bytes = 4095; }
+  SECTION("direct policy")
+  {
+    cfg.cufile.use_odirect = false;
+    cfg.cufile.compat_mode = cucascade::io::cufile::compat::off;
+  }
+  CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
 }
 
 TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_config",
@@ -949,6 +977,8 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   // 0 (size the REST pool from the NIC) is handed to cuCascade as is.
   cfg.rest_n_reactors = 0;
   CHECK(cfg.to_io_config().rest_n_reactors == 0);
+  cfg.backend = io_backend::cufile;
+  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::cufile);
 }
 
 TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][backend]")
@@ -975,6 +1005,126 @@ TEST_CASE("sirius_config rejects the removed kvikio backend and block",
                        "'scan_manager.kvikio': removed; remove this block and use "
                        "backend: native instead");
   }
+}
+
+TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][backend][cufile]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_backend_cufile.yaml",
+                      single_gpu_scan_manager_yaml("      backend: cufile\n"
+                                                   "      cufile_n_reactors: 3\n"
+                                                   "      cache:\n"
+                                                   "        mode: cucs\n"
+                                                   "      cufile:\n"
+                                                   "        max_inflight: 7\n"
+                                                   "        max_op_bytes: 8 MiB\n"
+                                                   "        gds_threshold: 128 KiB\n"
+                                                   "        use_odirect: false\n"
+                                                   "        compat_mode: on\n"
+                                                   "        poll_interval_us: 50\n"
+                                                   "        low_service_interval: 0\n"));
+  CHECK(cfg.backend == io_backend::cufile);
+  auto const io = cfg.to_io_config();
+  CHECK(io.backend == cucascade::io::io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 3);
+  CHECK(cfg.cufile.max_inflight == 7);
+  CHECK(cfg.cufile.max_op_bytes == (8UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (128UL << 10));
+  CHECK_FALSE(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::on);
+  CHECK(cfg.cufile.poll_interval_us == 50);
+  CHECK(cfg.cufile.low_service_interval == 0);
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
+  CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
+  CHECK(io.cufile.max_op_bytes == cfg.cufile.max_op_bytes);
+  CHECK(io.cufile.gds_threshold == cfg.cufile.gds_threshold);
+  CHECK(io.cufile.use_odirect == cfg.cufile.use_odirect);
+  CHECK(io.cufile.compat_mode == cfg.cufile.compat_mode);
+  CHECK(io.cufile.poll_interval_us == cfg.cufile.poll_interval_us);
+  CHECK(io.cufile.low_service_interval == cfg.cufile.low_service_interval);
+#endif
+
+  for (auto const& [spelling, expected] :
+       {std::pair{"auto", cucascade::io::cufile::compat::automatic},
+        std::pair{"on", cucascade::io::cufile::compat::on},
+        std::pair{"off", cucascade::io::cufile::compat::off}}) {
+    auto const parsed =
+      load_scan_manager("sirius_cufile_compat.yaml",
+                        single_gpu_scan_manager_yaml(
+                          std::string{"      cufile:\n        compat_mode: "} + spelling + "\n"));
+    CHECK(parsed.cufile.compat_mode == expected);
+  }
+}
+
+TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
+          "[scan_manager][config][backend][cufile]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"      cufile_n_reactors: 0\n", "scan_manager.cufile_n_reactors"},
+        std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
+        std::pair{"      cufile:\n        max_inflight: 0\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_inflight: -1\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_op_bytes: 4095\n", "cufile.max_op_bytes"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: -1\n",
+                  "cufile.n_max_concurrent_scans"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 0\n", "not configurable"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 4\n", "not configurable"},
+        std::pair{"      cufile:\n        gds_threshold: -1\n", "cufile.gds_threshold"},
+        std::pair{"      cufile:\n        poll_interval_us: -1\n", "cufile.poll_interval_us"},
+        std::pair{"      cufile:\n        low_service_interval: -1\n",
+                  "cufile.low_service_interval"},
+        std::pair{"      cufile:\n        compat_mode: ON\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        compat_mode: ''\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        use_odirect: false\n        compat_mode: off\n",
+                  "cufile.use_odirect"},
+        std::pair{"      cufile:\n        write_split_bytes: 4096\n", "write_split_bytes"},
+        std::pair{"      cufile:\n        register_min_bytes: 4096\n", "register_min_bytes"},
+        std::pair{"      io_backend: cufile\n", "io_backend"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_cufile_invalid.yaml", single_gpu_scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::ContainsSubstring(key));
+  }
+}
+
+TEST_CASE("the documented cuFile configuration example loads",
+          "[scan_manager][config][backend][cufile]")
+{
+  std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
+  REQUIRE(doc.is_open());
+  bool in_yaml = false;
+  std::string block;
+  std::string example;
+  size_t examples = 0;
+  for (std::string line; std::getline(doc, line);) {
+    if (!in_yaml) {
+      if (line == "```yaml") {
+        in_yaml = true;
+        block.clear();
+      }
+    } else if (line == "```") {
+      if (block.find("backend: cufile") != std::string::npos) {
+        ++examples;
+        example = block;
+      }
+      in_yaml = false;
+    } else {
+      block += line + '\n';
+    }
+  }
+  REQUIRE(examples == 1);
+  scan_manager_config cfg;
+  REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
+  CHECK(cfg.backend == io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 4);
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
+  CHECK(cfg.cufile.poll_interval_us == 200);
+  CHECK(cfg.cufile.low_service_interval == 4);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
@@ -1075,6 +1225,11 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.interface == d.interface);
     CHECK(r.pin_to_irq_cpus == d.pin_to_irq_cpus);
     CHECK(r.raise_reactor_priority == d.raise_reactor_priority);
+    CHECK(r.write_split_bytes == d.write_split_bytes);
+    CHECK(r.expect_continue == d.expect_continue);
+    CHECK(r.continue_timeout == d.continue_timeout);
+    CHECK(r.complete_timeout_s == d.complete_timeout_s);
+    CHECK(r.max_write_connections == d.max_write_connections);
     CHECK(r.max_retry_attempts == d.max_retry_attempts);
     CHECK(r.max_auth_retry_attempts == d.max_auth_retry_attempts);
     CHECK(r.retry_backoff_base == d.retry_backoff_base);
@@ -1143,7 +1298,12 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
                                                        "        fan_out: 3\n"
                                                        "        interface: eth1\n"
                                                        "        pin_to_irq_cpus: false\n"
-                                                       "        raise_reactor_priority: true\n"));
+                                                       "        raise_reactor_priority: true\n"
+                                                       "        write_part_bytes: 10 MiB\n"
+                                                       "        expect_continue: true\n"
+                                                       "        continue_timeout_ms: 250\n"
+                                                       "        complete_timeout_s: 120\n"
+                                                       "        max_write_connections: 4\n"));
   CHECK(cfg.rest_n_reactors == 4);
   auto const check = [](cucascade::io::rest::config const& rest) {
     CHECK(rest.n_max_concurrent_scans == 5);
@@ -1185,6 +1345,11 @@ TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][r
     CHECK(rest.interface == "eth1");
     CHECK_FALSE(rest.pin_to_irq_cpus);
     CHECK(rest.raise_reactor_priority);
+    CHECK(rest.write_split_bytes == (10UL << 20));
+    CHECK(rest.expect_continue);
+    CHECK(rest.continue_timeout == std::chrono::milliseconds{250});
+    CHECK(rest.complete_timeout_s == 120);
+    CHECK(rest.max_write_connections == 4);
   };
   check(cfg.rest);
   check(cfg.to_io_config().rest);
@@ -1221,6 +1386,10 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
                                                        "        dns_max_addresses: 4096\n"
                                                        "        footer_probe_bytes: 1 GiB\n"
                                                        "        fan_out: 1\n"
+                                                       "        write_part_bytes: 5 MiB\n"
+                                                       "        continue_timeout_ms: 0\n"
+                                                       "        complete_timeout_s: 0\n"
+                                                       "        max_write_connections: 0\n"
                                                        "        tls:\n"
                                                        "          session_cache: false\n"
                                                        "          session_cache_per_endpoint: 0\n"
@@ -1252,6 +1421,10 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
   CHECK(cfg.rest.dns_max_addresses == 4096);
   CHECK(cfg.rest.footer_probe_bytes == (1UL << 30));
   CHECK(cfg.rest.fan_out == 1);
+  CHECK(cfg.rest.write_split_bytes == (5UL << 20));
+  CHECK(cfg.rest.continue_timeout.count() == 0);
+  CHECK(cfg.rest.complete_timeout_s == 0);
+  CHECK(cfg.rest.max_write_connections == 0);
   CHECK(cfg.rest.tls.session_cache_per_endpoint == 0);
   CHECK(cfg.rest.tls.max_connection_bytes == 0);
 
@@ -1259,10 +1432,14 @@ TEST_CASE("REST transport accepts documented zero sentinels and range boundaries
                                        rest_yaml("        max_connections: 64\n"
                                                  "        queue_depth: 32768\n"
                                                  "        min_mtu: 65607\n"
-                                                 "        receive_buffer_bytes: 4 MiB\n"));
+                                                 "        receive_buffer_bytes: 4 MiB\n"
+                                                 "        write_part_bytes: 5 GiB\n"
+                                                 "        max_write_connections: 64\n"));
   CHECK(upper.rest.queue_depth == 32768);
   CHECK(upper.rest.min_mtu == 65607);
   CHECK(upper.rest.receive_buffer_bytes == (4UL << 20));
+  CHECK(upper.rest.write_split_bytes == (5UL << 30));
+  CHECK(upper.rest.max_write_connections == 64);
 
   auto const tight =
     load_scan_manager("sirius_rest_queue_tight.yaml",
@@ -1330,7 +1507,16 @@ TEST_CASE("sirius_config rejects invalid REST transport ranges with key context"
         std::pair{"wait_mode: poll", "wait_mode"},
         std::pair{"iowq_max_unbound: -1", "iowq_max_unbound"},
         std::pair{"iowq_max_unbound: 4294967296", "iowq_max_unbound"},
-        std::pair{"fan_out: 0", "fan_out"}}) {
+        std::pair{"fan_out: 0", "fan_out"},
+        std::pair{"write_part_bytes: 0", "write_part_bytes"},
+        std::pair{"write_part_bytes: -1", "write_part_bytes"},
+        std::pair{"write_part_bytes: 4 MiB", "write_part_bytes"},
+        std::pair{"write_part_bytes: 6 GiB", "write_part_bytes"},
+        std::pair{"expect_continue: maybe", "expect_continue"},
+        std::pair{"continue_timeout_ms: -1", "continue_timeout_ms"},
+        std::pair{"complete_timeout_s: -1", "complete_timeout_s"},
+        std::pair{"max_write_connections: -1", "max_write_connections"},
+        std::pair{"max_write_connections: 65", "max_write_connections"}}) {
     CAPTURE(body);
     scoped_yaml yaml("sirius_rest_transport_invalid.yaml",
                      rest_yaml(std::string{"        "} + body + "\n"));
@@ -1365,8 +1551,6 @@ TEST_CASE("sirius_config rejects REST keys the transport does not have",
                           "link_gbps: 100",
                           "tls_handshake_timeout_ms: 3000",
                           "ring_entries: 1024",
-                          "write_part_bytes: 16 MiB",
-                          "expect_continue: true",
                           "sqpoll: true",
                           "defer_taskrun: true"}) {
     CAPTURE(key);
@@ -1536,6 +1720,17 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
       }
     }
   }
+}
+
+TEST_CASE("sirius_config forces the native backend for multi-GPU",
+          "[scan_manager][config][backend][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  auto const cufile = load_scan_manager("sirius_cufile_multi_gpu.yaml",
+                                        "sirius:\n  topology:\n    num_gpus: 2\n  executor:\n    "
+                                        "scan_manager:\n      backend: cufile\n");
+  CHECK(cufile.backend == io_backend::native);
 }
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
