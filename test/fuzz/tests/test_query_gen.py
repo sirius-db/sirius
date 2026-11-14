@@ -419,7 +419,17 @@ class Phase2bShapes(unittest.TestCase):
 
     def test_set_operations_and_exact_float_keys(self):
         queries = self.generated(
-            ["features.set_ops.except=true", "features.set_ops.intersect=true"]
+            [
+                "features.set_ops.except=true",
+                "features.set_ops.intersect=true",
+                "features.cross_join=false",
+                "features.joins.any_join=false",
+                "features.joins.self_join=false",
+                "features.joins.grouped_inputs=false",
+                "features.joins.max_tables=4",
+                "features.joins.star_share=0",
+                "features.joins.expression_keys=false",
+            ]
         )
         ops = [n for q in queries for n in walk(q) if isinstance(n, SetOp)]
         for op in ("EXCEPT", "EXCEPT ALL", "INTERSECT", "INTERSECT ALL"):
@@ -477,7 +487,15 @@ class GeneratorValidity(unittest.TestCase):
             stats.update(s)
         missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
         # Rare cast families are exercised directly by Phase2cShapes.
-        missing = [f for f in missing if f != "cast_boundary:decimal_to_integer"]
+        missing = [
+            f
+            for f in missing
+            if f
+            not in (
+                "cast_boundary:decimal_to_integer",
+                "cast_boundary:integer_to_decimal",
+            )
+        ]
         self.assertEqual(missing, [], f"never emitted: {missing}")
 
     def test_every_claimed_feature_is_emitted(self):
