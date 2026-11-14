@@ -36,12 +36,14 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -494,8 +496,8 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
   if (r.has("n_max_concurrent_scans")) {
     throw std::runtime_error(
       "'cufile.n_max_concurrent_scans': not configurable; cuFile cannot "
-      "use fs_cache or scan readahead (use cufile_n_reactors and "
-      "cufile.max_inflight for read concurrency)");
+      "use fs_cache or scan readahead (use cufile.reactors_per_device or "
+      "cufile_n_reactors, and cufile.max_inflight, for read concurrency)");
   }
   count("max_inflight", opt.max_inflight, true);
   count("poll_interval_us", opt.poll_interval_us);
@@ -522,6 +524,40 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
   }
   if (!opt.use_odirect && opt.compat_mode == cucascade::io::cufile::compat::off) {
     throw std::runtime_error("'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
+  }
+  read_choice(r,
+              "staging_mode",
+              opt.staging_mode,
+              {{"automatic", cucascade::io::cufile::staging::automatic},
+               {"always", cucascade::io::cufile::staging::always},
+               {"never", cucascade::io::cufile::staging::never}});
+  r.optional("staging_piece_bytes", yaml::bytes(opt.staging_piece_bytes));
+  if (opt.staging_piece_bytes == 0 || opt.staging_piece_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::runtime_error("'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
+  }
+  count("staging_slots_per_reactor", opt.staging_slots_per_reactor, true);
+  // 0 = no cap beyond the device limits.
+  r.optional("max_staging_bytes_per_device", yaml::bytes(opt.max_staging_bytes_per_device));
+  // 0 = sized from storage_hint_path (see the cuFile backend's planner).
+  count("reactors_per_device", opt.reactors_per_device);
+  r.optional("pin_to_device_cpus", opt.pin_to_device_cpus);
+  r.optional("devices", opt.devices);
+  if (std::ranges::any_of(opt.devices, [](int id) { return id < 0; })) {
+    throw std::runtime_error("'cufile.devices': must contain only non-negative device ids");
+  }
+  {
+    auto sorted = opt.devices;
+    std::ranges::sort(sorted);
+    if (std::ranges::adjacent_find(sorted) != sorted.end()) {
+      throw std::runtime_error("'cufile.devices': must not contain duplicate device ids");
+    }
+  }
+  r.optional("storage_hint_path", opt.storage_hint_path);
+  // The planner sizes the pool from the storage of a regular file; a directory would
+  // silently read as unknown storage.
+  if (std::error_code ec; std::filesystem::is_directory(opt.storage_hint_path, ec)) {
+    throw std::runtime_error(
+      "'cufile.storage_hint_path': must name a file on the data filesystem, not a directory");
   }
   r.reject_unknown();
 }
@@ -639,11 +675,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   // Per routed REST context, shared by all GPUs; 0 sizes each pool from the egress NIC's IRQs.
   read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
-  {
-    std::int64_t reactors = static_cast<std::int64_t>(opt.cufile_n_reactors);
-    r.optional("cufile_n_reactors", reactors, yaml::greater_than<std::int64_t>{0});
-    opt.cufile_n_reactors = static_cast<std::size_t>(reactors);
-  }
+  // 0 plans a pinned pool per GPU; a positive count is one flat pool.
+  read_count(r, "cufile_n_reactors", opt.cufile_n_reactors);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
