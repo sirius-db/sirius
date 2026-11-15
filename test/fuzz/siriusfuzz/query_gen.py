@@ -1505,7 +1505,16 @@ class QueryGenerator:
             return self._gen_case(kind, scope, depth)
         if what == "coalesce":
             n = rng.randint(2, 3)
-            args = [self._gen_expr(kind, scope, depth + 1) for _ in range(n)]
+            if kind == "decimal" and not self.f.casts.decimal_scale:
+                # #2590: DuckDB's implicit common-type cast can reduce scale;
+                # CPU rounds where GPU truncates. Keep every arm exact-typed.
+                first = self._gen_expr(kind, scope, depth + 1)
+                typ = exact_type(first)
+                if typ is None or typ.kind != "decimal":
+                    raise GenerationFailed("unknown DECIMAL coalesce arm type")
+                args = [first] + [self._literal("decimal", typ) for _ in range(n - 1)]
+            else:
+                args = [self._gen_expr(kind, scope, depth + 1) for _ in range(n)]
             return Func("coalesce", args, kind=kind)
         if what == "cast":
             return self._gen_cast(kind, scope, depth)
@@ -2239,6 +2248,9 @@ def exact_type(expr: Expr) -> st.SqlType | None:
             else None
         )
     if isinstance(expr, Func):
+        if expr.name == "coalesce":
+            types = [exact_type(arg) for arg in expr.args]
+            return types[0] if types and all(t == types[0] for t in types) else None
         if expr.name in ("upper", "lower"):
             return st.VARCHAR
         if expr.name in ("round", "abs"):

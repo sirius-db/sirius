@@ -91,6 +91,26 @@ def run_batch(cfg, n, seed):
 
 
 class Phase2eTypes(unittest.TestCase):
+    def test_decimal_coalesce_has_no_implicit_scale_reduction(self):
+        from siriusfuzz import sqltypes as st
+
+        cfg = load_config(None, [
+            "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
+        ])
+        dg = DataGenerator(cfg, random.Random(44))
+        qg = QueryGenerator(cfg, dg.generate(44), random.Random(44), dg)
+        checked = 0
+        for _ in range(1200):
+            query = qg.generate()
+            for node in walk(query):
+                if isinstance(node, Func) and node.name == "coalesce" and node.kind == "decimal":
+                    types = [exact_type(arg) for arg in node.args]
+                    self.assertTrue(types and all(t == types[0] for t in types), query.sql())
+                    checked += 1
+        self.assertGreater(checked, 0)
+        decimal_type = st.decimal_type(12, 2)
+        self.assertEqual(exact_type(Func("coalesce", [Literal(1, decimal_type), Literal(2, decimal_type)], kind="decimal")), decimal_type)
+
     def test_decimal_scale_reduction_stays_in_gaps_mode(self):
         cfg = load_config(None, [
             "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
@@ -764,7 +784,7 @@ class GeneratorValidity(unittest.TestCase):
             try:
                 session.load_dataset(ds, "base")
                 session.load_dataset(ds, "perm", permutation_seed=5)
-                for _ in range(2500):
+                for _ in range(4500):
                     query = qg.generate()
                     if not isinstance(query, Select) or not any(
                         isinstance(node, Window) and node.name == "row_number"
