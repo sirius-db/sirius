@@ -536,6 +536,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt
     throw std::runtime_error("'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
   }
   count("staging_slots_per_reactor", opt.staging_slots_per_reactor, true);
+  r.optional("fuse_gap_bytes", yaml::bytes(opt.fuse_gap_bytes));
   // 0 = no cap beyond the device limits.
   r.optional("max_staging_bytes_per_device", yaml::bytes(opt.max_staging_bytes_per_device));
   // 0 = sized from storage_hint_path (see the cuFile backend's planner).
