@@ -263,6 +263,9 @@ struct scan_manager_config {
   /// interrupts and the reactors.  No effect when the reactors run unpinned.
   bool reserve_rest_reactor_cpus{true};
 
+  /// Allow DuckDB byte caching through sirius_httpfs; a startup policy captured per handle.
+  bool httpfs_external_file_cache{true};
+
   /// Engine-owned (not YAML): the CPU mask REST contexts are built and started
   /// from, set to the configuring thread's affinity when the reactor CPUs are
   /// reserved.  A routed REST context built lazily on a pool thread (whose mask

@@ -591,6 +591,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   // Per routed REST context, shared by all GPUs; 0 sizes each pool from the egress NIC's IRQs.
   read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
+  r.optional("httpfs_external_file_cache", opt.httpfs_external_file_cache);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
