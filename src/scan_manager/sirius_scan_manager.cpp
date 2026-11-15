@@ -1576,11 +1576,13 @@ sirius_scan_manager::~sirius_scan_manager()
     try {
       auto const s = cufile->stats();
       SIRIUS_LOG_INFO(
-        "[sirius_scan_manager] cufile reads: staged {} ({} MiB, {} early), direct {} ({} MiB), "
+        "[sirius_scan_manager] cufile reads: staged {} ({} MiB, {} early, {} fused slices), "
+        "direct {} ({} MiB), "
         "posix device {} ({} MiB), host {} ({} MiB), cufile failures {}, parked slices {}",
         s.staged_reads,
         s.staged_bytes >> 20,
         s.early_staged_reads,
+        s.fused_slices,
         s.direct_reads,
         s.direct_bytes >> 20,
         s.posix_device_reads,
