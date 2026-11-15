@@ -223,8 +223,8 @@ struct memory_prefetcher_config {
  * uses cuFile for local files and the same REST backend for @c s3://. Object-store
  * LIST and glob use the REST backend either way. Reads go through
  * @c cucascade::io::datasource. Raw HTTP(S) URLs are unsupported; use @c s3://
- * paths with an object-store endpoint instead. Multi-GPU forces
- * @ref io_backend::native.
+ * paths with an object-store endpoint instead. Both backends serve every
+ * configured GPU.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.
@@ -282,7 +282,7 @@ struct scan_manager_config {
   /// Independent of the metadata pool's explicit cpu_affinity override.
   std::vector<int> worker_startup_cpus;
 
-  /// Local cuFile reactors (single-GPU only).  0 (the default) plans a pinned
+  /// Local cuFile reactors.  0 (the default) plans a pinned
   /// group of @c cufile.reactors_per_device reactors for each GPU in
   /// @c cufile.devices (see @ref resolved_cufile); a positive count runs one
   /// flat, unpinned pool of that many reactors instead.

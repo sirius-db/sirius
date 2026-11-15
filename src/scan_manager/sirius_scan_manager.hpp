@@ -932,7 +932,6 @@ class sirius_scan_manager {
 
   /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
   ///        Holds the configured local @c uring_ioctx or @c cufile_ioctx.
-  ///        cuFile is single-GPU only.
   [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers

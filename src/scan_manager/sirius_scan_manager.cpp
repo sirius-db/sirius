@@ -1511,13 +1511,6 @@ sirius_scan_manager::sirius_scan_manager(
     }
     return io_ctx;
   };
-  if (_config.backend != scan_manager::io_backend::native &&
-      _topology_index->gpu_ids().size() > 1) {
-    throw std::runtime_error(
-      "[sirius_scan_manager] non-native IO does not support multi-GPU; topology reports " +
-      std::to_string(_topology_index->gpu_ids().size()) +
-      " GPUs. Set backend=native for multi-GPU runs.");
-  }
   switch (_config.backend) {
     case scan_manager::io_backend::native:
       _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);

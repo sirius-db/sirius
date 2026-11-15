@@ -1155,7 +1155,6 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   derive_uring_scan_budget();
-  enforce_native_backend_for_multi_gpu();
   reserve_rest_reactor_cpus();
   _scan_manager_config.worker_startup_cpus = get_worker_startup_cpus();
 }
@@ -1308,21 +1307,6 @@ void sirius_config::derive_uring_scan_budget()
     derived,
     _scan_manager_config.uring.n_max_concurrent_scans);
   _scan_manager_config.uring.n_max_concurrent_scans = derived;
-}
-
-void sirius_config::enforce_native_backend_for_multi_gpu()
-{
-  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
-    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
-  });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'native' but {} GPUs are configured; "
-      "the native backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'native'.",
-      num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::native;
-  }
 }
 
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()

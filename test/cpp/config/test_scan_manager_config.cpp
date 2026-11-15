@@ -1793,7 +1793,7 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
   }
 }
 
-TEST_CASE("sirius_config forces the native backend for multi-GPU",
+TEST_CASE("sirius_config keeps the cuFile backend for multi-GPU",
           "[scan_manager][config][backend][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
@@ -1801,7 +1801,7 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
   auto const cufile = load_scan_manager("sirius_cufile_multi_gpu.yaml",
                                         "sirius:\n  topology:\n    num_gpus: 2\n  executor:\n    "
                                         "scan_manager:\n      backend: cufile\n");
-  CHECK(cufile.backend == io_backend::native);
+  CHECK(cufile.backend == io_backend::cufile);
 }
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
