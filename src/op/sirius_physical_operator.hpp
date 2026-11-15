@@ -358,14 +358,26 @@ class pipelineable_operator_data : public operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches();
-    for (auto const& ro : ro_batches) {
-      if (!ro.get_data()) { continue; }
-      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
-    }
-    return total;
+    return estimate_input_sizes(nullptr).uncompressed_bytes;
   }
+
+  /// Sizes of the batches as a reservation estimate needs them.
+  struct input_size_estimate {
+    std::size_t uncompressed_bytes   = 0;  ///< Decoded size of every batch
+    std::size_t bytes_to_materialize = 0;  ///< Peak device bytes to bring the batches to the GPU
+  };
+
+  /**
+   * @brief Size the batches without waiting for one that another thread holds exclusively.
+   *
+   * A batch counts toward `bytes_to_materialize` when it is off the GPU or, with a
+   * @p target_space, in another memory space. A batch that is being converted (a spill holds its
+   * exclusive lock for the whole write) is sized from the sizes the batch last published and
+   * counted as if it had to be materialized, so the result can exceed the true need but never
+   * falls below it.
+   */
+  [[nodiscard]] input_size_estimate estimate_input_sizes(
+    const ::cucascade::memory::memory_space* target_space) const;
 
   [[nodiscard]] std::string get_origin_tiers() const override
   {

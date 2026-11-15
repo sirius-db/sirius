@@ -16,7 +16,9 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "compression/spill_compression.hpp"
 #include "cucascade/utils/overloaded.hpp"
+#include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -129,6 +131,52 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     }
   }
   return ro_batches;
+}
+
+pipelineable_operator_data::input_size_estimate pipelineable_operator_data::estimate_input_sizes(
+  const ::cucascade::memory::memory_space* target_space) const
+{
+  input_size_estimate estimate;
+  auto const add_to = [](std::size_t& total, std::size_t bytes) {
+    total = memory::saturating_add(total, bytes);
+  };
+
+  auto const add = [&](const ::cucascade::read_only_data_batch& ro) {
+    auto const* data = ro.get_data();
+    if (!data) { return; }
+    add_to(estimate.uncompressed_bytes, data->get_uncompressed_data_size_in_bytes());
+    const bool non_gpu     = ro.get_current_tier() != ::cucascade::memory::Tier::GPU;
+    const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
+                             ro.get_memory_space()->get_id() != target_space->get_id();
+    if (non_gpu || cross_space) {
+      add_to(estimate.bytes_to_materialize, sirius::peak_materialization_bytes(data));
+    }
+  };
+
+  if (_read_only_data_batches.has_value()) {
+    for (const auto& ro : *_read_only_data_batches) {
+      add(ro);
+    }
+    return estimate;
+  }
+
+  for (const auto& batch : _data_batches) {
+    if (!batch) { continue; }
+    if (auto ro = batch->try_to_read_only()) {
+      add(*ro);
+      continue;
+    }
+    // The tier the conversion leaves the batch in is unknown here. Charge the decoded size, plus
+    // the stored payload when the batch is compressed or the spill in flight may compress it.
+    auto const decoded = batch->get_last_known_uncompressed_size_in_bytes();
+    auto const stored  = batch->get_last_known_size_in_bytes();
+    add_to(estimate.uncompressed_bytes, decoded);
+    add_to(estimate.bytes_to_materialize, decoded);
+    if (stored != decoded || compression::spill_compression_applies(stored)) {
+      add_to(estimate.bytes_to_materialize, stored);
+    }
+  }
+  return estimate;
 }
 
 std::unique_ptr<pipelineable_operator_data>

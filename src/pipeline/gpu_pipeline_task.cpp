@@ -380,20 +380,11 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
     return peak_materialization_bytes(data);
   }
 
-  std::size_t input_size   = 0;
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
   if (pipelineable_input) {
-    for (const auto& ro : pipelineable_input->get_read_only_batches()) {
-      if (!ro.get_data()) { continue; }
-      const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
-      const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
-                               ro.get_memory_space()->get_id() != target_space->get_id();
-      if (non_gpu || cross_space) {
-        input_size = memory::saturating_add(input_size, peak_materialization_bytes(ro.get_data()));
-      }
-    }
+    return pipelineable_input->estimate_input_sizes(target_space).bytes_to_materialize;
   }
-  return input_size;
+  return 0;
 }
 
 gpu_pipeline_task::gpu_pipeline_task(
