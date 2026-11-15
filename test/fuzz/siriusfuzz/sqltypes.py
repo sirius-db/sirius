@@ -50,6 +50,7 @@ SMALLINT = SqlType("SMALLINT", "int", True, 16)
 INTEGER = SqlType("INTEGER", "int", True, 32)
 BIGINT = SqlType("BIGINT", "int", True, 64)
 HUGEINT = SqlType("HUGEINT", "int", True, 128)
+UHUGEINT = SqlType("UHUGEINT", "int", False, 128)
 UTINYINT = SqlType("UTINYINT", "int", False, 8)
 USMALLINT = SqlType("USMALLINT", "int", False, 16)
 UINTEGER = SqlType("UINTEGER", "int", False, 32)
@@ -83,6 +84,7 @@ _BY_NAME: dict[str, tuple[SqlType, ...]] = {
     "INTEGER": (INTEGER,),
     "BIGINT": (BIGINT,),
     "HUGEINT": (HUGEINT,),
+    "UHUGEINT": (UHUGEINT,),
     "UTINYINT": (UTINYINT,),
     "USMALLINT": (USMALLINT,),
     "UINTEGER": (UINTEGER,),

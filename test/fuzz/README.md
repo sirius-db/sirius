@@ -252,6 +252,8 @@ array scan/projection matches, while array range filters declined.
 the known special case mappings from `data.edge_values.unicode_case`.
 `data.strings.max_len` is a byte ceiling; lengths near 4,095 are rare so most
 strings remain short. The probe accepted 4,095 bytes and declined 4,096.
+UTF-8 and long-string tags require the referenced source column to contain
+that content in the generated dataset.
 `data.null_density_extremes` adds rare all-NULL and no-NULL columns, tagged
 when referenced. TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and
 STRUCT are not generated: the native scan declined every one of them in the

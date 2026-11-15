@@ -152,6 +152,21 @@ class QueryGenerator:
             st.UINTEGER,
             st.UBIGINT,
         ]
+        self._utf8_columns: set[tuple[str, str]] = set()
+        self._long_string_columns: set[tuple[str, str]] = set()
+        if config.data.strings.charset == "utf8" or config.data.strings.max_len > 40:
+            for table in dataset.tables:
+                for index, column in enumerate(table.columns):
+                    if column.type.kind != "varchar":
+                        continue
+                    values = (row[index] for row in table.rows if isinstance(row[index], str))
+                    for value in values:
+                        if any(ord(char) > 127 for char in value):
+                            self._utf8_columns.add((table.name, column.name))
+                        if len(value.encode("utf8")) > 40:
+                            self._long_string_columns.add((table.name, column.name))
+                        if (table.name, column.name) in self._utf8_columns and (table.name, column.name) in self._long_string_columns:
+                            break
         self._alias_n = 0
         self._cte_n = 0
 
@@ -208,19 +223,25 @@ class QueryGenerator:
 
     def _tag_types(self, query: Query) -> None:
         refs = [n for n in walk(query) if isinstance(n, ColumnRef)]
+        tables = {n.alias: n.table for n in walk(query) if isinstance(n, TableRef)}
         for typ in {r.type for r in refs}:
             if typ.kind == "decimal":
                 self._note(f"type:decimal_{typ.precision}_{typ.scale}")
             elif typ == st.HUGEINT:
                 self._note("type:hugeint")
+            elif typ == st.UHUGEINT:
+                self._note("type:uhugeint")
             elif typ.kind == "array":
                 self._note("type:array")
-        if self.cfg.data.strings.charset == "utf8" and any(r.kind == "varchar" for r in refs):
+        if self.cfg.data.strings.charset == "utf8" and any(
+            (tables.get(r.alias), r.name) in self._utf8_columns for r in refs
+        ):
             self._note("type:varchar_utf8")
-        if self.cfg.data.strings.max_len > 40 and any(r.kind == "varchar" for r in refs):
+        if self.cfg.data.strings.max_len > 40 and any(
+            (tables.get(r.alias), r.name) in self._long_string_columns for r in refs
+        ):
             self._note("type:varchar_long_below_limit")
         if self.cfg.data.null_density_extremes:
-            tables = {n.alias: n.name for n in walk(query) if isinstance(n, TableRef)}
             for ref in refs:
                 table_name = tables.get(ref.alias)
                 if table_name is None:

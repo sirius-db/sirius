@@ -33,6 +33,7 @@ from siriusfuzz.sqlast import (
     Join,
     Logical,
     Select,
+    SelectItem,
     SetOp,
     TableRef,
     Window,
@@ -161,6 +162,22 @@ class Phase2eTypes(unittest.TestCase):
                 self.assertEqual(len(query.items), 2)
         self.assertTrue(projected)
         self.assertGreater(qg.stats["type:array_projection"], 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cpu_session(tmp)
+            try:
+                session.load_dataset(ds, "array_probe")
+                for table in ds.tables:
+                    for column in table.columns:
+                        if column.type.kind == "array":
+                            self.assertEqual(
+                                session.run(
+                                    f'SELECT "{column.name}" FROM "{table.name}"',
+                                    gpu=False, timeout=120,
+                                ).status,
+                                "ok",
+                            )
+            finally:
+                session.close()
 
     def test_mixed_integer_keys_and_hugeint_sum_are_gated(self):
         from siriusfuzz import sqltypes as st
@@ -179,6 +196,16 @@ class Phase2eTypes(unittest.TestCase):
         self.assertGreater(qg.stats["join:mixed_integer_keys"], 0)
         self.assertEqual(exact_type(Agg("sum", ColumnRef("a", "b", st.BIGINT), kind="int")), st.HUGEINT)
 
+    def test_wide_integer_values_cross_64_bit_range(self):
+        from siriusfuzz import sqltypes as st
+
+        cfg = load_config(None, ["types.hugeint=true", "types.uhugeint=true"])
+        dg = DataGenerator(cfg, random.Random(39))
+        signed = [dg.typed_value(st.HUGEINT) for _ in range(200)]
+        unsigned = [dg.typed_value(st.UHUGEINT) for _ in range(200)]
+        self.assertTrue(any(abs(v) > (1 << 63) - 1 for v in signed))
+        self.assertTrue(any(v > (1 << 64) - 1 for v in unsigned))
+
     def test_string_limit_and_null_density_extremes(self):
         cfg = load_config(None, [
             "data.strings.charset=utf8", "data.strings.max_len=4095",
@@ -191,6 +218,17 @@ class Phase2eTypes(unittest.TestCase):
         columns = [c for seed in range(20) for t in dg.generate(seed).tables for c in t.columns[1:]]
         self.assertTrue(any(c.all_null for c in columns))
         self.assertTrue(any(c.no_null for c in columns))
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.schema_gen import Column, Dataset, Table
+
+        table = Table("t", [Column("k", st.INTEGER), Column("s", st.VARCHAR)], [(0, "é" + "x" * 100)])
+        qg = QueryGenerator(cfg, Dataset([table], 41), random.Random(41))
+        qg._tag_types(Select(
+            items=[SelectItem(ColumnRef("a", "s", st.VARCHAR), "c0")],
+            from_=TableRef("t", "a"),
+        ))
+        self.assertGreater(qg.stats["type:varchar_utf8"], 0)
+        self.assertGreater(qg.stats["type:varchar_long_below_limit"], 0)
 
 
 class Phase2cQuarantine(unittest.TestCase):

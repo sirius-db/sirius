@@ -154,7 +154,7 @@ class DataGenerator:
         if config.types.hugeint:
             self.types.append(st.HUGEINT)
         if config.types.uhugeint:
-            self.types.append(st.SqlType("UHUGEINT", "int", False, 128))
+            self.types.append(st.UHUGEINT)
         if config.types.array:
             self.types.append(st.INTEGER_ARRAY_3)
         self._pools: dict[str, list[Any]] = {}
@@ -198,6 +198,8 @@ class DataGenerator:
         words = list(_COMMON_WORDS)
         if self.cfg.data.strings.charset == "unicode":
             words += _UNICODE_WORDS
+        elif self.cfg.data.strings.charset == "utf8":
+            words += ["café", "東京", "😀"]
         self._pools["varchar"] = words
         self._pools["bool"] = [True, False]
         if self.cfg.types.array:
