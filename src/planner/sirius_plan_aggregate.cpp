@@ -40,6 +40,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
@@ -994,8 +995,56 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   auto const decimal_sum_bounds = decimal_sum_stats_bound_enabled(context)
                                     ? resolve_sum_input_bounds(context, op)
                                     : std::vector<std::optional<std::uint64_t>>{};
+  auto const count_join = detect_dense_count_join(context, op);
+  bool const count_star = count_join && !count_join->counted_value_idx;
 
   auto plan = create_plan(*op.children[0]);
+
+  // A physical RIGHT join preserves its build side, whichever logical side that was; a swapped
+  // join comes back under the projection restoring the logical column order, which the counts'
+  // fixed `[key, count]` output replaces.
+  auto* join_slot = &plan;
+  while (count_join && (*join_slot)->type == sirius::op::SiriusPhysicalOperatorType::PROJECTION &&
+         std::ranges::all_of(
+           (*join_slot)->Cast<sirius::op::sirius_physical_projection>().select_list,
+           [](auto const& expression) { return expression->is_reference(); })) {
+    join_slot = &(*join_slot)->children[0];
+  }
+  if (count_join && (*join_slot)->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    SIRIUS_LOG_INFO("[sirius_plan_aggregate] Not counting build matches: the join planned as {}",
+                    sirius::op::SiriusPhysicalOperatorToString((*join_slot)->type));
+  }
+  if (count_join && (*join_slot)->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto& join       = (*join_slot)->Cast<sirius::op::sirius_physical_hash_join>();
+    auto const& keys = join.prepared_keys();
+    bool const streams = duckdb::query_operator_options(context)->stream_right_joins;
+    if (join.join_type == duckdb::JoinType::RIGHT && streams && !join.is_mixed_join() &&
+        keys.size() == 1 &&
+        static_cast<std::size_t>(keys[0].left_index) == count_join->counted_key_idx &&
+        static_cast<std::size_t>(keys[0].right_index) == count_join->preserved_key_idx) {
+      // COUNT(*) counts an unmatched preserved row once; COUNT(col) does not.
+      sirius::op::sirius_physical_hash_join::build_count_spec spec{
+        .build_key      = static_cast<cudf::size_type>(count_join->preserved_key_idx),
+        .probe_value    = count_join->counted_value_idx
+                            ? std::optional<cudf::size_type>(
+                             static_cast<cudf::size_type>(*count_join->counted_value_idx))
+                            : std::nullopt,
+        .unmatched_fill = count_star ? 1 : 0};
+      join.enable_build_counts(spec, sirius::from_duckdb_vec(op.types));
+      join.estimated_cardinality = op.estimated_cardinality;
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_aggregate] Counting build matches in the RIGHT hash join: key col {}, {}",
+        count_join->preserved_key_idx,
+        count_star ? std::string("COUNT(*)")
+                   : "COUNT(col " + std::to_string(*count_join->counted_value_idx) + ")");
+      return std::move(*join_slot);
+    }
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] Not counting build matches: {} join, may stream {}, {} keys",
+      duckdb::JoinTypeToString(join.join_type),
+      streams,
+      keys.size());
+  }
 
   plan = extract_aggregate_expressions(
     context, std::move(plan), op.expressions, op.groups, op.grouping_sets);

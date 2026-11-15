@@ -105,6 +105,7 @@ target_sources(
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
+          right_join_build_matches.cu
           scan/equality_delete_mask.cu)
 
 add_subdirectory(scan/arrow)

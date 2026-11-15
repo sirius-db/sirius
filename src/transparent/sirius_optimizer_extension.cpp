@@ -21,6 +21,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/types/value.hpp>
@@ -310,6 +311,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
         copy = copy_logical_plan(*captured, context);
       }
     }
+    narrow_outer_join_counts(*copy, input.optimizer.binder);
     conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

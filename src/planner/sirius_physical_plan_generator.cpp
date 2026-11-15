@@ -1113,6 +1113,7 @@ plan_lineage collect_semantic_lineage(
     if (node.type == type::HASH_JOIN) {
       auto& physical = node.Cast<op::sirius_physical_hash_join>();
       join(physical, physical.lhs_output_columns.col_idxs, physical.rhs_output_columns.col_idxs);
+      if (physical.build_counts()) { result.columns.emplace_back(); }
     } else {
       auto& physical = node.Cast<op::sirius_physical_nested_loop_join>();
       auto left = physical.left_output_col_idxs, right = physical.right_output_col_idxs;
@@ -1724,13 +1725,15 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
   if (join_op.children.size() != 2) { throw std::logic_error("partitioned join needs two inputs"); }
   auto& build_concat = join_op.children[1]->Cast<sirius::op::sirius_physical_concat>();
   auto& build        = build_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
-  auto& probe = join_op.children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+  auto& probe_concat = join_op.children[0]->Cast<sirius::op::sirius_physical_concat>();
+  auto& probe        = probe_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
     sirius::op::bind_partition_inputs(join_op.Cast<sirius::op::sirius_physical_hash_join>(),
                                       build,
                                       probe,
                                       &build_concat,
-                                      probe_drives);
+                                      probe_drives,
+                                      &probe_concat);
   } else {
     sirius::op::bind_partition_inputs(
       join_op.Cast<sirius::op::sirius_physical_nested_loop_join>(), build, probe);
@@ -1751,8 +1754,16 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
   bool probe_drives = false;
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
-    auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
+    auto& hash_join         = join_op.Cast<sirius::op::sirius_physical_hash_join>();
+    bool const right_stream = op_params.stream_right_joins &&
+                              hash_join.join_type == duckdb::JoinType::RIGHT &&
+                              !hash_join.is_mixed_join();
+    hash_join.set_right_may_stream(right_stream);
+    if (hash_join.build_counts() && !right_stream) {
+      throw std::logic_error("a hash join counting its build matches must stream its probe");
+    }
+    probe_drives =
+      hash_join.is_right_family() && !hash_join.is_delim_join_inner() && !right_stream;
   }
   bind_wrapped_join(join_op, probe_drives);
 }

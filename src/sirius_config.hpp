@@ -323,6 +323,10 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
+  /// Size RIGHT hash joins from their build side so a build that fits runs BUILD_PROBE, streaming
+  /// the probe instead of folding each probe partition whole.
+  bool stream_right_joins = true;
+
   /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
   /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
   /// `rewrite_correlated_inequality_exists`.

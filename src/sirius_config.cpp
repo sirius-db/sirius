@@ -474,6 +474,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("stream_right_joins", opt.stream_right_joins);
   r.optional("enable_complete_group_having", opt.enable_complete_group_having);
   r.optional("enable_scan_reuse_rewrites", opt.enable_scan_reuse_rewrites);
   r.optional("pin_table_prove_unique_keys", opt.prove_unique_keys);

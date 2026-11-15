@@ -17,6 +17,7 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -686,8 +687,12 @@ TEST_CASE_METHOD(dense_count_join_fixture,
   REQUIRE(disabled_plan);
   using T = sirius::op::SiriusPhysicalOperatorType;
   CHECK(collect(disabled_plan.get(), T::DENSE_COUNT_JOIN).empty());
-  CHECK(collect(disabled_plan.get(), T::HASH_JOIN).size() == 1);
-  CHECK(collect(disabled_plan.get(), T::HASH_GROUP_BY).size() == 1);
+  auto const joins = collect(disabled_plan.get(), T::HASH_JOIN);
+  REQUIRE(joins.size() == 1);
+  // The streaming RIGHT join counts its build matches itself, so no HASH_GROUP_BY remains.
+  auto const& join = dynamic_cast<sirius::op::sirius_physical_hash_join&>(*joins.front());
+  CHECK(join.build_counts().has_value());
+  CHECK(collect(disabled_plan.get(), T::HASH_GROUP_BY).empty());
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
