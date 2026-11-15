@@ -282,13 +282,45 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
 
 // A correlated IN is the one MARK shape that genuinely mixes key policies: decorrelation makes
 // the correlated predicate null-safe while the IN operand stays a plain `=`, giving conditions
-// `(a IS NOT DISTINCT FROM a)` AND `(b = #0)`. That mixture is rejected at plan time.
+// `(a IS NOT DISTINCT FROM a)` AND `(b = #0)`. The IN rule then holds within each value of `a`.
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
-                 "gpu_execution mixed plain + null-safe MARK join falls back at plan time",
-                 "[integration][gpu_execution][join][nulls]")
+                 "gpu_execution correlated IN MARK join runs on GPU with per-group NULL marks",
+                 "[integration][gpu_execution][join][nulls][mark]")
 {
-  expect_plan_fallback_matches_cpu(
+  // mnl row 1 matches. Rows 2 and 3 have a NULL `b` against a non-empty group, so they are NULL.
+  // Row 4 misses a group with no NULL `b`, and rows 5 and 6 have an empty group (a NULL `a`
+  // equals nothing), so all three are FALSE, row 5 despite its NULL `b`.
+  compare_gpu_vs_cpu(
     "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS in_b FROM mnl");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b NOT IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS not_in_b FROM mnl");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b = ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS any_b FROM mnl");
+  // As a filter, NOT IN keeps only the definite FALSE marks.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id FROM mnl WHERE mnl.b NOT IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a)");
+  // No `id` matches a `b`. The miss is NULL where the row's own group holds a NULL `b` (rows 1
+  // to 3) and FALSE elsewhere, though other groups hold one.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.id IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS in_b FROM mnl");
+  // A null-safe correlation puts mnr's NULL `a` in a group of its own, which mnl row 6 matches.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a IS NOT DISTINCT FROM mnl.a) "
+    "AS in_b FROM mnl");
+  // Two correlated columns, so each group is one (a, id) pair.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a AND "
+    "mnr.id = mnl.id + 99) AS in_b FROM mnl");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution correlated IN MARK join with a cast IN operand",
+                 "[integration][gpu_execution][join][nulls][mark]")
+{
+  // The SMALLINT operand is cast to the subquery's INTEGER, so the IN key is a materialized
+  // column on the probe side.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtl.b IN (SELECT mtr.b FROM mtr WHERE mtr.a = mtl.a) AS in_b FROM mtl");
 }
 
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
@@ -416,11 +448,57 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                        ") AS m FROM ppl) GROUP BY m");
   }
 
-  // Correlated IN mixes a null-safe correlation key with the plain IN key; that MARK shape is
-  // rejected at plan time and runs on the CPU (unchanged by partitioning).
-  expect_plan_fallback_matches_cpu(
+  // A correlated IN mixes a null-safe correlation key with the plain IN key. Its NULL rule is per
+  // value of `g`: 13 large groups here, each holding NULL keys, so every miss is NULL.
+  compare_gpu_vs_cpu(
     "SELECT in_k, count(*) FROM (SELECT ppl.k IN (SELECT ppr_nulls.k FROM ppr_nulls WHERE "
     "ppr_nulls.g = ppl.g) AS in_k FROM ppl) GROUP BY in_k");
+}
+
+// A correlated IN over a build larger than both hash_partition_bytes and
+// max_build_hash_table_bytes. Its MARK join is hash-partitioned on the correlated column alone, so
+// each mark needs only its own partition's build.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution hash-partitioned correlated IN MARK join matches the CPU",
+                 "[integration][gpu_execution][join][nulls][mark][partition]")
+{
+  // 1000 probe groups; 1 in 101 probe rows has a NULL `g` and 1 in 97 a NULL `k`.
+  run_ok(
+    "CREATE TABLE cpl AS SELECT i AS id, CASE WHEN i % 101 = 0 THEN NULL ELSE i % 1000 END AS g, "
+    "CASE WHEN i % 97 = 0 THEN NULL ELSE (i // 1000) % 40 END AS k FROM range(300000) AS t(i);");
+  // Build groups 0 to 798, plus a NULL group: groups below 100 hold NULL `k`s, the others hold
+  // none, and groups 799 to 999 are empty. Half of the probe `k`s occur in a build group.
+  run_ok(
+    "CREATE TABLE cpr AS SELECT i AS id, "
+    "CASE WHEN i % 1000 = 799 THEN NULL ELSE i % 1000 END AS g, "
+    "CASE WHEN i % 1000 < 100 AND (i // 1000) % 7 = 0 THEN NULL ELSE ((i // 1000) % 30) * 2 END "
+    "AS k FROM range(600000) AS t(i) WHERE i % 1000 < 800;");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+  // Below the per-partition build size: only the planner's whole-build concat (join_concat_all)
+  // folds each partition's build into the one batch a MARK needs.
+  sirius::test::scoped_setting small_concat(*con, "concat_batch_bytes", 64 * 1024);
+
+  // A NULL probe `g` equals nothing under '=', so its group is empty; under IS NOT DISTINCT
+  // FROM it is the build's NULL group.
+  for (std::string const correlation : {"cpr.g = cpl.g", "cpr.g IS NOT DISTINCT FROM cpl.g"}) {
+    CAPTURE(correlation);
+    compare_gpu_vs_cpu(
+      "SELECT in_k, count(*), sum(id) FROM (SELECT cpl.id, cpl.k IN (SELECT cpr.k FROM cpr WHERE " +
+      correlation + ") AS in_k FROM cpl) GROUP BY in_k");
+    compare_gpu_vs_cpu(
+      "SELECT not_in_k, count(*), sum(id) FROM (SELECT cpl.id, cpl.k NOT IN (SELECT cpr.k FROM "
+      "cpr WHERE " +
+      correlation + ") AS not_in_k FROM cpl) GROUP BY not_in_k");
+    // NOT IN as a filter keeps the definite FALSE marks: a miss in a group with no NULL `k`,
+    // and every row of an empty group.
+    compare_gpu_vs_cpu(
+      "SELECT count(*), sum(id) FROM cpl WHERE cpl.k NOT IN (SELECT cpr.k FROM cpr WHERE " +
+      correlation + ")");
+  }
 }
 
 // Below, every key is IS NOT DISTINCT FROM, the join a set operation lowers to. Each case disables

@@ -139,10 +139,99 @@ mark_join_fixture create_mark_join(
   return f;
 }
 
+/**
+ * @brief Create the MARK join of a correlated IN with one correlated column:
+ * `left.g IS NOT DISTINCT FROM right.g AND left.v = right.v`.
+ * Left child has types {INTEGER, INTEGER, INTEGER} (g, v, id), right child has {INTEGER, INTEGER}
+ * (g, v).
+ */
+mark_join_fixture create_correlated_mark_join()
+{
+  mark_join_fixture f;
+
+  f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  f.logical_join->types = {duckdb::LogicalType::INTEGER,
+                           duckdb::LogicalType::INTEGER,
+                           duckdb::LogicalType::INTEGER,
+                           duckdb::LogicalType::BOOLEAN};
+
+  auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+      duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
+    0);
+  auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
+    0);
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition group_cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  conditions.push_back(std::move(group_cond));
+  duckdb::JoinCondition value_cond(
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
+    duckdb::ExpressionType::COMPARE_EQUAL);
+  conditions.push_back(std::move(value_cond));
+
+  f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
+    *f.logical_join,
+    std::move(left_child),
+    std::move(right_child),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    duckdb::JoinType::MARK,
+    duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
+    duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
+    sirius::from_duckdb_vec(
+      duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),  // delim_types
+    1000);
+
+  size_t next_id = 0;
+  number_operator_tree(*f.hash_join, next_id);
+
+  return f;
+}
+
 memory_space* get_shared_mem_space()
 {
   static auto manager = sirius::test::operator_utils::initialize_memory_manager();
   return manager->get_memory_space(Tier::GPU, 0);
+}
+
+using nullable_ints = std::vector<std::optional<int32_t>>;
+
+//! One INT32 column per argument; a nullopt entry is NULL.
+std::shared_ptr<cucascade::data_batch> make_nullable_int32_batch(
+  memory_space& space, const std::vector<nullable_ints>& columns)
+{
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& column : columns) {
+    std::vector<int32_t> values;
+    std::vector<bool> valids;
+    for (auto const& value : column) {
+      values.push_back(value.value_or(0));
+      valids.push_back(value.has_value());
+    }
+    batches.push_back(
+      make_numeric_batch_with_nulls<int32_t>(space, values, valids, cudf::type_id::INT32));
+  }
+  return concatenate_batches_horizontal(batches, space);
+}
+
+//! A mark column on the host; nullopt is a NULL mark.
+std::vector<std::optional<bool>> copy_marks_to_host(const cudf::column_view& mark)
+{
+  auto const valids = copy_validity_to_host(mark);
+  auto const values = copy_column_to_host<bool>(mark);
+  std::vector<std::optional<bool>> marks;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    marks.push_back(valids[i] ? std::optional<bool>{static_cast<bool>(values[i])} : std::nullopt);
+  }
+  return marks;
 }
 
 std::shared_ptr<cucascade::data_batch> make_three_int32_batch(memory_space& space,
@@ -1153,20 +1242,38 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::INNER));
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::MARK));
 
+  // One condition per comparison, on successive columns.
+  auto make_key_list = [](std::initializer_list<duckdb::ExpressionType> comparisons) {
+    duckdb::vector<duckdb::JoinCondition> conditions;
+    for (auto comparison : comparisons) {
+      auto const idx = static_cast<duckdb::idx_t>(conditions.size());
+      duckdb::JoinCondition cond(
+        duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+        duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
+        comparison);
+      conditions.push_back(std::move(cond));
+    }
+    return sirius::wrap_join_conditions(std::move(conditions));
+  };
+
   // Mixing the two is not, since one null_equality cannot express both policies.
-  duckdb::vector<duckdb::JoinCondition> mixed;
-  for (auto comparison :
-       {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM}) {
-    auto const idx = static_cast<duckdb::idx_t>(mixed.size());
-    duckdb::JoinCondition cond(
-      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
-      duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx),
-      comparison);
-    mixed.push_back(std::move(cond));
-  }
-  auto mixed_conditions = sirius::wrap_join_conditions(std::move(mixed));
+  auto mixed_conditions = make_key_list(
+    {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM});
   REQUIRE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::INNER));
   REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::MARK));
+
+  // The exception is a correlated IN: one null-safe key per correlated column, then the plain IN
+  // key.
+  auto correlated_conditions = make_key_list(
+    {duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM, duckdb::ExpressionType::COMPARE_EQUAL});
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(correlated_conditions, JT::MARK, 1));
+  // The correlated column count must account for every key but the last.
+  REQUIRE_FALSE(
+    sirius_physical_hash_join::are_conditions_supported(correlated_conditions, JT::MARK));
+  REQUIRE_FALSE(
+    sirius_physical_hash_join::are_conditions_supported(correlated_conditions, JT::MARK, 2));
+  // The IN key must come last.
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::MARK, 1));
 }
 
 // An all-null-safe MARK runs under EQUAL: NULL matches NULL and no comparison is UNKNOWN, so the
@@ -1468,6 +1575,206 @@ TEST_CASE(
     REQUIRE(marks[1].first == std::vector<bool>{true});
     REQUIRE(marks[1].second[0] == false);
   }
+}
+
+// `l.v IN (SELECT r.v FROM r WHERE r.g = l.g)`: `g` is the null-safe correlation key, `v` the plain
+// IN key. See sirius_physical_hash_join::mark_is_correlated for the rule.
+TEST_CASE("sirius_physical_hash_join correlated MARK applies the IN rule per group",
+          "[physical_hash_join][mark][nulls][correlated]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto f = create_correlated_mark_join();
+  // Both build sides of the STANDARD path (see mark_join_build_switch_ratio).
+  bool const build_on_left = GENERATE(false, true);
+  CAPTURE(build_on_left);
+  f.hash_join->mark_join_build_switch_ratio = build_on_left ? 0.1 : 0.0;
+
+  // Group 1 has no NULL IN key, group 2 has one, group NULL is matched null-safely, group 3 is
+  // empty.
+  auto right =
+    make_nullable_int32_batch(*space, {{1, 1, 2, 2, std::nullopt}, {10, 20, 10, std::nullopt, 30}});
+  nullable_ints const left_g{1, 1, 1, 2, 2, 2, 3, 3, std::nullopt, std::nullopt, std::nullopt};
+  nullable_ints const left_v{
+    10, 99, std::nullopt, 10, 99, std::nullopt, 10, std::nullopt, 30, 99, std::nullopt};
+  nullable_ints const left_id{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  auto left = make_nullable_int32_batch(*space, {left_g, left_v, left_id});
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left, right};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(view.num_columns() == 4);
+
+  std::vector<std::optional<bool>> const expected{
+    true,           // (1, 10) matches
+    false,          // (1, 99): group 1 holds no NULL
+    std::nullopt,   // (1, NULL): group 1 is not empty
+    true,           // (2, 10) matches
+    std::nullopt,   // (2, 99): group 2 holds a NULL
+    std::nullopt,   // (2, NULL)
+    false,          // (3, 10): group 3 is empty
+    false,          // (3, NULL): an empty group, even for a NULL IN key
+    true,           // (NULL, 30): NULL groups match
+    false,          // (NULL, 99)
+    std::nullopt};  // (NULL, NULL)
+  REQUIRE(copy_marks_to_host(view.column(3)) == expected);
+}
+
+// Each NULL source is resolved on its own: a build with no NULL IN key needs only the empty-group
+// test, a probe batch with no NULL IN key only the NULL-group test, and with neither every mark is
+// definite.
+TEST_CASE("sirius_physical_hash_join correlated MARK handles each NULL source alone",
+          "[physical_hash_join][mark][nulls][correlated]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  auto f = create_correlated_mark_join();
+
+  auto run = [&](std::shared_ptr<cucascade::data_batch> left,
+                 std::shared_ptr<cucascade::data_batch> right) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> inputs{std::move(left), std::move(right)};
+    auto outputs =
+      f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+    auto view = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+    auto mark = view.column(3);
+    return std::pair{copy_marks_to_host(mark), mark.null_count()};
+  };
+
+  SECTION("only the probe side has a NULL IN key")
+  {
+    auto right = make_nullable_int32_batch(*space, {{1, 1}, {10, 20}});
+    auto left  = make_nullable_int32_batch(
+      *space, {{1, 1, 3, 1}, {10, std::nullopt, std::nullopt, 99}, {0, 1, 2, 3}});
+    REQUIRE(run(left, right).first ==
+            std::vector<std::optional<bool>>{true, std::nullopt, false, false});
+  }
+
+  SECTION("only the build side has a NULL IN key")
+  {
+    auto right = make_nullable_int32_batch(*space, {{1, 2}, {10, std::nullopt}});
+    auto left  = make_nullable_int32_batch(*space, {{1, 1, 2, 3}, {10, 99, 99, 99}, {0, 1, 2, 3}});
+    REQUIRE(run(left, right).first ==
+            std::vector<std::optional<bool>>{true, false, std::nullopt, false});
+  }
+
+  SECTION("no NULL IN key on either side")
+  {
+    auto right = make_nullable_int32_batch(*space, {{1, std::nullopt}, {10, 30}});
+    auto left =
+      make_nullable_int32_batch(*space, {{1, 1, std::nullopt, 3}, {10, 99, 30, 10}, {0, 1, 2, 3}});
+    auto const result = run(left, right);
+    REQUIRE(result.second == 0);
+    REQUIRE(result.first == std::vector<std::optional<bool>>{true, false, true, false});
+  }
+
+  SECTION("an empty build")
+  {
+    auto right = make_nullable_int32_batch(*space, {{}, {}});
+    auto left  = make_nullable_int32_batch(*space, {{1, std::nullopt}, {10, std::nullopt}, {0, 1}});
+    auto const result = run(left, right);
+    REQUIRE(result.second == 0);
+    REQUIRE(result.first == std::vector<std::optional<bool>>{false, false});
+  }
+}
+
+// Partitioning on the correlation key alone keeps a group's rows, whatever their IN keys, in one
+// partition.
+TEST_CASE("sirius_physical_hash_join correlated MARK partitions on its correlation keys",
+          "[physical_hash_join][mark][correlated][partition]")
+{
+  auto f           = create_correlated_mark_join();
+  auto const& keys = f.hash_join->prepared_keys();
+  REQUIRE(keys.size() == 1);
+  REQUIRE(keys[0].left_index == 0);
+  REQUIRE(keys[0].right_index == 0);
+}
+
+// BUILD_PROBE keeps one build per partition and streams probe batches against it. The filter over
+// every group is built only by the first probe batch that holds a NULL IN key.
+TEST_CASE("sirius_physical_hash_join correlated MARK streams probe batches in BUILD_PROBE",
+          "[physical_hash_join][mark][nulls][correlated][build_probe]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+  bool const build_has_null_in_key = GENERATE(false, true);
+  CAPTURE(build_has_null_in_key);
+
+  auto f          = create_correlated_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // A small build on one GPU: a single BUILD_PROBE slot.
+  f.hash_join->set_active_gpu_ids({0});
+  constexpr uint64_t build_bytes = 1024;
+  auto const strategy =
+    f.hash_join->get_partition_strategy({build_bytes, true, true, build_bytes, 4, 4, build_bytes});
+  REQUIRE(strategy.num_partitions == 1);
+  REQUIRE(strategy.build_probe);
+  f.hash_join->set_placement(std::make_shared<const partition_placement>(strategy.placement));
+
+  // Groups 1 and 2; group 2 holds a NULL IN key in one variant.
+  build_repo->add_data_batch(
+    make_nullable_int32_batch(
+      *space,
+      {{1, 1, 2, 2},
+       {10,
+        20,
+        10,
+        build_has_null_in_key ? std::optional<int32_t>{} : std::optional<int32_t>{20}}}),
+    0);
+  // The first probe batch has no NULL IN key, the second has two.
+  probe_repo->add_data_batch(
+    make_nullable_int32_batch(*space, {{1, 2, 3}, {10, 99, 10}, {0, 1, 2}}), 0);
+  probe_repo->add_data_batch(
+    make_nullable_int32_batch(*space,
+                              {{1, 3, 2}, {std::nullopt, std::nullopt, 10}, {100, 101, 102}}),
+    0);
+  build_pipeline->finished = true;
+  probe_pipeline->finished = true;
+
+  // One build-and-probe task, then one probe-only task; keyed by each batch's first id.
+  std::map<int32_t, std::vector<std::optional<bool>>> marks;
+  for (auto hint = f.hash_join->get_next_task_hint();
+       hint.has_value() && hint->hint == TaskCreationHint::READY;
+       hint = f.hash_join->get_next_task_hint()) {
+    auto input = f.hash_join->get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    auto output = f.hash_join->execute(*input, cudf::get_default_stream());
+    auto view   = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
+    marks[copy_column_to_host<int32_t>(view.column(2)).front()] =
+      copy_marks_to_host(view.column(3));
+  }
+  REQUIRE(f.hash_join->is_build_probe_mode());
+  REQUIRE(marks.size() == 2);
+
+  // (1, 10) matches; (2, 99) misses a group that may hold a NULL; group 3 is empty.
+  REQUIRE(marks[0] == std::vector<std::optional<bool>>{
+                        true,
+                        build_has_null_in_key ? std::optional<bool>{} : std::optional<bool>{false},
+                        false});
+  // (1, NULL) is NULL, (3, NULL) is FALSE because group 3 is empty, (2, 10) matches.
+  REQUIRE(marks[100] == std::vector<std::optional<bool>>{std::nullopt, false, true});
 }
 
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",

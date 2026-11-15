@@ -17,6 +17,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cudf/binaryop.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -129,13 +130,32 @@ static bool all_keys_null_safe(duckdb::vector<sirius::join_condition> const& con
 
 // A MARK join mixing null-safe keys with anything else (a plain `=`, or an inequality). cuDF takes
 // one null_equality for every key and MARK does not route null-safe keys into the mixed-join
-// predicate, so the null-safe key would silently inherit UNEQUAL. Callers must reject this shape.
+// predicate, so the null-safe key would silently inherit UNEQUAL. Callers must reject this shape
+// unless it is a correlated IN (is_correlated_mark).
 static bool mark_join_mixes_null_safe_keys(duckdb::vector<sirius::join_condition> const& conditions)
 {
   bool const has_null_safe = std::any_of(conditions.begin(), conditions.end(), [](auto const& c) {
     return c.comparison == sirius::comparison_type::not_distinct_from;
   });
   return has_null_safe && !all_keys_null_safe(conditions);
+}
+
+// A correlated IN / = ANY (see sirius_physical_hash_join::mark_is_correlated): @p delim_key_count
+// null-safe correlation keys, then the plain IN key, in DuckDB's positions.
+static bool is_correlated_mark(duckdb::vector<sirius::join_condition> const& conditions,
+                               duckdb::JoinType join_type,
+                               std::size_t delim_key_count)
+{
+  if (join_type != duckdb::JoinType::MARK || delim_key_count == 0 ||
+      conditions.size() != delim_key_count + 1) {
+    return false;
+  }
+  return std::all_of(conditions.begin(),
+                     conditions.end() - 1,
+                     [](auto const& c) {
+                       return c.comparison == sirius::comparison_type::not_distinct_from;
+                     }) &&
+         conditions.back().comparison == sirius::comparison_type::equal;
 }
 
 // Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
@@ -281,12 +301,15 @@ bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_typ
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
-  duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
+  duckdb::vector<sirius::join_condition>& conditions,
+  duckdb::JoinType join_type,
+  std::size_t delim_key_count)
 {
   if (!is_join_type_supported(join_type)) { return false; }
 
-  // All-null-safe MARK is fine (EQUAL keys, definite marks); only the mixture is unencodable.
-  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions)) {
+  // All-null-safe MARK is fine (EQUAL keys, definite marks); a mixture only as a correlated IN.
+  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions) &&
+      !is_correlated_mark(conditions, join_type, delim_key_count)) {
     return false;
   }
 
@@ -434,9 +457,13 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
   reorder_join_conditions(conditions, route_null_safe);
 
+  // `this->`: the parameter of the same name is moved-from.
+  mark_is_correlated_ = is_correlated_mark(conditions, join_type, this->delim_types.size());
+
   // Backstop for the planner's screen; reaching here would silently give the null-safe key
   // NULL != NULL semantics.
-  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions)) {
+  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions) &&
+      !mark_is_correlated_) {
     throw duckdb::NotImplementedException(
       "sirius_physical_hash_join: MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a "
       "plain key is not supported");
@@ -446,10 +473,12 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // null-safe keys get their semantics from NULL_EQUAL instead.
   compare_nulls_ = cudf::null_equality::UNEQUAL;
   if (join_type == duckdb::JoinType::MARK) {
-    // All-null-safe MARK takes EQUAL and emits definite marks; any other MARK keeps UNEQUAL and
-    // the three-valued IN/EXISTS reconstruction, which assumes a NULL key never matches.
+    // All-null-safe MARK takes EQUAL and emits definite marks; a correlated MARK takes EQUAL and
+    // applies its IN key's NULL rule per group (resolve_correlated_mark_join_result). Any other
+    // MARK keeps UNEQUAL and the three-valued IN/EXISTS reconstruction, which assumes a NULL key
+    // never matches.
     mark_is_null_safe_ = all_keys_null_safe(conditions);
-    if (mark_is_null_safe_) { compare_nulls_ = cudf::null_equality::EQUAL; }
+    if (mark_is_null_safe_ || mark_is_correlated_) { compare_nulls_ = cudf::null_equality::EQUAL; }
   } else {
     bool saw_null_safe   = false;
     bool saw_plain_equal = false;
@@ -526,10 +555,14 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       throw duckdb::NotImplementedException("Join key operands must have matching physical types");
     }
     bool const hash_key = is_hash_equality_key(condition.comparison, route_null_safe);
-    _prepared_keys.push_back({static_cast<cudf::size_type>(left_ref.column_index),
-                              static_cast<cudf::size_type>(right_ref.column_index),
-                              type,
-                              hash_key});
+    // A correlated MARK partitions on its correlation keys alone, so a group never spans
+    // partitions.
+    if (!mark_is_correlated_ || &condition != &conditions.back()) {
+      _prepared_keys.push_back({static_cast<cudf::size_type>(left_ref.column_index),
+                                static_cast<cudf::size_type>(right_ref.column_index),
+                                type,
+                                hash_key});
+    }
     if (!hash_key) { continue; }
     is_all_inequality_join = false;
     ++num_equality_conditions;
@@ -1730,7 +1763,7 @@ sirius_physical_hash_join::mark_null_state sirius_physical_hash_join::resolve_ma
 void sirius_physical_hash_join::observe_partitioned_build_batch(
   cucascade::read_only_data_batch const& batch)
 {
-  if (join_type != duckdb::JoinType::MARK || mark_is_null_safe()) { return; }
+  if (!mark_propagates_build_nulls()) { return; }
   auto const view = get_cudf_table_view(batch);
   if (view.num_rows() == 0) { return; }
   _partitioned_build_has_rows.store(true, std::memory_order_release);
@@ -1740,6 +1773,64 @@ void sirius_physical_hash_join::observe_partitioned_build_batch(
       return;
     }
   }
+}
+
+/// @brief A BOOL8 column of @p num_rows rows, all @p value.
+static std::unique_ptr<cudf::column> make_bool_column(bool value,
+                                                      cudf::size_type num_rows,
+                                                      ::cuda::stream_ref stream)
+{
+  cudf::numeric_scalar<bool> scalar(value, true, stream);
+  return cudf::make_column_from_scalar(scalar, num_rows, stream);
+}
+
+/// @brief Writes @p value into the rows of @p column that @p indices names.
+static std::unique_ptr<cudf::column> scatter_bool(
+  std::unique_ptr<cudf::column> column,
+  rmm::device_uvector<cudf::size_type> const& indices,
+  bool value,
+  ::cuda::stream_ref stream)
+{
+  if (indices.size() == 0) { return column; }
+  cudf::numeric_scalar<bool> scalar(value, true, stream);
+  // A row scatter over a one-column table: the scalar is broadcast to every row of the map.
+  auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(scalar))},
+                                 as_gather_map(indices),
+                                 cudf::table_view({column->view()}),
+                                 stream);
+  return std::move(scattered->release()[0]);
+}
+
+/// @brief The mark values of a MARK join: true at the left rows in @p semi_indices, false
+/// elsewhere, with no null mask.
+static std::unique_ptr<cudf::column> make_mark_column(
+  rmm::device_uvector<cudf::size_type> const& semi_indices,
+  cudf::size_type num_left_rows,
+  ::cuda::stream_ref stream)
+{
+  return scatter_bool(make_bool_column(false, num_left_rows, stream), semi_indices, true, stream);
+}
+
+/// @brief A MARK join's output batch: a copy of the left output columns (every row passes
+/// through, no gather) followed by @p mark_column.
+static std::unique_ptr<operator_data> make_mark_join_output(
+  cudf::table_view const& left_full,
+  std::vector<cudf::size_type> const& lhs_output_col_idxs,
+  std::unique_ptr<cudf::column> mark_column,
+  ::cucascade::read_only_data_batch const& left_batch,
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
+  std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
+  for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
+    mark_out_cols.push_back(std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
+  }
+  mark_out_cols.push_back(std::move(mark_column));
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+      std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
 }
 
 /// @brief the MARK join output from the semi_join matching row indices.
@@ -1787,47 +1878,13 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
 {
-  cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
-  auto num_left_rows                   = left_cols_to_output.num_rows();
-
-  std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
-  for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
-    mark_out_cols.push_back(std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
-  }
-
-  // Create BOOL8 mark column: start all-false, scatter true at matching positions
-  cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-  auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
-
-  if (semi_indices.size() > 0) {
-    cudf::numeric_scalar<bool> true_scalar(true, true, stream);
-    cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
-                                  static_cast<cudf::size_type>(semi_indices.size()),
-                                  semi_indices.data(),
-                                  nullptr,
-                                  0,
-                                  0,
-                                  {});
-    // The scatter API is a bit confusing when it says: the number of elements in first arg i.e.
-    // the vector should have same number of columns in the target table. It is essentially a
-    // row-scatter operation. For our use case, we have only column i.e. target mark column;
-    // therefore we are good. The scalar is broadcasted to respective positions provided by the
-    // scatter map.
-    auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
-                                   scatter_map,
-                                   cudf::table_view({mark_column->view()}),
-                                   stream);
-    mark_column    = std::move(scattered->release()[0]);
-  }
+  auto mark_column = make_mark_column(semi_indices, left_full.num_rows(), stream);
 
   // Null-safe comparisons and an empty build both produce definite marks. In particular,
   // NULL IN (empty) is FALSE: there is no build row that can make the comparison UNKNOWN.
   if (marks_are_definite) {
-    mark_out_cols.push_back(std::move(mark_column));
-    auto definite_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
-        std::move(definite_table), *left_batch.get_memory_space(), stream, telemetry_info)});
+    return make_mark_join_output(
+      left_full, lhs_output_col_idxs, std::move(mark_column), left_batch, stream, telemetry_info);
   }
 
   // Apply SQL three-valued logic by attaching a null mask: unmatched rows become NULL when the
@@ -1846,11 +1903,115 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   }
   if (null_count > 0) { mark_column->set_null_mask(std::move(null_mask), null_count); }
 
-  mark_out_cols.push_back(std::move(mark_column));
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
-  return std::make_unique<pipelineable_operator_data>(
-    std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
-      std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
+  return make_mark_join_output(
+    left_full, lhs_output_col_idxs, std::move(mark_column), left_batch, stream, telemetry_info);
+}
+
+/// @brief The correlation key columns of a correlated MARK's keys: all but the last, the IN key.
+static cudf::table_view correlated_mark_group_keys(cudf::table_view const& keys)
+{
+  return cudf::table_view(std::vector<cudf::column_view>(keys.begin(), keys.end() - 1));
+}
+
+/// @brief Records which groups of a correlated MARK's build hold a NULL IN key.
+/// @param build_keys  The build's prepared key columns; they must outlive the result.
+static std::unique_ptr<correlated_mark_build> make_correlated_mark_build(
+  cudf::table_view const& build_keys, ::cuda::stream_ref stream)
+{
+  auto build              = std::make_unique<correlated_mark_build>();
+  build->group_keys       = correlated_mark_group_keys(build_keys);
+  auto const build_in_key = build_keys.column(build_keys.num_columns() - 1);
+  if (build_in_key.null_count() > 0) {
+    auto const in_key_is_null     = cudf::is_null(build_in_key, stream);
+    build->null_in_key_group_keys = sirius::apply_retention_mask(
+      build->group_keys, in_key_is_null->view(), stream, cudf::get_current_device_resource_ref());
+    build->null_in_key_groups = make_right_filtered_join_ptr(
+      build->null_in_key_group_keys->view(), cudf::null_equality::EQUAL, stream);
+  }
+  return build;
+}
+
+/// @brief The filter over every group of @p build, built on first use.
+/// @note Synchronizes @p stream when it builds: other probe tasks read the filter on their own
+/// streams.
+static cudf::filtered_join& correlated_mark_groups(correlated_mark_build& build,
+                                                   ::cuda::stream_ref stream)
+{
+  std::scoped_lock lock(build.groups_mutex);
+  if (!build.groups) {
+    build.groups =
+      make_right_filtered_join_ptr(build.group_keys, cudf::null_equality::EQUAL, stream);
+    stream.sync();
+  }
+  return *build.groups;
+}
+
+/// @brief Row-wise AND of two BOOL8 columns without nulls.
+static std::unique_ptr<cudf::column> logical_and(cudf::column_view const& lhs,
+                                                 cudf::column_view const& rhs,
+                                                 ::cuda::stream_ref stream)
+{
+  return cudf::binary_operation(
+    lhs, rhs, cudf::binary_operator::LOGICAL_AND, cudf::data_type{cudf::type_id::BOOL8}, stream);
+}
+
+/// @brief The MARK output of a correlated IN (see sirius_physical_hash_join::mark_is_correlated).
+///
+/// With `matched`, `key_valid` (the probe IN key is not NULL), `group_has_null` (the group holds a
+/// NULL IN key) and `group_empty` per probe row, the mark is `matched AND key_valid`, valid where
+///
+///   group_empty OR (key_valid AND (matched OR NOT group_has_null))
+///
+/// `group_has_null` takes a join only when the build holds a NULL IN key, and `group_empty` only
+/// when the probe batch does.
+///
+/// @param match_indices  Left rows with a build row equal on every key under EQUAL, so a NULL
+///                       probe IN key matches the NULL IN keys of its group.
+/// @param build          Per-group NULL facts of this task's build.
+/// @param probe_keys     Probe key columns (post-cast): the correlation keys, then the IN key.
+static std::unique_ptr<operator_data> resolve_correlated_mark_join_result(
+  rmm::device_uvector<cudf::size_type> const& match_indices,
+  correlated_mark_build& build,
+  cudf::table_view const& probe_keys,
+  cudf::table_view const& left_full,
+  std::vector<cudf::size_type> const& lhs_output_col_idxs,
+  ::cucascade::read_only_data_batch const& left_batch,
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& telemetry_info = {})
+{
+  auto const num_rows       = left_full.num_rows();
+  auto mark_column          = make_mark_column(match_indices, num_rows, stream);
+  auto const probe_in_key   = probe_keys.column(probe_keys.num_columns() - 1);
+  bool const probe_has_null = probe_in_key.null_count() > 0;
+
+  // An empty build leaves every group empty: every mark is a definite FALSE.
+  if (build.group_keys.num_rows() > 0 && (probe_has_null || build.null_in_key_groups)) {
+    auto const probe_groups = correlated_mark_group_keys(probe_keys);
+    // matched OR NOT group_has_null
+    auto valid = make_bool_column(true, num_rows, stream);
+    if (build.null_in_key_groups) {
+      auto const has_null_rows = build.null_in_key_groups->semi_join(probe_groups, stream);
+      valid                    = scatter_bool(std::move(valid), *has_null_rows, false, stream);
+      valid                    = scatter_bool(std::move(valid), match_indices, true, stream);
+    }
+    if (probe_has_null) {
+      auto key_valid = cudf::is_valid(probe_in_key, stream);
+      if (build.null_in_key_groups) {
+        mark_column = logical_and(mark_column->view(), key_valid->view(), stream);
+        valid       = logical_and(valid->view(), key_valid->view(), stream);
+      } else {
+        // No NULL build IN key: nothing matched a NULL probe one, and `valid` is still all true.
+        valid = std::move(key_valid);
+      }
+      auto const empty_rows = correlated_mark_groups(build, stream).anti_join(probe_groups, stream);
+      valid                 = scatter_bool(std::move(valid), *empty_rows, true, stream);
+    }
+    auto [null_mask, null_count] = cudf::bools_to_mask(valid->view(), stream);
+    if (null_count > 0) { mark_column->set_null_mask(std::move(*null_mask), null_count); }
+  }
+
+  return make_mark_join_output(
+    left_full, lhs_output_col_idxs, std::move(mark_column), left_batch, stream, telemetry_info);
 }
 
 /// Bounds on the equality-matched (probe, kept) pairs a residual kept-build probe task filters;
@@ -2152,11 +2313,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
-          // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
-          // time, but the build keys are not retained beyond this scope.
-          // A hash-partitioned build uses the join-wide observation instead (slots differ).
-          if (join_type == duckdb::JoinType::MARK && !mark_is_null_safe() &&
-              !_mark_build_partitioned.load(std::memory_order_acquire)) {
+          if (mark_is_correlated()) {
+            // The slot keeps the key columns these per-group facts view alive.
+            slot.correlated_mark = make_correlated_mark_build(build_keys, stream);
+          } else if (mark_propagates_build_nulls() &&
+                     !_mark_build_partitioned.load(std::memory_order_acquire)) {
+            // Record whether the build keys contain a NULL; MARK three-valued logic needs it at
+            // probe time, but the build keys are not retained beyond this scope.
+            // A hash-partitioned build uses the join-wide observation instead (slots differ).
             set_build_has_null(_build_has_null, table_has_any_null(build_keys));
           }
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
@@ -2194,8 +2358,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
         // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
         // A zero-row build batch reaches this path rather than the no-batches fast path above.
+        auto semi_indices = slot.filtered_table->semi_join(probe_keys, stream);
+        if (mark_is_correlated()) {
+          return resolve_correlated_mark_join_result(*semi_indices,
+                                                     *slot.correlated_mark,
+                                                     probe_keys,
+                                                     left_full,
+                                                     lhs_output_columns.col_idxs,
+                                                     input_batches[0],
+                                                     stream,
+                                                     batch_telemetry());
+        }
         auto const build_empty = get_cudf_table_view(slot.build_table.value()).num_rows() == 0;
-        auto semi_indices      = slot.filtered_table->semi_join(probe_keys, stream);
         auto const nulls =
           resolve_mark_null_state(_build_has_null.load(std::memory_order_acquire) > 0, build_empty);
         return resolve_mark_join_result(*semi_indices,
@@ -2449,6 +2623,30 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       // much larger than the left (output) side, building on the smaller left via cudf::mark_join
       // is faster (see issue #510 microbenchmark). Crossover is hardware-dependent and configured
       // via operator_params::mark_join_build_switch_ratio (0 disables).
+      auto const resolve_marks = [&](rmm::device_uvector<cudf::size_type> const& semi_indices) {
+        if (mark_is_correlated()) {
+          auto const build = make_correlated_mark_build(right_keys, stream);
+          return resolve_correlated_mark_join_result(semi_indices,
+                                                     *build,
+                                                     left_keys,
+                                                     left_full,
+                                                     lhs_output_columns.col_idxs,
+                                                     input_batches[0],
+                                                     stream,
+                                                     batch_telemetry());
+        }
+        auto const nulls =
+          resolve_mark_null_state(table_has_any_null(right_keys), right_keys.num_rows() == 0);
+        return resolve_mark_join_result(semi_indices,
+                                        left_full,
+                                        lhs_output_columns.col_idxs,
+                                        left_keys,
+                                        nulls.build_has_null,
+                                        nulls.marks_are_definite,
+                                        input_batches[0],
+                                        stream,
+                                        batch_telemetry());
+      };
       if (mark_join_build_switch_ratio > 0.0 && left_full.num_rows() > 0 &&
           static_cast<double>(right_full.num_rows()) >=
             mark_join_build_switch_ratio * static_cast<double>(left_full.num_rows())) {
@@ -2459,32 +2657,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           left_full.num_rows(),
           right_full.num_rows());
         auto mark_join_object = make_left_mark_join(left_keys, compare_nulls(), stream);
-        auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
-        auto const nulls =
-          resolve_mark_null_state(table_has_any_null(right_keys), right_keys.num_rows() == 0);
-        return resolve_mark_join_result(*semi_indices,
-                                        left_full,
-                                        lhs_output_columns.col_idxs,
-                                        left_keys,
-                                        nulls.build_has_null,
-                                        nulls.marks_are_definite,
-                                        input_batches[0],
-                                        stream,
-                                        batch_telemetry());
+        return resolve_marks(*mark_join_object.semi_join(right_keys, stream));
       }
       auto filtered_join_object = make_right_filtered_join(right_keys, compare_nulls(), stream);
-      auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
-      auto const nulls =
-        resolve_mark_null_state(table_has_any_null(right_keys), right_keys.num_rows() == 0);
-      return resolve_mark_join_result(*semi_indices,
-                                      left_full,
-                                      lhs_output_columns.col_idxs,
-                                      left_keys,
-                                      nulls.build_has_null,
-                                      nulls.marks_are_definite,
-                                      input_batches[0],
-                                      stream,
-                                      batch_telemetry());
+      return resolve_marks(*filtered_join_object.semi_join(left_keys, stream));
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result = cudf::full_join(left_keys, right_keys, compare_nulls(), stream);
       left_indices     = std::move(join_result.first);
@@ -2586,6 +2762,7 @@ void sirius_physical_hash_join::on_finalize_operator()
       slot.filtered_table.reset();
       slot.kept_matched.reset();
       slot.kept_build_batch.reset();
+      slot.correlated_mark.reset();
       slot.build_table = std::nullopt;
       slot.built_table_cast_columns.clear();
       slot.build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);

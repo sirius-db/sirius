@@ -439,6 +439,20 @@ std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& con
   return outputs;
 }
 
+// A correlated IN / = ANY: one null-safe key per correlated column (`mark_types`), then the plain
+// IN key. Mirrors sirius_physical_hash_join::mark_is_correlated.
+static bool is_correlated_in_mark(duckdb::LogicalComparisonJoin const& op)
+{
+  auto const correlated = op.mark_types.size();
+  if (correlated == 0 || op.conditions.size() != correlated + 1) { return false; }
+  for (std::size_t i = 0; i < correlated; ++i) {
+    if (op.conditions[i].GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      return false;
+    }
+  }
+  return op.conditions.back().GetComparisonType() == duckdb::ExpressionType::COMPARE_EQUAL;
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJoin& op)
 {
@@ -507,11 +521,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     reject_nested_column_operation(*condition.RightReference(), "a join condition");
   }
 
-  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys has no correct GPU
-  // encoding (see mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp), and the NLJ
-  // is no escape hatch: its MARK arm models the mixture but evaluates each (left batch x right
-  // batch) pair independently, so a left side spread over several right batches emits one partial
-  // mark per pair. Reject here so both routes are closed and DuckDB's CPU mark join answers.
+  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys runs on the GPU only as a
+  // correlated IN. Any other mixture has no correct GPU encoding (see
+  // mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp), and the NLJ is no escape
+  // hatch: its MARK arm models the mixture but evaluates each (left batch x right batch) pair
+  // independently, so a left side spread over several right batches emits one partial mark per
+  // pair. Reject here so both routes are closed and DuckDB's CPU mark join answers.
   if (op.join_type == duckdb::JoinType::MARK) {
     bool has_null_safe = false;
     bool all_null_safe = !op.conditions.empty();
@@ -522,7 +537,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         all_null_safe = false;
       }
     }
-    if (has_null_safe && !all_null_safe) {
+    if (has_null_safe && !all_null_safe && !is_correlated_in_mark(op)) {
       throw duckdb::NotImplementedException(
         "MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a plain key not supported "
         "in GPU");
@@ -640,8 +655,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   sirius::op::sirius_physical_hash_join::materialize_expression_join_keys(
     conditions, left, right, left_projection_map, right_projection_map);
 
-  bool is_supported_by_hash_join =
-    sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
+  bool is_supported_by_hash_join = sirius::op::sirius_physical_hash_join::are_conditions_supported(
+    conditions, op.join_type, op.mark_types.size());
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto options               = duckdb::query_operator_options(context);
     const auto& op_params      = *options;
