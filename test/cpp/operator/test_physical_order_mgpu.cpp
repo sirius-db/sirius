@@ -28,7 +28,12 @@
 //      multi-partition floor; correctness only.
 //   3. ORDER BY ... LIMIT over large input — exercises the top-N merge
 //      path with cross-GPU partitions feeding a single-GPU top-N sink.
+//   4. ORDER BY without LIMIT, forced onto many range partitions with a small
+//      sample — the only case here that reaches SORT_SAMPLE → SORT_PARTITION
+//      with more than one partition, and with SORT_PARTITION tasks on a GPU
+//      other than the one that computed the partition boundaries.
 
+#include "log/logging.hpp"
 #include "mgpu_test_utils.hpp"
 
 #include <cuda_runtime.h>
@@ -38,9 +43,12 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace sirius::test::mgpu;
@@ -68,6 +76,63 @@ fs::path make_tmp_dir(std::string const& tag)
   fs::remove_all(tmp, ec);
   fs::create_directories(tmp);
   return tmp;
+}
+
+bool log_dir_contains(fs::path const& log_dir, std::string const& needle)
+{
+  (void)sirius::log::get_sink()->flush();
+  std::error_code ec;
+  for (auto const& entry : fs::recursive_directory_iterator(log_dir, ec)) {
+    if (!entry.is_regular_file()) { continue; }
+    std::ifstream in(entry.path());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    if (ss.str().find(needle) != std::string::npos) { return true; }
+  }
+  return false;
+}
+
+// Runs @p query on the GPU with CPU fallback off and on DuckDB's CPU engine, and requires the two
+// results to be equal row for row, in order. require_gpu_matches_cpu sorts both sides first, which
+// would hide a wrongly ordered result.
+void require_gpu_matches_cpu_in_order(duckdb::Connection& con, std::string const& query)
+{
+  auto run = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(sql << ": " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+
+  run("SET enable_duckdb_fallback = false;");
+  auto gpu_result = run("CALL gpu_execution(\"" + query + "\")");
+  run("SET gpu_execution = false;");
+  auto cpu_result = run(query + ";");
+  run("SET gpu_execution = true;");
+
+  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+  auto const ncols = gpu_result->ColumnCount();
+  auto const nrows = gpu_result->RowCount();
+  auto gpu_rows    = gpu_result->Collection().GetRows();
+  auto cpu_rows    = cpu_result->Collection().GetRows();
+  // One assertion for the whole result: the result has millions of cells.
+  duckdb::idx_t mismatches = 0;
+  for (duckdb::idx_t r = 0; r < nrows; ++r) {
+    for (duckdb::idx_t c = 0; c < ncols; ++c) {
+      auto const gpu_cell = gpu_rows.GetValue(c, r).ToString();
+      auto const cpu_cell = cpu_rows.GetValue(c, r).ToString();
+      if (gpu_cell == cpu_cell) { continue; }
+      if (mismatches == 0) {
+        UNSCOPED_INFO("first mismatch at row " << r << " col " << c << ": GPU=[" << gpu_cell
+                                               << "] CPU=[" << cpu_cell << "]");
+      }
+      ++mismatches;
+    }
+  }
+  REQUIRE(mismatches == 0);
 }
 
 }  // namespace
@@ -243,6 +308,73 @@ TEST_CASE("physical_order - order by with limit over large input",
   REQUIRE(tasks_per_gpu.count(1));
   REQUIRE(tasks_per_gpu.at(0) >= 1);
   REQUIRE(tasks_per_gpu.at(1) >= 1);
+
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+// A range sort computes its partition boundaries once, in the first SORT_SAMPLE task, on that
+// task's GPU. Every later batch is range-partitioned by its own task on the GPU that holds it, so
+// that task needs the boundaries in its own GPU's memory: reading the first task's table is an
+// illegal memory access on GPUs without access to each other's memory pool.
+//
+// The other tests in this file use LIMIT, which plans TOP_N and never reaches this path.
+TEST_CASE("physical_order - range sort partitions batches on a GPU other than the sample's",
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp  = make_tmp_dir("range");
+  auto yaml = tmp / "mgpu.yaml";
+
+  // 8 files × 500k rows. Each query below reads two columns, about 64 MiB, which the 16 MB scan
+  // batch size splits into several batches spread over both GPUs. `k` is a permuted key, `s` its
+  // string form, `n` a nullable key; `v` breaks ties within a file. The files are identical, so
+  // rows that tie on every column are equal and the expected order is still unique.
+  constexpr int kNumFiles    = 8;
+  constexpr int kRowsPerFile = 500000;
+  generate_parquet_surface(tmp,
+                           "SELECT (range * 7919) % 1000003 AS k, range AS v, "
+                           "'key-' || lpad(((range * 7919) % 1000003)::VARCHAR, 8, '0') AS s, "
+                           "CASE WHEN range % 10 = 0 THEN NULL ELSE (range * 31) % 100003 END AS n "
+                           "FROM range(" +
+                             std::to_string(kRowsPerFile) + ")",
+                           kNumFiles);
+
+  // DEBUG level so the per-GPU boundary copy is logged.
+  scoped_log_dir log_dir(tmp / "logs", "debug");
+  write_mgpu_yaml(yaml, make_params());
+  REQUIRE(fs::exists(yaml));
+
+  auto const source = "FROM read_parquet('" + parquet_glob(tmp) + "') ";
+  std::vector<std::string> const queries{
+    "SELECT k, v " + source + "ORDER BY k, v DESC",
+    "SELECT s, v " + source + "ORDER BY s DESC, v",
+    "SELECT n, v " + source + "ORDER BY n DESC NULLS FIRST, v",
+  };
+
+  {
+    scoped_mgpu_env env(yaml);
+    auto con = env.make_connection();
+    // 1 MiB per partition gives tens of range partitions. A 4 MiB sample is met by the first
+    // batch, so the boundaries come from one batch on one GPU and every other batch is
+    // partitioned by a later task, on whichever GPU holds it.
+    for (auto const* setting :
+         {"SET max_sort_partition_bytes = 1048576;", "SET sort_sample_bytes = 4194304;"}) {
+      auto result = con.Query(setting);
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+    }
+
+    for (auto const& query : queries) {
+      INFO(query);
+      require_gpu_matches_cpu_in_order(con, query);
+    }
+
+    // The path under test ran: a GPU other than the sample task's received the boundaries.
+    INFO("log dir: " << log_dir.path());
+    REQUIRE(log_dir_contains(log_dir.path(), "[sort_boundaries] copied"));
+  }
 
   std::error_code ec;
   fs::remove_all(tmp, ec);

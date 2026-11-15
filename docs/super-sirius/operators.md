@@ -612,13 +612,19 @@ Samples input batches to compute P-1 partition boundary rows for range partition
 Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE → SCHEDULED → DONE`.
 - `get_next_task_hint()` waits in `NOT_DONE` until enough sample bytes are available (or the upstream finishes), then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
 - `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
-- `execute()` merges the pre-sorted sample batches, computes the boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
+- `execute()` merges the pre-sorted sample batches, computes the boundaries, synchronizes its stream and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
+
+The boundary rows are computed once, on the GPU of the sample task, but each SORT_PARTITION task
+searches its batch on the GPU that holds the batch. `sort_boundaries` (`src/op/sort_boundaries.hpp`)
+keeps the rows on the host and uploads one copy per GPU on the first request from that GPU, so a
+task never reads another GPU's memory pool. Each copy is complete before any task can see it, so
+tasks on other streams need no further ordering.
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.

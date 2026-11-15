@@ -18,11 +18,13 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sort_boundaries.hpp"
 #include "sirius_config.hpp"
 
-#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <atomic>
+#include <memory>
 
 namespace sirius {
 namespace op {
@@ -70,8 +72,20 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //! Get the computed partition boundaries (P-1 rows, sort key columns only)
-  const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
+  //! Get the computed partition boundaries (P-1 rows, sort key columns only) in @p space's
+  //! memory, for a task running on @p stream. Each GPU reads its own copy; see sort_boundaries.
+  //! Only valid once boundaries_computed() is true and get_num_partitions() is above 1.
+  [[nodiscard]] cudf::table_view get_partition_boundaries(
+    cucascade::memory::memory_space const& space, ::cuda::stream_ref stream) const
+  {
+    return _partition_boundaries->view_for(space, stream);
+  }
+
+  //! Number of partition boundary rows (0 when the sort has one partition)
+  [[nodiscard]] cudf::size_type get_num_partition_boundaries() const
+  {
+    return _partition_boundaries ? _partition_boundaries->num_rows() : 0;
+  }
 
   //! Get the computed number of partitions
   size_t get_num_partitions() const { return _num_partitions; }
@@ -82,12 +96,14 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return _boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE;
   }
 
-  //! Release the partition boundaries table to free GPU memory
+  //! Release the partition boundaries and every GPU's copy of them. Call only after all
+  //! SORT_PARTITION tasks have finished.
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
  private:
-  //! Partition boundary rows (P-1 rows containing sort key column values)
-  std::unique_ptr<cudf::table> _partition_boundaries;
+  //! Partition boundary rows (P-1 rows containing sort key column values). Set before
+  //! _boundary_state becomes DONE and not replaced afterwards.
+  std::unique_ptr<sort_boundaries> _partition_boundaries;
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;

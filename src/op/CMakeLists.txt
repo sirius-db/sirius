@@ -104,6 +104,7 @@ target_sources(
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
           sirius_physical_window.cpp
+          sort_boundaries.cpp
           aggregate/average.cu
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu

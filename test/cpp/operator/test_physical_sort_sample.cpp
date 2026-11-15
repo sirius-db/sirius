@@ -300,10 +300,10 @@ TEST_CASE("sirius_physical_sort_sample merges pre-sorted batches for partition b
   REQUIRE(output != nullptr);
   REQUIRE(sample_op.boundaries_computed());
   REQUIRE(sample_op.get_num_partitions() == 2);
-  REQUIRE(sample_op.get_partition_boundaries().num_rows() == 1);
+  REQUIRE(sample_op.get_num_partition_boundaries() == 1);
 
-  const auto boundary_key =
-    read_int32_column(sample_op.get_partition_boundaries().view().column(0), 0);
+  const auto boundary_key = read_int32_column(
+    sample_op.get_partition_boundaries(*space, cudf::get_default_stream()).column(0), 0);
   REQUIRE(boundary_key == 50);
 }
 
@@ -340,7 +340,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == 2);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
+  CHECK(sample_op.get_num_partition_boundaries() == 1);
 }
 
 TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
@@ -393,5 +393,5 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
   CHECK(sample_op.get_num_partitions() == rows_per_batch);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
+  CHECK(sample_op.get_num_partition_boundaries() == rows_per_batch - 1);
 }

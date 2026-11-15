@@ -66,10 +66,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       input.get_data_batches(), std::vector<std::size_t>(input.get_data_batches().size(), 0));
   }
 
-  auto start           = std::chrono::high_resolution_clock::now();
-  size_t num_parts     = _sample_op->get_num_partitions();
-  auto& boundaries     = _sample_op->get_partition_boundaries();
-  auto boundaries_view = boundaries.view();
+  auto start       = std::chrono::high_resolution_clock::now();
+  size_t num_parts = _sample_op->get_num_partitions();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -106,6 +104,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       sort_key_cols.push_back(input_table.column(idx));
     }
     cudf::table_view batch_sort_keys(sort_key_cols);
+
+    // The boundaries were computed on the GPU of the sample task. Read this GPU's copy: the
+    // batch and the boundaries must be in the same memory pool for the search below.
+    auto boundaries_view = _sample_op->get_partition_boundaries(*space, stream);
 
     // Use lower_bound: haystack=batch (sorted), needles=boundaries
     // Returns P-1 split positions in the batch
