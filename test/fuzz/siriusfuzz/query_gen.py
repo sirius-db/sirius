@@ -1042,11 +1042,13 @@ class QueryGenerator:
                 )
             if l.kind == "int" and l.type.signed:
                 self._note("join:expression_keys")
-                if rng.random() < 0.5:
+                # Widen first: the column may hold its type's maximum.
+                if l.type.bits < 64 and rng.random() < 0.5:
                     self._note("join:expression_arith")
-                    return Compare(
-                        "=", Arith("+", l, Literal(1, l.type), kind="int"), r
+                    wide = Arith(
+                        "+", Cast(l, st.BIGINT), Literal(1, st.BIGINT), kind="int"
                     )
+                    return Compare("=", wide, Cast(r, st.BIGINT))
                 self._note("join:expression_cast")
                 return Compare("=", Cast(l, st.BIGINT), Cast(r, st.BIGINT))
         if self.f.joins.inequality and allow_ineq_only and rng.random() < 0.08:

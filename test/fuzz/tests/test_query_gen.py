@@ -19,6 +19,7 @@ from siriusfuzz.session import Session
 from siriusfuzz.sqlast import (
     Agg,
     Arith,
+    Literal,
     ColumnRef,
     Compare,
     Derived,
@@ -241,6 +242,7 @@ class Phase2dJoinBudget(unittest.TestCase):
             "join:on_filters",
         ):
             self.assertGreater(qg.stats[tag], 0, tag)
+        arith = 0
         joins = [n for q in queries for n in walk(q) if isinstance(n, Join)]
         self.assertTrue(
             any(
@@ -263,6 +265,15 @@ class Phase2dJoinBudget(unittest.TestCase):
                 and j.cond.left.name != "k"
             ):
                 self.assertFalse(j.left.table.startswith("f"))
+            # Arithmetic keys are widened so a column maximum cannot overflow.
+            if (
+                isinstance(j.cond, Compare)
+                and isinstance(j.cond.left, Arith)
+                and isinstance(j.cond.left.right, Literal)
+            ):
+                self.assertIn("AS BIGINT) + ", j.cond.left.sql())
+                arith += 1
+        self.assertGreater(arith, 0)
 
 
 class Phase2cEdgeValues(unittest.TestCase):
