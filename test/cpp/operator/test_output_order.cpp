@@ -122,7 +122,7 @@ TEST_CASE("Output order traverses virtual child views", "[output_order]")
 TEST_CASE("Physical order analysis distinguishes local sorting from global merge", "[output_order]")
 {
   using namespace sirius::op;
-  sirius_physical_order local({}, {}, {}, 0);
+  sirius_physical_order local({}, 0, {}, {}, 0);
   REQUIRE(local.output_order() == OrderPreservationType::NO_ORDER);
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
   expressions.push_back(std::make_unique<sirius::ast::node>(sirius::ast::reference{0}));

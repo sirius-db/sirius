@@ -37,7 +37,23 @@
 
 // The file-backed native-scan fixture + GPU-vs-CPU comparator are shared with
 // the other gpu_execution integration suites; keep the historical name locally.
-using ArrayFixture = sirius::test::GpuExecutionFixture;
+class ArrayFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  void compare_sort_fallback(const std::string& sql)
+  {
+    INFO(sql);
+    run_ok("SET gpu_execution=false");
+    auto cpu = con->Query(sql);
+    REQUIRE_FALSE(cpu->HasError());
+    run_ok("SET gpu_execution=true");
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query(sql);
+    REQUIRE_FALSE(result->HasError());
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+    CHECK(sirius::test::collect_rows(*result, false) == sirius::test::collect_rows(*cpu, false));
+  }
+};
 
 namespace {
 
@@ -102,7 +118,7 @@ TEST_CASE_METHOD(ArrayFixture,
   run_ok("CREATE TABLE arr_allnull (id INTEGER, a INTEGER[3]);");
   run_ok("INSERT INTO arr_allnull SELECT range::INTEGER, NULL::INTEGER[3] FROM range(3000);");
   run_ok("CHECKPOINT;");
-  compare_gpu_vs_cpu("SELECT id, a FROM arr_allnull ORDER BY id;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_allnull;");
   compare_gpu_vs_cpu("SELECT count(*), count(a) FROM arr_allnull;");
 }
 
@@ -117,7 +133,7 @@ TEST_CASE_METHOD(ArrayFixture,
     "INSERT INTO arr_nullelems SELECT range::INTEGER, "
     "[NULL, NULL, NULL]::INTEGER[3] FROM range(3000);");
   run_ok("CHECKPOINT;");
-  compare_gpu_vs_cpu("SELECT id, a FROM arr_nullelems ORDER BY id;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_nullelems;");
 }
 
 TEST_CASE_METHOD(ArrayFixture,
@@ -346,36 +362,26 @@ TEST_CASE_METHOD(ArrayFixture,
 }
 
 TEST_CASE_METHOD(ArrayFixture,
-                 "gpu_execution array - NULL arrays survive an ORDER BY",
+                 "gpu_execution array - full ORDER BY declines nested payloads",
                  "[integration][gpu_execution][array][nulls]")
 {
-  // Regression: once a gather (ORDER BY) sorts a LIST column holding NULL arrays,
-  // cudf compacts the NULL rows' children out, so the values child is no longer
-  // fixed-stride. copy_array reads the LIST offsets to place each row's children
-  // at their array_size slot; a fixed-stride read would shift elements across
-  // rows. Mix whole-array NULLs with child-element NULLs so both validity levels
-  // ride through the sort. Every other null-array test omits ORDER BY.
+  // The common merge consumer currently declines ARRAY payloads in planning.
+  // Verify explicit fallback preserves both array-level and element-level NULLs.
   run_ok("CREATE TABLE arr_null_sort (id INTEGER, a INTEGER[3]);");
   run_ok(
     "INSERT INTO arr_null_sort VALUES "
     "(1, [1, 2, 3]), (2, NULL), (3, [NULL, 5, NULL]), (4, [7, NULL, 9]), (5, NULL);");
   run_ok("CHECKPOINT;");
-  // DESC so the sort's gather actually permutes the null rows out of input order.
-  compare_gpu_vs_cpu_ordered("SELECT id, a FROM arr_null_sort ORDER BY id DESC;");
+  // DESC verifies fallback preserves the requested output order.
+  compare_sort_fallback("SELECT id, a FROM arr_null_sort ORDER BY id DESC;");
 }
 
 TEST_CASE_METHOD(ArrayFixture,
-                 "gpu_execution array - NULL arrays survive an ORDER BY across scan batches",
+                 "gpu_execution array - full ORDER BY fallback preserves multi-batch NULL arrays",
                  "[integration][gpu_execution][array][nulls]")
 {
-  // Multi-batch regression for the compacted-child read-back. After ORDER BY
-  // compacts NULL arrays' children out, a later 2048-row window with no NULL
-  // arrays takes copy_array's fast path, but its element mask no longer starts
-  // at row_offset*array_size, it starts at the compacted base (and unaligned).
-  // Cluster whole-array NULLs early (ids 1000-1099) so the first window is
-  // compacted (slow path) and later windows are dense (fast path reading from the
-  // shifted base); element-level NULLs everywhere keep the child mask exercised.
-  // 5000 rows > STANDARD_VECTOR_SIZE (2048) forces multiple scan batches.
+  // Qualify the coverage reduction explicitly for more than one scan batch.
+  // GPU scan/read-back coverage remains in the passthrough and Top-N tests.
   run_ok("CREATE TABLE arr_null_sort_big (id INTEGER, a INTEGER[3]);");
   run_ok(
     "INSERT INTO arr_null_sort_big SELECT i, "
@@ -384,7 +390,7 @@ TEST_CASE_METHOD(ArrayFixture,
     "ELSE [i, i + 1, i + 2] END "
     "FROM range(5000) t(i);");
   run_ok("CHECKPOINT;");
-  compare_gpu_vs_cpu_ordered("SELECT id, a FROM arr_null_sort_big ORDER BY id;");
+  compare_sort_fallback("SELECT id, a FROM arr_null_sort_big ORDER BY id;");
 }
 
 //===----------------------------------------------------------------------===//

@@ -100,8 +100,10 @@ TEST_CASE_METHOD(OrderNullsGPUExecutionFixture,
                  "gpu_execution ORDER BY places NULLs correctly for ASC and DESC",
                  "[integration][gpu_execution][order_by][nulls]")
 {
-  // Shrink the sort partition so the 30k rows span multiple partitions and the
-  // merge path (not just a single-partition sort) is exercised with NULL keys.
+  // Exercise the common consumer with different run sizes and NULL keys.
+  auto const* chunk_bytes = GENERATE("4096", "65536");
+  scoped_setting sort_chunks(*this, "sort_chunk_bytes", chunk_bytes);
+  CAPTURE(chunk_bytes);
   scoped_setting sort_partition(*this, "max_sort_partition_bytes", "65536");
 
   for (const auto& order_case : kNullOrderCases) {

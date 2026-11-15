@@ -16,12 +16,23 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
+#include "utils/test_physical_operator.hpp"
+
+#include <cudf/concatenate.hpp>
 
 #include <catch.hpp>
+#include <duckdb.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_merge_sort.hpp>
 #include <op/sirius_physical_order.hpp>
 #include <op/sirius_physical_sort_partition.hpp>
+#include <op/sirius_physical_sort_sample.hpp>
+
+#include <algorithm>
+#include <functional>
+#include <random>
 
 using namespace sirius::op;
 using sirius::op::operator_data;
@@ -94,6 +105,7 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
 {
   sirius_physical_order order_op(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    types.size(),
     copy_orders(orders),
     duckdb::vector<duckdb::idx_t>(projections),
     0);
@@ -103,6 +115,79 @@ std::shared_ptr<data_batch> sort_batch(const std::shared_ptr<data_batch>& batch,
 }
 
 }  // namespace
+
+// Drive the same claim/prepare/execute/publish lifecycle as production. Each round
+// claims every currently available task, then completes them in reverse claim order,
+// so publication order differs from claim order. Returns final chunks in position order,
+// and records the kind of every executed task in `kinds` when given.
+std::vector<std::shared_ptr<data_batch>> run_ranges(
+  sirius_physical_merge_sort& merge,
+  std::vector<std::vector<std::shared_ptr<data_batch>>> ranges,
+  std::vector<sirius_physical_merge_sort::step>* kinds = nullptr)
+{
+  cucascade::shared_data_repository_manager repositories;
+  cucascade::shared_data_repository input, output;
+  sirius::op::test_physical_operator destination(SiriusPhysicalOperatorType::FILTER, {}, 0);
+  merge.operator_id = 1;
+  merge.register_refinement(repositories);
+  merge.add_port("default",
+                 std::make_unique<sirius_physical_operator::port>(
+                   MemoryBarrierType::FULL, &input, nullptr, nullptr));
+  destination.add_port("default",
+                       std::make_unique<sirius_physical_operator::port>(
+                         MemoryBarrierType::FULL, &output, nullptr, nullptr));
+  merge.add_next_port_after_sink({&destination, "default"});
+  for (std::size_t range = 0; range < ranges.size(); ++range) {
+    for (auto const& batch : ranges[range]) {
+      if (batch) { input.add_data_batch(batch, range); }
+    }
+  }
+  while (true) {
+    std::vector<std::unique_ptr<operator_data>> claimed;
+    while (auto work = merge.get_next_task_input_data()) {
+      claimed.push_back(std::move(work));
+    }
+    if (claimed.empty()) { break; }
+    for (auto it = claimed.rbegin(); it != claimed.rend(); ++it) {
+      auto& work = dynamic_cast<pipelineable_operator_data&>(**it);
+      if (kinds) { kinds->push_back(dynamic_cast<sirius_physical_merge_sort::work&>(work).kind); }
+      work.prepare_for_processing(get_default_gpu_space(), default_stream());
+      auto result = merge.execute(work, default_stream());
+      default_stream().sync();
+      merge.sink(*result, default_stream());
+      default_stream().sync();
+      merge.on_task_output_published(*result);
+    }
+  }
+  REQUIRE(merge.all_ports_empty());
+  std::vector<std::shared_ptr<data_batch>> results;
+  if (output.all_empty()) { return results; }
+  auto positions = output.get_positions();
+  std::sort(positions.begin(), positions.end());
+  for (auto position : positions) {
+    results.push_back(output.pop_data_batch_by_position(position));
+  }
+  return results;
+}
+
+std::unique_ptr<operator_data> run_merge(sirius_physical_merge_sort& merge,
+                                         std::vector<std::shared_ptr<data_batch>> batches)
+{
+  auto results = run_ranges(merge, {std::move(batches)});
+  if (results.size() <= 1) {
+    return std::make_unique<pipelineable_operator_data>(std::move(results));
+  }
+  std::vector<cudf::table_view> views;
+  for (auto const& batch : results) {
+    views.push_back(sirius::get_cudf_table_view(*batch));
+  }
+  auto* space    = get_default_gpu_space();
+  auto table     = cudf::concatenate(views, default_stream(), get_resource_ref(*space));
+  auto collected = sirius::make_data_batch(std::move(table), *space, default_stream(), {});
+  default_stream().sync();
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<data_batch>>{std::move(collected)});
+}
 
 // ---------------------------------------------------------------------------
 // 1-column tests
@@ -130,7 +215,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 1-column batches ascending
   sirius_physical_merge_sort op(
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch1, batch2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto table = sirius::get_cudf_table_view(
@@ -163,8 +248,7 @@ TEST_CASE("sirius_physical_merge_sort merges 3 sorted 1-column batches descendin
   sirius_physical_merge_sort op(
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
-  auto out =
-    op.execute(pipelineable_operator_data({batch1, batch2, batch3}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch1, batch2, batch3});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto table = sirius::get_cudf_table_view(
@@ -202,7 +286,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
   sirius_physical_merge_sort op(
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch1, batch2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto view = sirius::get_cudf_table_view(
@@ -246,7 +330,7 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
 
-  auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
+  auto out = run_merge(op, {sorted1, sorted2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto view = sirius::get_cudf_table_view(
@@ -287,7 +371,7 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
   sirius_physical_merge_sort op(
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch1, batch2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto view = sirius::get_cudf_table_view(
@@ -334,7 +418,7 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
                                 duckdb::vector<duckdb::idx_t>(projections),
                                 0);
 
-  auto out = op.execute(pipelineable_operator_data({sorted1, sorted2}), cudf::get_default_stream());
+  auto out = run_merge(op, {sorted1, sorted2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto view = sirius::get_cudf_table_view(
@@ -373,7 +457,7 @@ TEST_CASE("sirius_physical_merge_sort single batch passthrough", "[physical_merg
   sirius_physical_merge_sort op(
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
-  auto out = op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto table = sirius::get_cudf_table_view(
@@ -403,7 +487,7 @@ TEST_CASE("sirius_physical_merge_sort skips null batches", "[physical_merge_sort
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, batch1, nullptr, batch2, nullptr};
-  auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto out = run_merge(op, inputs);
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto table = sirius::get_cudf_table_view(
@@ -427,7 +511,7 @@ TEST_CASE("sirius_physical_merge_sort returns empty for all-null inputs", "[phys
     sirius::from_duckdb_vec(std::move(types)), std::move(orders), std::move(projections), 0);
 
   std::vector<std::shared_ptr<data_batch>> inputs{nullptr, nullptr};
-  auto out = op.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto out = run_merge(op, inputs);
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().empty());
 }
 
@@ -451,13 +535,14 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
 
   sirius_physical_order order_op(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>(types)),
+    types.size(),
     copy_orders(orders),
     duckdb::vector<duckdb::idx_t>(projections),
     0);
 
   sirius_physical_merge_sort op(&order_op);
 
-  auto out = op.execute(pipelineable_operator_data({batch1, batch2}), cudf::get_default_stream());
+  auto out = run_merge(op, {batch1, batch2});
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().size() == 1);
 
   auto table = sirius::get_cudf_table_view(
@@ -466,58 +551,303 @@ TEST_CASE("sirius_physical_merge_sort constructed from sirius_physical_order",
   REQUIRE(col0 == std::vector<int64_t>{1, 2, 3, 4, 5, 6});
 }
 
-TEST_CASE("sort range publication retains holes and merge claims destination positions",
-          "[physical_merge_sort][ordering]")
+// ---------------------------------------------------------------------------
+// Refinement of oversized ranges
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::unique_ptr<sirius_physical_merge_sort> make_bigint_merge(duckdb::OrderType direction,
+                                                              std::size_t chunk_bytes)
+{
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), direction));
+  auto op = std::make_unique<sirius_physical_merge_sort>(
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::BIGINT)},
+    std::move(orders),
+    duckdb::vector<std::size_t>{0},
+    0);
+  op->chunk_bytes = chunk_bytes;
+  return op;
+}
+
+std::vector<int64_t> sorted_values(std::mt19937_64& rng, std::size_t rows, int64_t range, bool desc)
+{
+  std::uniform_int_distribution<int64_t> dist(0, range);
+  std::vector<int64_t> values(rows);
+  for (auto& value : values) {
+    value = dist(rng);
+  }
+  std::sort(values.begin(), values.end());
+  if (desc) { std::reverse(values.begin(), values.end()); }
+  return values;
+}
+
+// Every chunk is bounded by the byte target's row equivalent; concatenation is ordered.
+std::vector<int64_t> collect_chunks(std::vector<std::shared_ptr<data_batch>> const& chunks,
+                                    std::size_t max_rows)
+{
+  std::vector<int64_t> all;
+  for (auto const& chunk : chunks) {
+    auto values = copy_column_to_host<int64_t>(sirius::get_cudf_table_view(*chunk).column(0));
+    CHECK(!values.empty());
+    CHECK(values.size() <= max_rows);
+    all.insert(all.end(), values.begin(), values.end());
+  }
+  return all;
+}
+
+}  // namespace
+
+TEST_CASE("merge sort refines an oversized range into bounded ordered chunks",
+          "[physical_merge_sort]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space);
+  std::mt19937_64 rng(42);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<int64_t> expected;
+  // Unequal contributions, many duplicate keys.
+  for (std::size_t rows : {1000, 37, 600, 1500, 1}) {
+    auto values = sorted_values(rng, rows, 300, false);
+    expected.insert(expected.end(), values.begin(), values.end());
+    inputs.push_back(make_1col_batch(*space, values));
+  }
+  std::sort(expected.begin(), expected.end());
+
+  std::size_t const chunk_bytes = 2048;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  auto chunks                   = run_ranges(*op, {inputs});
+  CHECK(chunks.size() > 1);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
+TEST_CASE("merge sort refines all-equal keys using contribution coordinates",
+          "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  for (int i = 0; i < 3; ++i) {
+    inputs.push_back(make_1col_batch(*space, std::vector<int64_t>(500, 7)));
+  }
+  std::size_t const chunk_bytes = 1024;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  auto chunks                   = run_ranges(*op, {inputs});
+  CHECK(chunks.size() > 1);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == std::vector<int64_t>(1500, 7));
+}
+
+TEST_CASE("merge sort coalesces many small contributions before refining", "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  std::mt19937_64 rng(11);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<int64_t> expected;
+  // 100 ten-row contributions against a 256-row target: sampling would take every row.
+  for (int i = 0; i < 100; ++i) {
+    auto values = sorted_values(rng, 10, 5000, false);
+    expected.insert(expected.end(), values.begin(), values.end());
+    inputs.push_back(make_1col_batch(*space, values));
+  }
+  std::sort(expected.begin(), expected.end());
+  std::size_t const chunk_bytes = 2048;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  auto chunks                   = run_ranges(*op, {inputs});
+  CHECK(chunks.size() > 1);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
+TEST_CASE("merge sort merges a range within the partition target and slices its output",
+          "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  // The sample operator's partition target sets the merge limit: 8 KiB plus slack.
+  duckdb::vector<duckdb::BoundOrderByNode> sample_orders;
+  sample_orders.push_back(make_order(0, duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT)));
+  sirius_physical_sort_sample sample(
+    duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::BIGINT)},
+    std::move(sample_orders),
+    1,
+    /*sort_sample_bytes=*/1,
+    /*max_partition_bytes=*/8192);
+  sample.execute(pipelineable_operator_data({make_1col_batch(*space, {1, 2, 3})}),
+                 default_stream());
+  REQUIRE(sample.get_partition_bytes() == 8192);
+
+  std::mt19937_64 rng(5);
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<int64_t> expected;
+  // 1200 rows (9600 bytes): over the chunk target, within the merge limit.
+  for (std::size_t rows : {500, 300, 400}) {
+    auto values = sorted_values(rng, rows, 1000, false);
+    expected.insert(expected.end(), values.begin(), values.end());
+    inputs.push_back(make_1col_batch(*space, values));
+  }
+  std::sort(expected.begin(), expected.end());
+
+  std::size_t const chunk_bytes = 1024;
+  auto op                       = make_bigint_merge(duckdb::OrderType::ASCENDING, chunk_bytes);
+  op->set_sample_op(&sample);
+  std::vector<sirius_physical_merge_sort::step> kinds;
+  auto chunks = run_ranges(*op, {inputs}, &kinds);
+  CHECK(kinds == std::vector{sirius_physical_merge_sort::step::merge});
+  CHECK(chunks.size() >= 9);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
+TEST_CASE("merge sort keeps range order when only some ranges are refined", "[physical_merge_sort]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  std::mt19937_64 rng(7);
+  // Descending: range 0 holds the largest keys. Range 1 fits; ranges 0 and 2 do not.
+  auto shift = [](std::vector<int64_t> values, int64_t offset) {
+    for (auto& value : values) {
+      value += offset;
+    }
+    return values;
+  };
+  std::vector<std::vector<int64_t>> range_values{shift(sorted_values(rng, 900, 99, true), 2000),
+                                                 shift(sorted_values(rng, 20, 99, true), 1000),
+                                                 sorted_values(rng, 700, 99, true)};
+  std::vector<std::vector<std::shared_ptr<data_batch>>> ranges(3);
+  std::vector<int64_t> expected;
+  for (std::size_t r = 0; r < range_values.size(); ++r) {
+    auto const& values = range_values[r];
+    auto half          = values.size() / 2;
+    // Two sorted contributions per range.
+    std::vector<int64_t> a(values.begin(), values.begin() + half);
+    std::vector<int64_t> b(values.begin() + half, values.end());
+    ranges[r].push_back(make_1col_batch(*space, a));
+    ranges[r].push_back(make_1col_batch(*space, b));
+    expected.insert(expected.end(), values.begin(), values.end());
+  }
+  std::sort(expected.begin(), expected.end(), std::greater<>{});
+
+  std::size_t const chunk_bytes = 1600;
+  auto op                       = make_bigint_merge(duckdb::OrderType::DESCENDING, chunk_bytes);
+  auto chunks                   = run_ranges(*op, ranges);
+  CHECK(chunks.size() > 3);
+  REQUIRE(collect_chunks(chunks, chunk_bytes / sizeof(int64_t)) == expected);
+}
+
+TEST_CASE("sort lowering shares executable comparison arguments", "[sort_comparison][cpu]")
+{
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, duckdb::LogicalType::BIGINT, duckdb::OrderType::ASCENDING));
-  auto types =
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
-  sirius_physical_merge_sort merge(types, std::move(orders), {0}, 8);
-  sirius_physical_sort_partition partition(types, {}, {0}, 8);
-  cucascade::data_repository repo;
-  merge.add_port("default",
-                 std::make_unique<sirius_physical_operator::port>(
-                   MemoryBarrierType::FULL, &repo, nullptr, nullptr));
-  partition.add_next_port_after_sink({&merge, "default"});
-  // Empty ranges 0 and 2 must not shift the nonempty range indices.
-  auto a = make_1col_batch(*space, {1, 3});
-  auto b = make_1col_batch(*space, {2, 4});
-  auto c = make_1col_batch(*space, {9, 10});
-  partition.sink(sort_partition_output({c, a}, {3, 1}), cudf::get_default_stream());
-  partition.sink(sort_partition_output({b}, {1}), cudf::get_default_stream());
-  REQUIRE(repo.size(0) == 0);
-  REQUIRE(repo.size(1) == 2);
-  REQUIRE(repo.size(2) == 0);
-  REQUIRE(repo.size(3) == 1);
-  auto first  = merge.get_next_task_input_data();
-  auto second = merge.get_next_task_input_data();
-  REQUIRE(first);
-  REQUIRE(second);
-  REQUIRE_FALSE(merge.get_next_task_input_data());
-  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*first).get_position() == 1);
-  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*second).get_position() == 3);
-  auto later   = merge.execute(*second, cudf::get_default_stream());
-  auto earlier = merge.execute(*first, cudf::get_default_stream());
-  REQUIRE(dynamic_cast<pipelineable_operator_data&>(*later).get_position() == 3);
-  auto& earlier_data = dynamic_cast<pipelineable_operator_data&>(*earlier);
-  REQUIRE(earlier_data.get_position() == 1);
-  auto table = sirius::get_cudf_table_view(*earlier_data.get_data_batches().front());
-  REQUIRE(copy_column_to_host<int64_t>(table.column(0)) == std::vector<int64_t>{1, 2, 3, 4});
-  // Completion order must not become logical order when the merge sink publishes.
-  cucascade::data_repository output_repo;
-  sirius_physical_merge_sort destination(types, {}, {0}, 8);
-  destination.add_port("default",
-                       std::make_unique<sirius_physical_operator::port>(
-                         MemoryBarrierType::FULL, &output_repo, nullptr, nullptr));
-  merge.add_next_port_after_sink({&destination, "default"});
-  merge.sink(*later, cudf::get_default_stream());
-  merge.sink(*earlier, cudf::get_default_stream());
-  REQUIRE(output_repo.get_ordering() == cucascade::data_repository_ordering::ORDERED);
-  REQUIRE(output_repo.get_positions() == std::vector<std::size_t>{1, 3});
-  REQUIRE(output_repo.pop_data_batch_by_position(1) == earlier_data.get_data_batches().front());
-  REQUIRE(output_repo.pop_data_batch_by_position(3) ==
-          dynamic_cast<pipelineable_operator_data&>(*later).get_data_batches().front());
+  orders.push_back(make_order(1,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::DESCENDING,
+                              duckdb::OrderByNullType::NULLS_LAST));
+  orders.push_back(make_order(0,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::ASCENDING,
+                              duckdb::OrderByNullType::NULLS_FIRST));
+  sirius_physical_order local({sirius::logical_type::make(sirius::type_id::BIGINT),
+                               sirius::logical_type::make(sirius::type_id::BIGINT)},
+                              2,
+                              std::move(orders),
+                              {0, 1},
+                              0);
+  sirius_physical_sort_sample sample(&local);
+  sirius_physical_sort_partition partition(&local);
+  sirius_physical_merge_sort merge(&local);
+  REQUIRE(sample.comparison == local.comparison);
+  REQUIRE(partition.comparison == local.comparison);
+  REQUIRE(merge.comparison == local.comparison);
+  CHECK(local.comparison->key_columns == std::vector<int>{1, 0});
+  CHECK(local.comparison->directions ==
+        std::vector<cudf::order>{cudf::order::DESCENDING, cudf::order::ASCENDING});
+  CHECK(local.comparison->null_precedence ==
+        std::vector<cudf::null_order>{cudf::null_order::BEFORE, cudf::null_order::BEFORE});
+}
+
+TEST_CASE("ORDER BY expansion retains hidden keys through the shared sort chain",
+          "[sort_comparison][cpu]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection connection(db);
+  auto bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(1,
+                              duckdb::LogicalType::BIGINT,
+                              duckdb::OrderType::DESCENDING,
+                              duckdb::OrderByNullType::NULLS_FIRST));
+  duckdb::unique_ptr<sirius_physical_operator> plan =
+    duckdb::make_uniq<sirius_physical_order>(duckdb::vector<sirius::logical_type>{bigint},
+                                             2,
+                                             std::move(orders),
+                                             duckdb::vector<std::size_t>{0},
+                                             10);
+  plan->children.push_back(duckdb::make_uniq<test_physical_operator>(
+    SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{bigint, bigint}, 10));
+  sirius::planner::sirius_physical_plan_generator generator(*connection.context);
+  generator.insert_gpu_pipeline_operators(plan);
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_SORT);
+  auto& merge = plan->Cast<sirius_physical_merge_sort>();
+  REQUIRE(merge.children.size() == 1);
+  auto& partition = merge.children[0]->Cast<sirius_physical_sort_partition>();
+  CHECK(merge.input_barrier_for(partition) == MemoryBarrierType::FULL);
+  auto& sample = partition.children[0]->Cast<sirius_physical_sort_sample>();
+  auto& local  = sample.children[0]->Cast<sirius_physical_order>();
+  CHECK(merge.types.size() == 1);
+  CHECK(partition.types.size() == 2);
+  CHECK(sample.types.size() == 2);
+  CHECK(local.types.size() == 2);
+  CHECK(local.projections == duckdb::vector<std::size_t>{0, 1});
+  CHECK(local.comparison == sample.comparison);
+  CHECK(local.comparison == partition.comparison);
+  CHECK(local.comparison == merge.comparison);
+  CHECK(local.comparison->key_columns == std::vector<int>{1});
+}
+
+TEST_CASE("sort stages reject out-of-schema keys during construction", "[sort_comparison][cpu]")
+{
+  auto bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(1, duckdb::LogicalType::BIGINT));
+  CHECK_THROWS_AS(sort_comparison_config(orders, 1), sirius::invalid_input_exception);
+  CHECK_NOTHROW(sort_comparison_config(orders, 2));
+  CHECK_THROWS_AS(sirius_physical_order({bigint}, 1, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_merge_sort({bigint}, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_sort_partition({bigint}, copy_orders(orders), {0}, 0),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(sirius_physical_sort_sample({bigint}, copy_orders(orders), 0),
+                  sirius::invalid_input_exception);
+}
+
+TEST_CASE("sort comparison lowers absolute SQL null precedence for both directions",
+          "[sort_comparison][cpu]")
+{
+  auto direction = GENERATE(duckdb::OrderType::ASCENDING, duckdb::OrderType::DESCENDING);
+  auto nulls = GENERATE(duckdb::OrderByNullType::NULLS_FIRST, duckdb::OrderByNullType::NULLS_LAST);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::BIGINT, direction, nulls));
+  sort_comparison_config config(orders, 1);
+  bool before =
+    (nulls == duckdb::OrderByNullType::NULLS_FIRST) != (direction == duckdb::OrderType::DESCENDING);
+  CHECK(config.null_precedence.front() ==
+        (before ? cudf::null_order::BEFORE : cudf::null_order::AFTER));
+  CHECK_THROWS_AS(sort_comparison_config(orders, 0), sirius::invalid_input_exception);
+}
+
+TEST_CASE("ORDER BY common consumer rejects nested payloads", "[sort_comparison][cpu]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection connection(db);
+
+  auto types = sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+    duckdb::LogicalType::BIGINT, duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT)});
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::BIGINT));
+  duckdb::unique_ptr<sirius_physical_operator> plan = duckdb::make_uniq<sirius_physical_order>(
+    types, 2, std::move(orders), duckdb::vector<std::size_t>{0, 1}, 10);
+  plan->children.push_back(
+    duckdb::make_uniq<test_physical_operator>(SiriusPhysicalOperatorType::INVALID, types, 10));
+  sirius::planner::sirius_physical_plan_generator generator(*connection.context);
+  CHECK_THROWS_AS(generator.insert_gpu_pipeline_operators(plan), sirius::not_implemented_exception);
 }

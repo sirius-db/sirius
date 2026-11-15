@@ -191,21 +191,35 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
     std::vector<std::string> host;
     if (col.size() == 0) { return host; }
     cudf::strings_column_view str_col(col);
-    std::vector<cudf::size_type> offsets(col.size() + 1);
-    cudaMemcpy(offsets.data(),
-               str_col.offsets().data<cudf::size_type>(),
-               (col.size() + 1) * sizeof(cudf::size_type),
-               cudaMemcpyDeviceToHost);
-    std::vector<char> chars(offsets.back());
+    std::vector<int64_t> offsets(col.size() + 1);
+    if (str_col.offsets().type().id() == cudf::type_id::INT64) {
+      CUDF_CUDA_TRY(cudaMemcpy(offsets.data(),
+                               str_col.offsets().data<int64_t>() + col.offset(),
+                               offsets.size() * sizeof(int64_t),
+                               cudaMemcpyDeviceToHost));
+    } else {
+      std::vector<cudf::size_type> narrow(offsets.size());
+      CUDF_CUDA_TRY(cudaMemcpy(narrow.data(),
+                               str_col.offsets().data<cudf::size_type>() + col.offset(),
+                               narrow.size() * sizeof(cudf::size_type),
+                               cudaMemcpyDeviceToHost));
+      std::copy(narrow.begin(), narrow.end(), offsets.begin());
+    }
+    std::vector<char> chars(offsets.back() - offsets.front());
     if (!chars.empty()) {
-      cudaMemcpy(chars.data(),
-                 str_col.chars_begin(cudf::get_default_stream()),
-                 offsets.back(),
-                 cudaMemcpyDeviceToHost);
+      CUDF_CUDA_TRY(cudaMemcpy(chars.data(),
+                               str_col.chars_begin(cudf::get_default_stream()) + offsets.front(),
+                               chars.size(),
+                               cudaMemcpyDeviceToHost));
     }
     host.reserve(col.size());
     for (cudf::size_type i = 0; i < col.size(); ++i) {
-      host.emplace_back(chars.data() + offsets[i], chars.data() + offsets[i + 1]);
+      if (offsets[i] == offsets[i + 1]) {
+        host.emplace_back();
+      } else {
+        host.emplace_back(chars.data() + offsets[i] - offsets.front(),
+                          chars.data() + offsets[i + 1] - offsets.front());
+      }
     }
     return host;
   } else {

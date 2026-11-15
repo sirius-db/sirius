@@ -188,6 +188,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
+    REQUIRE(setting_count(con, "sort_chunk_bytes") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
@@ -256,6 +257,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
+    REQUIRE(setting_count(con, "sort_chunk_bytes") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
@@ -280,6 +282,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
+    REQUIRE(setting_count(con, "sort_chunk_bytes") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
@@ -938,6 +941,7 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.concat_batch_bytes == batch);
   REQUIRE(params.cross_join_task_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
+  REQUIRE(params.sort_chunk_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
   REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
   REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * batch);
@@ -1043,6 +1047,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.hash_partition_bytes == 2 * mib);
   REQUIRE(params.concat_batch_bytes == 3 * mib);
   REQUIRE(params.sort_sample_bytes == 4 * mib);
+  REQUIRE(params.sort_chunk_bytes == 256 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
   REQUIRE(params.cross_join_task_bytes == 6 * mib);
   REQUIRE(params.max_build_probe_resident_bytes == 7 * mib);
@@ -1266,6 +1271,36 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(after.executions == before.executions + 3);
   REQUIRE(after.fallbacks == before.fallbacks);
   REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+
+  // Soft targets follow the usual session policy, including values above 64 MiB.
+  duckdb::Connection other(db);
+  auto& params = duckdb::session_operator_params(*con.context);
+  auto large   = con.Query("SET sort_chunk_bytes=268435456");
+  REQUIRE(large);
+  REQUIRE_FALSE(large->HasError());
+  REQUIRE(params.sort_chunk_bytes == 256ULL * 1024 * 1024);
+  REQUIRE(duckdb::query_operator_options(*con.context)->sort_chunk_bytes ==
+          params.sort_chunk_bytes);
+  REQUIRE(duckdb::session_operator_params(*other.context).sort_chunk_bytes == expected_batch);
+  for (auto const* sql :
+       {"SET sort_chunk_bytes=0", "SET sort_chunk_bytes=-1", "SET GLOBAL sort_chunk_bytes=1"}) {
+    auto invalid = con.Query(sql);
+    REQUIRE(invalid);
+    REQUIRE(invalid->HasError());
+    REQUIRE(params.sort_chunk_bytes == 256ULL * 1024 * 1024);
+  }
+  auto reset_chunk = con.Query("RESET sort_chunk_bytes");
+  REQUIRE(reset_chunk);
+  REQUIRE_FALSE(reset_chunk->HasError());
+  REQUIRE(params.sort_chunk_bytes == expected_batch);
+}
+
+TEST_CASE("Sirius configuration rejects zero sort chunk bytes", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(config_fixture("invalid_sort_chunk_zero.yaml")),
+                      Catch::Matchers::ContainsSubstring("operator_params.sort_chunk_bytes") &&
+                        Catch::Matchers::ContainsSubstring("greater than zero"));
 }
 
 TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")

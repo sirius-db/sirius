@@ -538,6 +538,8 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 }
 
 // Fixed-size ARRAY columns: pin and serve through the insert delta.
+// Compare unordered rows so these remain GPU scan/cache tests: full ORDER BY
+// with nested payloads currently declines during planning.
 TEST_CASE_METHOD(PinMvccInsertFixture,
                  "mvcc insert: a pinned ARRAY column serves the base from cache",
                  "[integration][gpu_execution][pin_table_mvcc_insert][array]")
@@ -551,7 +553,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   // No delta: the array decodes straight from the pinned prefix.
-  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19995 ORDER BY k;");
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19995;");
   run_ok("CALL unpin_table('t');");
 }
 
@@ -574,7 +576,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 
   // Spans the pin boundary: base rows 19998-19999 from cache, delta rows
   // 20000-20001 from the transient delta lane.
-  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19998 ORDER BY k;");
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19998;");
   run_ok("CALL unpin_table('t');");
 }
 
@@ -599,9 +601,9 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   run_ok("INSERT INTO t VALUES (200000, CAST([1, 2, 3] AS INTEGER[3]));");
 
   // Persistent delta rows.
-  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 149997 AND k < 150000 ORDER BY k;");
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 149997 AND k < 150000;");
   // The transient tail append.
-  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 200000 ORDER BY k;");
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 200000;");
   run_ok("CALL unpin_table('t');");
 }
 
@@ -623,7 +625,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
     "(20001, CAST([NULL, 5, NULL] AS INTEGER[3])), "
     "(20002, CAST([7, NULL, 9] AS INTEGER[3]));");
 
-  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19999 ORDER BY k;");
+  compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19999;");
   run_ok("CALL unpin_table('t');");
 }
 

@@ -4,6 +4,7 @@ target_sources(
           decimal_integer_cast.cu
           dense_count_join_impl.cu
           sorted_keys.cu
+          sampled_merge.cu
           low_cardinality_groupby.cu
           device_copy_batch.cpp
           device_transfer.cpp

@@ -416,10 +416,19 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 void sirius_physical_operator::push_data_batch_at_position(
   std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch, std::size_t position)
 {
+  push_data_batch_at_position(port_id, std::move(batch), position, 0);
+}
+
+void sirius_physical_operator::push_data_batch_at_position(
+  std::string_view port_id,
+  std::shared_ptr<::cucascade::data_batch> batch,
+  std::size_t position,
+  std::size_t partition)
+{
   auto* p = get_port(port_id);
   if (p && p->repo) {
     if (batch) { on_input_batch_pushed(port_id, *batch); }
-    p->repo->add_data_batch_at_position(std::move(batch), position);
+    p->repo->add_data_batch_at_position(std::move(batch), position, partition);
   }
 }
 
