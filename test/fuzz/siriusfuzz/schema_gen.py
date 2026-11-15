@@ -29,6 +29,7 @@ class Column:
     type: st.SqlType
     null_ratio: float = 0.0
     all_null: bool = False
+    no_null: bool = False
 
     def ddl(self) -> str:
         return f'"{self.name}" {self.type.name}'
@@ -147,7 +148,15 @@ class DataGenerator:
     def __init__(self, config: FuzzConfig, rng: random.Random):
         self.cfg = config
         self.rng = rng
-        self.types = st.types_from_names(config.features.types)
+        self.types = st.types_from_names(
+            config.features.types, config.types.decimal_widths
+        )
+        if config.types.hugeint:
+            self.types.append(st.HUGEINT)
+        if config.types.uhugeint:
+            self.types.append(st.SqlType("UHUGEINT", "int", False, 128))
+        if config.types.array:
+            self.types.append(st.INTEGER_ARRAY_3)
         self._pools: dict[str, list[Any]] = {}
 
     # -- pools -------------------------------------------------------------
@@ -191,6 +200,8 @@ class DataGenerator:
             words += _UNICODE_WORDS
         self._pools["varchar"] = words
         self._pools["bool"] = [True, False]
+        if self.cfg.types.array:
+            self._pools["array"] = [[0, 0, 0], [1, 2, 3], [-1, 0, 1]]
 
     def pool(self, kind: str) -> list[Any]:
         if not self._pools:
@@ -292,6 +303,16 @@ class DataGenerator:
 
     def _assign_nulls(self, col: Column) -> None:
         nulls = self.cfg.nulls
+        if self.cfg.data.null_density_extremes:
+            extreme = self.rng.random()
+            if extreme < 0.02:
+                col.all_null = True
+                col.null_ratio = 1.0
+                return
+            if extreme < 0.04:
+                col.no_null = True
+                col.null_ratio = 0.0
+                return
         if self.rng.random() < nulls.all_null_column_probability:
             col.all_null = True
             col.null_ratio = 1.0
@@ -318,6 +339,9 @@ class DataGenerator:
         if kind == "bool":
             return rng.random() < 0.5
         if kind == "int":
+            if typ.bits == 128 and rng.random() < 0.2:
+                magnitude = (1 << 64) + rng.randint(0, 1000)
+                return magnitude if not typ.signed or rng.random() < 0.5 else -magnitude
             lo, hi = self._int_bounds(typ)
             return rng.randint(lo, hi)
         if kind == "float":
@@ -340,6 +364,8 @@ class DataGenerator:
             )
         if kind == "varchar":
             return self._random_string()
+        if kind == "array":
+            return [rng.randint(-10, 10) for _ in range(3)]
         raise ValueError(kind)
 
     def _fit(self, v: Any, typ: st.SqlType) -> Any:
@@ -349,7 +375,9 @@ class DataGenerator:
             return max(lo, min(hi, int(v)))
         if typ.kind == "decimal":
             q = decimal.Decimal(1).scaleb(-typ.scale)
-            return decimal.Decimal(v).quantize(q)
+            fitted = decimal.Decimal(v).quantize(q)
+            maximum = decimal.Decimal(10) ** (typ.precision - typ.scale) - q
+            return max(-maximum, min(maximum, fitted))
         if typ.kind == "float" and typ.bits == 32:
             return float(f"{float(v):.7g}")
         if typ.kind == "timestamp":
@@ -407,6 +435,8 @@ class DataGenerator:
             if len(value) > 65536:
                 self._long_string_used = True
             return value
+        if typ.kind == "array":
+            return rng.choice([[0, 0, 0], [1, 2, 3], [-1, 0, 2147483647]])
         return None
 
     def _random_string(self) -> str:
@@ -415,10 +445,24 @@ class DataGenerator:
         if rng.random() < s.empty_string_ratio:
             return ""
         alphabet = string.ascii_letters + string.digits + " _%-."
-        if s.charset == "unicode":
+        if s.charset == "utf8":
+            alphabet += "é日本😀"
+        elif s.charset == "unicode":
             alphabet += "éßΩ日本😀"
-        n = rng.randint(1, max(1, s.max_len))
-        return "".join(rng.choice(alphabet) for _ in range(n))
+        if s.max_len > 40 and rng.random() < 0.01:
+            n = rng.choice([min(s.max_len, 1024), min(s.max_len, 2048), s.max_len - 1, s.max_len])
+        else:
+            n = rng.randint(1, max(1, min(40, s.max_len)))
+        chars: list[str] = []
+        used_bytes = 0
+        for _ in range(n):
+            char = rng.choice(alphabet)
+            size = len(char.encode("utf8"))
+            if used_bytes + size > s.max_len:
+                break
+            chars.append(char)
+            used_bytes += size
+        return "".join(chars)
 
 
 def _abbrev(typ: st.SqlType) -> str:
@@ -430,4 +474,5 @@ def _abbrev(typ: st.SqlType) -> str:
         "date": "dt",
         "timestamp": "ts",
         "varchar": "s",
+        "array": "a",
     }[typ.kind]

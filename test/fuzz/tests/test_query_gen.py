@@ -13,6 +13,7 @@ from . import conftest_path
 from siriusfuzz.compare import Tolerances, compare_mode, compare_results
 from siriusfuzz.config import load_config
 from siriusfuzz.query_gen import QueryGenerator
+from siriusfuzz.query_gen import exact_type
 from siriusfuzz.report import _CLAIMED_FEATURES
 from siriusfuzz.schema_gen import DataGenerator
 from siriusfuzz.session import Session
@@ -85,6 +86,82 @@ def run_batch(cfg, n, seed):
         finally:
             session.close()
     return ok, errors, qg.stats
+
+
+class Phase2eTypes(unittest.TestCase):
+    def test_decimal_widths_and_exact_mixed_result_types(self):
+        from siriusfuzz import sqltypes as st
+
+        cfg = load_config(None, [
+            "types.decimal_widths=[DECIMAL(9,2),DECIMAL(9,9),DECIMAL(18,0),DECIMAL(18,18)]",
+            "data.rows=[20,30]",
+        ])
+        dg = DataGenerator(cfg, random.Random(31))
+        ds = dg.generate(31)
+        widths = {c.type.name for table in ds.tables for c in table.columns if c.type.kind == "decimal"}
+        self.assertTrue(widths <= set(cfg.types.decimal_widths))
+        self.assertTrue(widths)
+        a, b = st.decimal_type(9, 2), st.decimal_type(18, 4)
+        self.assertEqual(exact_type(Arith("+", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(19, 4))
+        self.assertEqual(exact_type(Arith("*", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(18, 6))
+        _, errors, _ = run_batch(cfg, 100, seed=31)
+        self.assertNotIn("Binder Error", errors)
+        self.assertNotIn("Parser Error", errors)
+
+    def test_array_projection_only(self):
+        cfg = load_config(None, ["types.array=true", "data.rows=[20,30]"])
+        dg = DataGenerator(cfg, random.Random(33))
+        ds = None
+        for seed in range(30):
+            candidate = dg.generate(seed)
+            if any(c.type.kind == "array" for t in candidate.tables for c in t.columns):
+                ds = candidate
+                break
+        self.assertIsNotNone(ds)
+        self.assertTrue(any(c.type.kind == "array" for t in ds.tables for c in t.columns))
+        qg = QueryGenerator(cfg, ds, random.Random(33), dg)
+        projected = []
+        for _ in range(1000):
+            query = qg.generate()
+            if any(isinstance(n, ColumnRef) and n.kind == "array" for n in walk(query)):
+                projected.append(query)
+                self.assertIsInstance(query, Select)
+                self.assertIsInstance(query.from_, TableRef)
+                self.assertIsNone(query.where)
+                self.assertFalse(query.group_by)
+                self.assertEqual(len(query.items), 2)
+        self.assertTrue(projected)
+        self.assertGreater(qg.stats["type:array_projection"], 0)
+
+    def test_mixed_integer_keys_and_hugeint_sum_are_gated(self):
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.query_gen import Scope, ScopeTable
+
+        cfg = load_config(None, [
+            "features.joins.mixed_integer_keys=true",
+            "features.aggregates.hugeint_sum=true",
+        ])
+        dg = DataGenerator(cfg, random.Random(37))
+        qg = QueryGenerator(cfg, dg.generate(37), random.Random(37), dg)
+        left = Scope([ScopeTable("a", [ColumnRef("a", "i", st.INTEGER), ColumnRef("a", "s", st.SMALLINT), ColumnRef("a", "b", st.BIGINT)])])
+        right = ScopeTable("b", [ColumnRef("b", "b", st.BIGINT), ColumnRef("b", "u", st.UINTEGER), ColumnRef("b", "ub", st.UBIGINT)])
+        for _ in range(200):
+            qg._gen_join_cond(left, right, "inner")
+        self.assertGreater(qg.stats["join:mixed_integer_keys"], 0)
+        self.assertEqual(exact_type(Agg("sum", ColumnRef("a", "b", st.BIGINT), kind="int")), st.HUGEINT)
+
+    def test_string_limit_and_null_density_extremes(self):
+        cfg = load_config(None, [
+            "data.strings.charset=utf8", "data.strings.max_len=4095",
+            "data.null_density_extremes=true", "data.rows=[20,30]",
+        ])
+        dg = DataGenerator(cfg, random.Random(41))
+        lengths = [len(dg._random_string().encode("utf8")) for _ in range(2000)]
+        self.assertTrue(any(n >= 4094 for n in lengths))
+        self.assertTrue(any(n > 40 for n in lengths))
+        columns = [c for seed in range(20) for t in dg.generate(seed).tables for c in t.columns[1:]]
+        self.assertTrue(any(c.all_null for c in columns))
+        self.assertTrue(any(c.no_null for c in columns))
 
 
 class Phase2cQuarantine(unittest.TestCase):

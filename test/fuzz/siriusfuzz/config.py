@@ -66,6 +66,7 @@ class Joins:
     grouped_inputs: bool = True
     star_share: float = 0.3
     expression_keys: bool = True
+    mixed_integer_keys: bool = gap_switch(False)
     on_filters: bool = gap_switch(
         False
     )  # outer ON predicates hit arbitrary-join decline
@@ -100,6 +101,7 @@ class Aggregates:
     float_division_minmax: bool = gap_switch(
         False
     )  # c6aae63a: NaN from finite division
+    hugeint_sum: bool = gap_switch(False)
 
 
 @dataclass
@@ -279,7 +281,7 @@ class Nulls:
 
 @dataclass
 class Strings:
-    charset: str = "ascii"  # ascii | unicode
+    charset: str = "ascii"  # ascii | utf8 | unicode (case mapping gaps)
     empty_string_ratio: float = 0.05
     max_len: int = 40
 
@@ -327,6 +329,7 @@ class Data:
     rows: list[int] = field(default_factory=lambda: [50, 2000])
     common_value_ratio: float = 0.4
     numeric_range: str = "small"  # small | medium | full
+    null_density_extremes: bool = False
     strings: Strings = field(default_factory=Strings)
     edge_values: EdgeValues = field(default_factory=EdgeValues)
     pin: Pin = field(default_factory=Pin)
@@ -380,8 +383,28 @@ class Sirius:
 
 
 @dataclass
+class TypeOptions:
+    # The truth table admits these widths for native scan, filter, group and join.
+    decimal_widths: list[str] = field(default_factory=lambda: [
+        "DECIMAL(12,2)", "DECIMAL(18,4)",
+    ])
+    hugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
+    uhugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
+    time: bool = False  # not generated: from_duckdb does not map TIME
+    timestamptz: bool = False  # not generated: from_duckdb does not map TIMESTAMPTZ
+    interval: bool = False  # not generated: from_duckdb does not map INTERVAL
+    uuid: bool = False  # not generated: from_duckdb does not map UUID
+    blob: bool = False  # not generated: from_duckdb does not map BLOB
+    enum: bool = False  # not generated: from_duckdb does not map ENUM
+    array: bool = False  # fixed array scan/projection admission is separate
+    list: bool = False  # not generated: native scan rejects LIST
+    struct: bool = False  # not generated: native scan rejects STRUCT
+
+
+@dataclass
 class FuzzConfig:
     features: Features = field(default_factory=Features)
+    types: TypeOptions = field(default_factory=TypeOptions)
     nulls: Nulls = field(default_factory=Nulls)
     data: Data = field(default_factory=Data)
     oracle: Oracle = field(default_factory=Oracle)
@@ -482,7 +505,14 @@ class FuzzConfig:
         from . import sqltypes
 
         sqltypes.types_from_names(f.types)
+        widths = sqltypes.types_from_names(self.types.decimal_widths)
+        if not widths or any(t.kind != "decimal" or t.precision > 18 for t in widths):
+            raise ConfigError("types.decimal_widths needs GPU-decodable DECIMAL widths")
         sqltypes.types_from_names(f.casts.targets)
+        if self.data.strings.charset not in ("ascii", "utf8", "unicode"):
+            raise ConfigError("data.strings.charset must be ascii | utf8 | unicode")
+        if not 1 <= self.data.strings.max_len <= 65537:
+            raise ConfigError("data.strings.max_len must be between 1 and 65537")
         if self.variants.per_query < 0:
             raise ConfigError("variants.per_query must be >= 0")
 

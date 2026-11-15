@@ -107,7 +107,7 @@ class Scope:
 
     def columns(self, kind: str | None = None) -> list[ColumnRef]:
         cols = [c for t in self.tables for c in t.columns]
-        return [c for c in cols if kind is None or c.kind == kind]
+        return [c for c in cols if (c.kind != "array" if kind is None else c.kind == kind)]
 
     def outer_columns(self, kind: str | None = None) -> list[ColumnRef]:
         return self.outer.columns(kind) if self.outer is not None else []
@@ -194,15 +194,70 @@ class QueryGenerator:
         for _ in range(8):
             before = self.stats.copy()
             try:
-                return self._generate_once()
+                query = self._generate_once()
+                self._tag_types(query)
+                return query
             except GenerationFailed:
                 # Only report tags carried by a successfully emitted query.
                 self.stats = before
                 continue
         # Degenerate fallback: a single-table projection is always constructible.
-        return self._gen_select(depth=0, outer=None)
+        query = self._gen_select(depth=0, outer=None)
+        self._tag_types(query)
+        return query
+
+    def _tag_types(self, query: Query) -> None:
+        refs = [n for n in walk(query) if isinstance(n, ColumnRef)]
+        for typ in {r.type for r in refs}:
+            if typ.kind == "decimal":
+                self._note(f"type:decimal_{typ.precision}_{typ.scale}")
+            elif typ == st.HUGEINT:
+                self._note("type:hugeint")
+            elif typ.kind == "array":
+                self._note("type:array")
+        if self.cfg.data.strings.charset == "utf8" and any(r.kind == "varchar" for r in refs):
+            self._note("type:varchar_utf8")
+        if self.cfg.data.strings.max_len > 40 and any(r.kind == "varchar" for r in refs):
+            self._note("type:varchar_long_below_limit")
+        if self.cfg.data.null_density_extremes:
+            tables = {n.alias: n.name for n in walk(query) if isinstance(n, TableRef)}
+            for ref in refs:
+                table_name = tables.get(ref.alias)
+                if table_name is None:
+                    continue
+                table = next((t for t in self.ds.tables if t.name == table_name), None)
+                if table is None:
+                    continue
+                column = next((c for c in table.columns if c.name == ref.name), None)
+                if column is not None and column.all_null:
+                    self._note("data:all_null_column")
+                if column is not None and column.no_null:
+                    self._note("data:no_null_column")
+        for node in walk(query):
+            if isinstance(node, Arith) and node.op in ("+", "-", "*"):
+                left, right = exact_type(node.left), exact_type(node.right)
+                if left and right and left.kind == right.kind == "decimal" and left != right:
+                    self._note("type:decimal_mixed_scale")
+            if isinstance(node, Compare):
+                left, right = exact_type(node.left), exact_type(node.right)
+                if left and right and left.kind == right.kind == "decimal" and left != right:
+                    self._note("type:decimal_mixed_compare")
 
     def _generate_once(self) -> Query:
+        if self.cfg.types.array and self.rng.random() < 0.03:
+            tables = [t for t in self.ds.tables if any(c.type.kind == "array" for c in t.columns)]
+            if tables:
+                table = self.rng.choice(tables)
+                array_col = self.rng.choice([c for c in table.columns if c.type.kind == "array"])
+                alias = self._alias()
+                self._note("type:array_projection")
+                return Select(
+                    items=[
+                        SelectItem(ColumnRef(alias, "k", table.columns[0].type), "c0"),
+                        SelectItem(ColumnRef(alias, array_col.name, array_col.type), "c1"),
+                    ],
+                    from_=TableRef(table.name, alias),
+                )
         r = self.rng.random()
         pq = self.f.complexity.query
         if self.f.window_functions and self.rng.random() < 0.06:
@@ -965,6 +1020,21 @@ class QueryGenerator:
         ]
         if not pairs:
             return None
+        if self.f.joins.mixed_integer_keys:
+            target_pairs = {
+                frozenset((st.INTEGER, st.BIGINT)),
+                frozenset((st.SMALLINT, st.UINTEGER)),
+                frozenset((st.BIGINT, st.UBIGINT)),
+            }
+            mixed = [
+                (l, r) for l, r in pairs
+                if l.kind == "int" and frozenset((l.type, r.type)) in target_pairs
+            ]
+            if mixed and rng.random() < 0.25:
+                l, r = rng.choice(mixed)
+                self._note("join:mixed_integer_keys")
+                self._note(f"join:mixed_integer_keys:{l.type.name}_{r.type.name}")
+                return Compare("=", l, r)
         any_pairs = [(l, r) for l, r in pairs if l.type == r.type]
         if (
             self.f.joins.any_join
@@ -1033,6 +1103,8 @@ class QueryGenerator:
             if key_pairs and rng.random() < 0.7
             else rng.choice(pairs)
         )
+        if l.kind == "decimal" and l.type != r.type:
+            self._note("join:mixed_decimal_keys")
         if self.f.joins.expression_keys and l.type == r.type and rng.random() < 0.15:
             if l.kind == "varchar" and self._func_enabled("upper"):
                 self._note("join:expression_keys")
@@ -1471,7 +1543,14 @@ class QueryGenerator:
             }
             op = self._pick(ops)
             left = self._gen_expr("decimal", scope, depth + 1)
-            rk = "int" if op == "*" else rng.choice(["decimal", "int"])
+            if op == "*":
+                rk = (
+                    "decimal"
+                    if len(self.cfg.types.decimal_widths) > 2 and rng.random() < 0.5
+                    else "int"
+                )
+            else:
+                rk = rng.choice(["decimal", "int"])
             return Arith(op, left, self._gen_expr(rk, scope, depth + 1), kind="decimal")
         raise GenerationFailed(kind)
 
@@ -1939,6 +2018,9 @@ class QueryGenerator:
             self._note(f"agg:{name}")
             agg = self._maybe_filter_agg(Agg(name, arg, kind=out), scope, depth)
             if name == "sum" and kind == "int":
+                if self.f.aggregates.hugeint_sum and exact_type(arg) == st.BIGINT:
+                    self._note("agg:hugeint_sum")
+                    return agg
                 # sum(int) is HUGEINT; narrow as _gen_agg_of_kind does so the column type stays
                 # BIGINT (an EMPTY_RESULT over a HUGEINT column falls back to the CPU).
                 return Cast(agg, st.BIGINT)
@@ -2044,6 +2126,9 @@ class QueryGenerator:
         )
         agg = Agg(name, arg, kind=kind)
         if name == "sum" and kind == "int":
+            if self.f.aggregates.hugeint_sum and exact_type(arg) == st.BIGINT:
+                self._note("agg:hugeint_sum")
+                return agg
             # sum(int) is HUGEINT; narrow so the scalar can be compared like other ints.
             return Cast(agg, st.BIGINT)
         return agg
@@ -2136,6 +2221,22 @@ def exact_type(expr: Expr) -> st.SqlType | None:
         if expr.op == "/":
             return st.DOUBLE
         lt, rt = exact_type(expr.left), exact_type(expr.right)
+        if lt is not None and rt is not None and lt.kind == rt.kind == "decimal":
+            if expr.op in ("+", "-"):
+                scale = max(lt.scale, rt.scale)
+                width = max(
+                    scale + max(lt.precision - lt.scale, rt.precision - rt.scale),
+                    lt.precision, rt.precision,
+                ) + 1
+                return st.decimal_type(min(width, 38), scale)
+            if expr.op == "*":
+                scale = lt.scale + rt.scale
+                if scale > 38:
+                    return None
+                width = lt.precision + rt.precision
+                if width > 18 and max(lt.precision, rt.precision) <= 18 and scale < 18:
+                    width = 18
+                return st.decimal_type(min(width, 38), scale)
         if lt is not None and rt is not None and lt == rt and lt.kind == "int":
             return lt
         return None

@@ -231,6 +231,30 @@ by default. Rounding ties such as `0.125` and strings over 64 KiB have their
 own gaps switches. The long-string switch inserts at most one such value per small dataset;
 DuckDB-native GPU scans currently decline overflow strings.
 
+**Phase 2e type switches.** `types.decimal_widths` chooses the concrete DECIMAL
+widths used for generated columns. The type probe found native scan, filter,
+group, and join matches for `(9,2)`, `(9,9)`, `(12,2)`, `(18,0)`, `(18,4)`, and
+`(18,18)`; widths of 19 digits or more and `(4,0)` declined at scan. The
+shipped list stays at `(12,2)` and `(18,4)` until campaign acceptance. Mixed
+scale arithmetic, comparisons, and join keys use DuckDB's exact result width.
+`types.hugeint` and `types.uhugeint` add 128-bit integer columns in gaps mode;
+native scan declines both. `features.aggregates.hugeint_sum` leaves
+`sum(BIGINT)` at DuckDB's natural HUGEINT result in gaps mode. The ordinary
+generator casts that result to BIGINT. `features.joins.mixed_integer_keys`
+tests INTEGER/BIGINT, SMALLINT/UINTEGER, and BIGINT/UBIGINT equality keys in
+gaps mode until its acceptance run. `types.array` adds fixed `INTEGER[3]`
+columns and projects them only in a simple scan when enabled; the probe found
+array scan/projection matches, while array range filters declined.
+
+`data.strings.charset=utf8` includes accented Latin, CJK, and emoji without
+the known special case mappings from `data.edge_values.unicode_case`.
+`data.strings.max_len` is a byte ceiling; lengths near 4,095 are rare so most
+strings remain short. The probe accepted 4,095 bytes and declined 4,096.
+`data.null_density_extremes` adds rare all-NULL and no-NULL columns, tagged
+when referenced. TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and
+STRUCT are not generated: the native scan declined every one of them in the
+probe, so their `types.*` switches are reserved for a future decoder pass.
+
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
 otherwise the configuration's `sirius.configs` applies (by default the integration YAML and
 `config/partition16k.yaml`, whose 16 KiB budgets split the small fuzz tables into several hash

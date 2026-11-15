@@ -11,6 +11,20 @@
 # passes the planner and still fails on the GPU: that is how to find checks worth
 # moving to plan time.
 
+[types]
+decimal_widths = ["DECIMAL(12,2)", "DECIMAL(18,4)"]
+hugeint = false
+uhugeint = false
+time = false
+timestamptz = false
+interval = false
+uuid = false
+blob = false
+enum = false
+array = false
+list = false
+struct = false
+
 [features]
 window_functions = true
 window_gaps = false
@@ -44,6 +58,7 @@ self_join_share = 0.2
 grouped_inputs = true
 star_share = 0.3
 expression_keys = true
+mixed_integer_keys = false
 on_filters = false
 
 [features.subqueries]
@@ -66,6 +81,7 @@ filter = true
 filter_subquery = false
 expression_args = false
 float_division_minmax = false
+hugeint_sum = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",
@@ -135,6 +151,7 @@ tables = [3, 6]
 rows = [50, 2000]
 common_value_ratio = 0.4
 numeric_range = "small"   # DuckDB raises on integer overflow; keep values small
+null_density_extremes = false
 
 [data.strings]
 charset = "ascii"
