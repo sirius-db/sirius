@@ -515,6 +515,12 @@ class QueryGenerator:
             items = []
             for i, typ in enumerate(required):
                 expr = self._gen_expr(typ.kind, scope, depth + 1)
+                if typ.kind == "decimal" and not self.f.casts.decimal_scale:
+                    source = exact_type(expr)
+                    if source is None or (source.kind == "decimal" and source.scale > typ.scale):
+                        # #2590: a reducing-scale DECIMAL cast rounds on CPU but
+                        # truncates on GPU. Use an exact-typed value instead.
+                        expr = self._literal("decimal", typ)
                 items.append(
                     SelectItem(
                         expr if exact_type(expr) == typ else Cast(expr, typ), f"c{i}"
@@ -563,7 +569,10 @@ class QueryGenerator:
         if exact_outputs:
             for item in sel.items:
                 if exact_type(item.expr) is None:
-                    item.expr = Cast(item.expr, CONCRETE[item.expr.kind])
+                    if item.expr.kind == "decimal" and not self.f.casts.decimal_scale:
+                        item.expr = self._leaf("decimal", scope, depth + 1, prefer_column=True)
+                    else:
+                        item.expr = Cast(item.expr, CONCRETE[item.expr.kind])
 
     def _maybe_distinct(self, sel: Select) -> None:
         if self.f.distinct and self.rng.random() < 0.2:
@@ -1603,8 +1612,14 @@ class QueryGenerator:
             raise GenerationFailed("no cast source")
         src_kind = rng.choice(src_kinds)
         try_ = src_kind == "varchar" or (self.f.expressions.try_ and rng.random() < 0.3)
+        source = self._gen_expr(src_kind, scope, depth + 1)
+        if src_kind == kind == "decimal" and not self.f.casts.decimal_scale:
+            source_type = exact_type(source)
+            if source_type is None or source_type.scale > target.scale:
+                # #2590: reducing-scale decimal casts disagree on rounding.
+                raise GenerationFailed("quarantined decimal scale reduction")
         self._note(f"cast:{src_kind}->{kind}" + (":try" if try_ else ""))
-        return Cast(self._gen_expr(src_kind, scope, depth + 1), target, try_=try_)
+        return Cast(source, target, try_=try_)
 
     def _gen_cast_boundary(self, kind: str, scope: Scope, depth: int) -> Expr:
         c = self.f.casts
@@ -2185,6 +2200,15 @@ def exact_type(expr: Expr) -> st.SqlType | None:
     if isinstance(expr, Unary):
         return exact_type(expr.child)
     if isinstance(expr, SimpleCase):
+        result_types = [exact_type(value) for _, value in expr.whens]
+        if expr.else_ is not None:
+            result_types.append(exact_type(expr.else_))
+        return (
+            result_types[0]
+            if result_types and all(t == result_types[0] for t in result_types)
+            else None
+        )
+    if isinstance(expr, Case):
         result_types = [exact_type(value) for _, value in expr.whens]
         if expr.else_ is not None:
             result_types.append(exact_type(expr.else_))

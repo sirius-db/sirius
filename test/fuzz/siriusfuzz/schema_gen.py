@@ -374,10 +374,12 @@ class DataGenerator:
             lo, hi = typ.int_range()
             return max(lo, min(hi, int(v)))
         if typ.kind == "decimal":
-            q = decimal.Decimal(1).scaleb(-typ.scale)
-            fitted = decimal.Decimal(v).quantize(q)
-            maximum = decimal.Decimal(10) ** (typ.precision - typ.scale) - q
-            return max(-maximum, min(maximum, fitted))
+            with decimal.localcontext() as context:
+                context.prec = max(50, typ.precision + 5)
+                q = decimal.Decimal(1).scaleb(-typ.scale)
+                fitted = decimal.Decimal(v).quantize(q)
+                maximum = decimal.Decimal(10) ** (typ.precision - typ.scale) - q
+                return max(-maximum, min(maximum, fitted))
         if typ.kind == "float" and typ.bits == 32:
             return float(f"{float(v):.7g}")
         if typ.kind == "timestamp":

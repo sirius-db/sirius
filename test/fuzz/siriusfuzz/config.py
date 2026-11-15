@@ -36,6 +36,8 @@ def gap_switch(default: Any, on: Any = True) -> Any:
 
     ``--mode gaps`` sets every such switch to ``on``.
     """
+    if isinstance(default, list):
+        return field(default_factory=lambda: list(default), metadata={"gaps": on})
     return field(default=default, metadata={"gaps": on})
 
 
@@ -385,9 +387,12 @@ class Sirius:
 @dataclass
 class TypeOptions:
     # The truth table admits these widths for native scan, filter, group and join.
-    decimal_widths: list[str] = field(default_factory=lambda: [
-        "DECIMAL(12,2)", "DECIMAL(18,4)",
-    ])
+    decimal_widths: list[str] = gap_switch(
+        ["DECIMAL(12,2)", "DECIMAL(18,4)"],
+        ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(4,0)",
+         "DECIMAL(9,2)", "DECIMAL(9,9)", "DECIMAL(18,0)",
+         "DECIMAL(18,18)", "DECIMAL(19,4)", "DECIMAL(28,6)", "DECIMAL(38,10)"],
+    )
     hugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
     uhugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
     time: bool = False  # not generated: from_duckdb does not map TIME
@@ -506,8 +511,11 @@ class FuzzConfig:
 
         sqltypes.types_from_names(f.types)
         widths = sqltypes.types_from_names(self.types.decimal_widths)
-        if not widths or any(t.kind != "decimal" or t.precision > 18 for t in widths):
-            raise ConfigError("types.decimal_widths needs GPU-decodable DECIMAL widths")
+        if not widths or any(
+            t.kind != "decimal" or not 1 <= t.precision <= 38
+            or not 0 <= t.scale <= t.precision for t in widths
+        ):
+            raise ConfigError("types.decimal_widths needs valid DECIMAL(p,s) widths")
         sqltypes.types_from_names(f.casts.targets)
         if self.data.strings.charset not in ("ascii", "utf8", "unicode"):
             raise ConfigError("data.strings.charset must be ascii | utf8 | unicode")

@@ -237,6 +237,8 @@ group, and join matches for `(9,2)`, `(9,9)`, `(12,2)`, `(18,0)`, `(18,4)`, and
 `(18,18)`; widths of 19 digits or more and `(4,0)` declined at scan. The
 shipped list stays at `(12,2)` and `(18,4)` until campaign acceptance. Mixed
 scale arithmetic, comparisons, and join keys use DuckDB's exact result width.
+Gaps mode also selects `(4,0)` and widths of 19–38 digits to measure their
+native-scan declines.
 `types.hugeint` and `types.uhugeint` add 128-bit integer columns in gaps mode;
 native scan declines both. `features.aggregates.hugeint_sum` leaves
 `sum(BIGINT)` at DuckDB's natural HUGEINT result in gaps mode. The ordinary

@@ -20,6 +20,7 @@ from siriusfuzz.session import Session
 from siriusfuzz.sqlast import (
     Agg,
     Arith,
+    Cast,
     Literal,
     ColumnRef,
     Compare,
@@ -89,6 +90,21 @@ def run_batch(cfg, n, seed):
 
 
 class Phase2eTypes(unittest.TestCase):
+    def test_decimal_scale_reduction_stays_in_gaps_mode(self):
+        cfg = load_config(None, [
+            "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
+            "data.rows=[20,30]",
+        ])
+        dg = DataGenerator(cfg, random.Random(30))
+        qg = QueryGenerator(cfg, dg.generate(30), random.Random(30), dg)
+        for _ in range(1000):
+            query = qg.generate()
+            for node in walk(query):
+                if isinstance(node, Cast) and node.type.kind == "decimal":
+                    source = exact_type(node.child)
+                    if source is not None and source.kind == "decimal":
+                        self.assertLessEqual(source.scale, node.type.scale, query.sql())
+
     def test_decimal_widths_and_exact_mixed_result_types(self):
         from siriusfuzz import sqltypes as st
 
@@ -104,9 +120,22 @@ class Phase2eTypes(unittest.TestCase):
         a, b = st.decimal_type(9, 2), st.decimal_type(18, 4)
         self.assertEqual(exact_type(Arith("+", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(19, 4))
         self.assertEqual(exact_type(Arith("*", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(18, 6))
-        _, errors, _ = run_batch(cfg, 100, seed=31)
-        self.assertNotIn("Binder Error", errors)
-        self.assertNotIn("Parser Error", errors)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cpu_session(tmp)
+            try:
+                session.load_dataset(ds, "phase2e")
+                for table in ds.tables:
+                    for column in table.columns:
+                        if column.type.kind == "decimal":
+                            self.assertEqual(
+                                session.run(
+                                    f'SELECT "{column.name}" FROM "{table.name}"',
+                                    gpu=False, timeout=120,
+                                ).status,
+                                "ok",
+                            )
+            finally:
+                session.close()
 
     def test_array_projection_only(self):
         cfg = load_config(None, ["types.array=true", "data.rows=[20,30]"])
