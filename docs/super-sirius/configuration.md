@@ -786,6 +786,8 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
+| `parquet_footer_statistics_max_remote_reads` | -1 | The most footers of remote files (`s3://`) the footer-statistics pass reads for one Parquet scan while planning. A scan that needs more is planned without footer statistics and without a footer row count; none of its footers is read. Only files whose statistics are not cached for their current version count. `-1`: no limit. `0`: cached statistics only. The SQL setting of the same name overrides it for a connection. |
+| `parquet_footer_statistics_max_local_reads` | -1 | The same limit for local files. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -983,6 +985,8 @@ Evaluators retain their own policy values rather than reading mutable global def
 |----------|---------|-------------|
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 | `parquet_footer_statistics` | true | Give DuckDB's optimizer the merged footer statistics of every file of a multi-file Parquet scan. |
+| `parquet_footer_statistics_max_remote_reads` | NULL | The most footers of remote files the pass reads for one scan: `-1` no limit, `0` cached statistics only. `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_remote_reads`. |
+| `parquet_footer_statistics_max_local_reads` | NULL | The same for local files; `NULL` takes `sirius.operator_params.parquet_footer_statistics_max_local_reads`. |
 
 DuckDB reads column statistics for a scan of several Parquet files only with `union_by_name`.
 Without them its optimizer estimates every scan filter at a fixed 20%, even an `IS NOT NULL` on a
@@ -1010,6 +1014,26 @@ those of any path or glob, including `s3://` globs, returning the number of file
 Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
 query to table loading. Footers read ahead use DuckDB's default Parquet options, so only scans
 with those options reuse them; a scan with other options reads the footers again.
+
+Reading the footers costs planning time in proportion to the number of files, and remote footer
+work can require network requests. The two read limits bound it. Before reading, the pass counts
+the footers a scan needs that are not cached for the file's current version, remote and local
+files apart. If either count is over its limit the scan is planned as DuckDB bound it: no footer is
+read and the scan gets neither statistics nor a footer row count. It is all or nothing because the
+statistics of some files are not statistics of the scan. A remote file named in an explicit list,
+which the listing did not describe, counts as a read even when cached, since checking it takes a
+request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file, and
+only the records that fit the cache remain cached. The two SQL settings are per connection;
+`SET GLOBAL` and `RESET GLOBAL` are refused, and the engine-wide values come from the YAML.
+
+The cache keeps the statistics of at most 16,384 files, least recently used first out, and merged
+statistics made from at most 16,384 files in all. A read limit bounds misses, not the total scan
+size or future cache residency. An oversized scan can still be admitted through partial hits and
+need repeated reads and merging. A scan's footer row count belongs to the plan whose planning
+covered the scan, and to the copies Sirius makes of that plan; another statement over the same
+paths does not supply it. It is unknown when `parquet_footer_statistics` is off, when a limit is
+exceeded, when a footer cannot be read, and when DuckDB replaces the scan's file list while
+optimizing, as partition pruning does. The counts of at most 128 scans of live plans are kept.
 
 ```sql
 SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');

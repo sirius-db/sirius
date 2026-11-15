@@ -20,6 +20,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -41,34 +42,85 @@ namespace sirius::transparent {
 /// ETag) or a modification time old enough to trust. Checking a remote file costs one request, so
 /// the files are checked and read concurrently.
 ///
+/// A scan is covered whole or not at all, since the statistics of some of its files are not
+/// statistics of the scan. The footers a scan would have read, those not cached for the file's
+/// current version and the scan's reader options, are counted first, remote and local files apart.
+/// If either count exceeds its limit the scan is left as DuckDB bound it: no footer is read and its
+/// cached files are not used. The limits are the connection's
+/// `parquet_footer_statistics_max_remote_reads` and `parquet_footer_statistics_max_local_reads`,
+/// or where those are NULL the engine's `operator_params` of the same names: -1 for no limit, 0 for
+/// cached statistics only.
+///
 /// Must run before DuckDB's optimizer, from the pre-optimizer hook.
 ///
 /// \return The number of scans given statistics.
 std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
                                           duckdb::LogicalOperator& plan);
 
+/// The most footers add_parquet_footer_statistics may read for one scan; a negative limit is none.
+struct footer_read_limits {
+  std::int64_t remote = -1;
+  std::int64_t local  = -1;
+};
+
+/// \brief The limits in force for a planning on \p context: the connection's settings, and the
+/// engine configuration where the connection has set none.
+[[nodiscard]] footer_read_limits footer_read_limits_of(duckdb::ClientContext& context);
+
 /// \brief The number of rows in all files of \p get, a Parquet scan add_parquet_footer_statistics
-/// has covered (a one-file scan too), or nullopt. Exact and unfiltered: the sum of the footers' row
+/// covered (a one-file scan too), or nullopt. Exact and unfiltered: the sum of the footers' row
 /// counts. DuckDB's own cardinality for a multi-file scan extrapolates from one file.
+///
+/// The count belongs to the plan whose planning covered the scan: it is found through the file
+/// list of the scan's bind data. Another plan over the same paths does not have it, and neither
+/// does a scan whose file list DuckDB replaced while optimizing. A copy of the plan has it only
+/// through copy_parquet_scan_row_count.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
+
+/// \brief Make the row count of every Parquet scan in \p plan unknown.
+void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan);
+
+/// \brief Give \p to, the copy of the scan \p from in a copy of its plan, the row count of \p from.
+void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::LogicalGet const& to);
 
 /// \brief Read the footer statistics of \p paths into the cache add_parquet_footer_statistics uses,
 /// so the first query over them does not pay for reading every footer.
 ///
 /// The footers are read with DuckDB's default Parquet options, so only scans with those options
-/// reuse them; a scan with other options reads the footers again for its own statistics.
+/// reuse them; a scan with other options reads the footers again for its own statistics. The read
+/// limits of add_parquet_footer_statistics do not apply. All files are processed; only records
+/// that fit remain cached.
 ///
-/// \return The number of files whose statistics are cached.
+/// \return The number of files whose statistics were read or found cached.
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths);
 
 namespace detail {
+/// What the caches keep once no planning is running.
+struct cache_capacities {
+  std::size_t statistics;  ///< Files whose statistics are kept, each reader-options set apart.
+  std::size_t merges;      ///< Merged statistics kept; also row counts of live plans kept.
+  std::size_t merge_references;  ///< Files all kept merged statistics were merged from, together.
+};
+inline constexpr cache_capacities default_cache_capacities{16'384, 128, 16'384};
 /// The most sets of scan paths whose merged statistics are kept.
-inline constexpr std::size_t merged_statistics_cache_capacity = 128;
+inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;
 /// The number of scans whose merged statistics are cached, for tests.
 std::size_t merged_statistics_cache_size();
 /// The number of scans whose row counts are cached, for tests. Bounded like the merged statistics.
 std::size_t row_count_cache_size();
+/// The number of files whose statistics are cached, for tests.
+std::size_t statistics_cache_size();
+/// The number of files the cached merged statistics were merged from, for tests.
+std::size_t merged_reference_count();
+/// The number of per-file statistics alive in the process, cached or in use by a planning.
+std::size_t live_statistics_records();
+/// The number of footers read for statistics since the process started.
+std::uint64_t footer_read_count();
+/// For tests: replace the capacities, drop what exceeds them and return the previous ones.
+cache_capacities set_cache_capacities_for_testing(cache_capacities replacement);
+/// For tests: drop every cached statistic, merged statistic and row count.
+void clear_caches_for_testing();
 }  // namespace detail
 
 }  // namespace sirius::transparent

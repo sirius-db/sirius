@@ -668,6 +668,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   // 0 is meaningful here: it selects the share of GPU memory space capacity.
   r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
   r.optional("enable_exists_minmax_rewrite", opt.enable_exists_minmax_rewrite);
+  r.optional("parquet_footer_statistics_max_remote_reads",
+             opt.parquet_footer_statistics_max_remote_reads,
+             yaml::greater_than<std::int64_t>{-2});
+  r.optional("parquet_footer_statistics_max_local_reads",
+             opt.parquet_footer_statistics_max_local_reads,
+             yaml::greater_than<std::int64_t>{-2});
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
