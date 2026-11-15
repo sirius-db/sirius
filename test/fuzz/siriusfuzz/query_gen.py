@@ -570,7 +570,7 @@ class QueryGenerator:
             for item in sel.items:
                 if exact_type(item.expr) is None:
                     if item.expr.kind == "decimal" and not self.f.casts.decimal_scale:
-                        item.expr = self._leaf("decimal", scope, depth + 1, prefer_column=True)
+                        item.expr = self._literal("decimal", st.DECIMAL_18_4)
                     else:
                         item.expr = Cast(item.expr, CONCRETE[item.expr.kind])
 
