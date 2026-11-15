@@ -265,10 +265,14 @@ void downgrade_executor::processing_loop()
 
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
-      // query: outer loop DESCENDING by query id (newest query first), inner loop in
-      // get_repositories() order — ascending {operator_id, port_id} — with early stop once the
+      // query: outer loop DESCENDING by query id (newest query first), inner loop in REVERSE
+      // get_repositories() order — descending {operator_id, port_id} — with early stop once the
       // reservation is satisfied. Operator ids restart at 0 per query, so ordering is
       // (query id, operator id) rather than a single global counter.
+      //
+      // A repository is keyed by its CONSUMER's operator id, and ids follow the topological
+      // pipeline order, so descending order offers the data that is read last first and keeps
+      // the input of the operator about to run resident.
       //
       // Newest-first is the fairness policy: query ids are monotonic, so the newest query is the
       // one that has made the least progress, and spilling it costs the least re-materialization
@@ -289,7 +293,7 @@ void downgrade_executor::processing_loop()
         if (!borrow) { continue; }
         if (req->satisfied.load() || pool_interrupted || target_completed()) break;
         auto repos = manager->get_repositories();
-        for (auto* repo : repos) {
+        for (auto* repo : std::views::reverse(repos)) {
           if (req->satisfied.load() || target_completed()) break;
 
           convertible_data_batch_provider provider(repo);
