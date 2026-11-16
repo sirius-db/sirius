@@ -61,7 +61,7 @@ class Joins:
     any_join: bool = True
     any_mixed: bool = gap_switch(
         False
-    )  # 5a54110e: mixed arithmetic ANY GPU AST type error
+    )  # #2153 / 5a54110e: mixed arithmetic ANY GPU AST type error
     any_join_share: float = 0.15
     self_join: bool = True
     self_join_share: float = 0.2
@@ -102,7 +102,7 @@ class Aggregates:
     expression_args: bool = gap_switch(False)
     float_division_minmax: bool = gap_switch(
         False
-    )  # c6aae63a: NaN from finite division
+    )  # #2085/#2592 / c6aae63a: NaN from finite division
     hugeint_sum: bool = gap_switch(False)
 
 
@@ -148,7 +148,7 @@ class ScalarFunctions:
     )  # default queries use nonzero integer divisors so DuckDB can evaluate them
     regexp_backreferences: bool = gap_switch(
         False
-    )  # 0fca855a: regexp_replace \0\0 duplicates on CPU but not GPU
+    )  # unfiled 0fca855a: regexp_replace \0\0 duplicates on CPU but not GPU
     join_neighbours: bool = gap_switch(False)
     window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(
@@ -190,21 +190,21 @@ class Casts:
     temporal_numeric: bool = gap_switch(False)
     float_to_int: bool = gap_switch(
         False
-    )  # 83b0c0ed: FLOAT -> BIGINT rounds differently
-    integer_narrowing: bool = gap_switch(False)
-    integer_sign_change: bool = gap_switch(False)
-    integer_out_of_range: bool = gap_switch(False)
+    )  # #2152 / 83b0c0ed: FLOAT -> BIGINT rounds differently
+    integer_narrowing: bool = gap_switch(False)  # #2580: out-of-range wraps
+    integer_sign_change: bool = gap_switch(False)  # #2580: out-of-range wraps
+    integer_out_of_range: bool = gap_switch(False)  # #2580: out-of-range wraps
     integer_to_varchar: bool = True
     decimal_scale: bool = gap_switch(
         False
-    )  # reducing scale rounds on CPU, truncates on GPU
+    )  # #2590: reducing scale rounds on CPU, truncates on GPU
     decimal_to_integer: bool = True
     integer_to_decimal: bool = True
     decimal_to_double: bool = True
     date_timestamp: bool = True
     timestamp_units: bool = gap_switch(
         False
-    )  # second/millisecond casts truncate on GPU
+    )  # #2594: second/millisecond casts truncate on GPU
     try_cast: bool = True
     to_varchar: bool = gap_switch(
         False
@@ -299,10 +299,14 @@ class EdgeValues:
     probability: float = 0.02
     int_extremes: bool = True
     negative_zero: bool = True
-    nan_inf: bool = gap_switch(False)  # nonfinite floating aggregates mismatch
+    nan_inf: bool = gap_switch(
+        False
+    )  # #2085/#2592: nonfinite floating aggregates mismatch
     rounding_ties: bool = gap_switch(False)
     date_extremes: bool = True
-    unicode_case: bool = gap_switch(False)  # GPU case mapping differs for ß and İ
+    unicode_case: bool = gap_switch(
+        False
+    )  # #2598: GPU case mapping differs for ß and İ
     long_string: bool = gap_switch(False)
 
 
@@ -317,6 +321,9 @@ class Pin:
 class Parquet:
     tables_fraction: float = 0.0
     row_group_size: int = 256
+    timestamp_ms: bool = gap_switch(
+        False
+    )  # #2595: Parquet reads TIMESTAMP_MS as a drifting unit
 
 
 @dataclass
@@ -353,6 +360,8 @@ class Oracle:
     ambiguity_filter: bool = True
     known_issues: str = "known_issues.toml"
     query_timeout_seconds: float = 60.0
+    cpu_timeout_seconds: float = 20.0
+    tlp_share: float = 0.1
     reduce: bool = True
     reduce_max_steps: int = 150
     reduce_sqlsmith: str = "auto"  # auto | off | on
@@ -394,11 +403,26 @@ class Sirius:
 class TypeOptions:
     # The truth table admits these widths for native scan, filter, group and join.
     decimal_widths: list[str] = gap_switch(
-        ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(9,2)",
-         "DECIMAL(9,9)", "DECIMAL(18,0)", "DECIMAL(18,18)"],
-        ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(4,0)",
-         "DECIMAL(9,2)", "DECIMAL(9,9)", "DECIMAL(18,0)",
-         "DECIMAL(18,18)", "DECIMAL(19,4)", "DECIMAL(28,6)", "DECIMAL(38,10)"],
+        [
+            "DECIMAL(12,2)",
+            "DECIMAL(18,4)",
+            "DECIMAL(9,2)",
+            "DECIMAL(9,9)",
+            "DECIMAL(18,0)",
+            "DECIMAL(18,18)",
+        ],
+        [
+            "DECIMAL(12,2)",
+            "DECIMAL(18,4)",
+            "DECIMAL(4,0)",
+            "DECIMAL(9,2)",
+            "DECIMAL(9,9)",
+            "DECIMAL(18,0)",
+            "DECIMAL(18,18)",
+            "DECIMAL(19,4)",
+            "DECIMAL(28,6)",
+            "DECIMAL(38,10)",
+        ],
     )
     hugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
     uhugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
@@ -480,6 +504,13 @@ class FuzzConfig:
             raise ConfigError(
                 "oracle.query_timeout_seconds must be positive and finite"
             )
+        if (
+            not math.isfinite(self.oracle.cpu_timeout_seconds)
+            or self.oracle.cpu_timeout_seconds <= 0
+        ):
+            raise ConfigError("oracle.cpu_timeout_seconds must be positive and finite")
+        if not 0 <= self.oracle.tlp_share <= 1:
+            raise ConfigError("oracle.tlp_share must be between 0 and 1")
         if self.sirius.dataset_queries <= 0:
             raise ConfigError("sirius.dataset_queries must be positive")
         if f.aggregates.distinct not in ("off", "grouped_only", "on"):
@@ -519,8 +550,10 @@ class FuzzConfig:
         sqltypes.types_from_names(f.types)
         widths = sqltypes.types_from_names(self.types.decimal_widths)
         if not widths or any(
-            t.kind != "decimal" or not 1 <= t.precision <= 38
-            or not 0 <= t.scale <= t.precision for t in widths
+            t.kind != "decimal"
+            or not 1 <= t.precision <= 38
+            or not 0 <= t.scale <= t.precision
+            for t in widths
         ):
             raise ConfigError("types.decimal_widths needs valid DECIMAL(p,s) widths")
         sqltypes.types_from_names(f.casts.targets)

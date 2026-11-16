@@ -16,6 +16,7 @@ import time
 import shutil
 import tempfile
 import math
+import datetime as dt
 
 from .artifacts import provenance, write_json
 from .probe import execute_probe
@@ -30,10 +31,21 @@ from .config import (
     load_config,
     resolve_repo_path,
 )
-from .report import Report, default_known_issues_path, load_known_issues
-from .runner import Orchestrator, OrchestratorOptions
+from .report import (
+    Report,
+    _CLAIMED_FEATURES,
+    default_known_issues_path,
+    load_known_issues,
+)
+from .runner import Evaluator, Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
-from .session import SessionError, check_shell, discover_sirius_yaml, find_shell
+from .session import (
+    Session,
+    SessionError,
+    check_shell,
+    discover_sirius_yaml,
+    find_shell,
+)
 
 SELFTEST_DEFAULT_OVERRIDES = (
     "data.rows=[8,16]",
@@ -226,7 +238,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         if result["status"] != "ok":
             return 130 if result["status"] == "cancelled" else 2
     known = load_known_issues(default_known_issues_path(cfg))
-    report = Report(run_dir, cfg, known, seed, mode=args.mode)
+    prior = set()
+    if args.prior_signatures:
+        prior = {
+            line.strip().lower()
+            for line in pathlib.Path(args.prior_signatures).read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+    report = Report(run_dir, cfg, known, seed, mode=args.mode, prior_signatures=prior)
     opts = OrchestratorOptions(
         workers=args.workers,
         duration=parse_duration(args.duration),
@@ -261,6 +280,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     summary = Orchestrator(cfg, report, seed, opts).run()
+    env = json.loads((run_dir / "environment.json").read_text())
+    history = run_dir.parent / "yield.jsonl"
+    yield_row = {
+        "date": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "run_dir": str(run_dir),
+        "engine_revision": env.get("checkout", {}).get("revision"),
+        "harness_revision": env.get("checkout", {}).get("revision"),
+        "configuration": pathlib.Path(cfg.source_path).name,
+        "config_hash": summary["config_hash"],
+        "mode": args.mode,
+        "status": summary["status"],
+        "budget": summary["budget"],
+        "accounting": summary["accounting"],
+        "signatures": summary["signatures"],
+    }
+    compared = summary["budget"]["compared"]
+    yield_row["new_signatures_per_1000_compared"] = (
+        1000 * yield_row["signatures"]["new"] / compared if compared else None
+    )
+    with history.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(yield_row, sort_keys=True) + "\n")
     print(report.render_summary(summary))
     if summary["findings"]:
         first = run_dir / "findings" / summary["findings"][0]["name"]
@@ -581,6 +621,97 @@ def cmd_recheck(args: argparse.Namespace) -> int:
     return 0 if cleared == len(rows) else 1
 
 
+def cmd_coverage_check(args: argparse.Namespace) -> int:
+    run_dir = cli_path(args.run_dir, "run directory")
+    summary = json.loads((run_dir / "summary.json").read_text())
+    cfg = load_config(run_dir / "config.toml")
+    queries = summary["queries"]
+    if queries <= 0 or summary["status"] != "complete":
+        print("coverage-check: run is empty or incomplete", file=sys.stderr)
+        return 2
+    missing = []
+    for tag in _CLAIMED_FEATURES(cfg):
+        count = summary.get("coverage", {}).get(tag, {}).get("queries", 0)
+        per_1000 = 1000 * count / queries
+        if count == 0 or per_1000 < args.min_per_1000:
+            missing.append((tag, count, per_1000))
+    for tag, count, rate in missing:
+        print(f"LOW {tag}: {count}/{queries} ({rate:.2f} per 1000)")
+    print(
+        f"coverage-check: {len(_CLAIMED_FEATURES(cfg))-len(missing)} claimed features pass; "
+        f"{len(missing)} below {args.min_per_1000:g} per 1000"
+    )
+    return 1 if missing else 0
+
+
+def cmd_corpus(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    cfg.variants.per_query = 0
+    cfg.oracle.tlp_share = 0
+    engine = _engine(args, cfg)
+    corpus_dir = cli_path(args.corpus_dir, "corpus directory")
+    files = sorted(corpus_dir.glob("*.sql"))
+    if not files:
+        raise ValueError(f"no corpus SQL files in {corpus_dir}")
+    rows = []
+    with tempfile.TemporaryDirectory(prefix="siriusfuzz-corpus-") as temp:
+        for index, path in enumerate(files):
+            source = "\n".join(
+                line
+                for line in path.read_text().splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            statements = [s.strip() for s in source.split(";") if s.strip()]
+            if len(statements) < 2:
+                raise ValueError(f"{path}: expected setup statements and one query")
+            db_dir = pathlib.Path(temp) / f"case-{index}"
+            db_dir.mkdir()
+            session = Session(
+                engine.shell,
+                engine.extension,
+                engine.configs[0] if engine.configs else None,
+                db_dir,
+                0,
+                cpu_only=engine.cpu_only,
+                extension_explicit=engine.extension_explicit,
+            )
+            try:
+                session.open()
+                session.execute(f"ATTACH '{db_dir / 'case.duckdb'}' AS corpus")
+                session.execute("USE corpus")
+                for setup in statements[:-1]:
+                    session.execute(setup)
+                session.execute("CHECKPOINT")
+                rec = Evaluator(cfg, session, lambda _: None).evaluate(
+                    None, statements[-1], 0, path.stem, 0
+                )
+                verdict = rec.verdict
+                if verdict == "ok":
+                    status = "now matches"
+                elif verdict in ("mismatch", "variant_mismatch", "tlp_mismatch"):
+                    status = "still differs"
+                elif verdict in ("plan_fallback", "runtime_fallback"):
+                    status = "declined"
+                else:
+                    status = "error"
+                detail = rec.reason or rec.detail
+            except Exception as exc:
+                status, verdict, detail = "error", "setup_error", str(exc)
+            finally:
+                session.close()
+            row = {
+                "file": path.name,
+                "status": status,
+                "verdict": verdict,
+                "detail": detail,
+            }
+            rows.append(row)
+            print(f"{path.name}: {status} ({verdict}) {detail[:120]}")
+    if args.out:
+        write_json(pathlib.Path(args.out), rows)
+    return 0 if all(r["status"] == "still differs" for r in rows) else 1
+
+
 def cmd_show_config(args: argparse.Namespace) -> int:
     cfg = _load(args)
     print(cfg.to_toml())
@@ -642,6 +773,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--workers", type=int, default=1)
     run.add_argument("--out", help=f"output root (default {FUZZ_DIR / 'out'})")
+    run.add_argument(
+        "--prior-signatures", help="file with earlier eight-character signature hashes"
+    )
     run.add_argument("--no-reduce", action="store_true")
     run.add_argument(
         "--max-respawns",
@@ -718,6 +852,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="deadline for each replayed query (seconds)",
     )
     rc.set_defaults(func=cmd_recheck, dataset=None, dataset_seed=None, ordered=False)
+
+    cov = sub.add_parser(
+        "coverage-check", help="check claimed-feature emissions in a completed run"
+    )
+    cov.add_argument("run_dir")
+    cov.add_argument("--min-per-1000", type=float, default=1.0)
+    cov.set_defaults(func=cmd_coverage_check)
+
+    corpus = sub.add_parser(
+        "corpus", help="compare saved SQL reproducers on CPU and strict GPU"
+    )
+    _common_config_args(corpus)
+    _common_engine_args(corpus)
+    corpus.add_argument("--corpus-dir", default=str(FUZZ_DIR / "corpus"))
+    corpus.add_argument("--out", help="write per-file JSON results")
+    corpus.set_defaults(func=cmd_corpus)
 
     sc = sub.add_parser("show-config", help="print the effective configuration")
     _common_config_args(sc)

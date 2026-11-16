@@ -1,5 +1,37 @@
 # siriusfuzz: differential fuzzing for Sirius
 
+## Regression corpus and yield
+
+`pixi run fuzz corpus` compares every small SQL reproducer in `test/fuzz/corpus/`
+on DuckDB CPU and strict Sirius GPU. It reports `still differs`, `now matches`,
+`declined`, or `error` for each file. A `now matches` result is a prompt to check
+whether that family's quarantine can be removed. Dataset-dependent failures are
+listed in [the corpus README](corpus/README.md).
+
+Every campaign writes a coverage and budget table to `summary.txt`, machine-readable
+`coverage`, `accounting`, and `budget` sections to `summary.json`, and one row to
+`yield.jsonl` in the output root. Run `pixi run fuzz coverage-check <run-dir>`
+against a completed campaign to require every claimed feature at least once and
+at least one emission per 1,000 queries. `test/fuzz/scripts/nightly.sh 15m
+<output-root>` runs doctor, corpus, a campaign, and the coverage check. The script
+is run manually; it is not installed in a scheduler.
+
+| Gap switch | Withheld behavior | Issue | Corpus |
+|---|---|---|---|
+| `features.joins.any_mixed` | mixed arithmetic ANY operands | #2153 | bundle only |
+| `features.casts.float_to_int` | FLOAT to integer rounding | #2152 | `2152-float-to-integer.sql` |
+| `features.casts.integer_narrowing`, `integer_sign_change`, `integer_out_of_range` | integer casts outside the target range | #2580 | `2580-try-cast-wrap.sql` |
+| `features.casts.decimal_scale` | explicit and implicit DECIMAL scale reduction | #2590 | `2590-decimal-scale.sql`, `2590-decimal-coalesce.sql`, `2590-decimal-case.sql` |
+| `features.casts.timestamp_units` | casts to second/millisecond timestamp units | #2594 | `2594-timestamp-unit.sql` |
+| `data.parquet.timestamp_ms` | Parquet tables containing `TIMESTAMP_MS` | #2595 | saved bundle |
+| `data.edge_values.nan_inf`, `features.aggregates.float_division_minmax` | nonfinite MIN/MAX inputs, including computed NaN | #2085, #2592 | `2085-nan-grouped-minmax.sql`, `2592-nan-ungrouped-max.sql` |
+| `data.edge_values.unicode_case` | Unicode case mappings | #2598 | `2598-unicode-case.sql` |
+| `features.scalar_functions.regexp_backreferences` | repeated match backreferences after multibyte text | unfiled `0fca855a` | `0fca855a-regex-backreference.sql` |
+
+The filtered MIN (#2593), floating AVG (#2591), and EXCEPT ALL/TopN (#2596)
+families have no dedicated generation quarantine; their saved reproducer or
+bundle is checked separately.
+
 `siriusfuzz` generates SQL, runs it on both DuckDB (CPU) and Sirius (GPU), and saves every
 disagreement as a replayable finding. It is a plain command-line tool; no AI agent is required.
 

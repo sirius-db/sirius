@@ -478,6 +478,7 @@ class Session:
         self.duckdb_version: str | None = None
         self.sirius: str = "none"  # built-in | loaded | none
         self.restarts = 0
+        self.timings: collections.Counter[str] = collections.Counter()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -596,6 +597,7 @@ class Session:
 
     def _ensure_alive(self, state: dict[str, Any] | None = None) -> None:
         if not self.shell.alive:
+            started = time.monotonic()
             self.restarts += 1
             if self.evidence_path:
                 # The supervisor reads how long this step may legitimately take.
@@ -610,6 +612,7 @@ class Session:
                     },
                 )
             self._start()
+            self.timings["shell_restart"] += time.monotonic() - started
 
     def execute(self, sql: str, timeout: float = 600.0) -> ShellResult:
         """Run a statement that must succeed (setup, settings, data loading)."""
@@ -638,6 +641,7 @@ class Session:
         permutation_seed: int | None = None,
         variants: dict[str, Any] | None = None,
     ) -> None:
+        started = time.monotonic()
         self.db_dir.mkdir(parents=True, exist_ok=True)
         path = self.db_dir / f"{alias}.duckdb"
         for p in (path, pathlib.Path(str(path) + ".wal")):
@@ -651,12 +655,14 @@ class Session:
         self.execute(ds.schema_sql())
         self.execute(ds.data_sql(permutation_seed))
         self.execute("CHECKPOINT")
+        self.timings["data_loading"] += time.monotonic() - started
         self.apply_dataset_variants(alias, variants or {})
 
     def _pin_tables(self, pins: dict[str, dict[str, Any]]) -> None:
         if not self.gpu_available:
             return
         for name, choice in pins.items():
+            started = time.monotonic()
             enabled = "true" if choice["compression"] else "false"
             self.execute(f"SET pin_table_compression = {enabled}")
             self.execute(f"SET enable_compressed_materialization = {enabled}")
@@ -664,11 +670,13 @@ class Session:
                 "CALL pin_table(format = 'duckdb', "
                 f"name = {sql_literal(name)}, tier = {sql_literal(choice['tier'])})"
             )
+            self.timings["pin_setup"] += time.monotonic() - started
 
     def apply_dataset_variants(self, alias: str, variants: dict[str, Any]) -> None:
         """Apply saved physical layout after CHECKPOINT, also during replay."""
         self.use(alias)
         for name, row_group_size in variants.get("parquet", {}).items():
+            started = time.monotonic()
             folder = self.db_dir.parent / "datasets" / alias
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"{name}.parquet"
@@ -680,6 +688,7 @@ class Session:
             self.execute(
                 f'CREATE VIEW "{name}" AS SELECT * FROM read_parquet({sql_literal(str(path))})'
             )
+            self.timings["parquet_setup"] += time.monotonic() - started
         pins = variants.get("pin", {})
         self._pin_tables(pins)
         if pins and self.gpu_available:

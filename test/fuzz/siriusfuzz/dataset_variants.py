@@ -15,7 +15,12 @@ from .config import Data
 MARKER = "-- siriusfuzz dataset variants: "
 
 
-def choose(data: Data, table_names: list[str], seed: int) -> dict[str, Any]:
+def choose(
+    data: Data,
+    table_names: list[str],
+    seed: int,
+    parquet_exclude: set[str] | None = None,
+) -> dict[str, Any]:
     rng = random.Random(seed ^ 0x504841534531)
     names = sorted(table_names)
 
@@ -25,7 +30,10 @@ def choose(data: Data, table_names: list[str], seed: int) -> dict[str, Any]:
         count = min(len(candidates), max(1, round(len(names) * fraction)))
         return sorted(rng.sample(candidates, count))
 
-    parquet = selected(data.parquet.tables_fraction, names)
+    parquet = selected(
+        data.parquet.tables_fraction,
+        [n for n in names if n not in (parquet_exclude or set())],
+    )
     pin = selected(data.pin.tables_fraction, [n for n in names if n not in parquet])
     return {
         "parquet": {name: data.parquet.row_group_size for name in parquet},

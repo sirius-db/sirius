@@ -15,6 +15,7 @@ process as a last line of defence, respawns, and feeds the report.
 from __future__ import annotations
 
 import dataclasses
+import copy
 import multiprocessing as mp
 import os
 import pathlib
@@ -46,7 +47,23 @@ from .reduce import reduce_query
 from .report import QueryRecord, Report, signature
 from .schema_gen import DataGenerator, Dataset
 from .session import TEARDOWN_SECONDS, RunResult, Session
-from .sqlast import Query, labels
+from .sqlast import (
+    Agg,
+    ColumnRef,
+    Compare,
+    Derived,
+    IsNull,
+    Join,
+    Literal,
+    Logical,
+    Not,
+    Query,
+    Select,
+    TableRef,
+    Window,
+    labels,
+    walk,
+)
 
 HANG_GRACE_SECONDS = 60.0  # beyond the budget the worker declares for its current step
 
@@ -120,6 +137,7 @@ class Evaluator:
             cfg.oracle.float32_rel_tol, cfg.oracle.float64_rel_tol, cfg.oracle.abs_tol
         )
         self.timeout = cfg.oracle.query_timeout_seconds
+        self.cpu_timeout = cfg.oracle.cpu_timeout_seconds
         self.variants: dict[str, list[Any]] = {}
         if session.gpu_available:
             for name, values in cfg.variants.settings.items():
@@ -155,7 +173,7 @@ class Evaluator:
             comparison=mode,
         )
         rec.labels = labels(query) if query is not None else []
-        cpu = self.s.run(sql, gpu=False, timeout=self.timeout)
+        cpu = self.s.run(sql, gpu=False, timeout=self.cpu_timeout)
         rec.elapsed_cpu = cpu.elapsed
         if cpu.status == "crash":
             return self._crashed(rec, cpu, "CPU phase: ")
@@ -170,7 +188,7 @@ class Evaluator:
         self._type_columns(sql, cpu.result)
         if not self.s.gpu_available:
             # cpu-only harness check: a second CPU run must agree with the first.
-            gpu = self.s.run(sql, gpu=False, timeout=self.timeout)
+            gpu = self.s.run(sql, gpu=False, timeout=self.cpu_timeout)
         else:
             gpu = self.s.run(sql, gpu=True, timeout=self.timeout)
         rec.elapsed_gpu = gpu.elapsed
@@ -201,8 +219,103 @@ class Evaluator:
             rec.detail = f"compare={mode}: {outcome.detail}"
             rec.diffs = outcome.diffs
             return rec
+        started = time.monotonic()
         self._run_variants(rec, sql, cpu.result, gpu.result, mode)
+        rec.phase_seconds["setting_variants"] = time.monotonic() - started
+        if rec.verdict == Verdict.OK.value:
+            started = time.monotonic()
+            self._check_tlp(rec, query, gpu.result)
+            rec.phase_seconds["tlp_check"] = time.monotonic() - started
         return rec
+
+    def _check_tlp(
+        self, rec: QueryRecord, query: Query | None, baseline: ResultSet
+    ) -> None:
+        """Partition a plain SELECT by an exact, deterministic three-valued predicate."""
+        if not isinstance(query, Select) or query.from_ is None:
+            return
+        if query.distinct or query.limit is not None or query.group_by or query.having:
+            return
+        if any(isinstance(n, (Agg, Window)) for n in walk(query)):
+            return
+        if self.dataset is None:
+            return
+
+        def visible_tables(node):
+            if isinstance(node, TableRef):
+                yield node
+            elif isinstance(node, Join):
+                yield from visible_tables(node.left)
+                if node.join_type not in ("semi", "anti"):
+                    yield from visible_tables(node.right)
+            # A derived table's inner aliases are not visible to this SELECT.
+
+        choices = []
+        tables = {t.name: t for t in self.dataset.tables}
+        for ref in visible_tables(query.from_):
+            table = tables.get(ref.table)
+            if table is None:
+                continue
+            for col in table.columns:
+                if col.type.kind == "int" and col.name != "k":
+                    choices.append(ColumnRef(ref.alias, col.name, col.type))
+        if not choices:
+            return
+        rec.tlp = {"eligible": True, "checked": False}
+        if self.rng.random() >= self.cfg.oracle.tlp_share:
+            return
+        col = self.rng.choice(choices)
+        predicate = Compare("<", col, Literal(0, col.type))
+        branches = (predicate, Not(predicate), IsNull(predicate))
+        parts = []
+        counts = []
+        for branch in branches:
+            q = copy.deepcopy(query)
+            q.order_by = []
+            q.where = branch if q.where is None else Logical("AND", [q.where, branch])
+            part = self.s.run(
+                q.sql(),
+                gpu=self.s.gpu_available,
+                timeout=self.timeout if self.s.gpu_available else self.cpu_timeout,
+            )
+            if part.status != "ok" or part.result is None:
+                rec.tlp = {
+                    "eligible": True,
+                    "checked": True,
+                    "predicate": predicate.sql(),
+                    "error": part.error or part.status,
+                }
+                if self.s.gpu_available and part.status == "error":
+                    verdict, reason = classify_gpu_error(part.error)
+                    rec.verdict = verdict.value
+                    rec.reason = "TLP partition: " + reason
+                else:
+                    rec.verdict = (
+                        Verdict.GPU_ERROR.value
+                        if self.s.gpu_available
+                        else Verdict.CPU_ERROR.value
+                    )
+                    rec.reason = (
+                        "TLP partition: "
+                        + (part.error or part.status).split("\n", 1)[0][:160]
+                    )
+                return
+            counts.append(part.result.row_count)
+            parts.extend(part.result.rows)
+        rec.tlp = {
+            "eligible": True,
+            "checked": True,
+            "predicate": predicate.sql(),
+            "partition_rows": counts,
+            "baseline_rows": baseline.row_count,
+        }
+        union = ResultSet(baseline.columns, parts)
+        outcome = compare_results(baseline, union, False, self.tol)
+        if not outcome.equal:
+            rec.verdict = Verdict.TLP_MISMATCH.value
+            rec.reason = outcome.detail
+            rec.detail = f"TLP {predicate.sql()} counts={counts}: {outcome.detail}"
+            rec.diffs = outcome.diffs
 
     # -- helpers -------------------------------------------------------------
 
@@ -240,6 +353,15 @@ class Evaluator:
                     self.cfg.data,
                     [table.name for table in getattr(self.dataset, "tables", [])],
                     self.dataset.seed,
+                    parquet_exclude=(
+                        {
+                            t.name
+                            for t in getattr(self.dataset, "tables", [])
+                            if any(c.type.name == "TIMESTAMP_MS" for c in t.columns)
+                        }
+                        if not self.cfg.data.parquet.timestamp_ms
+                        else set()
+                    ),
                 )
                 perm_variants["pin"] = {}
                 self.s.load_dataset(
@@ -249,7 +371,7 @@ class Evaluator:
                     variants=perm_variants,
                 )
             self.s.use(self.perm_alias)
-            perm = self.s.run(sql, gpu=False, timeout=self.timeout)
+            perm = self.s.run(sql, gpu=False, timeout=self.cpu_timeout)
         finally:
             self.s.use(self.alias)
         if perm.status != "ok" or perm.result is None:
@@ -368,7 +490,7 @@ class Evaluator:
             )
 
         def cpu_ok(sql: str, typed: bool = False) -> RunResult | None:
-            res = self.s.run(sql, gpu=False, timeout=self.timeout)
+            res = self.s.run(sql, gpu=False, timeout=self.cpu_timeout)
             if res.status != "ok" or res.result is None:
                 return None
             if typed:  # only result comparisons need the types
@@ -554,9 +676,21 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
             if args.max_queries is not None and done_queries >= args.max_queries:
                 break
             ds_seed = args.seed * 1000 + dataset_idx
+            generation_start = time.monotonic()
             ds = data_gen.generate(ds_seed)
             dataset_variants = choose_dataset_variants(
-                cfg.data, [table.name for table in ds.tables], ds_seed
+                cfg.data,
+                [table.name for table in ds.tables],
+                ds_seed,
+                parquet_exclude=(
+                    {
+                        t.name
+                        for t in ds.tables
+                        if any(c.type.name == "TIMESTAMP_MS" for c in t.columns)
+                    }
+                    if not cfg.data.parquet.timestamp_ms
+                    else set()
+                ),
             )
             stem = f"w{w}-s{args.spawn_id}-d{dataset_idx}"
             alias = f"fz{w}_{dataset_idx}"
@@ -566,6 +700,14 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 + variant_comment(dataset_variants)
                 + f"{ds.schema_sql()}\n{ds.data_sql()}\nCHECKPOINT;\n"
             )
+            send(
+                {
+                    "type": "accounting",
+                    "stats": {"data_generation": time.monotonic() - generation_start},
+                    "dataset": stem,
+                }
+            )
+            before_timing = session.timings.copy()
             load_start = time.monotonic()
             try:
                 session.load_dataset(ds, alias, variants=dataset_variants)
@@ -575,6 +717,17 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                 return
             evaluator.set_dataset(ds, alias)
             load_seconds = time.monotonic() - load_start
+            load_parts = {
+                key: session.timings[key] - before_timing[key]
+                for key in (
+                    "data_loading",
+                    "parquet_setup",
+                    "pin_setup",
+                    "shell_restart",
+                )
+            }
+            load_parts["load_other"] = max(0.0, load_seconds - sum(load_parts.values()))
+            send({"type": "accounting", "stats": load_parts, "dataset": stem})
             log(
                 f"dataset loaded: {stem} rows={sum(t.row_count for t in ds.tables)} load_seconds={load_seconds:.3f}"
             )
@@ -603,7 +756,18 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     break
                 if args.max_queries is not None and done_queries >= args.max_queries:
                     break
+                generation_start = time.monotonic()
                 query = qgen.generate()
+                send({"type": "generated"})
+                send(
+                    {
+                        "type": "accounting",
+                        "stats": {
+                            "query_generation": time.monotonic() - generation_start
+                        },
+                        "dataset": stem,
+                    }
+                )
                 new_stats = qgen.stats - reported_stats
                 if new_stats:
                     send({"type": "stats", "stats": dict(new_stats)})
@@ -618,8 +782,19 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     }
                 )
                 try:
+                    eval_start = time.monotonic()
+                    before_restart = session.timings["shell_restart"]
                     session.begin_query(sql)
                     rec = evaluator.evaluate(query, sql, w, stem, ds_seed)
+                    eval_seconds = time.monotonic() - eval_start
+                    rec.phase_seconds["cpu_run"] = rec.elapsed_cpu
+                    rec.phase_seconds["gpu_run"] = rec.elapsed_gpu
+                    rec.phase_seconds["shell_restart"] = (
+                        session.timings["shell_restart"] - before_restart
+                    )
+                    rec.phase_seconds["evaluation_other"] = max(
+                        0.0, eval_seconds - sum(rec.phase_seconds.values())
+                    )
                     rec.generator_tags = sorted(new_stats)
                     rec.evidence = dict(session.evidence)
                     send({"type": "result", "record": asdict(rec)})
@@ -629,7 +804,17 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                         and wants_reduction(rec, args.mode, reduced)
                     ):
                         session.stage = "reduction"
+                        reduction_start = time.monotonic()
                         evaluator.reduce(rec, query)
+                        send(
+                            {
+                                "type": "accounting",
+                                "stats": {
+                                    "reduction": time.monotonic() - reduction_start
+                                },
+                                "dataset": stem,
+                            }
+                        )
                         send({"type": "reduction", "record": asdict(rec)})
                 except Exception as e:  # noqa: BLE001
                     # Harness bug or a shell that would not restart: the orchestrator
@@ -745,6 +930,7 @@ class Orchestrator:
     ):
         self.cfg = cfg
         self.report = report
+        self.report.workers = opts.workers
         self.seed = seed
         self.opts = opts
         self.ctx = mp.get_context("spawn")
@@ -888,7 +1074,13 @@ class Orchestrator:
                     msg = self.queue.get_nowait()
                 except queue_mod.Empty:
                     break
-                if msg["type"] in ("result", "reduction", "stats"):
+                if msg["type"] in (
+                    "result",
+                    "reduction",
+                    "stats",
+                    "generated",
+                    "accounting",
+                ):
                     self._handle(msg, set())
         return self.report.finish()
 
@@ -1007,6 +1199,10 @@ class Orchestrator:
             self.report.datasets += 1
         elif t == "stats":
             self.report.add_feature_stats(msg["stats"])
+        elif t == "generated":
+            self.report.generated += 1
+        elif t == "accounting":
+            self.report.add_accounting(msg["stats"], w, msg.get("dataset"))
         elif t == "canary":
             self._say(
                 f"[w{w}] interception canary: {'ok' if msg['ok'] else 'FAILED'} ({msg['why']})"

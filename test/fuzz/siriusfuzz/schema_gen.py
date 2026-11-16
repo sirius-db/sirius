@@ -288,7 +288,12 @@ class DataGenerator:
             odd = rng.randrange(1, 1000) * 2 + 1
             salt = rng.randrange(1, 100000)
             arms = " ".join(
-                f"WHEN {j} THEN {st.render_insert_value(value, col.type)}"
+                f"WHEN {j} THEN "
+                + (
+                    f"CAST({st.render_insert_value(value, col.type)} AS {col.type.name})"
+                    if col.type.kind == "decimal"
+                    else st.render_insert_value(value, col.type)
+                )
                 for j, value in enumerate(pool)
             )
             select.append(
@@ -454,7 +459,9 @@ class DataGenerator:
         elif s.charset == "unicode":
             alphabet += "éßΩ日本😀"
         if s.max_len > 40 and rng.random() < 0.01:
-            n = rng.choice([min(s.max_len, 1024), min(s.max_len, 2048), s.max_len - 1, s.max_len])
+            n = rng.choice(
+                [min(s.max_len, 1024), min(s.max_len, 2048), s.max_len - 1, s.max_len]
+            )
         else:
             n = rng.randint(1, max(1, min(40, s.max_len)))
         chars: list[str] = []

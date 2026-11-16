@@ -17,7 +17,14 @@ class DatasetVariantTests(unittest.TestCase):
         self.assertEqual(first, choose(data, names, 20261111))
         self.assertFalse(set(first["pin"]) & set(first["parquet"]))
         self.assertEqual(set(first["pin"]) | set(first["parquet"]), set(names))
-        self.assertEqual(from_dataset_sql(comment(first) + "CREATE TABLE t0(k INT);"), first)
+        self.assertEqual(
+            from_dataset_sql(comment(first) + "CREATE TABLE t0(k INT);"), first
+        )
+
+    def test_parquet_excludes_timestamp_ms_tables(self):
+        data = Data(parquet=Parquet(tables_fraction=1.0))
+        selected = choose(data, ["t0", "t1", "t2"], 7, parquet_exclude={"t1"})
+        self.assertEqual(set(selected["parquet"]), {"t0", "t2"})
 
 
 if __name__ == "__main__":

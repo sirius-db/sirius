@@ -179,6 +179,7 @@ compression = [false, true]
 [data.parquet]
 tables_fraction = 0.0
 row_group_size = 256
+timestamp_ms = false
 
 [data.large]
 fraction = 0.0
@@ -197,6 +198,8 @@ abs_tol = 1e-12
 ambiguity_filter = true
 known_issues = "known_issues.toml"
 query_timeout_seconds = 60
+cpu_timeout_seconds = 20
+tlp_share = 0.1
 reduce = true
 reduce_max_steps = 150
 reduce_sqlsmith = "auto"

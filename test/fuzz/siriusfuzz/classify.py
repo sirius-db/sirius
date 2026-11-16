@@ -24,6 +24,9 @@ class Verdict(str, Enum):
     CPU_TIMEOUT = "cpu_timeout"
     AMBIGUOUS = "ambiguous"  # mismatch that flips under permuted row order
     MISMATCH = "mismatch"  # logic bug: GPU rows differ from CPU rows
+    TLP_MISMATCH = (
+        "tlp_mismatch"  # GPU filter partition differs from the unfiltered GPU query
+    )
     VARIANT_MISMATCH = (
         "variant_mismatch"  # same query, different Sirius setting, different rows
     )
@@ -48,6 +51,7 @@ GAPS = {Verdict.PLAN_FALLBACK, Verdict.RUNTIME_FALLBACK}
 
 _FINDINGS = {
     Verdict.MISMATCH,
+    Verdict.TLP_MISMATCH,
     Verdict.VARIANT_MISMATCH,
     Verdict.PLAN_FALLBACK,
     Verdict.RUNTIME_FALLBACK,
@@ -64,6 +68,7 @@ SEVERITY = [
     Verdict.TIMEOUT,
     Verdict.GPU_INTERNAL_ERROR,
     Verdict.MISMATCH,
+    Verdict.TLP_MISMATCH,
     Verdict.VARIANT_MISMATCH,
     Verdict.GPU_OOM,
     Verdict.GPU_ERROR,

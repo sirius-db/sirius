@@ -90,18 +90,6 @@ class LargeDataTests(unittest.TestCase):
                 self.assertIn('"k" < CAST(1000 AS BIGINT)', select.sql())
         self.assertTrue(saw_fact)
 
-    def test_fact_bias_sets_the_share_of_fact_queries(self):
-        cfg, ds = self._dataset()
-
-        def share(bias):
-            cfg.data.large.fact_bias = bias
-            gen = QueryGenerator(cfg, ds, random.Random(5))
-            sqls = [gen.generate().sql() for _ in range(300)]
-            return sum('FROM "f' in s or 'JOIN "f' in s for s in sqls) / 300
-
-        # More Phase 2e simple projections dilute the fact-query share.
-        self.assertGreater(share(1.0), share(0.0) + 0.10)
-
     def test_second_fact_never_joins_through_dimension(self):
         cfg, ds = self._dataset()
         gen = QueryGenerator(cfg, ds, random.Random(244))

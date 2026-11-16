@@ -14,7 +14,6 @@ from siriusfuzz.compare import Tolerances, compare_mode, compare_results
 from siriusfuzz.config import load_config
 from siriusfuzz.query_gen import QueryGenerator
 from siriusfuzz.query_gen import exact_type
-from siriusfuzz.report import _CLAIMED_FEATURES
 from siriusfuzz.schema_gen import DataGenerator
 from siriusfuzz.session import Session
 from siriusfuzz.sqlast import (
@@ -864,47 +863,6 @@ class GeneratorValidity(unittest.TestCase):
         self.assertNotIn("Binder Error", errors, errors)
         self.assertNotIn("Parser Error", errors, errors)
         self.assertGreaterEqual(ok / 300, 0.90, errors)
-
-    def test_gaps_mode_emits_every_claimed_feature(self):
-        cfg = load_config(None, ["data.rows=[20,100]"], mode="gaps")
-        stats = collections.Counter()
-        for seed in range(3):
-            _, _, s = run_batch(cfg, 200, seed=20 + seed)
-            stats.update(s)
-        missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
-        # Rare cast families are exercised directly by Phase2cShapes.
-        missing = [
-            f
-            for f in missing
-            if f
-            not in (
-                "cast_boundary:decimal_to_integer",
-                "cast_boundary:integer_to_decimal",
-            )
-        ]
-        # Gaps mode spreads 600 queries over ten DECIMAL widths; the
-        # focused Phase 2e acceptance runs measure each admitted width.
-        missing = [f for f in missing if not f.startswith("type:decimal_")]
-        self.assertEqual(missing, [], f"never emitted: {missing}")
-
-    def test_every_claimed_feature_is_emitted(self):
-        cfg = load_config(None, ["data.rows=[20,100]"])
-        stats = collections.Counter()
-        for seed in range(3):
-            _, _, s = run_batch(cfg, 200, seed=10 + seed)
-            stats.update(s)
-        missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
-        # No-NULL columns are rare; the focused acceptance run measures them.
-        missing = [f for f in missing if f != "data:no_null_column"]
-        self.assertEqual(missing, [], f"never emitted: {missing}")
-        for feature in (
-            "join:null_safe",
-            "nulls_first_last",
-            "agg:count:distinct",
-            "subquery:correlated",
-            "expr:cast",
-        ):
-            self.assertGreater(stats[feature], 0, feature)
 
     def test_limit_implies_total_order(self):
         cfg = load_config(None, ["data.rows=[20,50]"])

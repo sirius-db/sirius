@@ -107,7 +107,9 @@ class Scope:
 
     def columns(self, kind: str | None = None) -> list[ColumnRef]:
         cols = [c for t in self.tables for c in t.columns]
-        return [c for c in cols if (c.kind != "array" if kind is None else c.kind == kind)]
+        return [
+            c for c in cols if (c.kind != "array" if kind is None else c.kind == kind)
+        ]
 
     def outer_columns(self, kind: str | None = None) -> list[ColumnRef]:
         return self.outer.columns(kind) if self.outer is not None else []
@@ -159,13 +161,18 @@ class QueryGenerator:
                 for index, column in enumerate(table.columns):
                     if column.type.kind != "varchar":
                         continue
-                    values = (row[index] for row in table.rows if isinstance(row[index], str))
+                    values = (
+                        row[index] for row in table.rows if isinstance(row[index], str)
+                    )
                     for value in values:
                         if any(ord(char) > 127 for char in value):
                             self._utf8_columns.add((table.name, column.name))
                         if len(value.encode("utf8")) > 40:
                             self._long_string_columns.add((table.name, column.name))
-                        if (table.name, column.name) in self._utf8_columns and (table.name, column.name) in self._long_string_columns:
+                        if (table.name, column.name) in self._utf8_columns and (
+                            table.name,
+                            column.name,
+                        ) in self._long_string_columns:
                             break
         self._alias_n = 0
         self._cte_n = 0
@@ -257,25 +264,46 @@ class QueryGenerator:
         for node in walk(query):
             if isinstance(node, Arith) and node.op in ("+", "-", "*"):
                 left, right = exact_type(node.left), exact_type(node.right)
-                if left and right and left.kind == right.kind == "decimal" and left != right:
+                if (
+                    left
+                    and right
+                    and left.kind == right.kind == "decimal"
+                    and left != right
+                ):
                     self._note("type:decimal_mixed_scale")
             if isinstance(node, Compare):
                 left, right = exact_type(node.left), exact_type(node.right)
-                if left and right and left.kind == right.kind == "decimal" and left != right:
+                if (
+                    left
+                    and right
+                    and left.kind == right.kind == "decimal"
+                    and left != right
+                ):
                     self._note("type:decimal_mixed_compare")
 
     def _generate_once(self) -> Query:
         if self.cfg.types.array and self.rng.random() < 0.03:
-            tables = [t for t in self.ds.tables if any(c.type.kind == "array" for c in t.columns)]
+            # A full fact-table array projection returns hundreds of thousands of
+            # large JSON values and consumes the campaign budget before new plans run.
+            tables = [
+                t
+                for t in self.ds.tables
+                if not t.name.startswith("f")
+                and any(c.type.kind == "array" for c in t.columns)
+            ]
             if tables:
                 table = self.rng.choice(tables)
-                array_col = self.rng.choice([c for c in table.columns if c.type.kind == "array"])
+                array_col = self.rng.choice(
+                    [c for c in table.columns if c.type.kind == "array"]
+                )
                 alias = self._alias()
                 self._note("type:array_projection")
                 return Select(
                     items=[
                         SelectItem(ColumnRef(alias, "k", table.columns[0].type), "c0"),
-                        SelectItem(ColumnRef(alias, array_col.name, array_col.type), "c1"),
+                        SelectItem(
+                            ColumnRef(alias, array_col.name, array_col.type), "c1"
+                        ),
                     ],
                     from_=TableRef(table.name, alias),
                 )
@@ -538,7 +566,9 @@ class QueryGenerator:
                 expr = self._gen_expr(typ.kind, scope, depth + 1)
                 if typ.kind == "decimal" and not self.f.casts.decimal_scale:
                     source = exact_type(expr)
-                    if source is None or (source.kind == "decimal" and source.scale > typ.scale):
+                    if source is None or (
+                        source.kind == "decimal" and source.scale > typ.scale
+                    ):
                         # #2590: a reducing-scale DECIMAL cast rounds on CPU but
                         # truncates on GPU. Use an exact-typed value instead.
                         expr = self._literal("decimal", typ)
@@ -808,8 +838,13 @@ class QueryGenerator:
             if n >= 5:
                 self._note("join:long_chain")
         allow_fact = outer is None and depth == 0
+        safe_long_chain = mode == "full" and n >= 5
         first, first_scope = self._gen_from_item(
-            depth, ctes, force_cte, allow_fact=allow_fact, prefer_fact=allow_fact
+            depth,
+            ctes,
+            force_cte,
+            allow_fact=allow_fact and not safe_long_chain,
+            prefer_fact=allow_fact and not safe_long_chain,
         )
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
@@ -844,6 +879,7 @@ class QueryGenerator:
                 if (
                     not table.name.startswith("f")
                     and nonkeys
+                    and not safe_long_chain
                     and table.row_count**2 <= self.f.joins.cartesian_max_rows
                     and rng.random() < 0.5
                 ):
@@ -856,7 +892,10 @@ class QueryGenerator:
                 self_cond = Compare("=", key, other_key)
             else:
                 right, right_scope = self._gen_from_item(
-                    depth, ctes, None, allow_fact=outer is None and depth == 0
+                    depth,
+                    ctes,
+                    None,
+                    allow_fact=outer is None and depth == 0 and not safe_long_chain,
                 )
             if (
                 (right_scope.table_name or "").startswith("f")
@@ -895,6 +934,7 @@ class QueryGenerator:
                         right_scope,
                         jt,
                         allow_ineq_only=cartesian_ok,
+                        unique_key_only=safe_long_chain,
                     )
                 )
             )
@@ -1037,7 +1077,12 @@ class QueryGenerator:
         return cols
 
     def _gen_join_cond(
-        self, scope: Scope, right: ScopeTable, jt: str, allow_ineq_only: bool = True
+        self,
+        scope: Scope,
+        right: ScopeTable,
+        jt: str,
+        allow_ineq_only: bool = True,
+        unique_key_only: bool = False,
     ) -> Expr | None:
         rng = self.rng
         left_cols = scope.columns()
@@ -1050,6 +1095,14 @@ class QueryGenerator:
         ]
         if not pairs:
             return None
+        if unique_key_only:
+            # Five/six-way joins over reusable payload values can explode on the CPU
+            # before the query reaches the GPU. Dimension k values are unique.
+            keys = [(l, r) for l, r in pairs if l.name == r.name == "k"]
+            if keys:
+                l, r = rng.choice(keys)
+                return Compare("=", l, r)
+            return None
         if self.f.joins.mixed_integer_keys:
             target_pairs = {
                 frozenset((st.INTEGER, st.BIGINT)),
@@ -1057,7 +1110,8 @@ class QueryGenerator:
                 frozenset((st.BIGINT, st.UBIGINT)),
             }
             mixed = [
-                (l, r) for l, r in pairs
+                (l, r)
+                for l, r in pairs
                 if l.kind == "int" and frozenset((l.type, r.type)) in target_pairs
             ]
             if mixed and rng.random() < 0.25:
@@ -1483,9 +1537,11 @@ class QueryGenerator:
                     Literal(rng.choice(REGEX_PATTERNS), st.VARCHAR),
                     Literal(
                         rng.choice(
-                            REGEX_REPLACEMENTS if self.f.scalar_functions.regexp_backreferences
+                            REGEX_REPLACEMENTS
+                            if self.f.scalar_functions.regexp_backreferences
                             else REGEX_REPLACEMENTS[:-1]
-                        ), st.VARCHAR
+                        ),
+                        st.VARCHAR,
                     ),
                 ],
                 "varchar",
@@ -1616,11 +1672,16 @@ class QueryGenerator:
             else_ = self._literal("decimal", typ) if self.rng.random() < 0.8 else None
         else:
             whens = [
-                (self._gen_bool(scope, depth + 1), self._gen_expr(kind, scope, depth + 1))
+                (
+                    self._gen_bool(scope, depth + 1),
+                    self._gen_expr(kind, scope, depth + 1),
+                )
                 for _ in range(n)
             ]
             else_ = (
-                self._gen_expr(kind, scope, depth + 1) if self.rng.random() < 0.8 else None
+                self._gen_expr(kind, scope, depth + 1)
+                if self.rng.random() < 0.8
+                else None
             )
         if self.f.expressions.simple_case and self.rng.random() < 0.3:
             cols = scope.columns("int")
@@ -2301,10 +2362,14 @@ def exact_type(expr: Expr) -> st.SqlType | None:
         if lt is not None and rt is not None and lt.kind == rt.kind == "decimal":
             if expr.op in ("+", "-"):
                 scale = max(lt.scale, rt.scale)
-                width = max(
-                    scale + max(lt.precision - lt.scale, rt.precision - rt.scale),
-                    lt.precision, rt.precision,
-                ) + 1
+                width = (
+                    max(
+                        scale + max(lt.precision - lt.scale, rt.precision - rt.scale),
+                        lt.precision,
+                        rt.precision,
+                    )
+                    + 1
+                )
                 return st.decimal_type(min(width, 38), scale)
             if expr.op == "*":
                 scale = lt.scale + rt.scale
