@@ -1667,6 +1667,9 @@ int main()
     run_roundtrip<std::int32_t>("int32_t", 803'500, 2526, arch, 100);
     run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 1000);
     run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 100'000);
+    // Offset bases: no value is a multiple of the step, only every difference is.
+    run_roundtrip<std::int32_t>("int32_t", 803'507, 2526, arch, 100);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'007LL, 5052, arch, 1000);
     // The ballot at open-ended / lane-typed bounds: engine lanes (int16 dates,
     // int32 decimals), negative minima, the full 32-bit int32 width, a 40-bit
     // int64 chunk and an int64 minimum next to INT64_MIN.

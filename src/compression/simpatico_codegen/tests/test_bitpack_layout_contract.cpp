@@ -55,9 +55,9 @@ std::unique_ptr<cudf::table> make_layout_fixture()
         host[static_cast<std::size_t>(i)] = pos;
         break;
       default:
-        // Partial final chunk with a 16-bit range. The filler is 1, not 0, so the
-        // chunk's common divisor is 1 and it keeps exercising a wide bit width.
-        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 1;
+        // Partial final chunk with a 16-bit range. Its one non-zero residual, 65533, is
+        // coprime to 10, so the divisor is 1 and it keeps exercising a wide bit width.
+        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65534 : 1;
         break;
     }
   }
@@ -163,11 +163,11 @@ void test_compact_persistence_and_decode()
   expect(counts == std::vector<std::int32_t>({1024, 1024, 1024, kPartialRows}),
          "unexpected per-chunk counts");
   expect(bits == std::vector<std::uint8_t>({0, 1, 10, 16}), "unexpected per-chunk bit widths");
-  // The folded-in common divisor: chunk 0 is a run of 40s and chunk 1 alternates
-  // 100 and 120, so their divisors are 40 and 20. The other chunks contain odd
-  // values coprime to 5, so their divisor is the no-op 1.
+  // The folded-in common divisor of the residuals: chunk 1 alternates 100 and 120, so
+  // its divisor is 20. Chunk 0 is constant and the others have residuals coprime to 10,
+  // so their divisor is the no-op 1.
   auto const divisors = copy_buffer<std::int32_t>(divs_desc);
-  expect(divisors == std::vector<std::int32_t>({40, 20, 1, 1}), "unexpected per-chunk divisors");
+  expect(divisors == std::vector<std::int32_t>({1, 20, 1, 1}), "unexpected per-chunk divisors");
 
   std::uint64_t expected_words = 0;
   for (std::size_t i = 0; i < counts.size(); ++i) {

@@ -1129,30 +1129,45 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "[chunk_id]);\n"
           << "        const " << in.elem_type << " " << v_div << " = " << p_divs << "[chunk_id];\n";
   } else {
-    // A magnitude in bp_utype, and the multiply-compare testing it for a multiple of 5
-    // (m * 5^-1 mod 2^w <= (2^w - 1) / 5), in 32 bits when the lane is that narrow.
-    const bool narrow5     = op_dt->elem_size <= 4;
-    const std::string u5   = narrow5 ? "unsigned int" : "unsigned long long";
-    const std::string inv5 = narrow5 ? "0xCCCCCCCDu" : "0xCCCCCCCCCCCCCCCDULL";
-    const std::string lim5 = narrow5 ? "0x33333333u" : "0x3333333333333333ULL";
-    const auto magnitude   = [&](const std::string& indent, const std::string& at) {
-      return indent + in.elem_type + " _vi = (" + at_lane(in.read_expr, at) + ");\n" + indent +
-             bp_utype + " _mu = static_cast<" + bp_utype + ">(_vi);\n" + indent +
-             "if (_vi < static_cast<" + in.elem_type + ">(0)) _mu = static_cast<" + bp_utype +
-             ">(0) - _mu;\n";
+    // A multiple-of-5 test is m * 5^-1 (mod 2^w) <= (2^w - 1) / 5; while the powers below
+    // divide, each multiply is the exact quotient, so a chain tests the next power.
+    const bool narrow5      = op_dt->elem_size <= 4;
+    const std::string u5    = narrow5 ? "unsigned int" : "unsigned long long";
+    const std::string inv5  = narrow5 ? "0xCCCCCCCDu" : "0xCCCCCCCCCCCCCCCDULL";
+    const std::string lim5  = narrow5 ? "0x33333333u" : "0x3333333333333333ULL";
+    const std::string fits5 = op_dt->elem_size == 16 ? "(_dr >> 64) == 0 && " : "";
+    const auto residual     = [&](const std::string& at) {
+      return "static_cast<" + bp_utype + ">(static_cast<" + bp_utype + ">(" +
+             at_lane(in.read_expr, at) + ") - static_cast<" + bp_utype + ">(" + cmin + "))";
     };
-    const std::string fits5 = op_dt->elem_size == 16 ? "(_mu >> 64) == 0 && " : "";
+    // Folds the powers of 5 dividing every residual into _f, in 32 or 64 bits.
+    const auto chain5 = [&](bool wide, const std::string& indent) {
+      const std::string t   = wide ? "unsigned long long" : "unsigned int";
+      const std::string inv = wide ? "0xCCCCCCCCCCCCCCCDULL" : "0xCCCCCCCDu";
+      const std::string lim = wide ? "0x3333333333333333ULL" : "0x33333333u";
+      std::string out       = indent + "for (int32_t i = tid; i < " + bp_len + "; i += 128) {\n" +
+                        indent + "    " + t + " _r = static_cast<" + t + ">(" + residual("i") +
+                        ");\n" + indent + "    unsigned int _g = 0u;\n";
+      for (int k = 0; k < 4; ++k) {
+        out += indent + "    _r *= " + inv + "; _g |= (_r <= " + lim + ") ? " +
+               std::to_string(1 << k) + "u : 0u;\n";
+      }
+      return out + indent + "    _f &= _g;\n" + indent + "}\n";
+    };
     body_
       // Pass 1: combined min+max in a single grid-stride loop.
       << "        " << in.elem_type << " _lmin = " << emax << ";\n"
       << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
       << op_dt->min_literal
       << ");\n"
-      // Bitpack folds in a per-chunk divisor 2^e2 * 5^e5 common to every element --
-      // decimal scales, powers of two and products such as 1000 -- where a general GCD
-      // would cost a Euclid per element. e2 costs an OR in this loop: a value and its
-      // negation share their trailing zeros. For 5, one sample per thread screens the
-      // chunk, and only a chunk whose samples are all multiples of 5 verifies every element.
+      // Bitpack folds in a per-chunk divisor 2^e2 * 5^e5 of every residual v - min --
+      // decimal scales, powers of two, products such as 1000, and any of these over an
+      // offset -- where a general GCD would cost a Euclid per element. A divisor of every
+      // v - min is exactly a divisor of every v - v0, for the chunk's first value v0, so this
+      // pass screens before the minimum is known. e2 costs an OR: v ^ v0 and v - v0 share
+      // their trailing zeros. For 5, one sample per thread screens the
+      // chunk, and only a chunk whose samples all pass verifies every residual.
+      << "        const " << in.elem_type << " _v0 = (" << at_lane(in.read_expr, "0") << ");\n"
       << "        unsigned long long _or_" << idstr << " = 0ULL;\n"
       << "        bool _s5_" << idstr
       << " = true;\n"
@@ -1162,14 +1177,22 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "        __shared__ unsigned int " << sh_div << "_f;\n"
       << "        if (tid == 0) { " << sh_div << "_e5 = 127; " << sh_div << "_f = 15u; }\n"
       << "        if (tid < " << bp_len << ") {\n"
-      << magnitude("            ", "tid") << "            _s5_" << idstr << " = " << fits5
-      << "static_cast<" << u5 << ">(_mu) * " << inv5 << " <= " << lim5 << ";\n"
+      << "            const " << in.elem_type << " _vs = (" << at_lane(in.read_expr, "tid")
+      << ");\n"
+      << "            const " << bp_utype << " _dr = _vs < _v0\n"
+      << "                ? static_cast<" << bp_utype << ">(static_cast<" << bp_utype
+      << ">(_v0) - static_cast<" << bp_utype << ">(_vs))\n"
+      << "                : static_cast<" << bp_utype << ">(static_cast<" << bp_utype
+      << ">(_vs) - static_cast<" << bp_utype << ">(_v0));\n"
+      << "            _s5_" << idstr << " = " << fits5 << "static_cast<" << u5 << ">(_dr) * "
+      << inv5 << " <= " << lim5 << ";\n"
       << "        }\n"
       << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
       << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
       << "            if (_vi < _lmin) _lmin = _vi;\n"
       << "            if (_vi > _lmax) _lmax = _vi;\n"
-      << "            _or_" << idstr << " |= static_cast<unsigned long long>(_vi);\n"
+      << "            _or_" << idstr << " |= static_cast<unsigned long long>(static_cast<"
+      << bp_utype << ">(_vi) ^ static_cast<" << bp_utype << ">(_v0));\n"
       << "        }\n"
       << "        {\n"
       << "            const int _tz = __reduce_min_sync(0xFFFFFFFFu, _or_" << idstr
@@ -1191,7 +1214,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "        const " << in.elem_type << " " << cmin << " = " << sh_min
       << "_b;\n"
       // The reduces above are the barrier, so every thread derives the same divisor. A
-      // chunk of zeros keeps the sentinel and divisor 1.
+      // constant chunk keeps the sentinel and divisor 1.
       << "        const int _btz = min(min(" << sh_div << "_tzw[0], " << sh_div << "_tzw[1]), min("
       << sh_div << "_tzw[2], " << sh_div << "_tzw[3]));\n"
       << "        const bool _bok5 = (" << sh_div << "_ok5w[0] & " << sh_div << "_ok5w[1] & "
@@ -1200,69 +1223,74 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "        if (_btz != 127) {\n"
       << "            int _e5 = 0;\n"
       << "            if (_bok5) {\n"
-      // Bit k of _f: 5^(k+1) divides every magnitude. Each multiply by 5^-1 is the exact
-      // quotient while the powers below it divide, so the chain tests the next power.
-      << "                unsigned int _f = 15u;\n"
-      << "                for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-      << magnitude("                    ", "i") << "                    " << u5
-      << " _r = static_cast<" << u5 << ">(_mu);\n"
-      << "                    unsigned int _g = 0u;\n"
-      << "                    _r *= " << inv5 << "; _g |= (_r <= " << lim5 << ") ? 1u : 0u;\n"
-      << "                    _r *= " << inv5 << "; _g |= (_r <= " << lim5 << ") ? 2u : 0u;\n"
-      << "                    _r *= " << inv5 << "; _g |= (_r <= " << lim5 << ") ? 4u : 0u;\n"
-      << "                    _r *= " << inv5 << "; _g |= (_r <= " << lim5 << ") ? 8u : 0u;\n"
-      << (fits5.empty() ? std::string{} : "                    if ((_mu >> 64) != 0) _g = 0u;\n")
-      << "                    _f &= _g;\n"
-      << "                }\n"
-      << "                const unsigned int _fw = __reduce_and_sync(0xFFFFFFFFu, _f);\n"
-      << "                if ((tid & 31) == 0) atomicAnd(&" << sh_div << "_f, _fw);\n"
-      << "                __syncthreads();\n"
-      // The exponent is the run of set bits; a chunk divisible by 5^4 takes the exact
-      // walk for any higher power.
-      << "                _e5 = __ffs(~" << sh_div << "_f) - 1;\n"
-      << "                if (_e5 == 4) {\n"
-      << "                    SimpaticoPow5 _p5;\n"
-      << "                    for (int32_t i = tid; i < " << bp_len
-      << " && _p5.e != 4; i += 128) {\n"
-      << magnitude("                        ", "i")
-      << "                        _p5.add(static_cast<unsigned long long>(_mu));\n"
-      << "                    }\n"
-      << "                    const int _ew = __reduce_min_sync(0xFFFFFFFFu, _p5.e < 0 ? 127 : "
-         "_p5.e);\n"
-      << "                    if ((tid & 31) == 0) atomicMin(&" << sh_div << "_e5, _ew);\n"
-      << "                    __syncthreads();\n"
-      << "                    _e5 = " << sh_div << "_e5;\n"
-      << "                }\n"
-      << "            }\n"
-      // Capped to fit the signed slot, which keeps it a common divisor.
-      << "            constexpr unsigned long long _lim = "
-      << (op_dt->elem_size <= 8
-            ? "static_cast<unsigned long long>(" + std::string(op_dt->max_literal) + ")"
-            : std::string("0x7FFFFFFFFFFFFFFFULL"))
-      << ";\n"
-      << "            unsigned long long _d = 1ULL;\n"
-      << "            for (int k = 0; k < _e5 && _d <= _lim / 5ULL; ++k) _d *= 5ULL;\n"
-      << "            for (int k = 0; k < _btz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
-      << "            " << v_div << " = static_cast<" << in.elem_type << ">(_d);\n"
-      << "        }\n"
-      << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
-      << bp_utype << ">(static_cast<" << bp_utype << ">(" << sh_max << "_b) - static_cast<"
-      << bp_utype << ">(" << cmin << ")), " << v_div << ");\n"
-      << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
-      << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
-      << "        if (tid == 0) {\n"
-      << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
-      << "            " << p_divs << "[chunk_id] = " << v_div << ";\n"
-      << "            if (" << v_div << " != " << in.elem_type << "{1}) " << p_lws << "["
-      << ::codegen::kBitpackDivisorFlagWord << "] = 1u;\n"
-      << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
-      << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
-      << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
-      << ") * " << bits_v << " + 31) / 32);\n"
-      << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
-      << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
-      << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
-      << "        }\n";
+      // A residual is at most the chunk's range, so the chain runs in 32 bits whenever the
+      // range fits, whatever the lane width. Bit k of _f: 5^(k+1) divides every residual.
+      << "                const " << bp_utype << " _rng = static_cast<" << bp_utype << ">("
+      << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+      << "                (void)_rng;\n"
+      << "                unsigned int _f = 15u;\n";
+    if (op_dt->elem_size <= 4) {
+      body_ << chain5(false, "                ");
+    } else {
+      body_ << "                if ((_rng >> 32) == 0) {\n"
+            << chain5(false, "                    ")
+            << (op_dt->elem_size == 16 ? "                } else if ((_rng >> 64) == 0) {\n"
+                                       : "                } else {\n")
+            << chain5(true, "                    ")
+            << (op_dt->elem_size == 16 ? "                } else {\n"
+                                         "                    _f = 0u;\n"
+                                       : "")
+            << "                }\n";
+    }
+    body_ << "                const unsigned int _fw = __reduce_and_sync(0xFFFFFFFFu, _f);\n"
+          << "                if ((tid & 31) == 0) atomicAnd(&" << sh_div << "_f, _fw);\n"
+          << "                __syncthreads();\n"
+          // The exponent is the run of set bits; a chunk divisible by 5^4 takes the exact
+          // walk for any higher power. It is reached only when the range fits 64 bits.
+          << "                _e5 = __ffs(~" << sh_div << "_f) - 1;\n"
+          << "                if (_e5 == 4) {\n"
+          << "                    SimpaticoPow5 _p5;\n"
+          << "                    for (int32_t i = tid; i < " << bp_len
+          << " && _p5.e != 4; i += 128) {\n"
+          << "                        _p5.add(static_cast<unsigned long long>(" << residual("i")
+          << "));\n"
+          << "                    }\n"
+          << "                    const int _ew = __reduce_min_sync(0xFFFFFFFFu, _p5.e < 0 ? 127 : "
+             "_p5.e);\n"
+          << "                    if ((tid & 31) == 0) atomicMin(&" << sh_div << "_e5, _ew);\n"
+          << "                    __syncthreads();\n"
+          << "                    _e5 = " << sh_div << "_e5;\n"
+          << "                }\n"
+          << "            }\n"
+          // Capped to fit the signed slot, which keeps it a common divisor.
+          << "            constexpr unsigned long long _lim = "
+          << (op_dt->elem_size <= 8
+                ? "static_cast<unsigned long long>(" + std::string(op_dt->max_literal) + ")"
+                : std::string("0x7FFFFFFFFFFFFFFFULL"))
+          << ";\n"
+          << "            unsigned long long _d = 1ULL;\n"
+          << "            for (int k = 0; k < _e5 && _d <= _lim / 5ULL; ++k) _d *= 5ULL;\n"
+          << "            for (int k = 0; k < _btz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
+          << "            " << v_div << " = static_cast<" << in.elem_type << ">(_d);\n"
+          << "        }\n"
+          << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
+          << bp_utype << ">(static_cast<" << bp_utype << ">(" << sh_max << "_b) - static_cast<"
+          << bp_utype << ">(" << cmin << ")), " << v_div << ");\n"
+          << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
+          << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
+          << "        if (tid == 0) {\n"
+          << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
+          << "            " << p_divs << "[chunk_id] = " << v_div << ";\n"
+          << "            if (" << v_div << " != " << in.elem_type << "{1}) " << p_lws << "["
+          << ::codegen::kBitpackDivisorFlagWord << "] = 1u;\n"
+          << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
+          << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
+          << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>("
+          << bp_len << ") * " << bits_v << " + 31) / 32);\n"
+          << "            atomicAdd(" << p_lws << " + (static_cast<uint32_t>(chunk_id) & "
+          << (::codegen::kBitpackLiveWordShards - 1) << "u) * "
+          << ::codegen::kBitpackLiveWordShardStride << "u, _pw);\n"
+          << "        }\n";
     // measure: the metadata and the live-word count are this mode's whole output.
     if (measure) { body_ << "        break;\n"; }
   }
