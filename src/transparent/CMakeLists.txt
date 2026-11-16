@@ -7,4 +7,5 @@ target_sources(
           narrow_outer_join_counts.cpp
           physical_sirius_execution.cpp
           parquet_footer_statistics.cpp
+          push_narrowing_expressions.cpp
           sirius_optimizer_extension.cpp)

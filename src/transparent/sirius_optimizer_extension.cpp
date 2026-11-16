@@ -23,6 +23,7 @@
 #include "transparent/connection_provenance.hpp"
 #include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
+#include "transparent/push_narrowing_expressions.hpp"
 
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -68,17 +69,13 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
 /// The option as `query_operator_options` resolves it, without creating the session's overrides:
 /// those snapshot the global configuration, which would stop the session from seeing later
 /// changes to it.
-bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
+bool operator_option_enabled(duckdb::ClientContext& context, bool sirius::operator_params::* option)
 {
   auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_minmax_rewrite;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_minmax_rewrite;
-  }
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+  return runtime && runtime->get_config().get_operator_params().*option;
 }
 
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
@@ -300,7 +297,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
     auto copy = copy_logical_plan(*captured, context);
-    if (exists_minmax_rewrite_enabled(context)) {
+    if (operator_option_enabled(context, &sirius::operator_params::enable_exists_minmax_rewrite)) {
       try {
         ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
           context, input.optimizer.binder, copy, gpu_memory_budget(context)));
@@ -312,6 +309,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
       }
     }
     narrow_outer_join_counts(*copy, input.optimizer.binder);
+    if (operator_option_enabled(context,
+                                &sirius::operator_params::enable_narrowing_expression_pushdown)) {
+      push_narrowing_expressions(*copy, input.optimizer.binder);
+    }
     conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
