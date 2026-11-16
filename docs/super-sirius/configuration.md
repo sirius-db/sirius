@@ -22,7 +22,8 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
+If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 90% of each backing NUMA node's RAM for pinned host memory.
+Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
 
 ### Concurrent query admission
 
@@ -170,7 +171,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
-| `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+| `initial_number_pools` | int | auto | When omitted, pre-allocate 10% of each backing NUMA node's total RAM, capped by host capacity and rounded down to whole pools (possibly zero). Requires discovered host RAM capacity. An explicit count overrides automatic sizing. Additional pools are created on demand. Initial host footprint = aligned `block_size × pool_size × initial_number_pools`. |
 
 ### Disk Memory (`sirius.memory.disk`)
 

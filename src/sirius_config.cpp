@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
@@ -874,7 +875,7 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
+  // Default to 90% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
   std::variant<double, std::uint64_t> capacity{0.9};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
@@ -883,7 +884,8 @@ struct host_mem_config {
   double downgrade_stop_fraction{0.8};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
-  std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
+  // Omitted: 10% of NUMA RAM in whole pools, capped by the host capacity.
+  std::optional<std::size_t> initial_number_pools;
 
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
@@ -942,14 +944,10 @@ struct host_mem_config {
     } else {
       builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
     }
-    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
-    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
-    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
-    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
-    // initial_number_pools} positionally therefore lands each value in the correctly-named
-    // cucascade config field — the names line up with the resulting config struct, not with the
-    // setter's parameter names.
-    builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
+    // cuCascade maps (chunk_size, block_size, initial_block_count) onto the host config's
+    // (block_size, pool_size, initial_number_pools). Its setter requires a positive count.
+    // build() only creates configs; resolve() replaces this temporary count before allocation.
+    builder.set_host_pool_features(block_size, pool_size, 1);
   }
 };
 
@@ -1255,6 +1253,34 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    for (auto& space : settings._memory_space_configs) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (!host) { continue; }
+      if (host_cfg.initial_number_pools.has_value()) {
+        host->initial_number_pools = *host_cfg.initial_number_pools;
+        continue;
+      }
+      auto const* node = hw_topology.find_numa_node(host->numa_id);
+      if (!node || node->memory_capacity == 0 || node->is_device_memory) {
+        throw configuration_input_error(
+          "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
+          std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
+      }
+      // Match the allocator's per-block alignment, then round the 10% target down to
+      // whole pools without exceeding the configured host capacity.
+      constexpr auto alignment = alignof(std::max_align_t);
+      constexpr auto max_size  = std::numeric_limits<std::size_t>::max();
+      if (host->block_size == 0 || host->pool_size == 0 ||
+          host->block_size > max_size - (alignment - 1)) {
+        throw configuration_input_error("memory.host: invalid block_size or pool_size");
+      }
+      auto const aligned_block_size = (host->block_size + alignment - 1) / alignment * alignment;
+      if (host->pool_size > max_size / aligned_block_size) {
+        throw configuration_input_error("memory.host: pool size in bytes overflows");
+      }
+      host->initial_number_pools = std::min(node->memory_capacity / 10, host->memory_capacity) /
+                                   (aligned_block_size * host->pool_size);
+    }
   }
 
   const auto defaults =
