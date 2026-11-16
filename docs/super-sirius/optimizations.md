@@ -510,8 +510,10 @@ distinctness proof.
 
 **Config:** `enable_late_materialization` controls the feature (SQL or YAML, enabled by default);
 The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
-that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
-floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+that a group-by-rowid ride needs. The connection-local `late_materialization_min_boundaries`,
+`late_materialization_min_value_x_boundaries`, `late_materialization_min_value_compressed`, and
+`late_materialization_count_defer` settings tune the floors and the count-on-deferred path.
+Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.
 

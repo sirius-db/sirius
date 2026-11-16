@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "simpatico_codegen/src/codegen/selection/decompression_pushdown_policy.hpp"
+
 #include <cudf/types.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -143,6 +145,7 @@ struct membership_measurement_request {
 struct pushdown_request {
   /// Query-local master policy; retained even when this request has no predicates.
   bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   /// One selected column's share of the filter. Entries are parallel to the
   /// column list the decode is asked for; a shorter vector leaves the tail
   /// unfiltered.
@@ -371,6 +374,8 @@ class decompression_pushdown_scan {
     /// columns). False when a column is exempt from that ceiling, in which case
     /// the reservation must cover the full width.
     bool survivors_bounded = false;
+    /// The request's surviving-row ceiling, capped at full width for thresholds above one.
+    double max_surviving_fraction = 1.0;
   };
   [[nodiscard]] compaction_forecast forecast_compaction(
     simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const;

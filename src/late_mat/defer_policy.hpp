@@ -44,12 +44,8 @@
 // the whole question when a measurement disappoints.
 
 #include <algorithm>
-#include <charconv>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <string>
-#include <system_error>
 #include <vector>
 
 namespace sirius::late_mat {
@@ -94,83 +90,15 @@ struct defer_candidate {
   [[nodiscard]] std::int64_t net_value_bytes(std::int64_t rowid_bytes) const noexcept;
 };
 
-/// Port-crossing floor, env-overridable for measurement (default 4). The
-/// product below relaxes the VALUE floor for long rides, never this one.
-inline int default_min_boundaries()
-{
-  static int const value = [] {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES");
-    if (v == nullptr || v[0] == '\0') { return 4; }
-    int parsed      = 0;
-    auto const* end = v + std::strlen(v);
-    auto const rc   = std::from_chars(v, end, parsed);
-    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : 4;
-  }();
-  return value;
-}
-
-/// Value x crossings floor (default 128 = the 32 B/row x 4 crossings the two
-/// independent floors used to imply). Value and crossings TRADE OFF.
-inline std::int64_t default_min_value_x_boundaries()
-{
-  static std::int64_t const value = [] {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES");
-    if (v == nullptr || v[0] == '\0') { return std::int64_t{128}; }
-    std::int64_t parsed = 0;
-    auto const* end     = v + std::strlen(v);
-    auto const rc       = std::from_chars(v, end, parsed);
-    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : std::int64_t{128};
-  }();
-  return value;
-}
-
-/// Count-on-deferred admit switch (SIRIUS_EXP_LATE_MAT_COUNT_DEFER, default OFF).
-///
-/// A column read only by COUNTs can ride and never come back: the aggregate
-/// needs the row, not the value. It is dark by default because the shapes that
-/// fire it on TPC-H save ~4 B/row, which no A/B run could separate from noise —
-/// and because a mis-marked column would lose values nothing restores. A
-/// workload that counts WIDE columns over long rides can turn it on.
-inline bool count_on_deferred_enabled()
-{
-  static bool const enabled = [] {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_COUNT_DEFER");
-    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
-  }();
-  return enabled;
-}
-
-/// Deferred-value floor for a bundle whose origin is COMPRESSED in the pin
-/// (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED, default: the ordinary floor).
-///
-/// Such a bundle saves more than the ride: the scan can skip decompressing what
-/// it is about to replace with a rowid. Until that decode-skip exists the two
-/// floors are the same number, and this knob is how the difference gets
-/// measured when it does.
-inline std::int64_t min_value_bytes_compressed(std::int64_t ordinary)
-{
-  static std::int64_t const value = []() -> std::int64_t {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED");
-    if (v == nullptr || v[0] == '\0') { return -1; }
-    std::int64_t parsed = 0;
-    auto const* end     = v + std::strlen(v);
-    auto const rc       = std::from_chars(v, end, parsed);
-    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : -1;
-  }();
-  return value < 0 ? ordinary : value;
-}
-
-/// The thresholds, in one place so a measurement can move them together.
+/// Query-local thresholds, populated from the scan's immutable operator options.
 struct defer_policy {
   /// A ride must save SOMETHING per row after the rowid; whether it repays is
   /// @ref min_value_x_boundaries.
   std::int64_t min_value_bytes = 1;
   /// Net value per row TIMES crossings saved — what the floor is really about.
-  std::int64_t min_value_x_boundaries = default_min_value_x_boundaries();
-  /// Port crossings the ride must save. Overridable with
-  /// SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES so a measurement can separate "the ride is
-  /// not worth taking" from "the crossing count under-reports it".
-  int min_boundaries = default_min_boundaries();
+  std::int64_t min_value_x_boundaries = 128;
+  /// Port crossings the ride must save.
+  int min_boundaries = 4;
   /// What riding costs per row.
   std::int64_t rowid_bytes = 8;
 };

@@ -1980,6 +1980,27 @@ TEST_CASE("a compressed split decoded with a join filter keeps the drop and the 
   stub_ingestible ingestible;
   ingestible.prefix_width = fsf::kOutputWidth;
 
+  SECTION("a dynamic-only request keeps this query's thresholds and diagnostics")
+  {
+    auto const split = make_split(fsf::make_key_set(stream));
+    sirius::codegen::fused_scan_policy const policy{.diagnostics                = true,
+                                                    .max_selectivity            = 0.22,
+                                                    .full_route_max_selectivity = 0.04,
+                                                    .index_walk_max_selectivity = 0.08,
+                                                    .max_membership_sources     = 3};
+    auto const refreshed = sirius::op::scan::detail::refresh_membership_probes(
+      {}, fsf::kSelected.size(), split->consumer.get(), {.fused_scan = policy});
+    REQUIRE(refreshed.has_value());
+    REQUIRE(refreshed->request != nullptr);
+    auto const& actual = refreshed->request->request().fused_scan;
+    CHECK(actual.diagnostics);
+    CHECK(actual.max_selectivity == policy.max_selectivity);
+    CHECK(actual.full_route_max_selectivity == policy.full_route_max_selectivity);
+    CHECK(actual.index_walk_max_selectivity == policy.index_walk_max_selectivity);
+    CHECK(actual.max_membership_sources == policy.max_membership_sources);
+    REQUIRE_FALSE(refreshed->attached.empty());
+  }
+
   SECTION("an accepting join filter, no carrier conversion")
   {
     auto split = make_split(fsf::make_key_set(stream));
@@ -2652,9 +2673,9 @@ TEST_CASE("a statically filtered compressed split keeps its compaction forecast 
   REQUIRE(batch_bytes > 0);
   // With decompression pushdown, the decode is forecast to compact and steal its table; the
   // checkpoint could see only that compacted table.
-  auto const forecast =
-    batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) *
-                                               sirius::decompression_pushdown_max_selectivity());
+  auto const forecast = batch_bytes / 4 + static_cast<std::size_t>(
+                                            static_cast<double>(batch_bytes) *
+                                            sirius::codegen::fused_scan_policy{}.max_selectivity);
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
         (split.enable_fused_scan_filter ? forecast : 2 * batch_bytes));
 }

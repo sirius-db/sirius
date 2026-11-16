@@ -256,8 +256,8 @@ struct cached_databatch_provider : public databatch_provider {
     // Origins are pin metadata; query-local policy controls whether a ride is installed.
     // A scan that is not stamped looks exactly like one that is stamped and
     // never used, so each refusal says which one it was.
-    auto const decline = [](char const* why) {
-      if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+    auto const decline = [this](char const* why) {
+      if (_pushdown_req.fused_scan.diagnostics) {
         std::fprintf(stderr, "sirius: late-mat origin not stamped: %s\n", why);
       }
     };
@@ -284,7 +284,7 @@ struct cached_databatch_provider : public databatch_provider {
       _chunk_row_start[c + 1] = _chunk_row_start[c] + pinned_chunk_rows(_entry, c);
     }
     _origin_columns = std::move(columns);
-    if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+    if (_pushdown_req.fused_scan.diagnostics) {
       std::fprintf(stderr,
                    "sirius: late-mat origin stamped: chunks=%zu rows=%lld columns=%zu\n",
                    chunk_count,
@@ -352,10 +352,13 @@ struct cached_databatch_provider : public databatch_provider {
   void attach_memberships(Representation& projected,
                           std::vector<op::scan::applied_entry>& history) const
   {
-    // The MVCC mask is already attached. Keep the provider defaults for prefetch;
-    // scan_operator_input::prepare_for_processing applies the split policy if conversion is still
-    // pending.
-    op::scan::attach_membership_probes(projected, _consumer.get(), {}, history);
+    // Prefetch may decode before a scan worker sees the split, so it must carry the same policy.
+    op::scan::attach_membership_probes(
+      projected,
+      _consumer.get(),
+      {.enable_fused_scan_filter = _pushdown_req.enable_fused_scan_filter,
+       .fused_scan               = _pushdown_req.fused_scan},
+      history);
   }
 
   std::shared_ptr<cucascade::data_batch> get_host_databatch(
@@ -368,7 +371,8 @@ struct cached_databatch_provider : public databatch_provider {
       auto projected = compressed->select_columns(_column_indices);
       // The host payload's plans become available after reconstruction. Attach only to
       // this query's projection; the converter narrows the request against those plans.
-      if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter) {
+      if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter ||
+          _pushdown_req.fused_scan.diagnostics) {
         projected->set_pushdown_scan(
           std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req));
       }
@@ -409,7 +413,8 @@ struct cached_databatch_provider : public databatch_provider {
         // dropping stays on for a masked chunk: the mask attached below is ANDed into the
         // same selection, so the compacted rows are the visible ones.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
-        if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter) {
+        if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter ||
+            _pushdown_req.fused_scan.diagnostics) {
           auto const scan =
             std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices);
@@ -950,10 +955,13 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // A bundle whose pinned columns are COMPRESSED is worth more than its ride
   // alone once the scan can skip decoding what it replaces with a rowid, so it
   // gets its own floor. The two are the same number until someone measures the
-  // difference (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED).
+  // difference (late_materialization_min_value_compressed).
   late_mat::defer_policy policy;
+  auto const& options           = scan_op.operator_options();
+  policy.min_boundaries         = options.late_materialization_min_boundaries;
+  policy.min_value_x_boundaries = options.late_materialization_min_value_x_boundaries;
   if (has_compressed_chunk) {
-    policy.min_value_bytes = late_mat::min_value_bytes_compressed(policy.min_value_bytes);
+    policy.min_value_bytes = options.late_materialization_min_value_compressed;
   }
   auto const planned = sirius::planner::plan_deferral(scan_op, policy);
   for (auto const& outcome : planned.census) {
@@ -983,7 +991,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // must hold, and the second is the one the plan pass cannot see: the pinned
   // values must carry no nulls, or counting a rowid that is never null would
   // count rows COUNT(col) skips.
-  if (late_mat::count_on_deferred_enabled() && planned.count_only_bundle) {
+  if (options.late_materialization_count_defer && planned.count_only_bundle) {
     bool null_free = true;
     for (auto const position : planned.positions) {
       if (position >= selected_columns.size()) {
@@ -1250,7 +1258,10 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     // must still repay is its own rowid.
     // A rider repays only its own rowid: it joins a ride somebody else already
     // argued for, so the floor that prices INSTALLING one does not apply.
-    late_mat::defer_policy const rider_policy{.min_value_bytes = 1, .min_value_x_boundaries = 0};
+    late_mat::defer_policy const rider_policy{
+      .min_value_bytes        = 1,
+      .min_value_x_boundaries = 0,
+      .min_boundaries         = scan_op.operator_options().late_materialization_min_boundaries};
     auto const planned = sirius::planner::plan_deferral(scan_op, rider_policy);
     if (!planned.installable() || !planned.group_extension.has_value()) { continue; }
     auto const& extension = *planned.group_extension;
@@ -1967,6 +1978,7 @@ void sirius_scan_manager::prepare_for_query(
       ingestible.filter_analysis(), slot_map, ingestible.output_prefix_width());
     pushdown_req.enable_fused_scan_filter =
       assignment.op->operator_options().enable_fused_scan_filter;
+    pushdown_req.fused_scan = assignment.op->operator_options().fused_scan;
     if (!assignment.op->operator_options().enable_fused_scan_filter) {
       // Answering an equality off a dictionary is independent of the gate; row
       // dropping is not, so give it up when the gate is off.
@@ -2009,6 +2021,7 @@ void sirius_scan_manager::prepare_for_query(
           assignment.op->get_operator_id());
       }
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        assignment.op->operator_options().fused_scan.diagnostics,
         "[decompression-pushdown] entry '{}': consumer={} request: {} slot(s), "
         "covers_whole_filter={}",
         assignment.entry_name,

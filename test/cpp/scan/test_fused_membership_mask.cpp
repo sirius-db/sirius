@@ -323,6 +323,7 @@ TEST_CASE("a membership cascade folds each probe's survivors into the next probe
   bool saw_prior_a = false;
   bool saw_prior_b = false;
   sirius::codegen::scan_filter_request request;
+  request.fused_scan.max_membership_sources = 2;
   request.filters.push_back({0, {0, 49}});  // v in [0, 49]: keeps i % 100 < 50
   request.membership_filters.push_back(
     make_probe_directive(1, make_key_set(stream, /*step=*/5), &saw_prior_a));

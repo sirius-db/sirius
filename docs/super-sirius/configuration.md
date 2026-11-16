@@ -1161,16 +1161,19 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 
 ### Late Materialization (experimental)
 
-Enabled by default. The connection-local SQL setting is snapshotted per query. The same key
-is accepted under YAML `sirius.operator_params`; `RESET` restores the startup default.
+Enabled by default. The connection-local SQL settings are snapshotted per query. The same keys
+are accepted under YAML `sirius.operator_params`; `RESET` restores the startup default.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_late_materialization` | true | Carries a pin-order rowid instead of scanned values for an eligible GPU-tier pinned table, restoring them at the far end. |
+| `late_materialization_min_boundaries` | 4 | Minimum port crossings a ride must save; nonnegative integer. |
+| `late_materialization_min_value_x_boundaries` | 128 | Minimum net bytes per row times crossings saved; nonnegative integer. |
+| `late_materialization_count_defer` | false | Allow null-free columns read only by COUNT to remain deferred. |
+| `late_materialization_min_value_compressed` | 1 | Minimum deferred bytes per row for compressed origins; nonnegative integer. Matches the ordinary value floor by default. |
 
-Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
-path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
-gate table, the mechanism, and results.
+See [Late Materialization](late-materialization.md#turning-it-on-experimental) for the mechanism
+and results.
 
 ### Grouped Aggregation (experimental)
 
@@ -1186,11 +1189,18 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
+| `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
+| `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
+| `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 
-This is a connection-local SQL setting, also accepted under YAML `sirius.operator_params`.
+These are connection-local SQL settings, also accepted under YAML `sirius.operator_params`.
 Planning, memory forecasting and decode use the same query policy, including background uploads.
-`SET GLOBAL` is rejected for all three optimization settings. Changing a setting does not alter
+`SET GLOBAL` is rejected for all optimization settings above. Changing a setting does not alter
 an existing query. Pin metadata remains reusable by queries with different settings.
+Selectivity thresholds must be finite and greater than zero; values above one are accepted,
+and a small positive index-walk threshold effectively disables that route.
 
 The former master environment variables `SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`,
 and `SIRIUS_EXP_LOWCARD_GROUPBY` are no longer read. Migrate overrides to these settings:
@@ -1201,7 +1211,20 @@ SET enable_fused_scan_filter = false;
 SET enable_low_cardinality_groupby = false;
 ```
 
-Other experimental thresholds and diagnostic environment variables retain their existing behavior.
+The former experimental threshold and diagnostic variables are also no longer read. Defaults
+are unchanged; migrate overrides using this mapping:
+
+| Retired environment variable | SQL / YAML setting |
+|---|---|
+| `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | `late_materialization_min_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | `late_materialization_min_value_x_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | `late_materialization_count_defer` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | `late_materialization_min_value_compressed` |
+| `SIRIUS_EXP_FUSED_SCAN_DIAG` | `fused_scan_diagnostics` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` | `fused_scan_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL` | `fused_scan_full_route_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` | `fused_scan_index_walk_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER` | `fused_scan_max_membership_sources` |
 
 See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
 

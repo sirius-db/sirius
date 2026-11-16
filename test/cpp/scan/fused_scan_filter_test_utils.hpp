@@ -18,7 +18,7 @@
 
 /**
  * @file fused_scan_filter_test_utils.hpp
- * @brief Fixtures shared by the filtered-decode tests: the env-gate armer, device upload and
+ * @brief Fixtures shared by the filtered-decode tests: device upload and
  * readback of plain columns, the synthetic source tables, the range source with the engine request
  * that carries its whole filter, and exact membership sets with the probe directives that consult
  * them.
@@ -56,16 +56,6 @@
 #include <vector>
 
 namespace sirius::test::fused_scan_filter {
-
-/// The membership cap is latched on first use. Set it before any test can latch it, without
-/// overriding an explicit setting (overwrite=0). The master SQL policy defaults to enabled.
-///
-/// MAX_MEMBER defaults to 1, which makes the multi-probe cascade unreachable; raise it to 2 so the
-/// fold-back (each probe's survivors become the next probe's prior) is actually covered.
-struct fused_gate_armer {
-  fused_gate_armer() { setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "2", /*overwrite=*/0); }
-};
-inline fused_gate_armer const arm_fused_gate{};
 
 inline constexpr cudf::size_type kRows = 4096;
 
@@ -261,6 +251,8 @@ inline source_rows rows_where(std::predicate<cudf::size_type> auto keep)
 inline sirius::pushdown_request covered_request(std::optional<std::size_t> output_prefix_width)
 {
   sirius::pushdown_request request;
+  // Exercise the multi-probe cascade without changing any other query's policy.
+  request.fused_scan.max_membership_sources = 2;
   request.columns.resize(kSelected.size());
   request.columns[2].range          = sirius::decode_range{kFilterLo, kFilterHi};
   request.ranges_cover_whole_filter = true;

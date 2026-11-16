@@ -3187,6 +3187,18 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
+static double positive_fused_scan_threshold(Value& value, char const* name)
+{
+  if (value.IsNull()) {
+    throw InvalidInputException("%s must be finite and greater than zero", name);
+  }
+  auto const threshold = value.GetValue<double>();
+  if (!std::isfinite(threshold) || threshold <= 0.0) {
+    throw InvalidInputException("%s must be finite and greater than zero", name);
+  }
+  return threshold;
+}
+
 void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                                            const sirius::operator_params& operator_defaults,
                                            const sirius::compression_config& compression_defaults)
@@ -3216,6 +3228,108 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     [](ClientContext& context, SetScope scope, Value& value) {
       get_operator_params(context, scope)->enable_low_cardinality_groupby =
         BooleanValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "late_materialization_min_boundaries",
+    "Minimum port crossings saved by a late-materialization deferral",
+    LogicalType::INTEGER,
+    Value::INTEGER(operator_defaults.late_materialization_min_boundaries),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull() || IntegerValue::Get(value) < 0) {
+        throw InvalidInputException("late_materialization_min_boundaries must be nonnegative");
+      }
+      get_operator_params(context, scope)->late_materialization_min_boundaries =
+        IntegerValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "late_materialization_min_value_x_boundaries",
+    "Minimum net bytes per row times saved crossings for a late-materialization deferral",
+    LogicalType::BIGINT,
+    Value::BIGINT(operator_defaults.late_materialization_min_value_x_boundaries),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull() || BigIntValue::Get(value) < 0) {
+        throw InvalidInputException(
+          "late_materialization_min_value_x_boundaries must be nonnegative");
+      }
+      get_operator_params(context, scope)->late_materialization_min_value_x_boundaries =
+        BigIntValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "late_materialization_count_defer",
+    "Allow null-free columns used only by COUNT to remain deferred",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.late_materialization_count_defer),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull()) {
+        throw InvalidInputException("late_materialization_count_defer must not be NULL");
+      }
+      get_operator_params(context, scope)->late_materialization_count_defer =
+        BooleanValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "late_materialization_min_value_compressed",
+    "Minimum deferred bytes per row for a compressed pinned origin",
+    LogicalType::BIGINT,
+    Value::BIGINT(operator_defaults.late_materialization_min_value_compressed),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull() || BigIntValue::Get(value) < 0) {
+        throw InvalidInputException(
+          "late_materialization_min_value_compressed must be nonnegative");
+      }
+      get_operator_params(context, scope)->late_materialization_min_value_compressed =
+        BigIntValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "fused_scan_diagnostics",
+    "Promote fused-scan decision traces to INFO and enable decoder diagnostics",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.fused_scan.diagnostics),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull()) {
+        throw InvalidInputException("fused_scan_diagnostics must not be NULL");
+      }
+      get_operator_params(context, scope)->fused_scan.diagnostics = BooleanValue::Get(value);
+    });
+  config.AddExtensionOption(
+    "fused_scan_max_selectivity",
+    "Maximum surviving-row fraction for ordinary fused-scan compaction",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.fused_scan.max_selectivity),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      auto const threshold = positive_fused_scan_threshold(value, "fused_scan_max_selectivity");
+      get_operator_params(context, scope)->fused_scan.max_selectivity = threshold;
+    });
+  config.AddExtensionOption(
+    "fused_scan_full_route_max_selectivity",
+    "Maximum surviving-row fraction when fused scanning decodes full-width outputs",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.fused_scan.full_route_max_selectivity),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      auto const threshold =
+        positive_fused_scan_threshold(value, "fused_scan_full_route_max_selectivity");
+      get_operator_params(context, scope)->fused_scan.full_route_max_selectivity = threshold;
+    });
+  config.AddExtensionOption(
+    "fused_scan_index_walk_max_selectivity",
+    "Maximum surviving-row fraction for the fused-scan survivor-index walk",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.fused_scan.index_walk_max_selectivity),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      auto const threshold =
+        positive_fused_scan_threshold(value, "fused_scan_index_walk_max_selectivity");
+      get_operator_params(context, scope)->fused_scan.index_walk_max_selectivity = threshold;
+    });
+  config.AddExtensionOption(
+    "fused_scan_max_membership_sources",
+    "Maximum join-filter membership probes carried by one fused decode",
+    LogicalType::BIGINT,
+    Value::BIGINT(operator_defaults.fused_scan.max_membership_sources),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull() || BigIntValue::Get(value) < 0) {
+        throw InvalidInputException("fused_scan_max_membership_sources must be nonnegative");
+      }
+      get_operator_params(context, scope)->fused_scan.max_membership_sources =
+        static_cast<std::size_t>(BigIntValue::Get(value));
     });
   config.AddExtensionOption(
     "expression_evaluator_strategy",

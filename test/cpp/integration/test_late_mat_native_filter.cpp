@@ -117,6 +117,21 @@ TEST_CASE_METHOD(NativeFilterFixture,
   REQUIRE(rows_of(*gpu_unfiltered) == expected_unfiltered);
   REQUIRE(sirius::late_mat::deferrals_installed() > before_unfiltered);
 
+  // The connection-local threshold changes the next plan without repinning the table.
+  run_ok("SET late_materialization_min_boundaries = 1000000;");
+  auto const before_threshold = sirius::late_mat::deferrals_installed();
+  auto threshold_result       = con->Query(query(false));
+  REQUIRE(threshold_result);
+  REQUIRE_FALSE(threshold_result->HasError());
+  REQUIRE(rows_of(*threshold_result) == expected_unfiltered);
+  REQUIRE(sirius::late_mat::deferrals_installed() == before_threshold);
+  run_ok("RESET late_materialization_min_boundaries;");
+  auto restored_result = con->Query(query(false));
+  REQUIRE(restored_result);
+  REQUIRE_FALSE(restored_result->HasError());
+  REQUIRE(rows_of(*restored_result) == expected_unfiltered);
+  REQUIRE(sirius::late_mat::deferrals_installed() > before_threshold);
+
   // The case under test: same plan, plus a filter the scan applies itself.
   auto const before_filtered = sirius::late_mat::deferrals_installed();
   auto gpu_filtered          = con->Query(query(true));

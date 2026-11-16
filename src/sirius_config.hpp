@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "compression/simpatico_codegen/src/codegen/selection/decompression_pushdown_policy.hpp"
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exchange/host_staging.hpp"
@@ -29,6 +30,7 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -161,6 +163,13 @@ struct operator_params {
   bool enable_late_materialization    = true;
   bool enable_fused_scan_filter       = true;
   bool enable_low_cardinality_groupby = true;
+
+  /// Connection-local deferral thresholds, copied into each query's planning policy.
+  int late_materialization_min_boundaries                  = 4;
+  std::int64_t late_materialization_min_value_x_boundaries = 128;
+  bool late_materialization_count_defer                    = false;
+  std::int64_t late_materialization_min_value_compressed   = 1;
+  codegen::fused_scan_policy fused_scan;
 
   /// Construct defaults with a shared batch size and 8x BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);

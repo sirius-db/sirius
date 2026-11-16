@@ -182,6 +182,92 @@ TEST_CASE("optimization switches default on and remain connection-local query sn
   }
 }
 
+TEST_CASE("experimental thresholds are ordinary connection-local immutable settings",
+          "[sirius][config][optimization_settings][isolated_context]")
+{
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const normal_settings{"SIRIUS_ENABLE_TEST_OPTIONS", "0"};
+  sirius::util::env_guard const retired_boundaries{"SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES", "99"};
+  sirius::util::env_guard const retired_value{"SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES", "99"};
+  sirius::util::env_guard const retired_count{"SIRIUS_EXP_LATE_MAT_COUNT_DEFER", "1"};
+  sirius::util::env_guard const retired_compressed{"SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED",
+                                                   "99"};
+  sirius::util::env_guard const retired_diag{"SIRIUS_EXP_FUSED_SCAN_DIAG", "1"};
+  sirius::util::env_guard const retired_selectivity{"SIRIUS_EXP_FUSED_SCAN_MAX_SEL", "0.99"};
+  sirius::util::env_guard const retired_full{"SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", "0.99"};
+  sirius::util::env_guard const retired_index{"SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL", "0.99"};
+  sirius::util::env_guard const retired_members{"SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "99"};
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection a(db), b(db);
+  auto check = [&](char const* name, auto default_value, auto changed_value, auto getter) {
+    using value_type = decltype(default_value);
+    CAPTURE(name);
+    auto const before = duckdb::query_operator_options(*a.context);
+    REQUIRE(getter(*before) == default_value);
+    auto read = [&](duckdb::Connection& connection) {
+      auto result = connection.Query("SELECT current_setting('" + std::string(name) + "')");
+      REQUIRE_FALSE(result->HasError());
+      return result->Collection().GetValue(0, 0).template GetValue<value_type>();
+    };
+    REQUIRE(read(a) == default_value);
+    auto const changed_sql = std::to_string(changed_value);
+    REQUIRE_FALSE(a.Query("SET " + std::string(name) + " = " + changed_sql)->HasError());
+    REQUIRE(read(a) == changed_value);
+    REQUIRE(getter(*duckdb::query_operator_options(*a.context)) == changed_value);
+    REQUIRE(read(b) == default_value);
+    REQUIRE(getter(*duckdb::query_operator_options(*b.context)) == default_value);
+    REQUIRE(getter(*before) == default_value);
+    REQUIRE(a.Query("SET GLOBAL " + std::string(name) + " = " + changed_sql)->HasError());
+    REQUIRE(a.Query("SET " + std::string(name) + " = NULL")->HasError());
+    REQUIRE(read(a) == changed_value);
+    REQUIRE_FALSE(a.Query("RESET " + std::string(name))->HasError());
+    REQUIRE(read(a) == default_value);
+    REQUIRE(getter(*duckdb::query_operator_options(*a.context)) == default_value);
+  };
+  check("late_materialization_min_boundaries", int64_t{4}, int64_t{0}, [](auto const& p) {
+    return p.late_materialization_min_boundaries;
+  });
+  check("late_materialization_min_value_x_boundaries", int64_t{128}, int64_t{0}, [](auto const& p) {
+    return p.late_materialization_min_value_x_boundaries;
+  });
+  check("late_materialization_count_defer", false, true, [](auto const& p) {
+    return p.late_materialization_count_defer;
+  });
+  check("late_materialization_min_value_compressed", int64_t{1}, int64_t{0}, [](auto const& p) {
+    return p.late_materialization_min_value_compressed;
+  });
+  check(
+    "fused_scan_diagnostics", false, true, [](auto const& p) { return p.fused_scan.diagnostics; });
+  check("fused_scan_max_selectivity", 0.35, 1.5, [](auto const& p) {
+    return p.fused_scan.max_selectivity;
+  });
+  check("fused_scan_full_route_max_selectivity", 0.10, 1.5, [](auto const& p) {
+    return p.fused_scan.full_route_max_selectivity;
+  });
+  check("fused_scan_index_walk_max_selectivity", 0.15, 1.5, [](auto const& p) {
+    return p.fused_scan.index_walk_max_selectivity;
+  });
+  check("fused_scan_max_membership_sources", uint64_t{1}, uint64_t{0}, [](auto const& p) {
+    return p.fused_scan.max_membership_sources;
+  });
+
+  for (auto const* name : {"late_materialization_min_boundaries",
+                           "late_materialization_min_value_x_boundaries",
+                           "late_materialization_min_value_compressed",
+                           "fused_scan_max_membership_sources"}) {
+    CAPTURE(name);
+    REQUIRE(a.Query("SET " + std::string(name) + " = -1")->HasError());
+  }
+  for (auto const* name : {"fused_scan_max_selectivity",
+                           "fused_scan_full_route_max_selectivity",
+                           "fused_scan_index_walk_max_selectivity"}) {
+    for (auto const* invalid : {"0", "-0.1", "'NaN'", "'Infinity'", "'-Infinity'"}) {
+      CAPTURE(name, invalid);
+      REQUIRE(a.Query("SET " + std::string(name) + " = " + invalid)->HasError());
+    }
+  }
+}
+
 TEST_CASE("YAML accepts optimization policy overrides before hardware resolution",
           "[sirius][config][optimization_settings]")
 {
@@ -191,10 +277,41 @@ sirius:
     enable_late_materialization: false
     enable_fused_scan_filter: false
     enable_low_cardinality_groupby: false
+    late_materialization_min_boundaries: 2
+    late_materialization_min_value_x_boundaries: 64
+    late_materialization_count_defer: true
+    late_materialization_min_value_compressed: 3
+    fused_scan_diagnostics: true
+    fused_scan_max_selectivity: 0.25
+    fused_scan_full_route_max_selectivity: 0.05
+    fused_scan_index_walk_max_selectivity: 0.08
+    fused_scan_max_membership_sources: 4
 )"));
   REQUIRE_FALSE(config.get_operator_params().enable_late_materialization);
   REQUIRE_FALSE(config.get_operator_params().enable_fused_scan_filter);
   REQUIRE_FALSE(config.get_operator_params().enable_low_cardinality_groupby);
+  auto const& p = config.get_operator_params();
+  CHECK(p.late_materialization_min_boundaries == 2);
+  CHECK(p.late_materialization_min_value_x_boundaries == 64);
+  CHECK(p.late_materialization_count_defer);
+  CHECK(p.late_materialization_min_value_compressed == 3);
+  CHECK(p.fused_scan.diagnostics);
+  CHECK(p.fused_scan.max_selectivity == 0.25);
+  CHECK(p.fused_scan.full_route_max_selectivity == 0.05);
+  CHECK(p.fused_scan.index_walk_max_selectivity == 0.08);
+  CHECK(p.fused_scan.max_membership_sources == 4);
+  for (auto const* invalid : {"late_materialization_min_boundaries: -1",
+                              "late_materialization_min_value_x_boundaries: -1",
+                              "late_materialization_min_value_compressed: -1",
+                              "fused_scan_max_membership_sources: -1",
+                              "fused_scan_max_selectivity: 0",
+                              "fused_scan_full_route_max_selectivity: -0.1",
+                              "fused_scan_index_walk_max_selectivity: .nan",
+                              "fused_scan_max_selectivity: .inf"}) {
+    CAPTURE(invalid);
+    REQUIRE_THROWS(sirius::parsed_sirius_config::from_node(
+      YAML::Load("sirius:\n  operator_params:\n    " + std::string(invalid))));
+  }
 }
 
 TEST_CASE("Test-only settings require explicit process opt-in",
@@ -1648,6 +1765,28 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     };
     check();
     REQUIRE_FALSE(con.Query("SET " + std::string(name) + " = true")->HasError());
+    REQUIRE_FALSE(con.Query("RESET " + std::string(name))->HasError());
+    check();
+  }
+  // A YAML override is the registered default restored by RESET for every new threshold.
+  for (auto const& [name, initial] :
+       {std::pair{"late_materialization_min_boundaries", "2"},
+        std::pair{"late_materialization_min_value_x_boundaries", "64"},
+        std::pair{"late_materialization_count_defer", "true"},
+        std::pair{"late_materialization_min_value_compressed", "3"},
+        std::pair{"fused_scan_diagnostics", "true"},
+        std::pair{"fused_scan_max_selectivity", "0.25"},
+        std::pair{"fused_scan_full_route_max_selectivity", "0.05"},
+        std::pair{"fused_scan_index_walk_max_selectivity", "0.08"},
+        std::pair{"fused_scan_max_membership_sources", "4"}}) {
+    CAPTURE(name);
+    auto check = [&] {
+      auto result = con.Query("SELECT current_setting('" + std::string(name) + "') = " + initial);
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(result->Collection().GetValue(0, 0).GetValue<bool>());
+    };
+    check();
+    REQUIRE_FALSE(con.Query("SET " + std::string(name) + " = 1")->HasError());
     REQUIRE_FALSE(con.Query("RESET " + std::string(name))->HasError());
     check();
   }

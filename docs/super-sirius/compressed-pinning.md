@@ -113,10 +113,10 @@ the scan (an unsupported shape) or on any decline, every column comes back as be
 
 It is enabled by default. Disable it per connection with
 `SET enable_fused_scan_filter = false`; YAML accepts the same name under
-`sirius.operator_params`. Diagnostics remain environment-controlled:
+`sirius.operator_params`. Enable the decision trace for a connection with:
 
-```bash
-SIRIUS_EXP_FUSED_SCAN_DIAG=1       # the decision trace — reach for this first
+```sql
+SET fused_scan_diagnostics = true;
 ```
 
 Measured on GB300, TPC-H SF1000, on top of a GPU-pinned compressed configuration: the suite
@@ -141,12 +141,16 @@ bitpack-rooted plan additionally buys the mask walk.
 Selectivity governs whether compaction is attempted at all, because compacting is only cheaper
 than decoding when enough rows are dropped:
 
-- a batch with any full-width column proceeds only below `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL`
+- a batch with any full-width column proceeds only below `fused_scan_full_route_max_selectivity`
   (0.10);
-- otherwise compaction is given up above `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` (0.35), unless a
+- otherwise compaction is given up above `fused_scan_max_selectivity` (0.35), unless a
   dictionary output is present — that route is exempt, since it wins regardless;
-- below `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` (0.15) the decode walks a survivor index list
+- below `fused_scan_index_walk_max_selectivity` (0.15) the decode walks a survivor index list
   instead of the mask bits.
+
+These thresholds and `fused_scan_max_membership_sources` (default 1) accept connection-local
+`SET` overrides and YAML startup defaults under `sirius.operator_params`. A query snapshots its
+policy, including diagnostics, so later settings changes do not affect work already submitted.
 
 One batch measured unselective predicts the rest of that scan, so the scan stops attempting it
 rather than paying per batch.

@@ -130,10 +130,12 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
   // A decode request without probes decodes exactly like none.
   if (selection.steps.empty() && !clears_probes) { return membership_refresh{}; }
   auto snap = snapshot_membership_probes(selection, n_slots);
+  sirius::pushdown_request fallback;
+  fallback.enable_fused_scan_filter = options.enable_fused_scan_filter;
+  fallback.fused_scan               = options.fused_scan;
   auto const base =
-    current
-      ? current
-      : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+    current ? current
+            : std::make_shared<const sirius::decompression_pushdown_scan>(std::move(fallback));
   return membership_refresh{
     base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
     std::move(snap.attached)};
@@ -350,6 +352,7 @@ void scan_operator_input::prepare_for_processing(
               auto request =
                 rep->pushdown_scan() ? rep->pushdown_scan()->request() : sirius::pushdown_request{};
               request.enable_fused_scan_filter = false;
+              request.fused_scan               = fused_scan;
               rep->set_pushdown_scan(
                 std::make_shared<const sirius::decompression_pushdown_scan>(std::move(request)));
             }
@@ -389,6 +392,7 @@ void scan_operator_input::prepare_for_processing(
             attach_membership_probes(*rep,
                                      consumer.get(),
                                      {.enable_fused_scan_filter = enable_fused_scan_filter,
+                                      .fused_scan               = fused_scan,
                                       .selection_unprofitable   = selection_unprofitable,
                                       .uncomposed_mvcc_mask     = mvcc_keep_mask.has_mask() &&
                                                               !rep->visibility_mask().has_mask()},
@@ -711,8 +715,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
       // The cached checkpoint needs no more: such a split's table leaves the cached batch once
       // decoded, unless a refused carrier-converting transfer leaves the checkpoint the compacted
       // table, which this envelope sizes as it does post_filter_and_project's copy.
-      auto const cap =
-        forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
+      auto const cap = forecast.max_surviving_fraction;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
     if (!row_filter_pending && !cached_checkpoint) {
