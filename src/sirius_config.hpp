@@ -369,8 +369,8 @@ struct compression_config {
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
   /// lines) passed to simpatico::compress_with_plan after column selection.
-  /// An empty directory setting or absent usable table plan selects plans
-  /// automatically, using the same per-column policy as spill compression.
+  /// An empty directory setting or no readable, nonempty matching file selects plans
+  /// automatically. A matching plan that does not cover pinned columns leaves the pin raw.
   std::string input_plan_dir{};
 
   /// Store batches the downgrade executor spills to the host or disk tier

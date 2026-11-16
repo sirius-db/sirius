@@ -656,11 +656,13 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry has the same source and row count, new columns are merged and
-  ///     duplicate columns are dropped. Only column-major GPU entries support this
-  ///     merge; host and device-chunked entries are rejected, even when empty.
-  ///     Chunk placement must also match. Rejection preserves the published entry;
-  ///     UNPIN first to change the storage format of a same-source, same-row-count pin.
+  ///   - If a nonempty device-chunked GPU entry exists, replace it with the raw
+  ///     column-major result, including when automatic compression falls back to raw.
+  ///   - For other entries with the same source and row count, new columns are merged
+  ///     and duplicates dropped. Only column-major GPU entries support this merge;
+  ///     host entries and empty device-chunked entries are rejected. Chunk placement
+  ///     must also match. Rejection preserves the published entry; UNPIN first to
+  ///     change these incompatible storage formats.
   ///   - If the source differs, including a recreated table with the same name, the
   ///     existing entry is replaced.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An

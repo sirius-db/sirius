@@ -3053,10 +3053,12 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Merge only pins for the same source and row coverage. Shape checks alone
-    // cannot distinguish equally sized tables.
+    // Merge only pins for the same source and row coverage. Device-chunked GPU
+    // entries must be replaced when an automatic re-pin falls back to raw storage.
+    // Shape checks alone cannot distinguish equally sized tables.
     if (existing_it->second->cache_info.same_source_as(cache_info) &&
-        existing_it->second->num_rows == new_num_rows) {
+        existing_it->second->num_rows == new_num_rows &&
+        existing_it->second->device_chunks.empty()) {
       // SQL re-pin holds exclusive maintenance. Preserve the direct API's existing
       // refusal while readers borrow this generation; online replacement is not enabled.
       if (existing_it->second.use_count() > 1) {

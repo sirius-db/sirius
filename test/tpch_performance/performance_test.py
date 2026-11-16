@@ -793,11 +793,13 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
             con.execute(stmt)
         log("All TPC-H views registered")
     if gpu_execution:
+        con.execute(
+            f"SET pin_table_compression = {'true' if PIN_COMPRESSION_PLAN_DIR else 'false'};"
+        )
         if PIN_COMPRESSION_PLAN_DIR:
             log(
                 f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
             )
-            con.execute("SET pin_table_compression = true;")
             con.execute(
                 "SET pin_table_input_compression_plan_dir = "
                 f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
@@ -1140,17 +1142,21 @@ def _build_precmd_temp_sql(
         parts.append(_build_views_sql(source).rstrip("\n"))
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
+    if pin != "none":
+        parts.append(
+            f"SET pin_table_compression = {'true' if PIN_COMPRESSION_PLAN_DIR else 'false'};"
+        )
+        if PIN_COMPRESSION_PLAN_DIR:
+            parts.append(
+                "SET pin_table_input_compression_plan_dir = "
+                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
+            )
+
     pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
     if pre_sql:
         parts.append(pre_sql.rstrip(";") + ";")
 
     if pin != "none":
-        if PIN_COMPRESSION_PLAN_DIR:
-            parts.append("SET pin_table_compression = true;")
-            parts.append(
-                "SET pin_table_input_compression_plan_dir = "
-                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
-            )
         parts.append(emit_pin(qnum, source, data_source))
 
     parts.append("SET gpu_execution = true;")

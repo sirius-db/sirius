@@ -216,6 +216,33 @@ struct compression_pin_config {
   std::vector<std::string> column_names;
 };
 
+#ifdef SIRIUS_TEST_PIN_STAGING_OVERRIDES
+namespace testing {
+/// Fail the calling thread's Nth final compressed-GPU payload allocation (one-based).
+/// Zero only counts attempts. Decode, plan selection and encoding are not intercepted.
+/// Available only in the unit-test variant of pin_table.cpp.
+class scoped_pin_staging_failure {
+ public:
+  explicit scoped_pin_staging_failure(std::size_t fail_at);
+  ~scoped_pin_staging_failure();
+  scoped_pin_staging_failure(scoped_pin_staging_failure const&)            = delete;
+  scoped_pin_staging_failure& operator=(scoped_pin_staging_failure const&) = delete;
+
+  [[nodiscard]] std::size_t attempts() const noexcept { return attempts_; }
+  [[nodiscard]] bool failed() const noexcept { return failed_; }
+
+ private:
+  friend void before_pin_staging_allocation();
+  scoped_pin_staging_failure* previous_;
+  std::size_t fail_at_;
+  std::size_t attempts_{0};
+  bool failed_{false};
+};
+
+void before_pin_staging_allocation();
+}  // namespace testing
+#endif
+
 /// One GPU-tier chunk of a compression-enabled pin, in emission order. Exactly
 /// one form is populated: a batch that qualified for compression carries
 /// @c compressed (a compressed_device_representation holding every pinned column);

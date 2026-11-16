@@ -20,7 +20,7 @@ CALL pin_table('/data/lineitem/*.parquet',
                compression => true);
 ```
 
-Without a usable table plan, each materialized chunk uses the same per-column policy as
+When no readable, nonempty matching plan is found, each materialized chunk uses the same policy as
 [spill compression](memory-management.md#spill-compression). It samples up to 65,536 values:
 integer-valued columns choose bitpacking, delta-bitpacking, or delta-RLE-bitpacking, with
 more elaborate plans requiring over 10% estimated size savings. Strings with at least
@@ -55,7 +55,7 @@ translation), threaded through `sirius_scan_manager::prepare_for_query`.
 
 The `pin_table_compression` setting defaults to true; an explicit `compression` argument
 always wins. Chunks below 1 MiB remain raw by default. After encoding, compression is
-kept only when header plus payload is at most 75% of the original device footprint.
+kept by default only when header plus payload is at most 75% of the original device footprint.
 All-identity automatic plans skip encoding. Encoding failures leave subsequent chunks raw;
 automatic GPU pins retain their source until staging succeeds so staging failures can
 also fall back. An explicit plan that does not cover the pinned columns is rejected with
@@ -65,10 +65,11 @@ The `parquet` pin tier continues to cache file bytes without this decode/compres
 When pinned zone-map capture is enabled, supported native min/max statistics are
 retained for compressed chunks on both tiers, so entire chunks can be pruned before decode.
 
-Fully raw automatic GPU results retain the ordinary column-major storage and incremental
-column-merge behavior. GPU pins containing compressed chunks retain their existing
-replacement behavior on re-pin: pin the full intended column set in one call, or opt out
-of compression when incremental column merging is required.
+Fully raw automatic GPU results use ordinary column-major storage and can merge compatible
+raw columns. If the previous GPU pin stored chunks in compressed form, a fully raw re-pin
+replaces that entry instead of attempting a column merge. GPU pins containing compressed
+chunks also replace the previous entry on re-pin: pin the full intended column set in one
+call, or opt out of compression when incremental column merging is required.
 
 The current late-materialization installer declines compressed origins because their
 null counts cannot be checked without decoding. Those queries use ordinary decoding and

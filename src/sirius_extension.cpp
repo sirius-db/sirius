@@ -1448,9 +1448,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         count_narrowed_columns(dev_result.column_storage));
 
       if (pin_comp.plan_dsl.empty() &&
-          std::none_of(dev_result.chunks.begin(), dev_result.chunks.end(), [](auto const& chunk) {
-            return chunk.compressed != nullptr;
-          })) {
+          std::ranges::none_of(dev_result.chunks,
+                               [](auto const& chunk) { return chunk.compressed != nullptr; })) {
         // Raw-only results must retain ordinary column-major insertion: re-pinning
         // additional columns merges them, and cached zone maps remain available.
         // These columns are private to this result; moving their buffers makes this
@@ -3609,8 +3608,9 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "pin_table_input_compression_plan_dir",
     "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "Overrides automatic plan selection when a usable matching file exists. "
-    "An empty directory setting or missing table plan uses the spill-selection heuristic. "
+    "A readable, nonempty matching file overrides automatic plan selection. "
+    "An empty directory setting or missing file uses the spill-selection heuristic; "
+    "a selected plan that does not cover pinned columns leaves the pin uncompressed. "
     "No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
@@ -3619,7 +3619,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
     "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
-    "inert until compression is enabled and a matching plan resolves",
+    "applies to automatic plans and explicit table plans when compression is enabled",
     LogicalType::UBIGINT,
     Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
@@ -3628,7 +3628,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "pin_table_compression_max_compressed_fraction",
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
     "finite, non-negative fraction of the batch's original size (values above 1 permit "
-    "expansion); inert until compression is enabled and a matching plan resolves",
+    "expansion); applies to automatic plans and explicit table plans when compression is enabled",
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);

@@ -196,7 +196,7 @@ size and actual compressed-footprint gates below still apply.
 | `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
-| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no usable matching file selects plans automatically. |
+| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no readable, nonempty matching file selects plans automatically. A selected plan that does not cover the pinned columns leaves the pin raw. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
@@ -993,7 +993,7 @@ retention gates.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `pin_table_compression` | true | Default for `pin_table` calls that omit the `compression` argument. |
-| `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). Without a usable matching file, plans are selected automatically. No effect on spill compression. |
+| `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). If no readable, nonempty matching file is found, plans are selected automatically; a selected plan that does not cover the pinned columns leaves the pin raw. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |

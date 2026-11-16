@@ -38,6 +38,7 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda/stream>
@@ -64,6 +65,29 @@
 #include <vector>
 
 namespace sirius {
+
+#ifdef SIRIUS_TEST_PIN_STAGING_OVERRIDES
+namespace testing {
+namespace {
+thread_local scoped_pin_staging_failure* active_staging_failure = nullptr;
+}
+
+scoped_pin_staging_failure::scoped_pin_staging_failure(std::size_t fail_at)
+  : previous_(active_staging_failure), fail_at_(fail_at)
+{ active_staging_failure = this; }
+
+scoped_pin_staging_failure::~scoped_pin_staging_failure() { active_staging_failure = previous_; }
+
+void before_pin_staging_allocation()
+{
+  auto* fault = active_staging_failure;
+  if (fault && ++fault->attempts_ == fault->fail_at_) {
+    fault->failed_ = true;
+    throw rmm::out_of_memory("injected compressed pin staging allocation failure");
+  }
+}
+}  // namespace testing
+#endif
 
 // A coalescer change that splits a row group across batches or reorders batches
 // must fail the pin loudly here instead of silently misaligning the per-chunk
@@ -927,6 +951,9 @@ device_pin_result materialize_all_batches_compressed(
               }
               std::size_t const payload_capacity =
                 align_up(cur, kLeafAlign) + kLeafAlign;  // tail slop for the last buffer
+#ifdef SIRIUS_TEST_PIN_STAGING_OVERRIDES
+              testing::before_pin_staging_allocation();
+#endif
               blob->payload =
                 rmm::device_buffer(payload_capacity, stream, src_space->get_default_allocator());
               // Zero first: inter-leaf alignment padding and the tail slop are never

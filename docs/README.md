@@ -186,9 +186,12 @@ unpinned and pinned again.
 
 ### Compression with Simpatico
 
-Sirius can use Simpatico to compress pinned data in GPU or host memory. After loading Sirius,
-set both compression options **before** calling `pin_table`. This example runs from the
-repository root and uses the bundled TPC-H SF1000 compression plans:
+Sirius attempts Simpatico compression by default when pinning data in GPU or host memory.
+Without a plan file, it automatically chooses a plan for each column in each chunk. Use
+`compression => false` on a pin call, or `SET pin_table_compression = false`, to opt out.
+
+Table plan files are optional overrides. This example runs from the repository root and uses
+the bundled TPC-H SF1000 plans instead of automatic selection:
 
 ```sql
 SET pin_table_compression = true;
@@ -206,12 +209,18 @@ ORDER BY l_returnflag;
 CALL unpin_table('lineitem');
 ```
 
-Use `tier = 'host'` to pin compressed data in host memory. For other datasets, point the plan
-directory at plans matching your table schemas. A plan file must match the pinned table's
-`name` (for example, `lineitem.txt`) and contain one column plan per full-table column in schema
-order. Tables without a matching plan, small batches, and batches with insufficient compression
-savings remain uncompressed. To change whether an existing pin is compressed, unpin and pin it
-again. Restart the process when changing a previously loaded compression plan.
+Use `tier = 'host'` to pin compressed data in host memory. To override automatic selection for
+other datasets, point the plan directory at plans matching your table schemas. A plan file
+must match the pinned table's `name` (for example, `lineitem.txt`) and contain one column plan
+per full-table column in schema order. Without a readable, nonempty matching file, selection
+remains automatic. A selected file that does not cover the requested columns leaves the pin
+uncompressed, as do small chunks, insufficient savings, and recoverable encoding failures.
+
+Each pin call reads the calling session's plan settings; no process restart is needed to
+change a plan. A compressed GPU result replaces the previous entry when pinned again. A raw
+GPU result can merge compatible raw columns, or replace a previous compressed GPU entry.
+Pin the complete intended column set together when compression is enabled. See the guide
+below for merge requirements and explicit-plan staging limits.
 
 From Python, execute the same SQL with `con.execute(...)` after loading the extension and before
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
