@@ -23,13 +23,12 @@ using core::reason;
 void expect_violation(std::optional<core::violation> const& actual,
                       std::string_view field,
                       reason why,
-                      std::string_view text,
-                      core::capabilities const& backend = {})
+                      std::string_view text)
 {
   REQUIRE(actual.has_value());
   CHECK(actual->field == field);
   CHECK(actual->why == why);
-  auto const message = core::describe(*actual, backend);
+  auto const message = core::describe(*actual);
   CHECK(message == text);
   for (auto const sentinel :
        {"CORE_ACCESS_SENTINEL", "CORE_SECRET_SENTINEL", "CORE_TOKEN_SENTINEL"}) {
@@ -39,7 +38,7 @@ void expect_violation(std::optional<core::violation> const& actual,
 
 }  // namespace
 
-TEST_CASE("Object-store core validates intrinsic field and reason pairs", "[object_store_core]")
+TEST_CASE("Object-store scope validates intrinsic field and reason pairs", "[object_store_scope]")
 {
   struct row {
     std::string core::settings::* member;
@@ -177,7 +176,7 @@ TEST_CASE("Object-store core validates intrinsic field and reason pairs", "[obje
   }
 }
 
-TEST_CASE("Object-store core preserves endpoint and field precedence", "[object_store_core]")
+TEST_CASE("Object-store scope preserves endpoint and field precedence", "[object_store_scope]")
 {
   struct endpoint_row {
     char const* endpoint;
@@ -216,9 +215,9 @@ TEST_CASE("Object-store core preserves endpoint and field precedence", "[object_
   value.signing_mode   = 255;
   value.ca_bundle_path = (files.directory / "missing.pem").string();
   value.uri_prefix     = "http://bad";
-  core::capabilities backend{false, false, false, "precedence"};
+  core::capabilities backend{false};
   auto check = [&](std::string_view field, reason why, std::string_view text) {
-    expect_violation(core::check_settings(value, backend), field, why, text, backend);
+    expect_violation(core::check_settings(value, backend), field, why, text);
   };
   check("endpoint", reason::required, "required");
   value.endpoint = "https://host";
@@ -242,30 +241,21 @@ TEST_CASE("Object-store core preserves endpoint and field precedence", "[object_
         reason::transport_unavailable,
         "no S3-over-RDMA backend is registered in this build");
   backend.rdma_transport = true;
-  check("signing_mode",
-        reason::signing_mode_unsupported,
-        "the configured precedence backend does not honor a signing mode");
-  backend.signing_mode_choice = true;
-  check("ca_bundle_path",
-        reason::ca_bundle_unsupported,
-        "the configured precedence backend does not honor a CA bundle");
-  backend.custom_ca_bundle = true;
   CHECK_FALSE(core::check_settings(value, backend));
 }
 
-TEST_CASE("Object-store core checks CA type and readability before backend support",
-          "[object_store_core]")
+TEST_CASE("Object-store scope checks CA type and readability before backend support",
+          "[object_store_scope]")
 {
   temporary_files files;
   auto value = valid_settings();
-  core::capabilities const backend{false, false, false, "file-check"};
+  core::capabilities const backend{false};
   for (auto const& path : {files.directory, files.directory / "missing.pem"}) {
     value.ca_bundle_path = path.string();
     expect_violation(core::check_settings(value, backend),
                      "ca_bundle_path",
                      reason::ca_bundle_not_regular_file,
-                     "is not a regular file",
-                     backend);
+                     "is not a regular file");
   }
   if (::geteuid() == 0) { SKIP("The unreadable-file witness requires a non-root user"); }
   REQUIRE_FALSE(std::ifstream(files.unreadable).good());
@@ -274,20 +264,14 @@ TEST_CASE("Object-store core checks CA type and readability before backend suppo
   expect_violation(core::check_settings(value, backend),
                    "ca_bundle_path",
                    reason::ca_bundle_unreadable,
-                   "file is not readable",
-                   backend);
+                   "file is not readable");
   value.ca_bundle_path = files.readable.string();
   value.uri_prefix.clear();
-  expect_violation(core::check_settings(value, backend),
-                   "ca_bundle_path",
-                   reason::ca_bundle_unsupported,
-                   "the configured file-check backend does not honor a CA bundle",
-                   backend);
   CHECK_FALSE(core::check_settings(value, {}));
 }
 
-TEST_CASE("Object-store core retains raw enum values and accepts valid empty fields",
-          "[object_store_core]")
+TEST_CASE("Object-store scope retains raw enum values and accepts valid empty fields",
+          "[object_store_scope]")
 {
   CHECK(core::transport_auto == 0);
   CHECK(core::transport_http == 1);
@@ -312,7 +296,7 @@ TEST_CASE("Object-store core retains raw enum values and accepts valid empty fie
   value.access_key = std::string("a\0x", 3);
   value.secret_key = std::string("s\0x", 3);
   CHECK_FALSE(core::check_settings(value, {}));
-  core::capabilities const all{true, true, true, "all"};
+  core::capabilities const all{true};
   for (std::uint32_t transport : {0U, 1U, 2U}) {
     for (std::uint32_t signing : {0U, 1U}) {
       value.transport    = transport;
@@ -327,68 +311,22 @@ TEST_CASE("Object-store core retains raw enum values and accepts valid empty fie
     expect_violation(core::check_settings(value, all),
                      "transport",
                      reason::transport_unknown,
-                     "must be one of Transport::kAuto, kHttp, kRdma",
-                     all);
+                     "must be one of Transport::kAuto, kHttp, kRdma");
     value.transport    = 0;
     value.signing_mode = unknown;
     expect_violation(core::check_settings(value, all),
                      "signing_mode",
                      reason::signing_mode_unknown,
-                     "must be one of SigningMode::kPresigned, kHeader",
-                     all);
+                     "must be one of SigningMode::kPresigned, kHeader");
   }
   value.signing_mode = 2;
   expect_violation(core::check_settings(value, all),
                    "signing_mode",
                    reason::signing_mode_unknown,
-                   "must be one of SigningMode::kPresigned, kHeader",
-                   all);
+                   "must be one of SigningMode::kPresigned, kHeader");
 }
 
-TEST_CASE("Object-store core capability flags are independent", "[object_store_core]")
-{
-  temporary_files files;
-  for (unsigned mask = 0; mask < 8; ++mask) {
-    INFO("capabilities " << mask);
-    core::capabilities const backend{
-      (mask & 1U) != 0, (mask & 2U) != 0, (mask & 4U) != 0, "independent"};
-    auto value      = valid_settings();
-    value.transport = core::transport_rdma;
-    if (backend.rdma_transport) {
-      CHECK_FALSE(core::check_settings(value, backend));
-    } else {
-      expect_violation(core::check_settings(value, backend),
-                       "transport",
-                       reason::transport_unavailable,
-                       "no S3-over-RDMA backend is registered in this build",
-                       backend);
-    }
-    value.transport    = core::transport_auto;
-    value.signing_mode = core::signing_header;
-    if (backend.signing_mode_choice) {
-      CHECK_FALSE(core::check_settings(value, backend));
-    } else {
-      expect_violation(core::check_settings(value, backend),
-                       "signing_mode",
-                       reason::signing_mode_unsupported,
-                       "the configured independent backend does not honor a signing mode",
-                       backend);
-    }
-    value.signing_mode   = core::signing_presigned;
-    value.ca_bundle_path = files.readable.string();
-    if (backend.custom_ca_bundle) {
-      CHECK_FALSE(core::check_settings(value, backend));
-    } else {
-      expect_violation(core::check_settings(value, backend),
-                       "ca_bundle_path",
-                       reason::ca_bundle_unsupported,
-                       "the configured independent backend does not honor a CA bundle",
-                       backend);
-    }
-  }
-}
-
-TEST_CASE("Object-store core checks prefix shape in publication order", "[object_store_core]")
+TEST_CASE("Object-store scope checks prefix shape in publication order", "[object_store_scope]")
 {
   for (auto const prefix : {"", "s3://bucket/", "s3://Bucket/Mixed/", "s3://bucket/a/b/"}) {
     CHECK_FALSE(core::check_uri_prefix(prefix));

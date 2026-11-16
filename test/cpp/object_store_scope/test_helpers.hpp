@@ -5,18 +5,13 @@
 #include "object_store_scope/scope.hpp"
 #include "object_store_scope/settings.hpp"
 
-#include <chrono>
-#include <condition_variable>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -57,7 +52,8 @@ bool same_owner(std::shared_ptr<Left> const& left, std::shared_ptr<Right> const&
 struct temporary_files {
   temporary_files()
   {
-    auto pattern = (std::filesystem::temp_directory_path() / "sirius-core-XXXXXX").string();
+    auto pattern =
+      (std::filesystem::temp_directory_path() / "sirius-object-store-scope-XXXXXX").string();
     std::vector<char> buffer(pattern.begin(), pattern.end());
     buffer.push_back('\0');
     auto const path = ::mkdtemp(buffer.data());
@@ -80,42 +76,6 @@ struct temporary_files {
   std::filesystem::path directory;
   std::filesystem::path readable;
   std::filesystem::path unreadable;
-};
-
-// A broken lock contract must fail the process rather than hang in a thread destructor.
-// The watchdog never calls the test framework.
-class operation_deadline {
- public:
-  explicit operation_deadline(char const* label)
-    : _watchdog([this, label] {
-        std::unique_lock lock(_mutex);
-        if (!_changed.wait_for(lock, std::chrono::seconds(20), [this] { return _done; })) {
-          std::fprintf(stderr, "object-store core timeout: %s\n", label);
-          std::fflush(stderr);
-          std::_Exit(124);
-        }
-      })
-  {
-  }
-
-  ~operation_deadline()
-  {
-    {
-      std::lock_guard lock(_mutex);
-      _done = true;
-    }
-    _changed.notify_one();
-    _watchdog.join();
-  }
-
-  operation_deadline(operation_deadline const&)            = delete;
-  operation_deadline& operator=(operation_deadline const&) = delete;
-
- private:
-  std::mutex _mutex;
-  std::condition_variable _changed;
-  bool _done{false};
-  std::thread _watchdog;
 };
 
 }  // namespace sirius::test::object_store_test

@@ -32,8 +32,6 @@ enum class reason : std::uint8_t {
   prefix_query_or_fragment,
   prefix_unmatchable_segment,
   transport_unavailable,
-  signing_mode_unsupported,
-  ca_bundle_unsupported,
 };
 
 /// A refused field and the reason. `field` refers to static storage; the offending value is
@@ -54,6 +52,6 @@ struct violation {
 [[nodiscard]] std::optional<violation> check_uri_prefix(std::string_view uri_prefix);
 
 /// The fixed reason text of @p refused, without the field name.
-[[nodiscard]] std::string describe(const violation& refused, const capabilities& backend);
+[[nodiscard]] std::string describe(const violation& refused);
 
 }  // namespace sirius::object_store_scope

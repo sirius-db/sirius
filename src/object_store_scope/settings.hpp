@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <string>
-#include <string_view>
 
 namespace sirius::object_store_scope {
 
@@ -34,10 +33,6 @@ struct settings {
 /// `check_settings()` rather than dropped.
 struct capabilities {
   bool rdma_transport{false};
-  bool signing_mode_choice{true};
-  bool custom_ca_bundle{true};
-  /// Names the backend in a refusal; refers to static storage.
-  std::string_view backend_name{"native"};
 };
 
 }  // namespace sirius::object_store_scope

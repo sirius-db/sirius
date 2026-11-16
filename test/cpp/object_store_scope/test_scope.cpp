@@ -29,8 +29,8 @@ void expect_refusal(std::optional<core::refusal> const& actual,
 
 }  // namespace
 
-TEST_CASE("Object-store core resolves longest byte prefixes with scheme-only folding",
-          "[object_store_core]")
+TEST_CASE("Object-store scope resolves longest byte prefixes with scheme-only folding",
+          "[object_store_scope]")
 {
   auto const deep     = entry_for("s3://Bucket/Path/deep/");
   auto const parent   = entry_for("s3://Bucket/Path/");
@@ -68,8 +68,8 @@ TEST_CASE("Object-store core resolves longest byte prefixes with scheme-only fol
   CHECK(core::resolve(core::scope_set{second, parent}, "s3://Bucket/Path/file").hit == second);
 }
 
-TEST_CASE("Object-store core gates raw keys before scopes but after an empty-set miss",
-          "[object_store_core]")
+TEST_CASE("Object-store scope gates raw keys before scopes but after an empty-set miss",
+          "[object_store_scope]")
 {
   core::scope_set const empty;
   core::scope_set const default_only{entry_for("")};
@@ -100,7 +100,7 @@ TEST_CASE("Object-store core gates raw keys before scopes but after an empty-set
   expect_refusal(ambiguous.refused, core::refusal_kind::unmatchable_key, "<redacted-uri>");
 }
 
-TEST_CASE("Object-store core classifies a complete plan in item order", "[object_store_core]")
+TEST_CASE("Object-store scope classifies a complete plan in item order", "[object_store_scope]")
 {
   using core::refusal_kind;
   core::scope_set const empty;
@@ -138,7 +138,7 @@ TEST_CASE("Object-store core classifies a complete plan in item order", "[object
                  "<redacted-uri>");
 }
 
-TEST_CASE("Object-store core refusal tokens are stable and nonthrowing", "[object_store_core]")
+TEST_CASE("Object-store scope refusal tokens are stable and nonthrowing", "[object_store_scope]")
 {
   using core::refusal_kind;
   static_assert(noexcept(core::token_of(refusal_kind::unconfigured)));

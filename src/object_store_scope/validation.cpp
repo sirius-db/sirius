@@ -140,16 +140,10 @@ std::optional<violation> check_settings(const settings& value, const capabilitie
   if (value.transport == transport_rdma && !backend.rdma_transport) {
     return refuse("transport", reason::transport_unavailable);
   }
-  if (value.signing_mode != signing_presigned && !backend.signing_mode_choice) {
-    return refuse("signing_mode", reason::signing_mode_unsupported);
-  }
-  if (!value.ca_bundle_path.empty() && !backend.custom_ca_bundle) {
-    return refuse("ca_bundle_path", reason::ca_bundle_unsupported);
-  }
   return std::nullopt;
 }
 
-std::string describe(const violation& refused, const capabilities& backend)
+std::string describe(const violation& refused)
 {
   switch (refused.why) {
     case reason::required: return "required";
@@ -175,12 +169,6 @@ std::string describe(const violation& refused, const capabilities& backend)
              "percent-encoded)";
     case reason::transport_unavailable:
       return "no S3-over-RDMA backend is registered in this build";
-    case reason::signing_mode_unsupported:
-      return "the configured " + std::string{backend.backend_name} +
-             " backend does not honor a signing mode";
-    case reason::ca_bundle_unsupported:
-      return "the configured " + std::string{backend.backend_name} +
-             " backend does not honor a CA bundle";
   }
   return {};
 }

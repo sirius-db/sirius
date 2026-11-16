@@ -69,6 +69,9 @@ set(TEST_SOURCES
     test/cpp/exec/test_sirius_ffi_embedder.cpp
     test/cpp/exec/test_sirius_ffi_byte_ranges.cpp
     test/cpp/exec/test_sirius_ffi_object_store.cpp
+    test/cpp/object_store_scope/test_registry.cpp
+    test/cpp/object_store_scope/test_scope.cpp
+    test/cpp/object_store_scope/test_validation.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp

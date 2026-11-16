@@ -39,7 +39,6 @@
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "log/logging.hpp"                // SIRIUS_LOG_INFO
-#include "object_store_scope/backend_capabilities.hpp"
 #include "object_store_scope/registry.hpp"
 #include "object_store_scope/scope.hpp"
 #include "object_store_scope/settings.hpp"
@@ -141,31 +140,17 @@ void run_hook(std::mutex& mutex, std::shared_ptr<const std::function<void()>> co
 void run_capture_pause_hook() { run_hook(capture_pause_mutex, capture_pause_hook); }
 void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transaction_entry_hook); }
 
-using publication_observer_fn =
-  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)>;
-
-std::mutex publication_observer_mutex;
-std::shared_ptr<const publication_observer_fn> publication_observer;
-
-// Hands the set a publication produced to the installed observer (if any), outside the observer
-// mutex and after the registry released its locks.
-void notify_publication(
-  const std::shared_ptr<const sirius::object_store_scope::scope_set>& published)
-{
-  std::shared_ptr<const publication_observer_fn> observer;
-  {
-    std::lock_guard lock(publication_observer_mutex);
-    observer = publication_observer;
-  }
-  if (observer) { (*observer)(published); }
-}
-
 // --- ObjectStoreConfig checks ------------------------------------------------------------------
 //
 // Run at put_object_store() and at the object-store factory without object-store network
 // access or backend-resource creation. CA readability may access the local filesystem.
 // Errors name the field and a fixed reason, never its value. Authentication, TLS and
 // network failures are reported when a snapshot is used.
+
+// Options the IO backend cannot honor are refused rather than ignored. At this tree the only
+// registered backend is the Sirius stack (uring + REST), whatever the configuration selects: no
+// S3-over-RDMA backend exists.
+constexpr sirius::object_store_scope::capabilities kBackendCapabilities{};
 
 sirius::object_store_scope::settings to_settings(const ObjectStoreConfig& cfg)
 {
@@ -180,24 +165,31 @@ sirius::object_store_scope::settings to_settings(const ObjectStoreConfig& cfg)
           .uri_prefix     = cfg.uri_prefix};
 }
 
-[[noreturn]] void throw_violation(const sirius::object_store_scope::violation& refused,
-                                  const sirius::object_store_scope::capabilities& backend)
+[[noreturn]] void throw_violation(const sirius::object_store_scope::violation& refused)
 {
   throw std::invalid_argument("ObjectStoreConfig." + std::string{refused.field} + ": " +
-                              sirius::object_store_scope::describe(refused, backend));
+                              sirius::object_store_scope::describe(refused));
+}
+
+void check_object_store(const ObjectStoreConfig& cfg)
+{
+  if (auto const refused =
+        sirius::object_store_scope::check_settings(to_settings(cfg), kBackendCapabilities)) {
+    throw_violation(*refused);
+  }
 }
 
 // Publishes `cfg` on `registry` for the scope its uri_prefix names; a refused field throws. The
 // registry keeps `cfg` itself as the owner of the entry, so a lookup returns the published
 // pointer. The caller keeps its own reference across the call.
 void publish_snapshot(sirius::object_store_scope::registry& registry,
-                      const std::shared_ptr<ObjectStoreConfig>& cfg,
-                      const sirius::object_store_scope::capabilities& backend)
+                      const std::shared_ptr<ObjectStoreConfig>& cfg)
 {
-  auto result = registry.publish(
-    std::make_shared<const sirius::object_store_scope::settings>(to_settings(*cfg)), cfg, backend);
-  if (result.refused) { throw_violation(*result.refused, backend); }
-  notify_publication(result.published);
+  auto const result = registry.publish(
+    std::make_shared<const sirius::object_store_scope::settings>(to_settings(*cfg)),
+    cfg,
+    kBackendCapabilities);
+  if (result.refused) { throw_violation(*result.refused); }
 }
 
 // The FFI texts of the refusals; each starts with the stable reason token.
@@ -403,10 +395,7 @@ std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_
 void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 {
   if (!cfg) { throw std::invalid_argument("object_store: put_object_store requires a snapshot"); }
-  publish_snapshot(impl_->object_store,
-                   cfg,
-                   sirius::object_store_scope::capabilities_of(
-                     impl_->context->get_config().get_scan_manager_config()));
+  publish_snapshot(impl_->object_store, cfg);
   SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot published for {} scope",
                   cfg->uri_prefix.empty() ? "the default" : "a prefixed");
 }
@@ -414,9 +403,8 @@ void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
 void Context::drop_object_store(std::string_view uri_prefix) const
 {
   auto const result = impl_->object_store.drop(uri_prefix);
-  if (result.refused) { throw_violation(*result.refused, {}); }
+  if (result.refused) { throw_violation(*result.refused); }
   if (result.published) {
-    notify_publication(result.published);
     SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot dropped for {} scope",
                     uri_prefix.empty() ? "the default" : "a prefixed");
   }
@@ -497,17 +485,14 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path,
                                                   std::shared_ptr<ObjectStoreConfig> cfg)
 {
-  // The snapshot is checked against the parsed configuration and published before bring_up(),
-  // so a rejected snapshot never creates engine state.
+  // Reject invalid settings before bring_up(). Publication rechecks them afterward,
+  // so a CA file that changes during bring-up can still cause a later rejection.
   auto config = config_path.empty() ? sirius::parsed_sirius_config{}
                                     : sirius::parsed_sirius_config::from_file(config_path);
-  auto impl   = std::make_unique<Context::Impl>();
-  if (cfg) {
-    publish_snapshot(impl->object_store,
-                     cfg,
-                     sirius::object_store_scope::capabilities_of(config.get_scan_manager_config()));
-  }
+  if (cfg) { check_object_store(*cfg); }
+  auto impl = std::make_unique<Context::Impl>();
   impl->bring_up(config);
+  if (cfg) { publish_snapshot(impl->object_store, cfg); }
   return std::unique_ptr<Context>(new Context(std::move(impl)));
 }
 
@@ -785,18 +770,6 @@ void set_transaction_entry_hook(std::function<void()> hook)
   {
     std::lock_guard lock(transaction_entry_mutex);
     retired = std::exchange(transaction_entry_hook, std::move(next));
-  }
-}
-
-void set_publication_observer(
-  std::function<void(std::shared_ptr<const sirius::object_store_scope::scope_set>)> observer)
-{
-  auto next =
-    observer ? std::make_shared<const publication_observer_fn>(std::move(observer)) : nullptr;
-  std::shared_ptr<const publication_observer_fn> retired;
-  {
-    std::lock_guard lock(publication_observer_mutex);
-    retired = std::exchange(publication_observer, std::move(next));
   }
 }
 
