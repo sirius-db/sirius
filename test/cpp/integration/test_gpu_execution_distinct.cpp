@@ -343,7 +343,6 @@ TEST_CASE_METHOD(DistinctFixture,
     compare_gpu_vs_cpu("SELECT k, avg(v), first(v) FROM dist_fd GROUP BY k");
   }
 
-  // COLLECT_SET puts the groupby, and its row selector, on cuDF's sort path.
   SECTION("COUNT(DISTINCT)")
   {
     compare_gpu_vs_cpu("SELECT k, first(v), count(DISTINCT v) FROM dist_fd GROUP BY k");
@@ -360,7 +359,6 @@ TEST_CASE_METHOD(DistinctFixture,
     compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM dist_fd GROUP BY k");
   }
 
-  // M2 sorts the local input by key before the groupby.
   SECTION("stddev_samp")
   {
     compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v), stddev_samp(v) FROM dist_fd GROUP BY k");
@@ -658,7 +656,6 @@ TEST_CASE_METHOD(DistinctBulkFixture,
     "count(*) AS c, sum(payload) AS s FROM dist_dup GROUP BY k",
     {0, 3, 4});
 
-  // MERGE_SETS puts the merge groupby, and its row selector, on cuDF's sort path.
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM ("
     "  SELECT k, first(payload) AS a, count(DISTINCT payload % 7) AS c"
@@ -673,8 +670,7 @@ TEST_CASE_METHOD(DistinctBulkFixture,
                  "gpu_execution FIRST beside stddev_samp keeps each group's row",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // M2 sorts the local input by key, and MERGE_M2 puts the merge on cuDF's sort path. The checks
-  // match the many-batch FIRST case above; rounding keeps the stddev comparison exact.
+  // The checks match the many-batch FIRST case above; rounding keeps the stddev comparison exact.
   auto const check = [&] {
     compare_gpu_vs_cpu(
       "SELECT count(*) FROM ("
