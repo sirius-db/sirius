@@ -204,6 +204,37 @@ Because the merged plan reads one view fewer times than the original, `compare_r
 
 **Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
 
+### Partial Aggregate Below a Payload Join
+
+**Motivation:** TPC-H q10 sums `lineitem ⋈ orders` revenue and groups by seven keys, four of them `customer` strings. The join with `customer` repeats those strings for every matching lineitem row (0.7 GB becomes 9.7 GB at SF500), and every operator up to the group-by carries them. Summing each customer's rows first lets the join bring in each customer's strings once.
+
+**Mechanism:** `push_partial_aggregates_below_joins` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), after the subquery rewrites. For an aggregate over inner joins whose arguments all come from one subtree `S`:
+
+```
+AGGREGATE(groups; sum(x))                 AGGREGATE(groups; sum(partial))
+ └─ JOIN ... (adds group-by strings)       └─ JOIN ...
+     └─ S                                       └─ AGGREGATE(columns of S read above it; sum(x))
+                                                    └─ S
+```
+
+`S` is the argument side of the lowest join whose other side supplies a variable-width column the aggregate groups by. The new aggregate groups by every column of `S` that the joins above it or the original aggregate's groups read. Rows of `S` that agree on those columns pair with the same rows of every join above, so combining them first changes no result, whether or not any join key is unique. The original aggregate keeps its table indexes and output types, so nothing above it changes. The joins' projection maps are rebuilt for the new columns, and the rewritten subtree is checked with DuckDB's `ColumnBindingResolver` before it is kept.
+
+DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported_optimizers.hpp`). It carries aggregate states through `combine` and `finalize`, which the GPU cannot run, and it only considers the join directly under the aggregate, which in q10 is `nation`.
+
+**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.61 s instead of 1.36 s with its columns pinned on the GPU, and in 1.52 s instead of 1.63 s unpinned, the same as when the SQL is rewritten by hand. TPC-DS q11 at SF100 goes from 0.28 s to 0.17 s pinned.
+
+**When it applies:**
+- Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
+- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
+- Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
+- The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
+- Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
+- `S` is not already grouped.
+
+**Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
+
+**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
+
 ### Sorted-Key Grouped Aggregation
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.

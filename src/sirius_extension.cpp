@@ -3050,6 +3050,16 @@ static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope,
                    params->enable_exists_minmax_rewrite);
 }
 
+static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto* params                                = get_operator_params(context, scope);
+  params->enable_partial_aggregate_below_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN to {}",
+                   params->enable_partial_aggregate_below_join);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3669,6 +3679,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_exists_minmax_rewrite),
                     SetEnableExistsMinmaxRewrite);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_partial_aggregate_below_join",
+                    "aggregate below an inner join that only adds group-by payload",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
+                    SetEnablePartialAggregateBelowJoin);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

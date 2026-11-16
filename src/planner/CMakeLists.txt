@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
-  PRIVATE connector_registry.cpp
+  PRIVATE aggregate_binding.cpp
+          connector_registry.cpp
           decimal_sum_input_bounds.cpp
           delim_cte_proof.cpp
           late_mat_plan_pass.cpp
@@ -37,6 +38,7 @@ target_sources(
           sirius_plan_limit.cpp
           sirius_plan_narrowing_policy.cpp
           sirius_plan_order.cpp
+          sirius_plan_partial_aggregate_pushdown.cpp
           sirius_plan_projection.cpp
           sirius_plan_projection_utils.cpp
           sirius_plan_recursive_cte.cpp

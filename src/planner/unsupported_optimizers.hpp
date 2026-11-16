@@ -24,6 +24,7 @@ namespace sirius::planner {
 
 // Rewrites that produce aggregate or scan shapes unsupported by GPU execution.
 inline constexpr std::array unsupported_optimizers{
+  // Carries aggregate states. `push_partial_aggregates_below_joins` pushes plain aggregates.
   duckdb::OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN,
   duckdb::OptimizerType::GROUPING_SETS,
   duckdb::OptimizerType::AGGREGATE_REUSE,

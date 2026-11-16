@@ -15,10 +15,7 @@
  */
 
 #include "cudf/cudf_utils.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -43,6 +40,7 @@
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "planner/aggregate_binding.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -388,22 +386,6 @@ std::optional<duckdb::vector<ProjectionIndex>> output_map(LogicalOperator& repla
   return map;
 }
 
-unique_ptr<duckdb::BoundAggregateExpression> bind_extremum(duckdb::ClientContext& context,
-                                                           char const* name,
-                                                           LogicalType const& type,
-                                                           unique_ptr<Expression> argument,
-                                                           unique_ptr<Expression> filter = nullptr)
-{
-  auto& entry =
-    duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
-      context, DEFAULT_SCHEMA, name);
-  auto function = entry.functions.GetFunctionByArguments(context, {type});
-  duckdb::vector<unique_ptr<Expression>> children;
-  children.push_back(std::move(argument));
-  duckdb::FunctionBinder binder(context);
-  return binder.BindAggregateFunction(std::move(function), std::move(children), std::move(filter));
-}
-
 /// One subquery answered by the shared aggregate.
 struct subquery {
   unique_ptr<Expression> value;      ///< The compared column, over T
@@ -491,13 +473,14 @@ unique_ptr<LogicalOperator> build(duckdb::ClientContext& context,
              unary(ExpressionType::OPERATOR_IS_NULL, sub.value->Copy())),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)),
         duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(0)));
-      aggregates.push_back(bind_extremum(context, "max", LogicalType::INTEGER, std::move(seen)));
+      aggregates.push_back(
+        bind_builtin_aggregate(context, "max", LogicalType::INTEGER, std::move(seen)));
     }
     // As FILTERs, MIN and MAX share one filtered input column in the physical plan.
-    aggregates.push_back(bind_extremum(
+    aggregates.push_back(bind_builtin_aggregate(
       context, "min", type, sub.value->Copy(), sub.predicate ? sub.predicate->Copy() : nullptr));
     aggregates.push_back(
-      bind_extremum(context, "max", type, std::move(sub.value), std::move(sub.predicate)));
+      bind_builtin_aggregate(context, "max", type, std::move(sub.value), std::move(sub.predicate)));
   }
   auto const group_index     = binder.GenerateTableIndex();
   auto const aggregate_index = binder.GenerateTableIndex();
