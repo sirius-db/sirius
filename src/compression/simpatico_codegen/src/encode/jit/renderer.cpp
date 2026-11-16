@@ -370,6 +370,23 @@ struct SimpaticoPow5 {
         }
     }
 };
+// Warp-wide min / AND; the __reduce_*_sync intrinsics need sm_80, so older GPUs shuffle.
+__device__ __forceinline__ int simpatico_warp_min(int v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_min_sync(0xFFFFFFFFu, v);
+#else
+    for (int o = 16; o > 0; o >>= 1) v = min(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
+    return v;
+#endif
+}
+__device__ __forceinline__ unsigned int simpatico_warp_and(unsigned int v) {
+#if __CUDA_ARCH__ >= 800
+    return __reduce_and_sync(0xFFFFFFFFu, v);
+#else
+    for (int o = 16; o > 0; o >>= 1) v &= __shfl_xor_sync(0xFFFFFFFFu, v, o);
+    return v;
+#endif
+}
 // A chunk residual divided by its folded-in divisor: no division for the no-op divisor 1, and
 // a 32-bit one when both operands fit.
 template <class U, class T>
@@ -1224,7 +1241,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << bp_utype << ">(_vi) ^ static_cast<" << bp_utype << ">(_v0));\n"
       << "        }\n"
       << "        {\n"
-      << "            const int _tz = __reduce_min_sync(0xFFFFFFFFu, _or_" << idstr
+      << "            const int _tz = simpatico_warp_min(_or_" << idstr
       << " != 0ULL ? __ffsll(static_cast<long long>(_or_" << idstr << ")) - 1 : 127);\n"
       << "            const bool _a5 = __all_sync(0xFFFFFFFFu, _s5_" << idstr << ");\n"
       << "            if ((tid & 31) == 0) { " << sh_div << "_tzw[tid >> 5] = _tz; " << sh_div
@@ -1261,7 +1278,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
                                        : "")
             << "                }\n";
     }
-    body_ << "                const unsigned int _fw = __reduce_and_sync(0xFFFFFFFFu, _f);\n"
+    body_ << "                const unsigned int _fw = simpatico_warp_and(_f);\n"
           << "                if ((tid & 31) == 0) atomicAnd(&" << sh_div << "_f, _fw);\n"
           << "                __syncthreads();\n"
           // The exponent is the run of set bits; a chunk divisible by 5^4 takes the exact
@@ -1274,7 +1291,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "                        _p5.add(static_cast<unsigned long long>(" << residual("i")
           << "));\n"
           << "                    }\n"
-          << "                    const int _ew = __reduce_min_sync(0xFFFFFFFFu, _p5.e < 0 ? 127 : "
+          << "                    const int _ew = simpatico_warp_min(_p5.e < 0 ? 127 : "
              "_p5.e);\n"
           << "                    if ((tid & 31) == 0) atomicMin(&" << sh_div << "_e5, _ew);\n"
           << "                    __syncthreads();\n"
