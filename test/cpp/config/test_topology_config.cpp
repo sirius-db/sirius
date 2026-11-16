@@ -81,6 +81,18 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
     host_settings += ", initial_number_pools: 3";
     expected_pools = 3;
   }
+  SECTION("explicit positive count does not require discovered RAM")
+  {
+    host_settings += ", initial_number_pools: 3";
+    topology.numa_nodes.front().memory_capacity = 0;
+    expected_pools                              = 3;
+  }
+  SECTION("automatic count can round down to zero")
+  {
+    host_settings     = "capacity_bytes: 64Mi";
+    expected_pools    = 0;
+    expected_capacity = 64ULL << 20;
+  }
   SECTION("explicit zero disables preallocation without requiring discovered RAM")
   {
     host_settings += ", initial_number_pools: 0";

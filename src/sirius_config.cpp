@@ -917,14 +917,10 @@ struct host_mem_config {
     } else {
       builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
     }
-    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
-    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
-    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
-    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
-    // initial_number_pools} positionally therefore lands each value in the correctly-named
-    // cucascade config field — the names line up with the resulting config struct, not with the
-    // setter's parameter names.
-    builder.set_host_pool_features(block_size, pool_size, initial_number_pools.value_or(0));
+    // cuCascade maps (chunk_size, block_size, initial_block_count) onto the host config's
+    // (block_size, pool_size, initial_number_pools). Its setter requires a positive count.
+    // build() only creates configs; resolve() replaces this temporary count before allocation.
+    builder.set_host_pool_features(block_size, pool_size, 1);
   }
 };
 
@@ -1230,19 +1226,21 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
-    if (!host_cfg.initial_number_pools) {
-      for (auto& space : settings._memory_space_configs) {
-        auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
-        if (!host) { continue; }
-        auto const* node = hw_topology.find_numa_node(host->numa_id);
-        if (!node || node->memory_capacity == 0 || node->is_device_memory) {
-          throw configuration_input_error(
-            "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
-            std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
-        }
-        host->initial_number_pools = memory::default_initial_host_pools(
-          node->memory_capacity, host->memory_capacity, host->block_size, host->pool_size);
+    for (auto& space : settings._memory_space_configs) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (!host) { continue; }
+      if (host_cfg.initial_number_pools.has_value()) {
+        host->initial_number_pools = *host_cfg.initial_number_pools;
+        continue;
       }
+      auto const* node = hw_topology.find_numa_node(host->numa_id);
+      if (!node || node->memory_capacity == 0 || node->is_device_memory) {
+        throw configuration_input_error(
+          "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
+          std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
+      }
+      host->initial_number_pools = memory::default_initial_host_pools(
+        node->memory_capacity, host->memory_capacity, host->block_size, host->pool_size);
     }
   }
 
