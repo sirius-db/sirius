@@ -10,7 +10,7 @@ instead, and puts the values back at the far end by gathering them out of the pi
 works only for a **GPU-tier pinned** table — the values have to still exist somewhere
 addressable when the far end asks for them, and that is what the pin guarantees.
 
-## Turning it on (experimental)
+## Configuration
 
 ```sql
 SET enable_late_materialization = true; -- enabled by default; false disables deferrals

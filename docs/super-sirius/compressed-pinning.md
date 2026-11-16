@@ -96,7 +96,7 @@ With nvCOMP 6, `nvcomp_cascaded` plans remain unavailable because the old config
 options were removed. Its metadata field reserves the distinction needed to support the new
 Cascaded API later. nvCOMP 5 builds continue to support the existing Cascaded plans.
 
-## Filtering while decompressing (experimental)
+## Filtering while decompressing
 
 A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
 a column's plan allows it the filter is answered from the compressed form, and the surviving

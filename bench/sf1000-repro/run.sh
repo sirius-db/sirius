@@ -53,7 +53,6 @@ echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "config    : $CFG"
-echo "optimizations: enabled by default; CFG may override"
 echo
 
 cd "$REPO"

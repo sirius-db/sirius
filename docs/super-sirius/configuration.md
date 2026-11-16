@@ -783,7 +783,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
-| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
@@ -1159,10 +1159,7 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 |----------|---------|-------------|
 | `spill_compression` | false | Store batches the downgrade executor spills to the host or disk tier Simpatico-compressed. Applies to the whole process, not just the session. See [Spill compression](#spill-compression-siriuscompression) for the YAML-only gates. |
 
-### Late Materialization (experimental)
-
-Enabled by default. The connection-local SQL settings are snapshotted per query. The same keys
-are accepted under YAML `sirius.operator_params`; `RESET` restores the startup default.
+### Late Materialization
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1172,12 +1169,11 @@ are accepted under YAML `sirius.operator_params`; `RESET` restores the startup d
 | `late_materialization_count_defer` | false | Allow null-free columns read only by COUNT to remain deferred. |
 | `late_materialization_min_value_compressed` | 1 | Minimum deferred bytes per row for compressed origins; nonnegative integer. Matches the ordinary value floor by default. |
 
-See [Late Materialization](late-materialization.md#turning-it-on-experimental) for the mechanism
+See [Late Materialization](late-materialization.md#configuration) for the mechanism
 and results.
 
-### Grouped Aggregation (experimental)
+### Grouped Aggregation
 
-Enabled by default, controlled by connection-local SQL `SET` or YAML `sirius.operator_params`.
 The specialized path applies only to eligible batches and otherwise uses cuDF's group-by.
 
 | Variable | Default | Description |
@@ -1195,10 +1191,6 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
 | `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 
-These are connection-local SQL settings, also accepted under YAML `sirius.operator_params`.
-Planning, memory forecasting and decode use the same query policy, including background uploads.
-`SET GLOBAL` is rejected for all optimization settings above. Changing a setting does not alter
-an existing query. Pin metadata remains reusable by queries with different settings.
 Selectivity thresholds must be finite and greater than zero; values above one are accepted,
 and a small positive index-walk threshold effectively disables that route.
 
@@ -1226,7 +1218,7 @@ are unchanged; migrate overrides using this mapping:
 | `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` | `fused_scan_index_walk_max_selectivity` |
 | `SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER` | `fused_scan_max_membership_sources` |
 
-See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation) for the mechanism and its measured effect.
 
 ### Runtime Data Size Estimation
 

@@ -236,7 +236,7 @@ Because the merged plan reads one view fewer times than the original, `compare_r
 
 **Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
 
-### Low-Cardinality Grouped Aggregation (experimental)
+### Low-Cardinality Grouped Aggregation
 
 **Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
 
@@ -253,7 +253,7 @@ It applies only to one or two non-null one-character STRING keys, at most 64 gro
 - `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
 
-**Config:** `enable_low_cardinality_groupby` (SQL or YAML, enabled by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+**Config:** `enable_low_cardinality_groupby` (SQL or YAML, enabled by default; see [Configuration](configuration.md#grouped-aggregation)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
 
 ### Distinct Hash Join (PR #558)
 
@@ -481,7 +481,7 @@ result materialization restore native carriers.
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
 
-### Late Materialization (unreleased, experimental)
+### Late Materialization
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
 reads them — through joins that copy them beside their keys, partitions that write them to a
