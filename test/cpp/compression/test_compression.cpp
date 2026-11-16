@@ -239,8 +239,8 @@ void require_cached_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
   REQUIRE(actual->RowCount() == expected->RowCount());
   for (duckdb::idx_t row = 0; row < expected->RowCount(); ++row) {
     for (duckdb::idx_t column = 0; column < expected->ColumnCount(); ++column) {
-      CHECK(actual->Collection().GetValue(column, row) ==
-            expected->Collection().GetValue(column, row));
+      CHECK(duckdb::Value::NotDistinctFrom(actual->Collection().GetValue(column, row),
+                                           expected->Collection().GetValue(column, row)));
     }
   }
 }
