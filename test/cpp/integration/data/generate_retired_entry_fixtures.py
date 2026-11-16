@@ -14,11 +14,9 @@ manifest `status` from 1 (ADDED) to 2 (DELETED):
       file and returns 3.
 
   iceberg_v2_eq_delete_retired   <- iceberg_v2_equality_delete
-      The table's only equality-delete file, retired. Equality deletes are the one thing the
-      GPU path refuses outright, so the interesting assertion is the ROUTE: with no LIVE
-      equality delete the table must stay GPU-eligible. A status-blind gate refuses it
-      forever over a delete that no longer applies -- a silent performance cliff rather than
-      a wrong answer, which is why nothing would otherwise catch it.
+      The table's only equality-delete file, retired. Nothing deletes any more, so the scan
+      must return all 5 rows. A reader that ignores status still applies the retired file
+      and returns 3.
 
 Hand-forged for the same reason as iceberg_v3_dv_replaced: pyiceberg refuses to write delete
 files at all ("Merge on read is not yet supported, falling back to copy-on-write"), so the

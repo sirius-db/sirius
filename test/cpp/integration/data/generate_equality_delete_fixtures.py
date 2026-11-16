@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Build the Iceberg equality-delete fixtures the GPU scan path is tested against.
+
+Run from the repo root:
+    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py
+    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py --verify
+
+Each fixture isolates one rule a reader gets silently wrong. The rows a WRONG reader returns
+are listed beside the right ones, so a failure says which rule broke:
+
+  iceberg_v2_eq_wide_delete_file    The delete file stores the whole row; equality_ids=[1].
+                                    Matching on every column deletes nothing.
+  iceberg_v2_eq_manifest_rewrite    A rewritten manifest: its own sequence number is 3, but one
+                                    entry keeps data sequence number 1. Comparing the MANIFEST
+                                    number skips a delete that applies.
+  iceberg_v2_eq_null_key            Composite key with NULL members. NULL matches NULL.
+  iceberg_v2_eq_partitioned         One delete stored in partition A, one stored under an
+                                    unpartitioned spec. The first must not reach partition B;
+                                    the second must reach both.
+  iceberg_v2_eq_upsert_same_commit  One commit rewrites key 2 twice: the equality delete removes
+                                    the OLDER commit's row, a position delete removes this
+                                    commit's first version. Applying the equality delete to its
+                                    own commit loses the row just written.
+  iceberg_v2_eq_renamed_key         The key column was renamed between the data file and the
+                                    delete file. Only the field ID still links them.
+  iceberg_v2_eq_promoted_key        The key was promoted int -> long. Old data and an old delete
+                                    file store INT32; newer files store INT64.
+  iceberg_v2_eq_double_key          A DOUBLE key. The GPU path declines it; the fixture pins the
+                                    refusal and the rows DuckDB returns.
+
+Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
+independent writer of equality deletes is Flink. Avro schemas are copied from an existing
+fixture so they stay byte-compatible with what the Iceberg extension already reads.
+"""
+
+import argparse
+import copy
+import json
+import pathlib
+import shutil
+import sys
+
+DATA = pathlib.Path(__file__).resolve().parent
+REL = pathlib.Path("test/cpp/integration/data")
+TEMPLATE = DATA / "iceberg_eq_seq_number" / "metadata"
+POS_PATH_ID, POS_POS_ID = 2147483546, 2147483545
+
+
+def _avro(path):
+    import fastavro
+
+    with open(path, "rb") as fh:
+        reader = fastavro.reader(fh)
+        return dict(reader.metadata), reader.writer_schema, list(reader)
+
+
+class Table:
+    """One fixture: accumulates commits, then writes metadata that describes all of them."""
+
+    def __init__(self, name, schemas, partition_specs=None):
+        self.name, self.root, self.rel = name, DATA / name, REL / name
+        self.schemas = schemas  # list of [(field_id, name, iceberg_type)]
+        self.specs = partition_specs or [[]]
+        self.snapshots, self.manifests, self.seq = [], [], 0
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        (self.root / "data").mkdir(parents=True)
+        (self.root / "metadata").mkdir()
+        self.entry_meta, self.entry_schema, _ = _avro(TEMPLATE / "manifest-delete.avro")
+        _, self.list_schema, rows = _avro(TEMPLATE / "snap-9600000000000002-2-ml.avro")
+        self.list_row = rows[0]
+
+    def parquet(self, file_name, columns):
+        """columns: [(field_id, name, arrow_type, values)]. Returns (relative path, rows, size)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        fields = [
+            pa.field(n, t, metadata={"PARQUET:field_id": str(i)})
+            for i, n, t, _ in columns
+        ]
+        table = pa.table(
+            [pa.array(v, t) for _, _, t, v in columns], schema=pa.schema(fields)
+        )
+        pq.write_table(table, self.root / "data" / file_name)
+        return (
+            str(self.rel / "data" / file_name),
+            table.num_rows,
+            (self.root / "data" / file_name).stat().st_size,
+        )
+
+    def _manifest(self, name, content, spec_id, entries):
+        """entries: [(status, explicit_sequence_or_None, file, content, partition, equality_ids)]."""
+        import fastavro
+
+        spec = self.specs[spec_id]
+        schema = copy.deepcopy(self.entry_schema)
+        for field in schema["fields"]:
+            if field["name"] != "data_file":
+                continue
+            for sub in field["type"]["fields"]:
+                if sub["name"] == "partition":
+                    sub["type"]["fields"] = [
+                        {
+                            "field-id": f["field-id"],
+                            "name": f["name"],
+                            "type": ["null", "string"],
+                            "default": None,
+                        }
+                        for f in spec
+                    ]
+        meta = dict(self.entry_meta)
+        meta["content"] = "data" if content == 0 else "deletes"
+        meta["partition-spec"] = json.dumps(spec)
+        meta["partition-spec-id"] = str(spec_id)
+        meta["schema"] = json.dumps(self._schema_json(len(self.schemas) - 1))
+        rows = []
+        for status, explicit_seq, (path, count, size), kind, partition, ids in entries:
+            rows.append(
+                {
+                    "status": status,
+                    "snapshot_id": self.snapshot_id(self.seq),
+                    "sequence_number": explicit_seq,
+                    "file_sequence_number": explicit_seq,
+                    "data_file": {
+                        "content": kind,
+                        "file_path": path,
+                        "file_format": "PARQUET",
+                        "partition": partition or {},
+                        "record_count": count,
+                        "file_size_in_bytes": size,
+                        "column_sizes": None,
+                        "value_counts": None,
+                        "null_value_counts": None,
+                        "nan_value_counts": None,
+                        "lower_bounds": None,
+                        "upper_bounds": None,
+                        "key_metadata": None,
+                        "split_offsets": [4],
+                        "equality_ids": ids,
+                        "sort_order_id": 0 if kind != 1 else None,
+                    },
+                }
+            )
+        out = self.root / "metadata" / name
+        with open(out, "wb") as fh:
+            fastavro.writer(fh, schema, rows, codec="null", metadata=meta)
+        added = sum(1 for r in rows if r["status"] == 1)
+        existing = sum(1 for r in rows if r["status"] == 0)
+        values = sorted({p[f["name"]] for *_, p, _ in entries if p for f in spec})
+        row = dict(self.list_row)
+        row.update(
+            manifest_path=str(self.rel / "metadata" / name),
+            manifest_length=out.stat().st_size,
+            partition_spec_id=spec_id,
+            content=content,
+            sequence_number=self.seq,
+            min_sequence_number=min(
+                [self.seq] + [s for _, s, *_ in entries if s is not None]
+            ),
+            added_snapshot_id=self.snapshot_id(self.seq),
+            added_files_count=added,
+            existing_files_count=existing,
+            deleted_files_count=0,
+            added_rows_count=sum(
+                r["data_file"]["record_count"] for r in rows if r["status"] == 1
+            ),
+            existing_rows_count=sum(
+                r["data_file"]["record_count"] for r in rows if r["status"] == 0
+            ),
+            deleted_rows_count=0,
+            partitions=(
+                [
+                    {
+                        "contains_null": False,
+                        "contains_nan": False,
+                        "lower_bound": values[0].encode(),
+                        "upper_bound": values[-1].encode(),
+                    }
+                    for _ in spec
+                ]
+                if values
+                else []
+            ),
+        )
+        return row
+
+    def snapshot_id(self, seq):
+        return 8800000000000000 + seq
+
+    def commit(self, operation, manifests, replace=False):
+        """manifests: [(file name, content, spec_id, entries)]. replace drops earlier DATA
+        manifests, as a manifest rewrite does."""
+        import fastavro
+
+        self.seq += 1
+        if replace:
+            self.manifests = [m for m in self.manifests if m["content"] != 0]
+        self.manifests += [self._manifest(*m) for m in manifests]
+        name = f"snap-{self.snapshot_id(self.seq)}-{self.seq}-ml.avro"
+        with open(self.root / "metadata" / name, "wb") as fh:
+            fastavro.writer(fh, self.list_schema, self.manifests, codec="null")
+        self.snapshots.append(
+            {
+                "snapshot-id": self.snapshot_id(self.seq),
+                "sequence-number": self.seq,
+                "timestamp-ms": 1700000000000 + 1000 * self.seq,
+                "manifest-list": str(self.rel / "metadata" / name),
+                "summary": {"operation": operation},
+                "schema-id": len(self.schemas) - 1,
+                **(
+                    {"parent-snapshot-id": self.snapshot_id(self.seq - 1)}
+                    if self.seq > 1
+                    else {}
+                ),
+            }
+        )
+
+    def _schema_json(self, schema_id):
+        return {
+            "type": "struct",
+            "schema-id": schema_id,
+            "fields": [
+                {"id": i, "name": n, "required": False, "type": t}
+                for i, n, t in self.schemas[schema_id]
+            ],
+        }
+
+    def finish(self):
+        meta = json.loads((TEMPLATE / "v1.metadata.json").read_text())
+        meta.update(
+            {
+                "location": str(self.rel),
+                "table-uuid": "e0e0e0e0-0000-4000-8000-"
+                + f"{abs(hash(self.name)) % 16**12:012x}",
+                "last-sequence-number": self.seq,
+                "last-updated-ms": self.snapshots[-1]["timestamp-ms"],
+                "last-column-id": max(i for s in self.schemas for i, _, _ in s),
+                "current-schema-id": len(self.schemas) - 1,
+                "schemas": [self._schema_json(i) for i in range(len(self.schemas))],
+                "partition-specs": [
+                    {"spec-id": i, "fields": spec} for i, spec in enumerate(self.specs)
+                ],
+                "default-spec-id": 0,
+                "last-partition-id": max(
+                    [999] + [f["field-id"] for s in self.specs for f in s]
+                ),
+                "current-snapshot-id": self.snapshots[-1]["snapshot-id"],
+                "refs": {
+                    "main": {
+                        "snapshot-id": self.snapshots[-1]["snapshot-id"],
+                        "type": "branch",
+                    }
+                },
+                "snapshots": self.snapshots,
+                "snapshot-log": [
+                    {"snapshot-id": s["snapshot-id"], "timestamp-ms": s["timestamp-ms"]}
+                    for s in self.snapshots
+                ],
+            }
+        )
+        # A fixed UUID per fixture: hash() is salted per process.
+        meta["table-uuid"] = "e0e0e0e0-0000-4000-8000-%012x" % (
+            sum(ord(c) * 131**k for k, c in enumerate(self.name)) % 16**12
+        )
+        (self.root / "metadata" / "v1.metadata.json").write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n"
+        )
+        (self.root / "metadata" / "version-hint.text").write_text("1")
+
+
+def fruit_schema():
+    return [[(1, "fruit", "string"), (2, "count", "long")]]
+
+
+def build_wide_delete_file():
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_wide_delete_file", fruit_schema())
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (
+                1,
+                "fruit",
+                pa.string(),
+                ["apple", "banana", "cherry", "date", "elderberry"],
+            ),
+            (2, "count", pa.int64(), [1, 2, 3, 4, 5]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    # The whole deleted row, with counts that no longer match the data: only fruit is a key.
+    # Columns are stored count-first so position cannot stand in for the field ID either.
+    delete = t.parquet(
+        "delete-eq-2.parquet",
+        [
+            (2, "count", pa.int64(), [999, 0]),
+            (1, "fruit", pa.string(), ["banana", "date"]),
+        ],
+    )
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t.finish()
+
+
+def build_manifest_rewrite():
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_manifest_rewrite", fruit_schema())
+    data1 = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+            (2, "count", pa.int64(), [1, 2, 3]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data1, 0, None, None)])])
+    delete = t.parquet("delete-eq-2.parquet", [(1, "fruit", pa.string(), ["banana"])])
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    data2 = t.parquet(
+        "data-3.parquet",
+        [
+            (1, "fruit", pa.string(), ["banana", "date"]),
+            (2, "count", pa.int64(), [4, 5]),
+        ],
+    )
+    # The append also rewrites the data manifest: data-1 becomes EXISTING and keeps its own
+    # sequence number 1 inside a manifest whose sequence number is 3.
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-3-merged.avro",
+                0,
+                0,
+                [(0, 1, data1, 0, None, None), (1, None, data2, 0, None, None)],
+            )
+        ],
+        replace=True,
+    )
+    t.finish()
+
+
+def build_null_key():
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_null_key", fruit_schema())
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", None, "cherry", None, "cherry"]),
+            (2, "count", pa.int64(), [1, 2, 3, 4, None]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    delete = t.parquet(
+        "delete-eq-2.parquet",
+        [
+            (1, "fruit", pa.string(), [None, "cherry"]),
+            (2, "count", pa.int64(), [2, None]),
+        ],
+    )
+    t.commit(
+        "delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1, 2])])]
+    )
+    t.finish()
+
+
+def build_partitioned():
+    import pyarrow as pa
+
+    spec = [
+        {"name": "region", "transform": "identity", "source-id": 2, "field-id": 1000}
+    ]
+    t = Table(
+        "iceberg_v2_eq_partitioned",
+        [[(1, "id", "long"), (2, "region", "string"), (3, "v", "long")]],
+        [spec, []],
+    )
+
+    def data(region, values):
+        return t.parquet(
+            f"data-1-{region}.parquet",
+            [
+                (1, "id", pa.int64(), [1, 2, 3]),
+                (2, "region", pa.string(), [region] * 3),
+                (3, "v", pa.int64(), values),
+            ],
+        )
+
+    a, b = data("A", [10, 20, 50]), data("B", [30, 40, 60])
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-1.avro",
+                0,
+                0,
+                [
+                    (1, None, a, 0, {"region": "A"}, None),
+                    (1, None, b, 0, {"region": "B"}, None),
+                ],
+            )
+        ],
+    )
+    in_a = t.parquet("delete-eq-2-A.parquet", [(1, "id", pa.int64(), [1])])
+    t.commit(
+        "delete",
+        [("m-delete-2.avro", 1, 0, [(1, None, in_a, 2, {"region": "A"}, [1])])],
+    )
+    everywhere = t.parquet("delete-eq-3-global.parquet", [(1, "id", pa.int64(), [2])])
+    t.commit(
+        "delete", [("m-delete-3.avro", 1, 1, [(1, None, everywhere, 2, None, [1])])]
+    )
+    t.finish()
+
+
+def build_upsert_same_commit():
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_upsert_same_commit", [[(1, "id", "long"), (2, "v", "string")]]
+    )
+    data1 = t.parquet(
+        "data-1.parquet",
+        [(1, "id", pa.int64(), [1, 2, 3]), (2, "v", pa.string(), ["a", "b", "c"])],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data1, 0, None, None)])])
+    data2 = t.parquet(
+        "data-2.parquet",
+        [(1, "id", pa.int64(), [2, 2, 4]), (2, "v", pa.string(), ["x", "y", "d"])],
+    )
+    eq = t.parquet("delete-eq-2.parquet", [(1, "id", pa.int64(), [2])])
+    pos = t.parquet(
+        "delete-pos-2.parquet",
+        [
+            (POS_PATH_ID, "file_path", pa.string(), [data2[0]]),
+            (POS_POS_ID, "pos", pa.int64(), [0]),
+        ],
+    )
+    t.commit(
+        "overwrite",
+        [
+            ("m-data-2.avro", 0, 0, [(1, None, data2, 0, None, None)]),
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [(1, None, eq, 2, None, [1]), (1, None, pos, 1, None, None)],
+            ),
+        ],
+    )
+    t.finish()
+
+
+def build_renamed_key():
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_renamed_key",
+        [
+            [(1, "fruit", "string"), (2, "count", "long")],
+            [(1, "produce", "string"), (2, "count", "long")],
+        ],
+    )
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+            (2, "count", pa.int64(), [1, 2, 3]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    delete = t.parquet("delete-eq-2.parquet", [(1, "produce", pa.string(), ["banana"])])
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t.finish()
+
+
+def build_promoted_key():
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_promoted_key",
+        [
+            [(1, "id", "int"), (2, "v", "string")],
+            [(1, "id", "long"), (2, "v", "string")],
+        ],
+    )
+    data1 = t.parquet(
+        "data-1-int.parquet",
+        [
+            (1, "id", pa.int32(), [1, 2, 3, 4]),
+            (2, "v", pa.string(), ["a", "b", "c", "d"]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data1, 0, None, None)])])
+    old = t.parquet("delete-eq-2-int.parquet", [(1, "id", pa.int32(), [2])])
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, old, 2, None, [1])])])
+    data2 = t.parquet(
+        "data-3-long.parquet",
+        [(1, "id", pa.int64(), [2, 5, 6]), (2, "v", pa.string(), ["b2", "e", "f"])],
+    )
+    t.commit("append", [("m-data-3.avro", 0, 0, [(1, None, data2, 0, None, None)])])
+    new = t.parquet("delete-eq-4-long.parquet", [(1, "id", pa.int64(), [4, 5])])
+    t.commit("delete", [("m-delete-4.avro", 1, 0, [(1, None, new, 2, None, [1])])])
+    t.finish()
+
+
+def build_double_key():
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_double_key", [[(1, "fruit", "string"), (2, "weight", "double")]]
+    )
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+            (2, "weight", pa.float64(), [1.5, 2.5, 3.5]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    delete = t.parquet("delete-eq-2.parquet", [(2, "weight", pa.float64(), [2.5])])
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [2])])])
+    t.finish()
+
+
+# name -> (builder, rows a correct reader returns, sorted)
+FIXTURES = {
+    "iceberg_v2_eq_wide_delete_file": (
+        build_wide_delete_file,
+        [("apple", 1), ("cherry", 3), ("elderberry", 5)],
+    ),
+    "iceberg_v2_eq_manifest_rewrite": (
+        build_manifest_rewrite,
+        [("apple", 1), ("banana", 4), ("cherry", 3), ("date", 5)],
+    ),
+    "iceberg_v2_eq_null_key": (
+        build_null_key,
+        [("apple", 1), ("cherry", 3), (None, 4)],
+    ),
+    "iceberg_v2_eq_partitioned": (
+        build_partitioned,
+        [(1, "B", 30), (3, "A", 50), (3, "B", 60)],
+    ),
+    "iceberg_v2_eq_upsert_same_commit": (
+        build_upsert_same_commit,
+        [(1, "a"), (2, "y"), (3, "c"), (4, "d")],
+    ),
+    "iceberg_v2_eq_renamed_key": (build_renamed_key, [("apple", 1), ("cherry", 3)]),
+    "iceberg_v2_eq_promoted_key": (
+        build_promoted_key,
+        [(1, "a"), (2, "b2"), (3, "c"), (6, "f")],
+    ),
+    "iceberg_v2_eq_double_key": (build_double_key, [("apple", 1.5), ("cherry", 3.5)]),
+}
+
+
+def verify(name, expected):
+    """Check the fixture against DuckDB's Iceberg reader -- the oracle the GPU path is held to."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("LOAD iceberg")
+    rows = con.sql(f"SELECT * FROM iceberg_scan('{REL / name}')").fetchall()
+    key = lambda row: tuple((v is None, v) for v in row)  # noqa: E731
+    if sorted(rows, key=key) != sorted(expected, key=key):
+        print(f"  {name}: FAIL - got {sorted(rows, key=key)}", file=sys.stderr)
+        return False
+    print(f"  {name}: OK - {len(rows)} rows")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--verify", action="store_true", help="validate only, write nothing"
+    )
+    args = ap.parse_args()
+    if not args.verify:
+        for name, (build, _) in FIXTURES.items():
+            build()
+            print(f"wrote {name}")
+        print("validating:")
+    ok = True
+    for name, (_, expected) in FIXTURES.items():
+        ok &= verify(name, expected)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

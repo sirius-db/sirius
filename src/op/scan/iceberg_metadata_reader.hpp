@@ -56,7 +56,7 @@ struct IcebergDeleteFileEntry {
   std::string referenced_data_file;   // data file this DV applies to (V3, empty if absent)
   int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
-  int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
+  int64_t sequence_number{0};         // inherited data sequence number (equality deletes)
   int64_t file_size_in_bytes{-1};
   int64_t record_count{-1};  // deleted positions the manifest claims (V3, -1 if absent)
 
@@ -78,10 +78,11 @@ struct IcebergDeleteFileEntry {
 
 struct iceberg_delete_discovery {
   std::vector<std::string> positional_delete_files;
+  /// Live equality-delete entries of the snapshot. Non-empty selects eager loading.
   std::vector<IcebergDeleteFileEntry> equality_delete_entries;
   std::vector<IcebergDeleteFileEntry> deletion_vector_entries;
-  /// From the data manifests; equality deletes need them to test applicability.
-  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
+  /// Present whenever @ref equality_delete_entries is non-empty on an admitted scan.
+  std::optional<iceberg_equality_plan> equality_plan;
 };
 
 void validate_deletion_vector_claims(iceberg_delete_discovery const&);
@@ -108,27 +109,72 @@ inventory_result read_delete_inventory(duckdb::ClientContext&,
                                        std::optional<int64_t>,
                                        std::string_view injection           = {},
                                        std::string_view expected_table_uuid = {});
+
+/// Ceilings on the equality deletes a statement loads, shaped like the deletion-vector ceilings in
+/// puffin_reader.hpp: one per delete file, one per statement, charged from the manifests'
+/// `record_count` before any delete file is opened. A table above them is declined.
+///
+/// Sized to retain what the deletion-vector statement ceiling retains, about 2 GiB (256M
+/// positions x 8 B). A built group retains 24 B per INT64 key row, 32 B for two INT64 keys and
+/// about 31 B for a 10-character string key (measured, libcudf 26.10), so 64M rows is 1.5-2 GiB.
+/// Unlike decoded positions this memory is on the device and outside the scan's reservations.
+/// `record_count` bounds rows, not bytes; the byte ceiling on delete files covers long keys.
+inline constexpr int64_t kMaxEqualityDeleteRowsPerFile       = 32LL * 1024 * 1024;
+inline constexpr int64_t kMaxEqualityDeleteRowsPerStatement  = 64LL * 1024 * 1024;
+inline constexpr int64_t kMaxEqualityDeleteBytesPerStatement = 1024LL * 1024 * 1024;
+/// Not a memory bound: every batch is probed once per applicable delete group.
+inline constexpr std::size_t kMaxEqualityDeleteFilesPerDataFile = 64;
+
+/// Running total of the equality deletes a statement has agreed to load.
+struct equality_delete_charge {
+  int64_t rows  = 0;
+  int64_t bytes = 0;
+};
+/// Adds every delete file of @p plan to @p total. False when a file is above the per-file
+/// ceiling or the total would pass a statement ceiling; @p total is then unspecified.
+[[nodiscard]] bool charge_equality_deletes(
+  iceberg_equality_plan const& plan,
+  equality_delete_charge& total,
+  int64_t statement_row_limit = kMaxEqualityDeleteRowsPerStatement);
+
+/// A scan plan that contradicts the inventory, or that this reader cannot interpret.
+struct equality_plan_error : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+/**
+ * @brief Read which equality-delete files apply to which data file, from `iceberg_scan_plan`.
+ *
+ * Applicability is the extension's answer, checked against @p inventory: both must list the same
+ * live data files and equality deletes, and every (data file, delete) pair must have a strictly
+ * lower data sequence number on the data file. Any disagreement throws @ref equality_plan_error.
+ * `keys` is left empty; the plan gate resolves field IDs against the bound schema.
+ */
+iceberg_equality_plan read_equality_plan(duckdb::ClientContext&,
+                                         std::string const& table_path,
+                                         int64_t snapshot_id,
+                                         iceberg_delete_inventory const& inventory);
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);
 
-/// One group of equality-delete files sharing the same key column schema.
+/// Equality-delete files that share their key columns and apply to exactly the same data files.
 struct EqualityDeleteGroup {
-  /// GPU-resident deduplicated key table.
+  /// GPU-resident deduplicated keys: one column per key, in @ref key_field_ids order, in the
+  /// bound key types.
   std::unique_ptr<cudf::table> delete_table;
-  std::vector<std::string> key_names;
-  /// Populated when the delete file's footer carries them.
-  std::vector<std::optional<int32_t>> key_field_ids;
-  /// Build side = delete_table.
+  /// Iceberg field IDs of the keys, ascending. From the manifest's `equality_ids`.
+  std::vector<int32_t> key_field_ids;
+  /// Bound-schema (P-space) index of each key, parallel to @ref key_field_ids.
+  std::vector<std::size_t> key_primary_indices;
+  /// The delete files merged into this group; diagnostics only.
+  std::vector<std::string> delete_files;
+  /// Build side = delete_table. NULL keys compare equal.
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
-  /// Applies only to data files with a STRICTLY lower DATA sequence number.
-  ///
-  /// ⚠️ Holds the MANIFEST's number, which is not that. Per the inheritance rule an entry takes
-  /// its manifest's number only when its own is null AND its status is ADDED, so after a manifest
-  /// rewrite these are inflated and the strict-inequality test flips both ways. This is one of the
-  /// reasons load_delete_payload() refuses live equality entries.
-  int64_t sequence_number{0};
 };
+
+/// Ascending indices into @ref IcebergDeleteData::equality_delete_groups.
+using equality_group_list = std::vector<uint32_t>;
 
 /**
  * @brief Fully materialized Iceberg delete data for one table.
@@ -141,28 +187,30 @@ struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
-  /// One per unique (key-column schema, sequence number).
+  /// Built on the planning thread's device; the plan gate declines multi-GPU configurations.
   std::vector<EqualityDeleteGroup> equality_delete_groups;
 
-  /// Keyed as the manifest wrote the path. NOT the file's data sequence number -- see above.
-  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
+  /// Every data file of the snapshot (keyed as the manifest wrote the path) -> the groups that
+  /// apply to it. Files with the same applicability share one list object. Empty when the table
+  /// has no equality deletes; otherwise a scanned file missing from it must be refused.
+  std::unordered_map<std::string, std::shared_ptr<equality_group_list const>>
+    equality_groups_by_data_file;
 
   [[nodiscard]] bool empty() const
   {
-    return positional_deletes.empty() && equality_delete_groups.empty();
+    return positional_deletes.empty() && equality_delete_groups.empty() &&
+           equality_groups_by_data_file.empty();
   }
 };
 
 /**
- * @brief Concatenate the delete files' rows, deduplicate them, and stand up the GPU hash join the
- *        scan probes. All @p views must share @p key_names.
+ * @brief Concatenate the delete files' key rows, deduplicate them, and stand up the GPU hash join
+ *        the scan probes. Every view holds exactly the key columns, in @p key_field_ids order.
  *
- * Exported only so this and the anti-join mask can be tested directly: the SQL route that reaches
- * them is declined at plan time, so no fixture can, and an inverted mask would stay green until
- * the route is switched on.
+ * Exported so this and the anti-join mask can be tested without a table.
  */
-EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
-                                         std::vector<std::optional<int32_t>> key_field_ids,
+EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
+                                         std::vector<std::size_t> key_primary_indices,
                                          std::vector<cudf::table_view> const& views);
 
 /**
