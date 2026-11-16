@@ -103,7 +103,7 @@ class Aggregates:
     float_division_minmax: bool = gap_switch(
         False
     )  # c6aae63a: NaN from finite division
-    hugeint_sum: bool = True
+    hugeint_sum: bool = gap_switch(False)
 
 
 @dataclass

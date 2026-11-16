@@ -244,8 +244,10 @@ Gaps mode also selects `(4,0)` and widths of 19–38 digits to measure their
 native-scan declines.
 `types.hugeint` and `types.uhugeint` add 128-bit integer columns in gaps mode;
 native scan declines both. `features.aggregates.hugeint_sum` leaves
-`sum(BIGINT)` at DuckDB's natural HUGEINT result by default. Its isolated
-acceptance had 55 OK and no planner declines in 56 tagged queries.
+`sum(BIGINT)` at DuckDB's natural HUGEINT result in gaps mode. Its isolated
+acceptance had 55 OK and no planner declines in 56 tagged queries, but a
+combined default run had six planner declines in 100 tags (94% non-fallback),
+below the 95% admission gate. The declines involved 128-bit GPU VALUES carriers.
 `features.joins.mixed_integer_keys` tests INTEGER/BIGINT,
 SMALLINT/UINTEGER, and BIGINT/UBIGINT equality keys in gaps mode. The
 BIGINT/UBIGINT pair had 35/38 non-fallback, below the 95% gate.

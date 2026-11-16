@@ -258,6 +258,8 @@ class Phase2eTypes(unittest.TestCase):
         from siriusfuzz import sqltypes as st
         from siriusfuzz.query_gen import Scope, ScopeTable
 
+        self.assertFalse(load_config(None).features.aggregates.hugeint_sum)
+        self.assertTrue(load_config(None, mode="gaps").features.aggregates.hugeint_sum)
         cfg = load_config(None, [
             "features.joins.mixed_integer_keys=true",
             "features.aggregates.hugeint_sum=true",

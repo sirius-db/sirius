@@ -82,7 +82,7 @@ filter = true
 filter_subquery = false
 expression_args = false
 float_division_minmax = false
-hugeint_sum = true
+hugeint_sum = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",
