@@ -96,81 +96,115 @@ class Phase2eTypes(unittest.TestCase):
         from siriusfuzz.query_gen import Scope, ScopeTable
 
         for enabled in (False, True):
-            cfg = load_config(None, [
-                f'features.scalar_functions.variable_divisors={str(enabled).lower()}',
-                'features.scalar_functions.enabled=[int_div,mod]',
-            ])
+            cfg = load_config(
+                None,
+                [
+                    f"features.scalar_functions.variable_divisors={str(enabled).lower()}",
+                    "features.scalar_functions.enabled=[int_div,mod]",
+                ],
+            )
             dg = DataGenerator(cfg, random.Random(53))
             qg = QueryGenerator(cfg, dg.generate(53), random.Random(53), dg)
-            ref = ColumnRef('a', 'i', st.INTEGER)
-            scope = Scope([ScopeTable('a', [ref])])
+            ref = ColumnRef("a", "i", st.INTEGER)
+            scope = Scope([ScopeTable("a", [ref])])
             qg._gen_expr = lambda kind, scope, depth: ref
-            rights = [qg._gen_arith('int', scope, 0).right for _ in range(200)]
+            rights = [qg._gen_arith("int", scope, 0).right for _ in range(200)]
             if enabled:
                 self.assertTrue(any(not isinstance(right, Literal) for right in rights))
             else:
-                self.assertTrue(all(isinstance(right, Literal) and right.value != 0 for right in rights))
+                self.assertTrue(
+                    all(
+                        isinstance(right, Literal) and right.value != 0
+                        for right in rights
+                    )
+                )
 
     def test_decimal_case_has_no_implicit_scale_reduction(self):
         from siriusfuzz.sqlast import Case
 
-        cfg = load_config(None, ['data.rows=[20,30]'])
+        cfg = load_config(None, ["data.rows=[20,30]"])
         dg = DataGenerator(cfg, random.Random(54))
         qg = QueryGenerator(cfg, dg.generate(54), random.Random(54), dg)
         checked = 0
         for _ in range(1200):
             query = qg.generate()
             for node in walk(query):
-                if isinstance(node, (Case, SimpleCase)) and node.kind == 'decimal':
+                if isinstance(node, (Case, SimpleCase)) and node.kind == "decimal":
                     types = [exact_type(result) for _, result in node.whens]
                     if node.else_ is not None:
                         types.append(exact_type(node.else_))
-                    self.assertTrue(types and all(t == types[0] for t in types), query.sql())
+                    self.assertTrue(
+                        types and all(t == types[0] for t in types), query.sql()
+                    )
                     checked += 1
         self.assertGreater(checked, 0)
 
     def test_regex_backreference_guard(self):
         for enabled in (False, True):
-            cfg = load_config(None, [
-                f'features.scalar_functions.regexp_backreferences={str(enabled).lower()}',
-                'features.scalar_functions.enabled=[regexp_replace]',
-                'data.rows=[20,30]',
-            ])
+            cfg = load_config(
+                None,
+                [
+                    f"features.scalar_functions.regexp_backreferences={str(enabled).lower()}",
+                    "features.scalar_functions.enabled=[regexp_replace]",
+                    "data.rows=[20,30]",
+                ],
+            )
             dg = DataGenerator(cfg, random.Random(51))
             qg = QueryGenerator(cfg, dg.generate(51), random.Random(51), dg)
             replacements = []
             for _ in range(600):
                 for node in walk(qg.generate()):
-                    if isinstance(node, Func) and node.name == 'regexp_replace':
+                    if isinstance(node, Func) and node.name == "regexp_replace":
                         replacements.append(node.args[2].value)
             self.assertTrue(replacements)
-            self.assertEqual('\\0\\0' in replacements, enabled)
+            self.assertEqual("\\0\\0" in replacements, enabled)
 
     def test_decimal_coalesce_has_no_implicit_scale_reduction(self):
         from siriusfuzz import sqltypes as st
 
-        cfg = load_config(None, [
-            "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
-        ])
+        cfg = load_config(
+            None,
+            [
+                "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(44))
         qg = QueryGenerator(cfg, dg.generate(44), random.Random(44), dg)
         checked = 0
         for _ in range(1200):
             query = qg.generate()
             for node in walk(query):
-                if isinstance(node, Func) and node.name == "coalesce" and node.kind == "decimal":
+                if (
+                    isinstance(node, Func)
+                    and node.name == "coalesce"
+                    and node.kind == "decimal"
+                ):
                     types = [exact_type(arg) for arg in node.args]
-                    self.assertTrue(types and all(t == types[0] for t in types), query.sql())
+                    self.assertTrue(
+                        types and all(t == types[0] for t in types), query.sql()
+                    )
                     checked += 1
         self.assertGreater(checked, 0)
         decimal_type = st.decimal_type(12, 2)
-        self.assertEqual(exact_type(Func("coalesce", [Literal(1, decimal_type), Literal(2, decimal_type)], kind="decimal")), decimal_type)
+        self.assertEqual(
+            exact_type(
+                Func(
+                    "coalesce",
+                    [Literal(1, decimal_type), Literal(2, decimal_type)],
+                    kind="decimal",
+                )
+            ),
+            decimal_type,
+        )
 
     def test_decimal_scale_reduction_stays_in_gaps_mode(self):
-        cfg = load_config(None, [
-            "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
-            "data.rows=[20,30]",
-        ])
+        cfg = load_config(
+            None,
+            [
+                "types.decimal_widths=[DECIMAL(12,2),DECIMAL(18,4),DECIMAL(9,9),DECIMAL(18,18)]",
+                "data.rows=[20,30]",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(30))
         qg = QueryGenerator(cfg, dg.generate(30), random.Random(30), dg)
         for _ in range(1000):
@@ -181,21 +215,36 @@ class Phase2eTypes(unittest.TestCase):
                     if source is not None and source.kind == "decimal":
                         self.assertLessEqual(source.scale, node.type.scale, query.sql())
 
+    @unittest.skipUnless(SHELL, "no DuckDB shell available")
     def test_decimal_widths_and_exact_mixed_result_types(self):
         from siriusfuzz import sqltypes as st
 
-        cfg = load_config(None, [
-            "types.decimal_widths=[DECIMAL(9,2),DECIMAL(9,9),DECIMAL(18,0),DECIMAL(18,18)]",
-            "data.rows=[20,30]",
-        ])
+        cfg = load_config(
+            None,
+            [
+                "types.decimal_widths=[DECIMAL(9,2),DECIMAL(9,9),DECIMAL(18,0),DECIMAL(18,18)]",
+                "data.rows=[20,30]",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(31))
         ds = dg.generate(31)
-        widths = {c.type.name for table in ds.tables for c in table.columns if c.type.kind == "decimal"}
+        widths = {
+            c.type.name
+            for table in ds.tables
+            for c in table.columns
+            if c.type.kind == "decimal"
+        }
         self.assertTrue(widths <= set(cfg.types.decimal_widths))
         self.assertTrue(widths)
         a, b = st.decimal_type(9, 2), st.decimal_type(18, 4)
-        self.assertEqual(exact_type(Arith("+", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(19, 4))
-        self.assertEqual(exact_type(Arith("*", Literal(1, a), Literal(2, b), "decimal")), st.decimal_type(18, 6))
+        self.assertEqual(
+            exact_type(Arith("+", Literal(1, a), Literal(2, b), "decimal")),
+            st.decimal_type(19, 4),
+        )
+        self.assertEqual(
+            exact_type(Arith("*", Literal(1, a), Literal(2, b), "decimal")),
+            st.decimal_type(18, 6),
+        )
         with tempfile.TemporaryDirectory() as tmp:
             session = cpu_session(tmp)
             try:
@@ -206,13 +255,15 @@ class Phase2eTypes(unittest.TestCase):
                             self.assertEqual(
                                 session.run(
                                     f'SELECT "{column.name}" FROM "{table.name}"',
-                                    gpu=False, timeout=120,
+                                    gpu=False,
+                                    timeout=120,
                                 ).status,
                                 "ok",
                             )
             finally:
                 session.close()
 
+    @unittest.skipUnless(SHELL, "no DuckDB shell available")
     def test_array_projection_only(self):
         cfg = load_config(None, ["types.array=true", "data.rows=[20,30]"])
         dg = DataGenerator(cfg, random.Random(33))
@@ -223,7 +274,9 @@ class Phase2eTypes(unittest.TestCase):
                 ds = candidate
                 break
         self.assertIsNotNone(ds)
-        self.assertTrue(any(c.type.kind == "array" for t in ds.tables for c in t.columns))
+        self.assertTrue(
+            any(c.type.kind == "array" for t in ds.tables for c in t.columns)
+        )
         qg = QueryGenerator(cfg, ds, random.Random(33), dg)
         projected = []
         for _ in range(1000):
@@ -247,7 +300,8 @@ class Phase2eTypes(unittest.TestCase):
                             self.assertEqual(
                                 session.run(
                                     f'SELECT "{column.name}" FROM "{table.name}"',
-                                    gpu=False, timeout=120,
+                                    gpu=False,
+                                    timeout=120,
                                 ).status,
                                 "ok",
                             )
@@ -260,18 +314,42 @@ class Phase2eTypes(unittest.TestCase):
 
         self.assertFalse(load_config(None).features.aggregates.hugeint_sum)
         self.assertTrue(load_config(None, mode="gaps").features.aggregates.hugeint_sum)
-        cfg = load_config(None, [
-            "features.joins.mixed_integer_keys=true",
-            "features.aggregates.hugeint_sum=true",
-        ])
+        cfg = load_config(
+            None,
+            [
+                "features.joins.mixed_integer_keys=true",
+                "features.aggregates.hugeint_sum=true",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(37))
         qg = QueryGenerator(cfg, dg.generate(37), random.Random(37), dg)
-        left = Scope([ScopeTable("a", [ColumnRef("a", "i", st.INTEGER), ColumnRef("a", "s", st.SMALLINT), ColumnRef("a", "b", st.BIGINT)])])
-        right = ScopeTable("b", [ColumnRef("b", "b", st.BIGINT), ColumnRef("b", "u", st.UINTEGER), ColumnRef("b", "ub", st.UBIGINT)])
+        left = Scope(
+            [
+                ScopeTable(
+                    "a",
+                    [
+                        ColumnRef("a", "i", st.INTEGER),
+                        ColumnRef("a", "s", st.SMALLINT),
+                        ColumnRef("a", "b", st.BIGINT),
+                    ],
+                )
+            ]
+        )
+        right = ScopeTable(
+            "b",
+            [
+                ColumnRef("b", "b", st.BIGINT),
+                ColumnRef("b", "u", st.UINTEGER),
+                ColumnRef("b", "ub", st.UBIGINT),
+            ],
+        )
         for _ in range(200):
             qg._gen_join_cond(left, right, "inner")
         self.assertGreater(qg.stats["join:mixed_integer_keys"], 0)
-        self.assertEqual(exact_type(Agg("sum", ColumnRef("a", "b", st.BIGINT), kind="int")), st.HUGEINT)
+        self.assertEqual(
+            exact_type(Agg("sum", ColumnRef("a", "b", st.BIGINT), kind="int")),
+            st.HUGEINT,
+        )
 
     def test_wide_integer_values_cross_64_bit_range(self):
         from siriusfuzz import sqltypes as st
@@ -284,26 +362,42 @@ class Phase2eTypes(unittest.TestCase):
         self.assertTrue(any(v > (1 << 64) - 1 for v in unsigned))
 
     def test_string_limit_and_null_density_extremes(self):
-        cfg = load_config(None, [
-            "data.strings.charset=utf8", "data.strings.max_len=4095",
-            "data.null_density_extremes=true", "data.rows=[20,30]",
-        ])
+        cfg = load_config(
+            None,
+            [
+                "data.strings.charset=utf8",
+                "data.strings.max_len=4095",
+                "data.null_density_extremes=true",
+                "data.rows=[20,30]",
+            ],
+        )
         dg = DataGenerator(cfg, random.Random(41))
         lengths = [len(dg._random_string().encode("utf8")) for _ in range(2000)]
         self.assertTrue(any(n >= 4094 for n in lengths))
         self.assertTrue(any(n > 40 for n in lengths))
-        columns = [c for seed in range(20) for t in dg.generate(seed).tables for c in t.columns[1:]]
+        columns = [
+            c
+            for seed in range(20)
+            for t in dg.generate(seed).tables
+            for c in t.columns[1:]
+        ]
         self.assertTrue(any(c.all_null for c in columns))
         self.assertTrue(any(c.no_null for c in columns))
         from siriusfuzz import sqltypes as st
         from siriusfuzz.schema_gen import Column, Dataset, Table
 
-        table = Table("t", [Column("k", st.INTEGER), Column("s", st.VARCHAR)], [(0, "é" + "x" * 100)])
+        table = Table(
+            "t",
+            [Column("k", st.INTEGER), Column("s", st.VARCHAR)],
+            [(0, "é" + "x" * 100)],
+        )
         qg = QueryGenerator(cfg, Dataset([table], 41), random.Random(41))
-        qg._tag_types(Select(
-            items=[SelectItem(ColumnRef("a", "s", st.VARCHAR), "c0")],
-            from_=TableRef("t", "a"),
-        ))
+        qg._tag_types(
+            Select(
+                items=[SelectItem(ColumnRef("a", "s", st.VARCHAR), "c0")],
+                from_=TableRef("t", "a"),
+            )
+        )
         self.assertGreater(qg.stats["type:varchar_utf8"], 0)
         self.assertGreater(qg.stats["type:varchar_long_below_limit"], 0)
 
@@ -790,7 +884,7 @@ class GeneratorValidity(unittest.TestCase):
         ]
         # Gaps mode spreads 600 queries over ten DECIMAL widths; the
         # focused Phase 2e acceptance runs measure each admitted width.
-        missing = [f for f in missing if not f.startswith('type:decimal_')]
+        missing = [f for f in missing if not f.startswith("type:decimal_")]
         self.assertEqual(missing, [], f"never emitted: {missing}")
 
     def test_every_claimed_feature_is_emitted(self):
@@ -801,7 +895,7 @@ class GeneratorValidity(unittest.TestCase):
             stats.update(s)
         missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
         # No-NULL columns are rare; the focused acceptance run measures them.
-        missing = [f for f in missing if f != 'data:no_null_column']
+        missing = [f for f in missing if f != "data:no_null_column"]
         self.assertEqual(missing, [], f"never emitted: {missing}")
         for feature in (
             "join:null_safe",
