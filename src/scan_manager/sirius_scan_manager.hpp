@@ -1177,6 +1177,7 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   metadata_placement _metadata_placement;
+  std::atomic<size_t> _next_metadata_domain{0};
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();

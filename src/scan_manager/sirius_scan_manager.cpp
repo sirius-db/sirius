@@ -2183,6 +2183,7 @@ std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_c
     }
   }
   if (domains.empty()) domains.push_back(0);  // Explicit fallback placement from initialization.
+  rotate_metadata_domains(domains, _next_metadata_domain);
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,

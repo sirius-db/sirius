@@ -687,7 +687,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per asynchronous-coalescing or reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -1349,7 +1349,9 @@ raises that default if necessary to provide at least one worker per domain. An e
 supplied value is never raised: initialization rejects it when it cannot cover all eligible
 domains. Each worker binds once, before accepting work; there is no per-operation affinity
 guard or extra coalescing pool. CPU sets intersect GPU topology, the cgroup v2 effective
-CPU allowance, and an explicit `scan_manager.cpu_affinity` when supplied. A caller's
+CPU allowance, and an explicit `scan_manager.cpu_affinity` when supplied. Discovery resolves
+the cgroup2 mount from `/proc/self/mountinfo` and walks from membership toward that
+mount root to find the nearest effective cpuset when a leaf has no cpuset controller files. A caller's
 incidental DuckDB thread affinity does not define this allowance. To restrict scan workers,
 use the explicit affinity configuration or a deployment cpuset; `taskset` on the caller alone
 is not a worker placement policy. Without readable cgroup v2 allowance the caller's affinity
@@ -1358,7 +1360,9 @@ and reports that fallback rather than claiming locality. An empty CPU intersecti
 initialization.
 
 Each preparation source selects a stable worker domain from the query's eligible GPU
-domains. Its metadata jobs and Parquet coalescer operations share that domain. Workers do
+domains. A manager-wide cursor rotates the starting domain across queries, including
+independent single-source scans; each query rotates within its own eligible GPU-domain set.
+Its metadata jobs and Parquet coalescer operations share the source's stable domain. Workers do
 not steal domain-routed jobs from other domains. Final GPU batch placement is unchanged;
 CPU placement does not imply page migration or pin all batches to one GPU.
 

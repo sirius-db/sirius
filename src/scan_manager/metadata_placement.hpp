@@ -22,10 +22,16 @@
 #include "scan_manager/config.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <filesystem>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -36,11 +42,16 @@ struct metadata_placement {
   std::vector<std::vector<int>> cpus;
 };
 
-inline std::vector<int> read_cpu_list(std::string const& path)
+inline std::optional<std::vector<int>> read_cpu_list(std::string const& path)
 {
+  errno = 0;
   std::ifstream file(path);
+  if (!file) {
+    if (errno == ENOENT) return std::nullopt;
+    throw std::system_error(errno, std::generic_category(), "reading " + path);
+  }
   std::string list;
-  if (!(file >> list)) return {};
+  if (!(file >> list)) return std::vector<int>{};
   std::vector<int> result;
   std::istringstream parts(list);
   std::string part;
@@ -56,26 +67,98 @@ inline std::vector<int> read_cpu_list(std::string const& path)
   return result;
 }
 
-// Read the deployment's cgroup allowance, not the DuckDB caller's potentially
-// single-CPU affinity. Explicit scan-manager cpu_affinity_list further restricts it.
-// On systems without readable cgroup v2 cpusets, preserve the inherited allowance.
+// mountinfo escapes whitespace and backslashes as three octal digits.
+inline std::string unescape_mount_path(std::string const& value)
+{
+  std::string result;
+  for (size_t i = 0; i < value.size(); ++i) {
+    if (value[i] == '\\' && i + 3 < value.size() &&
+        value.find_first_not_of("01234567", i + 1) >= i + 4) {
+      result += static_cast<char>(std::stoi(value.substr(i + 1, 3), nullptr, 8));
+      i += 3;
+    } else {
+      result += value[i];
+    }
+  }
+  return result;
+}
+
+// Resolve membership against the visible cgroup2 mount root, including bind mounts
+// and namespace roots. Missing leaf controller files inherit the nearest ancestor's
+// effective cpuset. An unreadable/malformed file must not authorize a broader ancestor.
+inline std::vector<int> metadata_cgroup_cpus(
+  std::istream& membership,
+  std::istream& mounts,
+  std::function<std::optional<std::vector<int>>(std::string const&)> const& read = read_cpu_list)
+{
+  namespace fs = std::filesystem;
+  auto valid   = [](fs::path const& path) {
+    return path.is_absolute() && std::none_of(path.begin(), path.end(), [](auto const& part) {
+             return part == ".." || part == ".";
+           });
+  };
+  fs::path group;
+  std::string line;
+  while (std::getline(membership, line)) {
+    if (line.starts_with("0::/")) {
+      group = line.substr(3);
+      break;
+    }
+  }
+  if (!valid(group)) return {};
+  fs::path mount, relative;
+  size_t specificity = 0;
+  while (std::getline(mounts, line)) {
+    auto separator = line.find(" - ");
+    if (separator == std::string::npos) continue;
+    std::istringstream suffix(line.substr(separator + 3));
+    std::string type;
+    if (!(suffix >> type) || type != "cgroup2") continue;
+    std::istringstream fields(line.substr(0, separator));
+    std::string id, parent, device, root_text, mount_text;
+    if (!(fields >> id >> parent >> device >> root_text >> mount_text)) continue;
+    fs::path root = unescape_mount_path(root_text), point = unescape_mount_path(mount_text);
+    if (!valid(root) || !valid(point)) continue;
+    auto within = group.lexically_relative(root);
+    if (within.empty() || *within.begin() == "..") continue;
+    if (root.native().size() >= specificity) {
+      specificity = root.native().size();
+      mount       = std::move(point);
+      relative    = std::move(within);
+    }
+  }
+  if (mount.empty()) return {};  // No proven mapping: use inherited thread affinity.
+  auto current = (mount / relative).lexically_normal();
+  for (;;) {
+    if (auto cpus = read((current / "cpuset.cpus.effective").string())) return *cpus;
+    if (current == mount) return {};
+    current = current.parent_path();
+  }
+}
+
+// Read the deployment allowance, not an incidental single-CPU DuckDB caller mask.
+// If it cannot be established, keep the inherited allowance rather than guessing root.
 inline std::vector<int> metadata_allowed_cpus()
 {
-  std::ifstream cgroups("/proc/self/cgroup");
-  std::string line;
-  while (std::getline(cgroups, line)) {
-    if (!line.starts_with("0::/")) continue;
-    auto path = line.substr(3);
-    if (path.find("..") != std::string::npos) break;
-    auto cpus = read_cpu_list("/sys/fs/cgroup" + path + "/cpuset.cpus.effective");
+  try {
+    std::ifstream cgroups("/proc/self/cgroup"), mounts("/proc/self/mountinfo");
+    auto cpus = metadata_cgroup_cpus(cgroups, mounts);
     if (!cpus.empty()) return cpus;
-    // A cgroup namespace may expose this process's cgroup at the mount root.
-    cpus = read_cpu_list("/sys/fs/cgroup/cpuset.cpus.effective");
-    if (!cpus.empty()) return cpus;
+  } catch (std::exception const& error) {
+    SIRIUS_LOG_WARN("scan metadata placement: {}", error.what());
   }
   SIRIUS_LOG_WARN(
     "scan metadata placement: cgroup CPU allowance unavailable; using caller affinity");
   return exec::thread_util::get_current_thread_affinity();
+}
+
+// A manager-wide cursor spreads independent attempts across their eligible domains.
+// Rotating only the starting point preserves each source's stable locality and GPU subset.
+inline void rotate_metadata_domains(std::vector<int>& domains, std::atomic<size_t>& next)
+{
+  if (domains.size() < 2) return;
+  auto start = next.fetch_add(1, std::memory_order_relaxed) % domains.size();
+  std::rotate(domains.begin(), domains.begin() + start, domains.end());
 }
 
 inline metadata_placement make_metadata_placement(memory::topology_index const& topology,

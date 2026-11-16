@@ -18,6 +18,7 @@
 #include "duckdb/common/exception.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "scan_manager/metadata_placement.hpp"
 #include "scan_manager/native_reader_executor.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/preparation_fixture.hpp"
@@ -3350,8 +3351,10 @@ TEST_CASE("async partial emission and final flush execute on metadata workers",
   auto a     = std::make_shared<worker_accumulator>(100);
   auto out   = std::make_shared<sink>();
   std::thread::id partial_thread, flush_thread;
-  a->before_partial = [&] { partial_thread = std::this_thread::get_id(); };
-  a->before_flush   = [&] { flush_thread = std::this_thread::get_id(); };
+  a->before_partial = [&] {
+    if (partial_thread == std::thread::id{}) partial_thread = std::this_thread::get_id();
+  };
+  a->before_flush = [&] { flush_thread = std::this_thread::get_id(); };
   std::atomic<bool> exhausted{!partial};
   f.source(a, out, [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
     if (!std::exchange(claimed, true))
@@ -3361,6 +3364,15 @@ TEST_CASE("async partial emission and final flush execute on metadata workers",
   });
   f.start();
   REQUIRE(out->await(1));
+  if (partial) {
+    // Check the standalone deadline emission before exhaustion can invoke flush,
+    // which itself calls partial_emit even when there is no retained data.
+    auto stats = f.coordinator.snapshot();
+    CHECK(partial_thread != std::thread::id{});
+    CHECK(partial_thread != stats.owner);
+    CHECK(partial_thread != stats.runner);
+    CHECK(flush_thread == std::thread::id{});
+  }
   out->consume();
   exhausted = true;
   f.coordinator.wake_for_testing();
@@ -3554,4 +3566,73 @@ TEST_CASE("completed async sources progress beside a repeatedly ready first sour
   f.finish();
   CHECK(advances == 32);
   CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("independent single-source queries can coalesce on different eligible domains",
+          "[coordinator][async_coalescing][domain_rotation][review_regression]")
+{
+  using namespace sirius::exec;
+  auto allowed = thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  int second = allowed.size() > 1 ? allowed[1] : allowed[0];
+  // Logical domains remain distinct even on a one-CPU test host.
+  std::vector<std::vector<int>> masks{{allowed.front()}, {second}};
+  static_thread_pool workers(2, "query_domains", {}, nullptr, masks);
+  std::atomic<size_t> next{0};
+  struct attempt {
+    scoped_dispatcher dispatcher;
+    sirius::pipeline::completion_handler completion;
+    std::unique_ptr<preparation_coordinator> coordinator;
+    std::shared_ptr<hold> held = std::make_shared<hold>();
+    std::atomic<unsigned> wrong{0}, metadata{0};
+    explicit attempt(static_thread_pool& pool) : dispatcher(pool) {}
+  };
+  std::vector<std::unique_ptr<attempt>> attempts;
+  for (int query = 0; query < 2; ++query) {
+    auto owned = std::make_unique<attempt>(workers);
+    auto& a    = *owned;
+    std::vector<int> domains{0, 1};
+    rotate_metadata_domains(domains, next);
+    auto expected = masks[domains.front()];
+    a.coordinator = std::make_unique<preparation_coordinator>(
+      a.completion, a.dispatcher, preparation_config{}.resolve(2), nullptr, nullptr, domains);
+    auto coalescer            = std::make_shared<worker_accumulator>(1);
+    coalescer->before_advance = [&a, expected] {
+      if (thread_util::get_current_thread_affinity() != expected) ++a.wrong;
+      a.held->wait();
+    };
+    auto source =
+      make_source(preparation_coordinator::execution_domain::metadata_worker, coalescer);
+    source.try_claim   = single_job([&a, expected] {
+      if (thread_util::get_current_thread_affinity() != expected) ++a.wrong;
+      ++a.metadata;
+      return std::make_unique<tagged>(1);
+    });
+    source.destination = std::make_shared<split_connector>();
+    source.close       = [] {};
+    a.coordinator->add_source(std::move(source));
+    attempts.push_back(std::move(owned));
+  }
+  auto cleanup = std::shared_ptr<void>(nullptr, [&](void*) {
+    for (auto& a : attempts)
+      a->coordinator->request_stop(stop_reason::normal_eos);
+    for (auto& a : attempts)
+      a->held->release();
+    for (auto& a : attempts)
+      a->coordinator->drain();
+  });
+  for (auto& a : attempts) {
+    a->coordinator->arm();
+    a->coordinator->start();
+  }
+  // Holding the first domain's worker must not prevent the other independent
+  // query from entering coalescing on its own domain's otherwise-idle worker.
+  REQUIRE(attempts[0]->held->await());
+  REQUIRE(attempts[1]->held->await());
+  cleanup.reset();
+  for (auto& a : attempts) {
+    CHECK(a->metadata == 1);
+    CHECK(a->wrong == 0);
+    CHECK_FALSE(a->completion.has_error());
+  }
 }
