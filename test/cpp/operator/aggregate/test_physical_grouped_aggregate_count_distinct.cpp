@@ -653,8 +653,8 @@ TEST_CASE("count distinct: multi-column struct expression",
     true /*sort*/));
 }
 
-TEST_CASE("count distinct: large low-cardinality input uses group key labels",
-          "[aggregate][group_key_labels][physical_grouped_aggregate_count_distinct]")
+TEST_CASE("count distinct: large low-cardinality multi-column key",
+          "[aggregate][physical_grouped_aggregate_count_distinct]")
 {
   using KeyTraits = gpu_type_traits<int32_t>;
   using ValTraits = gpu_type_traits<int32_t>;

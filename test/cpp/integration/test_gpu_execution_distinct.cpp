@@ -708,11 +708,11 @@ TEST_CASE_METHOD(DistinctBulkFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution FIRST beside a COUNT(DISTINCT) over a label-encoded key",
+                 "gpu_execution FIRST beside a COUNT(DISTINCT) over a large VARCHAR-keyed batch",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // COLLECT_SET, a VARCHAR key and at least 2^20 rows in one batch make the local groupby
-  // label-encode its keys, so the row selector runs over the encoded groupby.
+  // COLLECT_SET, a VARCHAR key and at least 2^20 rows in one batch: the row selector rides the
+  // same groupby as the COLLECT_SET request.
   run_ok(
     "CREATE TABLE dist_big AS "
     "SELECT (i % 10)::VARCHAR AS ks, i AS payload FROM range(2000000) t(i);");
@@ -727,6 +727,23 @@ TEST_CASE_METHOD(DistinctFixture,
     "SELECT ks, first(payload) AS a, min(payload) AS m, "
     "count(DISTINCT payload % 7) AS c FROM dist_big GROUP BY ks",
     {0, 2, 3});
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution COUNT(DISTINCT) over dictionary-encoded nullable string keys",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Long, low-cardinality VARCHAR keys are dictionary-encoded before the groupby and decoded
+  // afterwards; NULLs in the keys and the counted value exercise both sides. Each k1 group has its
+  // own distinct count, so a count attached to the wrong decoded key shows up.
+  run_ok(
+    "CREATE TABLE dist_dict AS SELECT "
+    "CASE WHEN i % 11 = 0 THEN NULL ELSE 'category_' || (i % 7)::VARCHAR || '_long_suffix' END "
+    "AS k1, i % 3 AS k2, CASE WHEN i % 13 = 0 THEN NULL ELSE i % (4 + 3 * (i % 7)) END AS v "
+    "FROM range(200000) t(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT k1, k2, count(DISTINCT v) FROM dist_dict GROUP BY k1, k2");
+  compare_gpu_vs_cpu("SELECT k1, count(DISTINCT v), count(*) FROM dist_dict GROUP BY k1");
 }
 
 //===----------------------------------------------------------------------===//
