@@ -72,10 +72,16 @@ TEST_CASE("prefetch lease acquisition reports fatal errors and preserves ordinar
   sirius::exec::query_lifecycle_registry lifecycle;
   lifecycle.open_query(sirius::make_query_id(1));
   lifecycle.open_query(sirius::make_query_id(2));
+  // A sweep leases a stream only for a batch it converts, so queue one.
   auto connector = std::make_shared<split_connector>();
+  one_batch_provider provider(fixture.make_host_build_batch());
+  std::stop_source stop;
+  sirius::scan_manager::load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, *connector, stop.get_token(), false);
   memory_prefetcher_config config;
-  config.num_threads      = 1;
-  config.poll_interval_ms = 1;
+  config.num_threads       = 1;
+  config.poll_interval_ms  = 1;
+  config.min_free_fraction = 0;
   scoped_cuda_status_fault fault(scoped_cuda_status_fault::acquire_stream, status);
   memory_prefetcher worker(config, {connector}, fixture.gpu_space, lifecycle);
   bool observed = await_condition([&] { return fault.consumed(); });
