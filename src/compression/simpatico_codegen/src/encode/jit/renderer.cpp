@@ -1154,11 +1154,13 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       // negation share their trailing zeros. For 5, one sample per thread screens the
       // chunk, and only a chunk whose samples are all multiples of 5 verifies every element.
       << "        unsigned long long _or_" << idstr << " = 0ULL;\n"
-      << "        bool _s5_" << idstr << " = true;\n"
-      << "        __shared__ int " << sh_div << "_tz, " << sh_div << "_ok5, " << sh_div << "_e5;\n"
+      << "        bool _s5_" << idstr
+      << " = true;\n"
+      // Per-warp slots, read after the reduces' barrier: no reset races the warps' writes.
+      << "        __shared__ int " << sh_div << "_tzw[4], " << sh_div << "_ok5w[4], " << sh_div
+      << "_e5;\n"
       << "        __shared__ unsigned int " << sh_div << "_f;\n"
-      << "        if (tid == 0) { " << sh_div << "_tz = 127; " << sh_div << "_ok5 = 1; " << sh_div
-      << "_e5 = 127; " << sh_div << "_f = 15u; }\n"
+      << "        if (tid == 0) { " << sh_div << "_e5 = 127; " << sh_div << "_f = 15u; }\n"
       << "        if (tid < " << bp_len << ") {\n"
       << magnitude("            ", "tid") << "            _s5_" << idstr << " = " << fits5
       << "static_cast<" << u5 << ">(_mu) * " << inv5 << " <= " << lim5 << ";\n"
@@ -1173,8 +1175,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "            const int _tz = __reduce_min_sync(0xFFFFFFFFu, _or_" << idstr
       << " != 0ULL ? __ffsll(static_cast<long long>(_or_" << idstr << ")) - 1 : 127);\n"
       << "            const bool _a5 = __all_sync(0xFFFFFFFFu, _s5_" << idstr << ");\n"
-      << "            if ((tid & 31) == 0) { atomicMin(&" << sh_div << "_tz, _tz); if (!_a5) "
-      << sh_div << "_ok5 = 0; }\n"
+      << "            if ((tid & 31) == 0) { " << sh_div << "_tzw[tid >> 5] = _tz; " << sh_div
+      << "_ok5w[tid >> 5] = _a5 ? 1 : 0; }\n"
       << "        }\n"
       << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
       << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
@@ -1190,11 +1192,14 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "_b;\n"
       // The reduces above are the barrier, so every thread derives the same divisor. A
       // chunk of zeros keeps the sentinel and divisor 1.
+      << "        const int _btz = min(min(" << sh_div << "_tzw[0], " << sh_div << "_tzw[1]), min("
+      << sh_div << "_tzw[2], " << sh_div << "_tzw[3]));\n"
+      << "        const bool _bok5 = (" << sh_div << "_ok5w[0] & " << sh_div << "_ok5w[1] & "
+      << sh_div << "_ok5w[2] & " << sh_div << "_ok5w[3]) != 0;\n"
       << "        " << in.elem_type << " " << v_div << " = " << in.elem_type << "{1};\n"
-      << "        if (" << sh_div << "_tz != 127) {\n"
+      << "        if (_btz != 127) {\n"
       << "            int _e5 = 0;\n"
-      << "            if (" << sh_div
-      << "_ok5 != 0) {\n"
+      << "            if (_bok5) {\n"
       // Bit k of _f: 5^(k+1) divides every magnitude. Each multiply by 5^-1 is the exact
       // quotient while the powers below it divide, so the chain tests the next power.
       << "                unsigned int _f = 15u;\n"
@@ -1237,8 +1242,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << ";\n"
       << "            unsigned long long _d = 1ULL;\n"
       << "            for (int k = 0; k < _e5 && _d <= _lim / 5ULL; ++k) _d *= 5ULL;\n"
-      << "            for (int k = 0; k < " << sh_div
-      << "_tz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
+      << "            for (int k = 0; k < _btz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
       << "            " << v_div << " = static_cast<" << in.elem_type << ">(_d);\n"
       << "        }\n"
       << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
