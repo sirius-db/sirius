@@ -406,13 +406,17 @@ struct rewriter {
       }
 
       case T::MERGE_SORT: {
-        // MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY → input: rows range-exchanged
-        // after the sample, on boundaries every rank's sample agrees on.
+        // MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY [→ PASSTHROUGH_SINK] → input: rows
+        // range-exchanged after the sample, on boundaries every rank's sample agrees on.
         auto& partition = expect(*node.children[0], T::SORT_PARTITION);
         auto& sample =
           expect(*partition.children[0], T::SORT_SAMPLE).Cast<op::sirius_physical_sort_sample>();
         auto& order = expect(*sample.children[0], T::ORDER_BY);
-        if (visit(order.children[0]) == placement::rank0) { return done(placement::rank0); }
+        // An ORDER_BY that sorts several input batches as one run reads them from a
+        // PASSTHROUGH_SINK, which only ends its input's pipeline: the rows stay where they are.
+        auto* input = &order.children[0];
+        if ((*input)->type == T::PASSTHROUGH_SINK) { input = &(*input)->children[0]; }
+        if (visit(*input) == placement::rank0) { return done(placement::rank0); }
         exchange_spec spec;
         spec.routing = exchange_spec::mode::range;
         for (auto const& o : sample.orders) {
