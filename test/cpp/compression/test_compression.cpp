@@ -2166,7 +2166,7 @@ TEST_CASE("pin_table compression - automatic plans preserve narrowed carriers",
   // The INT16 carrier serves correctly end to end.
   auto res = con.Query(
     "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
-             "FROM read_parquet('" +
+    "FROM read_parquet('" +
     glob + "') GROUP BY k)\");");
   require_ok(res, "select no-plan");
   REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
@@ -2221,7 +2221,7 @@ TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails 
   auto const before = sirius::test::get_compressed_materialization_stats(con);
   auto res          = con.Query(
     "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
-    "FROM read_parquet('" +
+             "FROM read_parquet('" +
     glob + "') GROUP BY k)\");");
   require_ok(res, "select widthop");
   REQUIRE(res->Collection().GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));

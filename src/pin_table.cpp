@@ -74,7 +74,9 @@ thread_local scoped_pin_staging_failure* active_staging_failure = nullptr;
 
 scoped_pin_staging_failure::scoped_pin_staging_failure(std::size_t fail_at)
   : previous_(active_staging_failure), fail_at_(fail_at)
-{ active_staging_failure = this; }
+{
+  active_staging_failure = this;
+}
 
 scoped_pin_staging_failure::~scoped_pin_staging_failure() { active_staging_failure = previous_; }
 
