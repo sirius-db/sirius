@@ -40,8 +40,7 @@
 #include <duckdb/common/enums/expression_type.hpp>
 
 // cudf
-#include "cudf/ast_compat.hpp"
-
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>

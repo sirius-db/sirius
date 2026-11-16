@@ -23,8 +23,7 @@
 #include <expression_evaluator/like_multiliteral.hpp>
 
 // cudf
-#include "cudf/ast_compat.hpp"
-
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>

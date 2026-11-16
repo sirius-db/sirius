@@ -14,14 +14,12 @@
  * limitations under the License.
  */
 
-// Regression test for parquet bloom filter probes in libcudf 26.08
-// (rapidsai/cudf#24319). DuckDB writes bloom filters by default, and cuDF's
-// reader probes them with the equality conjuncts of the pushed-down filter.
-// The probe hashes the literal as the cuDF type instead of the parquet physical
-// type, so equality on TINYINT and SMALLINT dropped row groups that hold the
-// value, and equality on DECIMAL threw "Mismatched predicate column and literal
-// types". Sirius now keeps those conjuncts out of the reader filter and applies
-// them post-decode.
+// Regression tests for parquet bloom filter probes (rapidsai/cudf#24319).
+// DuckDB writes bloom filters by default, and cuDF's reader probes them with
+// the equality conjuncts of the pushed-down filter. A probe that hashes the
+// literal as the cuDF type instead of the parquet physical type drops row
+// groups that hold the value for TINYINT and SMALLINT, and throws "Mismatched
+// predicate column and literal types" for DECIMAL.
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -159,9 +157,7 @@ TEST_CASE_METHOD(ParquetBloomFilterFixture,
   compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan_ + " WHERE d18 = 7");
 }
 
-// Only the equality is kept out of the reader. The range conjunct is still
-// pushed, so the scan is partially filtered by the reader and must apply the
-// equality post-decode.
+// Equalities pushed into the reader next to range conjuncts.
 TEST_CASE_METHOD(ParquetBloomFilterFixture,
                  "parquet equality with bloom filters next to a pushed conjunct",
                  "[integration][gpu_execution][scan][parquet][pushdown]")

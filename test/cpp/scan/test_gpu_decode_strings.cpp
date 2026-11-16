@@ -27,7 +27,6 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
-#include <rmm/version_config.hpp>
 
 #include <cuda/scan/gpu_decode_strings.cuh>
 #include <cuda/scan/strings/dict_fsst.cuh>
@@ -63,24 +62,13 @@ namespace {
 // Prevent decoder kernels from reading beyond the small backing allocation.
 struct reject_decode_allocation_resource {
   size_t allocations = 0;
-  rmm::mr::callback_memory_resource resource
-  {
-// RMM 26.12 puts the stream first and adds an alignment argument.
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
+  rmm::mr::callback_memory_resource resource{
     [](::cuda::stream_ref, size_t, size_t, void* arg) -> void* {
-#else
-    [](size_t, ::cuda::stream_ref, void* arg) -> void* {
-#endif
       ++*static_cast<size_t*>(arg);
       throw std::logic_error("invalid metadata reached decode scratch allocation");
     },
-#if RMM_VERSION_MAJOR > 26 || (RMM_VERSION_MAJOR == 26 && RMM_VERSION_MINOR >= 12)
-      [](::cuda::stream_ref, void*, size_t, size_t, void*) {},
-#else
-      [](void*, size_t, ::cuda::stream_ref, void*) {},
-#endif
-      &allocations
-  };
+    [](::cuda::stream_ref, void*, size_t, size_t, void*) {},
+    &allocations};
 };
 
 /// Stage segment bytes on device; build a single-segment string column input
