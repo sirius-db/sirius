@@ -31,6 +31,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_install_info.hpp"
+#include "duckdb/main/http/http_transport_manager.hpp"
+#include "duckdb/main/http/http_util.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -40,6 +42,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <tuple>
 
 namespace {
 
@@ -47,6 +50,84 @@ constexpr char const* gpu_execution_setting = "gpu_execution";
 // Set by the backend entry point (sirius-duckdb/src/sirius/sirius_extension.cpp).
 constexpr char const* backend_init_started_key = "sirius_backend_init_started";
 constexpr char const* runtime_ready_key        = "sirius_runtime_ready";
+
+/// Whether the repository an installed backend came from now publishes a different build. Asks with
+/// the ETag recorded at install time and stops after the response headers, so nothing is
+/// downloaded. Best effort: any failure means no.
+struct backend_update_check {
+  static bool update_available(duckdb::DatabaseInstance& db, std::string const& extension_path)
+  {
+    try {
+      auto& fs  = duckdb::FileSystem::GetLocal(db);
+      auto info = duckdb::ExtensionInstallInfo::TryReadInfoFile(
+        fs, extension_path + ".info", fs.ExtractBaseName(extension_path));
+      if (!info || info->mode != duckdb::ExtensionInstallMode::REPOSITORY || info->etag.empty() ||
+          !duckdb::StringUtil::StartsWith(info->full_path, "http")) {
+        return false;
+      }
+      // Compare repository URLs over plain http: install records https when httpfs is loaded.
+      auto const plain = [](std::string url) {
+        return duckdb::StringUtil::StartsWith(url, "https://") ? "http://" + url.substr(8) : url;
+      };
+      auto url              = plain(info->full_path);
+      auto const repository = plain(info->repository_url);
+      // UPDATE EXTENSIONS uses the primary repository even when install fell back to its backup.
+      auto const backup = duckdb::ExtensionRepository::TryGetBackupRepositoryUrl(repository);
+      if (!backup.empty() && duckdb::StringUtil::StartsWith(url, backup)) {
+        url = repository + url.substr(backup.size());
+      }
+      // Like install: https only when httpfs provides it.
+      if (db.ExtensionIsLoaded("httpfs")) { duckdb::HTTPUtil::BumpToSecureProtocol(url); }
+      if (!may_download(db, url)) { return false; }
+      auto& manager = db.config.GetHTTPTransportManager();
+      auto session  = manager.CreateSession(db, url);
+      auto& params  = session.Parameters();
+      // A slow or unreachable repository must not hold up LOAD.
+      params.timeout                    = 2;
+      params.retries                    = 0;
+      params.follow_location            = false;
+      params.keep_alive                 = false;
+      params.skip_external_access_check = true;  // may_download applied install's rules
+      duckdb::HTTPHeaders headers(db);
+      headers.Insert("If-None-Match", info->etag);
+      bool newer = false;
+      duckdb::GetRequestInfo request(
+        url,
+        headers,
+        params,
+        [&](duckdb::HTTPResponse const& response) {
+          newer = response.status == duckdb::HTTPStatusCode::OK_200 && response.HasHeader("ETag") &&
+                  response.GetHeaderValue("ETag") != info->etag;
+          return false;  // The headers answer the question; skip the body.
+        },
+        [](duckdb::const_data_ptr_t, duckdb::idx_t) { return false; });
+      request.try_request = true;
+      std::ignore         = session.Request(request);
+      return newer;
+    } catch (...) {
+      return false;
+    }
+  }
+
+ private:
+  /// Mirrors the file access rules DuckDB applies to extension downloads.
+  static bool may_download(duckdb::DatabaseInstance& db, std::string const& url)
+  {
+    if (duckdb::Settings::Get<duckdb::EnableExternalAccessSetting>(db) ||
+        duckdb::ExtensionRepository::IsOfficialRepositoryUrl(url)) {
+      return true;
+    }
+    for (auto const& segment : duckdb::StringUtil::Split(duckdb::StringUtil::Lower(url), '/')) {
+      if (segment == "." || segment == ".." || duckdb::StringUtil::Contains(segment, "%2e")) {
+        return false;
+      }
+    }
+    auto const regular = duckdb::FileType::FILE_TYPE_REGULAR;
+    return db.config.CanAccessFile(url, regular) ||
+           (duckdb::StringUtil::StartsWith(url, "https://") &&
+            db.config.CanAccessFile("http://" + url.substr(8), regular));
+  }
+};
 
 /// Outcome of looking for a CUDA 12.8+ driver. Probed once per process.
 struct cuda_driver {
@@ -337,9 +418,21 @@ class sirius_loader {
       if (repository.type == duckdb::ExtensionRepositoryType::USER_PROVIDED) {
         directory = fs.JoinPath(fs.JoinPath(directory, "repositories"), repository.name);
       }
-      auto const installed = fs.FileExists(fs.JoinPath(directory, backend + ".duckdb_extension"));
+      auto const path      = fs.JoinPath(directory, backend + ".duckdb_extension");
+      auto const installed = fs.FileExists(path);
       if (installed) {
         duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
+        if (backend_update_check::update_available(db, path)) {
+          try {
+            report(duckdb::StringUtil::Format(
+              "Sirius: an update for %s is available. Run UPDATE EXTENSIONS (%s); and restart "
+              "DuckDB to use it.",
+              backend,
+              backend));
+          } catch (...) {
+            // The notice is advisory; it must not keep the installed backend from loading.
+          }
+        }
       } else {
         install_with_status(backend, options);
       }
