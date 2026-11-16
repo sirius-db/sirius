@@ -783,7 +783,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
-| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
@@ -1159,28 +1159,66 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 |----------|---------|-------------|
 | `spill_compression` | false | Store batches the downgrade executor spills to the host or disk tier Simpatico-compressed. Applies to the whole process, not just the session. See [Spill compression](#spill-compression-siriuscompression) for the YAML-only gates. |
 
-### Late Materialization (experimental)
-
-Off by default, and gated by environment variables rather than `sirius_config`/`SET` — this is
-still an experimental optimization, not a normal session choice.
+### Late Materialization
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
+| `enable_late_materialization` | true | Carries a pin-order rowid instead of scanned values for an eligible GPU-tier pinned table, restoring them at the far end. |
+| `late_materialization_min_boundaries` | 4 | Minimum port crossings a ride must save; nonnegative integer. |
+| `late_materialization_min_value_x_boundaries` | 128 | Minimum net bytes per row times crossings saved; nonnegative integer. |
+| `late_materialization_count_defer` | false | Allow null-free columns read only by COUNT to remain deferred. |
+| `late_materialization_min_value_compressed` | 1 | Minimum deferred bytes per row for compressed origins; nonnegative integer. Matches the ordinary value floor by default. |
 
-Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
-path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
-gate table, the mechanism, and results.
+See [Late Materialization](late-materialization.md#configuration) for the mechanism
+and results.
 
-### Grouped Aggregation (experimental)
+### Grouped Aggregation
 
-Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+The specialized path applies only to eligible batches and otherwise uses cuDF's group-by.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+| `enable_low_cardinality_groupby` | true | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
 
-See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
+### Fused Scan Filtering
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
+| `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
+| `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
+| `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
+
+Selectivity thresholds must be finite and greater than zero; values above one are accepted,
+and a small positive index-walk threshold effectively disables that route.
+
+The former master environment variables `SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`,
+and `SIRIUS_EXP_LOWCARD_GROUPBY` are no longer read. Migrate overrides to these settings:
+
+```sql
+SET enable_late_materialization = false;
+SET enable_fused_scan_filter = false;
+SET enable_low_cardinality_groupby = false;
+```
+
+The former experimental threshold and diagnostic variables are also no longer read. Defaults
+are unchanged; migrate overrides using this mapping:
+
+| Retired environment variable | SQL / YAML setting |
+|---|---|
+| `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | `late_materialization_min_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | `late_materialization_min_value_x_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | `late_materialization_count_defer` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | `late_materialization_min_value_compressed` |
+| `SIRIUS_EXP_FUSED_SCAN_DIAG` | `fused_scan_diagnostics` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` | `fused_scan_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL` | `fused_scan_full_route_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` | `fused_scan_index_walk_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER` | `fused_scan_max_membership_sources` |
+
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation) for the mechanism and its measured effect.
 
 ### Runtime Data Size Estimation
 

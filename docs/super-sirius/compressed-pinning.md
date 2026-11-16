@@ -96,7 +96,7 @@ With nvCOMP 6, `nvcomp_cascaded` plans remain unavailable because the old config
 options were removed. Its metadata field reserves the distinction needed to support the new
 Cascaded API later. nvCOMP 5 builds continue to support the existing Cascaded plans.
 
-## Filtering while decompressing (experimental)
+## Filtering while decompressing
 
 A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
 a column's plan allows it the filter is answered from the compressed form, and the surviving
@@ -111,11 +111,12 @@ filter the decode applies alongside does not change this: it is optional, so whe
 batch does not bear on the scan's own filter. With any conjunct of the scan's own filter left to
 the scan (an unsupported shape) or on any decline, every column comes back as before.
 
-It is off by default and inert when off (byte-identical to an ordinary decompress):
+It is enabled by default. Disable it per connection with
+`SET enable_fused_scan_filter = false`; YAML accepts the same name under
+`sirius.operator_params`. Enable the decision trace for a connection with:
 
-```bash
-SIRIUS_EXP_FUSED_SCAN_FILTER=1     # the gate
-SIRIUS_EXP_FUSED_SCAN_DIAG=1       # the decision trace — reach for this first
+```sql
+SET fused_scan_diagnostics = true;
 ```
 
 Measured on GB300, TPC-H SF1000, on top of a GPU-pinned compressed configuration: the suite
@@ -140,22 +141,29 @@ bitpack-rooted plan additionally buys the mask walk.
 Selectivity governs whether compaction is attempted at all, because compacting is only cheaper
 than decoding when enough rows are dropped:
 
-- a batch with any full-width column proceeds only below `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL`
+- a batch with any full-width column proceeds only below `fused_scan_full_route_max_selectivity`
   (0.10);
-- otherwise compaction is given up above `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` (0.35), unless a
+- otherwise compaction is given up above `fused_scan_max_selectivity` (0.35), unless a
   dictionary output is present — that route is exempt, since it wins regardless;
-- below `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` (0.15) the decode walks a survivor index list
+- below `fused_scan_index_walk_max_selectivity` (0.15) the decode walks a survivor index list
   instead of the mask bits.
+
+These thresholds and `fused_scan_max_membership_sources` (default 1) accept connection-local
+`SET` overrides and YAML startup defaults under `sirius.operator_params`. A query snapshots its
+policy, including diagnostics, so later settings changes do not affect work already submitted.
 
 One batch measured unselective predicts the rest of that scan, so the scan stops attempting it
 rather than paying per batch.
 
-Two operational caveats. These are environment variables, not `SET` options: they are
-process-wide, read once and cached, so they cannot be changed per session and do not appear in
-`duckdb_settings()`. And the trace is the only way to see what happened — the plan per column (route,
-bounds, what was dropped and why), then per batch the sources in the order they ran, the
-enumeration chosen, the survivor count and whether the batch came back needing no further
-filtering.
+Use `SET <name> = <value>` to change these settings for subsequent queries on the current
+connection, and `RESET <name>` to restore the startup default, including any YAML override.
+Inspect their current values in `duckdb_settings()`. Each query keeps the policy captured when
+it starts; later changes do not alter work already submitted.
+
+The decision trace shows what happened: the plan per column (route, bounds, what was dropped
+and why), then per batch the sources in the order they ran, the enumeration chosen, the
+survivor count and whether the batch came back needing no further filtering. Enable
+`fused_scan_diagnostics` to emit these decisions at INFO level.
 
 ## Interaction with the downgrade executor
 

@@ -20,6 +20,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/aggregate/wide_integer_sum.hpp"
+#include "sirius_config.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
@@ -177,37 +178,40 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
     if (has_grouping_sets()) {
-      results.push_back(
-        gpu_aggregate_impl::local_grouping_sets_aggregate(input_batch,
-                                                          group_idx,
-                                                          cudf_aggregates,
-                                                          cudf_aggregate_idx,
-                                                          cudf_aggregate_struct_col_indices,
-                                                          grouping_set_keys,
-                                                          grouping_functions,
-                                                          stream,
-                                                          *space,
-                                                          batch_telemetry(),
-                                                          cudf_aggregate_input_max_abs,
-                                                          cudf_aggregate_is_wide_integer_sum));
+      results.push_back(gpu_aggregate_impl::local_grouping_sets_aggregate(
+        input_batch,
+        group_idx,
+        cudf_aggregates,
+        cudf_aggregate_idx,
+        cudf_aggregate_struct_col_indices,
+        grouping_set_keys,
+        grouping_functions,
+        stream,
+        *space,
+        batch_telemetry(),
+        cudf_aggregate_input_max_abs,
+        cudf_aggregate_is_wide_integer_sum,
+        operator_options().enable_low_cardinality_groupby));
       continue;
     }
     auto const last_groups     = _last_batch_groups.load(std::memory_order_relaxed);
     bool const split_wide_sums = last_groups <= split_wide_sum_max_groups;
     cudf::size_type num_groups = 0;
-    auto result                = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
-                                                              group_idx,
-                                                              cudf_aggregates,
-                                                              cudf_aggregate_idx,
-                                                              cudf_aggregate_struct_col_indices,
-                                                              carried,
-                                                              stream,
-                                                              *space,
-                                                              batch_telemetry(),
-                                                              cudf_aggregate_input_max_abs,
-                                                              cudf_aggregate_is_wide_integer_sum,
-                                                              split_wide_sums,
-                                                              &num_groups);
+    auto result                = gpu_aggregate_impl::local_grouped_aggregate(
+      input_batch,
+      group_idx,
+      cudf_aggregates,
+      cudf_aggregate_idx,
+      cudf_aggregate_struct_col_indices,
+      carried,
+      stream,
+      *space,
+      batch_telemetry(),
+      cudf_aggregate_input_max_abs,
+      cudf_aggregate_is_wide_integer_sum,
+      split_wide_sums,
+      &num_groups,
+      operator_options().enable_low_cardinality_groupby);
     _last_batch_groups.store(num_groups, std::memory_order_relaxed);
     results.push_back(std::move(result));
   }

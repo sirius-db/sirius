@@ -614,6 +614,33 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
+  r.optional("enable_late_materialization", opt.enable_late_materialization);
+  r.optional("enable_fused_scan_filter", opt.enable_fused_scan_filter);
+  r.optional("enable_low_cardinality_groupby", opt.enable_low_cardinality_groupby);
+  r.optional("late_materialization_min_boundaries",
+             opt.late_materialization_min_boundaries,
+             [](int value) { return value >= 0; });
+  r.optional("late_materialization_min_value_x_boundaries",
+             opt.late_materialization_min_value_x_boundaries,
+             [](std::int64_t value) { return value >= 0; });
+  r.optional("late_materialization_count_defer", opt.late_materialization_count_defer);
+  r.optional("late_materialization_min_value_compressed",
+             opt.late_materialization_min_value_compressed,
+             [](std::int64_t value) { return value >= 0; });
+  r.optional("fused_scan_diagnostics", opt.fused_scan.diagnostics);
+  auto const positive_finite = [](double value) { return std::isfinite(value) && value > 0.0; };
+  r.optional("fused_scan_max_selectivity", opt.fused_scan.max_selectivity, positive_finite);
+  r.optional("fused_scan_full_route_max_selectivity",
+             opt.fused_scan.full_route_max_selectivity,
+             positive_finite);
+  r.optional("fused_scan_index_walk_max_selectivity",
+             opt.fused_scan.index_walk_max_selectivity,
+             positive_finite);
+  r.optional("fused_scan_max_membership_sources",
+             opt.fused_scan.max_membership_sources,
+             [](std::size_t value) {
+               return value <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+             });
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   if (opt.scan_task_batch_size == 0) {
     throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
