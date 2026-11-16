@@ -1020,27 +1020,27 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE(gpu_rows == expected);
   }
 
+  /// A table with live equality deletes runs on the GPU: rows match the literal expectation and
+  /// DuckDB, the scan is not declined, and @p payload_loads delete files are read -- so a test
+  /// cannot pass by quietly loading nothing.
   void expect_equality_rows(std::string const& query,
                             std::vector<std::vector<std::string>> expected,
-                            uint64_t count = 1)
+                            uint64_t payload_loads = 1)
   {
     auto before = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::scoped_recording_log_sink logs;
-    expect_iceberg_rows(query, gpu_route::plan_fallback, std::move(expected));
+    expect_iceberg_rows(query, gpu_route::gpu, std::move(expected));
     auto after = sirius::test::get_transparent_execution_stats(*con);
-    auto reason =
-      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
-    CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
-    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
-    CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
-    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+    for (auto reason : {sirius::op::scan::verdict_reason::iceberg_equality_deletes,
+                        sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven,
+                        sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported,
+                        sirius::op::scan::verdict_reason::iceberg_equality_budget,
+                        sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu}) {
+      auto index = static_cast<std::size_t>(reason);
+      CHECK(after.semantic_declines[index] == before.semantic_declines[index]);
+    }
+    CHECK(after.iceberg_delete_payload_loads ==
+          before.iceberg_delete_payload_loads + payload_loads);
     CHECK(after.iceberg_inventory_bytes_peak > 0);
-    auto text = "this iceberg table has " + std::to_string(count) +
-                " equality-delete file(s), which the GPU scan path does not apply yet";
-    bool seen = false;
-    for (auto const& record : logs.records())
-      if (record.message.find(text) != std::string::npos) seen = true;
-    CHECK(seen);
   }
 
   void expect_iceberg_schema_refusal(std::string const& query,
@@ -1473,9 +1473,13 @@ class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixtu
   {
     eq_path =
       (get_project_root() / "test/cpp/integration/data/iceberg_v2_equality_delete").string();
+    double_key_path =
+      (get_project_root() / "test/cpp/integration/data/iceberg_v2_eq_double_key").string();
   }
 
   std::string eq_path;
+  /// Keyed on a DOUBLE column: the one equality-delete shape here the GPU path still declines.
+  std::string double_key_path;
 };
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
@@ -1494,7 +1498,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   auto transaction = con->Query("BEGIN TRANSACTION READ ONLY");
   REQUIRE(transaction);
   REQUIRE_FALSE(transaction->HasError());
-  auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(eq_path));
+  auto logical = con->ExtractPlan("SELECT fruit, weight FROM " + pinned_scan(double_key_path));
   REQUIRE(logical);
   auto* current = logical.get();
   while (current->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -1515,13 +1519,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   auto const& scan = node->Cast<sirius::op::sirius_physical_table_scan>();
   REQUIRE(scan.pre_declined);
   CHECK(scan.pre_declined->verdict == sirius::op::scan::eligibility_verdict::unsupported);
-  CHECK(scan.pre_declined->reason == sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  CHECK(scan.pre_declined->reason ==
+        sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
   CHECK(scan.bound_view == nullptr);
   CHECK(scan.contract_id == 0);
   CHECK(generator.read_views->entries().empty());
   REQUIRE(generator.contract_provenance.first_pre_decline);
   CHECK(generator.contract_provenance.first_pre_decline->first ==
-        sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+        sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
   auto rollback = con->Query("ROLLBACK");
   REQUIRE(rollback);
   REQUIRE_FALSE(rollback->HasError());
@@ -1672,6 +1677,215 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
   expect_equality_rows(
     "SELECT fruit, count FROM " + pinned_scan(multi_data_path) + " ORDER BY count;",
     {{"apple", "1"}, {"cherry", "3"}, {"date", "4"}, {"fig", "6"}});
+}
+
+//===----------------------------------------------------------------------===//
+// V2 equality deletes: the rules a reader gets silently wrong. Each fixture is built by
+// generate_equality_delete_fixtures.py, which documents the wrong answer beside the right one.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergEqRulesFixture : public GPUExecutionIcebergFixture {
+ public:
+  std::string table(std::string const& name)
+  {
+    return (get_project_root() / "test/cpp/integration/data" / name).string();
+  }
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality keys come from equality_ids",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The delete file stores whole rows whose counts no longer match the data. Matching on every
+  // stored column would delete nothing; only `fruit` is a key.
+  auto path = table("iceberg_v2_eq_wide_delete_file");
+  require_delete_files(path, 1);
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality keys the query does not output",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path = table("iceberg_v2_eq_wide_delete_file");
+  auto scan = pinned_scan(path);
+  // The key is not selected: it must be read anyway and must not come back as a column.
+  expect_equality_rows("SELECT count FROM " + scan + " ORDER BY count;", {{"1"}, {"3"}, {"5"}});
+  // No column is selected at all.
+  expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}});
+  // The key is read for the filter as well as for the delete.
+  expect_equality_rows("SELECT count FROM " + scan + " WHERE fruit <> 'apple' ORDER BY count;",
+                       {{"3"}, {"5"}});
+  // The filter is on another column and would by itself keep the deleted rows.
+  expect_equality_rows("SELECT fruit FROM " + scan + " WHERE count >= 2 ORDER BY fruit;",
+                       {{"cherry"}, {"elderberry"}});
+  // Output order differs from schema order, with the key last.
+  expect_equality_rows("SELECT count, fruit FROM " + scan + " ORDER BY count;",
+                       {{"1", "apple"}, {"3", "cherry"}, {"5", "elderberry"}});
+  // Row provenance survives the delete.
+  expect_equality_rows("SELECT count, file_row_number FROM " + scan + " ORDER BY count;",
+                       {{"1", "0"}, {"3", "2"}, {"5", "4"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality deletes use the inherited sequence number",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // After a manifest rewrite both data files sit in a manifest at sequence 3, above the delete
+  // at 2. The older file keeps data sequence number 1 and must still lose banana/2; the newer
+  // file's banana/4 must survive.
+  auto path = table("iceberg_v2_eq_manifest_rewrite");
+  require_delete_files(path, 1);
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
+  expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"1"}, {"3"}, {"4"}, {"5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality deletes match NULL keys",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Deletes (NULL, 2) and (cherry, NULL). (NULL, 4) and (cherry, 3) share one key member with a
+  // delete row and must survive.
+  auto path = table("iceberg_v2_eq_null_key");
+  require_delete_files(path, 1);
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}, {"NULL", "4"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality deletes respect partitions",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // id=1 is deleted in partition A only; id=2 is deleted under an unpartitioned spec, so
+  // everywhere. Both partitions hold ids 1..3, and the two data files are small enough to be
+  // coalesced into one batch unless their different delete sets keep them apart.
+  auto path = table("iceberg_v2_eq_partitioned");
+  require_delete_files(path, 2);
+  auto scan = pinned_scan(path);
+  expect_equality_rows("SELECT id, region, v FROM " + scan + " ORDER BY v;",
+                       {{"1", "B", "30"}, {"3", "A", "50"}, {"3", "B", "60"}},
+                       2);
+  expect_equality_rows("SELECT v FROM " + scan + " ORDER BY v;", {{"30"}, {"50"}, {"60"}}, 2);
+  expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}}, 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - upsert within one commit",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The second commit writes key 2 twice. Its equality delete removes the first commit's (2, b)
+  // and must NOT touch its own commit's rows; its position delete removes the superseded (2, x).
+  // Exactly one row with id 2 survives, and it is the last one written.
+  auto path = table("iceberg_v2_eq_upsert_same_commit");
+  require_delete_files(path, 2);
+  expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY id;",
+                       {{"1", "a"}, {"2", "y"}, {"3", "c"}, {"4", "d"}},
+                       2);
+  expect_equality_rows(
+    "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"c"}, {"d"}, {"y"}}, 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality keys are matched by field id",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The key was renamed fruit -> produce after the data file was written. The delete file uses
+  // the new name; the data file still uses the old one.
+  auto path = table("iceberg_v2_eq_renamed_key");
+  require_delete_files(path, 1);
+  expect_equality_rows("SELECT produce, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"cherry", "3"}});
+  expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"1"}, {"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality keys across an int to long promotion",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The first data file and the first delete file store the key as INT32; later files store
+  // INT64. The old delete (id=2) applies to the old data file only, so the re-inserted (2, b2)
+  // survives; the new delete (id in 4, 5) applies to both data files.
+  auto path = table("iceberg_v2_eq_promoted_key");
+  require_delete_files(path, 2);
+  expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
+                       {{"1", "a"}, {"2", "b2"}, {"3", "c"}, {"6", "f"}},
+                       2);
+  expect_equality_rows(
+    "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"b2"}, {"c"}, {"f"}}, 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - an unsupported equality key declines to DuckDB",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path   = table("iceberg_v2_eq_double_key");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows("SELECT fruit, weight FROM " + pinned_scan(path) + " ORDER BY weight;",
+                      gpu_route::plan_fallback,
+                      {{"apple", "1.5"}, {"cherry", "3.5"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto index =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality deletes above the statement ceiling decline",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The fixture's delete file holds 2 rows. The ceiling is charged from the manifest's
+  // record_count, per statement: one scan fits under 3, two scans of the same table do not.
+  auto path     = table("iceberg_v2_eq_wide_delete_file");
+  auto scan     = pinned_scan(path);
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->statement_equality_limit_for_testing);
+  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_budget);
+  auto declines = [&] {
+    return sirius::test::get_transparent_execution_stats(*con).semantic_declines[index];
+  };
+  auto loads = [&] {
+    return sirius::test::get_transparent_execution_stats(*con).iceberg_delete_payload_loads;
+  };
+
+  counters->statement_equality_limit_for_testing = 1;
+  auto before_declines                           = declines();
+  auto before_loads                              = loads();
+  expect_iceberg_rows("SELECT count FROM " + scan + " ORDER BY count;",
+                      gpu_route::plan_fallback,
+                      {{"1"}, {"3"}, {"5"}});
+  CHECK(declines() == before_declines + 1);
+  CHECK(loads() == before_loads);  // refused before any delete file is opened
+
+  counters->statement_equality_limit_for_testing = 3;
+  expect_equality_rows("SELECT count FROM " + scan + " ORDER BY count;", {{"1"}, {"3"}, {"5"}});
+
+  before_declines = declines();
+  before_loads    = loads();
+  auto result = con->Query("SELECT count FROM " + scan + " UNION ALL SELECT count FROM " + scan +
+                           " ORDER BY count;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  CHECK(collect_rows(*result) ==
+        std::vector<std::vector<std::string>>{{"1"}, {"1"}, {"3"}, {"3"}, {"5"}, {"5"}});
+  CHECK(declines() == before_declines + 1);
+  CHECK(loads() == before_loads);
+
+  counters->statement_equality_limit_for_testing = 4;
+  before_declines                                = declines();
+  before_loads                                   = loads();
+  result = con->Query("SELECT count FROM " + scan + " UNION ALL SELECT count FROM " + scan +
+                      " ORDER BY count;");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  CHECK(collect_rows(*result) ==
+        std::vector<std::vector<std::string>>{{"1"}, {"1"}, {"3"}, {"3"}, {"5"}, {"5"}});
+  CHECK(declines() == before_declines);
+  CHECK(loads() == before_loads + 2);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1863,10 +2077,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
                  "gpu_execution iceberg - a retired equality-delete file does not refuse the GPU",
                  "[integration][gpu_execution][iceberg]")
 {
-  // Equality deletes are the one thing this path refuses outright, so the ROUTE is the
-  // assertion. With the table's only equality-delete entry retired there is nothing to apply,
-  // and the gate must not keep refusing over it. Getting this wrong costs performance rather
-  // than correctness, which is exactly why the rows alone would never reveal it.
+  // With the table's only equality-delete entry retired there is nothing to plan or apply. A
+  // status-blind reader would load the retired file and delete two rows.
   require_delete_files(eq_retired_path, 1);
   expect_iceberg_rows(
     "SELECT fruit, count FROM " + pinned_scan(eq_retired_path) + " ORDER BY count;",
@@ -3610,23 +3822,86 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "Iceberg equality refusal walks inventory once and reads no payload",
                  "[integration][iceberg][verdict]")
 {
-  auto scan   = pinned_scan(eq_path);
+  // A declined equality-delete table: the refusal comes from planning the deletes, before any
+  // delete file is opened.
+  auto scan   = pinned_scan(double_key_path);
   auto before = sirius::test::get_transparent_execution_stats(*con);
-  expect_iceberg_rows("SELECT fruit, count FROM " + scan,
+  expect_iceberg_rows("SELECT fruit, weight FROM " + scan,
                       gpu_route::plan_fallback,
-                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+                      {{"apple", "1.5"}, {"cherry", "3.5"}});
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
   CHECK(after.iceberg_inventory_bytes_peak > 0);
   CHECK(after.budget_exceeded == before.budget_exceeded);
-  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  auto index =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
   CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  // The inventory is kept now: the equality plan is checked against it.
   auto inventory =
     sirius::op::scan::read_delete_inventory(*con->context, eq_path, current_snapshot_id(eq_path));
   CHECK(inventory.equality_count == 1);
-  CHECK_FALSE(inventory.inventory);
+  REQUIRE(inventory.inventory);
+  CHECK(inventory.inventory->entries.size() == 2);
+  CHECK_FALSE(inventory.inventory->equality);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "Iceberg equality plan agrees with the inventory or is refused",
+                 "[integration][iceberg][verdict]")
+{
+  using namespace sirius::op::scan;
+  auto path =
+    (get_project_root() / "test/cpp/integration/data/iceberg_v2_eq_manifest_rewrite").string();
+  auto sid       = current_snapshot_id(path);
+  auto inventory = read_delete_inventory(*con->context, path, sid);
+  REQUIRE(inventory.inventory);
+
+  // The manifest's sequence number is 3 for both data files; only the inherited one separates
+  // the file the delete applies to from the one written after it.
+  std::map<std::string, std::pair<int64_t, int64_t>> sequences;
+  for (auto const& entry : inventory.inventory->entries)
+    sequences[fs::path(entry.file_path).filename().string()] = {entry.manifest_sequence_number,
+                                                                entry.data_sequence_number};
+  CHECK(sequences.at("data-1.parquet") == std::pair<int64_t, int64_t>{3, 1});
+  CHECK(sequences.at("data-3.parquet") == std::pair<int64_t, int64_t>{3, 3});
+  CHECK(sequences.at("delete-eq-2.parquet") == std::pair<int64_t, int64_t>{2, 2});
+
+  auto plan = read_equality_plan(*con->context, path, sid, *inventory.inventory);
+  REQUIRE(plan.files.size() == 1);
+  CHECK(plan.files[0].equality_ids == std::vector<int32_t>{1});
+  CHECK(plan.files[0].data_sequence_number == 2);
+  REQUIRE(plan.by_data_file.size() == 2);
+  for (auto const& [data_file, files] : plan.by_data_file) {
+    auto const older = fs::path(data_file).filename() == "data-1.parquet";
+    CHECK(files == (older ? std::vector<uint32_t>{0} : std::vector<uint32_t>{}));
+  }
+
+  // Each mutation makes the inventory contradict the plan; none may be resolved by guessing.
+  auto mutated = [&](auto const& change) {
+    auto copy = *inventory.inventory;
+    for (auto& entry : copy.entries)
+      change(entry);
+    return copy;
+  };
+  // The data file is as new as the delete: applying it would delete an upsert's own row.
+  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, mutated([](auto& entry) {
+                    if (entry.content == "DATA") entry.data_sequence_number = 2;
+                  })),
+                  equality_plan_error);
+  // The inventory does not list the delete the plan applies.
+  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, mutated([](auto& entry) {
+                    if (entry.content == "EQUALITY_DELETES") entry.content = "POSITION_DELETES";
+                  })),
+                  equality_plan_error);
+  // The inventory lists a data file the plan never mentions.
+  auto extra = *inventory.inventory;
+  extra.entries.push_back({"DATA", "unplanned.parquet", 1, "PARQUET", "m.avro", 1});
+  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, extra), equality_plan_error);
+  // A snapshot the table does not have.
+  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid + 12345, *inventory.inventory),
+                  equality_plan_error);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -3921,11 +4196,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto result = con->Query("SELECT fruit, count FROM " + scan);
   REQUIRE(result);
   REQUIRE(result->HasError());
-  CHECK(result->GetError().find("this iceberg table has 1 equality-delete file(s), which the GPU "
-                                "scan path does not apply yet") != std::string::npos);
+  // This V3 fixture carries no row-lineage fields, so the extension cannot plan it. The scan is
+  // refused while planning its equality deletes -- still before the malformed vector is read.
+  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("iceberg_scan_plan failed"));
   auto after = sirius::test::get_transparent_execution_stats(*con);
   auto reason =
-    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven);
   CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
   CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);

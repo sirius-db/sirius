@@ -1699,16 +1699,42 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
         "[iceberg_gpu_ingestible] no delete data for 'test-table'; the planner must resolve it "
         "(or decline the scan) before building the ingestible");
     }
-    SECTION("equality deletes retain the original refusal")
+    SECTION("equality groups without their data-file mapping are refused")
     {
+      // Loaded groups that no data file maps to would never be applied.
       auto info    = make_info({"/a/data.parquet"}, {});
       auto payload = std::make_shared<IcebergDeleteData>();
       payload->equality_delete_groups.emplace_back();
       info->delete_data = std::move(payload);
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        Catch::Matchers::ContainsSubstring(
+                          "equality-delete groups were loaded without the data files they apply "
+                          "to"));
+    }
+    SECTION("a scanned file absent from the equality plan is refused")
+    {
+      // The plan covers another file. Reading this one as "no equality deletes apply" would
+      // return rows the table removed.
+      auto info    = make_info({"/a/data.parquet"}, {});
+      auto payload = std::make_shared<IcebergDeleteData>();
+      payload->equality_groups_by_data_file.emplace("/a/other.parquet",
+                                                    std::make_shared<equality_group_list const>());
+      info->delete_data = std::move(payload);
       CHECK_THROWS_WITH(
         make_ingestible(std::move(info)),
-        Catch::Matchers::ContainsSubstring("iceberg table '{}' carries equality deletes, which the "
-                                           "GPU scan path does not apply yet"));
+        Catch::Matchers::ContainsSubstring("is absent from the equality-delete plan"));
+    }
+    SECTION("hive partitions and equality deletes are refused")
+    {
+      auto info    = make_info({"/a/data.parquet"}, {});
+      auto payload = std::make_shared<IcebergDeleteData>();
+      payload->equality_groups_by_data_file.emplace("/a/data.parquet",
+                                                    std::make_shared<equality_group_list const>());
+      info->delete_data = std::move(payload);
+      info->partition_indices.emplace_back("p", 1);
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        Catch::Matchers::ContainsSubstring(
+                          "combines hive partition columns with equality deletes"));
     }
   }
 }

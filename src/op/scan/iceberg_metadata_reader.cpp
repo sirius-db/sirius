@@ -22,11 +22,13 @@
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
+#include <duckdb/common/enum_util.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
@@ -252,12 +254,13 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // Injection is latched by the planning attempt, after the original scan bound successfully.
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
-  // One metadata query supplies both the equality count and the admitted
-  // inventory. Retain raw chunks until the count is known; a refusal discards
-  // them without copying their path strings or issuing a second manifest walk.
+  // One query supplies the equality count and the inventory; the equality plan is checked
+  // against the latter. data_sequence_number is the inherited value, which
+  // manifest_sequence_number stops being once a manifest is rewritten.
   if (counters) ++counters->iceberg_manifest_walks;
   auto meta_result = conn.Submit(
-    "SELECT content::VARCHAR, file_path, manifest_sequence_number, file_format, manifest_path "
+    "SELECT content::VARCHAR, file_path, manifest_sequence_number, file_format, manifest_path, "
+    "data_sequence_number "
     "FROM " +
     live);
   if (!meta_result) throw inventory_query_error("", true);
@@ -281,26 +284,25 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
           ++result.equality_count;
       }
       peak_bytes = std::max(peak_bytes, bytes + chunk->GetAllocationSize());
-      if (result.equality_count) {
-        chunks.clear();
-        bytes = sizeof(iceberg_delete_inventory);
-      } else {
-        bytes += chunk->GetAllocationSize();
-        chunks.push_back(std::move(chunk));
-      }
+      bytes += chunk->GetAllocationSize();
+      chunks.push_back(std::move(chunk));
     }
     if (stream.HasError()) throw std::runtime_error(stream.GetError());
   } catch (std::exception const& error) {
     throw inventory_query_error(error.what(), false);
   }
-  if (result.equality_count) result.inventory.reset();
   for (auto& chunk : chunks) {
     for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      iceberg_delete_inventory::entry row{chunk->GetValue(0, i).ToString(),
-                                          chunk->GetValue(1, i).ToString(),
-                                          chunk->GetValue(2, i).GetValue<int64_t>(),
-                                          chunk->GetValue(3, i).ToString(),
-                                          chunk->GetValue(4, i).ToString()};
+      // A NULL inherited sequence number cannot order a delete against a data file. Keep it
+      // distinguishable from every real one; read_equality_plan() refuses it.
+      auto const data_seq = chunk->GetValue(5, i);
+      iceberg_delete_inventory::entry row{
+        chunk->GetValue(0, i).ToString(),
+        chunk->GetValue(1, i).ToString(),
+        chunk->GetValue(2, i).GetValue<int64_t>(),
+        chunk->GetValue(3, i).ToString(),
+        chunk->GetValue(4, i).ToString(),
+        data_seq.IsNull() ? int64_t{-1} : data_seq.GetValue<int64_t>()};
       bytes += row.content.capacity() + row.file_path.capacity() + row.file_format.capacity() +
                row.manifest_path.capacity() + 4;
       auto old_capacity = result.inventory->entries.capacity();
@@ -321,11 +323,154 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   return result;
 }
 
+static_assert(kMaxEqualityDeleteRowsPerFile == kMaxDeletionVectorPositions,
+              "the per-file equality-delete ceiling is the per-vector deletion-vector ceiling");
+
+bool charge_equality_deletes(iceberg_equality_plan const& plan,
+                             equality_delete_charge& total,
+                             int64_t statement_row_limit)
+{
+  for (auto const& file : plan.files) {
+    // Subtractions, not sums: every term comes from a manifest.
+    if (file.record_count < 0 || file.file_size_in_bytes < 0 ||
+        file.record_count > kMaxEqualityDeleteRowsPerFile ||
+        file.record_count > statement_row_limit - total.rows ||
+        file.file_size_in_bytes > kMaxEqualityDeleteBytesPerStatement - total.bytes)
+      return false;
+    total.rows += file.record_count;
+    total.bytes += file.file_size_in_bytes;
+  }
+  return true;
+}
+
+iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
+                                         std::string const& table_path,
+                                         int64_t snapshot_id,
+                                         iceberg_delete_inventory const& inventory)
+{
+  // What the inventory -- a separate walk of the same manifests -- says about each file.
+  std::unordered_map<std::string_view, int64_t> data_sequence, delete_sequence;
+  for (auto const& entry : inventory.entries) {
+    if (entry.content == "DATA") {
+      data_sequence.emplace(entry.file_path, entry.data_sequence_number);
+    } else if (entry.content == "EQUALITY_DELETES") {
+      delete_sequence.emplace(entry.file_path, entry.data_sequence_number);
+    }
+  }
+
+  iceberg_metadata_connection metadata_conn(context);
+  // The struct is repacked so its field order is this function's, not the extension's.
+  auto result = metadata_conn.Query(
+    "SELECT file_path, snapshot_id, "
+    "[{'p': d.file_path, 'c': d.\"content\", 'ids': d.equality_ids, 'n': d.record_count, "
+    "'b': d.file_size_in_bytes} for d in delete_files] "
+    "FROM iceberg_scan_plan('" +
+    escape_sql_string(table_path) + "', snapshot_from_id = " + std::to_string(snapshot_id) + ")");
+  if (!result || result->HasError()) {
+    throw equality_plan_error("[iceberg] iceberg_scan_plan failed for '" + table_path +
+                              "': " + (result ? result->GetError() : "null result"));
+  }
+
+  auto const fail = [&](std::string const& what) -> equality_plan_error {
+    return equality_plan_error("[iceberg] equality plan for '" + table_path + "': " + what);
+  };
+
+  iceberg_equality_plan plan;
+  std::unordered_map<std::string, uint32_t> delete_index;
+  while (true) {
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      auto const path_value     = chunk->GetValue(0, row);
+      auto const snapshot_value = chunk->GetValue(1, row);
+      auto const deletes_value  = chunk->GetValue(2, row);
+      if (path_value.IsNull() || snapshot_value.IsNull())
+        throw fail("the scan plan returned a task without a file path or snapshot id");
+      auto data_file = path_value.ToString();
+      if (snapshot_value.GetValue<int64_t>() != snapshot_id)
+        throw fail("the scan plan describes snapshot " +
+                   std::to_string(snapshot_value.GetValue<int64_t>()) + ", not the requested " +
+                   std::to_string(snapshot_id));
+      auto const data_seq = data_sequence.find(data_file);
+      if (data_seq == data_sequence.end())
+        throw fail("the scan plan lists data file '" + data_file +
+                   "', which the inventory does not list as a live DATA entry");
+      if (data_seq->second < 0)
+        throw fail("data file '" + data_file + "' has no data sequence number");
+
+      std::vector<uint32_t> applicable;
+      if (!deletes_value.IsNull()) {
+        for (auto const& delete_value : duckdb::ListValue::GetChildren(deletes_value)) {
+          if (delete_value.IsNull()) throw fail("the scan plan returned a NULL delete file");
+          auto const& fields = duckdb::StructValue::GetChildren(delete_value);
+          if (fields.size() != 5 || fields[0].IsNull() || fields[1].IsNull())
+            throw fail("the scan plan returned a delete file without a path or content kind");
+          auto const content = fields[1].GetValue<int32_t>();
+          // Position deletes and deletion vectors are discovered and applied by position.
+          if (content == 1) continue;
+          if (content != 2)
+            throw fail("the scan plan returned delete content kind " + std::to_string(content));
+          auto delete_file      = fields[0].ToString();
+          auto const delete_seq = delete_sequence.find(delete_file);
+          if (delete_seq == delete_sequence.end())
+            throw fail("the scan plan applies equality delete '" + delete_file +
+                       "', which the inventory does not list as a live EQUALITY_DELETES entry");
+          // The one rule that separates an upsert from deleting the row just written.
+          if (delete_seq->second < 0 || data_seq->second >= delete_seq->second)
+            throw fail("the scan plan applies equality delete '" + delete_file +
+                       "' (data sequence number " + std::to_string(delete_seq->second) +
+                       ") to data file '" + data_file + "' (data sequence number " +
+                       std::to_string(data_seq->second) +
+                       "); an equality delete applies only to strictly older data");
+          auto [slot, fresh] =
+            delete_index.emplace(delete_file, static_cast<uint32_t>(plan.files.size()));
+          if (fresh) {
+            iceberg_equality_delete_file file;
+            file.file_path = std::move(delete_file);
+            if (!fields[2].IsNull())
+              for (auto const& id : duckdb::ListValue::GetChildren(fields[2])) {
+                if (id.IsNull()) throw fail("an equality_ids entry is NULL");
+                file.equality_ids.push_back(id.GetValue<int32_t>());
+              }
+            if (file.equality_ids.empty())
+              throw fail("equality delete '" + file.file_path + "' has no equality_ids");
+            if (std::set<int32_t>(file.equality_ids.begin(), file.equality_ids.end()).size() !=
+                file.equality_ids.size())
+              throw fail("equality delete '" + file.file_path + "' repeats an equality id");
+            if (fields[3].IsNull() || fields[4].IsNull() || fields[3].GetValue<int64_t>() < 0 ||
+                fields[4].GetValue<int64_t>() < 0)
+              throw fail("equality delete '" + file.file_path +
+                         "' has no usable record count or file size");
+            file.record_count         = fields[3].GetValue<int64_t>();
+            file.file_size_in_bytes   = fields[4].GetValue<int64_t>();
+            file.data_sequence_number = delete_seq->second;
+            plan.files.push_back(std::move(file));
+          }
+          applicable.push_back(slot->second);
+        }
+      }
+      std::sort(applicable.begin(), applicable.end());
+      if (std::adjacent_find(applicable.begin(), applicable.end()) != applicable.end())
+        throw fail("data file '" + data_file + "' lists one equality delete twice");
+      if (!plan.by_data_file.emplace(std::move(data_file), std::move(applicable)).second)
+        throw fail("the scan plan lists a data file twice");
+    }
+  }
+  // Under-delivery would leave a scanned file unplanned. Counts suffice: both sides are sets and
+  // membership was checked above.
+  if (plan.by_data_file.size() != data_sequence.size())
+    throw fail("the scan plan lists " + std::to_string(plan.by_data_file.size()) +
+               " data file(s) but the inventory lists " + std::to_string(data_sequence.size()));
+  return plan;
+}
+
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
                                                  std::string const& table_path,
                                                  iceberg_delete_inventory&& inventory)
 {
   iceberg_delete_discovery result;
+  result.equality_plan   = std::move(inventory.equality);
+  std::size_t data_files = 0;
 
   // See iceberg_metadata_connection for why this is a connection, why it cannot observe a
   // different snapshot than the bind did, and why it mirrors settings instead of forcing them.
@@ -364,7 +509,6 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
   for (auto& row : inventory.entries) {
     auto const& content = row.content;
     auto filepath       = std::move(row.file_path);
-    auto seq            = row.manifest_sequence_number;
 
     if (content == kPositionDeletes) {
       auto const& file_format = row.file_format;
@@ -388,10 +532,10 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
       IcebergDeleteFileEntry entry;
       entry.file_path       = std::move(filepath);
       entry.content         = 2;
-      entry.sequence_number = seq;
+      entry.sequence_number = row.data_sequence_number;
       result.equality_delete_entries.push_back(std::move(entry));
     } else if (content == kContentDataFile) {
-      result.data_file_manifest_sequence_numbers[filepath] = seq;
+      ++data_files;
     } else {
       // Unknown content could omit data-file sequence numbers or a new delete class.
       // Decline rather than risk applying or skipping deletes incorrectly.
@@ -436,7 +580,16 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
     result.positional_delete_files.size(),
     result.equality_delete_entries.size(),
     result.deletion_vector_entries.size(),
-    result.data_file_manifest_sequence_numbers.size());
+    data_files);
+
+  // The gate plans equality deletes before lowering. Entries without a plan mean a caller
+  // skipped it, and loading them unplanned would apply them to every data file.
+  if (!result.equality_delete_entries.empty() && !result.equality_plan) {
+    throw std::runtime_error("[iceberg] '" + table_path + "' has " +
+                             std::to_string(result.equality_delete_entries.size()) +
+                             " live equality-delete entr(ies) but no equality plan reached "
+                             "lowering; the plan gate must plan them or decline the scan");
+  }
 
   return result;
 }
@@ -518,64 +671,127 @@ void read_positional_delete_file(duckdb::ClientContext& context,
   }
 }
 
-struct equality_delete_read_result {
-  std::unique_ptr<cudf::table> tbl;
-  std::vector<std::string> col_names;
-  std::vector<std::optional<int32_t>> field_ids;
-};
+/// The cuDF type a key column must have for a bound type the gate admitted.
+cudf::type_id bound_key_type(duckdb::LogicalTypeId type)
+{
+  switch (type) {
+    case duckdb::LogicalTypeId::INTEGER: return cudf::type_id::INT32;
+    case duckdb::LogicalTypeId::BIGINT: return cudf::type_id::INT64;
+    case duckdb::LogicalTypeId::VARCHAR: return cudf::type_id::STRING;
+    default:
+      throw std::runtime_error("[iceberg] equality-delete key type " +
+                               duckdb::EnumUtil::ToString(type) +
+                               " reached the loader; the plan gate admits only INTEGER, BIGINT "
+                               "and VARCHAR keys");
+  }
+}
 
-/// Reads an equality-delete file into a GPU table, plus its column names and Iceberg field ids.
-/// Stays on device because the result feeds a cudf::distinct_hash_join directly. @p ioctx must
-/// be non-null: the caller must provide an ioctx.
-equality_delete_read_result read_equality_delete_file(
-  std::string const& delete_file_path, std::shared_ptr<cucascade::io::ioctx> const& ioctx)
+/// Top-level leaf columns of a parquet file by Iceberg field ID. Nested keys are declined by the
+/// gate, so nested leaves are skipped.
+std::unordered_map<int32_t, std::string> top_level_leaves_by_field_id(
+  cudf::io::parquet::FileMetaData const& file_meta)
+{
+  std::unordered_map<int32_t, std::string> result;
+  std::unordered_set<int32_t> repeated;
+  if (file_meta.schema.empty()) return result;
+  std::size_t next = 1;
+  for (int32_t child = 0; child < file_meta.schema[0].num_children; ++child) {
+    if (next >= file_meta.schema.size())
+      throw std::runtime_error("[iceberg] equality-delete file has a truncated parquet schema");
+    auto const& element = file_meta.schema[next];
+    if (element.num_children == 0 && element.field_id.has_value() &&
+        !result.emplace(element.field_id.value(), element.name).second)
+      repeated.insert(element.field_id.value());
+    // Skip this element's whole subtree.
+    std::size_t pending = 1;
+    while (pending > 0) {
+      if (next >= file_meta.schema.size())
+        throw std::runtime_error("[iceberg] equality-delete file has a truncated parquet schema");
+      pending += static_cast<std::size_t>(std::max(file_meta.schema[next].num_children, 0));
+      --pending;
+      ++next;
+    }
+  }
+  for (auto id : repeated)
+    result.erase(id);
+  return result;
+}
+
+/// Reads the key columns of one equality-delete file onto the device, in @p key_field_ids order
+/// and normalized to the bound key types. Other columns are not read: a writer may store the
+/// whole deleted row, and matching on those deletes nothing once a non-key value has changed.
+std::unique_ptr<cudf::table> read_equality_delete_file(
+  std::string const& delete_file_path,
+  std::shared_ptr<cucascade::io::ioctx> const& ioctx,
+  std::vector<int32_t> const& key_field_ids,
+  iceberg_equality_plan const& plan)
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
 
   // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
-  auto datasource = sirius::io::open_datasource(ioctx, delete_file_path);
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  sources.push_back(sirius::io::open_datasource(ioctx, delete_file_path));
+  auto footers = cudf::io::read_parquet_footers(sources);
+  if (footers.size() != 1)
+    throw std::runtime_error("[iceberg] Failed to read equality-delete footer: " +
+                             delete_file_path);
+  auto const leaves = top_level_leaves_by_field_id(footers[0]);
 
-  auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
+  // Keys are found by field ID, never by name: a renamed key keeps its ID and changes its name.
+  std::vector<std::string> names;
+  names.reserve(key_field_ids.size());
+  for (auto id : key_field_ids) {
+    auto const leaf = leaves.find(id);
+    if (leaf == leaves.end())
+      throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                               "' has no top-level column with field id " + std::to_string(id) +
+                               ", which its manifest entry lists in equality_ids");
+    names.push_back(leaf->second);
+  }
+  if (std::set<std::string>(names.begin(), names.end()).size() != names.size())
+    throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                             "' maps two key field ids to one column name");
+
+  auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{sources[0].get()})
+                .columns(names)
+                .build();
   auto result = cudf::io::read_parquet(opts, stream);
-
-  if (!result.tbl) {
+  if (!result.tbl || result.metadata.schema_info.size() != names.size() ||
+      static_cast<std::size_t>(result.tbl->num_columns()) != names.size())
     throw std::runtime_error("[iceberg] Failed to read equality-delete file: " + delete_file_path);
-  }
 
-  std::vector<std::string> col_names;
-  col_names.reserve(result.metadata.schema_info.size());
-  for (auto const& si : result.metadata.schema_info) {
-    col_names.push_back(si.name);
-  }
-
-  std::vector<std::optional<int32_t>> field_ids;
-  try {
-    // The table read has completed, so moving ownership to the footer pass is safe.
-    std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-    sources.push_back(std::move(datasource));
-    auto footers = cudf::io::read_parquet_footers(sources);
-
-    if (!footers.empty()) {
-      auto id_map = extract_field_id_map(footers[0]);
-      field_ids.reserve(col_names.size());
-      for (auto const& name : col_names) {
-        auto it = id_map.find(name);
-        field_ids.push_back(it != id_map.end() ? std::optional{it->second} : std::nullopt);
-      }
+  // Placed by returned name rather than trusting the reader to keep the requested order.
+  auto columns = result.tbl->release();
+  std::vector<std::unique_ptr<cudf::column>> keys(names.size());
+  for (std::size_t k = 0; k < names.size(); ++k) {
+    std::size_t found = names.size();
+    for (std::size_t c = 0; c < names.size(); ++c)
+      if (result.metadata.schema_info[c].name == names[k]) found = c;
+    if (found == names.size() || !columns[found])
+      throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                               "' did not return key column '" + names[k] + "'");
+    auto const want = bound_key_type(plan.keys.at(key_field_ids[k]).type);
+    auto const have = columns[found]->type().id();
+    if (have == want) {
+      keys[k] = std::move(columns[found]);
+    } else if (have == cudf::type_id::INT32 && want == cudf::type_id::INT64) {
+      // The one promotion Iceberg allows for an integer key: the delete file predates it.
+      keys[k] = cudf::cast(columns[found]->view(), cudf::data_type{want}, stream);
+    } else {
+      throw std::runtime_error(
+        "[iceberg] equality-delete file '" + delete_file_path + "' stores key field id " +
+        std::to_string(key_field_ids[k]) + " as cuDF type " +
+        std::to_string(static_cast<int>(have)) + ", which cannot be compared with the bound " +
+        duckdb::EnumUtil::ToString(plan.keys.at(key_field_ids[k]).type) + " column");
     }
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_DEBUG(
-      "[iceberg] Could not extract field IDs from '{}': {}", delete_file_path, e.what());
-    field_ids.clear();
   }
-
   stream.sync();
-  SIRIUS_LOG_INFO("[iceberg] read equality-delete: path={} rows={} cols={}",
+  auto table = std::make_unique<cudf::table>(std::move(keys));
+  SIRIUS_LOG_INFO("[iceberg] read equality-delete: path={} rows={} key_cols={}",
                   delete_file_path,
-                  result.tbl->num_rows(),
-                  result.tbl->num_columns());
-  return {std::move(result.tbl), std::move(col_names), std::move(field_ids)};
+                  table->num_rows(),
+                  table->num_columns());
+  return table;
 }
 
 /// Merges V2 positional deletes and V3 deletion vectors into one per-data-file map.
@@ -671,71 +887,96 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
   }
 }
 
-/// Groups equality deletes by (schema, sequence number) so the scan-time applicability check is
-/// one CPU comparison per group.
-void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
+/// Builds the delete groups the scan probes and records which of them each data file needs.
+/// A group is the delete files that share their keys and apply to exactly the same data files,
+/// so memory grows with the delete rows, not with the number of distinct applicability sets.
+void materialize_equality_deletes(duckdb::ClientContext& context,
+                                  iceberg_equality_plan const& plan,
                                   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
                                   IcebergDeleteData& data)
 {
-  if (eq_entries.empty()) return;
+  // Distinct applicability lists. Data files sharing a list share one group list below, and
+  // that shared pointer is what the batch coalescer compares.
+  std::map<std::vector<uint32_t>, uint32_t> class_of_list;
+  std::vector<std::vector<uint32_t> const*> classes;
+  for (auto const& [data_file, files] : plan.by_data_file) {
+    auto const [slot, fresh] =
+      class_of_list.emplace(files, static_cast<uint32_t>(class_of_list.size()));
+    if (fresh) classes.push_back(&slot->first);
+  }
 
-  SIRIUS_LOG_INFO("[iceberg] Loading {} equality-delete file(s).", eq_entries.size());
+  // Each delete file's signature: the classes that use it. Unused files are never opened.
+  std::vector<std::vector<uint32_t>> signature(plan.files.size());
+  for (auto const& [files, id] : class_of_list)
+    for (auto file : files)
+      signature.at(file).push_back(id);
+  for (auto& classes_using : signature)
+    std::sort(classes_using.begin(), classes_using.end());
 
-  struct FileGroup {
-    std::vector<std::string> key_names;
-    std::vector<std::optional<int32_t>> key_field_ids;
+  std::map<std::pair<std::vector<int32_t>, std::vector<uint32_t>>, uint32_t> group_of;
+  std::vector<std::vector<uint32_t>> group_files;
+  std::vector<uint32_t> group_of_file(plan.files.size(), 0);
+  for (uint32_t file = 0; file < plan.files.size(); ++file) {
+    if (signature[file].empty()) continue;
+    // Canonical key order, so two files listing the same ids in a different order still merge.
+    auto ids = plan.files[file].equality_ids;
+    std::sort(ids.begin(), ids.end());
+    auto const [slot, fresh] = group_of.emplace(std::pair{std::move(ids), signature[file]},
+                                                static_cast<uint32_t>(group_files.size()));
+    if (fresh) group_files.emplace_back();
+    group_files[slot->second].push_back(file);
+    group_of_file[file] = slot->second;
+  }
+
+  SIRIUS_LOG_INFO("[iceberg] Loading equality deletes: {} file(s) in {} group(s).",
+                  plan.files.size(),
+                  group_files.size());
+  data.equality_delete_groups.resize(group_files.size());
+  for (auto const& [key, group_index] : group_of) {
+    auto const& ids = key.first;
+    std::vector<std::size_t> primary;
+    primary.reserve(ids.size());
+    for (auto id : ids)
+      primary.push_back(plan.keys.at(id).primary_index);
     std::vector<std::unique_ptr<cudf::table>> tables;
-    int64_t sequence_number;
-  };
-  std::vector<FileGroup> groups;
-  // Indexed rather than scanned: every commit can write a delete file at a NEW sequence number,
-  // so the group count grows with the file count and a linear search per file would compare
-  // O(files²) name vectors.
-  std::unordered_map<std::string, std::size_t> group_index;
-
-  for (auto const& eq_entry : eq_entries) {
-    SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {} (seq={})",
-                     eq_entry.file_path,
-                     eq_entry.sequence_number);
-    auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
-
-    std::string key = std::to_string(eq_entry.sequence_number);
-    for (auto const& name : read_result.col_names) {
-      key += '\0';  // not a legal column-name character, so the join is unambiguous
-      key += name;
-    }
-
-    auto const [it, inserted] = group_index.emplace(std::move(key), groups.size());
-    if (inserted) {
-      groups.push_back(
-        {read_result.col_names, read_result.field_ids, {}, eq_entry.sequence_number});
-    }
-    groups[it->second].tables.push_back(std::move(read_result.tbl));
-  }
-
-  for (auto& g : groups) {
-    if (g.tables.empty()) continue;
     std::vector<cudf::table_view> views;
-    views.reserve(g.tables.size());
-    for (auto const& table : g.tables) {
-      views.push_back(table->view());
+    std::vector<std::string> paths;
+    for (auto file : group_files[group_index]) {
+      if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
+      tables.push_back(read_equality_delete_file(plan.files[file].file_path, ioctx, ids, plan));
+      views.push_back(tables.back()->view());
+      paths.push_back(plan.files[file].file_path);
     }
-    auto group = build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), views);
-    group.sequence_number = g.sequence_number;
-    data.equality_delete_groups.push_back(std::move(group));
+    auto group                               = build_equality_group(ids, std::move(primary), views);
+    group.delete_files                       = std::move(paths);
+    data.equality_delete_groups[group_index] = std::move(group);
   }
 
-  SIRIUS_LOG_INFO("[iceberg] Built {} equality-delete group(s).",
-                  data.equality_delete_groups.size());
+  std::vector<std::shared_ptr<equality_group_list const>> list_of_class(classes.size());
+  for (auto const& [files, id] : class_of_list) {
+    equality_group_list groups;
+    for (auto file : files)
+      groups.push_back(group_of_file[file]);
+    std::sort(groups.begin(), groups.end());
+    groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+    list_of_class[id] = std::make_shared<equality_group_list const>(std::move(groups));
+  }
+  for (auto const& [data_file, files] : plan.by_data_file)
+    data.equality_groups_by_data_file.emplace(data_file, list_of_class[class_of_list.at(files)]);
 }
 
 }  // anonymous namespace
 
-EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
-                                         std::vector<std::optional<int32_t>> key_field_ids,
+EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
+                                         std::vector<std::size_t> key_primary_indices,
                                          std::vector<cudf::table_view> const& views)
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
+  if (views.empty() || key_field_ids.empty() || key_field_ids.size() != key_primary_indices.size())
+    throw std::invalid_argument("[iceberg] an equality-delete group needs files and keys");
+  for (auto const& view : views)
+    if (static_cast<std::size_t>(view.num_columns()) != key_field_ids.size())
+      throw std::invalid_argument("[iceberg] an equality-delete table does not match its keys");
 
   auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
                                       : cudf::concatenate(views, stream);
@@ -750,25 +991,20 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                 cudf::nan_equality::ALL_EQUAL,
                                 stream);
 
-  // Avoid fmt::join — it requires <fmt/ranges.h> which the vcpkg fmt build
-  // does not pull in transitively. Format the comma-joined list manually.
-  std::string key_names_joined;
-  for (size_t i = 0; i < key_names.size(); ++i) {
-    if (i > 0) key_names_joined += ", ";
-    key_names_joined += key_names[i];
-  }
-  SIRIUS_LOG_INFO(
-    "[iceberg] Equality-delete group [{}]: {} row(s).", key_names_joined, deduped->num_rows());
+  SIRIUS_LOG_INFO("[iceberg] Equality-delete group over {} key column(s): {} row(s).",
+                  key_field_ids.size(),
+                  deduped->num_rows());
 
+  // A NULL delete key matches a NULL data value -- `col IS NULL`, the opposite of a SQL join.
   auto hash_join = std::make_unique<cudf::distinct_hash_join>(
     deduped->view(), cudf::null_equality::EQUAL, 0.5, stream);
   stream.sync();
 
   EqualityDeleteGroup group;
-  group.delete_table  = std::move(deduped);
-  group.key_names     = std::move(key_names);
-  group.key_field_ids = std::move(key_field_ids);
-  group.hash_join     = std::move(hash_join);
+  group.delete_table        = std::move(deduped);
+  group.key_field_ids       = std::move(key_field_ids);
+  group.key_primary_indices = std::move(key_primary_indices);
+  group.hash_join           = std::move(hash_join);
   return group;
 }
 
@@ -785,10 +1021,6 @@ uint64_t iceberg_delete_data_uncached_read_count()
 }
 
 namespace {
-
-/// The single switch that turns the equality-delete route on. Two defects keep it false; both are
-/// named at the refusal site below.
-constexpr bool kEqualityDeleteRouteImplementedToSpec = false;
 
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   duckdb::ClientContext& context,
@@ -825,28 +1057,11 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
     materialize_positional_deletes(context, discovery, data->positional_deletes);
   }
   if (has_eq_deletes) {
-    // The plan gate declines these tables, so reaching here means it has a hole. Two pieces of
-    // this machinery do not implement the spec yet and both fail SILENTLY:
-    //
-    //  1. applies_to compares the MANIFEST's sequence number, not the entry's inherited data
-    //     sequence number, so after a manifest rewrite it skips deletes that apply and applies
-    //     deletes to data that post-dates them.
-    //  2. Keys are every column of the delete file, not the entry's `equality_ids`. A Flink
-    //     upsert writer persists the whole row with `equality_ids=[pk]`, so matching on all
-    //     columns deletes nothing whose non-key columns have since changed.
-    //
-    // Fix both and add tests that reach the route before flipping the flag.
-    if (!kEqualityDeleteRouteImplementedToSpec) {
-      throw std::runtime_error(
-        "[iceberg] '" + table_path + "' has " +
-        std::to_string(discovery.equality_delete_entries.size()) +
-        " live equality-delete entr(ies); the GPU path does not implement equality deletes to "
-        "spec (manifest-level sequence numbers, and keys taken from every column rather than the "
-        "entry's equality_ids), so this table must be read by DuckDB");
-    }
-    data->data_file_manifest_sequence_numbers =
-      std::move(discovery.data_file_manifest_sequence_numbers);
-    materialize_equality_deletes(discovery.equality_delete_entries, metadata_ioctx, *data);
+    if (!discovery.equality_plan)
+      throw std::runtime_error("[iceberg] '" + table_path +
+                               "' has live equality deletes but no equality plan; the plan gate "
+                               "must plan them or decline the scan");
+    materialize_equality_deletes(context, *discovery.equality_plan, metadata_ioctx, *data);
   }
 
   return data;

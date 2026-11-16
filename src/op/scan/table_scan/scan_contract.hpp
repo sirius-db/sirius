@@ -206,6 +206,11 @@ enum class verdict_reason : uint16_t {
   iceberg_puffin_uri_unsupported,
   iceberg_puffin_remote_eager,
   iceberg_delete_corrupt,
+  // Equality deletes the GPU path can read in principle but not in this shape.
+  iceberg_equality_plan_unproven,    // scan plan unreadable, or it contradicts the inventory
+  iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
+  iceberg_equality_budget,           // delete set above the plan-time budget
+  iceberg_equality_multi_gpu,        // delete tables are built on one device only
   provider_admission_refused
 };
 
@@ -264,6 +269,7 @@ struct physical_check_counters {
     iceberg_statement_route_for_testing;
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
   std::optional<uint64_t> statement_dv_limit_for_testing;
+  std::optional<int64_t> statement_equality_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
@@ -453,6 +459,32 @@ struct pre_decline {
   std::string text;
 };
 
+// One live equality-delete file, as the Iceberg extension's scan plan describes it.
+struct iceberg_equality_delete_file {
+  std::string file_path;
+  // Field IDs that decide row equality, in manifest order. Never the delete file's column list:
+  // a writer may store the whole deleted row.
+  std::vector<int32_t> equality_ids;
+  int64_t record_count         = 0;
+  int64_t file_size_in_bytes   = 0;
+  int64_t data_sequence_number = 0;  // Inherited value, from the inventory.
+};
+
+// Which equality-delete files apply to which data file. Applicability is resolved by the Iceberg
+// extension, the reader the CPU path uses, and cross-checked against inventory sequence numbers.
+struct iceberg_equality_plan {
+  std::vector<iceberg_equality_delete_file> files;
+  // Every data file of the snapshot, keyed as the manifest wrote its path, to the sorted indices
+  // of the `files` that apply. A scanned file absent from this map must be refused.
+  std::unordered_map<std::string, std::vector<uint32_t>> by_data_file;
+  struct key {
+    std::size_t primary_index;   // Index into the bound schema (P-space).
+    duckdb::LogicalTypeId type;  // Bound type; delete-file key columns are normalized to it.
+  };
+  // Field ID of every key in any `equality_ids` -> its bound column. Filled by the plan gate.
+  std::unordered_map<int32_t, key> keys;
+};
+
 // The live metadata rows stay owned by one scan node until Iceberg lowering.
 // S3 populates this from the single inventory query.
 struct iceberg_delete_inventory {
@@ -462,8 +494,12 @@ struct iceberg_delete_inventory {
     int64_t manifest_sequence_number = 0;
     std::string file_format;
     std::string manifest_path;
+    // Inherited data sequence number. Differs from the manifest's after a manifest rewrite.
+    int64_t data_sequence_number = 0;
   };
   std::vector<entry> entries;
+  // Present only when the snapshot has live equality deletes and they were planned.
+  std::optional<iceberg_equality_plan> equality;
 };
 
 struct pre_capture_result {
