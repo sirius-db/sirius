@@ -1069,7 +1069,7 @@ SET enable_compressed_materialization = false;
 
 `enable_dictionary_carrier` (also accepted under `sirius.operator_params`) extends this to strings.
 A VARCHAR column the scan does not filter on qualifies when its source stores it as a dictionary:
-- its GPU-tier pin uses a Simpatico `dictionary` plan in every chunk;
+- its GPU- or host-tier pin uses a Simpatico `dictionary` plan in every chunk;
 - it is a Parquet column whose every chunk in the first file is dictionary-encoded with a
   dictionary of at most 256 KB, and the scan has no table filters at all (under a reader row filter
   cuDF cannot transcode the pages and would hash-encode every string column);

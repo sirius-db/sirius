@@ -4058,7 +4058,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
 
   config.AddExtensionOption(
     "enable_dictionary_carrier",
-    "Keep dictionary-encoded VARCHAR columns (GPU-tier pins, Parquet, DuckDB-native storage) as "
+    "Keep dictionary-encoded VARCHAR columns (compressed pins, Parquet, DuckDB-native storage) as "
     "DICTIONARY32 carriers past the scan, so grouped aggregates group on the codes (off by "
     "default)",
     LogicalType::BOOLEAN,

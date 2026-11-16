@@ -41,7 +41,8 @@
 // The tier narrowing policy: the analysis-only first pass of `apply_compressed_schema_passes`. It
 // walks the pre-propagation tree with the same traversal skeleton and per-operator column maps as
 // `propagate_compressed_schema`, tracing each candidate narrow scan column (a non-native sidecar
-// entry of a scan marked `sidecar_from_gpu_tier_pin`) upward and accumulating four use flags per
+// entry of a scan marked `sidecar_from_gpu_tier_pin`, or any dictionary carrier) upward and
+// accumulating four use flags per
 // column: transport (survives into a hash-join payload output or an eligible grouped-aggregate key
 // output), narrow_comparison (engages a narrow-domain comparison or BETWEEN), evaluator_restore
 // (any other reference occurrence inside an expression), and boundary_restore (dies where
@@ -348,16 +349,18 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       // case marks boundary restores anyway.
       auto& scan = op.Cast<sirius::op::sirius_physical_table_scan>();
       carried_columns map(op.types.size());
-      if ((!scan.sidecar_from_gpu_tier_pin && !scan.sidecar_from_source_dictionaries) ||
-          !op.has_physical_overrides()) {
-        return map;
-      }
+      if (!op.has_physical_overrides()) { return map; }
+      // A host-tier pin keeps its narrow numeric columns, which shrink the upload, but its
+      // dictionary carriers upload the same compressed bytes either way and are judged.
+      bool const judge_narrow =
+        scan.sidecar_from_gpu_tier_pin || scan.sidecar_from_source_dictionaries;
       auto const native    = native_physical_schema(op);
       auto const& physical = op.get_physical_types();
       D_ASSERT(native.size() == physical.size());
       if (native.size() != physical.size()) { return map; }
       for (std::size_t column_idx = 0; column_idx < physical.size(); ++column_idx) {
         if (physical[column_idx] == native[column_idx]) { continue; }
+        if (!judge_narrow && physical[column_idx].id() != cudf::type_id::DICTIONARY32) { continue; }
         map[column_idx] = state.candidates.size();
         state.candidates.push_back({&scan, column_idx, physical[column_idx]});
       }

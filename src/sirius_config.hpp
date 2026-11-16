@@ -332,7 +332,7 @@ struct operator_params {
 
   /// Keep a dictionary-encoded VARCHAR column as a cuDF DICTIONARY32 carrier (keys plus codes) past
   /// the scan, so a grouped aggregate groups on its codes instead of decoded strings. Covers
-  /// GPU-tier pins dictionary-encoded in every chunk, Parquet columns dictionary-encoded in every
+  /// compressed pins dictionary-encoded in every chunk, Parquet columns dictionary-encoded in every
   /// row group, and DuckDB-native columns stored as dictionaries. Independent of
   /// `enable_compressed_materialization`. A column the scan filters on keeps its native carrier,
   /// and a Parquet scan with any reader filter carries no dictionaries.

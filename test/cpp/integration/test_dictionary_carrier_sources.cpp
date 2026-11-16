@@ -16,10 +16,11 @@
 
 /**
  * @file test_dictionary_carrier_sources.cpp
- * @brief enable_dictionary_carrier on unpinned Parquet and DuckDB-native scans.
+ * @brief enable_dictionary_carrier on Parquet, DuckDB-native, and compressed pinned scans.
  *
  * The planner carries a string column as DICTIONARY32 when its storage dictionary-encodes it and
- * the scan does not filter it, and every query over such a carrier returns DuckDB's results.
+ * the scan does not filter it, and every query over such a carrier returns DuckDB's results. A
+ * compressed pin qualifies on either tier.
  */
 
 #include "utils/gpu_execution_fixture.hpp"
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace {
@@ -89,9 +91,41 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
 
   ~DictionaryCarrierFixture()
   {
-    con->Query("RESET enable_dictionary_carrier;");
+    if (pinned) { con->Query("CALL unpin_table('t');"); }
+    for (auto const* setting : {"enable_dictionary_carrier",
+                                "pin_table_compression",
+                                "pin_table_compression_min_batch_size_bytes",
+                                "pin_table_compression_max_compressed_fraction",
+                                "pin_table_input_compression_plan_dir"}) {
+      con->Query("RESET " + std::string(setting) + ";");
+    }
     std::error_code ignored;
     fs::remove_all(dir, ignored);
+  }
+
+  // Pin `t` Simpatico-compressed on @p tier, with dictionary plans for the strings that repeat.
+  void pin_compressed(std::string const& tier)
+  {
+    auto const plan_dir = dir / "plans";
+    fs::create_directories(plan_dir);
+    {
+      std::ofstream plan(plan_dir / "t.txt");
+      plan << "input -> identity\n"
+              "---\n"
+              "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+              "---\n"
+              "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+              "---\n"
+              "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+              "---\n"
+              "input -> identity\n";
+    }
+    run_ok("SET pin_table_compression = true;");
+    run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+    run_ok("SET pin_table_compression_max_compressed_fraction = 2.0;");
+    run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
+    run_ok("CALL pin_table(format='duckdb', name='t', tier='" + tier + "');");
+    pinned = true;
   }
 
   // The number of scan outputs the planner carries as DICTIONARY32.
@@ -108,7 +142,7 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
       carried = static_cast<std::size_t>(std::ranges::count_if(
         scan->get_physical_types(),
         [](cudf::data_type type) { return type.id() == cudf::type_id::DICTIONARY32; }));
-      CHECK(scan->sidecar_from_source_dictionaries == (carried > 0));
+      CHECK(scan->sidecar_from_source_dictionaries == (!pinned && carried > 0));
     }
     run_ok("ROLLBACK;");
     run_ok("SET gpu_execution = true;");
@@ -138,6 +172,7 @@ class DictionaryCarrierFixture : public sirius::test::GpuExecutionFixture {
 
   fs::path dir;
   std::string parquet;
+  bool pinned = false;
 };
 
 }  // namespace
@@ -167,6 +202,21 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
   CHECK(carried_dictionaries("SELECT low, x FROM t WHERE x > 10") == 1);
   run_ok("SET enable_dictionary_carrier = false;");
   CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 0);
+}
+
+TEST_CASE_METHOD(
+  DictionaryCarrierFixture,
+  "dictionary carrier - a compressed pin carries its dictionary columns on either tier",
+  "[integration][gpu_execution][dictionary_carrier]")
+{
+  auto const tier = GENERATE(as<std::string>{}, "gpu", "host");
+  CAPTURE(tier);
+  pin_compressed(tier);
+  CHECK(carried_dictionaries("SELECT low, count(*) FROM t GROUP BY low") == 1);
+  CHECK(carried_dictionaries("SELECT low, nullable, \"group\" FROM t") == 3);
+  // An identity plan stores `distinct_values` as plain strings.
+  CHECK(carried_dictionaries("SELECT low, distinct_values FROM t") == 1);
+  compare_all("t");
 }
 
 TEST_CASE_METHOD(DictionaryCarrierFixture,

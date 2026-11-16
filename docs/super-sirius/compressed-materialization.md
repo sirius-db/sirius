@@ -173,7 +173,8 @@ narrowing always shrinks, so host-tier-backed sidecars are never touched: only s
 pinned-native, and host-tier scans structurally invisible to the pass. The one unpinned exception
 is a fresh Parquet or DuckDB-native scan stamped `sidecar_from_source_dictionaries`, whose only
 targets are [dictionary carriers](optimizations.md#dictionary-carrier); it has no upload term
-either, so it is judged the same way. A GPU-tier serve has no
+either, so it is judged the same way. A host-tier pin's dictionary carriers are judged too: its
+chunks upload the same compressed bytes whether or not the decode keeps the dictionary. A GPU-tier serve has no
 upload term, so each narrow column must justify itself through the plan.
 
 The pass walks the physical tree bottom-up with the same traversal and per-operator column maps
