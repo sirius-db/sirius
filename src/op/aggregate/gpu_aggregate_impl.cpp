@@ -162,8 +162,8 @@ std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view const& codes,
 ///
 /// A STRING key whose batch is dictionary-encoded is grouped on its INT32 codes. Without
 /// @p encoded_keys, its result column is decoded back to STRING. With @p encoded_keys, the result
-/// column holds the codes, and `(*encoded_keys)[i]` owns the DICTIONARY32 column whose keys are the
-/// strings of key `i` (null for a key that is not encoded); see decode_key_codes().
+/// column holds the codes, and `(*encoded_keys)[i]` is the STRING column of the distinct strings of
+/// key `i` that the codes index (null for a key that is not encoded); see decode_key_codes().
 std::unique_ptr<cudf::table> grouped_aggregate_table(
   cudf::table_view input_table,
   const std::vector<int>& group_idx,
@@ -318,6 +318,7 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   constexpr double dict_encode_min_avg_len = 8.0;
   constexpr double dict_encode_max_ratio   = 0.10;
   // The DICTIONARY32 column of each encoded key, by key position; the group-by runs on its codes.
+  // After the group-by, only its keys child (the distinct strings) is kept.
   std::vector<std::unique_ptr<cudf::column>> encoded_key_owners(group_idx.size());
   std::vector<std::optional<cudf::column_view>> encoded_key_strings(group_idx.size());
   std::vector<cudf::column_view> group_cols;
@@ -602,6 +603,14 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
   // Nothing reads the temporary input buffers after the groupby, so release them before the
   // allocations below. The result loop only reads type metadata from `requests[i].values`.
   temp_struct_cols.clear();
+  // Likewise the codes of encoded keys, one INT32 per input row: keep only the distinct strings.
+  for (std::size_t i = 0; i < encoded_key_owners.size(); ++i) {
+    if (!encoded_key_owners[i]) { continue; }
+    auto contents = encoded_key_owners[i]->release();
+    encoded_key_owners[i] =
+      std::move(contents.children[cudf::dictionary_column_view::keys_column_index]);
+    encoded_key_strings[i] = encoded_key_owners[i]->view();
+  }
   auto output_cols = groupby_result.first->release();
 
   // Expand the single label key back into the original group key columns. The groupby emits
@@ -768,9 +777,10 @@ std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
 /// Expand the partial aggregate @p partial, grouped by all @p num_keys keys, into one block of
 /// rows per grouping set. See `gpu_aggregate_impl::local_grouping_sets_aggregate()`.
 ///
-/// @p encoded_keys is empty, or has one entry per key: the DICTIONARY32 column of a key that
-/// @p partial holds as INT32 codes (see grouped_aggregate_table()), or null. Such keys are
-/// re-aggregated on their codes and decoded to STRING only in the output.
+/// @p encoded_keys is empty, or has one entry per key: for a key that @p partial holds as INT32
+/// codes (see grouped_aggregate_table()), the STRING column of the distinct strings they index;
+/// otherwise null. Such keys are re-aggregated on their codes and decoded to STRING only in the
+/// output.
 std::unique_ptr<cudf::table> expand_grouping_sets(
   cudf::table_view partial,
   std::size_t num_keys,
@@ -783,7 +793,7 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
 {
   std::vector<std::optional<cudf::column_view>> key_strings(num_keys);
   for (std::size_t k = 0; k < encoded_keys.size() && k < num_keys; ++k) {
-    if (encoded_keys[k]) { key_strings[k] = cudf::dictionary_column_view(*encoded_keys[k]).keys(); }
+    if (encoded_keys[k]) { key_strings[k] = encoded_keys[k]->view(); }
   }
 
   std::vector<cudf::size_type> aggregate_col_ids(aggregates.size());
