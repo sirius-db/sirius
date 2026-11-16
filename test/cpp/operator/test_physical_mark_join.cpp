@@ -1707,8 +1707,9 @@ TEST_CASE("sirius_physical_hash_join correlated MARK handles each NULL source al
   }
 }
 
-// `l.v > ANY (SELECT r.v FROM r WHERE r.g = l.g)`: the same per-group rule with an inequality IN
-// key, which is the predicate of a mixed join hashed on the correlation key.
+// `l.v <> ANY (SELECT r.v FROM r WHERE r.g = l.g)`: the same per-group rule with an inequality IN
+// key, which is the predicate of a mixed join hashed on the correlation key. The operator takes
+// any comparison, though DuckDB plans the ordered ones as aggregates.
 TEST_CASE("sirius_physical_hash_join correlated MARK applies an inequality ANY per group",
           "[physical_hash_join][mark][nulls][correlated]")
 {
