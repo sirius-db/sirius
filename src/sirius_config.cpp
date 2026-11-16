@@ -509,6 +509,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
   r.optional("enable_exists_minmax_rewrite", opt.enable_exists_minmax_rewrite);
   r.optional("enable_narrowing_expression_pushdown", opt.enable_narrowing_expression_pushdown);
+  r.optional("enable_build_side_swap", opt.enable_build_side_swap);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "

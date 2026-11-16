@@ -336,6 +336,10 @@ struct operator_params {
   /// See `push_narrowing_expressions`.
   bool enable_narrowing_expression_pushdown = true;
 
+  /// Build an inner join on its filtered side when the unfiltered side is larger. See
+  /// `swap_unfiltered_builds`.
+  bool enable_build_side_swap = false;
+
   /// Distributed execution: apply a HAVING above a grouped aggregate's merge to the partial
   /// groups that the Parquet footers prove already whole (see op::complete_group_having).
   bool enable_complete_group_having = true;

@@ -3039,6 +3039,13 @@ static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
                    params->enable_narrowing_expression_pushdown);
 }
 
+static void SetEnableBuildSideSwap(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                   = get_operator_params(context, scope);
+  params->enable_build_side_swap = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_BUILD_SIDE_SWAP to {}", params->enable_build_side_swap);
+}
+
 static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                         = get_operator_params(context, scope);
@@ -3542,6 +3549,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
                     SetEnableNarrowingExpressionPushdown);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_build_side_swap",
+                    "runtime override for building inner joins on their filtered side",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_build_side_swap),
+                    SetEnableBuildSideSwap);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_complete_group_having",

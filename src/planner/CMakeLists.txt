@@ -17,6 +17,7 @@ target_sources(
           scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
           substrait_scan_ranges.cpp
+          build_side_choice.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp
