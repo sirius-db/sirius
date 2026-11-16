@@ -26,6 +26,7 @@
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -33,6 +34,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -511,6 +513,37 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
+/// Which cuCascade io stack reads and writes the spill files of a DISK memory space.
+enum class disk_io_backend : uint8_t {
+  AUTOMATIC,  ///< cuCascade's choice: cuFile when GPUDirect Storage works, else io_uring
+  URING,      ///< io_uring reactors
+  CUFILE,     ///< cuFile reactors; POSIX I/O where GPUDirect Storage is off or unavailable
+};
+
+[[nodiscard]] std::optional<disk_io_backend> parse_disk_io_backend(std::string_view name) noexcept;
+[[nodiscard]] std::string_view to_string(disk_io_backend backend) noexcept;
+
+/// Spill-file I/O of one DISK memory space (`sirius.memory.disk.io`, `sirius.space.disk[].io`).
+struct disk_io_config {
+  /// Unset selects the default: the cuFile reactors when this build has them, else AUTOMATIC.
+  std::optional<disk_io_backend> backend;
+  /// false: buffered I/O through the page cache. true: O_DIRECT, and GPUDirect Storage with the
+  /// cuFile reactors.
+  bool direct_io{false};
+  /// Reactor threads serving the space's transfers; 0 keeps cuCascade's own count (4 io_uring
+  /// reactors, a pinned group of cuFile reactors per GPU).
+  std::size_t reactors{8};
+
+  [[nodiscard]] bool operator==(const disk_io_config&) const = default;
+};
+
+/// The backend @p config resolves to in this build (see disk_io_config::backend).
+[[nodiscard]] disk_io_backend effective_disk_io_backend(const disk_io_config& config) noexcept;
+
+/// The cuCascade options that build the io context described by @p config.
+[[nodiscard]] cucascade::disk_io_context_options to_disk_io_context_options(
+  const disk_io_config& config);
+
 /// Parameters controlling Simpatico compression. The unprefixed fields apply to
 /// pin_table(tier=>'host'); the spill_ fields apply to batches the downgrade
 /// executor spills to the host or disk tier.
@@ -609,6 +642,10 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
+  /// Spill-file I/O settings of the DISK memory space @p disk_id; the defaults when the space
+  /// has no `io` block.
+  [[nodiscard]] disk_io_config get_disk_io_config(int disk_id) const;
+
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
@@ -704,6 +741,8 @@ struct sirius_config {
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
+  /// `io` blocks of the DISK memory spaces, by disk id.
+  std::map<int, disk_io_config> _disk_io_configs;
   creator::task_creator_config _task_creator_config;
   /// Query admission limit (`sirius.max_concurrent_queries`).
   int _max_concurrent_queries{1};

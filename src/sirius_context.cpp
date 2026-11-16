@@ -60,6 +60,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/disk_io_context.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -94,6 +95,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace duckdb {
 
@@ -993,11 +995,33 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   }
 
   // A spill directory that is missing or not writable fails every write to the disk tier
-  // while the run goes on without one; refuse to start instead.
-  for (auto const& space : config_.get_memory_space_configs()) {
-    if (auto const* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space)) {
-      sirius::validate_spill_directory(disk->mount_paths);
+  // while the run goes on without one; refuse to start instead. Each disk space gets the io
+  // context its `io` settings describe; spaces with equal settings share one context (one set
+  // of reactors).
+  auto memory_space_configs = config_.get_memory_space_configs();
+  std::vector<std::pair<sirius::disk_io_config, std::shared_ptr<cucascade::io::ioctx>>>
+    disk_io_contexts;
+  for (auto& space : memory_space_configs) {
+    auto* disk = std::get_if<cucascade::memory::disk_memory_space_config>(&space);
+    if (disk == nullptr) { continue; }
+    sirius::validate_spill_directory(disk->mount_paths);
+    if (disk->io_context != nullptr) { continue; }
+    auto const io = config_.get_disk_io_config(disk->disk_id);
+    auto shared   = std::ranges::find(disk_io_contexts, io, [](auto const& e) { return e.first; });
+    if (shared == disk_io_contexts.end()) {
+      auto context = cucascade::make_disk_io_context(sirius::to_disk_io_context_options(io));
+      shared       = disk_io_contexts.emplace(disk_io_contexts.end(), io, std::move(context));
     }
+    disk->io_context = shared->second;
+    SIRIUS_LOG_INFO(
+      "SiriusContext: disk space {} ('{}') spills through the {} reactors (backend setting {}, "
+      "direct_io {}, {} reactors)",
+      disk->disk_id,
+      disk->mount_paths,
+      shared->second->type() == cucascade::io::io_context_type::cufile ? "cuFile" : "io_uring",
+      sirius::to_string(sirius::effective_disk_io_backend(io)),
+      io.direct_io,
+      io.reactors);
   }
   sirius::pipeline::gpu_pipeline_executor::set_reservation_policy(
     config_.get_reservation_wait_policy());
@@ -1015,8 +1039,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       config_.get_scan_manager_config(), gpu_ids, config_.get_hw_topology());
   }
 
-  memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    config_.get_memory_space_configs());
+  memory_manager_ =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(memory_space_configs);
 
   // The usage limit bounds what Sirius allocates, not what the device's memory pool reserves:
   // under spilling the pool can hold up to 1.4 times the limit and not give it back, and

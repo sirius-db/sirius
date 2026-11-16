@@ -71,25 +71,27 @@ memory_capacity = 1TB;          // reservation / in-flight conversion bound, not
 ### DISK I/O and ownership
 
 Raw spills and compressed `.hpln` spills use the same per-space
-`std::shared_ptr<cucascade::io::ioctx>`. Unless a context is supplied through the C++ API,
-`get_or_init_io_context(cucascade::default_disk_io_context)` adopts the default on first
-conversion. That default is process-shared but cached only through a weak pointer: live
-spaces and in-flight conversions hold strong references, not a static owning singleton or
-a separate reactor pool per mount. An unused DISK space starts no I/O workers.
+`std::shared_ptr<cucascade::io::ioctx>`. `SiriusContext` builds it at startup with
+`cucascade::make_disk_io_context()` from the space's `io` settings
+([configuration](configuration.md#spill-file-io-siriusmemorydiskio)) and hands it to the
+space; spaces with equal settings share one context. The default is the cuFile reactors with
+buffered I/O and eight reactor threads, which start with the context and stay idle until the
+first spill. A DISK space built through the C++ API without a context still adopts
+`cucascade::default_disk_io_context()` on its first conversion.
 
-Automatic selection prefers **cuFile with real GDS**, then **usable io_uring**, then the
-**cuFile POSIX/staging path** when io_uring is unavailable or forbidden. cuFile compatibility
-mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `uring`, and
-`cufile`. These DISK contexts are independent of the scan backend; the removed kvikIO
-backend is not supported for reads or writes.
+The cuCascade DISK factory supports `automatic`, `uring`, and `cufile`. Its `automatic`
+prefers **cuFile with real GDS**, then **usable io_uring**, then the **cuFile POSIX/staging
+path** when io_uring is unavailable or forbidden; cuFile compatibility mode alone is not real
+GDS. These DISK contexts are independent of the scan backend; the removed kvikIO backend is
+not supported for reads or writes.
 
 A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
 (64 MiB of portable pinned staging per reactor). A cuFile one borrows its pinned host
 scratch from the HOST space of the GPU's NUMA node for each transfer and gives it back
 before the transfer settles; device-write bodies on a real GDS host go through the same
 registered GPU staging slots as scan reads. Destruction stops/drains reactor
-workers before releasing their staging. The weak default cache does not prolong that
-lifetime; spill representations and contexts must still be released before CUDA/RMM global
+workers before releasing their staging. The memory spaces own their contexts;
+spill representations and contexts must still be released before CUDA/RMM global
 teardown, including in debug builds. Each conversion retains its context, file object and
 source/destination owners until all submitted work completes, draining futures on errors
 before buffers or partial-file guards can unwind.

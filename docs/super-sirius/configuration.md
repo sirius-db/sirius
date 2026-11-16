@@ -188,18 +188,49 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). The directory is checked at startup: a missing one is created, and Sirius refuses to start when it cannot be created, is not a directory or is not writable (it used to start and fail every spill to disk). |
 
-Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
-The default is adopted lazily on first conversion and shared process-wide through a weak
-cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uring**, then
-**cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
-reactor teardown and its staging (a cuFile context borrows its pinned host scratch from the
-HOST space per transfer); see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+Raw and compressed `.hpln` spills use the DISK space's `cucascade::io::ioctx`, built at
+startup from the space's `io` block (below). The context owns its reactor
+teardown and its staging (a cuFile context borrows its pinned host scratch from the HOST
+space per transfer); see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+Disk spaces with equal `io` settings share one context.
 
-The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
-layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
-settings, and no backend registration is required. `sirius.executor.scan_manager.backend`,
-reactor counts and cache settings configure independent scan contexts, not this spill
-default. The removed kvikIO backend is not available for reads or writes.
+#### Spill-file I/O (`sirius.memory.disk.io`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `backend` | string | `cufile` (see below) | `cufile`: cuCascade's cuFile reactors. `uring`: its io_uring reactors. `automatic`: cuCascade chooses, cuFile when GPUDirect Storage really works on the host, else io_uring, else the cuFile reactors if io_uring is forbidden in the process. |
+| `direct_io` | bool | false | `false`: buffered reads and writes through the page cache. `true`: O_DIRECT; with the cuFile reactors, device data then goes through GPUDirect Storage where the driver and the file system support it. |
+| `reactors` | int | 8 | Reactor threads that serve the space's transfers. `0` keeps cuCascade's own count: 4 io_uring reactors, or a group of cuFile reactors per GPU pinned to that GPU's CPUs. A cuFile reactor borrows up to 16 MiB of pinned staging from the HOST space while a transfer runs; each io_uring reactor pins 64 MiB of its own at startup. |
+
+With the defaults, spill files are written and read with POSIX calls on eight reactor threads,
+device data staged through pinned memory, exactly as on a host without GPUDirect Storage. This
+needs neither `libcufile` nor the `nvidia-fs` driver at run time: with `direct_io: false` the
+cuFile driver is never opened and no device staging slots are registered.
+`io: { backend: automatic, direct_io: true, reactors: 0 }` is cuCascade's own default. In a build without `cufile.h` (no cuFile reactors compiled in)
+the default `backend` is `automatic` instead, which there means io_uring.
+
+Choosing a setting:
+
+- Keep the default on network and parallel file systems. Their direct writes are usually far
+  slower than their buffered writes.
+- `direct_io: true` with `backend: cufile` is worth measuring on a local NVMe device with a
+  working GPUDirect Storage stack.
+- `backend: uring` fails at startup where the process may not use io_uring (some container
+  seccomp profiles). An invalid combination is reported when Sirius starts, not at the first
+  spill.
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: /mnt/nvme/sirius_spill
+      io: { direct_io: true, reactors: 4 }   # backend stays cufile
+```
+
+The `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and the spill-file layouts
+are unchanged. `sirius.executor.scan_manager.backend`, its reactor counts and cache settings
+configure independent scan contexts, not spilling. The removed kvikIO backend is not
+available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -307,9 +338,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
 | `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
-
-These spaces use the same [lazy DISK I/O default](#disk-memory-siriusmemorydisk),
-independent of the scan contexts; the low-level YAML surface adds no I/O selection knobs.
+| `io` | map | defaults | Spill-file I/O of this space: `backend`, `direct_io`, `reactors`, as in [`sirius.memory.disk.io`](#spill-file-io-siriusmemorydiskio). |
 
 ```yaml
 sirius:
