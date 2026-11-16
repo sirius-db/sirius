@@ -17,6 +17,7 @@
 #include "compression/compressed_payload_sources.hpp"
 
 #include "compression/device_compressed_blob.hpp"
+#include "compression/spill_io.hpp"
 #include "log/logging.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -25,7 +26,6 @@
 
 #include <api/compressed_table_io.hpp>
 #include <cucascade/data/disk_file_format.hpp>
-#include <cucascade/data/disk_io_backend.hpp>
 #include <cucascade/error.hpp>
 
 #include <algorithm>
@@ -237,9 +237,17 @@ void copy_host_bytes_to_device(std::unique_ptr<std::vector<std::byte>> bytes,
 
 class disk_payload_source final : public simpatico::payload_source {
  public:
+  // The context and the one opened file are kept for the life of the source, so every read of
+  // a window refill reuses them. Reads are cache-unaware: a spill file must never enter (or be
+  // served from) a scan cache.
   explicit disk_payload_source(const compressed_disk_representation& representation)
-    : _owner(share(representation))
+    : _owner(share(representation)),
+      _ctx(detail::spill_context(representation.get_memory_space())),
+      _object(_ctx->open_io_object(representation.path()))
   {
+    if (!_ctx->supports_device_read()) {
+      throw std::logic_error("compressed spill: DISK context cannot read device memory");
+    }
   }
 
   void read_to_device(std::uint64_t offset,
@@ -249,7 +257,6 @@ class disk_payload_source final : public simpatico::payload_source {
   {
     if (size == 0) { return; }
     auto const& file  = _owner->cast<compressed_disk_representation>();
-    auto& backend     = file.get_memory_space().get_io_backend();
     auto file_offset  = file.header_bytes() + static_cast<std::size_t>(offset);
     auto remaining    = static_cast<std::size_t>(size);
     auto* destination = static_cast<std::byte*>(dst);
@@ -260,25 +267,37 @@ class disk_payload_source final : public simpatico::payload_source {
     if (auto const misaligned = file_offset % cucascade::DISK_FILE_ALIGNMENT; misaligned != 0) {
       auto const head = std::min(remaining, cucascade::DISK_FILE_ALIGNMENT - misaligned);
       auto staged     = std::make_unique<std::vector<std::byte>>(head);
-      backend.read(file.path(), staged->data(), head, file_offset);
+      detail::check_spill_bytes(
+        _ctx->host_read_io(
+          *_object, file_offset, head, reinterpret_cast<std::uint8_t*>(staged->data())),
+        head);
       copy_host_bytes_to_device(std::move(staged), destination, stream);
       file_offset += head;
       destination += head;
       remaining -= head;
     }
-    if (remaining > 0) { backend.read(file.path(), destination, remaining, file_offset, stream); }
+    if (remaining > 0) {
+      // Resolves once the bytes are in device memory, ordered after the work on `stream`.
+      detail::spill_request request{_ctx->device_read_async_io(
+        *_object, file_offset, remaining, reinterpret_cast<std::uint8_t*>(destination), stream)};
+      detail::check_spill_bytes(request.get(), remaining);
+    }
   }
 
  private:
   std::unique_ptr<cucascade::idata_representation> _owner;
+  std::shared_ptr<cucascade::io::ioctx> _ctx;
+  std::shared_ptr<cucascade::io::io_object> _object;
 };
 
 std::shared_ptr<const simpatico::hpln_description> describe_disk(
   const compressed_disk_representation& representation)
 {
   std::vector<std::uint8_t> header(representation.header_bytes());
-  representation.get_memory_space().get_io_backend().read(
-    representation.path(), header.data(), header.size(), 0);
+  auto const ctx    = detail::spill_context(representation.get_memory_space());
+  auto const object = ctx->open_io_object(representation.path());
+  detail::check_spill_bytes(ctx->host_read_io(*object, 0, header.size(), header.data()),
+                            header.size());
   return parse_header(header);
 }
 
