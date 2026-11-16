@@ -86,8 +86,8 @@ inline bool enum_to_string(priority_order order, std::string& s)
   }
 }
 
-/// Unresolved task-creator fallback; hardware resolution derives the configured default.
-inline constexpr int default_task_creator_num_threads = 1;
+/// Fixed task-creator default, unless YAML explicitly sets the count.
+inline constexpr int default_task_creator_num_threads = 4;
 
 /// Configuration for the task creator.
 /// Embeds the thread pool config plus internal scheduling policy.

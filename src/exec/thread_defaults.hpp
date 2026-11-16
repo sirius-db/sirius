@@ -35,6 +35,7 @@ struct hardware_thread_defaults {
 /// T is logical CPU hardware threads; G counts configured GPU memory spaces.
 /// GPU pools split T/(2G) as 75% pipeline, 25% downgrade, then round down and
 /// clamp independently. Unknown CPU count / no configured GPUs use one.
+/// Task creator and scan manager use fixed defaults, independent of T and G.
 [[nodiscard]] constexpr hardware_thread_defaults derive_thread_defaults(
   unsigned int cpu_threads, std::size_t gpu_count) noexcept
 {
@@ -46,9 +47,9 @@ struct hardware_thread_defaults {
     return static_cast<int>(std::clamp(n, lo, hi));
   };
   return {.pipeline       = bounded(3 * t / (8 * g), 4, 8),
-          .task_creator   = bounded(t / 16, 1, 4),
+          .task_creator   = 4,
           .downgrade      = bounded(t / (8 * g), 1, 4),
-          .scan_manager   = bounded(3 * t / 4, 4, 32),
+          .scan_manager   = 18,
           .rest_reactors  = static_cast<std::size_t>(std::clamp<std::uint64_t>(t / 6, 2, 32)),
           .uring_reactors = t >= 32 ? 4U : 2U};
 }

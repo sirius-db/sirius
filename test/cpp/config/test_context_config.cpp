@@ -82,16 +82,16 @@ TEST_CASE("hardware thread defaults round and clamp each pool", "[config][thread
     sirius::exec::hardware_thread_defaults expected;
   };
   for (auto const& row : {
-         example{0, 0, {4, 1, 1, 4, 2, 2}},
-         example{20, 1, {7, 1, 2, 15, 3, 2}},
-         example{31, 1, {8, 1, 3, 23, 5, 2}},
-         example{32, 1, {8, 2, 4, 24, 5, 4}},
-         example{39, 2, {7, 2, 2, 29, 6, 4}},
-         example{64, 8, {4, 4, 1, 32, 10, 4}},
-         example{96, 4, {8, 4, 3, 32, 16, 4}},
-         example{192, 8, {8, 4, 3, 32, 32, 4}},
-         example{std::numeric_limits<unsigned int>::max(), 1, {8, 4, 4, 32, 32, 4}},
-         example{32, std::numeric_limits<std::size_t>::max(), {4, 2, 1, 24, 5, 4}},
+         example{0, 0, {4, 4, 1, 18, 2, 2}},
+         example{20, 1, {7, 4, 2, 18, 3, 2}},
+         example{31, 1, {8, 4, 3, 18, 5, 2}},
+         example{32, 1, {8, 4, 4, 18, 5, 4}},
+         example{39, 2, {7, 4, 2, 18, 6, 4}},
+         example{64, 8, {4, 4, 1, 18, 10, 4}},
+         example{96, 4, {8, 4, 3, 18, 16, 4}},
+         example{192, 8, {8, 4, 3, 18, 32, 4}},
+         example{std::numeric_limits<unsigned int>::max(), 1, {8, 4, 4, 18, 32, 4}},
+         example{32, std::numeric_limits<std::size_t>::max(), {4, 4, 1, 18, 5, 4}},
        }) {
     CAPTURE(row.cpu, row.gpus);
     auto const actual = sirius::exec::derive_thread_defaults(row.cpu, row.gpus);

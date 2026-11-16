@@ -30,7 +30,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -69,10 +68,10 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
   return c;
 }
 
-/// Scan workers: floor(75% of logical CPU hardware threads), clamped to [4, 32].
-[[nodiscard]] inline int default_scan_manager_num_threads()
+/// Fixed scan-worker default, unless YAML explicitly sets the count.
+[[nodiscard]] inline constexpr int default_scan_manager_num_threads()
 {
-  return exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).scan_manager;
+  return exec::derive_thread_defaults(0, 0).scan_manager;
 }
 
 /// How the readahead decides *when* to issue the next prefetch.

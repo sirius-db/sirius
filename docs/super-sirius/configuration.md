@@ -322,7 +322,7 @@ See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: clamp(floor(T/16), 1, 4)`). Task creation
+Thread pool (fixed default `num_threads: 4`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
 on demand and prioritizes source-side pipelines first. The former
 `sirius.executor.task_creator.strategy` and
@@ -370,7 +370,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | clamp(floor(3T/4), 4, 32) | Metadata-producer worker threads. |
+| `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
@@ -911,28 +911,29 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | clamp(floor(T/16), 1, 4) | `task_creator` | Task creation from scheduling requests |
+| `task_creator` | `executor.task_creator` | 4 (fixed) | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | clamp(floor(3T/(8G)), 4, 8) per GPU | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | clamp(floor(T/(8G)), 1, 4) per executor | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | clamp(floor(3T/4), 4, 32) | `scan_manager` | Scan metadata production (IO reactors are separate) |
+| `scan_manager` | `executor.scan_manager` | 18 (fixed) | `scan_manager` | Scan metadata production (IO reactors are separate) |
 
 Here T is the logical CPU hardware-thread count and G is the number of configured GPU memory
 spaces, before any per-query GPU limit. Unknown CPU counts and zero configured GPUs use one.
 Each expression is rounded down once and clamped independently. Pipeline and downgrade split
 T/(2G) as 75% and 25% before applying their limits. HOST downgrade executors inherit the same
 downgrade setting. These independently capped pools do not form a total CPU-thread budget.
+Task creator and scan manager stay fixed at 4 and 18 threads, independent of T and G.
 
 REST reactors default to clamp(floor(T/6), 2, 32); uring reactors default to 2 below 32 CPU
-hardware threads and 4 otherwise. Omitted or null YAML counts use these hardware defaults;
+hardware threads and 4 otherwise. Omitted or null YAML counts use these defaults;
 explicit counts take precedence, including `rest_n_reactors: 0` for NIC-based automatic sizing.
 Resolution happens before deriving pipeline-dependent REST readahead and reserving reactor CPUs.
 
 | CPU threads | GPUs | Pipeline / GPU | Task creator | Downgrade / executor | Scan manager | REST | uring |
 |---|---|---|---|---|---|---|---|
-| 20 | 1 | 7 | 1 | 2 | 15 | 3 | 2 |
-| 32 | 1 | 8 | 2 | 4 | 24 | 5 | 4 |
-| 96 | 4 | 8 | 4 | 3 | 32 | 16 | 4 |
-| 192 | 8 | 8 | 4 | 3 | 32 | 32 | 4 |
+| 20 | 1 | 7 | 4 | 2 | 18 | 3 | 2 |
+| 32 | 1 | 8 | 4 | 4 | 18 | 5 | 4 |
+| 96 | 4 | 8 | 4 | 3 | 18 | 16 | 4 |
+| 192 | 8 | 8 | 4 | 3 | 18 | 32 | 4 |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
