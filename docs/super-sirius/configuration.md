@@ -22,7 +22,8 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
+If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 70% of each backing NUMA node's RAM for pinned host memory.
+Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
 
 ### Concurrent query admission
 

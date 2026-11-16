@@ -91,7 +91,11 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
   }
   SECTION("pool byte size overflow is rejected")
   {
-    host_settings += ", pool_size: " + std::to_string(std::numeric_limits<std::size_t>::max());
+    // Keep the count within YAML's signed range so resolution checks the byte-size overflow.
+    constexpr std::size_t block_size = 1ULL << 20;
+    constexpr auto pool_size         = std::numeric_limits<std::size_t>::max() / block_size + 1;
+    host_settings +=
+      ", block_size: " + std::to_string(block_size) + ", pool_size: " + std::to_string(pool_size);
     expected_error = "pool size in bytes overflows";
   }
   SECTION("default host budget uses seventy percent of NUMA RAM")
