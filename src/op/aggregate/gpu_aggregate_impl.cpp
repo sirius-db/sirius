@@ -139,8 +139,8 @@ namespace {
 
 /// The strings of the INT32 dictionary @p codes of a key, whose distinct values are @p strings.
 /// Rows that are NULL in @p codes are NULL in the result.
-std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view codes,
-                                               cudf::column_view strings,
+std::unique_ptr<cudf::column> decode_key_codes(cudf::column_view const& codes,
+                                               cudf::column_view const& strings,
                                                ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
@@ -852,7 +852,7 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
         requests[i].values = source_aggregates.column(static_cast<cudf::size_type>(i));
         requests[i].aggregations.push_back(make_reaggregation(aggregates[i]));
       }
-      auto [grouped_keys, results] = grouper.aggregate(requests, stream, mr);
+      auto [grouped_keys, grouped_results] = grouper.aggregate(requests, stream, mr);
       constant_key.reset();
       num_rows = grouped_keys->num_rows();
 
@@ -864,9 +864,9 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
         num_rows = 1;
       } else {
         // Re-aggregating a COUNT with SUM widens it, so match the partial column types.
-        for (std::size_t i = 0; i < results.size(); ++i) {
+        for (std::size_t i = 0; i < grouped_results.size(); ++i) {
           auto col =
-            cast_if_needed(std::move(results[i].results[0]),
+            cast_if_needed(std::move(grouped_results[i].results[0]),
                            partial_aggregates.column(static_cast<cudf::size_type>(i)).type(),
                            stream,
                            mr);
