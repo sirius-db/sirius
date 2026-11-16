@@ -100,7 +100,7 @@ static void collect_reference_indices(sirius::ast::node const& expr,
 }
 
 // Mixed plain/null-safe keys require different null policies, so route the null-safe keys
-// to the conditional predicate. MARK joins cannot use MIXED_JOIN.
+// to the conditional predicate. A MARK join never routes: see is_correlated_mark.
 static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const& conditions,
                                     duckdb::JoinType join_type)
 {
@@ -131,7 +131,7 @@ static bool all_keys_null_safe(duckdb::vector<sirius::join_condition> const& con
 // A MARK join mixing null-safe keys with anything else (a plain `=`, or an inequality). cuDF takes
 // one null_equality for every key and MARK does not route null-safe keys into the mixed-join
 // predicate, so the null-safe key would silently inherit UNEQUAL. Callers must reject this shape
-// unless it is a correlated IN (is_correlated_mark).
+// unless it is a correlated quantified comparison (is_correlated_mark).
 static bool mark_join_mixes_null_safe_keys(duckdb::vector<sirius::join_condition> const& conditions)
 {
   bool const has_null_safe = std::any_of(conditions.begin(), conditions.end(), [](auto const& c) {
@@ -140,8 +140,9 @@ static bool mark_join_mixes_null_safe_keys(duckdb::vector<sirius::join_condition
   return has_null_safe && !all_keys_null_safe(conditions);
 }
 
-// A correlated IN / = ANY (see sirius_physical_hash_join::mark_is_correlated): @p delim_key_count
-// null-safe correlation keys, then the plain IN key, in DuckDB's positions.
+// A correlated IN / ANY / ALL (see sirius_physical_hash_join::mark_is_correlated):
+// @p delim_key_count null-safe correlation keys, then the IN key under a null-propagating
+// comparison, in DuckDB's positions.
 static bool is_correlated_mark(duckdb::vector<sirius::join_condition> const& conditions,
                                duckdb::JoinType join_type,
                                std::size_t delim_key_count)
@@ -150,12 +151,14 @@ static bool is_correlated_mark(duckdb::vector<sirius::join_condition> const& con
       conditions.size() != delim_key_count + 1) {
     return false;
   }
+  auto const in_comparison = conditions.back().comparison;
   return std::all_of(conditions.begin(),
                      conditions.end() - 1,
                      [](auto const& c) {
                        return c.comparison == sirius::comparison_type::not_distinct_from;
                      }) &&
-         conditions.back().comparison == sirius::comparison_type::equal;
+         in_comparison != sirius::comparison_type::not_distinct_from &&
+         in_comparison != sirius::comparison_type::distinct_from;
 }
 
 // Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
@@ -307,7 +310,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
 {
   if (!is_join_type_supported(join_type)) { return false; }
 
-  // All-null-safe MARK is fine (EQUAL keys, definite marks); a mixture only as a correlated IN.
+  // All-null-safe MARK is fine (EQUAL keys, definite marks); a mixture only as a correlated
+  // quantified comparison.
   if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions) &&
       !is_correlated_mark(conditions, join_type, delim_key_count)) {
     return false;
@@ -574,9 +578,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // Mixed join: has at least one equality condition (for hashing) and at least one inequality
   // condition (for the binary predicate).
   if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
-    // A MARK join must run in BUILD_PROBE mode (it needs the full build resident for build_has_null
-    // and per-row marks)
-    if (join_type == duckdb::JoinType::MARK) {
+    // The join-wide NULL rule of a MARK join has no mixed-join form. A correlated MARK's rule is
+    // per group, and its inequality IN key is the predicate.
+    if (join_type == duckdb::JoinType::MARK && !mark_is_correlated_) {
       throw std::runtime_error(
         "sirius_physical_hash_join: MARK join with mixed (equality + inequality) conditions is not "
         "supported");
@@ -1907,20 +1911,29 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
     left_full, lhs_output_col_idxs, std::move(mark_column), left_batch, stream, telemetry_info);
 }
 
-/// @brief The correlation key columns of a correlated MARK's keys: all but the last, the IN key.
+/// @brief The correlation key columns of a correlated MARK's hash keys when the IN key is hashed
+/// too (an `=` IN key): all but the last.
 static cudf::table_view correlated_mark_group_keys(cudf::table_view const& keys)
 {
   return cudf::table_view(std::vector<cudf::column_view>(keys.begin(), keys.end() - 1));
 }
 
-/// @brief Records which groups of a correlated MARK's build hold a NULL IN key.
-/// @param build_keys  The build's prepared key columns; they must outlive the result.
-static std::unique_ptr<correlated_mark_build> make_correlated_mark_build(
-  cudf::table_view const& build_keys, ::cuda::stream_ref stream)
+/// @brief The IN key column of the same hash keys: the last.
+static cudf::column_view correlated_mark_in_key(cudf::table_view const& keys)
 {
-  auto build              = std::make_unique<correlated_mark_build>();
-  build->group_keys       = correlated_mark_group_keys(build_keys);
-  auto const build_in_key = build_keys.column(build_keys.num_columns() - 1);
+  return keys.column(keys.num_columns() - 1);
+}
+
+/// @brief Records which groups of a correlated MARK's build hold a NULL IN key.
+/// @param group_keys    The build's correlation key columns; they must outlive the result.
+/// @param build_in_key  The build's IN key column.
+static std::unique_ptr<correlated_mark_build> make_correlated_mark_build(
+  cudf::table_view const& group_keys,
+  cudf::column_view const& build_in_key,
+  ::cuda::stream_ref stream)
+{
+  auto build        = std::make_unique<correlated_mark_build>();
+  build->group_keys = group_keys;
   if (build_in_key.null_count() > 0) {
     auto const in_key_is_null     = cudf::is_null(build_in_key, stream);
     build->null_in_key_group_keys = sirius::apply_retention_mask(
@@ -1965,14 +1978,16 @@ static std::unique_ptr<cudf::column> logical_and(cudf::column_view const& lhs,
 /// `group_has_null` takes a join only when the build holds a NULL IN key, and `group_empty` only
 /// when the probe batch does.
 ///
-/// @param match_indices  Left rows with a build row equal on every key under EQUAL, so a NULL
-///                       probe IN key matches the NULL IN keys of its group.
+/// @param match_indices  Left rows with a matching build row. An `=` IN key is hashed under EQUAL,
+///                       so a NULL probe IN key matches the NULL IN keys of its group.
 /// @param build          Per-group NULL facts of this task's build.
-/// @param probe_keys     Probe key columns (post-cast): the correlation keys, then the IN key.
+/// @param probe_groups   The probe's correlation key columns (post-cast).
+/// @param probe_in_key   The probe's IN key column.
 static std::unique_ptr<operator_data> resolve_correlated_mark_join_result(
   rmm::device_uvector<cudf::size_type> const& match_indices,
   correlated_mark_build& build,
-  cudf::table_view const& probe_keys,
+  cudf::table_view const& probe_groups,
+  cudf::column_view const& probe_in_key,
   cudf::table_view const& left_full,
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
   ::cucascade::read_only_data_batch const& left_batch,
@@ -1981,12 +1996,10 @@ static std::unique_ptr<operator_data> resolve_correlated_mark_join_result(
 {
   auto const num_rows       = left_full.num_rows();
   auto mark_column          = make_mark_column(match_indices, num_rows, stream);
-  auto const probe_in_key   = probe_keys.column(probe_keys.num_columns() - 1);
   bool const probe_has_null = probe_in_key.null_count() > 0;
 
   // An empty build leaves every group empty: every mark is a definite FALSE.
   if (build.group_keys.num_rows() > 0 && (probe_has_null || build.null_in_key_groups)) {
-    auto const probe_groups = correlated_mark_group_keys(probe_keys);
     // matched OR NOT group_has_null
     auto valid = make_bool_column(true, num_rows, stream);
     if (build.null_in_key_groups) {
@@ -2315,7 +2328,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
           if (mark_is_correlated()) {
             // The slot keeps the key columns these per-group facts view alive.
-            slot.correlated_mark = make_correlated_mark_build(build_keys, stream);
+            slot.correlated_mark = make_correlated_mark_build(
+              correlated_mark_group_keys(build_keys), correlated_mark_in_key(build_keys), stream);
           } else if (mark_propagates_build_nulls() &&
                      !_mark_build_partitioned.load(std::memory_order_acquire)) {
             // Record whether the build keys contain a NULL; MARK three-valued logic needs it at
@@ -2362,7 +2376,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         if (mark_is_correlated()) {
           return resolve_correlated_mark_join_result(*semi_indices,
                                                      *slot.correlated_mark,
-                                                     probe_keys,
+                                                     correlated_mark_group_keys(probe_keys),
+                                                     correlated_mark_in_key(probe_keys),
                                                      left_full,
                                                      lhs_output_columns.col_idxs,
                                                      input_batches[0],
@@ -2472,6 +2487,25 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     if (join_type == duckdb::JoinType::MARK) {
       auto semi_indices = cudf::mixed_left_semi_join(
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
+      if (mark_is_correlated()) {
+        // The hash keys are the correlation keys; the IN key is the predicate's two operands.
+        auto const& in_key = conditions.back();
+        auto const column  = [](cudf::table_view const& table, sirius::ast::node const& operand) {
+          return table.column(
+            static_cast<cudf::size_type>(operand.get<sirius::ast::reference>().column_index));
+        };
+        auto const build =
+          make_correlated_mark_build(right_eq, column(right_full, *in_key.right), stream);
+        return resolve_correlated_mark_join_result(*semi_indices,
+                                                   *build,
+                                                   left_eq,
+                                                   column(left_full, *in_key.left),
+                                                   left_full,
+                                                   lhs_output_columns.col_idxs,
+                                                   input_batches[0],
+                                                   stream,
+                                                   batch_telemetry());
+      }
       auto const nulls =
         resolve_mark_null_state(table_has_any_null(right_eq), right_eq.num_rows() == 0);
       return resolve_mark_join_result(*semi_indices,
@@ -2625,10 +2659,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       // via operator_params::mark_join_build_switch_ratio (0 disables).
       auto const resolve_marks = [&](rmm::device_uvector<cudf::size_type> const& semi_indices) {
         if (mark_is_correlated()) {
-          auto const build = make_correlated_mark_build(right_keys, stream);
+          auto const build = make_correlated_mark_build(
+            correlated_mark_group_keys(right_keys), correlated_mark_in_key(right_keys), stream);
           return resolve_correlated_mark_join_result(semi_indices,
                                                      *build,
-                                                     left_keys,
+                                                     correlated_mark_group_keys(left_keys),
+                                                     correlated_mark_in_key(left_keys),
                                                      left_full,
                                                      lhs_output_columns.col_idxs,
                                                      input_batches[0],

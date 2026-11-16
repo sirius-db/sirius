@@ -140,12 +140,13 @@ mark_join_fixture create_mark_join(
 }
 
 /**
- * @brief Create the MARK join of a correlated IN with one correlated column:
- * `left.g IS NOT DISTINCT FROM right.g AND left.v = right.v`.
+ * @brief Create the MARK join of a correlated IN / ANY with one correlated column:
+ * `left.g IS NOT DISTINCT FROM right.g AND left.v <in_comparison> right.v`.
  * Left child has types {INTEGER, INTEGER, INTEGER} (g, v, id), right child has {INTEGER, INTEGER}
  * (g, v).
  */
-mark_join_fixture create_correlated_mark_join()
+mark_join_fixture create_correlated_mark_join(
+  duckdb::ExpressionType in_comparison = duckdb::ExpressionType::COMPARE_EQUAL)
 {
   mark_join_fixture f;
 
@@ -175,7 +176,7 @@ mark_join_fixture create_correlated_mark_join()
   duckdb::JoinCondition value_cond(
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1),
-    duckdb::ExpressionType::COMPARE_EQUAL);
+    in_comparison);
   conditions.push_back(std::move(value_cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -810,10 +811,10 @@ TEST_CASE("sirius_physical_hash_join mark join - right NULL key on build-on-left
   REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false, true});
 }
 
-// A MARK join must run in BUILD_PROBE mode, which is mutually exclusive with MIXED_JOIN. A MARK
-// join carrying both an equality and an inequality condition (the shape that would otherwise select
-// MIXED_JOIN) is therefore rejected at construction rather than silently mis-executed. No GPU is
-// needed: the constructor makes the mode decision from the conditions alone.
+// A MARK join carrying a plain equality and an inequality condition (the shape that would
+// otherwise select MIXED_JOIN) has a join-wide NULL rule with no mixed-join form, so it is rejected
+// at construction rather than silently mis-executed. Only a correlated ANY runs as a mixed join.
+// No GPU is needed: the constructor makes the mode decision from the conditions alone.
 TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupported",
           "[physical_mark_join]")
 {
@@ -1274,6 +1275,32 @@ TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
     sirius_physical_hash_join::are_conditions_supported(correlated_conditions, JT::MARK, 2));
   // The IN key must come last.
   REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::MARK, 1));
+
+  // A correlated ANY / ALL compares the IN key with an inequality, which runs as a mixed join.
+  for (auto comparison : {duckdb::ExpressionType::COMPARE_NOTEQUAL,
+                          duckdb::ExpressionType::COMPARE_LESSTHAN,
+                          duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                          duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                          duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO}) {
+    auto any_conditions =
+      make_key_list({duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM, comparison});
+    REQUIRE(sirius_physical_hash_join::are_conditions_supported(any_conditions, JT::MARK, 1));
+    REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(any_conditions, JT::MARK));
+  }
+  // Not a null-safe IN key: its comparison is never UNKNOWN, so the rule does not apply.
+  auto distinct_conditions = make_key_list({duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM,
+                                            duckdb::ExpressionType::COMPARE_DISTINCT_FROM});
+  REQUIRE_FALSE(
+    sirius_physical_hash_join::are_conditions_supported(distinct_conditions, JT::MARK, 1));
+  // Nor an inequality IN key on a correlation key's column, which a mixed join cannot take.
+  auto const int_type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto ref            = [&](uint32_t index) {
+    return std::make_unique<sirius::ast::node>(sirius::ast::reference{index, int_type});
+  };
+  duckdb::vector<sirius::join_condition> overlapping;
+  overlapping.push_back({ref(0), ref(0), sirius::comparison_type::not_distinct_from});
+  overlapping.push_back({ref(0), ref(1), sirius::comparison_type::gt});
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(overlapping, JT::MARK, 1));
 }
 
 // An all-null-safe MARK runs under EQUAL: NULL matches NULL and no comparison is UNKNOWN, so the
@@ -1680,12 +1707,77 @@ TEST_CASE("sirius_physical_hash_join correlated MARK handles each NULL source al
   }
 }
 
+// `l.v > ANY (SELECT r.v FROM r WHERE r.g = l.g)`: the same per-group rule with an inequality IN
+// key, which is the predicate of a mixed join hashed on the correlation key.
+TEST_CASE("sirius_physical_hash_join correlated MARK applies an inequality ANY per group",
+          "[physical_hash_join][mark][nulls][correlated]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Group 1 has no NULL IN key, group 2 has one, group NULL is matched null-safely, group 3 is
+  // empty.
+  auto right =
+    make_nullable_int32_batch(*space, {{1, 1, 2, 2, std::nullopt}, {10, 20, 10, std::nullopt, 30}});
+  nullable_ints const left_g{1, 1, 1, 2, 2, 2, 3, 3, std::nullopt, std::nullopt, std::nullopt};
+  nullable_ints const left_v{
+    15, 10, std::nullopt, 15, 10, std::nullopt, 15, std::nullopt, 40, 30, std::nullopt};
+  nullable_ints const left_id{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  auto left = make_nullable_int32_batch(*space, {left_g, left_v, left_id});
+
+  auto run = [&](duckdb::ExpressionType comparison) {
+    auto f = create_correlated_mark_join(comparison);
+    std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left, right};
+    auto outputs =
+      f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+    auto view = sirius::get_cudf_table_view(
+      *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+    return copy_marks_to_host(view.column(3));
+  };
+
+  SECTION("greater than")
+  {
+    std::vector<std::optional<bool>> const expected{
+      true,           // (1, 15) > 10
+      false,          // (1, 10): no smaller IN key, and group 1 holds no NULL
+      std::nullopt,   // (1, NULL): group 1 is not empty
+      true,           // (2, 15) > 10
+      std::nullopt,   // (2, 10): group 2 holds a NULL
+      std::nullopt,   // (2, NULL)
+      false,          // (3, 15): group 3 is empty
+      false,          // (3, NULL): an empty group, even for a NULL IN key
+      true,           // (NULL, 40) > 30
+      false,          // (NULL, 30)
+      std::nullopt};  // (NULL, NULL)
+    REQUIRE(run(duckdb::ExpressionType::COMPARE_GREATERTHAN) == expected);
+  }
+
+  SECTION("not equal")
+  {
+    std::vector<std::optional<bool>> const expected{
+      true,           // (1, 15) <> 10
+      true,           // (1, 10) <> 20
+      std::nullopt,   // (1, NULL)
+      true,           // (2, 15) <> 10
+      std::nullopt,   // (2, 10): equals the only non-NULL IN key, and group 2 holds a NULL
+      std::nullopt,   // (2, NULL)
+      false,          // (3, 15)
+      false,          // (3, NULL)
+      true,           // (NULL, 40) <> 30
+      false,          // (NULL, 30): equals the only IN key of the NULL group
+      std::nullopt};  // (NULL, NULL)
+    REQUIRE(run(duckdb::ExpressionType::COMPARE_NOTEQUAL) == expected);
+  }
+}
+
 // Partitioning on the correlation key alone keeps a group's rows, whatever their IN keys, in one
 // partition.
 TEST_CASE("sirius_physical_hash_join correlated MARK partitions on its correlation keys",
           "[physical_hash_join][mark][correlated][partition]")
 {
-  auto f           = create_correlated_mark_join();
+  auto const in_comparison =
+    GENERATE(duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_GREATERTHAN);
+  auto f           = create_correlated_mark_join(in_comparison);
   auto const& keys = f.hash_join->prepared_keys();
   REQUIRE(keys.size() == 1);
   REQUIRE(keys[0].left_index == 0);

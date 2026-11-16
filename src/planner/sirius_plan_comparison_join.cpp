@@ -439,9 +439,9 @@ std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& con
   return outputs;
 }
 
-// A correlated IN / = ANY: one null-safe key per correlated column (`mark_types`), then the plain
-// IN key. Mirrors sirius_physical_hash_join::mark_is_correlated.
-static bool is_correlated_in_mark(duckdb::LogicalComparisonJoin const& op)
+// A correlated IN / ANY / ALL: one null-safe key per correlated column (`mark_types`), then the
+// quantified comparison. Mirrors sirius_physical_hash_join::mark_is_correlated.
+static bool is_correlated_any_mark(duckdb::LogicalComparisonJoin const& op)
 {
   auto const correlated = op.mark_types.size();
   if (correlated == 0 || op.conditions.size() != correlated + 1) { return false; }
@@ -450,7 +450,15 @@ static bool is_correlated_in_mark(duckdb::LogicalComparisonJoin const& op)
       return false;
     }
   }
-  return op.conditions.back().GetComparisonType() == duckdb::ExpressionType::COMPARE_EQUAL;
+  switch (op.conditions.back().GetComparisonType()) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: return true;
+    default: return false;
+  }
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -521,12 +529,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     reject_nested_column_operation(*condition.RightReference(), "a join condition");
   }
 
-  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys runs on the GPU only as a
-  // correlated IN. Any other mixture has no correct GPU encoding (see
-  // mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp), and the NLJ is no escape
-  // hatch: its MARK arm models the mixture but evaluates each (left batch x right batch) pair
-  // independently, so a left side spread over several right batches emits one partial mark per
-  // pair. Reject here so both routes are closed and DuckDB's CPU mark join answers.
+  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) keys with another key runs on the GPU
+  // only as a correlated IN / ANY / ALL, and only in the hash join. Any other mixture has no
+  // correct GPU encoding (see mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp),
+  // and the NLJ is no escape hatch: its MARK arm models the mixture but evaluates each (left
+  // batch x right batch) pair independently, so a left side spread over several right batches
+  // emits one partial mark per pair. Reject so both routes are closed and DuckDB's CPU mark join
+  // answers.
+  bool mark_mixes_null_safe_keys = false;
   if (op.join_type == duckdb::JoinType::MARK) {
     bool has_null_safe = false;
     bool all_null_safe = !op.conditions.empty();
@@ -537,7 +547,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         all_null_safe = false;
       }
     }
-    if (has_null_safe && !all_null_safe && !is_correlated_in_mark(op)) {
+    mark_mixes_null_safe_keys = has_null_safe && !all_null_safe;
+    if (mark_mixes_null_safe_keys && !is_correlated_any_mark(op)) {
       throw duckdb::NotImplementedException(
         "MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a plain key not supported "
         "in GPU");
@@ -657,6 +668,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   bool is_supported_by_hash_join = sirius::op::sirius_physical_hash_join::are_conditions_supported(
     conditions, op.join_type, op.mark_types.size());
+  // The hash join declines an inequality IN key that shares a column with a correlation key.
+  if (mark_mixes_null_safe_keys && !is_supported_by_hash_join) {
+    throw duckdb::NotImplementedException(
+      "Correlated ANY / ALL comparing a correlation key column not supported in GPU");
+  }
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto options               = duckdb::query_operator_options(context);
     const auto& op_params      = *options;

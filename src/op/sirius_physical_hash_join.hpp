@@ -302,11 +302,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * condition. For mixed joins (equality + inequality), also requires that no column referenced
    * by an equality condition appears in any inequality condition on the same side — cuDF's
    * mixed_join API requires disjoint equality and conditional table columns. A MARK join mixing
-   * null-safe and plain keys is supported only as a correlated IN (see mark_is_correlated).
+   * null-safe keys with another key is supported only as a correlated quantified comparison (see
+   * mark_is_correlated).
    *
    * @param join_type Used to exclude MARK joins from null-safe routing.
    * @param delim_key_count Number of correlated columns of a MARK join (DuckDB's `mark_types`),
-   * which identifies a correlated IN.
+   * which identifies a correlated quantified comparison.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
                                        duckdb::JoinType join_type,
@@ -567,8 +568,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// that mixes the two kinds) forces UNEQUAL. A MARK join follows the same rule:
   /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
   /// all-plain keys use UNEQUAL and the IN/EXISTS three-valued result logic. A MARK
-  /// join *mixing* the two runs only as a correlated IN, under EQUAL (see
-  /// mark_is_correlated); any other mixture is rejected at plan time.
+  /// join *mixing* the two runs only as a correlated quantified comparison, under
+  /// EQUAL (see mark_is_correlated); any other mixture is rejected at plan time.
   cudf::null_equality compare_nulls() const { return compare_nulls_; }
   cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
 
@@ -577,10 +578,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
   bool mark_is_null_safe_ = false;
 
-  /// A correlated IN / = ANY: one null-safe correlation key per `delim_types` entry, then the
-  /// plain IN key, as in DuckDB's PhysicalHashJoin::InitializeHashTable. The build rows sharing a
-  /// probe row's correlation keys are its group, and the IN rule applies within it: TRUE on a
-  /// match, FALSE for an empty group, else NULL if the probe or a group IN key is NULL.
+  /// A correlated IN / ANY / ALL: one null-safe correlation key per `delim_types` entry, then the
+  /// IN key under `=` or an inequality, as in DuckDB's PhysicalHashJoin::InitializeHashTable. The
+  /// build rows sharing a probe row's correlation keys are its group, and the quantifier's rule
+  /// applies within it: TRUE on a match, FALSE for an empty group, else NULL if the probe or a
+  /// group IN key is NULL. An `=` IN key is a hash key; an inequality one makes this a MIXED_JOIN.
   [[nodiscard]] bool mark_is_correlated() const { return mark_is_correlated_; }
   bool mark_is_correlated_ = false;
 

@@ -313,6 +313,43 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
     "mnr.id = mnl.id + 99) AS in_b FROM mnl");
 }
 
+// A correlated ANY / ALL with an inequality: the same per-group rule, run as a mixed join hashed
+// on the correlated column.
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution correlated ANY MARK join with an inequality runs on GPU",
+                 "[integration][gpu_execution][join][nulls][mark]")
+{
+  // mnl row 1 (100) is not above its group's 100, and the group holds a NULL `b`: NULL. Row 4
+  // (300) is not above 999 in a group with no NULL: FALSE.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b > ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+  // Row 1 matches.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b >= ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+  // Row 4 matches.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b < ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b <> ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+  // ALL negates an ANY, so an empty group (rows 5 and 6) is TRUE.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b <= ALL (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id FROM mnl WHERE mnl.b <= ALL (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a)");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnl.b > ANY (SELECT mnr.b FROM mnr WHERE mnr.a IS NOT DISTINCT FROM mnl.a) "
+    "AS m FROM mnl");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution correlated ANY comparing its correlated column falls back",
+                 "[integration][gpu_execution][join][nulls][mark]")
+{
+  // `mnl.a` is both the correlation key and the compared operand, which a mixed join cannot take.
+  expect_plan_fallback_matches_cpu(
+    "SELECT mnl.id, mnl.a > ANY (SELECT mnr.b FROM mnr WHERE mnr.a = mnl.a) AS m FROM mnl");
+}
+
 TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
                  "gpu_execution correlated IN MARK join with a cast IN operand",
                  "[integration][gpu_execution][join][nulls][mark]")
@@ -498,6 +535,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     compare_gpu_vs_cpu(
       "SELECT count(*), sum(id) FROM cpl WHERE cpl.k NOT IN (SELECT cpr.k FROM cpr WHERE " +
       correlation + ")");
+    // An inequality: only `k` = 0 is not above some build `k`.
+    compare_gpu_vs_cpu(
+      "SELECT m, count(*), sum(id) FROM (SELECT cpl.id, cpl.k > ANY (SELECT cpr.k FROM cpr WHERE " +
+      correlation + ") AS m FROM cpl) GROUP BY m");
   }
 }
 
