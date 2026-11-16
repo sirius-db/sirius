@@ -29,10 +29,12 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -344,4 +346,96 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   REQUIRE(single_get != nullptr);
   CHECK(sirius::transparent::parquet_scan_row_count(*single_get) ==
         std::optional<std::size_t>{100});
+}
+
+namespace {
+
+bool contains(std::vector<std::string> const& names, std::string const& name)
+{
+  return std::ranges::find(names, name) != names.end();
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - dictionary columns are the strings every row group "
+                 "dictionary-encodes",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  using sirius::transparent::parquet_dictionary_carrier_max_bytes;
+  using sirius::transparent::parquet_dictionary_string_columns;
+  auto const file = dir / "strings.parquet";
+  // `low` repeats ten values; `distinct` never repeats, so the writer stores it plainly; `mixed`
+  // repeats in the first row group only.
+  auto const write = [&](std::string const& low) {
+    run_ok("SET threads = 1;");
+    run_ok("COPY (SELECT range AS x, " + low +
+           " AS low, 'u' || range AS distinct_values, CASE WHEN range < 50000 THEN 'k' || "
+           "(range % 10) ELSE 'u' || range END AS mixed FROM range(100000)) TO '" +
+           file.string() + "' (FORMAT parquet, ROW_GROUP_SIZE 50000);");
+    run_ok("RESET threads;");
+  };
+  write("'k' || (range % 10)");
+
+  run_ok("SET gpu_execution = false;");
+  auto layout = con->Query(
+    "SELECT path_in_schema, row_group_id, encodings, dictionary_page_offset IS NOT NULL FROM "
+    "parquet_metadata('" +
+    file.string() + "') ORDER BY ALL");
+  run_ok("SET gpu_execution = true;");
+  REQUIRE_FALSE(layout->HasError());
+  auto const rows = collect_rows(*layout, /*sort=*/false);
+  INFO(layout->ToString());
+  auto const dictionary_in = [&](std::string const& column, bool first_group) {
+    for (auto const& row : rows) {
+      if (row[0] == column && (row[1] == "0") == first_group) {
+        return row[3] == "true" && row[2].find("DICTIONARY") != std::string::npos;
+      }
+    }
+    return false;
+  };
+  REQUIRE(dictionary_in("low", true));
+  REQUIRE(dictionary_in("mixed", true));
+  REQUIRE_FALSE(dictionary_in("mixed", false));
+  REQUIRE_FALSE(dictionary_in("distinct_values", false));
+
+  auto const columns = [&](std::size_t max_bytes) {
+    auto const plan = con->ExtractPlan("SELECT * FROM read_parquet('" + file.string() + "')");
+    auto const* get = first_get(*plan);
+    REQUIRE(get != nullptr);
+    run_ok("BEGIN TRANSACTION;");
+    auto names = parquet_dictionary_string_columns(*con->context, *get, max_bytes);
+    run_ok("ROLLBACK;");
+    return names;
+  };
+  auto const found = columns(parquet_dictionary_carrier_max_bytes);
+  CHECK(contains(found, "low"));
+  CHECK_FALSE(contains(found, "mixed"));
+  CHECK_FALSE(contains(found, "distinct_values"));
+  CHECK_FALSE(contains(found, "x"));
+
+  CHECK(columns(1).empty());
+
+  // A rewritten file is probed again rather than answered from the cache.
+  write("'u' || range");
+  CHECK_FALSE(contains(columns(parquet_dictionary_carrier_max_bytes), "low"));
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - a scan that is not of Parquet has no dictionary "
+                 "columns",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  run_ok("CREATE TABLE native_strings AS SELECT 'k' || (range % 10) AS s FROM range(1000);");
+  auto const plan = con->ExtractPlan("SELECT s FROM native_strings");
+  auto const* get = first_get(*plan);
+  REQUIRE(get != nullptr);
+  run_ok("BEGIN TRANSACTION;");
+  CHECK(sirius::transparent::parquet_dictionary_string_columns(
+          *con->context, *get, sirius::transparent::parquet_dictionary_carrier_max_bytes)
+          .empty());
+  run_ok("ROLLBACK;");
+  run_ok("DROP TABLE native_strings;");
 }
