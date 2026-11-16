@@ -58,6 +58,9 @@ constexpr std::int64_t k_slow_read_hold_ns = 2'000'000'000;
 /// Device bytes read before the share of POSIX reads is judged.
 constexpr std::uint64_t k_fallback_min_bytes = 1ULL << 30;
 
+/// How far behind its schedule a paced context may fall and still catch up at once.
+constexpr std::int64_t k_pace_credit_ns = 50'000'000;
+
 /// Lines about held reads that may wait for their thread; more are counted, not kept.
 constexpr std::size_t k_max_held_lines = 256;
 
@@ -310,8 +313,8 @@ gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _option
     }
     SIRIUS_LOG_INFO(
       "[gds] cuFile ready: nvidia-fs {}.{}, posix_fallback_allowed={}, cufile_counters={}, "
-      "num_threads={}, task_size={}, read_timeout_s={}, slow_read_ms_per_mib={}, require={}, "
-      "cpus_allowed={}",
+      "num_threads={}, task_size={}, read_timeout_s={}, slow_read_ms_per_mib={}, "
+      "max_gb_per_s={}, require={}, cpus_allowed={}",
       props.get_nvfs_major_version(),
       props.get_nvfs_minor_version(),
       may_fall_back,
@@ -320,6 +323,7 @@ gds_ioctx::gds_ioctx(gds_config config, options opts) : _config(config), _option
       _config.task_size,
       _config.read_timeout.count(),
       _config.slow_read_ms_per_mib,
+      _config.max_gb_per_s,
       _config.require,
       allowed_cpus());
   }
@@ -477,6 +481,22 @@ void gds_ioctx::note_read(std::int64_t read_ns,
   }
 }
 
+void gds_ioctx::pace(std::size_t bytes)
+{
+  if (_config.max_gb_per_s <= 0) { return; }
+  // Bytes over GB/s is nanoseconds.
+  auto const cost = static_cast<std::int64_t>(static_cast<double>(bytes) / _config.max_gb_per_s);
+  std::int64_t at = 0;
+  {
+    std::lock_guard lock{_pace_mutex};
+    at         = std::max(_pace_next, now_ns() - k_pace_credit_ns);
+    _pace_next = at + cost;
+  }
+  if (auto const wait = at - now_ns(); wait > 0) {
+    std::this_thread::sleep_for(std::chrono::nanoseconds{wait});
+  }
+}
+
 void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
                           std::size_t slice_index,
                           std::size_t piece_offset,
@@ -496,6 +516,9 @@ void gds_ioctx::run_piece(std::shared_ptr<request> const& req,
       _reading[worker].size.store(piece_size);
       _reading[worker].device.store(slice.has_device_request());
       if (slice.has_device_request()) {
+        // Before the start time: the watchdog would take the wait for a read in flight.
+        pace(piece_size);
+        if (auto failed = failure()) { std::rethrow_exception(failed); }
         auto const started = now_ns();
         _read_started[worker].store(started);
         if (_options.reader) {

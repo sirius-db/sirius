@@ -360,6 +360,42 @@ TEST_CASE("gds_ioctx stops issuing reads when they stay slow", "[gds_ioctx]")
   CHECK_FALSE(ctx.stalled());  // no read is stuck: the process is not told to exit
 }
 
+TEST_CASE("gds_ioctx holds device reads to max_gb_per_s", "[gds_ioctx]")
+{
+  constexpr std::size_t size = 16 * k_mib;
+  pattern_file file(size);
+  struct outcome {
+    double elapsed_ms;
+    gds_ioctx::io_counters counters;
+  };
+  auto const read_all = [&](double max_gb_per_s) {
+    auto opts   = posix_options();
+    opts.reader = [](kvikio::FileHandle&, void*, std::size_t piece, std::size_t) { return piece; };
+    gds_config config;
+    config.num_threads  = 4;
+    config.task_size    = k_mib;
+    config.max_gb_per_s = max_gb_per_s;
+    gds_ioctx ctx(config, std::move(opts));
+    auto const obj = ctx.open_io_object(file.path.string());
+    rmm::device_buffer dst(size, rmm::cuda_stream_default);
+    auto const started = std::chrono::steady_clock::now();
+    REQUIRE(read_device(ctx, *obj, 0, size, dst) == size);
+    auto const elapsed =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started);
+    return outcome{elapsed.count(), ctx.counters()};
+  };
+
+  // 16 pieces of 1 MiB at 64 MB/s are 262 ms; the first 50 ms of them start at once and the
+  // last piece's own time is not waited for.
+  auto const capped = read_all(0.064);
+  CHECK(capped.elapsed_ms >= 190.0);
+  CHECK(capped.elapsed_ms < 2000.0);
+  // The wait is time before a read, not inside one: the watchdog times what is inside.
+  CHECK(capped.counters.device_wait_ns >= 1'000'000'000);
+  CHECK(capped.counters.device_read_ns < 50'000'000);
+  CHECK(read_all(0.0).elapsed_ms < 190.0);
+}
+
 TEST_CASE("gds_ioctx serves local files only", "[gds_ioctx]")
 {
   gds_config config;
