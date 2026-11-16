@@ -630,6 +630,9 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
       if (!encoded_keys) {
         output_cols[i] =
           decode_key_codes(output_cols[i]->view(), *encoded_key_strings[i], stream, mr);
+        // Nothing else reads the key's distinct strings.
+        encoded_key_strings[i].reset();
+        encoded_key_owners[i].reset();
       }
     } else if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
       cudf::dictionary_column_view dict_view(output_cols[i]->view());
