@@ -143,6 +143,9 @@ class ScalarFunctions:
     gap_enabled: list[str] = field(
         default_factory=list, metadata={"gaps": ["lower", "abs", "negate"]}
     )
+    regexp_backreferences: bool = gap_switch(
+        False
+    )  # 0fca855a: repeated match backreference differs after UTF-8
     join_neighbours: bool = gap_switch(False)
     window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(

@@ -1481,7 +1481,12 @@ class QueryGenerator:
                 [
                     self._gen_expr("varchar", scope, depth + 1),
                     Literal(rng.choice(REGEX_PATTERNS), st.VARCHAR),
-                    Literal(rng.choice(REGEX_REPLACEMENTS), st.VARCHAR),
+                    Literal(
+                        rng.choice(
+                            REGEX_REPLACEMENTS if self.f.scalar_functions.regexp_backreferences
+                            else REGEX_REPLACEMENTS[:-1]
+                        ), st.VARCHAR
+                    ),
                 ],
                 "varchar",
             )

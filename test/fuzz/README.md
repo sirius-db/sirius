@@ -254,6 +254,9 @@ the known special case mappings from `data.edge_values.unicode_case`.
 strings remain short. The probe accepted 4,095 bytes and declined 4,096.
 UTF-8 and long-string tags require the referenced source column to contain
 that content in the generated dataset.
+`features.scalar_functions.regexp_backreferences` keeps repeated match
+backreferences such as `\0\0` in gaps mode. Signature `0fca855a` duplicates the
+match on CPU but not GPU when UTF-8 characters precede it.
 `data.null_density_extremes` adds rare all-NULL and no-NULL columns, tagged
 when referenced. TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and
 STRUCT are not generated: the native scan declined every one of them in the

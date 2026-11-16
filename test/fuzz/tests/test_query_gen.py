@@ -91,6 +91,23 @@ def run_batch(cfg, n, seed):
 
 
 class Phase2eTypes(unittest.TestCase):
+    def test_regex_backreference_guard(self):
+        for enabled in (False, True):
+            cfg = load_config(None, [
+                f'features.scalar_functions.regexp_backreferences={str(enabled).lower()}',
+                'features.scalar_functions.enabled=[regexp_replace]',
+                'data.rows=[20,30]',
+            ])
+            dg = DataGenerator(cfg, random.Random(51))
+            qg = QueryGenerator(cfg, dg.generate(51), random.Random(51), dg)
+            replacements = []
+            for _ in range(600):
+                for node in walk(qg.generate()):
+                    if isinstance(node, Func) and node.name == 'regexp_replace':
+                        replacements.append(node.args[2].value)
+            self.assertTrue(replacements)
+            self.assertEqual('\\0\\0' in replacements, enabled)
+
     def test_decimal_coalesce_has_no_implicit_scale_reduction(self):
         from siriusfuzz import sqltypes as st
 
