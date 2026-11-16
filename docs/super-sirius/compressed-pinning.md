@@ -155,12 +155,15 @@ policy, including diagnostics, so later settings changes do not affect work alre
 One batch measured unselective predicts the rest of that scan, so the scan stops attempting it
 rather than paying per batch.
 
-Two operational caveats. These are environment variables, not `SET` options: they are
-process-wide, read once and cached, so they cannot be changed per session and do not appear in
-`duckdb_settings()`. And the trace is the only way to see what happened — the plan per column (route,
-bounds, what was dropped and why), then per batch the sources in the order they ran, the
-enumeration chosen, the survivor count and whether the batch came back needing no further
-filtering.
+Use `SET <name> = <value>` to change these settings for subsequent queries on the current
+connection, and `RESET <name>` to restore the startup default, including any YAML override.
+Inspect their current values in `duckdb_settings()`. Each query keeps the policy captured when
+it starts; later changes do not alter work already submitted.
+
+The decision trace shows what happened: the plan per column (route, bounds, what was dropped
+and why), then per batch the sources in the order they ran, the enumeration chosen, the
+survivor count and whether the batch came back needing no further filtering. Enable
+`fused_scan_diagnostics` to emit these decisions at INFO level.
 
 ## Interaction with the downgrade executor
 
