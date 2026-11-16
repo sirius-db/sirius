@@ -18,7 +18,6 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
-#include "memory/host_pool_config.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
@@ -35,6 +34,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
@@ -1239,8 +1239,20 @@ try {
           "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
           std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
       }
-      host->initial_number_pools = memory::default_initial_host_pools(
-        node->memory_capacity, host->memory_capacity, host->block_size, host->pool_size);
+      // Match the allocator's per-block alignment, then round the 10% target down to
+      // whole pools without exceeding the configured host capacity.
+      constexpr auto alignment = alignof(std::max_align_t);
+      constexpr auto max_size  = std::numeric_limits<std::size_t>::max();
+      if (host->block_size == 0 || host->pool_size == 0 ||
+          host->block_size > max_size - (alignment - 1)) {
+        throw configuration_input_error("memory.host: invalid block_size or pool_size");
+      }
+      auto const aligned_block_size = (host->block_size + alignment - 1) / alignment * alignment;
+      if (host->pool_size > max_size / aligned_block_size) {
+        throw configuration_input_error("memory.host: pool size in bytes overflows");
+      }
+      host->initial_number_pools = std::min(node->memory_capacity / 10, host->memory_capacity) /
+                                   (aligned_block_size * host->pool_size);
     }
   }
 

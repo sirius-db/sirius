@@ -17,8 +17,10 @@
 #include "catch.hpp"
 #include "sirius_config.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -63,8 +65,35 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
   std::string host_settings     = "capacity_bytes: 48Gi";
   std::size_t expected_pools    = 51;
   std::size_t expected_capacity = 48ULL << 30;
-  bool expect_error             = false;
+  std::string expected_error;
   SECTION("default uses discovered NUMA RAM") {}
+  SECTION("larger NUMA capacity changes the initial count")
+  {
+    topology.numa_nodes.front().memory_capacity = 128ULL << 30;
+    expected_pools                              = 102;
+  }
+  SECTION("custom pool dimensions change the initial count")
+  {
+    host_settings += ", block_size: 2Mi, pool_size: 256";
+    expected_pools = 12;
+  }
+  SECTION("block alignment is applied before counting pools")
+  {
+    topology.numa_nodes.front().memory_capacity = 1600;
+    host_settings     = "capacity_bytes: 160, block_size: 1, pool_size: 1";
+    expected_capacity = 160;
+    expected_pools    = 160 / alignof(std::max_align_t);
+  }
+  SECTION("block alignment overflow is rejected")
+  {
+    host_settings += ", block_size: " + std::to_string(std::numeric_limits<std::size_t>::max());
+    expected_error = "invalid block_size or pool_size";
+  }
+  SECTION("pool byte size overflow is rejected")
+  {
+    host_settings += ", pool_size: " + std::to_string(std::numeric_limits<std::size_t>::max());
+    expected_error = "pool size in bytes overflows";
+  }
   SECTION("default host budget uses seventy percent of NUMA RAM")
   {
     host_settings.clear();
@@ -102,7 +131,7 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
   SECTION("automatic sizing rejects unknown RAM")
   {
     topology.numa_nodes.front().memory_capacity = 0;
-    expect_error                                = true;
+    expected_error                              = "set initial_number_pools explicitly";
   }
   scoped_yaml yaml("sirius_initial_host_pools.yaml",
                    "sirius:\n"
@@ -112,9 +141,9 @@ TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured
                    "    host: { " +
                      host_settings + " }\n");
   auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
-  if (expect_error) {
+  if (!expected_error.empty()) {
     REQUIRE_THROWS_WITH(parsed.resolve(topology),
-                        Catch::Matchers::ContainsSubstring("set initial_number_pools explicitly"));
+                        Catch::Matchers::ContainsSubstring(expected_error));
     return;
   }
   auto resolved          = parsed.resolve(topology);

@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "memory/host_pool_config.hpp"
 #include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
@@ -30,25 +29,6 @@
 #include <stdexcept>
 
 using namespace sirius;
-
-TEST_CASE("Default initial host pools follow NUMA RAM within the host budget",
-          "[config_opt][host_pool]")
-{
-  constexpr std::size_t gib = 1ULL << 30;
-  constexpr std::size_t mib = 1ULL << 20;
-  using memory::default_initial_host_pools;
-  CHECK(default_initial_host_pools(64 * gib, 48 * gib, mib, 128) == 51);
-  CHECK(default_initial_host_pools(128 * gib, 48 * gib, mib, 128) == 102);
-  CHECK(default_initial_host_pools(64 * gib, 2 * gib, mib, 128) == 16);
-  CHECK(default_initial_host_pools(64 * gib, 64 * mib, mib, 128) == 0);
-  CHECK(default_initial_host_pools(64 * gib, 48 * gib, 2 * mib, 256) == 12);
-  // Alignment must match the allocator even with an odd configured block size.
-  CHECK(default_initial_host_pools(1600, 160, 1, 1) == 160 / alignof(std::max_align_t));
-  CHECK_THROWS(default_initial_host_pools(gib, gib, 0, 128));
-  CHECK_THROWS(default_initial_host_pools(gib, gib, mib, 0));
-  CHECK_THROWS(default_initial_host_pools(gib, gib, std::numeric_limits<std::size_t>::max(), 1));
-  CHECK_THROWS(default_initial_host_pools(gib, gib, mib, std::numeric_limits<std::size_t>::max()));
-}
 
 namespace {
 struct allocation_failure {
