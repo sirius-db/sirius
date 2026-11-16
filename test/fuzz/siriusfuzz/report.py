@@ -496,8 +496,12 @@ class Report:
     def finish(self) -> dict[str, Any]:
         self._log.close()
         elapsed = time.time() - self.started
-        self.accounting["idle_and_unattributed"] = max(
-            0.0, elapsed * self.workers - sum(self.accounting.values())
+        for worker in range(self.workers):
+            stats = self.accounting_by_worker.setdefault(worker, collections.Counter())
+            stats["idle_and_unattributed"] = max(0.0, elapsed - sum(stats.values()))
+        self.accounting["idle_and_unattributed"] = sum(
+            stats["idle_and_unattributed"]
+            for stats in self.accounting_by_worker.values()
         )
         ordered = sorted(
             self.findings.values(),

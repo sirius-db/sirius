@@ -62,7 +62,7 @@ class Joins:
     any_mixed: bool = gap_switch(
         False
     )  # #2153 / 5a54110e: mixed arithmetic ANY GPU AST type error
-    any_join_share: float = 0.15
+    any_join_share: float = 1.0
     self_join: bool = True
     self_join_share: float = 0.2
     grouped_inputs: bool = True

@@ -70,7 +70,7 @@ class LargeDataTests(unittest.TestCase):
         right = ScopeTable(
             "a1", [ColumnRef("a1", c.name, c.type) for c in dim.columns], "t0"
         )
-        cond = gen._gen_join_cond(Scope([left]), right, "inner")
+        cond = gen._gen_join_cond(Scope([left]), right, "inner", allow_ineq_only=False)
         self.assertIn('"a0"."fk_t0" = "a1"."k"', cond.sql())
 
     def test_large_projection_is_bounded_and_nested_queries_use_dimensions(self):
