@@ -22,7 +22,7 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 70% of each backing NUMA node's RAM for pinned host memory.
+If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 90% of each backing NUMA node's RAM for pinned host memory.
 Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
 
 ### Concurrent query admission
@@ -163,7 +163,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `capacity_fraction` | double (0,1] | 0.7 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
+| `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |

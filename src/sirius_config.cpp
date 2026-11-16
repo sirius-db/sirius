@@ -848,8 +848,8 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  // Default to 70% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
-  std::variant<double, std::uint64_t> capacity{0.7};
+  // Default to 90% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
+  std::variant<double, std::uint64_t> capacity{0.9};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
   // needs a configured downgrade_root_dirs; without one the executor warns and skips.
