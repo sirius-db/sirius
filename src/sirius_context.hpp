@@ -157,6 +157,18 @@ class SiriusConnectionState : public ClientContextState {
     return observer_;
   }
 
+  /// \brief OnFinalizePrepare entry: end `duckdb_preparation` (started by QueryBegin), if open.
+  void end_duckdb_preparation() noexcept;
+  [[nodiscard]] std::optional<sirius::telemetry::query_activity::id_type> duckdb_preparation_id()
+    const noexcept
+  {
+    return duckdb_preparation_.id();
+  }
+  /// \brief The observer for a GPU execution, created if QueryBegin's best-effort creation
+  /// failed. Throws on failure: call it inside the GPU attempt, so a failure takes the
+  /// GPU-failure path.
+  std::shared_ptr<sirius::telemetry::query_observer> observer_for_execution(ClientContext& context);
+
   /// \brief Per-connection monotonic query ordinal, advanced by
   /// this state's QueryBegin for SQL↔(instance, connection, query) log
   /// correlation.
@@ -172,16 +184,6 @@ class SiriusConnectionState : public ClientContextState {
   {
     if (!observer_ || (is_internal_query_active() && !parent)) return {};
     return observer_->activity(phase, kind, parent);
-  }
-  void frontend_interval(const char* phase, const char* kind = "work") noexcept
-  {
-    if (is_internal_query_active()) return;
-    end_frontend_interval();
-    frontend_interval_ = activity(phase, kind);
-  }
-  void end_frontend_interval() noexcept
-  {
-    if (!is_internal_query_active()) frontend_interval_.finish();
   }
 
   /// \brief Start a planning generation, discarding the previous capture and decline.
@@ -332,8 +334,9 @@ class SiriusConnectionState : public ClientContextState {
 
  private:
   void finish_observation(const char* outcome) noexcept;
+  void create_observer(ClientContext& context);
   std::shared_ptr<sirius::telemetry::query_observer> observer_;
-  sirius::telemetry::query_activity frontend_interval_;
+  sirius::telemetry::query_activity duckdb_preparation_;
   uint64_t planning_generation_   = 0;
   uint64_t captured_generation_   = 0;
   uint64_t declined_generation_   = 0;

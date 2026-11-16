@@ -172,12 +172,8 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
 {
   auto state      = duckdb::make_uniq<SiriusGlobalSourceState>();
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  auto conn_state = duckdb::get_sirius_connection_state(context);
-  auto query_label =
-    conn_state ? conn_state->take_pending_query_label() : std::optional<std::string>{};
-  state->iface = duckdb::make_uniq<sirius::sirius_interface>(
-    context, conn_state ? conn_state->query_observer() : nullptr);
-  state->iface->observer->label(query_label);
+  // The observer is acquired in GetDataInternal, inside the GPU attempt.
+  state->iface          = duckdb::make_uniq<sirius::sirius_interface>(context, nullptr);
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }
@@ -198,13 +194,12 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
   // Lazy execution: run the GPU query on first GetData call.
   if (!state.result) {
-    if (auto connection = duckdb::get_sirius_connection_state(context.client)) {
-      connection->end_frontend_interval();
-    }
+    // Null only if acquiring it below failed, which is itself a GPU failure.
     auto observe = [&](const char* phase,
                        const char* kind                                         = "work",
                        std::optional<telemetry::query_activity::id_type> parent = std::nullopt) {
-      return state.iface->observer->activity(phase, kind, parent);
+      auto const& observer = state.iface->observer;
+      return observer ? observer->activity(phase, kind, parent) : telemetry::query_activity{};
     };
     SIRIUS_LOG_INFO("Transparent GPU execution: executing query");
     if (state.sirius_context) { state.sirius_context->record_transparent_execution(); }
@@ -226,6 +221,15 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // first Fetch exposes the result, so an abandoned result holds nothing.
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
+      {
+        auto connection = duckdb::get_sirius_connection_state(context.client);
+        if (!connection) {
+          throw duckdb::ExecutorException("Transparent GPU execution has no connection state");
+        }
+        auto label            = connection->take_pending_query_label();
+        state.iface->observer = connection->observer_for_execution(context.client);
+        state.iface->observer->label(label);
+      }
       auto preparation = observe("execution_preparation");
       if (state.sirius_context) {
         state.sirius_context->observe_native_checkpoint_for_testing(context.client,
@@ -545,7 +549,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // CpuFallbackGuard marks the replay so sirius_httpfs refuses to serve s3://
       // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
       // TARGET executing connection's state.
-      state.iface->observer->cpu_replay();
+      if (state.iface->observer) { state.iface->observer->cpu_replay(); }
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
       auto replay = observe("cpu_replay");
       state.result =

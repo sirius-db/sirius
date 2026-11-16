@@ -140,12 +140,15 @@ class query_observer {
     publish_metadata();
   }
 
-  void correlate(uint64_t connection, uint64_t ordinal) noexcept
+  void correlate(uint64_t connection,
+                 uint64_t ordinal,
+                 std::optional<uint64_t> planning_generation = std::nullopt) noexcept
   {
     observe([&] {
       metadata_.connection_id = connection;
       metadata_.query_ordinal = ordinal;
-      metadata_.disposition   = "cpu_only";
+      if (planning_generation) { metadata_.planning_generation = planning_generation; }
+      metadata_.disposition = "cpu_only";
       publish_metadata();
     });
   }

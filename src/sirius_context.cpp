@@ -263,7 +263,31 @@ SiriusConnectionState::~SiriusConnectionState() { finish_observation("abandoned"
 void SiriusConnectionState::finish_observation(const char* outcome) noexcept
 {
   if (auto observer = std::exchange(observer_, nullptr)) { observer->complete(outcome); }
-  frontend_interval_.finish(outcome);
+  duckdb_preparation_.finish(outcome);
+}
+
+void SiriusConnectionState::create_observer(ClientContext& context)
+{
+  auto runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (!runtime || !runtime->is_initialized()) {
+    throw std::runtime_error("query observation requires an initialized Sirius runtime");
+  }
+  auto observer = std::make_shared<sirius::telemetry::query_observer>(
+    runtime->get_telemetry_context(), std::nullopt, session_label_);
+  observer->correlate(connection_id(),
+                      query_ordinal_,
+                      planning_generation_ ? std::optional(planning_generation_) : std::nullopt);
+  observer->planning();
+  observer_ = std::move(observer);
+}
+
+void SiriusConnectionState::end_duckdb_preparation() noexcept { duckdb_preparation_.finish(); }
+
+std::shared_ptr<sirius::telemetry::query_observer> SiriusConnectionState::observer_for_execution(
+  ClientContext& context)
+{
+  if (!observer_) { create_observer(context); }
+  return observer_;
 }
 
 void SiriusConnectionState::QueryBegin(ClientContext& context)
@@ -278,20 +302,17 @@ void SiriusConnectionState::QueryBegin(ClientContext& context)
     cpu_replay_error_.reset();
   }
   auto const query_ordinal = next_query_ordinal();
+  // Best-effort: on failure the statement is unobserved until GPU execution, which
+  // creates the observer inside its recoverable path (observer_for_execution).
+  try {
+    create_observer(context);
+    duckdb_preparation_ = activity("duckdb_preparation");
+  } catch (...) {  // Observation must not fail the query it decorates.
+  }
   shared_ptr<SiriusContext> runtime;
   try {
     runtime = context.registered_state->Get<SiriusContext>("sirius_state");
-  } catch (...) {  // Best-effort observation, including registry lookup.
-  }
-  try {
-    if (runtime && runtime->is_initialized()) {
-      observer_ = std::make_shared<sirius::telemetry::query_observer>(
-        runtime->get_telemetry_context(), std::nullopt, session_label_);
-      observer_->correlate(connection_id(), query_ordinal);
-      observer_->planning();
-      frontend_interval("query_begin_to_pre_hook_or_end");
-    }
-  } catch (...) {  // Observation must not fail the query it decorates.
+  } catch (...) {  // Best-effort logging, including registry lookup.
   }
 
   // No admission or runtime work is acquired here. Execution-window mutations
@@ -1761,7 +1782,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
-  if (conn_state) conn_state->end_frontend_interval();
+  if (conn_state) conn_state->end_duckdb_preparation();
   auto observe = [&](const char* phase,
                      const char* kind = "work",
                      std::optional<sirius::telemetry::query_activity::id_type> parent =
@@ -1769,8 +1790,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     return conn_state ? conn_state->activity(phase, kind, parent)
                       : sirius::telemetry::query_activity{};
   };
-  auto finalize = observe("finalize_prepare");
-  auto setup    = observe("finalize_setup", "work", finalize.id());
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1833,7 +1852,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                   prepared.physical_plan->Root(), context)
                                               : sirius::transparent::plan_source_policy{{}, false};
 
-  setup.finish();
+  // Observed only once the statement is a GPU candidate.
+  auto finalize = observe("finalize_prepare");
   if (!logical_plan) {
     if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
     try {
@@ -2039,7 +2059,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     record_transparent_rebind_success();
     installation.finish();
     finalize.finish();
-    if (conn_state) conn_state->frontend_interval("wrapper_installed_to_execution", "wait");
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
   } catch (InterruptException&) {

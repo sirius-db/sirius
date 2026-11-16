@@ -335,10 +335,10 @@ inventing a duration. Disabled telemetry skips activity allocation and emission.
 
 ### Coverage and interpretation
 
-Transparent SQL records eligibility, observed work between DuckDB hooks, optimizer
-capture, finalize validation, execution admission and preparation, pipeline construction,
-runtime retirement/window cleanup, and CPU replay. Copies and intentional outer replans
-have explicit parents even while internal SQL callbacks are suppressed. Explicit
+Transparent SQL records DuckDB preparation (including optimizer capture), finalize
+validation, execution admission and preparation, pipeline construction, runtime
+retirement/window cleanup, and CPU replay. Copies and intentional outer replans have
+explicit parents even while internal SQL callbacks are suppressed. Explicit
 `gpu_execution` calls also record their bind and execution-time parse/bind/optimize work.
 Streaming fragment observations start at `run()` and include execution admission;
 fragment building and input staging remain outside that invocation's coverage.
@@ -346,7 +346,6 @@ fragment building and input staging remain outside that invocation's coverage.
 `execution_preparation` ends with decision `validated_plan_reused` or `plan_rebuilt`.
 A reuse decision does not create a synthetic translation interval. Callback intervals
 are observed elapsed time, potentially including other extensions and caller latency;
-activity trees do not claim an exclusive partition of DuckDB's internal phases.
-`wrapper_installed_to_execution` is latency, not a CPU-planning measurement. The coarse
+activity trees do not claim an exclusive partition of DuckDB's internal phases. The coarse
 query-list Planning field displays a phase-start offset in the viewer; inspect
 activity interval lengths on the timeline for measured costs.

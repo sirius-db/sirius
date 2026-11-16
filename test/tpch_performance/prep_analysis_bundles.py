@@ -129,6 +129,61 @@ def capture_window(sqlite_path):
     return (utc_ns + (start - sys_ns), utc_ns + (stop - sys_ns))
 
 
+def _ndjson_records(ctx, *entity_dirs):
+    """Every record of the first entity directory present (directory names vary by export)."""
+    for name in entity_dirs:
+        for path in sorted(glob.glob(os.path.join(ctx, name, "*.ndjson"))):
+            with open(path) as f:
+                for line in f:
+                    if line.strip():
+                        yield json.loads(line)
+        if glob.glob(os.path.join(ctx, name)):
+            return
+
+
+def _target(ref):
+    """A scope reference serializes as {"target": id}; older captures used the bare id."""
+    return ref["target"] if isinstance(ref, dict) else ref
+
+
+def quent_query_windows(ctx, group_names):
+    """Yield (query uuid, (group label, query label), (init_ns, finished_ns)).
+
+    Queries start as "unnamed_query" when their label is set after observation begins;
+    the label then arrives in a later QueryDetails revision. The highest revision's
+    instance_name wins, falling back to Init.instance_name for captures without details.
+    """
+    inits = {}  # query uuid -> (group label, init label, init_ns)
+    finished = {}  # query uuid -> finished_ns
+    for rec in _ndjson_records(ctx, "Query", "query"):
+        event = rec["data"]
+        init = event.get("Init")
+        if init:
+            glabel = group_names.get(_target(init["query_group_id"]), "?")
+            inits[rec["id"]] = (glabel, init["instance_name"], rec["timestamp"])
+        elif "Finished" in event:
+            finished[rec["id"]] = rec["timestamp"]
+
+    labels = {}  # query uuid -> (revision, instance_name)
+    for rec in _ndjson_records(ctx, "QueryDetails", "query_details"):
+        update = rec["data"].get("Update")
+        if not update:
+            continue
+        name = (update.get("metadata") or {}).get("instance_name")
+        if not name:
+            continue
+        qid = _target(update["query_id"])
+        if qid not in labels or update["revision"] > labels[qid][0]:
+            labels[qid] = (update["revision"], name)
+
+    # Emit in Init order so a repeated label keeps its latest query, as before.
+    for qid, (glabel, init_label, init_ns) in sorted(
+        inits.items(), key=lambda item: item[1][2]
+    ):
+        label = labels.get(qid, (0, init_label))[1]
+        yield qid, (glabel, label), (init_ns, finished.get(qid, init_ns))
+
+
 def manifest_windows(manifest, quent_windows):
     """range index -> absolute wall-clock (start, stop) ns, or None.
 
@@ -322,8 +377,7 @@ def main():
     ctx = ctx_dirs[0]
 
     group_names = {}
-    for line in open(glob.glob(os.path.join(ctx, "query_group", "*.ndjson"))[0]):
-        rec = json.loads(line)
+    for rec in _ndjson_records(ctx, "QueryGroup", "query_group"):
         decl = rec["data"].get("Declaration")
         if decl:
             # Group labels retain the engine prefix; manifest phases omit it.
@@ -331,20 +385,9 @@ def main():
 
     queries = {}  # (group label, query label) -> query uuid
     quent_windows = {}  # (group label, query label) -> (init_ns, exit_ns)
-    uuid_key = {}
-    for line in open(glob.glob(os.path.join(ctx, "query", "*.ndjson"))[0]):
-        rec = json.loads(line)
-        event = rec["data"]
-        init = event.get("Init")
-        if init:
-            glabel = group_names.get(init["query_group_id"]["target"], "?")
-            key = (glabel, init["instance_name"])
-            queries[key] = rec["id"]
-            uuid_key[rec["id"]] = key
-            quent_windows[key] = (rec["timestamp"], rec["timestamp"])
-        elif "Finished" in event and rec["id"] in uuid_key:
-            key = uuid_key[rec["id"]]
-            quent_windows[key] = (quent_windows[key][0], rec["timestamp"])
+    for qid, key, window in quent_query_windows(ctx, group_names):
+        queries[key] = qid
+        quent_windows[key] = window
 
     # --- timestamp join: manifest range -> surviving report ---
     m_windows = manifest_windows(manifest, quent_windows)

@@ -57,6 +57,7 @@ class sirius_interface {
   //! The client context
   duckdb::ClientContext& client_context;
   //! Retains the outer invocation through engine destruction, without completing it.
+  //! Set by the caller inside its GPU attempt, before sirius_execute_query.
   std::shared_ptr<telemetry::query_observer> observer;
   //! The currently active query context
   duckdb::unique_ptr<sirius_active_query_context> sirius_active_query;

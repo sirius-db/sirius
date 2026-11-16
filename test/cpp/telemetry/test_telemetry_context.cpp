@@ -622,6 +622,8 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
   uint64_t planning_failure_connection = 0;
   std::string prepare_id;
   std::vector<std::string> execution_ids;
+  std::string cpu_only_id;
+  std::string transparent_gpu_id;
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
@@ -678,7 +680,7 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
 
     ok("SET gpu_execution = false");
     state->set_pending_query_label("next-gpu");
-    run(con, "SELECT 42", "cpu_only", false);
+    cpu_only_id = run(con, "SELECT 42", "cpu_only", false);
     REQUIRE(state->take_pending_query_label() == "next-gpu");
     state->set_pending_query_label("next-gpu");
 
@@ -714,7 +716,7 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
     ok("ALTER TABLE numbers ADD COLUMN extra INTEGER DEFAULT 1");
     execution_ids.push_back(run(con, "EXECUTE telemetry_prepared", "gpu", true));
     ok("SET sirius_test_inject_pin_registry_change = true");
-    run(con, "SELECT sum(i) FROM numbers", "gpu", true);
+    transparent_gpu_id = run(con, "SELECT sum(i) FROM numbers", "gpu", true);
     ok("SET sirius_test_inject_pin_registry_change = false");
     ok("SET sirius_test_inject_read_view_mismatch = 'execute_copy_fails'");
     run(con, "SELECT sum(i) FROM numbers", "gpu", true);
@@ -915,6 +917,32 @@ TEST_CASE("outer query observations cover CPU, prepared execution, replay and co
       REQUIRE(metadata.find("\"execution_query_id\":null") == std::string::npos);
       if (query.executed) { REQUIRE_FALSE(lines_for_query(output, "Plan", query.id).empty()); }
     }
+  }
+
+  // Per-statement cost: lines naming the query, plus its activities' Finished lines,
+  // which name only the activity.
+  auto const all         = read_all_telemetry_lines(output);
+  auto const records_for = [&](const std::string& id) {
+    std::vector<std::string> ids{id};
+    for (auto const& started : lines_for_query(output, "QueryActivity", id)) {
+      ids.push_back(started.substr(started.find("\"id\":\"") + 6, 36));
+    }
+    return std::count_if(all.begin(), all.end(), [&](auto const& line) {
+      return std::any_of(ids.begin(), ids.end(), [&](auto const& needle) {
+        return line.find(needle) != std::string::npos;
+      });
+    });
+  };
+  // A CPU-only statement records one activity, duckdb_preparation.
+  auto const cpu_activities = lines_for_query(output, "QueryActivity", cpu_only_id);
+  REQUIRE(cpu_activities.size() == 1);
+  REQUIRE(any_line_with_all(cpu_activities, {"duckdb_preparation"}));
+  UNSCOPED_INFO("records per CPU-only statement: " << records_for(cpu_only_id));
+  UNSCOPED_INFO("records per GPU statement: " << records_for(transparent_gpu_id));
+  REQUIRE(records_for(cpu_only_id) == 9);
+  auto const gpu_activities = lines_for_query(output, "QueryActivity", transparent_gpu_id);
+  for (auto const* phase : {"duckdb_preparation", "optimizer_capture", "finalize_prepare"}) {
+    REQUIRE(any_line_with_all(gpu_activities, {phase}));
   }
   std::filesystem::remove_all(root);
 }

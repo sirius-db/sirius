@@ -465,7 +465,8 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
                                                               vector<Identifier>& names)
 {
   auto state    = get_sirius_connection_state(context);
-  auto binding  = state ? state->activity("explicit_bind") : sirius::telemetry::query_activity{};
+  auto binding  = state ? state->activity("explicit_bind", "work", state->duckdb_preparation_id())
+                        : sirius::telemetry::query_activity{};
   auto result   = make_uniq<SiriusTableFunctionData>();
   result->query = input.inputs[0].ToString();
   result->enable_optimizer = true;
@@ -567,10 +568,8 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
   if (gstate.finished) { return; }
 
   if (!gstate.res) {
-    auto conn_state = get_sirius_connection_state(context);
-    auto observer   = conn_state ? conn_state->query_observer() : nullptr;
-    if (observer) { observer->label(data.query_label); }
-    if (conn_state) conn_state->end_frontend_interval();
+    // Acquired inside the GPU attempt; null only if that failed.
+    std::shared_ptr<sirius::telemetry::query_observer> observer;
     auto observe = [&](const char* phase,
                        const char* kind = "work",
                        std::optional<sirius::telemetry::query_activity::id_type> parent =
@@ -597,6 +596,10 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     {
       std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
       try {
+        auto conn_state = get_sirius_connection_state(context);
+        if (!conn_state) { throw ExecutorException("gpu_execution has no connection state"); }
+        observer = conn_state->observer_for_execution(context);
+        observer->label(data.query_label);
         auto preparation = observe("execution_preparation");
         if (sirius_ctx) {
           Value mark_unavailable;
@@ -607,7 +610,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
           }
           auto admission = observe("execution_admission", "wait", preparation.id());
           window.emplace(*sirius_ctx, context, "gpu_execution");
-          if (observer) { observer->execution_window(window->query_id()); }
+          observer->execution_window(window->query_id());
         }
 
         unique_ptr<LogicalOperator> query_plan;

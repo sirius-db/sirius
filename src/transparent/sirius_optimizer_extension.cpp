@@ -23,7 +23,6 @@
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
-#include <absl/cleanup/cleanup.h>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -225,16 +224,12 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
-  conn_state->end_frontend_interval();
-  auto eligibility = conn_state->activity("eligibility");
   // Decide before optimization can remove scans, including when GPU execution is off.
   (void)should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties());
-  eligibility.finish();
   if (parquet_footer_statistics_enabled(context)) {
     auto const scans = add_parquet_footer_statistics(context, *plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
   }
-  conn_state->frontend_interval("between_optimizer_hooks");
   // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
   // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
   // TPC-H q19 and q7 disjunctions end up). This hook used to derive them too, for DuckDB 1.5, which
@@ -296,14 +291,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
-  conn_state->end_frontend_interval();
-  // Runs on every return, including declines and caught copy failures.
-  auto remaining =
-    absl::Cleanup([&] { conn_state->frontend_interval("remaining_duckdb_preparation"); });
-  auto capture = conn_state->activity("optimizer_capture");
   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
   if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
+  auto capture =
+    conn_state->activity("optimizer_capture", "work", conn_state->duckdb_preparation_id());
 
   // Copy the optimized plan into THIS connection's per-connection state,
   // stamped with the current planning generation. OnFinalizePrepare will

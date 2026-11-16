@@ -33,21 +33,22 @@ DuckDB's optimizer invokes Sirius pre- and post-optimization hooks registered vi
 
 ## Query preparation on the timeline
 
-`SiriusConnectionState` owns one observer from outer `QueryBegin` through `QueryEnd`.
-Frontend, plan, execution and CPU replay records share that query UUID. Internal metadata
-SQL cannot reset or advance it. Prepared statements retain plans, never invocation observers.
-See [Quent telemetry](quent-telemetry.md#query-activity-timelines) for viewer and outcome details.
+`SiriusConnectionState` owns one observer per outer statement, from `QueryBegin` through
+`QueryEnd`, which completes it. Creation in `QueryBegin` is best-effort. If it fails, GPU
+execution creates the observer inside the GPU attempt, where a failure is an ordinary GPU
+failure and takes the CPU fallback path. Frontend, plan, execution and CPU replay records
+share the query UUID. Internal metadata SQL cannot reset or advance it. Prepared statements
+retain plans, never invocation observers. See
+[Quent telemetry](quent-telemetry.md#query-activity-timelines) for viewer and outcome
+details.
 
 | Activity | Measured boundary |
 |----------|-------------------|
-| `query_begin_to_pre_hook_or_end` | Observed time from QueryBegin to the pre-hook, execution entry, or outer completion; includes binding when the hook runs, but is not a parser timer |
-| `eligibility` | Sirius pre-hook classification |
-| `between_optimizer_hooks` | DuckDB optimization and any intervening extension hooks |
-| `optimizer_capture` | Post-hook checks, logical read views, logical-plan copy |
+| `duckdb_preparation` | `QueryBegin` to `OnFinalizePrepare` entry (or query end): parsing, binding, DuckDB optimization, Sirius's capture, and CPU physical planning. The only interval spanning callbacks; a CPU-only statement records nothing else |
+| `explicit_bind` | `gpu_execution` bind of the inner SQL; parented to `duckdb_preparation` |
+| `optimizer_capture` | Post-hook logical read views and logical-plan copy; parented to `duckdb_preparation` |
 | `logical_copy` | Copy with nested serialization/deserialization, binding preservation and cardinality restoration; explicitly parented to capture, finalize, or execution rebuild |
-| `remaining_duckdb_preparation` | Post-hook return to finalize entry; includes CPU physical planning when present |
-| `finalize_prepare` | Setup, optional parse/bind/optimize, validation copy, planning admission, read views, GPU translation/validation and wrapper installation |
-| `wrapper_installed_to_execution` | Latency between wrapper installation and execution entry; separate from CPU planning work |
+| `finalize_prepare` | GPU candidates only: optional parse/bind/optimize, validation copy, planning admission, read views, GPU translation/validation and wrapper installation |
 | `execution_preparation` | Execution admission and the actual reuse/rebuild path; Finished records the reuse decision |
 | `pipeline_construction` | Engine pipeline construction |
 | `gpu_execution` | Engine execution, including runtime startup and waiting for completion; existing task telemetry describes individual pipeline work |
@@ -56,10 +57,9 @@ See [Quent telemetry](quent-telemetry.md#query-activity-timelines) for viewer an
 | `cpu_replay` | CPU execution after the GPU attempt and execution-window cleanup |
 
 Admission and retirement intervals have kind `wait`; other owned intervals have kind `work`.
-Parents include their children. Callback-spanning intervals describe observed boundaries,
-not exclusive DuckDB phases. When a hook is skipped, the initial interval remains broadly
-named rather than claiming unobserved planning work. QueryBegin does not cover extension
-initialization or promise to include all parsing.
+Parents include their children. `duckdb_preparation` describes observed boundaries, not
+an exclusive DuckDB phase. The wait between wrapper installation and execution entry is
+not covered.
 
 ## Step 1b: Explicit Table Function Path
 
