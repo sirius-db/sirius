@@ -46,7 +46,6 @@ public:
 **Description**: Untyped, uninitialized device memory with RAII. Supports host-to-device copy construction. Copy ctor/assignment deleted (must specify stream explicitly).
 
 **Our usage**:
-- `src/op/sirius_physical_top_n.cpp:175` — Creates null mask buffers: `std::make_unique<rmm::device_buffer>(std::move(new_mask))`
 - `test/cpp/utils/data_utils.hpp:95` — Creates char buffers for string column construction
 - `test/cpp/operator/operator_test_utils.hpp:249` — Allocates char data for test string columns
 - `test/cpp/memory/test_host_table_utils.cpp:280` — Copies host mask to device

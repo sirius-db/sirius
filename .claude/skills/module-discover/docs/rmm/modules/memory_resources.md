@@ -1,47 +1,40 @@
 # Memory Resources
 
 **Status**: USED
-**Path**: `rmm/mr/device_memory_resource.hpp`, `rmm/mr/cuda_memory_resource.hpp`, `rmm/mr/pool_memory_resource.hpp`
-**Headers we include**: `<rmm/mr/device_memory_resource.hpp>`, `<rmm/mr/cuda_memory_resource.hpp>`, `<rmm/mr/pool_memory_resource.hpp>`
+**Path**: `rmm/mr/cuda_memory_resource.hpp`, `rmm/mr/pool_memory_resource.hpp`
+**Headers we include**: `<rmm/mr/cuda_memory_resource.hpp>`, `<rmm/mr/pool_memory_resource.hpp>`
 
 ## Summary
 
-Polymorphic memory resource classes for GPU memory allocation. Sirius uses `cuda_memory_resource` (raw cudaMalloc) as the upstream allocator and wraps it in `pool_memory_resource` for the GPU processing memory pool.
+Device memory resources. RMM has no polymorphic `device_memory_resource` base class: resources satisfy the CCCL `cuda::mr` resource concept and are passed as `rmm::device_async_resource_ref` (non-owning) or `cuda::mr::any_resource<cuda::mr::device_accessible>` (owning). Sirius uses `cuda_memory_resource` (raw cudaMalloc) as the upstream allocator and wraps it in `pool_memory_resource` for the GPU processing memory pool.
 
 ## API Reference
 
-### `rmm::mr::device_memory_resource`
+### Resource concept
 
-**Header**: `<rmm/mr/device_memory_resource.hpp>`
+Every resource provides:
 ```cpp
-class device_memory_resource {
-public:
-  virtual ~device_memory_resource() = default;
-
-  void* allocate(cuda_stream_view stream, std::size_t bytes,
-                 std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT);
-  void deallocate(cuda_stream_view stream, void* ptr, std::size_t bytes,
-                  std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT) noexcept;
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT);
-  void deallocate_sync(void* ptr, std::size_t bytes,
-                       std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT) noexcept;
-  bool is_equal(device_memory_resource const& other) const noexcept;
-};
+void* allocate(cuda::stream_ref stream, std::size_t bytes,
+               std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT);
+void deallocate(cuda::stream_ref stream, void* ptr, std::size_t bytes,
+                std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept;
+void* allocate_sync(std::size_t bytes, std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT);
+void deallocate_sync(void* ptr, std::size_t bytes,
+                     std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept;
+bool operator==(Resource const&) const noexcept;
+friend void get_property(Resource const&, cuda::mr::device_accessible) noexcept;
 ```
 
-**Description**: Abstract base class for all device memory allocators. Stream-ordered allocation API. **Important (v26.x)**: `allocate(stream, bytes)` and `deallocate(stream, ptr, bytes)` — stream is the FIRST parameter.
-
-**Our usage**:
-- `src/include/memory/sirius_memory_reservation_manager.hpp:20` — Type used for memory resource pointers
+The stream is the FIRST parameter of `allocate`/`deallocate`.
 
 ### `rmm::mr::cuda_memory_resource`
 
 **Header**: `<rmm/mr/cuda_memory_resource.hpp>`
 ```cpp
-class cuda_memory_resource final : public device_memory_resource {
+class cuda_memory_resource final {
 public:
   cuda_memory_resource() = default;
-  // Internally uses cudaMalloc / cudaFree
+  // Resource concept members; internally uses cudaMalloc / cudaFree
 };
 ```
 
@@ -50,27 +43,24 @@ public:
 **Our usage**:
 - `test/cpp/data/test_host_parquet_representation.cpp:78` — Creates cuda MR in test setup
 
-### `rmm::mr::pool_memory_resource<Upstream>`
+### `rmm::mr::pool_memory_resource`
 
 **Header**: `<rmm/mr/pool_memory_resource.hpp>`
 ```cpp
-template <typename Upstream>
-class pool_memory_resource final : public /* stream_ordered_memory_resource */ {
+// Copyable; copies share the pool.
+class pool_memory_resource
+  : public cuda::mr::shared_resource<detail::pool_memory_resource_impl> {
 public:
-  explicit pool_memory_resource(Upstream* upstream_mr,
+  explicit pool_memory_resource(cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
                                 std::size_t initial_pool_size,
                                 std::optional<std::size_t> maximum_pool_size = std::nullopt);
-  explicit pool_memory_resource(device_async_resource_ref upstream_mr,
-                                std::size_t initial_pool_size,
-                                std::optional<std::size_t> maximum_pool_size = std::nullopt);
-  ~pool_memory_resource() override;  // releases all upstream memory
 
   device_async_resource_ref get_upstream_resource() const noexcept;
   std::size_t pool_size() const noexcept;
 };
 ```
 
-**Description**: Coalescing best-fit suballocator. Allocates a large pool from upstream and sub-allocates from it. Thread-safe. Grows geometrically up to `maximum_pool_size`. On destruction, returns all memory to upstream.
+**Description**: Coalescing best-fit suballocator. Allocates a large pool from upstream and sub-allocates from it. Thread-safe. Grows geometrically up to `maximum_pool_size`. Returns all memory to upstream when the last copy is destroyed.
 
 **Our usage**:
 
@@ -80,4 +70,3 @@ public:
 |-----|--------|-------------------|
 | `pool_memory_resource::pool_size()` | `pool_memory_resource.hpp` | Query current pool size |
 | `pool_memory_resource::get_upstream_resource()` | `pool_memory_resource.hpp` | Get upstream resource ref |
-| `device_memory_resource::allocate_sync()` | `device_memory_resource.hpp` | Synchronous allocation |

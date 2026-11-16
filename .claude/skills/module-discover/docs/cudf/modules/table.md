@@ -56,7 +56,11 @@ class column {
     data_type type() const;
     size_type size() const;
     size_type null_count() const;
-    struct contents { std::unique_ptr<rmm::device_buffer> data; ... };
+    struct contents {
+        std::unique_ptr<rmm::device_buffer> data;
+        std::unique_ptr<cuda::device_buffer<bitmask_type>> null_mask;
+        std::vector<std::unique_ptr<column>> children;
+    };
     contents release();
 };
 ```

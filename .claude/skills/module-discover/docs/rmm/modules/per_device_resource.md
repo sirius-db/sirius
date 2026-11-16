@@ -6,22 +6,9 @@
 
 ## Summary
 
-Global per-device resource management. Maps CUDA device IDs to default memory resources. Provides thread-safe get/set functions. The initial default for any device is a `cuda_memory_resource` (raw cudaMalloc).
+Global per-device resource management. Maps CUDA device IDs to owned default memory resources (`cuda::mr::any_resource`); getters return `device_async_resource_ref`. Provides thread-safe get/set functions. The initial default for any device is a `cuda_memory_resource` (raw cudaMalloc).
 
 ## API Reference
-
-### `rmm::mr::get_current_device_resource()`
-
-**Header**: `<rmm/mr/per_device_resource.hpp>`
-```cpp
-inline device_memory_resource* get_current_device_resource();
-```
-
-**Description**: Returns the `device_memory_resource*` for the current CUDA device. Thread-safe.
-
-**Our usage**:
-- `test/cpp/utils/data_utils.hpp:60` — Default MR for test data construction
-- `test/cpp/utils/test_validation_utility.hpp:220,277` — `auto mr = rmm::mr::get_current_device_resource()`
 
 ### `rmm::mr::get_current_device_resource_ref()`
 
@@ -39,8 +26,7 @@ inline device_async_resource_ref get_current_device_resource_ref();
 
 | API | Brief Description |
 |-----|-------------------|
-| `set_current_device_resource()` | Set the default MR for current device |
-| `set_per_device_resource()` | Set MR for a specific device ID |
-| `get_per_device_resource()` | Get MR for a specific device ID |
-| `set_current_device_resource_ref()` | Set resource ref for current device |
-| `reset_current_device_resource_ref()` | Reset to initial cuda MR |
+| `set_current_device_resource(any_resource)` | Set the default MR for current device; returns the previous one as an owning `any_resource` |
+| `set_per_device_resource(cuda_device_id, any_resource)` | Set MR for a specific device ID |
+| `get_per_device_resource_ref(cuda_device_id)` | Get MR ref for a specific device ID |
+| `reset_current_device_resource()` | Reset to initial cuda MR |
