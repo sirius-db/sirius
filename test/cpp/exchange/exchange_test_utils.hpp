@@ -86,8 +86,7 @@ inline io_env& env()
 inline void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
 {
   auto const rows = column.size();
-  std::vector<std::uint32_t> words(
-    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
+  std::vector<std::uint32_t> words(cudf::num_bitmask_words(rows), 0);
   cudf::size_type nulls = 0;
   for (cudf::size_type i = 0; i < rows; ++i) {
     if (i % 7 == 0) {
@@ -96,7 +95,13 @@ inline void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
       words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
     }
   }
-  rmm::device_buffer mask(words.data(), words.size() * sizeof(std::uint32_t), stream);
+  auto mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream);
+  RMM_CUDA_TRY(cudaMemcpyAsync(mask.data(),
+                               words.data(),
+                               words.size() * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice,
+                               stream.get()));
+  stream.sync();
   column.set_null_mask(std::move(mask), nulls);
 }
 
@@ -175,7 +180,8 @@ inline table_digest digest(std::shared_ptr<cucascade::data_batch> const& batch)
   if (batch->to_read_only().get_current_tier() != Tier::GPU) {
     rmm::cuda_stream stream;
     sirius::convertible_data_batch convertible(batch);
-    REQUIRE(convertible.convert({env().gpu}, stream.view(), *env().mgr, true).has_value());
+    REQUIRE(convertible.convert({env().gpu}, ::cuda::stream_ref{stream.value()}, *env().mgr, true)
+              .has_value());
     stream.synchronize();
   }
   auto ro = batch->to_read_only();

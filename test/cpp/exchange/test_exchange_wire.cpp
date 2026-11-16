@@ -434,14 +434,14 @@ TEST_CASE("plan_stream refuses a type it cannot send, and sizes INT64 string off
     cudf::data_type{cudf::type_id::INT64},
     static_cast<cudf::size_type>(offsets.size()),
     rmm::device_buffer(offsets.data(), offsets.size() * sizeof(std::int64_t), stream),
-    rmm::device_buffer{},
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
     0);
   auto const strings =
     cudf::make_strings_column(3,
                               std::move(offsets_column),
                               rmm::device_buffer(chars.data(), chars.size(), stream),
                               0,
-                              rmm::device_buffer{});
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
   auto const meta = plan_stream(cudf::table_view{{strings->view()}}, stream, bytes);
   REQUIRE(meta.size() == 1);
   CHECK(meta[0].data_size == chars.size());
