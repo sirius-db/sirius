@@ -66,6 +66,10 @@ struct FusedTree {
   // than one place).
   std::map<std::string, std::shared_ptr<FusedTree>> children;
 
+  // Bitpack only: the encoder detects a per-chunk divisor of the residuals. Without it
+  // every chunk's divisor is 1 and the detection code is not emitted.
+  bool bitpack_gcd = false;
+
   bool is_leaf() const noexcept { return children.empty(); }
 
   static std::shared_ptr<FusedTree> make(OpKind op)

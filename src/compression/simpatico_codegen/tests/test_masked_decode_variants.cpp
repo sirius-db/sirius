@@ -288,7 +288,8 @@ bool run_roundtrip(
 
   const std::vector<Element> data = gen_data<Element>(n, base, range, step);
 
-  auto tree = jit::FusedTree::make(OpKind::Bitpack);
+  auto tree         = jit::FusedTree::make(OpKind::Bitpack);
+  tree->bitpack_gcd = true;
 
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
   if (!compact_packed_on_host(enc, nc)) return false;

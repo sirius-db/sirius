@@ -269,9 +269,10 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
   std::mt19937_64 rng{7};
   std::vector<std::int64_t> random(100'000), sorted(100'000), repeated_keys(100'000);
   for (std::size_t i = 0; i < random.size(); ++i) {
-    random[i]        = static_cast<std::int64_t>(rng() % 1'000'000'000);
-    sorted[i]        = static_cast<std::int64_t>(i * 1000 + rng() % 7);
-    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+    random[i] = static_cast<std::int64_t>(rng() % 1'000'000'000);
+    sorted[i] = static_cast<std::int64_t>(i * 1000 + rng() % 7);
+    // The offset keeps the key gaps (994 or 1001) free of a common 2^a * 5^b divisor.
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
   }
   auto const int64       = cudf::data_type{cudf::type_id::INT64};
   auto const random_plan = plan(numeric_column(int64, random, stream)->view());
@@ -293,6 +294,31 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
                                 stream)
                       .front();
   CHECK(contains(plan(tail), "rle"));
+
+  // A bitpack detects its divisor only where the sample has one: random values have
+  // none, while prices in whole units are multiples of 100 and keys
+  // spaced exactly 1000 apart differ by multiples of 1000.
+  CHECK_FALSE(contains(random_plan, "bitpack_gcd"));
+  CHECK_FALSE(contains(sorted_plan, "bitpack_gcd"));
+  std::vector<std::int64_t> whole_units(100'000);
+  for (auto& v : whole_units) {
+    v = static_cast<std::int64_t>(rng() % 1'000'000) * 100;
+  }
+  auto const units_plan = plan(numeric_column(int64, whole_units, stream)->view());
+  CHECK(contains(units_plan, "input -> bitpack_gcd"));
+  // Per leaf: after the first group the run lengths alternate 3 and 1, so they differ by 2,
+  // while the run values (0 and the key gaps) share nothing.
+  auto const repeated_plan = plan(repeated_column->view());
+  INFO(repeated_plan);
+  CHECK(contains(repeated_plan, "delta.differences.runs -> bitpack_gcd"));
+  CHECK(contains(repeated_plan, "delta.differences.values -> bitpack ->"));
+  std::vector<std::int64_t> spaced_keys(100'000);
+  for (std::size_t i = 0; i < spaced_keys.size(); ++i) {
+    spaced_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+  }
+  auto const spaced_plan = plan(numeric_column(int64, spaced_keys, stream)->view());
+  INFO(spaced_plan);
+  CHECK(contains(spaced_plan, "-> bitpack_gcd"));
 
   // Other fixed-width types are bitpacked as they are.
   auto const doubles = numeric_column(
@@ -337,7 +363,8 @@ TEST_CASE("pin compression: default plans favor what a filtered scan can decode 
   std::mt19937_64 rng{11};
   std::vector<std::int64_t> repeated_keys(100'000), long_runs(100'000);
   for (std::size_t i = 0; i < repeated_keys.size(); ++i) {
-    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+    // The offset keeps the key gaps (994 or 1001) free of a common 2^a * 5^b divisor.
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
   }
   std::int64_t run_value = 0;
   for (std::size_t i = 0; i < long_runs.size(); ++i) {

@@ -1122,12 +1122,41 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
                      "[chunk_id] = " + in.elem_type + "{1}; }\n")
         << "            break;\n"
         << "        }\n";
+  const bool gcd = node.bitpack_gcd;
+  // Block-wide min and max of _lmin / _lmax into sh_min_b / sh_max_b, and cmin.
+  const auto emit_range_reduce = [&] {
+    body_ << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
+          << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
+          << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
+          << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
+          << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+          << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
+          << "        __syncthreads();\n"
+          << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
+          << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
+          << "        __syncthreads();\n"
+          << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n";
+  };
   if (pack) {
     // The measure pass already reduced this chunk; read its range back.
     body_ << "        const " << in.elem_type << " " << cmin << " = " << p_min << "[chunk_id];\n"
           << "        const int32_t " << bits_v << " = static_cast<int32_t>(" << p_bits
           << "[chunk_id]);\n"
-          << "        const " << in.elem_type << " " << v_div << " = " << p_divs << "[chunk_id];\n";
+          << "        const " << in.elem_type << " " << v_div << " = "
+          << (gcd ? p_divs + "[chunk_id]" : in.elem_type + "{1}") << ";\n";
+  } else if (!gcd) {
+    body_
+      // Pass 1: combined min+max in a single grid-stride loop.
+      << "        " << in.elem_type << " _lmin = " << emax << ";\n"
+      << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
+      << op_dt->min_literal << ");\n"
+      << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
+      << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
+      << "            if (_vi < _lmin) _lmin = _vi;\n"
+      << "            if (_vi > _lmax) _lmax = _vi;\n"
+      << "        }\n";
+    emit_range_reduce();
+    body_ << "        const " << in.elem_type << " " << v_div << " = " << in.elem_type << "{1};\n";
   } else {
     // A multiple-of-5 test is m * 5^-1 (mod 2^w) <= (2^w - 1) / 5; while the powers below
     // divide, each multiply is the exact quotient, so a chain tests the next power.
@@ -1200,19 +1229,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
       << "            const bool _a5 = __all_sync(0xFFFFFFFFu, _s5_" << idstr << ");\n"
       << "            if ((tid & 31) == 0) { " << sh_div << "_tzw[tid >> 5] = _tz; " << sh_div
       << "_ok5w[tid >> 5] = _a5 ? 1 : 0; }\n"
-      << "        }\n"
-      << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
-      << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
-      << "        __shared__ " << in.elem_type << " " << sh_min << "_b;\n"
-      << "        __shared__ " << in.elem_type << " " << sh_max << "_b;\n"
-      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-      << ").Reduce(_lmin, SimpaticoMin()); if (tid == 0) " << sh_min << "_b = _m; }\n"
-      << "        __syncthreads();\n"
-      << "        { " << in.elem_type << " _m = BR_" << idstr << "(br_ts_" << idstr
-      << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
-      << "        __syncthreads();\n"
-      << "        const " << in.elem_type << " " << cmin << " = " << sh_min
-      << "_b;\n"
+      << "        }\n";
+    emit_range_reduce();
+    body_
       // The reduces above are the barrier, so every thread derives the same divisor. A
       // constant chunk keeps the sentinel and divisor 1.
       << "        const int _btz = min(min(" << sh_div << "_tzw[0], " << sh_div << "_tzw[1]), min("
@@ -1272,8 +1291,10 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "            for (int k = 0; k < _e5 && _d <= _lim / 5ULL; ++k) _d *= 5ULL;\n"
           << "            for (int k = 0; k < _btz && _d <= _lim / 2ULL; ++k) _d *= 2ULL;\n"
           << "            " << v_div << " = static_cast<" << in.elem_type << ">(_d);\n"
-          << "        }\n"
-          << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
+          << "        }\n";
+  }
+  if (!pack) {
+    body_ << "        const " << bp_utype << " " << max_r << " = simpatico_bp_div(static_cast<"
           << bp_utype << ">(static_cast<" << bp_utype << ">(" << sh_max << "_b) - static_cast<"
           << bp_utype << ">(" << cmin << ")), " << v_div << ");\n"
           << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
@@ -1281,8 +1302,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "        if (tid == 0) {\n"
           << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
           << "            " << p_divs << "[chunk_id] = " << v_div << ";\n"
-          << "            if (" << v_div << " != " << in.elem_type << "{1}) " << p_lws << "["
-          << ::codegen::kBitpackDivisorFlagWord << "] = 1u;\n"
+          << (gcd ? "            if (" + v_div + " != " + in.elem_type + "{1}) " + p_lws + "[" +
+                      std::to_string(::codegen::kBitpackDivisorFlagWord) + "] = 1u;\n"
+                  : std::string{})
           << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
           << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
           << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>("

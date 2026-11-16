@@ -149,7 +149,10 @@ void test_compact_persistence_and_decode()
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n", stream, mr);
+    input->view(),
+    "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n",
+    stream,
+    mr);
 
   auto const description  = compressed.describe(stream);
   auto const& leaf        = find_bitpack_leaf(description);
@@ -274,6 +277,23 @@ void test_int64_widths_and_tail()
 
 }  // namespace
 
+// Plain bitpack does not detect divisors: chunk 1's 100/120 packs at the 5 bits of its
+// range, and the divisor channel is dropped.
+void test_plain_bitpack_skips_divisor()
+{
+  auto input        = make_layout_fixture();
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto compressed = simpatico::compress_with_plan(
+    input->view(), "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n", stream, mr);
+  auto const description = compressed.describe(stream);
+  auto const& leaf       = find_bitpack_leaf(description);
+  auto const bits        = copy_buffer<std::uint8_t>(find_buffer(leaf, "chunk_bits"));
+  expect(bits == std::vector<std::uint8_t>({0, 5, 10, 16}), "unexpected plain bit widths");
+  expect(find_buffer(leaf, "chunk_divisors").num_rows == 0, "plain bitpack kept divisors");
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
@@ -282,6 +302,7 @@ int main()
   }
   try {
     test_compact_persistence_and_decode();
+    test_plain_bitpack_skips_divisor();
     test_int64_widths_and_tail();
     std::printf("test_bitpack_layout_contract: PASS\n");
     return 0;

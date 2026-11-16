@@ -84,6 +84,8 @@ std::optional<OpId> op_id_from_name(std::string const& name)
     if (name == e.name) return e.id;
   }
 
+  if (name == kBitpackGcdName) return OpId::Bitpack;
+
   // Parameterised suffix families sharing a bare-name entry above.
   if (after_prefix(name, "bitcomp")) return OpId::Bitcomp;
   if (after_prefix(name, "nvcomp_cascaded")) return OpId::NvcompCascaded;
