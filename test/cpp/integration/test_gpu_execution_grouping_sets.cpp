@@ -24,7 +24,9 @@
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/log_test_utils.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 using GroupingSetsFixture = sirius::test::GpuExecutionFixture;
@@ -212,29 +214,39 @@ TEST_CASE_METHOD(GroupingSetsFixture,
     "i::BIGINT v "
     "FROM range(1000) r(i);");
   run_ok("CHECKPOINT;");
+  // Compare with the CPU, and check (when DEBUG logging is compiled in) that the GPU run took the
+  // dictionary-encoded path rather than grouping on the strings.
+  auto const compare = [this](std::string const& query) {
+    sirius::test::scoped_recording_log_sink logs;
+    compare_gpu_vs_cpu(query);
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_DEBUG
+    auto encoded = std::ranges::any_of(logs.records(), [](auto const& record) {
+      return record.message.find("local_grouped_agg: dict-encoding key col") != std::string::npos;
+    });
+    CHECK(encoded);
+#endif
+  };
   SECTION("ROLLUP")
   {
-    compare_gpu_vs_cpu(
-      "SELECT k1, a, count(*) n, sum(v) s, min(k2) lo FROM gs_long GROUP BY ROLLUP(k1, a);");
+    compare("SELECT k1, a, count(*) n, sum(v) s, min(k2) lo FROM gs_long GROUP BY ROLLUP(k1, a);");
   }
   SECTION("ROLLUP with the string key last")
   {
-    compare_gpu_vs_cpu("SELECT a, k1, count(*) n, sum(v) s FROM gs_long GROUP BY ROLLUP(a, k1);");
+    compare("SELECT a, k1, count(*) n, sum(v) s FROM gs_long GROUP BY ROLLUP(a, k1);");
   }
   SECTION("CUBE with GROUPING()")
   {
-    compare_gpu_vs_cpu(
+    compare(
       "SELECT k1, k2, a, GROUPING(k1, k2, a) g, count(*) n, sum(v) s "
       "FROM gs_long GROUP BY CUBE(k1, k2, a);");
   }
   SECTION("GROUPING SETS without the set over all keys")
   {
-    compare_gpu_vs_cpu(
-      "SELECT k1, k2, sum(v) s FROM gs_long GROUP BY GROUPING SETS ((k1), (k2), ());");
+    compare("SELECT k1, k2, sum(v) s FROM gs_long GROUP BY GROUPING SETS ((k1), (k2), ());");
   }
   SECTION("ordinary GROUP BY on two string keys")
   {
-    compare_gpu_vs_cpu("SELECT k1, k2, count(*) n, sum(v) s FROM gs_long GROUP BY k1, k2;");
+    compare("SELECT k1, k2, count(*) n, sum(v) s FROM gs_long GROUP BY k1, k2;");
   }
 }
 
