@@ -198,6 +198,47 @@ TEST_CASE_METHOD(GroupingSetsFixture,
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,
+                 "grouping sets - long, low-cardinality string keys match the CPU",
+                 "[integration][gpu_execution][grouping_sets]")
+{
+  // `k1` and `k2` are long enough (8+ bytes on average) and have few enough distinct values
+  // (under 10% of rows) that the grouped aggregate groups them on dictionary codes. `k1` has
+  // NULLs, so a NULL key of a leaf group and a NULL of a rolled-up key both occur.
+  run_ok(
+    "CREATE TABLE gs_long AS SELECT "
+    "CASE WHEN i % 11 = 0 THEN NULL ELSE 'long_category_name_' || (i % 5)::VARCHAR END k1, "
+    "'another_long_key_value_' || (i % 3)::VARCHAR k2, "
+    "(i % 2)::INTEGER a, "
+    "i::BIGINT v "
+    "FROM range(1000) r(i);");
+  run_ok("CHECKPOINT;");
+  SECTION("ROLLUP")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k1, a, count(*) n, sum(v) s, min(k2) lo FROM gs_long GROUP BY ROLLUP(k1, a);");
+  }
+  SECTION("ROLLUP with the string key last")
+  {
+    compare_gpu_vs_cpu("SELECT a, k1, count(*) n, sum(v) s FROM gs_long GROUP BY ROLLUP(a, k1);");
+  }
+  SECTION("CUBE with GROUPING()")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k1, k2, a, GROUPING(k1, k2, a) g, count(*) n, sum(v) s "
+      "FROM gs_long GROUP BY CUBE(k1, k2, a);");
+  }
+  SECTION("GROUPING SETS without the set over all keys")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k1, k2, sum(v) s FROM gs_long GROUP BY GROUPING SETS ((k1), (k2), ());");
+  }
+  SECTION("ordinary GROUP BY on two string keys")
+  {
+    compare_gpu_vs_cpu("SELECT k1, k2, count(*) n, sum(v) s FROM gs_long GROUP BY k1, k2;");
+  }
+}
+
+TEST_CASE_METHOD(GroupingSetsFixture,
                  "grouping sets - empty input matches the CPU",
                  "[integration][gpu_execution][grouping_sets]")
 {
