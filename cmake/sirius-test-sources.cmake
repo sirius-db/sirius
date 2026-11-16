@@ -54,6 +54,17 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_fs_cache_reclaim.cpp
     test/cpp/downgrade/test_spill_policy.cpp
+    test/cpp/exchange/test_distributed_session.cpp
+    test/cpp/exchange/test_exchange_batch_io.cpp
+    test/cpp/exchange/test_exchange_byte_ranges.cpp
+    test/cpp/exchange/test_exchange_collectives.cpp
+    test/cpp/exchange/test_exchange_distribute_plan.cpp
+    test/cpp/exchange/test_exchange_nixl.cpp
+    test/cpp/exchange/test_exchange_operators.cpp
+    test/cpp/exchange/test_exchange_plan_reuse.cpp
+    test/cpp/exchange/test_exchange_query_windows.cpp
+    test/cpp/exchange/test_exchange_transport.cpp
+    test/cpp/exchange/test_exchange_wire.cpp
     test/cpp/exec/test_arrow_result_stream.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
@@ -289,6 +300,8 @@ set(TEST_SOURCES
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_delim_aggregate_reuse.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
+    test/cpp/planner/test_distributed_scan_refusals.cpp
+    test/cpp/planner/test_one_rank_parity.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
@@ -316,6 +329,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
+    test/cpp/pipeline/test_finalize_listeners.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp

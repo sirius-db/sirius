@@ -1103,6 +1103,21 @@ The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
 
+### Distributed Execution
+
+Distributed execution is experimental: these settings can change or go away between releases.
+
+See [Distributed Execution](distributed-sirius.md). The exchange belongs to the process, not the
+connection: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank` connects it and
+waits for every peer; set the other way round, the first distributed query connects it. Once it is
+connected, none of these settings can change, on any connection.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
+| `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
+
 ### Pinned Tables
 
 Pinned-table zone-map capture and pruning are automatic. The advanced YAML escape hatch is under
