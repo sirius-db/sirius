@@ -103,7 +103,7 @@ class Aggregates:
     float_division_minmax: bool = gap_switch(
         False
     )  # c6aae63a: NaN from finite division
-    hugeint_sum: bool = gap_switch(False)
+    hugeint_sum: bool = True
 
 
 @dataclass
@@ -145,7 +145,7 @@ class ScalarFunctions:
     )
     regexp_backreferences: bool = gap_switch(
         False
-    )  # 0fca855a: repeated match backreference differs after UTF-8
+    )  # 0fca855a: regexp_replace \0\0 duplicates on CPU but not GPU
     join_neighbours: bool = gap_switch(False)
     window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(
@@ -286,9 +286,9 @@ class Nulls:
 
 @dataclass
 class Strings:
-    charset: str = "ascii"  # ascii | utf8 | unicode (case mapping gaps)
+    charset: str = "utf8"  # ascii | utf8 | unicode (case mapping gaps)
     empty_string_ratio: float = 0.05
-    max_len: int = 40
+    max_len: int = 4095
 
 
 @dataclass
@@ -334,7 +334,7 @@ class Data:
     rows: list[int] = field(default_factory=lambda: [50, 2000])
     common_value_ratio: float = 0.4
     numeric_range: str = "small"  # small | medium | full
-    null_density_extremes: bool = False
+    null_density_extremes: bool = True
     strings: Strings = field(default_factory=Strings)
     edge_values: EdgeValues = field(default_factory=EdgeValues)
     pin: Pin = field(default_factory=Pin)
@@ -391,7 +391,8 @@ class Sirius:
 class TypeOptions:
     # The truth table admits these widths for native scan, filter, group and join.
     decimal_widths: list[str] = gap_switch(
-        ["DECIMAL(12,2)", "DECIMAL(18,4)"],
+        ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(9,2)",
+         "DECIMAL(9,9)", "DECIMAL(18,0)", "DECIMAL(18,18)"],
         ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(4,0)",
          "DECIMAL(9,2)", "DECIMAL(9,9)", "DECIMAL(18,0)",
          "DECIMAL(18,18)", "DECIMAL(19,4)", "DECIMAL(28,6)", "DECIMAL(38,10)"],
@@ -404,7 +405,7 @@ class TypeOptions:
     uuid: bool = False  # not generated: from_duckdb does not map UUID
     blob: bool = False  # not generated: from_duckdb does not map BLOB
     enum: bool = False  # not generated: from_duckdb does not map ENUM
-    array: bool = False  # fixed array scan/projection admission is separate
+    array: bool = True  # only simple scan/projection is generated
     list: bool = False  # not generated: native scan rejects LIST
     struct: bool = False  # not generated: native scan rejects STRUCT
 

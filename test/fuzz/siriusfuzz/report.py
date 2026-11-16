@@ -647,6 +647,25 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
             "agg:expression:count_case",
             "agg:expression:cast_minmax",
         ]
+    if f.aggregates.hugeint_sum:
+        claimed.append("agg:hugeint_sum")
+    accepted_widths = {
+        "DECIMAL(9,2)", "DECIMAL(9,9)", "DECIMAL(12,2)",
+        "DECIMAL(18,0)", "DECIMAL(18,4)", "DECIMAL(18,18)",
+    }
+    for width in cfg.types.decimal_widths:
+        if width not in accepted_widths:
+            continue
+        precision, scale = width.removeprefix("DECIMAL(").removesuffix(")").split(",")
+        claimed.append(f"type:decimal_{precision}_{scale}")
+    if cfg.data.strings.charset == "utf8":
+        claimed.append("type:varchar_utf8")
+    if cfg.data.strings.max_len > 40:
+        claimed.append("type:varchar_long_below_limit")
+    if cfg.data.null_density_extremes:
+        claimed += ["data:all_null_column", "data:no_null_column"]
+    if cfg.types.array:
+        claimed.append("type:array_projection")
     return claimed
 
 

@@ -235,31 +235,38 @@ DuckDB-native GPU scans currently decline overflow strings.
 widths used for generated columns. The type probe found native scan, filter,
 group, and join matches for `(9,2)`, `(9,9)`, `(12,2)`, `(18,0)`, `(18,4)`, and
 `(18,18)`; widths of 19 digits or more and `(4,0)` declined at scan. The
-shipped list stays at `(12,2)` and `(18,4)` until campaign acceptance. Mixed
+shipped list includes all six widths after DECIMAL acceptance. Mixed
 scale arithmetic, comparisons, and join keys use DuckDB's exact result width.
+Default DECIMAL `COALESCE` arms share one exact type: mixing scales introduces
+an implicit scale-reducing cast that reproduces the #2590 rounding mismatch.
 Gaps mode also selects `(4,0)` and widths of 19–38 digits to measure their
 native-scan declines.
 `types.hugeint` and `types.uhugeint` add 128-bit integer columns in gaps mode;
 native scan declines both. `features.aggregates.hugeint_sum` leaves
-`sum(BIGINT)` at DuckDB's natural HUGEINT result in gaps mode. The ordinary
-generator casts that result to BIGINT. `features.joins.mixed_integer_keys`
-tests INTEGER/BIGINT, SMALLINT/UINTEGER, and BIGINT/UBIGINT equality keys in
-gaps mode until its acceptance run. `types.array` adds fixed `INTEGER[3]`
-columns and projects them only in a simple scan when enabled; the probe found
-array scan/projection matches, while array range filters declined.
+`sum(BIGINT)` at DuckDB's natural HUGEINT result by default. Its isolated
+acceptance had 55 OK and no planner declines in 56 tagged queries.
+`features.joins.mixed_integer_keys` tests INTEGER/BIGINT,
+SMALLINT/UINTEGER, and BIGINT/UBIGINT equality keys in gaps mode. The
+BIGINT/UBIGINT pair had 35/38 non-fallback, below the 95% gate.
+`types.array` adds fixed `INTEGER[3]` columns by default and projects them only in a simple scan; the probe found
+array scan/projection matches, while array range filters declined. Focused
+acceptance had 31/31 tagged projections OK.
 
-`data.strings.charset=utf8` includes accented Latin, CJK, and emoji without
-the known special case mappings from `data.edge_values.unicode_case`.
+`data.strings.charset=utf8` includes accented Latin, CJK, and emoji. The
+repeated-match regexp backreference path is quarantined after signature
+`0fca855a`; the separate case-mapping gaps remain controlled by
+`data.edge_values.unicode_case`.
 `data.strings.max_len` is a byte ceiling; lengths near 4,095 are rare so most
 strings remain short. The probe accepted 4,095 bytes and declined 4,096.
 UTF-8 and long-string tags require the referenced source column to contain
 that content in the generated dataset.
+`data.null_density_extremes` adds rare all-NULL and no-NULL columns by
+default, tagged when referenced.
 `features.scalar_functions.regexp_backreferences` keeps repeated match
-backreferences such as `\0\0` in gaps mode. Signature `0fca855a` duplicates the
-match on CPU but not GPU when UTF-8 characters precede it.
-`data.null_density_extremes` adds rare all-NULL and no-NULL columns, tagged
-when referenced. TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and
-STRUCT are not generated: the native scan declined every one of them in the
+backreferences such as `\0\0` in gaps mode. Signature `0fca855a` duplicates
+the match on CPU but not GPU when UTF-8 characters precede it.
+TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and STRUCT are not
+generated: the native scan declined every one of them in the
 probe, so their `types.*` switches are reserved for a future decoder pass.
 
 **Sirius YAML.** `--sirius-config` selects it (repeat the flag to alternate across workers);
