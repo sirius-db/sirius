@@ -2661,23 +2661,30 @@ TEST_CASE("a statically filtered compressed split keeps its compaction forecast 
     nullptr,
     nullptr,
     consumer);
-  sirius::pushdown_request request;
-  request.columns.resize(2);
-  request.columns[0].range          = sirius::decode_range{.lo = 0, .hi = 8};
-  request.ranges_cover_whole_filter = true;
-  auto handed = serve_pinned(scan, make_compressed_entry(e, 1024), true, std::move(request));
-  auto& split = dynamic_cast<scan_operator_input&>(*handed);
-  // The pending static filter keeps a full-width decode in the batch for the checkpoint.
-  REQUIRE(split.cached_checkpoint_possible());
-  auto const batch_bytes = split.get_estimated_size_in_bytes();
-  REQUIRE(batch_bytes > 0);
-  // With decompression pushdown, the decode is forecast to compact and steal its table; the
-  // checkpoint could see only that compacted table.
-  auto const forecast = batch_bytes / 4 + static_cast<std::size_t>(
-                                            static_cast<double>(batch_bytes) *
-                                            sirius::codegen::fused_scan_policy{}.max_selectivity);
-  CHECK(split.get_estimated_working_set_size_in_bytes() ==
-        (split.enable_fused_scan_filter ? forecast : 2 * batch_bytes));
+  auto const entry = make_compressed_entry(e, 1024);
+  for (bool const enabled : {true, false}) {
+    for (double const cap : {0.20, 0.80, 2.0}) {
+      CAPTURE(enabled, cap);
+      sirius::pushdown_request request;
+      request.enable_fused_scan_filter   = enabled;
+      request.fused_scan.max_selectivity = cap;
+      request.columns.resize(2);
+      request.columns[0].range          = sirius::decode_range{.lo = 0, .hi = 8};
+      request.ranges_cover_whole_filter = true;
+      auto handed                       = serve_pinned(scan, entry, true, std::move(request));
+      auto& split                       = dynamic_cast<scan_operator_input&>(*handed);
+      split.enable_fused_scan_filter    = enabled;
+      REQUIRE(split.cached_checkpoint_possible());
+      auto const batch_bytes = split.get_estimated_size_in_bytes();
+      REQUIRE(batch_bytes > 0);
+      // Mask workspace plus outputs, capped at full width; disabled decoding needs a copy.
+      auto const forecast =
+        batch_bytes / 4 +
+        static_cast<std::size_t>(static_cast<double>(batch_bytes) * std::min(cap, 1.0));
+      CHECK(split.get_estimated_working_set_size_in_bytes() ==
+            (enabled ? forecast : 2 * batch_bytes));
+    }
+  }
 }
 
 TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",

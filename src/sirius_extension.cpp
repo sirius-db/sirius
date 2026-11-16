@@ -3210,22 +3210,31 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_late_materialization),
     [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull()) {
+        throw InvalidInputException("enable_late_materialization must not be NULL");
+      }
       get_operator_params(context, scope)->enable_late_materialization = BooleanValue::Get(value);
     });
-  config.AddExtensionOption("enable_fused_scan_filter",
-                            "Fuse eligible filters into compressed scan decoding",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(operator_defaults.enable_fused_scan_filter),
-                            [](ClientContext& context, SetScope scope, Value& value) {
-                              get_operator_params(context, scope)->enable_fused_scan_filter =
-                                BooleanValue::Get(value);
-                            });
+  config.AddExtensionOption(
+    "enable_fused_scan_filter",
+    "Fuse eligible filters into compressed scan decoding",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_fused_scan_filter),
+    [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull()) {
+        throw InvalidInputException("enable_fused_scan_filter must not be NULL");
+      }
+      get_operator_params(context, scope)->enable_fused_scan_filter = BooleanValue::Get(value);
+    });
   config.AddExtensionOption(
     "enable_low_cardinality_groupby",
     "Use the specialized grouped aggregation path when its eligibility checks succeed",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_low_cardinality_groupby),
     [](ClientContext& context, SetScope scope, Value& value) {
+      if (value.IsNull()) {
+        throw InvalidInputException("enable_low_cardinality_groupby must not be NULL");
+      }
       get_operator_params(context, scope)->enable_low_cardinality_groupby =
         BooleanValue::Get(value);
     });

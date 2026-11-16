@@ -176,9 +176,24 @@ TEST_CASE("optimization switches default on and remain connection-local query sn
     REQUIRE_FALSE(duckdb::query_operator_options(*a.context).get()->*member);
     REQUIRE(duckdb::query_operator_options(*b.context).get()->*member);
     REQUIRE(before.get()->*member);
+    // Reject NULL without changing either DuckDB's value or the next query's snapshot.
+    auto const disabled = duckdb::query_operator_options(*a.context);
+    REQUIRE(a.Query("SET " + std::string(name) + " = NULL")->HasError());
+    auto unchanged = a.Query("SELECT current_setting('" + std::string(name) + "')");
+    REQUIRE_FALSE(unchanged->HasError());
+    REQUIRE_FALSE(unchanged->Collection().GetValue(0, 0).IsNull());
+    REQUIRE_FALSE(unchanged->Collection().GetValue(0, 0).GetValue<bool>());
+    REQUIRE_FALSE(duckdb::query_operator_options(*a.context).get()->*member);
+    REQUIRE_FALSE(disabled.get()->*member);
     REQUIRE(a.Query("SET GLOBAL " + std::string(name) + " = false")->HasError());
     REQUIRE_FALSE(a.Query("RESET " + std::string(name))->HasError());
     REQUIRE(duckdb::query_operator_options(*a.context).get()->*member);
+    REQUIRE(a.Query("SET " + std::string(name) + " = NULL")->HasError());
+    REQUIRE(duckdb::query_operator_options(*a.context).get()->*member);
+    auto restored = a.Query("SELECT current_setting('" + std::string(name) + "')");
+    REQUIRE_FALSE(restored->HasError());
+    REQUIRE_FALSE(restored->Collection().GetValue(0, 0).IsNull());
+    REQUIRE(restored->Collection().GetValue(0, 0).GetValue<bool>());
   }
 }
 
