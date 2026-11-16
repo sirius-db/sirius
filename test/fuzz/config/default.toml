@@ -91,6 +91,7 @@ enabled = ["add", "sub", "mul", "div", "int_div", "mod",
            "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
            "date_trunc", "upper", "round", "date_arith"]
 gap_enabled = []       # lower/abs/unary minus await the 95% admission gate
+variable_divisors = false  # avoid CPU division-by-zero skips in default runs
 regexp_backreferences = false  # 0fca855a: repeated match backreference differs on GPU
 join_neighbours = false
 window_args = false

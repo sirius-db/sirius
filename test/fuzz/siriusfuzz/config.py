@@ -143,6 +143,9 @@ class ScalarFunctions:
     gap_enabled: list[str] = field(
         default_factory=list, metadata={"gaps": ["lower", "abs", "negate"]}
     )
+    variable_divisors: bool = gap_switch(
+        False
+    )  # default queries use nonzero integer divisors so DuckDB can evaluate them
     regexp_backreferences: bool = gap_switch(
         False
     )  # 0fca855a: regexp_replace \0\0 duplicates on CPU but not GPU

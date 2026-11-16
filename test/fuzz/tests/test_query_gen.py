@@ -91,6 +91,44 @@ def run_batch(cfg, n, seed):
 
 
 class Phase2eTypes(unittest.TestCase):
+    def test_default_integer_divisors_are_nonzero_literals(self):
+        from siriusfuzz import sqltypes as st
+        from siriusfuzz.query_gen import Scope, ScopeTable
+
+        for enabled in (False, True):
+            cfg = load_config(None, [
+                f'features.scalar_functions.variable_divisors={str(enabled).lower()}',
+                'features.scalar_functions.enabled=[int_div,mod]',
+            ])
+            dg = DataGenerator(cfg, random.Random(53))
+            qg = QueryGenerator(cfg, dg.generate(53), random.Random(53), dg)
+            ref = ColumnRef('a', 'i', st.INTEGER)
+            scope = Scope([ScopeTable('a', [ref])])
+            qg._gen_expr = lambda kind, scope, depth: ref
+            rights = [qg._gen_arith('int', scope, 0).right for _ in range(200)]
+            if enabled:
+                self.assertTrue(any(not isinstance(right, Literal) for right in rights))
+            else:
+                self.assertTrue(all(isinstance(right, Literal) and right.value != 0 for right in rights))
+
+    def test_decimal_case_has_no_implicit_scale_reduction(self):
+        from siriusfuzz.sqlast import Case
+
+        cfg = load_config(None, ['data.rows=[20,30]'])
+        dg = DataGenerator(cfg, random.Random(54))
+        qg = QueryGenerator(cfg, dg.generate(54), random.Random(54), dg)
+        checked = 0
+        for _ in range(1200):
+            query = qg.generate()
+            for node in walk(query):
+                if isinstance(node, (Case, SimpleCase)) and node.kind == 'decimal':
+                    types = [exact_type(result) for _, result in node.whens]
+                    if node.else_ is not None:
+                        types.append(exact_type(node.else_))
+                    self.assertTrue(types and all(t == types[0] for t in types), query.sql())
+                    checked += 1
+        self.assertGreater(checked, 0)
+
     def test_regex_backreference_guard(self):
         for enabled in (False, True):
             cfg = load_config(None, [

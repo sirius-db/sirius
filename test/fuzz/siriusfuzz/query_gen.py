@@ -1548,9 +1548,10 @@ class QueryGenerator:
             op = self._pick(ops)
             left = self._gen_expr("int", scope, depth + 1)
             right = self._gen_expr("int", scope, depth + 1)
-            if op in ("//", "%") and rng.random() < 0.8:
-                # Mostly non-zero divisors so the CPU side does not just produce NULLs.
-                right = Literal(rng.choice([2, 3, 5, 7, -3]), st.INTEGER)
+            if op in ("//", "%"):
+                use_literal = rng.random() < 0.8
+                if use_literal or not self.f.scalar_functions.variable_divisors:
+                    right = Literal(rng.choice([2, 3, 5, 7, -3]), st.INTEGER)
             return Arith(op, left, right, kind="int")
         if kind == "float":
             ops = {
@@ -1600,13 +1601,27 @@ class QueryGenerator:
 
     def _gen_case(self, kind: str, scope: Scope, depth: int) -> Expr:
         n = self.rng.randint(1, 2)
-        whens = [
-            (self._gen_bool(scope, depth + 1), self._gen_expr(kind, scope, depth + 1))
-            for _ in range(n)
-        ]
-        else_ = (
-            self._gen_expr(kind, scope, depth + 1) if self.rng.random() < 0.8 else None
-        )
+        if kind == "decimal" and not self.f.casts.decimal_scale:
+            # #2590: CASE's implicit common-type cast can reduce a DECIMAL arm's
+            # scale. DuckDB rounds there while Sirius truncates (a3dc45ec).
+            first = self._gen_expr(kind, scope, depth + 1)
+            typ = exact_type(first)
+            if typ is None or typ.kind != "decimal":
+                raise GenerationFailed("unknown DECIMAL CASE arm type")
+            whens = [(self._gen_bool(scope, depth + 1), first)]
+            whens += [
+                (self._gen_bool(scope, depth + 1), self._literal("decimal", typ))
+                for _ in range(n - 1)
+            ]
+            else_ = self._literal("decimal", typ) if self.rng.random() < 0.8 else None
+        else:
+            whens = [
+                (self._gen_bool(scope, depth + 1), self._gen_expr(kind, scope, depth + 1))
+                for _ in range(n)
+            ]
+            else_ = (
+                self._gen_expr(kind, scope, depth + 1) if self.rng.random() < 0.8 else None
+            )
         if self.f.expressions.simple_case and self.rng.random() < 0.3:
             cols = scope.columns("int")
             if cols:

@@ -237,8 +237,9 @@ group, and join matches for `(9,2)`, `(9,9)`, `(12,2)`, `(18,0)`, `(18,4)`, and
 `(18,18)`; widths of 19 digits or more and `(4,0)` declined at scan. The
 shipped list includes all six widths after DECIMAL acceptance. Mixed
 scale arithmetic, comparisons, and join keys use DuckDB's exact result width.
-Default DECIMAL `COALESCE` arms share one exact type: mixing scales introduces
-an implicit scale-reducing cast that reproduces the #2590 rounding mismatch.
+Default DECIMAL `COALESCE` and `CASE` result arms share one exact type:
+mixing scales introduces an implicit scale-reducing cast that reproduces
+the #2590 rounding mismatch (`a3dc45ec` for `CASE`).
 Gaps mode also selects `(4,0)` and widths of 19–38 digits to measure their
 native-scan declines.
 `types.hugeint` and `types.uhugeint` add 128-bit integer columns in gaps mode;
@@ -262,6 +263,9 @@ UTF-8 and long-string tags require the referenced source column to contain
 that content in the generated dataset.
 `data.null_density_extremes` adds rare all-NULL and no-NULL columns by
 default, tagged when referenced.
+`features.scalar_functions.variable_divisors` allows column or expression
+denominators for integer division and modulo in gaps mode. Default queries
+use nonzero literal divisors to avoid CPU division-by-zero skips.
 `features.scalar_functions.regexp_backreferences` keeps repeated match
 backreferences such as `\0\0` in gaps mode. Signature `0fca855a` duplicates
 the match on CPU but not GPU when UTF-8 characters precede it.
