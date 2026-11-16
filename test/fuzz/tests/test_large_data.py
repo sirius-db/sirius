@@ -99,7 +99,8 @@ class LargeDataTests(unittest.TestCase):
             sqls = [gen.generate().sql() for _ in range(300)]
             return sum('FROM "f' in s or 'JOIN "f' in s for s in sqls) / 300
 
-        self.assertGreater(share(1.0), share(0.0) + 0.18)
+        # More Phase 2e simple projections dilute the fact-query share.
+        self.assertGreater(share(1.0), share(0.0) + 0.10)
 
     def test_second_fact_never_joins_through_dimension(self):
         cfg, ds = self._dataset()
