@@ -10,10 +10,10 @@
   </a>
 </p>
 
-Sirius is a GPU-Native Composable Analytics Engine. It plugs into existing databases via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with \* are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF, cuVS, and cuCascade, Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-native SQL engine. It plugs into existing databases via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with \* are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF, cuVS, and cuCascade, Sirius delivers high-performance GPU-accelerated analytics.
 
 <p align="center">
-  <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-Native Composable Analytics Engine" width="700"/>
+  <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-native SQL engine" width="700"/>
 </p>
 
 ## Concurrent queries
