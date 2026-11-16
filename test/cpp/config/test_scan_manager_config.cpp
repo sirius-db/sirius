@@ -629,11 +629,10 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
 TEST_CASE("apply_defaults derives the readahead budgets like the file path does",
           "[scan_manager][config][readahead]")
 {
-  constexpr auto pipeline_threads =
-    static_cast<std::size_t>(std::max(1, sirius::exec::default_gpu_pipeline_num_threads));
-
   sirius::sirius_config cfg;
   cfg.apply_defaults();
+  auto const pipeline_threads =
+    static_cast<std::size_t>(cfg.get_gpu_pipeline_executor_config().num_threads);
   auto const& scan_manager = cfg.get_scan_manager_config();
 
   CHECK(scan_manager.cache.mode == cache_mode::cucs);
@@ -1046,7 +1045,9 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CAPTURE(body);
     auto const cfg = load_scan_manager("sirius_rest_defaults.yaml", rest_yaml(body));
     auto const& r  = cfg.rest;
-    CHECK(cfg.rest_n_reactors == 2);
+    CHECK(
+      cfg.rest_n_reactors ==
+      sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).rest_reactors);
     CHECK(r.request_timeout_s == d.request_timeout_s);
     CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
     CHECK(r.stall_time_s == d.stall_time_s);
@@ -1541,15 +1542,22 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
   auto const check_defaults = [&](scan_manager_config const& cfg) {
-    CHECK(cfg.uring_n_reactors == 4);
-    CHECK(cfg.rest_n_reactors == 2);
+    auto const threads =
+      sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1);
+    CHECK(cfg.uring_n_reactors == threads.uring_reactors);
+    CHECK(cfg.rest_n_reactors == threads.rest_reactors);
     CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 4);
     CHECK(cfg.uring.range_batch_slices == 8);
   };
 
-  SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
+  SECTION("resolved defaults")
+  {
+    sirius::sirius_config config;
+    config.apply_defaults();
+    check_defaults(config.get_scan_manager_config());
+  }
 
   SECTION("empty uring block")
   {

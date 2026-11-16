@@ -17,6 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "exec/config.hpp"
+#include "exec/thread_defaults.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
@@ -43,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -561,6 +563,15 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
   r.reject_unknown();
 }
 
+static void validate_rest_fan_out(scan_manager::scan_manager_config const& opt)
+{
+  if (opt.rest_n_reactors > 0 && opt.rest.fan_out > opt.rest_n_reactors &&
+      opt.rest.fan_out != cucascade::io::rest::config{}.fan_out) {
+    throw std::runtime_error("'rest.fan_out': must be at most rest_n_reactors (" +
+                             std::to_string(opt.rest_n_reactors) + ")");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -598,11 +609,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
   // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
-  if (opt.rest_n_reactors > 0 && opt.rest.fan_out > opt.rest_n_reactors &&
-      opt.rest.fan_out != cucascade::io::rest::config{}.fan_out) {
-    throw std::runtime_error("'rest.fan_out': must be at most rest_n_reactors (" +
-                             std::to_string(opt.rest_n_reactors) + ")");
-  }
+  if (r.has_value("rest_n_reactors")) { validate_rest_fan_out(opt); }
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -1025,6 +1032,9 @@ struct parsed_sirius_config::Impl {
   disk_mem_config disk_cfg;
   std::filesystem::path source_path;
   bool use_effective_gpu_capacity = false;
+  struct {
+    bool pipeline{}, task_creator{}, downgrade{}, scan_manager{}, uring{}, rest{};
+  } explicit_threads;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
 };
 
@@ -1148,11 +1158,25 @@ try {
   // Executors
   if (auto exec_node = r.optional_node("executor")) {
     yaml::reader er(*exec_node, "sirius.executor");
-    if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
-    if (auto n = er.optional_node("pipeline"))
+    if (auto n = er.optional_node("task_creator")) {
+      impl->explicit_threads.task_creator = yaml::reader(*n).has_value("num_threads");
+      from_yaml(*n, settings._task_creator_config);
+    }
+    if (auto n = er.optional_node("scan_manager")) {
+      yaml::reader counts(*n);
+      impl->explicit_threads.scan_manager = counts.has_value("num_threads");
+      impl->explicit_threads.uring        = counts.has_value("uring_n_reactors");
+      impl->explicit_threads.rest         = counts.has_value("rest_n_reactors");
+      from_yaml(*n, settings._scan_manager_config);
+    }
+    if (auto n = er.optional_node("pipeline")) {
+      impl->explicit_threads.pipeline = yaml::reader(*n).has_value("num_threads");
       from_yaml(*n, settings._gpu_pipeline_executor_config);
-    if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
+    }
+    if (auto n = er.optional_node("downgrade")) {
+      impl->explicit_threads.downgrade = yaml::reader(*n).has_value("num_threads");
+      from_yaml(*n, settings._downgrade_executor_config);
+    }
     er.reject_unknown();
   }
 
@@ -1303,6 +1327,28 @@ try {
     settings._operator_params.max_build_hash_table_bytes =
       sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
+  // Pool widths depend on configured GPU executors, not the per-query GPU subset.
+  auto const gpu_count = static_cast<std::size_t>(std::count_if(
+    settings._memory_space_configs.begin(),
+    settings._memory_space_configs.end(),
+    [](auto const& space) {
+      return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+    }));
+  auto const threads = exec::derive_thread_defaults(std::thread::hardware_concurrency(), gpu_count);
+  auto const& named  = impl_->explicit_threads;
+  if (!named.pipeline) { settings._gpu_pipeline_executor_config.num_threads = threads.pipeline; }
+  if (!named.task_creator) {
+    settings._task_creator_config.thread_pool.num_threads = threads.task_creator;
+  }
+  if (!named.downgrade) {
+    settings._downgrade_executor_config.thread_pool.num_threads = threads.downgrade;
+  }
+  if (!named.scan_manager) {
+    settings._scan_manager_config.thread_pool.num_threads = threads.scan_manager;
+  }
+  if (!named.uring) { settings._scan_manager_config.uring_n_reactors = threads.uring_reactors; }
+  if (!named.rest) { settings._scan_manager_config.rest_n_reactors = threads.rest_reactors; }
+  validate_rest_fan_out(settings._scan_manager_config);
   settings.finalize_derived_config();
   return settings;
 } catch (const std::bad_alloc&) {

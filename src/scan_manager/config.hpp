@@ -19,6 +19,7 @@
 
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "exec/thread_defaults.hpp"
 #include "scan_manager/preparation_options.hpp"
 
 #include <cucascade/io/config.hpp>
@@ -35,9 +36,8 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count (matches cuCascade's @c io_config::uring_n_reactors;
-/// one worker thread each);
-/// counted in the scan-manager sizing budget below.
+/// Unresolved uring fallback; hardware resolution uses 2 reactors below 32 CPU
+/// hardware threads and 4 otherwise, unless YAML explicitly sets the count.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
 /// Sirius keeps read-path chunks in cuCascade's pinned host cache for reuse,
@@ -69,14 +69,10 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
   return c;
 }
 
-/// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
+/// Scan workers: floor(75% of logical CPU hardware threads), clamped to [4, 32].
 [[nodiscard]] inline int default_scan_manager_num_threads()
 {
-  constexpr int reserved =
-    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
-  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+  return exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).scan_manager;
 }
 
 /// How the readahead decides *when* to issue the next prefetch.

@@ -86,8 +86,7 @@ inline bool enum_to_string(priority_order order, std::string& s)
   }
 }
 
-/// Default task-creator pool size; counted in the scan-manager sizing budget
-/// (see scan_manager::default_scan_manager_num_threads).
+/// Unresolved task-creator fallback; hardware resolution derives the configured default.
 inline constexpr int default_task_creator_num_threads = 1;
 
 /// Configuration for the task creator.
