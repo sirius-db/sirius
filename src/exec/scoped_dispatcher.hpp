@@ -85,6 +85,7 @@ class scoped_dispatcher {
   }
 
   size_t num_domains() const noexcept { return pool_.num_domains(); }
+  bool stop_requested() const noexcept { return stop_.stop_requested(); }
 
   // @brief Blocking. Waits for an inflight slot, then submits directly to the pool.
   // Bypasses the pending queue — this is the producer-side back-pressure path.

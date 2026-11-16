@@ -2182,7 +2182,9 @@ std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_c
         domains.push_back(domain);
     }
   }
-  if (domains.empty()) domains.push_back(0);  // Explicit fallback placement from initialization.
+  // CPU restrictions may exclude every GPU-local domain for this query. Use the
+  // first permitted manager domain, even when it is remote from the query's GPUs.
+  if (domains.empty()) domains.push_back(0);
   rotate_metadata_domains(domains, _next_metadata_domain);
   return std::make_unique<preparation_coordinator>(
     *state.completion,

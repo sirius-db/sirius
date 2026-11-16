@@ -195,8 +195,12 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
         std::lock_guard lock(owner->gate->mutex);
         if (operation->done || owner->gate->closed) return;
       }
-      // Preserve an enqueue exception reported by the control driver. A silent
-      // dispatcher discard otherwise needs its own failure and retirement signal.
+      // Submission failures unwind captures before the dispatcher/control catch.
+      // Let that catch commit the original error before it cancels readers: an
+      // early stop here could let a reader's cancellation error win instead.
+      // Explicit dispatcher cancellation must still retire discarded work even
+      // if its caller happens to be unwinding an unrelated exception.
+      if (std::uncaught_exceptions() && !owner->dispatcher->stop_requested()) return;
       if (!std::uncaught_exceptions()) {
         try {
           throw std::runtime_error("accepted coalescing operation was discarded");
@@ -1195,6 +1199,8 @@ bool preparation_coordinator::state::complete_coalescing(lock_type& lock)
     auto operation         = std::move(source.coalescing);
     source.retained_since  = operation->first;
     source.retained_bytes  = operation->retained_bytes;
+    bool const check_partial =
+      operation->type == coalescing_operation::kind::advance && !operation->batch;
     queue_batch(lock,
                 id,
                 std::move(operation->batch),
@@ -1218,6 +1224,10 @@ bool preparation_coordinator::state::complete_coalescing(lock_type& lock)
     lock.unlock();
     operation.reset();
     lock.lock();
+    // Match synchronous advancement: check the configured fill/age policy before
+    // a ready continuation can reserve this source for another worker advance.
+    // The partial-emission helper retains rotating selection and output guards.
+    if (check_partial && !gate->closed) emit_partial_batch(lock, true);
     return true;
   }
   return false;

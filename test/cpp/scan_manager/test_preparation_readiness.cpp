@@ -3636,3 +3636,143 @@ TEST_CASE("independent single-source queries can coalesce on different eligible 
     CHECK_FALSE(a->completion.has_error());
   }
 }
+
+TEST_CASE("unfinished async input honors minimum fill before its next advance",
+          "[coordinator][async_coalescing][partial_batch][review_regression][review_20261116]")
+{
+  preparation_options options{2, 2, GENERATE(1u, 8u), 1};
+  options.partial_batch = partial_batch_options{3, 1ms, 60s};
+  fixture f(2, 2, k_interrupt_check_interval, options);
+  auto a            = std::make_shared<worker_accumulator>(100);
+  auto out          = std::make_shared<sink>();
+  auto continuation = f.make_hold();
+  auto first        = accumulator::clock::time_point{} + 100ms;
+  a->fake_now       = first;
+  f.coordinator.clock_for_testing([first] { return first + 2ms; });
+  std::atomic<unsigned> advances{0};
+  std::atomic<size_t> first_partial_rows{0};
+  a->before_advance = [&] {
+    if (++advances == 4) continuation->wait();
+  };
+  a->before_partial = [&] {
+    size_t empty = 0;
+    first_partial_rows.compare_exchange_strong(empty, a->retained);
+  };
+  // The input remains unfinished and below the normal batch cap. The next
+  // advance cannot finish until after we observe the configured early batch.
+  f.source(a, out, single_job([] { return std::make_unique<tagged>(7, 20); }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(continuation->await());
+  REQUIRE(out->await(1));
+  CHECK(first_partial_rows == 3);
+  CHECK(f.coordinator.snapshot().size_emissions == 1);
+  CHECK_FALSE(f.completion.has_error());
+  f.coordinator.request_stop(stop_reason::normal_eos);
+  continuation->release();
+  f.finish();
+  CHECK(out->count() == 1);
+  CHECK(out->close_calls == 1);
+}
+
+TEST_CASE("rejected coalescing commits its error before cancelling a running reader",
+          "[coordinator][async_coalescing][review_regression][review_20261116]")
+{
+  // Leave a dispatcher slot free beside the held reader, so coalescing is
+  // rejected by the pool immediately rather than accepted into pending work.
+  fixture f(3);
+  auto reader    = f.make_hold();
+  auto ready_out = std::make_shared<sink>(), reader_out = std::make_shared<sink>();
+  std::atomic<bool> original_at_cancel{false};
+  std::atomic<unsigned> notifications{0};
+  f.source(std::make_shared<accumulator>(1),
+           reader_out,
+           [&, claimed = false]() mutable -> preparation_coordinator::claim_result {
+             if (std::exchange(claimed, true)) return preparation_exhausted{};
+             return preparation_coordinator::job{
+               [&](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+                 std::stop_callback observer(stop.token(), [&] {
+                   original_at_cancel = bool(f.completion.terminal_error());
+                   ++notifications;
+                   // Make the competing reader failure synchronous, so the ordering is
+                   // deterministic even if cancellation fires during capture unwinding.
+                   f.completion.report_error(std::make_exception_ptr(
+                     std::system_error(std::make_error_code(std::errc::operation_canceled))));
+                   reader->release();
+                 });
+                 reader->wait();
+                 throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+               }};
+           });
+  f.source(std::make_shared<worker_accumulator>(1), ready_out, single_job([&] {
+             if (!reader->await()) throw std::runtime_error("reader did not start");
+             return std::make_unique<tagged>(1);
+           }));
+  f.coordinator.before_control_step_for_testing([&] {
+    // A stopped pool rejects after moving the callable into its wrapper, just
+    // like a queue allocation failure, exercising the same ticket unwinding.
+    if (f.coordinator.snapshot().results_peak) f.pool.stop();
+  });
+  auto done  = f.completion.get_awaitable();
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "thread pool is stopped");
+  f.finish();
+  f.dispatcher.wait_for_all();
+  CHECK(original_at_cancel);
+  CHECK(notifications == 1);
+  CHECK(ready_out->count() == 0);
+  CHECK(ready_out->close_calls == 1);
+  CHECK(reader_out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("dispatcher cancellation while unwinding still retires pending coalescing",
+          "[coordinator][async_coalescing][review_20261116]")
+{
+  fixture f(1);
+  auto worker = f.make_hold(), accepted = f.make_hold();
+  auto out = std::make_shared<sink>();
+  f.source(std::make_shared<worker_accumulator>(1), out, single_job([] {
+             return std::make_unique<tagged>(1);
+           }));
+  bool blocker_submitted = false;
+  f.coordinator.before_control_step_for_testing([&] {
+    auto stats = f.coordinator.snapshot();
+    if (stats.results_peak && !blocker_submitted) {
+      f.dispatcher.wait_for_all();
+      f.dispatcher.enqueue([worker] { worker->wait(); });
+      blocker_submitted = true;
+    }
+    if (stats.coalescing_submitted) accepted->wait();
+  });
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(accepted->await());
+  REQUIRE(worker->await());
+  try {
+    struct stop_on_unwind {
+      sirius::exec::scoped_dispatcher& dispatcher;
+      ~stop_on_unwind() { dispatcher.request_stop(); }
+    } stop{f.dispatcher};
+    throw std::runtime_error("unrelated caller failure");
+  } catch (std::runtime_error const&) {
+  }
+  // Discarding the pending ticket must close the gate even during unrelated
+  // unwinding. Otherwise the controller would wait forever for its completion.
+  bool closed;
+  {
+    auto gate = f.coordinator.publication_gate();
+    std::lock_guard lock(gate->mutex);
+    closed = gate->closed;
+  }
+  CHECK(closed);
+  if (!closed) f.coordinator.request_stop(stop_reason::normal_eos);
+  worker->release();
+  accepted->release();
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
