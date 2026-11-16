@@ -58,7 +58,8 @@ downgrade_trigger_fraction = 0.9;
 downgrade_stop_fraction = 0.8;
 block_size = 1MiB;              // cuCascade block size
 pool_size = 128;                // blocks per pool
-initial_number_pools = 4;       // pools allocated at startup
+initial_number_pools;           // auto: 10% of NUMA RAM, capped by host capacity,
+                              // rounded down to whole pools; explicit count overrides
 ```
 
 **Disk Memory Space:**

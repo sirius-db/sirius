@@ -46,6 +46,77 @@ struct scoped_yaml {
 
 }  // namespace
 
+TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured",
+          "[topology_config][config][host_pool]")
+{
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto topology = discovery.get_topology();
+  REQUIRE_FALSE(topology.gpus.empty());
+  topology.gpus.resize(1);
+  topology.num_gpus       = 1;
+  auto const numa_id      = topology.gpus.front().numa_node;
+  topology.numa_nodes     = {{.id = numa_id, .memory_capacity = 64ULL << 30, .has_cpus = true}};
+  topology.num_numa_nodes = 1;
+
+  std::string host_settings     = "capacity_bytes: 48Gi";
+  std::size_t expected_pools    = 51;
+  std::size_t expected_capacity = 48ULL << 30;
+  bool expect_error             = false;
+  SECTION("default uses discovered NUMA RAM") {}
+  SECTION("default host budget uses seventy percent of NUMA RAM")
+  {
+    host_settings.clear();
+    expected_capacity = static_cast<std::size_t>(static_cast<double>(64ULL << 30) * 0.7);
+  }
+  SECTION("smaller host budget caps initial allocation")
+  {
+    host_settings     = "capacity_bytes: 2Gi";
+    expected_pools    = 16;
+    expected_capacity = 2ULL << 30;
+  }
+  SECTION("explicit count overrides automatic sizing")
+  {
+    host_settings += ", initial_number_pools: 3";
+    expected_pools = 3;
+  }
+  SECTION("explicit zero disables preallocation without requiring discovered RAM")
+  {
+    host_settings += ", initial_number_pools: 0";
+    topology.numa_nodes.front().memory_capacity = 0;
+    expected_pools                              = 0;
+  }
+  SECTION("automatic sizing rejects unknown RAM")
+  {
+    topology.numa_nodes.front().memory_capacity = 0;
+    expect_error                                = true;
+  }
+  scoped_yaml yaml("sirius_initial_host_pools.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: 1 }\n"
+                   "  memory:\n"
+                   "    gpu: { usage_limit_bytes: 1Gi }\n"
+                   "    host: { " +
+                     host_settings + " }\n");
+  auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
+  if (expect_error) {
+    REQUIRE_THROWS_WITH(parsed.resolve(topology),
+                        Catch::Matchers::ContainsSubstring("set initial_number_pools explicitly"));
+    return;
+  }
+  auto resolved          = parsed.resolve(topology);
+  std::size_t host_count = 0;
+  for (auto const& space : resolved.get_memory_space_configs()) {
+    if (auto const* host = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      CHECK(host->initial_number_pools == expected_pools);
+      CHECK(host->memory_capacity == expected_capacity);
+      ++host_count;
+    }
+  }
+  CHECK(host_count == 1);
+}
+
 TEST_CASE("parsed hardware configuration resolves independently after copying",
           "[topology_config][config]")
 {

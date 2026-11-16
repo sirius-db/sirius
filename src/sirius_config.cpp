@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/host_pool_config.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
@@ -847,8 +848,8 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
-  std::variant<double, std::uint64_t> capacity{0.9};
+  // Default to 70% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
+  std::variant<double, std::uint64_t> capacity{0.7};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
   // needs a configured downgrade_root_dirs; without one the executor warns and skips.
@@ -856,7 +857,8 @@ struct host_mem_config {
   double downgrade_stop_fraction{0.8};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
-  std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
+  // Omitted: 10% of NUMA RAM in whole pools, capped by the host capacity.
+  std::optional<std::size_t> initial_number_pools;
 
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
@@ -922,7 +924,7 @@ struct host_mem_config {
     // initial_number_pools} positionally therefore lands each value in the correctly-named
     // cucascade config field — the names line up with the resulting config struct, not with the
     // setter's parameter names.
-    builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
+    builder.set_host_pool_features(block_size, pool_size, initial_number_pools.value_or(0));
   }
 };
 
@@ -1228,6 +1230,20 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    if (!host_cfg.initial_number_pools) {
+      for (auto& space : settings._memory_space_configs) {
+        auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+        if (!host) { continue; }
+        auto const* node = hw_topology.find_numa_node(host->numa_id);
+        if (!node || node->memory_capacity == 0 || node->is_device_memory) {
+          throw configuration_input_error(
+            "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
+            std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
+        }
+        host->initial_number_pools = memory::default_initial_host_pools(
+          node->memory_capacity, host->memory_capacity, host->block_size, host->pool_size);
+      }
+    }
   }
 
   const auto defaults =
