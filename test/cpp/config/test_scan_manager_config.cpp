@@ -130,6 +130,15 @@ void require_load_error(std::string const& name,
   REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::EndsWith(": " + message));
 }
 
+/// The hardware defaults a config loaded from a file resolves to on this machine: the unnamed
+/// REST reactor count follows this machine's kTLS state and egress NIC.
+sirius::exec::hardware_thread_defaults machine_thread_defaults()
+{
+  auto const from_nic = sirius::rest_reactors_sized_from_nic(
+    cucascade::memory::discover_kernel_tls(), sirius::discover_egress_nic(""));
+  return sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1, from_nic);
+}
+
 }  // namespace
 
 TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
@@ -641,15 +650,16 @@ TEST_CASE("apply_defaults derives the readahead budgets like the file path does"
   CHECK_FALSE(scan_manager.cache.dispose_on_idle);
 
   // Having no sirius.yaml must size the readahead exactly like an empty one.
-  // The local (uring) backend stays at 0 (readahead off); the rest backend
+  // The local (uring) backend defaults to the pipeline width; the rest backend
   // defaults to max(8, 2x the pipeline width).
   CHECK(scan_manager.pipeline_width == pipeline_threads);
-  CHECK(scan_manager.uring.n_max_concurrent_scans == 0);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == pipeline_threads);
   CHECK_FALSE(scan_manager.uring.n_max_concurrent_scans_explicit);
   CHECK(scan_manager.rest.n_max_concurrent_scans == std::max<std::size_t>(8, 2 * pipeline_threads));
 }
 
-TEST_CASE("uring scan budget stays 0 unless set", "[scan_manager][config][readahead]")
+TEST_CASE("uring scan budget defaults to the pipeline width unless set",
+          "[scan_manager][config][readahead]")
 {
   constexpr std::size_t pipeline_width = 7;
   constexpr std::size_t other_explicit = 5;
@@ -673,17 +683,18 @@ TEST_CASE("uring scan budget stays 0 unless set", "[scan_manager][config][readah
     return text;
   };
 
-  // Omitted: the local backend stays off and is not scaled to the pipeline width.
+  // Omitted: the local backend takes one scan per pipeline thread, and the value is a
+  // derived default rather than a named one.
   auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
   CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
-  CHECK(omitted.uring.n_max_concurrent_scans == 0);
+  CHECK(omitted.uring.n_max_concurrent_scans == pipeline_width);
 
   // An explicit 0 is recorded as explicit and keeps the local readahead off.
   auto const explicit_zero = load_scan_manager("sirius_uring_budget_explicit_zero.yaml", yaml(0));
   CHECK(explicit_zero.uring.n_max_concurrent_scans_explicit);
   CHECK(explicit_zero.uring.n_max_concurrent_scans == 0);
 
-  // An explicit positive value opts the local path in and wins.
+  // An explicit positive value wins over the pipeline width.
   auto const explicit_other =
     load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
   CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
@@ -1037,17 +1048,15 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
 TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport defaults",
           "[scan_manager][config][rest][tls]")
 {
-  // Sirius sets no REST transport defaults of its own: an empty block must leave
-  // every field at cuCascade's struct default (compared field by field, so a
-  // cuCascade default change needs no edit here).
+  // Sirius sets no REST transport defaults of its own beyond the derived ones (the scan budget and
+  // min_mtu): an empty block must leave every other field at cuCascade's struct default (compared
+  // field by field, so a cuCascade default change needs no edit here).
   cucascade::io::rest::config const d{};
   for (auto const* body : {"        {}\n", "        tls: {}\n"}) {
     CAPTURE(body);
     auto const cfg = load_scan_manager("sirius_rest_defaults.yaml", rest_yaml(body));
     auto const& r  = cfg.rest;
-    CHECK(
-      cfg.rest_n_reactors ==
-      sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).rest_reactors);
+    CHECK(cfg.rest_n_reactors == machine_thread_defaults().rest_reactors);
     CHECK(r.request_timeout_s == d.request_timeout_s);
     CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
     CHECK(r.stall_time_s == d.stall_time_s);
@@ -1069,7 +1078,8 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.keepalive_idle_s == d.keepalive_idle_s);
     CHECK(r.keepalive_interval_s == d.keepalive_interval_s);
     CHECK(r.keepalive_count == d.keepalive_count);
-    CHECK(r.min_mtu == d.min_mtu);
+    // The one transport default Sirius derives (from the egress NIC's MTU) besides the scan budget.
+    CHECK(r.min_mtu == sirius::default_rest_min_mtu(sirius::discover_egress_nic("")));
     CHECK(r.mtu_reject_max_attempts == d.mtu_reject_max_attempts);
     CHECK(r.close_with_rst == d.close_with_rst);
     CHECK(r.fan_out == d.fan_out);
@@ -1542,11 +1552,13 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
   auto const check_defaults = [&](scan_manager_config const& cfg) {
-    auto const threads =
-      sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1);
+    // Loading from a file resolves against this machine's discovered topology.
+    auto const threads = machine_thread_defaults();
     CHECK(cfg.uring_n_reactors == threads.uring_reactors);
     CHECK(cfg.rest_n_reactors == threads.rest_reactors);
-    CHECK(cfg.uring.n_max_concurrent_scans == 0);
+    // The local readahead budget is derived from the pipeline pool, not named.
+    CHECK(cfg.pipeline_width > 0);
+    CHECK(cfg.uring.n_max_concurrent_scans == cfg.pipeline_width);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 4);
     CHECK(cfg.uring.range_batch_slices == 8);

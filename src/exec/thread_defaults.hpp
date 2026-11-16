@@ -36,8 +36,13 @@ struct hardware_thread_defaults {
 /// GPU pools split T/(2G) as 75% pipeline, 25% downgrade, then round down and
 /// clamp independently. Unknown CPU count / no configured GPUs use one.
 /// Task creator and scan manager use fixed defaults, independent of T and G.
+/// uring reactors are 2 below 32 hardware threads and 4 otherwise. REST reactors
+/// are clamp(T/6, 16, 32), except when @p rest_from_nic: then 0, the request for
+/// cuCascade to size the pool from the egress NIC (one reactor per IRQ CPU).
+/// The caller sets it when kernel TLS is loaded and the NIC's queue IRQs are
+/// steered to a subset of its NUMA node's cores (see @c rest_reactors_sized_from_nic).
 [[nodiscard]] constexpr hardware_thread_defaults derive_thread_defaults(
-  unsigned int cpu_threads, std::size_t gpu_count) noexcept
+  unsigned int cpu_threads, std::size_t gpu_count, bool rest_from_nic = false) noexcept
 {
   std::uint64_t const t = std::max(1U, cpu_threads);
   // More GPUs than CPU threads already puts both GPU pools below their minima.
@@ -50,7 +55,9 @@ struct hardware_thread_defaults {
           .task_creator   = 4,
           .downgrade      = bounded(t / (8 * g), 1, 4),
           .scan_manager   = 18,
-          .rest_reactors  = static_cast<std::size_t>(std::clamp<std::uint64_t>(t / 6, 2, 32)),
+          .rest_reactors  = rest_from_nic
+                              ? std::size_t{0}
+                              : static_cast<std::size_t>(std::clamp<std::uint64_t>(t / 6, 16, 32)),
           .uring_reactors = t >= 32 ? 4U : 2U};
 }
 

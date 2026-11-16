@@ -85,8 +85,8 @@ constexpr auto PIPELINE_THREADS =
 
 TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][readahead]")
 {
-  // The local (uring) backend defaults to 0 (readahead off): on local NVMe a
-  // prefetch only reorders the executor's own reads against the same device.
+  // The unresolved local (uring) default is 0; sirius_config derives it from the pipeline
+  // width at load time unless the config sets it explicitly.
   CHECK(scan_manager_config{}.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(scan_manager_config{}.uring.n_max_concurrent_scans_explicit);
   // cuCascade's rest::config struct default; sirius_config rescales it to the configured

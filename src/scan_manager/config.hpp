@@ -51,14 +51,13 @@ inline constexpr std::size_t default_uring_n_reactors = 4;
   return c;
 }
 
-/// Sirius's default uring backend config: cuCascade's struct defaults with
-/// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is
-/// 0 as well; the explicit assignment keeps Sirius's choice independent of it.
+/// Sirius's unresolved uring backend config: cuCascade's struct defaults with
+/// @c n_max_concurrent_scans = 0.  cuCascade's own default is 0 as well; the
+/// explicit assignment keeps Sirius's choice independent of it.
 ///
-/// Local NVMe has no round trip to hide, so a readahead competes with the
-/// executor's own reads for the same device and just reorders the queue rather
-/// than adding throughput.  Set a positive value (or @c max_readahead_scans) to
-/// opt the local path in.
+/// @c sirius_config re-defaults the budget to the pipeline pool size when it
+/// resolves a configuration (@c sirius_config::derive_uring_scan_budget), so this
+/// zero is what a @c scan_manager_config built directly carries.
 /// @c n_max_concurrent_scans_explicit stays false: this is a default, not a
 /// value the config named.
 [[nodiscard]] inline cucascade::io::uring::config default_uring_config() noexcept
@@ -290,7 +289,7 @@ struct scan_manager_config {
 
   /// Local (uring) reactor configuration. @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.  Defaults
-  /// to @ref default_uring_config (readahead off).
+  /// to @ref default_uring_config (budget 0 until @c sirius_config derives it).
   cucascade::io::uring::config uring{default_uring_config()};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS policy,
@@ -356,9 +355,10 @@ struct scan_manager_config {
     // chunk would be dropped before its scan ever asked for it.
     if (!cache.enabled()) { return plan; }
     // A backend budget of zero is the backend opting out of readahead entirely
-    // (see default_uring_config).  Honor it even under the
-    // opportunistic strategy, which would otherwise substitute the pipeline
-    // width and run a readahead the backend asked not to have.
+    // (an explicit `n_max_concurrent_scans: 0`, or the unresolved default of
+    // default_uring_config).  Honor it even under the opportunistic strategy,
+    // which would otherwise substitute the pipeline width and run a readahead
+    // the backend asked not to have.
     if (backend_budget == 0) { return plan; }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful

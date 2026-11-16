@@ -1035,6 +1035,8 @@ struct parsed_sirius_config::Impl {
   struct {
     bool pipeline{}, task_creator{}, downgrade{}, scan_manager{}, uring{}, rest{};
   } explicit_threads;
+  /// Whether the YAML named scan_manager.rest.min_mtu, an explicit 0 included.
+  bool explicit_rest_min_mtu = false;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
 };
 
@@ -1167,6 +1169,9 @@ try {
       impl->explicit_threads.scan_manager = counts.has_value("num_threads");
       impl->explicit_threads.uring        = counts.has_value("uring_n_reactors");
       impl->explicit_threads.rest         = counts.has_value("rest_n_reactors");
+      if (auto rest = counts.optional_node("rest")) {
+        impl->explicit_rest_min_mtu = yaml::reader(*rest).has_value("min_mtu");
+      }
       from_yaml(*n, settings._scan_manager_config);
     }
     if (auto n = er.optional_node("pipeline")) {
@@ -1242,8 +1247,38 @@ try {
                                                       : source_path.string() + ": " + e.what());
 }
 
+std::optional<cucascade::memory::nic_topology> discover_egress_nic(
+  std::string_view configured_interface)
+{
+  try {
+    if (auto const iface = cucascade::memory::select_egress_interface(configured_interface);
+        iface.has_value()) {
+      return cucascade::memory::discover_nic(*iface);
+    }
+  } catch (...) {
+    // No NIC information: the caller falls back to the CPU-count default.
+  }
+  return std::nullopt;
+}
+
+bool rest_reactors_sized_from_nic(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  return kernel_tls.loaded && egress_nic.has_value() && egress_nic->irqs_steered();
+}
+
+std::size_t default_rest_min_mtu(
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  constexpr int standard_ethernet_mtu = 1500;
+  return egress_nic.has_value() && egress_nic->mtu > standard_ethernet_mtu
+           ? static_cast<std::size_t>(egress_nic->mtu)
+           : std::size_t{0};
+}
+
 sirius_config parsed_sirius_config::resolve(
-  const cucascade::memory::system_topology_info& hw_topology) const
+  const cucascade::memory::system_topology_info& hw_topology, const egress_nic_probe& probe) const
 try {
   auto settings         = impl_->settings;
   settings._hw_topology = hw_topology;
@@ -1334,8 +1369,17 @@ try {
     [](auto const& space) {
       return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
     }));
-  auto const threads = exec::derive_thread_defaults(std::thread::hardware_concurrency(), gpu_count);
-  auto const& named  = impl_->explicit_threads;
+  auto const& named    = impl_->explicit_threads;
+  // The egress NIC is looked up once, and only when a value derived from it is unnamed: the REST
+  // reactor count (which loaded kernel TLS must also allow) or rest.min_mtu.
+  std::optional<cucascade::memory::nic_topology> egress_nic;
+  if ((!named.rest && hw_topology.kernel_tls.loaded) || !impl_->explicit_rest_min_mtu) {
+    egress_nic = probe(settings._scan_manager_config.rest.interface);
+  }
+  auto const rest_from_nic =
+    !named.rest && rest_reactors_sized_from_nic(hw_topology.kernel_tls, egress_nic);
+  auto const threads =
+    exec::derive_thread_defaults(std::thread::hardware_concurrency(), gpu_count, rest_from_nic);
   if (!named.pipeline) { settings._gpu_pipeline_executor_config.num_threads = threads.pipeline; }
   if (!named.task_creator) {
     settings._task_creator_config.thread_pool.num_threads = threads.task_creator;
@@ -1348,6 +1392,9 @@ try {
   }
   if (!named.uring) { settings._scan_manager_config.uring_n_reactors = threads.uring_reactors; }
   if (!named.rest) { settings._scan_manager_config.rest_n_reactors = threads.rest_reactors; }
+  if (!impl_->explicit_rest_min_mtu) {
+    settings._scan_manager_config.rest.min_mtu = default_rest_min_mtu(egress_nic);
+  }
   validate_rest_fan_out(settings._scan_manager_config);
   settings.finalize_derived_config();
   return settings;
@@ -1360,13 +1407,12 @@ try {
 
 void sirius_config::finalize_derived_config()
 {
-  // The uring (local-disk) readahead budget keeps its default of 0: on local
-  // NVMe a prefetch competes with the executor's own reads for the same device.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
+  derive_uring_scan_budget();
   enforce_native_backend_for_multi_gpu();
   reserve_rest_reactor_cpus();
 }
@@ -1447,8 +1493,8 @@ void sirius_config::derive_rest_scan_budget()
   // per pipeline thread the readahead has no lead — every split a thread picks
   // up is the split whose prefetch only just started, so the read blocks on it.
   // Several splits per thread give the prefetch time to land.  Local disk has no
-  // such round trip to hide, so uring keeps its own default (0, readahead off)
-  // unless the config names a budget.
+  // such round trip to hide, so its budget is derived separately
+  // (derive_uring_scan_budget).
   //
   // Only the untouched default is replaced, so an explicit
   // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
@@ -1472,6 +1518,31 @@ void sirius_config::derive_rest_scan_budget()
     derived,
     _scan_manager_config.rest.n_max_concurrent_scans);
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
+}
+
+void sirius_config::derive_uring_scan_budget()
+{
+  // One scan per pipeline thread.  The opportunistic readahead issues only while
+  // a pipeline thread is off computing rather than reading, so the scans it can
+  // usefully keep in flight are bounded by the pool's width; publishing that
+  // width keeps the backend's budget in step with what the strategy schedules
+  // against (and is the budget an `eager` override would run with).
+  //
+  // Only the untouched default is replaced, so an explicit
+  // uring.n_max_concurrent_scans in the config still wins, an explicit 0 (which
+  // keeps the local readahead off) included.
+  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
+
+  auto const derived =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  if (derived == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size = "
+    "{}, replacing the built-in default of {}",
+    derived,
+    _scan_manager_config.uring.n_max_concurrent_scans);
+  _scan_manager_config.uring.n_max_concurrent_scans = derived;
 }
 
 void sirius_config::enforce_native_backend_for_multi_gpu()

@@ -27,8 +27,13 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -76,22 +81,23 @@ cucascade::memory::gpu_memory_space_config gpu_space(const sirius::sirius_config
 
 TEST_CASE("hardware thread defaults round and clamp each pool", "[config][thread_defaults]")
 {
+  // REST reactors are clamp(T/6, 16, 32) unless the pool is sized from the egress NIC.
   struct example {
     unsigned int cpu;
     std::size_t gpus;
     sirius::exec::hardware_thread_defaults expected;
   };
   for (auto const& row : {
-         example{0, 0, {4, 4, 1, 18, 2, 2}},
-         example{20, 1, {7, 4, 2, 18, 3, 2}},
-         example{31, 1, {8, 4, 3, 18, 5, 2}},
-         example{32, 1, {8, 4, 4, 18, 5, 4}},
-         example{39, 2, {7, 4, 2, 18, 6, 4}},
-         example{64, 8, {4, 4, 1, 18, 10, 4}},
+         example{0, 0, {4, 4, 1, 18, 16, 2}},
+         example{20, 1, {7, 4, 2, 18, 16, 2}},
+         example{31, 1, {8, 4, 3, 18, 16, 2}},
+         example{32, 1, {8, 4, 4, 18, 16, 4}},
+         example{39, 2, {7, 4, 2, 18, 16, 4}},
+         example{64, 8, {4, 4, 1, 18, 16, 4}},
          example{96, 4, {8, 4, 3, 18, 16, 4}},
          example{192, 8, {8, 4, 3, 18, 32, 4}},
          example{std::numeric_limits<unsigned int>::max(), 1, {8, 4, 4, 18, 32, 4}},
-         example{32, std::numeric_limits<std::size_t>::max(), {4, 4, 1, 18, 5, 4}},
+         example{32, std::numeric_limits<std::size_t>::max(), {4, 4, 1, 18, 16, 4}},
        }) {
     CAPTURE(row.cpu, row.gpus);
     auto const actual = sirius::exec::derive_thread_defaults(row.cpu, row.gpus);
@@ -101,6 +107,16 @@ TEST_CASE("hardware thread defaults round and clamp each pool", "[config][thread
     CHECK(actual.scan_manager == row.expected.scan_manager);
     CHECK(actual.rest_reactors == row.expected.rest_reactors);
     CHECK(actual.uring_reactors == row.expected.uring_reactors);
+
+    // Sizing the REST pool from the NIC requests 0 (cuCascade: one reactor per IRQ CPU) and
+    // changes nothing else.
+    auto const from_nic = sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true);
+    CHECK(from_nic.rest_reactors == 0);
+    CHECK(from_nic.pipeline == row.expected.pipeline);
+    CHECK(from_nic.task_creator == row.expected.task_creator);
+    CHECK(from_nic.downgrade == row.expected.downgrade);
+    CHECK(from_nic.scan_manager == row.expected.scan_manager);
+    CHECK(from_nic.uring_reactors == row.expected.uring_reactors);
   }
 }
 
@@ -187,6 +203,183 @@ TEST_CASE("REST fan-out validation uses the resolved hardware reactor count",
   auto const invalid = sirius::parsed_sirius_config::from_node(root);
   CHECK_THROWS_WITH(invalid.resolve({}),
                     Catch::Matchers::ContainsSubstring("must be at most rest_n_reactors"));
+}
+
+namespace {
+
+// A NIC whose queue IRQs are each delivered to one CPU: steered iff those CPUs are a strict
+// subset of the node's.
+cucascade::memory::nic_topology make_nic(std::vector<int> irq_cpus, std::vector<int> node_cpus)
+{
+  cucascade::memory::nic_topology nic;
+  nic.interface = "eth0";
+  nic.node_cpus = std::move(node_cpus);
+  nic.irq_cpus  = std::move(irq_cpus);
+  int queue     = 0;
+  for (int const cpu : nic.irq_cpus) {
+    nic.queue_irqs.push_back(
+      {.irq = 100 + queue, .queue = queue, .cpus = {cpu}, .requested_cpus = {cpu}});
+    ++queue;
+  }
+  return nic;
+}
+
+}  // namespace
+
+TEST_CASE("REST reactors are sized from the NIC only with kTLS and steered IRQs",
+          "[context_config][config][thread_defaults]")
+{
+  cucascade::memory::kernel_tls_info loaded;
+  loaded.loaded = true;
+  cucascade::memory::kernel_tls_info const not_loaded{};
+  auto const steered = make_nic({2, 3, 4, 5}, {0, 1, 2, 3, 4, 5, 6, 7});
+
+  CHECK(sirius::rest_reactors_sized_from_nic(loaded, steered));
+  // No kTLS, or no NIC information, or IRQs that are not steered: the CPU-count default.
+  CHECK_FALSE(sirius::rest_reactors_sized_from_nic(not_loaded, steered));
+  CHECK_FALSE(sirius::rest_reactors_sized_from_nic(loaded, std::nullopt));
+  // IRQ CPUs that cover the whole node leave no subset of cores to align with.
+  CHECK_FALSE(sirius::rest_reactors_sized_from_nic(loaded, make_nic({0, 1, 2, 3}, {0, 1, 2, 3})));
+  // No queue IRQs at all (a virtual interface).
+  CHECK_FALSE(sirius::rest_reactors_sized_from_nic(loaded, make_nic({}, {0, 1, 2, 3})));
+  // An IRQ spread over several CPUs is not steered.
+  auto spread                         = make_nic({2, 3}, {0, 1, 2, 3, 4, 5, 6, 7});
+  spread.queue_irqs[0].cpus           = {2, 3};
+  spread.queue_irqs[0].requested_cpus = {2, 3};
+  CHECK_FALSE(sirius::rest_reactors_sized_from_nic(loaded, spread));
+}
+
+TEST_CASE("rest.min_mtu defaults to the NIC's MTU only for a jumbo-frame NIC",
+          "[context_config][config][thread_defaults]")
+{
+  auto const with_mtu = [](int mtu) {
+    auto nic = make_nic({2, 3}, {0, 1, 2, 3, 4, 5, 6, 7});
+    nic.mtu  = mtu;
+    return nic;
+  };
+  CHECK(sirius::default_rest_min_mtu(with_mtu(9000)) == 9000);
+  // The NIC's own value, not a fixed jumbo size.
+  CHECK(sirius::default_rest_min_mtu(with_mtu(9001)) == 9001);
+  CHECK(sirius::default_rest_min_mtu(with_mtu(8500)) == 8500);
+  CHECK(sirius::default_rest_min_mtu(with_mtu(1501)) == 1501);
+  // Standard Ethernet and unknown MTUs, and no NIC information: no check.
+  CHECK(sirius::default_rest_min_mtu(with_mtu(1500)) == 0);
+  CHECK(sirius::default_rest_min_mtu(with_mtu(1280)) == 0);
+  CHECK(sirius::default_rest_min_mtu(with_mtu(0)) == 0);
+  CHECK(sirius::default_rest_min_mtu(std::nullopt) == 0);
+}
+
+TEST_CASE("resolved REST defaults follow kTLS, NIC IRQ steering and the NIC's MTU",
+          "[context_config][config][thread_defaults]")
+{
+  struct named_keys {
+    std::optional<int> rest_n_reactors;
+    std::optional<int> min_mtu;
+    std::string interface;
+  };
+  auto const make_root = [](named_keys const& named) {
+    auto root         = YAML::Load(R"(sirius:
+  space:
+    gpu: [{device_id: 0, memory_capacity: 512MiB}]
+  executor:
+    scan_manager: {reserve_rest_reactor_cpus: false}
+)");
+    auto scan_manager = root["sirius"]["executor"]["scan_manager"];
+    if (named.rest_n_reactors) { scan_manager["rest_n_reactors"] = *named.rest_n_reactors; }
+    if (named.min_mtu) { scan_manager["rest"]["min_mtu"] = *named.min_mtu; }
+    if (!named.interface.empty()) { scan_manager["rest"]["interface"] = named.interface; }
+    return root;
+  };
+  cucascade::memory::system_topology_info with_ktls{};
+  with_ktls.kernel_tls.loaded = true;
+  cucascade::memory::system_topology_info const without_ktls{};
+
+  int probes = 0;
+  std::string probed_interface;
+  std::optional<cucascade::memory::nic_topology> nic;
+  sirius::egress_nic_probe const probe = [&](std::string_view interface) {
+    ++probes;
+    probed_interface = interface;
+    return nic;
+  };
+  auto const resolve = [&](named_keys const& named, auto const& topology) {
+    return sirius::parsed_sirius_config::from_node(make_root(named))
+      .resolve(topology, probe)
+      .get_scan_manager_config();
+  };
+  auto const fallback =
+    sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).rest_reactors;
+  REQUIRE(fallback >= 16);
+  REQUIRE(fallback <= 32);
+  auto const steered = make_nic({2, 3, 4, 5}, {0, 1, 2, 3, 4, 5, 6, 7});
+
+  SECTION("kTLS loaded and IRQs steered: the pool is NIC-sized (0)")
+  {
+    nic = steered;
+    CHECK(resolve({}, with_ktls).rest_n_reactors == 0);
+    // One lookup serves both the reactor count and rest.min_mtu.
+    CHECK(probes == 1);
+    CHECK(probed_interface.empty());
+  }
+  SECTION("the configured interface is the one probed")
+  {
+    nic = steered;
+    CHECK(resolve({.interface = "enp1s0"}, with_ktls).rest_n_reactors == 0);
+    CHECK(probed_interface == "enp1s0");
+  }
+  SECTION("kTLS loaded but IRQs not steered, or no NIC: clamp(T/6, 16, 32)")
+  {
+    nic = make_nic({0, 1, 2, 3}, {0, 1, 2, 3});
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback);
+    nic.reset();
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback);
+  }
+  SECTION("no kTLS: clamp(T/6, 16, 32), whatever the NIC")
+  {
+    nic = steered;
+    CHECK(resolve({}, without_ktls).rest_n_reactors == fallback);
+    // Nothing needs the NIC once rest.min_mtu is named too.
+    CHECK(probes == 1);
+    probes = 0;
+    CHECK(resolve({.min_mtu = 0}, without_ktls).rest_n_reactors == fallback);
+    CHECK(probes == 0);
+  }
+  SECTION("a named reactor count wins")
+  {
+    nic = steered;
+    for (int const named : {0, 5}) {
+      CAPTURE(named);
+      auto const expected = static_cast<std::size_t>(named);
+      CHECK(resolve({.rest_n_reactors = named, .min_mtu = 0}, with_ktls).rest_n_reactors ==
+            expected);
+      CHECK(resolve({.rest_n_reactors = named, .min_mtu = 0}, without_ktls).rest_n_reactors ==
+            expected);
+    }
+    CHECK(probes == 0);
+  }
+  SECTION("rest.min_mtu is the NIC's MTU for a jumbo-frame NIC, whatever kTLS says")
+  {
+    nic      = steered;
+    nic->mtu = 9000;
+    CHECK(resolve({}, with_ktls).rest.min_mtu == 9000);
+    CHECK(resolve({}, without_ktls).rest.min_mtu == 9000);
+  }
+  SECTION("rest.min_mtu is 0 for a standard-MTU NIC or without NIC information")
+  {
+    nic      = steered;
+    nic->mtu = 1500;
+    CHECK(resolve({}, with_ktls).rest.min_mtu == 0);
+    nic.reset();
+    CHECK(resolve({}, with_ktls).rest.min_mtu == 0);
+  }
+  SECTION("a named rest.min_mtu wins, an explicit 0 included, and needs no NIC")
+  {
+    nic      = steered;
+    nic->mtu = 9000;
+    CHECK(resolve({.min_mtu = 0}, without_ktls).rest.min_mtu == 0);
+    CHECK(resolve({.min_mtu = 8000}, without_ktls).rest.min_mtu == 8000);
+    CHECK(probes == 0);
+  }
 }
 
 TEST_CASE("public configuration builds from defaults", "[context_config][config]")

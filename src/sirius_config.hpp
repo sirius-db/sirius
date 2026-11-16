@@ -27,6 +27,7 @@
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
@@ -34,9 +35,11 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace YAML {
@@ -434,6 +437,30 @@ class configuration_input_error : public std::runtime_error {
 
 class parsed_sirius_config;
 
+/// The egress NIC a REST pool would use (the configured @c rest.interface, else the default
+/// route's interface), as cuCascade discovers it; @c nullopt when there is none or it cannot be
+/// read.  cuCascade's own discovery in production.
+using egress_nic_probe = std::function<std::optional<cucascade::memory::nic_topology>(
+  std::string_view configured_interface)>;
+
+/// cuCascade's egress-NIC discovery, exactly as the REST pool planner runs it.  Never throws.
+[[nodiscard]] std::optional<cucascade::memory::nic_topology> discover_egress_nic(
+  std::string_view configured_interface);
+
+/// Whether the REST reactor count is sized from the egress NIC rather than from the CPU count:
+/// kernel TLS is loaded and the NIC's queue IRQs are steered to a strict subset of its NUMA node's
+/// cores.  The pool then has one reactor per IRQ CPU (cuCascade's @c rest_n_reactors = 0).
+[[nodiscard]] bool rest_reactors_sized_from_nic(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The @c rest.min_mtu default for @p egress_nic: the NIC's MTU when the topology reports a
+/// jumbo-frame interface (an MTU above the standard Ethernet 1500), so a connection that negotiated
+/// smaller segments is rejected and retried on the next address; 0 (no check) otherwise, including
+/// when there is no NIC information.
+[[nodiscard]] std::size_t default_rest_min_mtu(
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
 /// The CPUs a REST pool built from (@c rest_n_reactors, @c rest) would pin to, sorted:
 /// cuCascade's @c planned_reactor_cpus in production.  May throw.
 using rest_reactor_cpu_planner =
@@ -560,6 +587,13 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// configured pipeline pool size (one scan per pipeline thread), so the local
+  /// readahead runs with the width the executor can actually use. Called from
+  /// @ref finalize_derived_config; an explicit config value (an explicit 0
+  /// included) is left alone.
+  void derive_uring_scan_budget();
+
   /// Restrict the GPU pipeline, scan manager, task creator and downgrade pools
   /// to the CPUs the REST reactors will not pin to (see
   /// @c scan_manager_config::reserve_rest_reactor_cpus).  Called from
@@ -597,8 +631,10 @@ class parsed_sirius_config {
   /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
   /// embedder check backend-dependent options before the engine is brought up.
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
-  [[nodiscard]] sirius_config resolve(
-    const cucascade::memory::system_topology_info& topology) const;
+  /// @p probe finds the egress NIC, once, when a value derived from it is unnamed (the REST reactor
+  /// count, which also needs loaded kernel TLS, or @c rest.min_mtu); tests inject a fixed NIC.
+  [[nodiscard]] sirius_config resolve(const cucascade::memory::system_topology_info& topology,
+                                      const egress_nic_probe& probe = discover_egress_nic) const;
 
  private:
   struct Impl;
