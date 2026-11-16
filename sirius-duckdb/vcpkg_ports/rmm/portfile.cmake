@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  67b090cc1d3018bcc983f601b7680ea6bb018baf8245b65fe19032b077076bd11e16c22444dfe286e23d87b258f18c0077b1c638dc4eefc696eabdfb9ffbae94
+  0
   HEAD_REF
   main
   PATCHES
@@ -20,9 +20,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
+  0
   HEAD_REF
   main)
 
@@ -49,7 +49,7 @@ vcpkg_replace_string(
 
 # Ensure vcpkg CCCL headers are found before pixi/conda system CCCL headers. The
 # pixi compiler injects -I flags for its bundled CCCL which may be an older
-# version. RMM still includes cuda/stream_ref, deprecated by CCCL 3.5.0.
+# version.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
@@ -62,8 +62,7 @@ vcpkg_cmake_configure(
   -DBUILD_BENCHMARKS=OFF
   "-DCMAKE_CUDA_ARCHITECTURES=${VCPKG_CUDA_ARCHITECTURES}"
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
-)
+  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
 
 vcpkg_cmake_install()
 
