@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build the Iceberg equality-delete fixtures the GPU scan path is tested against.
 
-Run from the repo root:
-    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py
-    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py --verify
-    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py NAME...   (only these)
+The fixtures are not checked in: test_gpu_execution_multi_format.cpp runs this script once per
+test process and reads them from a scratch directory. To build and check them by hand:
+    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py --out DIR
+    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py --out DIR NAME...
 
 Each fixture isolates one rule a reader gets silently wrong. The rows a WRONG reader returns
 are listed beside the right ones, so a failure says which rule broke:
@@ -796,16 +796,28 @@ def main():
     ap.add_argument(
         "--verify", action="store_true", help="validate only, write nothing"
     )
+    ap.add_argument(
+        "--out", required=True, help="directory the fixtures are written to"
+    )
+    ap.add_argument(
+        "--no-verify", action="store_true", help="skip the check against DuckDB"
+    )
     ap.add_argument("names", nargs="*", help="fixtures to build (default: all)")
     args = ap.parse_args()
     if unknown := [name for name in args.names if name not in FIXTURES]:
         ap.error(f"unknown fixtures: {', '.join(unknown)}")
     selected = {n: f for n, f in FIXTURES.items() if not args.names or n in args.names}
+    # Paths in the metadata are absolute, so the tables read from any working directory.
+    global DATA, REL
+    DATA = REL = pathlib.Path(args.out).resolve()
+    DATA.mkdir(parents=True, exist_ok=True)
     if not args.verify:
         for name, (build, _) in selected.items():
             build()
             print(f"wrote {name}")
         print("validating:")
+    if args.no_verify:
+        return 0
     ok = True
     for name, (_, expected) in selected.items():
         ok &= verify(name, expected)

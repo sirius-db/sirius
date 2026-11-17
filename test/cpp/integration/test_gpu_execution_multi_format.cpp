@@ -180,6 +180,25 @@ static fs::path get_project_root()
 #endif
 }
 
+/// Path of the equality-delete table @p name. generate_equality_delete_fixtures.py builds every
+/// table once per process, into a scratch directory.
+static std::string equality_fixture(std::string const& name)
+{
+  static sirius::test::scratch_dir generated("iceberg_equality");
+  static bool ready = [] {
+    auto const script =
+      get_project_root() / "test/cpp/integration/data/generate_equality_delete_fixtures.py";
+    auto const command = "python3 -B '" + script.string() + "' --no-verify --out '" +
+                         generated.path().string() + "' > /dev/null";
+    REQUIRE(std::system(command.c_str()) == 0);
+    return true;
+  }();
+  (void)ready;
+  auto const path = generated.path() / name;
+  REQUIRE(fs::exists(path / "metadata/v1.metadata.json"));
+  return path.string();
+}
+
 struct sirius_config_env_guard {
   sirius_config_env_guard(const std::string& config_path)
   {
@@ -1504,8 +1523,7 @@ class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixtu
   {
     eq_path =
       (get_project_root() / "test/cpp/integration/data/iceberg_v2_equality_delete").string();
-    double_key_path =
-      (get_project_root() / "test/cpp/integration/data/iceberg_v2_eq_double_key").string();
+    double_key_path = equality_fixture("iceberg_v2_eq_double_key");
   }
 
   std::string eq_path;
@@ -1643,71 +1661,63 @@ class GPUExecutionIcebergEqEdgeCaseFixture : public GPUExecutionIcebergFixture {
 };
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
-                 "gpu_execution iceberg - V2 equality deletes single-column key",
-                 "[integration][gpu_execution][iceberg]")
-{
-  require_delete_files(single_col_path, 1);
-  // The key is the fruit column alone (field_id=1); count is not part of it.
-  // Delete entries "banana" and "date" must match on fruit regardless of count.
-  expect_equality_rows(
-    "SELECT fruit, count FROM " + pinned_scan(single_col_path) + " ORDER BY count;",
-    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
-                 "gpu_execution iceberg - V2 equality deletes multiple delete files",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // Two separate one-row equality-delete files — exercises the concatenate/deduplicate path.
-  require_delete_files(multi_del_path, 2);
-  expect_equality_rows(
-    "SELECT fruit, count FROM " + pinned_scan(multi_del_path) + " ORDER BY count;",
-    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}},
-    2);
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
-                 "gpu_execution iceberg - V2 equality deletes all rows deleted",
+                 "gpu_execution iceberg - V2 equality delete edge cases",
                  "[integration][gpu_execution][iceberg][virtual_columns]")
 {
-  // The delete file covers every data row — an all-false mask, which is where an
-  // A retention-mask implementation that mishandles the empty result shows up.
-  require_delete_files(all_del_path, 1);
-  expect_equality_rows(
-    "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";", {});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
-                 "gpu_execution iceberg - V2 equality and positional deletes combined",
-                 "[integration][gpu_execution][iceberg][virtual_columns]")
-{
-  // Both delete kinds against one table. The positional delete removes row 0 (apple/1). The
-  // equality delete sits at the same sequence number as the data, so per the Iceberg spec it
-  // does NOT apply — deletes only affect data files with strictly lower sequence numbers.
-  // banana/2 surviving is the assertion that the sequence-number rule is honoured.
-  require_delete_files(combined_path, 2);
-  auto const filename =
-    "test/cpp/integration/data/iceberg_v2_eq_pos_combined/data/"
-    "00000-0-a7b8c9d0-0007-0007-0007-000000000001-00001.parquet";
-  expect_equality_rows("SELECT fruit, count, filename, file_row_number FROM " +
-                         pinned_scan(combined_path) + " ORDER BY count;",
-                       {{"banana", "2", filename, "1"},
-                        {"cherry", "3", filename, "2"},
-                        {"date", "4", filename, "3"},
-                        {"elderberry", "5", filename, "4"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
-                 "gpu_execution iceberg - V2 equality deletes multiple data files",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // Two data files, one delete file removing a row from each: file 1 loses banana/2, file 2
-  // loses elderberry/5. Exercises applying one delete set across per-file boundaries — the
-  // same boundary the GPU path's one-file-per-batch coalescing rule exists to protect.
-  require_delete_files(multi_data_path, 1);
-  expect_equality_rows(
-    "SELECT fruit, count FROM " + pinned_scan(multi_data_path) + " ORDER BY count;",
-    {{"apple", "1"}, {"cherry", "3"}, {"date", "4"}, {"fig", "6"}});
+  // One block per rule, each on its own table.
+  {
+    INFO("V2 equality deletes single-column key");
+    require_delete_files(single_col_path, 1);
+    // The key is the fruit column alone (field_id=1); count is not part of it.
+    // Delete entries "banana" and "date" must match on fruit regardless of count.
+    expect_equality_rows(
+      "SELECT fruit, count FROM " + pinned_scan(single_col_path) + " ORDER BY count;",
+      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  }
+  {
+    INFO("V2 equality deletes multiple delete files");
+    // Two separate one-row equality-delete files — exercises the concatenate/deduplicate path.
+    require_delete_files(multi_del_path, 2);
+    expect_equality_rows(
+      "SELECT fruit, count FROM " + pinned_scan(multi_del_path) + " ORDER BY count;",
+      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}},
+      2);
+  }
+  {
+    INFO("V2 equality deletes all rows deleted");
+    // The delete file covers every data row — an all-false mask, which is where an
+    // A retention-mask implementation that mishandles the empty result shows up.
+    require_delete_files(all_del_path, 1);
+    expect_equality_rows(
+      "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";", {});
+  }
+  {
+    INFO("V2 equality and positional deletes combined");
+    // Both delete kinds against one table. The positional delete removes row 0 (apple/1). The
+    // equality delete sits at the same sequence number as the data, so per the Iceberg spec it
+    // does NOT apply — deletes only affect data files with strictly lower sequence numbers.
+    // banana/2 surviving is the assertion that the sequence-number rule is honoured.
+    require_delete_files(combined_path, 2);
+    auto const filename =
+      "test/cpp/integration/data/iceberg_v2_eq_pos_combined/data/"
+      "00000-0-a7b8c9d0-0007-0007-0007-000000000001-00001.parquet";
+    expect_equality_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                           pinned_scan(combined_path) + " ORDER BY count;",
+                         {{"banana", "2", filename, "1"},
+                          {"cherry", "3", filename, "2"},
+                          {"date", "4", filename, "3"},
+                          {"elderberry", "5", filename, "4"}});
+  }
+  {
+    INFO("V2 equality deletes multiple data files");
+    // Two data files, one delete file removing a row from each: file 1 loses banana/2, file 2
+    // loses elderberry/5. Exercises applying one delete set across per-file boundaries — the
+    // same boundary the GPU path's one-file-per-batch coalescing rule exists to protect.
+    require_delete_files(multi_data_path, 1);
+    expect_equality_rows(
+      "SELECT fruit, count FROM " + pinned_scan(multi_data_path) + " ORDER BY count;",
+      {{"apple", "1"}, {"cherry", "3"}, {"date", "4"}, {"fig", "6"}});
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -1717,136 +1727,116 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 class GPUExecutionIcebergEqRulesFixture : public GPUExecutionIcebergFixture {
  public:
-  std::string table(std::string const& name)
-  {
-    return (get_project_root() / "test/cpp/integration/data" / name).string();
-  }
+  std::string table(std::string const& name) { return equality_fixture(name); }
 };
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality keys come from equality_ids",
+                 "gpu_execution iceberg - equality delete rules",
                  "[integration][gpu_execution][iceberg]")
 {
-  // The delete file stores whole rows whose counts no longer match the data. Matching on every
-  // stored column would delete nothing; only `fruit` is a key.
-  auto path = table("iceberg_v2_eq_wide_delete_file");
-  require_delete_files(path, 1);
-  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality keys the query does not output",
-                 "[integration][gpu_execution][iceberg]")
-{
-  auto path = table("iceberg_v2_eq_wide_delete_file");
-  auto scan = pinned_scan(path);
-  // The key is not selected: it must be read anyway and must not come back as a column.
-  expect_equality_rows("SELECT count FROM " + scan + " ORDER BY count;", {{"1"}, {"3"}, {"5"}});
-  // No column is selected at all.
-  expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}});
-  // The key is read for the filter as well as for the delete.
-  expect_equality_rows("SELECT count FROM " + scan + " WHERE fruit <> 'apple' ORDER BY count;",
-                       {{"3"}, {"5"}});
-  // The filter is on another column and would by itself keep the deleted rows.
-  expect_equality_rows("SELECT fruit FROM " + scan + " WHERE count >= 2 ORDER BY fruit;",
-                       {{"cherry"}, {"elderberry"}});
-  // Output order differs from schema order, with the key last.
-  expect_equality_rows("SELECT count, fruit FROM " + scan + " ORDER BY count;",
-                       {{"1", "apple"}, {"3", "cherry"}, {"5", "elderberry"}});
-  // Row provenance survives the delete.
-  expect_equality_rows("SELECT count, file_row_number FROM " + scan + " ORDER BY count;",
-                       {{"1", "0"}, {"3", "2"}, {"5", "4"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality deletes use the inherited sequence number",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // After a manifest rewrite both data files sit in a manifest at sequence 3, above the delete
-  // at 2. The older file keeps data sequence number 1 and must still lose banana/2; the newer
-  // file's banana/4 must survive.
-  auto path = table("iceberg_v2_eq_manifest_rewrite");
-  require_delete_files(path, 1);
-  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
-  expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"1"}, {"3"}, {"4"}, {"5"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality deletes match NULL keys",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // Deletes (NULL, 2) and (cherry, NULL). (NULL, 4) and (cherry, 3) share one key member with a
-  // delete row and must survive.
-  auto path = table("iceberg_v2_eq_null_key");
-  require_delete_files(path, 1);
-  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"apple", "1"}, {"cherry", "3"}, {"NULL", "4"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality deletes respect partitions",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // id=1 is deleted in partition A only; id=2 is deleted under an unpartitioned spec, so
-  // everywhere. Both partitions hold ids 1..3, and the two data files are small enough to be
-  // coalesced into one batch unless their different delete sets keep them apart.
-  auto path = table("iceberg_v2_eq_partitioned");
-  require_delete_files(path, 2);
-  auto scan = pinned_scan(path);
-  expect_equality_rows("SELECT id, region, v FROM " + scan + " ORDER BY v;",
-                       {{"1", "B", "30"}, {"3", "A", "50"}, {"3", "B", "60"}},
-                       2);
-  expect_equality_rows("SELECT v FROM " + scan + " ORDER BY v;", {{"30"}, {"50"}, {"60"}}, 2);
-  expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}}, 2);
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - upsert within one commit",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // The second commit writes key 2 twice. Its equality delete removes the first commit's (2, b)
-  // and must NOT touch its own commit's rows; its position delete removes the superseded (2, x).
-  // Exactly one row with id 2 survives, and it is the last one written.
-  auto path = table("iceberg_v2_eq_upsert_same_commit");
-  require_delete_files(path, 2);
-  expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY id;",
-                       {{"1", "a"}, {"2", "y"}, {"3", "c"}, {"4", "d"}},
-                       2);
-  expect_equality_rows(
-    "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"c"}, {"d"}, {"y"}}, 2);
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality keys are matched by field id",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // The key was renamed fruit -> produce after the data file was written. The delete file uses
-  // the new name; the data file still uses the old one.
-  auto path = table("iceberg_v2_eq_renamed_key");
-  require_delete_files(path, 1);
-  expect_equality_rows("SELECT produce, count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"apple", "1"}, {"cherry", "3"}});
-  expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
-                       {{"1"}, {"3"}});
-}
-
-TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
-                 "gpu_execution iceberg - equality keys across an int to long promotion",
-                 "[integration][gpu_execution][iceberg]")
-{
-  // The first data file and the first delete file store the key as INT32; later files store
-  // INT64. The old delete (id=2) applies to the old data file only, so the re-inserted (2, b2)
-  // survives; the new delete (id in 4, 5) applies to both data files.
-  auto path = table("iceberg_v2_eq_promoted_key");
-  require_delete_files(path, 2);
-  expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
-                       {{"1", "a"}, {"2", "b2"}, {"3", "c"}, {"6", "f"}},
-                       2);
-  expect_equality_rows(
-    "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"b2"}, {"c"}, {"f"}}, 2);
+  // One block per rule, each on its own table.
+  {
+    INFO("equality keys come from equality_ids");
+    // The delete file stores whole rows whose counts no longer match the data. Matching on every
+    // stored column would delete nothing; only `fruit` is a key.
+    auto path = table("iceberg_v2_eq_wide_delete_file");
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  }
+  {
+    INFO("equality keys the query does not output");
+    auto path = table("iceberg_v2_eq_wide_delete_file");
+    auto scan = pinned_scan(path);
+    // The key is not selected: it must be read anyway and must not come back as a column.
+    expect_equality_rows("SELECT count FROM " + scan + " ORDER BY count;", {{"1"}, {"3"}, {"5"}});
+    // No column is selected at all.
+    expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}});
+    // The key is read for the filter as well as for the delete.
+    expect_equality_rows("SELECT count FROM " + scan + " WHERE fruit <> 'apple' ORDER BY count;",
+                         {{"3"}, {"5"}});
+    // The filter is on another column and would by itself keep the deleted rows.
+    expect_equality_rows("SELECT fruit FROM " + scan + " WHERE count >= 2 ORDER BY fruit;",
+                         {{"cherry"}, {"elderberry"}});
+    // Output order differs from schema order, with the key last.
+    expect_equality_rows("SELECT count, fruit FROM " + scan + " ORDER BY count;",
+                         {{"1", "apple"}, {"3", "cherry"}, {"5", "elderberry"}});
+    // Row provenance survives the delete.
+    expect_equality_rows("SELECT count, file_row_number FROM " + scan + " ORDER BY count;",
+                         {{"1", "0"}, {"3", "2"}, {"5", "4"}});
+  }
+  {
+    INFO("equality deletes use the inherited sequence number");
+    // After a manifest rewrite both data files sit in a manifest at sequence 3, above the delete
+    // at 2. The older file keeps data sequence number 1 and must still lose banana/2; the newer
+    // file's banana/4 must survive.
+    auto path = table("iceberg_v2_eq_manifest_rewrite");
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
+    expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"1"}, {"3"}, {"4"}, {"5"}});
+  }
+  {
+    INFO("equality deletes match NULL keys");
+    // Deletes (NULL, 2) and (cherry, NULL). (NULL, 4) and (cherry, 3) share one key member with a
+    // delete row and must survive.
+    auto path = table("iceberg_v2_eq_null_key");
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}, {"NULL", "4"}});
+  }
+  {
+    INFO("equality deletes respect partitions");
+    // id=1 is deleted in partition A only; id=2 is deleted under an unpartitioned spec, so
+    // everywhere. Both partitions hold ids 1..3, and the two data files are small enough to be
+    // coalesced into one batch unless their different delete sets keep them apart.
+    auto path = table("iceberg_v2_eq_partitioned");
+    require_delete_files(path, 2);
+    auto scan = pinned_scan(path);
+    expect_equality_rows("SELECT id, region, v FROM " + scan + " ORDER BY v;",
+                         {{"1", "B", "30"}, {"3", "A", "50"}, {"3", "B", "60"}},
+                         2);
+    expect_equality_rows("SELECT v FROM " + scan + " ORDER BY v;", {{"30"}, {"50"}, {"60"}}, 2);
+    expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}}, 2);
+  }
+  {
+    INFO("upsert within one commit");
+    // The second commit writes key 2 twice. Its equality delete removes the first commit's (2, b)
+    // and must NOT touch its own commit's rows; its position delete removes the superseded (2, x).
+    // Exactly one row with id 2 survives, and it is the last one written.
+    auto path = table("iceberg_v2_eq_upsert_same_commit");
+    require_delete_files(path, 2);
+    expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY id;",
+                         {{"1", "a"}, {"2", "y"}, {"3", "c"}, {"4", "d"}},
+                         2);
+    expect_equality_rows(
+      "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"c"}, {"d"}, {"y"}}, 2);
+  }
+  {
+    INFO("equality keys are matched by field id");
+    // The key was renamed fruit -> produce after the data file was written. The delete file uses
+    // the new name; the data file still uses the old one.
+    auto path = table("iceberg_v2_eq_renamed_key");
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT produce, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}});
+    expect_equality_rows("SELECT count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"1"}, {"3"}});
+  }
+  {
+    INFO("equality keys across an int to long promotion");
+    // The first data file and the first delete file store the key as INT32; later files store
+    // INT64. The old delete (id=2) applies to the old data file only, so the re-inserted (2, b2)
+    // survives; the new delete (id in 4, 5) applies to both data files.
+    auto path = table("iceberg_v2_eq_promoted_key");
+    require_delete_files(path, 2);
+    expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
+                         {{"1", "a"}, {"2", "b2"}, {"3", "c"}, {"6", "f"}},
+                         2);
+    expect_equality_rows(
+      "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"b2"}, {"c"}, {"f"}}, 2);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -2031,8 +2021,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                  "[integration][gpu_execution][iceberg]")
 {
   // The fixture's one data file is subject to two delete files.
-  auto query = "SELECT fruit, count FROM " + pinned_scan(table("iceberg_v2_eq_multi_delete_file")) +
-               " ORDER BY count;";
+  auto query =
+    "SELECT fruit, count FROM " +
+    pinned_scan(
+      (get_project_root() / "test/cpp/integration/data/iceberg_v2_eq_multi_delete_file").string()) +
+    " ORDER BY count;";
   auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
   auto reset    = reset_after_test(counters->equality_files_per_data_file_limit_for_testing);
   auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_budget);
@@ -4037,8 +4030,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "[integration][iceberg][verdict]")
 {
   using namespace sirius::op::scan;
-  auto path =
-    (get_project_root() / "test/cpp/integration/data/iceberg_v2_eq_manifest_rewrite").string();
+  auto path      = equality_fixture("iceberg_v2_eq_manifest_rewrite");
   auto sid       = current_snapshot_id(path);
   auto inventory = read_delete_inventory(*con->context, path, sid);
   REQUIRE(inventory.inventory);
