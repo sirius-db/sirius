@@ -4,6 +4,7 @@
 #include "config/option.hpp"
 #include "config/size.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -30,6 +31,30 @@ struct positive_fraction {
   [[nodiscard]] static constexpr const char* description() noexcept
   {
     return "must be greater than 0.0 and at most 1.0";
+  }
+};
+
+/// Accepts finite values above 0 (NaN and infinity fail).
+struct positive_finite {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  }
+  [[nodiscard]] static constexpr const char* description() noexcept
+  {
+    return "must be finite and greater than 0";
+  }
+};
+
+/// Accepts finite values at or above 0 (NaN and infinity fail).
+struct non_negative_finite {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value >= 0.0;
+  }
+  [[nodiscard]] static constexpr const char* description() noexcept
+  {
+    return "must be finite and not negative";
   }
 };
 
