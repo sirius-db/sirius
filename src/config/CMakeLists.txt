@@ -1,1 +1,1 @@
-target_sources(sirius_objects PRIVATE yaml.cpp)
+target_sources(sirius_objects PRIVATE user_config.cpp yaml.cpp)
