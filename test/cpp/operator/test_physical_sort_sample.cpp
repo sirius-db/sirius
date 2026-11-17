@@ -472,3 +472,20 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   CHECK(sample_op.get_num_partitions() == rows_per_batch);
   CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
 }
+
+TEST_CASE("sirius_physical_sort_sample records key-row stride", "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto sample_op = make_sort_sample(1000000, 30000);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 3, 20000);
+  attach_port(sample_op, *repo);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  auto const& stats = sample_op.get_range_sample_stats();
+  CHECK(stats.sample_rows == 60000);
+  CHECK(stats.sample_stride == 15);
+  CHECK(stats.sample_key_rows == 3999);
+}
