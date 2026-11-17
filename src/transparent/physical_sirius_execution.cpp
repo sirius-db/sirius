@@ -28,6 +28,7 @@
 #include <duckdb/execution/executor.hpp>
 #include <duckdb/execution/operator/helper/physical_result_collector.hpp>
 #include <duckdb/execution/operator/helper/physical_result_sink.hpp>
+#include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/buffered_data/batched_buffered_data.hpp>
 #include <duckdb/main/buffered_data/simple_buffered_data.hpp>
 #include <duckdb/main/client_config.hpp>
@@ -52,6 +53,9 @@ struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
   duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
   duckdb::SiriusContext* sirius_context = nullptr;
   bool finished                         = false;
+  // The CPU plan built for this fallback when the stashed one came from a rewritten logical plan
+  // (see plan_without_rewrites). Declared before the executor that runs it, so it outlives it.
+  duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_replanned;
   // Private executor for the CPU fallback plan (see run_cpu_fallback_plan). Kept
   // alive here so the materialized result's backing pipelines outlive GetData.
   duckdb::unique_ptr<duckdb::Executor> cpu_executor;
@@ -130,6 +134,52 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   }
 }
 
+// DuckDB's own CPU plan of @p sql, for a fallback whose stashed plan was built from a logical
+// plan the pre-optimize hook had rewritten for the GPU. The internal-query guard keeps that hook
+// out, so this is the plan DuckDB makes with GPU execution off.
+//
+// Returns null when @p sql cannot stand in for the statement: it is not one plain SELECT (an
+// EXECUTE of a prepared statement, for one), it has parameters, it fails to plan, or its result
+// types differ from @p stashed. The caller then runs the stashed plan, which returns the same rows.
+duckdb::shared_ptr<duckdb::PreparedStatementData> plan_without_rewrites(
+  duckdb::ClientContext& client,
+  std::string const& sql,
+  duckdb::PreparedStatementData const& stashed)
+{
+  if (sql.empty()) { return nullptr; }
+  try {
+    duckdb::SiriusContext::InternalQueryGuard guard(client);
+    duckdb::Parser parser(client);
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1 ||
+        parser.statements[0]->type != duckdb::StatementType::SELECT_STATEMENT) {
+      return nullptr;
+    }
+    duckdb::Planner planner(client);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    if (!planner.plan || !planner.properties.bound_all_parameters || !planner.value_map.empty() ||
+        planner.types != stashed.types) {
+      return nullptr;
+    }
+    duckdb::Optimizer optimizer(*planner.binder, client);
+    auto logical_plan = optimizer.Optimize(std::move(planner.plan));
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->types      = planner.types;
+    prepared->names      = planner.names;
+    prepared->properties = planner.properties;
+    duckdb::PhysicalPlanGenerator physical_planner(client);
+    prepared->physical_plan = physical_planner.Plan(std::move(logical_plan));
+    return prepared;
+  } catch (duckdb::InterruptException&) {
+    throw;
+  } catch (std::exception& e) {
+    SIRIUS_LOG_INFO("Transparent execution: CPU fallback keeps the rewritten plan: {}", e.what());
+    return nullptr;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -149,7 +199,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   std::uint64_t validated_plan_pin_epoch,
   std::optional<uint64_t> captured_transaction_id,
   std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs,
-  std::uint64_t validated_distributed_query)
+  std::uint64_t validated_distributed_query,
+  bool plan_rewritten)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
@@ -160,6 +211,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
+    plan_rewritten_(plan_rewritten),
     source_policy_(std::move(source_policy)),
     captured_transaction_id_(captured_transaction_id),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
@@ -544,8 +596,15 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
       // TARGET executing connection's state.
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
-      state.result =
-        run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      auto* cpu_plan = cpu_fallback_prepared_.get();
+      if (plan_rewritten_) {
+        state.cpu_replanned = plan_without_rewrites(context.client, query_sql_, *cpu_plan);
+        if (state.cpu_replanned) {
+          cpu_plan = state.cpu_replanned.get();
+          if (state.sirius_context) { state.sirius_context->record_transparent_fallback_replan(); }
+        }
+      }
+      state.result = run_cpu_fallback_plan(context.client, *cpu_plan, state.cpu_executor);
     }
 
     SIRIUS_LOG_INFO("Transparent GPU execution: query completed");

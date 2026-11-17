@@ -44,6 +44,9 @@ enum class decline_reason : uint8_t {
   provider_internal,
   hidden_catalog,         ///< a registered catalog or scanned table is HIDDEN
   classification_failed,  ///< inspection failed or a registered catalog identity did not match
+  /// Sirius rewrote the plan before optimization and then did not take the query. DuckDB plans
+  /// the statement a second time, and this keeps both hooks out of that pass.
+  rewritten_plan_fallback,
 };
 
 struct classification_result {

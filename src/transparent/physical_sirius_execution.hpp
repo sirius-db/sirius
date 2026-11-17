@@ -63,7 +63,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     std::uint64_t validated_plan_pin_epoch                                         = 0,
     std::optional<uint64_t> captured_transaction_id                                = std::nullopt,
     std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs     = nullptr,
-    std::uint64_t validated_distributed_query                                      = 0);
+    std::uint64_t validated_distributed_query                                      = 0,
+    bool plan_rewritten                                                            = false);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -119,6 +120,11 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// to the same ClientContext (same transaction/MVCC snapshot). shared_ptr so the
   /// const source state can keep it alive across the nested run.
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared_;
+
+  /// Whether the pre-optimize hook rewrote the logical plan `cpu_fallback_prepared_` was built
+  /// from. A runtime fallback then plans `query_sql_` again, without the rewrites, and runs that;
+  /// it keeps the stashed plan only when the statement cannot be planned from its text alone.
+  bool plan_rewritten_ = false;
 
   /// Derived from the retained CPU plan before any SQL replan.
   plan_source_policy source_policy_;

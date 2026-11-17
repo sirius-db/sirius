@@ -27,6 +27,7 @@
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
+#include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
@@ -277,27 +278,44 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
 // edit is decided and built in full before it changes the plan, with moves that cannot fail, so
 // the plan is valid whenever a rewrite throws. There is no rollback: edits made before the throw
 // stay, including an `EXISTS` already answered when the search for the next one fails.
-void rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
+//
+// Returns whether the plan may have changed. A rewrite that throws counts, since it can have made
+// edits first.
+bool rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
 {
   auto& context = input.context;
+  bool changed  = false;
   // First: once the keys reach a second table, the subquery no longer has the single key join the
   // comparison of the two subqueries looks for.
   if (exists_from_aggregate_enabled(context)) {
     try {
-      sirius::planner::answer_exists_from_aggregate(context, plan);
+      changed = sirius::planner::answer_exists_from_aggregate(context, plan) > 0;
     } catch (std::exception& e) {
+      changed = true;
       SIRIUS_LOG_DEBUG("Stopped answering EXISTS from aggregate subqueries: {}",
                        sirius::sanitized_message(e));
     }
   }
   if (subquery_key_carry_enabled(context)) {
     try {
-      sirius::planner::carry_subquery_keys_across_equalities(context, input.optimizer.binder, plan);
+      changed = sirius::planner::carry_subquery_keys_across_equalities(
+                  context, input.optimizer.binder, plan) > 0 ||
+                changed;
     } catch (std::exception& e) {
+      changed = true;
       SIRIUS_LOG_DEBUG("Subquery keys not carried across equalities: {}",
                        sirius::sanitized_message(e));
     }
   }
+  return changed;
+}
+
+// Whether the statement returns rows to the client. `INSERT ... SELECT`, `CREATE TABLE AS` and
+// `COPY` do not, and Sirius never runs them.
+bool returns_query_result(duckdb::OptimizerExtensionInput& input)
+{
+  return input.optimizer.binder.GetStatementProperties().return_type ==
+         duckdb::StatementReturnType::QUERY_RESULT;
 }
 
 // What Sirius needs from the plan before DuckDB optimizes it: its decision on the query, scan
@@ -316,10 +334,13 @@ void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
     auto const scans = add_parquet_footer_statistics(context, plan);
     if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
   }
-  // After the statistics, whose row counts one rewrite reads; before the proofs, which describe
-  // the plan the built-in optimizers will receive.
-  if (gpu_execution_enabled(context) && declined == decline_reason::none) {
-    rewrite_delim_ctes(input, plan);
+  // After the statistics, which give Parquet scans the row counts one rewrite's size guard reads;
+  // before the proofs, which describe the plan the built-in optimizers will receive. Only for a
+  // statement that can reach the GPU: anything else must get the plan DuckDB makes alone. A query
+  // that Sirius turns down later is planned again without the rewrites (`mark_plan_rewritten`).
+  if (gpu_execution_enabled(context) && declined == decline_reason::none && ctx->is_initialized() &&
+      returns_query_result(input) && rewrite_delim_ctes(input, plan)) {
+    conn_state->mark_plan_rewritten();
   }
   // DuckDB clears its delim-CTE restriction proof before this hook runs, and never sets it for
   // Parquet scans. Re-derive it before the built-in optimizers restructure the delim CTEs; the
