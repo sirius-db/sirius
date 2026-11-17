@@ -32,6 +32,8 @@ class Repository(ThreadingHTTPServer):
     def __init__(self, root):
         self.root = root
         self.etag = '"1"'
+        # ETags of files other than the current builds, by path relative to the root.
+        self.etags = {}
 
         class Handler(BaseHTTPRequestHandler):
             def do_HEAD(handler):
@@ -48,14 +50,15 @@ class Repository(ThreadingHTTPServer):
                 if not path.is_file():
                     handler.send_error(404)
                     return
-                if handler.headers.get("If-None-Match") == self.etag:
+                etag = self.etags.get(str(path.relative_to(self.root)), self.etag)
+                if handler.headers.get("If-None-Match") == etag:
                     handler.send_response(304)
-                    handler.send_header("ETag", self.etag)
+                    handler.send_header("ETag", etag)
                     handler.end_headers()
                     return
                 body = path.read_bytes()
                 handler.send_response(200)
-                handler.send_header("ETag", self.etag)
+                handler.send_header("ETag", etag)
                 handler.send_header("Content-Length", str(len(body)))
                 handler.end_headers()
                 if send_body:
@@ -392,6 +395,7 @@ class LoaderTests(unittest.TestCase):
         )
         destination.parent.mkdir(parents=True)
         shutil.copyfile(self.backend(version), destination)
+        self.revision, self.platform = version_dir, host["platform"]
         return repository
 
     def test_auto_install_from_repository(self):
@@ -457,6 +461,27 @@ class LoaderTests(unittest.TestCase):
         result = self.query(load, autoinstall=True)
         self.assertEqual(self.rows(result), [{"backend": 13}])
         self.assertEqual(result.stderr, "")
+
+    def test_reports_update_for_pinned_version(self):
+        repository = self.repository_with_backend(13)
+        name = self.backend(13).name
+        pinned = Path("sirius_cuda13/v0") / self.revision / self.platform / name
+        (repository / pinned).parent.mkdir(parents=True)
+        shutil.copyfile(self.backend(13), repository / pinned)
+        server = Repository(repository)
+        self.addCleanup(server.stop)
+        server.etags[str(pinned)] = '"v0"'
+        result = self.query(
+            f"FORCE INSTALL sirius_cuda13 FROM {quote(server.url)} VERSION 'v0';"
+            f"SET autoinstall_extension_repository={quote(server.url)};"
+            f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",
+            autoinstall=True,
+        )
+        # The current build differs from the pinned one, as UPDATE EXTENSIONS would find.
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertIn(
+            "Sirius: an update for sirius_cuda13 is available.", result.stderr
+        )
 
     def test_loader_has_no_cuda_or_engine_dependency(self):
         result = subprocess.run(

@@ -58,24 +58,19 @@ struct backend_update_check {
   static bool update_available(duckdb::DatabaseInstance& db, std::string const& extension_path)
   {
     try {
-      auto& fs  = duckdb::FileSystem::GetLocal(db);
-      auto info = duckdb::ExtensionInstallInfo::TryReadInfoFile(
-        fs, extension_path + ".info", fs.ExtractBaseName(extension_path));
+      auto& fs        = duckdb::FileSystem::GetLocal(db);
+      auto const name = fs.ExtractBaseName(extension_path);
+      auto const info =
+        duckdb::ExtensionInstallInfo::TryReadInfoFile(fs, extension_path + ".info", name);
       if (!info || info->mode != duckdb::ExtensionInstallMode::REPOSITORY || info->etag.empty() ||
-          !duckdb::StringUtil::StartsWith(info->full_path, "http")) {
+          !duckdb::StringUtil::StartsWith(info->repository_url, "http")) {
         return false;
       }
-      // Compare repository URLs over plain http: install records https when httpfs is loaded.
-      auto const plain = [](std::string url) {
-        return duckdb::StringUtil::StartsWith(url, "https://") ? "http://" + url.substr(8) : url;
-      };
-      auto url              = plain(info->full_path);
-      auto const repository = plain(info->repository_url);
-      // UPDATE EXTENSIONS uses the primary repository even when install fell back to its backup.
-      auto const backup = duckdb::ExtensionRepository::TryGetBackupRepositoryUrl(repository);
-      if (!backup.empty() && duckdb::StringUtil::StartsWith(url, backup)) {
-        url = repository + url.substr(backup.size());
-      }
+      // Ask for the artifact UPDATE EXTENSIONS would install: the repository's current build, from
+      // the primary server, rather than the pinned version or backup recorded in full_path.
+      auto const repository = duckdb::ExtensionRepository::GetRepositoryByUrl(info->repository_url);
+      auto url              = duckdb::ExtensionHelper::ExtensionFinalizeUrlTemplate(
+        duckdb::ExtensionHelper::ExtensionUrlTemplate(&db, repository, ""), name);
       // Like install: https only when httpfs provides it.
       if (db.ExtensionIsLoaded("httpfs")) { duckdb::HTTPUtil::BumpToSecureProtocol(url); }
       if (!may_download(db, url)) { return false; }
