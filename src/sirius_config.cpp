@@ -567,13 +567,16 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
   r.reject_unknown();
 }
 
-static void validate_rest_fan_out(scan_manager::scan_manager_config const& opt)
+// The REST fan-out against the reactor count, named under @p path ("rest" or a full path).
+static std::optional<std::string> rest_fan_out_error(scan_manager::scan_manager_config const& opt,
+                                                     std::string_view path)
 {
   if (opt.rest_n_reactors > 0 && opt.rest.fan_out > opt.rest_n_reactors &&
       opt.rest.fan_out != cucascade::io::rest::config{}.fan_out) {
-    throw std::runtime_error("'rest.fan_out': must be at most rest_n_reactors (" +
-                             std::to_string(opt.rest_n_reactors) + ")");
+    return "'" + std::string(path) + ".fan_out': must be at most rest_n_reactors (" +
+           std::to_string(opt.rest_n_reactors) + ")";
   }
+  return std::nullopt;
 }
 
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
@@ -613,7 +616,9 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
   // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
-  if (r.has_value("rest_n_reactors")) { validate_rest_fan_out(opt); }
+  if (r.has_value("rest_n_reactors")) {
+    if (auto error = rest_fan_out_error(opt, "rest")) { throw std::runtime_error(*error); }
+  }
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -1254,10 +1259,12 @@ try {
                                                       : source_path.string() + ": " + e.what());
 }
 
-parsed_sirius_config parsed_sirius_config::from_user_config(const config::user_config& user)
+parsed_sirius_config parsed_sirius_config::from_user_config(const config::user_config& input)
 try {
-  // The rules across blocks, also for a configuration built in code rather than read.
-  user.validate(config::user_config_root);
+  // Read back what the user defined: fallbacks fill in the rest and every block checks its rules,
+  // for a configuration built in code (or never read) as much as for one read from a file.
+  config::user_config user;
+  user.read(input.write(false), config::user_config_root, config::environment::prod);
 
   auto impl      = std::make_shared<Impl>();
   auto& settings = impl->settings;
@@ -1487,20 +1494,26 @@ try {
   ops.avg_variable_column_bytes                = op.avg_variable_column_bytes.get().count();
   ops.enable_runtime_size_estimation           = op.enable_runtime_size_estimation.get();
   ops.use_hw_decompression                     = op.use_hw_decompression.get();
-  // Unset batch sizes are derived from GPU memory when the configuration is resolved.
-  std::pair<config::config_option<config::ubytes> const*, uint64_t operator_params::*> const
-    batch_options[] = {
-      {&op.scan_task_batch_size, &operator_params::scan_task_batch_size},
-      {&op.hash_partition_bytes, &operator_params::hash_partition_bytes},
-      {&op.concat_batch_bytes, &operator_params::concat_batch_bytes},
-      {&op.cross_join_task_bytes, &operator_params::cross_join_task_bytes},
-      {&op.sort_sample_bytes, &operator_params::sort_sample_bytes},
-      {&op.max_build_hash_table_bytes, &operator_params::max_build_hash_table_bytes},
-      {&op.max_build_probe_resident_bytes, &operator_params::max_build_probe_resident_bytes}};
-  for (auto const& [option, member] : batch_options) {
-    if (auto const* value = option->get_if()) {
-      ops.*member = value->count();
-      impl->explicit_batch_settings.push_back(member);
+  // Unset batch sizes are derived from GPU memory when the configuration is resolved; the
+  // options are found by the keys batch_settings names, so the two cannot disagree.
+  config::config_option<config::ubytes> const* const batch_options[] = {
+    &op.scan_task_batch_size,
+    &op.hash_partition_bytes,
+    &op.concat_batch_bytes,
+    &op.cross_join_task_bytes,
+    &op.sort_sample_bytes,
+    &op.max_build_hash_table_bytes,
+    &op.max_build_probe_resident_bytes};
+  static_assert(std::size(batch_options) == std::size(batch_settings));
+  for (auto const& setting : batch_settings) {
+    auto const option = std::ranges::find_if(
+      batch_options, [&](auto const* candidate) { return candidate->key() == setting.name; });
+    if (option == std::end(batch_options)) {
+      throw std::logic_error(std::string("no operator option for batch setting ") + setting.name);
+    }
+    if (auto const* value = (*option)->get_if()) {
+      ops.*setting.member = value->count();
+      impl->explicit_batch_settings.push_back(setting.member);
     }
   }
 
@@ -1610,10 +1623,33 @@ std::size_t default_rest_min_mtu(
   std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
 {
   constexpr int standard_ethernet_mtu = 1500;
-  return egress_nic.has_value() && egress_nic->mtu > standard_ethernet_mtu
+  // The largest min_mtu cuCascade accepts (an IPv4 TCP packet's 65535 bytes plus options); a NIC
+  // reporting more gets no check rather than a configuration that fails to start.
+  constexpr int largest_min_mtu = 65535 + 60 + 12;
+  return egress_nic.has_value() && egress_nic->mtu > standard_ethernet_mtu &&
+             egress_nic->mtu <= largest_min_mtu
            ? static_cast<std::size_t>(egress_nic->mtu)
            : std::size_t{0};
 }
+
+namespace {
+// cuCascade's configurator rejects selections the machine cannot serve (more GPUs than it has, an
+// unknown device id, a host fraction without known NUMA memory): a configuration error.
+std::vector<cucascade::memory::memory_space_config> build_memory_spaces(
+  cucascade::memory::reservation_manager_configurator const& builder,
+  cucascade::memory::system_topology_info const& topology)
+{
+  try {
+    return builder.build(topology);
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (const configuration_input_error&) {
+    throw;
+  } catch (const std::exception& e) {
+    throw configuration_input_error(e.what());
+  }
+}
+}  // namespace
 
 sirius_config parsed_sirius_config::resolve(
   const cucascade::memory::system_topology_info& hw_topology, const egress_nic_probe& probe) const
@@ -1640,7 +1676,7 @@ try {
       // Resolve selected devices through the same configurator before its byte-limit assertion.
       auto capacity_builder = builder;
       capacity_builder.set_usage_limit_ratio_per_gpu(1.0);
-      for (auto const& space : capacity_builder.build(hw_topology)) {
+      for (auto const& space : build_memory_spaces(capacity_builder, hw_topology)) {
         if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
             gpu && *bytes > gpu->memory_capacity) {
           throw configuration_input_error(
@@ -1649,7 +1685,7 @@ try {
         }
       }
     }
-    settings._memory_space_configs = builder.build(hw_topology);
+    settings._memory_space_configs = build_memory_spaces(builder, hw_topology);
     for (auto& space : settings._memory_space_configs) {
       auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
       if (!host) { continue; }
@@ -1742,7 +1778,10 @@ try {
                                      "sirius.executor.scan_manager.rest")) {
     throw configuration_input_error(*error);
   }
-  validate_rest_fan_out(settings._scan_manager_config);
+  if (auto error =
+        rest_fan_out_error(settings._scan_manager_config, "sirius.executor.scan_manager.rest")) {
+    throw configuration_input_error(*error);
+  }
   settings.finalize_derived_config();
   return settings;
 } catch (const std::bad_alloc&) {

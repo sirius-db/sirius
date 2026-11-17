@@ -206,6 +206,7 @@ struct rest_options : block_base<rest_options> {
   /// Bytes per second; a transfer slower than this for stall_time_s is abandoned.
   config_option<bytes> stall_speed_limit_bytes =
     option<bytes>("stall_speed_limit_bytes")
+      .validate(non_negative<bytes>{})
       .fallback(bytes(defaults().stall_speed_limit_bytes))
       .build();
   config_option<std::chrono::seconds> stall_time =

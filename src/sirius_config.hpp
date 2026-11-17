@@ -671,8 +671,9 @@ class parsed_sirius_config {
   static parsed_sirius_config from_file(const std::filesystem::path& path);
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
-  /// The same intent from the typed user configuration. @throws configuration_input_error for a
-  /// rule across its blocks.
+  /// The same intent from the typed user configuration: its user-defined values are read back, so
+  /// fallbacks fill in the rest and every block's rules hold, also for a configuration built in
+  /// code. @throws configuration_input_error when a value or a rule fails.
   static parsed_sirius_config from_user_config(const config::user_config& user);
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
