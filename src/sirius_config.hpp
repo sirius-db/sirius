@@ -134,6 +134,10 @@ constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 
+/// Aggregate below an inner join that only adds variable-width columns the aggregate groups by,
+/// and combine the partial results above it.
+constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -343,6 +347,11 @@ struct operator_params {
   /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
   /// `rewrite_correlated_inequality_exists`.
   bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
+
+  /// Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds
+  /// variable-width group-by columns, so the join repeats them once per key instead of once per
+  /// row. See `push_partial_aggregates_below_joins`.
+  bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.

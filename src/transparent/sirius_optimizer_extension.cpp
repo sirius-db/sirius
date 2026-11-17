@@ -21,6 +21,7 @@
 #include "planner/delim_cte_proof.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
@@ -95,6 +96,20 @@ bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
   }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool partial_aggregate_below_join_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_partial_aggregate_below_join;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_partial_aggregate_below_join;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_partial_aggregate_below_join;
 }
 
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
@@ -390,30 +405,52 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    auto copy = copy_logical_plan(*captured, context);
-    // Runs before the EXISTS rewrite, whose recorded count a failure here would otherwise discard.
-    if (delim_aggregate_reuse_enabled(context)) {
-      try {
-        sirius::planner::reuse_delim_rows_for_subquery_aggregates(
-          context, input.optimizer.binder, copy);
-      } catch (std::exception& e) {
-        SIRIUS_LOG_WARN(
-          "Transparent execution: delim aggregate reuse failed, planning without it: {}",
-          sirius::sanitized_message(e));
-        copy = copy_logical_plan(*captured, context);
+    // The subquery rewrites on @p copy; returns the subqueries the EXISTS rewrite replaced. A
+    // rewrite that fails is left out by starting over from a fresh copy. The delim reuse runs
+    // first, so its failure starts over before the EXISTS rewrite has replaced anything.
+    auto const rewrite_subqueries =
+      [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
+      if (delim_aggregate_reuse_enabled(context)) {
+        try {
+          sirius::planner::reuse_delim_rows_for_subquery_aggregates(
+            context, input.optimizer.binder, copy);
+        } catch (std::exception& e) {
+          SIRIUS_LOG_WARN(
+            "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+            sirius::sanitized_message(e));
+          copy = copy_logical_plan(*captured, context);
+        }
       }
-    }
-    if (exists_minmax_rewrite_enabled(context)) {
+      if (!exists_minmax_rewrite_enabled(context)) { return 0; }
       try {
-        ctx->record_exists_minmax_rewrites(sirius::planner::rewrite_correlated_inequality_exists(
-          context, input.optimizer.binder, copy, gpu_memory_budget(context)));
+        return sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context));
       } catch (std::exception& e) {
         SIRIUS_LOG_WARN(
           "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
           sirius::sanitized_message(e));
         copy = copy_logical_plan(*captured, context);
+        return 0;
+      }
+    };
+    auto copy                     = copy_logical_plan(*captured, context);
+    auto exists_rewrites          = rewrite_subqueries(copy);
+    std::size_t pushed_aggregates = 0;
+    if (partial_aggregate_below_join_enabled(context)) {
+      try {
+        pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
+          context, input.optimizer.binder, copy);
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: partial aggregate pushdown failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy            = copy_logical_plan(*captured, context);
+        exists_rewrites = rewrite_subqueries(copy);
       }
     }
+    // Recorded once the plan is final, so the counts describe the plan that is captured.
+    ctx->record_exists_minmax_rewrites(exists_rewrites);
+    ctx->record_partial_aggregate_pushdowns(pushed_aggregates);
     conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

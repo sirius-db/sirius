@@ -127,6 +127,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_delim_aggregate_reuse.cpp
     test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
+    test/cpp/integration/test_gpu_execution_partial_aggregate_pushdown.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_domain_evidence.cpp
@@ -305,6 +306,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_one_rank_parity.cpp
+    test/cpp/planner/test_partial_aggregate_pushdown.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
