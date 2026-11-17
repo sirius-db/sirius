@@ -146,6 +146,7 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
   };
   std::size_t i = 0;
   bool dot = false, digits = false;
+  std::size_t integer_digits = 0;
   for (; i < text.size(); ++i) {
     char const c = text[i];
     if (c == '.' && !dot) {
@@ -154,6 +155,11 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
     }
     if (c < '0' || c > '9') { break; }
     digits = true;
+    // yaml-cpp read a bare "010" as octal; reading it as ten would change the value silently.
+    if (!dot && integer_digits++ == 1 && text.front() == '0') {
+      return parse_status::failure("invalid " + std::string(k.noun) + ": " +
+                                   detail::quoted(original) + " (leading zeros are not allowed)");
+    }
     if (c == '0') {
       ++(dot ? frac_zeros : int_zeros);
       continue;

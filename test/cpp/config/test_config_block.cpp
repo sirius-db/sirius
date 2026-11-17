@@ -15,7 +15,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-struct pool_options : block_base<pool_options> {
+struct sample_pool : block_base<sample_pool> {
   config_option<int> num_threads =
     option<int>("num_threads").validate([](int v) { return v > 0; }).fallback(4).build();
   config_option<std::vector<int>> cpu_affinity = option<std::vector<int>>("cpu_affinity").build();
@@ -28,7 +28,7 @@ struct pool_options : block_base<pool_options> {
   }
 };
 
-struct downgrade_options : block_base<downgrade_options> {
+struct sample_downgrade : block_base<sample_downgrade> {
   config_option<double> trigger = option<double>("trigger_fraction").fallback(0.8).build();
   config_option<double> stop    = option<double>("stop_fraction").fallback(0.6).build();
   config_option<std::chrono::milliseconds> period =
@@ -45,17 +45,17 @@ struct downgrade_options : block_base<downgrade_options> {
   }
 };
 
-struct gpu_space_options : block_base<gpu_space_options> {
+struct sample_gpu_space : block_base<sample_gpu_space> {
   config_option<int> device_id  = option<int>("device_id").mark_mandatory().build();
   config_option<bytes> capacity = option<bytes>("memory_capacity").build();
 
   auto fields() { return field_list(device_id, capacity); }
 };
 
-struct executor_options : block_base<executor_options> {
-  pool_options pipeline;
-  downgrade_options downgrade;
-  std::vector<gpu_space_options> gpus;
+struct sample_executor : block_base<sample_executor> {
+  sample_pool pipeline;
+  sample_downgrade downgrade;
+  std::vector<sample_gpu_space> gpus;
 
   auto fields()
   {
@@ -87,7 +87,7 @@ std::string read_error(config_block& block, const node& n)
 
 TEST_CASE("an absent block takes every fallback", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   executor.read(node{}, "sirius.executor", environment::prod);
   REQUIRE_FALSE(executor.user_defined());
   REQUIRE_FALSE(executor.pipeline.user_defined());
@@ -103,7 +103,7 @@ TEST_CASE("nested blocks read their own mapping", "[config][config_block]")
   node root = node::mapping();
   root.set("pipeline", scalars({{"num_threads", "8"}}));
   root.set("downgrade", node::mapping());  // present but empty
-  executor_options executor;
+  sample_executor executor;
   executor.read(root, "sirius.executor", environment::prod);
   REQUIRE(executor.pipeline.user_defined());
   REQUIRE(executor.pipeline.num_threads.user_defined());
@@ -114,7 +114,7 @@ TEST_CASE("nested blocks read their own mapping", "[config][config_block]")
 
 TEST_CASE("errors name the dotted path", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   node root = node::mapping();
   root.set("pipeline", scalars({{"num_threads", "0"}}));
   REQUIRE(read_error(executor, root) ==
@@ -136,7 +136,7 @@ TEST_CASE("errors name the dotted path", "[config][config_block]")
 
 TEST_CASE("removed keys fail even with a null value, before other errors", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   node pipeline = scalars({{"num_threads", "oops"}});
   pipeline.set("thread_name_prefix", node{});
   node root = node::mapping();
@@ -147,7 +147,7 @@ TEST_CASE("removed keys fail even with a null value, before other errors", "[con
 
 TEST_CASE("validate() checks rules across fields", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   node root = node::mapping();
   root.set("downgrade", scalars({{"trigger_fraction", "0.5"}}));
   REQUIRE(read_error(executor, root) ==
@@ -156,7 +156,7 @@ TEST_CASE("validate() checks rules across fields", "[config][config_block]")
 
 TEST_CASE("lists read one block per element", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   node root = node::mapping();
   root.set("gpu",
            node::sequence({scalars({{"device_id", "0"}, {"memory_capacity", "8 GiB"}}),
@@ -184,12 +184,12 @@ TEST_CASE("write emits what was read and reads back to it", "[config][config_blo
   root.set("downgrade", node::mapping());
   root.set("gpu", node::sequence({scalars({{"device_id", "2"}, {"memory_capacity", "1536 MiB"}})}));
 
-  executor_options executor;
+  sample_executor executor;
   executor.read(root, "sirius.executor", environment::prod);
   // File values only: the empty downgrade block stays (it was present), fallbacks do not.
   REQUIRE(executor.write(false) == root);
 
-  executor_options reread;
+  sample_executor reread;
   reread.read(executor.write(true), "sirius.executor", environment::prod);
   REQUIRE(reread.pipeline.cpu_affinity.get() == std::vector<int>{1, 3});
   REQUIRE(reread.downgrade.trigger.user_defined());  // fallbacks were written out
@@ -197,14 +197,14 @@ TEST_CASE("write emits what was read and reads back to it", "[config][config_blo
   REQUIRE(reread.gpus.at(0).capacity.get() == bytes(1536_MiB));
 
   // An absent block writes nothing.
-  executor_options empty;
+  sample_executor empty;
   empty.read(node{}, "sirius.executor", environment::prod);
   REQUIRE(empty.write(false) == node::mapping());
 }
 
 TEST_CASE("blocks are read and written through the type-erased interface", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   config_block& erased = executor;
   erased.read(scalars({}), "sirius.executor", environment::prod);
   REQUIRE(erased.user_defined());
@@ -215,18 +215,18 @@ TEST_CASE("blocks are read and written through the type-erased interface", "[con
 
 namespace {
 
-struct tls_options : block_base<tls_options> {
+struct sample_tls : block_base<sample_tls> {
   config_option<std::string> cert = option<std::string>("cert").mark_mandatory().build();
   config_option<int> prod_only    = option<int>("prod_only").fallback(1).for_prod().build();
   auto fields() { return field_list(cert, prod_only); }
 };
 
-struct memory_options : block_base<memory_options> {
+struct sample_memory : block_base<sample_memory> {
   config_option<bytes, double> capacity =
     option<bytes>("capacity_bytes").or_type<double>("capacity_fraction").fallback(0.9).build();
   config_option<int> prod_only = option<int>("prod_only").fallback(1).for_prod().build();
-  tls_options tls;
-  std::vector<gpu_space_options> gpus;
+  sample_tls tls;
+  std::vector<sample_gpu_space> gpus;
   auto fields() { return field_list(capacity, prod_only, sub("tls", tls), list("gpu", gpus)); }
   void validate(std::string_view path) const
   {
@@ -245,7 +245,7 @@ struct duplicate_option_keys : block_base<duplicate_option_keys> {
 
 struct option_and_sub_share_a_key : block_base<option_and_sub_share_a_key> {
   config_option<int> a = option<int>("k").build();
-  pool_options pool;
+  sample_pool pool;
   auto fields() { return field_list(a, sub("k", pool)); }
 };
 
@@ -255,7 +255,7 @@ struct option_and_removed_share_a_key : block_base<option_and_removed_share_a_ke
 };
 
 struct empty_sub_key : block_base<empty_sub_key> {
-  pool_options pool;
+  sample_pool pool;
   auto fields() { return field_list(sub("", pool)); }
 };
 
@@ -279,15 +279,15 @@ std::string read_error_at(config_block& block, const node& n, std::string_view p
 
 static_assert(!std::is_copy_assignable_v<config_block>);
 static_assert(!std::is_copy_constructible_v<config_block>);
-static_assert(std::is_copy_constructible_v<executor_options>);
-static_assert(std::is_nothrow_move_constructible_v<executor_options>);
+static_assert(std::is_copy_constructible_v<sample_executor>);
+static_assert(std::is_nothrow_move_constructible_v<sample_executor>);
 
 TEST_CASE("a failed read leaves the block unchanged", "[config][config_block]")
 {
   node root = node::mapping();
   root.set("pipeline", scalars({{"num_threads", "8"}}));
   root.set("gpu", node::sequence({scalars({{"device_id", "5"}})}));
-  executor_options executor;
+  sample_executor executor;
   executor.read(root, "sirius.executor", environment::prod);
 
   node bad = node::mapping();
@@ -300,7 +300,7 @@ TEST_CASE("a failed read leaves the block unchanged", "[config][config_block]")
   REQUIRE(executor.user_defined());
 
   // An absent block whose read fails on an unknown key stays absent.
-  executor_options absent;
+  sample_executor absent;
   REQUIRE_THROWS_AS(absent.read(scalars({{"zzz", "1"}}), "sirius.executor", environment::prod),
                     config_error);
   REQUIRE_FALSE(absent.user_defined());
@@ -314,7 +314,7 @@ TEST_CASE("a later read replaces everything", "[config][config_block]")
   node root = node::mapping();
   root.set("pipeline", pipeline);
   root.set("gpu", node::sequence({scalars({{"device_id", "5"}})}));
-  executor_options executor;
+  sample_executor executor;
   executor.read(root, "sirius.executor", environment::prod);
 
   executor.read(node{}, "sirius.executor", environment::prod);
@@ -329,7 +329,7 @@ TEST_CASE("the environment reaches nested blocks and list elements", "[config][c
   node tls  = scalars({{"cert", "a.pem"}, {"prod_only", "7"}});
   node root = scalars({{"prod_only", "7"}});
   root.set("tls", tls);
-  memory_options memory;
+  sample_memory memory;
   memory.read(root, "sirius.memory", environment::dev);
   REQUIRE(memory.prod_only.is_unset());
   REQUIRE(memory.tls.prod_only.is_unset());
@@ -341,7 +341,7 @@ TEST_CASE("the environment reaches nested blocks and list elements", "[config][c
 TEST_CASE("mandatory options are required only when their block is present",
           "[config][config_block]")
 {
-  memory_options memory;
+  sample_memory memory;
   memory.read(node::mapping(), "sirius.memory", environment::prod);
   REQUIRE(memory.tls.cert.is_unset());
   REQUIRE_FALSE(memory.tls.user_defined());
@@ -359,7 +359,7 @@ TEST_CASE("mandatory options are required only when their block is present",
 
 TEST_CASE("alternatives inside a block", "[config][config_block]")
 {
-  memory_options memory;
+  sample_memory memory;
   memory.read(scalars({{"capacity_bytes", "1 GiB"}}), "sirius.memory", environment::prod);
   REQUIRE(memory.capacity.get<bytes>() == 1_GiB);
   REQUIRE(read_error_at(memory,
@@ -372,14 +372,14 @@ TEST_CASE("alternatives inside a block", "[config][config_block]")
 
 TEST_CASE("messages at the root path", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   REQUIRE(read_error_at(executor, node::scalar("x"), "") == "expected a mapping, got a scalar");
   REQUIRE(read_error_at(executor, scalars({{"zzz", "1"}}), "") == "unknown config key: 'zzz'");
 }
 
 TEST_CASE("list shapes", "[config][config_block]")
 {
-  executor_options executor;
+  sample_executor executor;
   node root = node::mapping();
   root.set("gpu", node::sequence());
   executor.read(root, "sirius.executor", environment::prod);
@@ -418,8 +418,8 @@ TEST_CASE("declaration bugs are logic errors", "[config][config_block]")
   duplicate_option_keys bad;
   REQUIRE_THROWS_AS(bad.read(node{}, "", environment::prod), std::logic_error);
 
-  executor_options{}.check_declaration();
-  memory_options{}.check_declaration();
+  sample_executor{}.check_declaration();
+  sample_memory{}.check_declaration();
 }
 
 TEST_CASE("blocks copy deeply and write through const", "[config][config_block]")
@@ -427,21 +427,21 @@ TEST_CASE("blocks copy deeply and write through const", "[config][config_block]"
   node root = node::mapping();
   root.set("pipeline", scalars({{"num_threads", "8"}}));
   root.set("gpu", node::sequence({scalars({{"device_id", "5"}})}));
-  executor_options original;
+  sample_executor original;
   original.read(root, "sirius.executor", environment::prod);
 
-  executor_options copy = original;
+  sample_executor copy = original;
   REQUIRE(copy.user_defined());
   copy.pipeline.num_threads.assign(2);
   copy.gpus.clear();
   REQUIRE(original.pipeline.num_threads.get() == 8);
   REQUIRE(original.gpus.size() == 1);
 
-  std::vector<executor_options> many{original, original};
+  std::vector<sample_executor> many{original, original};
   auto moved = std::move(many);
   REQUIRE(moved[1].gpus.at(0).device_id.get() == 5);
 
-  const executor_options& constant = original;
+  const sample_executor& constant = original;
   REQUIRE(constant.write(false) == root);
 }
 
@@ -451,11 +451,11 @@ TEST_CASE("write order is declaration order; values survive any input order",
   node root = node::mapping();
   root.set("gpu", node::sequence({scalars({{"memory_capacity", "1 GiB"}, {"device_id", "3"}})}));
   root.set("pipeline", scalars({{"num_threads", "8"}}));
-  executor_options executor;
+  sample_executor executor;
   executor.read(root, "sirius.executor", environment::prod);
   REQUIRE(executor.write(false) != root);
 
-  executor_options reread;
+  sample_executor reread;
   reread.read(executor.write(false), "sirius.executor", environment::prod);
   REQUIRE(reread.gpus.at(0).device_id.get() == 3);
   REQUIRE(reread.gpus.at(0).capacity.get() == 1_GiB);

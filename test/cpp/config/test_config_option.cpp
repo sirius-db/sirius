@@ -30,7 +30,7 @@ node map_of(std::initializer_list<std::pair<std::string, std::string>> entries)
 }
 
 /// The two options of the original sketch.
-struct memory_options {
+struct sample_memory {
   config_option<bytes, double> capacity = option<bytes>("capacity")
                                             .validate([](bytes v) { return v >= 0_B; })
                                             .or_type<double>("capacity_fraction")
@@ -54,7 +54,7 @@ struct memory_options {
   }
 };
 
-std::string load_error(memory_options& options, const node& block)
+std::string load_error(sample_memory& options, const node& block)
 {
   try {
     options.load(block);
@@ -104,7 +104,7 @@ TEST_CASE("value_source tracks file vs fallback", "[config][config_option]")
 
 TEST_CASE("for_prod options are skipped outside prod", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   options.load(node::mapping(), environment::prod);
   REQUIRE(options.capacity.is_fallback());
   REQUIRE(options.capacity.get<double>() == 0.95);
@@ -117,7 +117,7 @@ TEST_CASE("for_prod options are skipped outside prod", "[config][config_option]"
 
 TEST_CASE("alternatives hold the type of the key that was present", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   options.load(map_of({{"capacity", "1 GiB"}}));
   REQUIRE(options.capacity.user_defined());
   REQUIRE(options.capacity.get<bytes>() == 1_GiB);
@@ -145,7 +145,7 @@ TEST_CASE("a fallback does not satisfy a mandatory option", "[config][config_opt
 
 TEST_CASE("present but invalid values never fall back", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   REQUIRE(load_error(options, map_of({{"capacity", "1 B"}, {"capacity_fraction", "0.8"}})) ==
           "'memory': 'capacity' and 'capacity_fraction' are mutually exclusive");
   REQUIRE(load_error(options, map_of({{"capacity_fraction", "1.5"}})) ==
@@ -166,7 +166,7 @@ TEST_CASE("present but invalid values never fall back", "[config][config_option]
 
 TEST_CASE("scope and description are declared per option", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   REQUIRE(options.capacity.scope() == option_scope::session);
   REQUIRE(options.timeout.scope() == option_scope::query);
   REQUIRE(to_string(option_scope::query) == "query");
@@ -254,7 +254,7 @@ TEST_CASE("custom parsers and writers replace the defaults", "[config][config_op
 
 TEST_CASE("write emits file values, and fallbacks only on request", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   options.load(map_of({{"capacity_fraction", "0.5"}}));
 
   node file_only = node::mapping();
@@ -268,7 +268,7 @@ TEST_CASE("write emits file values, and fallbacks only on request", "[config][co
   REQUIRE(everything == map_of({{"capacity_fraction", "0.5"}, {"timeout", "1500 ms"}}));
 
   // What was written reads back to the same values and sources.
-  memory_options reread;
+  sample_memory reread;
   reread.load(everything);
   REQUIRE(reread.capacity.get<double>() == 0.5);
   REQUIRE(reread.timeout.get() == 1500ms);
@@ -277,7 +277,7 @@ TEST_CASE("write emits file values, and fallbacks only on request", "[config][co
 
 TEST_CASE("assign sets a value as if read from the file", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   options.capacity.assign(2_GiB);
   REQUIRE(options.capacity.user_defined());
   REQUIRE(options.capacity.get<bytes>() == 2_GiB);
@@ -328,7 +328,7 @@ TEST_CASE("node accessors check the kind", "[config][config_option]")
 
 TEST_CASE("a null alternative does not conflict with a present one", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   node block = map_of({{"capacity_fraction", "0.5"}});
   block.set("capacity", node{});
   options.load(block);
@@ -361,7 +361,7 @@ TEST_CASE("messages at the root have no path prefix", "[config][config_option]")
 
 TEST_CASE("every failed load leaves the option unset", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   auto failing = [&](const node& block) {
     options.load(map_of({{"capacity", "1 GiB"}}));  // populated first
     REQUIRE_THROWS_AS(options.capacity.load(block, "memory", environment::prod), config_error);
@@ -567,7 +567,7 @@ TEST_CASE("vector values", "[config][config_option]")
 
 TEST_CASE("write replaces a sibling alternative and skips unset options", "[config][config_option]")
 {
-  memory_options options;
+  sample_memory options;
   node block = map_of({{"capacity", "1 GiB"}});
   options.load(block);
   options.capacity.assign(0.5);
