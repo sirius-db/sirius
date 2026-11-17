@@ -175,7 +175,8 @@ Selectivity governs whether compaction is attempted at all, because compacting i
 than decoding when enough rows are dropped:
 
 - a batch with any full-width column proceeds only below `fused_scan_full_route_max_selectivity`
-  (0.10);
+  (0.10), or below `fused_scan_max_selectivity` when it also has a dictionary output, whose
+  savings pay for the full-width columns' gather;
 - otherwise compaction is given up above `fused_scan_max_selectivity` (0.35), unless a
   dictionary output is present — that route is exempt, since it wins regardless;
 - below `fused_scan_index_walk_max_selectivity` (0.15) the decode walks a survivor index list

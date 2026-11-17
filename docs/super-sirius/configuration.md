@@ -1221,7 +1221,7 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
 | `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
 | `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
-| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. A batch that also has a dictionary output uses `fused_scan_max_selectivity` instead, if larger. |
 | `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
 | `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 
