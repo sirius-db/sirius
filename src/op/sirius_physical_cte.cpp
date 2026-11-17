@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-// #include "duckdb/parallel/meta_pipeline.hpp"
-// #include "duckdb/parallel/pipeline.hpp"
-
 #include "op/sirius_physical_cte.hpp"
 
 #include "pipeline/sirius_meta_pipeline.hpp"

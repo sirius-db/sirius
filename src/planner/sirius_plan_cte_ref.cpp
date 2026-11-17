@@ -26,34 +26,26 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
 {
   D_ASSERT(op.children.empty());
 
-  // Check if this LogicalCTERef is supposed to scan a materialized CTE.
-  // Lookup if there is a materialized CTE for the cte_index.
+  // A materialized CTE registers itself before its consumer is planned. A reference to anything
+  // else reads a recursive CTE's working table, which Sirius does not plan.
   auto materialized_cte = materialized_ctes.find(op.cte_index);
-
-  // If this check fails, this is a reference to a materialized recursive CTE.
-  if (materialized_cte != materialized_ctes.end()) {
-    auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-      sirius::from_duckdb_vec(op.chunk_types),
-      sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
-      op.estimated_cardinality,
-      op.cte_index.index);
-    if (cte_reader_proofs) {
-      chunk_scan->reader_role = cte_reader_proofs->role_of(op.table_index.index);
-    }
-
-    auto cte = recursive_cte_tables.find(op.cte_index);
-    if (cte == recursive_cte_tables.end()) {
-      throw duckdb::InvalidInputException("Referenced materialized CTE does not exist.");
-    }
-
-    chunk_scan->collection = cte->second.get();
-
-    materialized_cte->second.push_back(*chunk_scan.get());
-
-    return std::move(chunk_scan);
+  if (materialized_cte == materialized_ctes.end()) {
+    throw duckdb::NotImplementedException("Recursive CTE is not implemented");
   }
 
-  throw duckdb::NotImplementedException("Recursive CTE is not implemented");
+  // The scan holds no data: the CTE's batches are routed to this scan's parent.
+  auto cte_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
+    sirius::from_duckdb_vec(op.chunk_types),
+    sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
+    op.estimated_cardinality,
+    op.cte_index.index);
+  if (cte_reader_proofs) {
+    cte_scan->reader_role = cte_reader_proofs->role_of(op.table_index.index);
+  }
+
+  materialized_cte->second.push_back(*cte_scan.get());
+
+  return std::move(cte_scan);
 }
 
 }  // namespace sirius::planner

@@ -76,7 +76,6 @@ void sirius_physical_column_data_scan::build_pipelines(
       return;
     }
     case SiriusPhysicalOperatorType::CTE_SCAN: {
-      // throw NotImplementedException("CTE scan not implemented for GPU");
       auto entry = state.cte_dependencies.find(*this);
       D_ASSERT(entry != state.cte_dependencies.end());
       // this chunk scan introduces a dependency to the current pipeline

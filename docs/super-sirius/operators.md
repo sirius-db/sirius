@@ -233,7 +233,10 @@ Generates a single empty row for constant queries (e.g., `SELECT 1+2`).
 ### `sirius_physical_column_data_scan` — `COLUMN_DATA_SCAN` / `CTE_SCAN` / `DELIM_SCAN`
 **File:** `src/op/sirius_physical_column_data_scan.hpp`
 
-Scans a pre-materialized `ColumnDataCollection`. Used for CTE results, correlated subquery intermediates, and expression-generated data.
+A scan of rows produced elsewhere in the plan. What it holds depends on its type:
+
+- `COLUMN_DATA_SCAN` holds a host `ColumnDataCollection` of constant rows (`VALUES`). The plan generator replaces it with `GPU_VALUES`, so it never executes.
+- `CTE_SCAN` and `DELIM_SCAN` hold no data. They are routing-only: the pipeline builder wires the producer's batches (the CTE, or the delim join's distinct keys) to the scan's parent, and the scan is never added to a pipeline's operator list.
 
 ## Streaming Operators
 
@@ -672,9 +675,11 @@ Merges local top-N results from multiple partitions. The final output batch is a
 ### `sirius_physical_cte` — `CTE`
 **File:** `src/op/sirius_physical_cte.hpp`
 
-Materializes Common Table Expression results into a `ColumnDataCollection` for later scanning by CTE_SCAN operators.
+Sink of a materialized CTE's definition pipeline. `execute()` forwards the definition's GPU batches unchanged, and the pipeline converter gives the CTE one repository edge per `CTE_SCAN`, into the pipeline of that scan's parent. Every reader therefore receives the same batches; nothing is copied to the host.
 
-- **Key members:** `working_table`, `cte_scans`, `ctename`, `table_index`
+- `children[0]` is the definition and `children[1]` the consumer that holds the `CTE_SCAN`s. The operator's `types` are the consumer's, since that is what its parent reads.
+- A CTE that no `CTE_SCAN` reads is not planned at all (see [Physical Plan Generation](physical-plan-generation.md)).
+- **Key members:** `cte_scans`, `ctename`, `table_index`
 
 ### `sirius_physical_left_delim_join` — `LEFT_DELIM_JOIN`
 ### `sirius_physical_right_delim_join` — `RIGHT_DELIM_JOIN`
@@ -717,7 +722,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` |
 | DUMMY_SCAN | Scan | Generates 1 row |
-| COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
+| COLUMN_DATA_SCAN | Scan | Constant rows; replaced by GPU_VALUES at plan time |
 | FILTER | Relational | `expression_evaluator::select()` |
 | PROJECTION | Relational | `expression_evaluator::evaluate()` |
 | UNORDERED_STREAMING_LIMIT | Relational | Inline claims, retry-safe slices, early pipeline completion |
@@ -743,7 +748,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | CONCAT | Pipeline | Partition reassembly |
 | PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
-| CTE | CTE | Materialize to ColumnDataCollection |
+| CTE | CTE | Forward the definition's batches to every CTE_SCAN's parent |
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
 | STREAMING_SINK | Result | Terminal operator of a streaming fragment |
