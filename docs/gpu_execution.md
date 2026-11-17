@@ -87,6 +87,8 @@ To re-enable:
 SET gpu_execution = true;
 ```
 
+Sirius requires DuckDB's default `delim_join_as_cte = true`. With `false`, which DuckDB has deprecated, a correlated subquery becomes a delim join, and Sirius plans only the CTE form. A `SELECT` that Sirius would run, and any `gpu_execution(...)` call, then fails with an error that names the setting; it does not fall back to the CPU, whatever `enable_duckdb_fallback` says. Other statements still run, so `SET delim_join_as_cte = true` restores the session, and `SET gpu_execution = false` runs queries on the CPU with either value.
+
 **How it works:** Two optimizer extensions are registered at extension load time. A pre-optimizer hook disables DuckDB optimizers incompatible with Sirius (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). A post-optimizer hook captures the optimized logical plan and attempts GPU plan generation via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if plan generation throws, the original DuckDB CPU plan runs unchanged.
 
 ## Generating Test Datasets

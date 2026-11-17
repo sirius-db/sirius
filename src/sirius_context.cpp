@@ -2000,6 +2000,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
   }
   if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
+  // From here on Sirius would run the query. An error, not a fallback: the CPU would answer
+  // every query of the session without the user learning why.
+  sirius::transparent::require_delim_join_as_cte(context);
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
