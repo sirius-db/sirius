@@ -978,13 +978,13 @@ TEST_CASE("sirius_config rejects the removed kvikio backend and block",
 {
   require_load_error("sirius_backend_kvikio_removed.yaml",
                      single_gpu_scan_manager_yaml("      backend: kvikio\n"),
-                     "'scan_manager.backend': backend: kvikio has been removed; "
-                     "use backend: native instead");
+                     "'sirius.executor.scan_manager.backend': backend: kvikio has been "
+                     "removed; use backend: native instead");
   for (auto const* block : {"{}", "{task_size: 8 MiB}"}) {
     require_load_error("sirius_kvikio_block_removed.yaml",
                        scan_manager_yaml(std::string{"      kvikio: "} + block + "\n"),
-                       "'scan_manager.kvikio': removed; remove this block and use "
-                       "backend: native instead");
+                       "'sirius.executor.scan_manager.kvikio': removed; remove this block "
+                       "and use backend: native instead");
   }
 }
 
@@ -1337,7 +1337,6 @@ TEST_CASE("sirius_config rejects invalid REST transport ranges with key context"
         std::pair{"mtu_reject_max_attempts: 4294967296", "mtu_reject_max_attempts"},
         std::pair{"receive_buffer_bytes: 8 KiB", "receive_buffer_bytes"},
         std::pair{"receive_buffer_bytes: 8 MiB", "receive_buffer_bytes"},
-        std::pair{"queue_depth: 127", "queue_depth"},
         std::pair{"queue_depth: 32769", "queue_depth"},
         std::pair{"queue_depth: 0", "queue_depth"},
         std::pair{"max_connections: 1024", "queue_depth"},
@@ -1351,6 +1350,11 @@ TEST_CASE("sirius_config rejects invalid REST transport ranges with key context"
     REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
                         Catch::Matchers::ContainsSubstring(std::string{"rest."} + key));
   }
+
+  // queue_depth is checked against max_connections once that is derived (half the queue), so a
+  // small queue alone reads.
+  scoped_yaml small_queue("sirius_rest_small_queue.yaml", rest_yaml("        queue_depth: 127\n"));
+  REQUIRE_NOTHROW(sirius::parsed_sirius_config::from_file(small_queue.path()));
 
   // The REST reactor count is a nonnegative total.
   for (auto const* value : {"-1", "1.5", "many"}) {
@@ -1366,7 +1370,8 @@ TEST_CASE("sirius_config rejects invalid REST transport ranges with key context"
                      scan_manager_yaml("      rest_n_reactors: 2\n"
                                        "      rest:\n"
                                        "        fan_out: 3\n"),
-                     "'rest.fan_out': must be at most rest_n_reactors (2)");
+                     "'sirius.executor.scan_manager.rest.fan_out': must be at most "
+                     "rest_n_reactors (2)");
 }
 
 TEST_CASE("sirius_config rejects REST keys the transport does not have",
@@ -1386,9 +1391,10 @@ TEST_CASE("sirius_config rejects REST keys the transport does not have",
     CAPTURE(key);
     scoped_yaml yaml("sirius_rest_unknown_key.yaml",
                      rest_yaml(std::string{"        "} + key + "\n"));
-    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
-                        Catch::Matchers::ContainsSubstring("unknown config key") &&
-                          Catch::Matchers::ContainsSubstring("in rest"));
+    REQUIRE_THROWS_WITH(
+      sirius::parsed_sirius_config::from_file(yaml.path()),
+      Catch::Matchers::ContainsSubstring("unknown config key") &&
+        Catch::Matchers::ContainsSubstring("in sirius.executor.scan_manager.rest"));
   }
 }
 
@@ -1597,12 +1603,12 @@ TEST_CASE("sirius_config rejects an out-of-range uring.slices_per_pass",
 {
   require_load_error("sirius_uring_slices_per_pass_65.yaml",
                      uring_yaml("        slices_per_pass: 65\n"),
-                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
-                     "free staging slot), got 65");
+                     "'sirius.executor.scan_manager.uring.slices_per_pass': must be between 0 "
+                     "and 64 (0 = no cap: fill every free staging slot), got 65");
   require_load_error("sirius_uring_slices_per_pass_negative.yaml",
                      uring_yaml("        slices_per_pass: -1\n"),
-                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
-                     "free staging slot), got -1");
+                     "'sirius.executor.scan_manager.uring.slices_per_pass': must be a "
+                     "nonnegative integer, got '-1'");
 }
 
 TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config][uring]")
@@ -1617,7 +1623,8 @@ TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config
   }
   require_load_error("sirius_uring_range_batch_slices_negative.yaml",
                      uring_yaml("        range_batch_slices: -1\n"),
-                     "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
+                     "'sirius.executor.scan_manager.uring.range_batch_slices': must be a "
+                     "nonnegative integer, got '-1'");
 }
 
 TEST_CASE("sirius_config rejects the removed uring.prefetch_reactors key",

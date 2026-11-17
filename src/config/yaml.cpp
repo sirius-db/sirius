@@ -1,6 +1,8 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "config/yaml.hpp"
 
+#include "config/yaml_cpp.hpp"
+
 #include <yaml-cpp/depthguard.h>
 #include <yaml-cpp/yaml.h>
 
@@ -146,6 +148,15 @@ node parse_yaml(std::string_view text)
   }
 }
 
+node from_yaml_cpp(const YAML::Node& document)
+{
+  try {
+    return converter{}.convert(document, "", 0);
+  } catch (const YAML::Exception& e) {
+    throw yaml_syntax_error(e.what());
+  }
+}
+
 std::string emit_yaml(const node& n)
 {
   YAML::Emitter out;
@@ -159,8 +170,15 @@ void read_yaml(config_block& block,
                std::string_view root_key,
                environment env)
 {
-  auto const document = parse_yaml(text);
-  auto const missing  = "missing top-level '" + std::string(root_key) + "' key";
+  read_yaml(block, parse_yaml(text), root_key, env);
+}
+
+void read_yaml(config_block& block,
+               const node& document,
+               std::string_view root_key,
+               environment env)
+{
+  auto const missing = "missing top-level '" + std::string(root_key) + "' key";
   if (document.is_null()) { throw config_error(missing); }
   if (!document.is_mapping()) {
     throw config_error("expected a mapping at the top level, got " +

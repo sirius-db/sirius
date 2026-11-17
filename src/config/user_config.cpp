@@ -37,6 +37,13 @@ user_config read_user_config(std::string_view yaml, environment env)
   return config;
 }
 
+user_config read_user_config(const node& document, environment env)
+{
+  user_config config;
+  read_yaml(config, document, user_config_root, env);
+  return config;
+}
+
 user_config default_user_config(environment env)
 {
   user_config config;

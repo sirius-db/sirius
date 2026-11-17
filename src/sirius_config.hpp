@@ -725,6 +725,9 @@ class parsed_sirius_config {
  private:
   struct Impl;
   explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  /// from_user_config, naming @p source_path in resolution errors.
+  static parsed_sirius_config from_user_config(const config::user_config& user,
+                                               const std::filesystem::path& source_path);
   std::shared_ptr<const Impl> impl_;
 };
 

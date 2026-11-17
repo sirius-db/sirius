@@ -176,11 +176,12 @@ struct tls_options : block_base<tls_options> {
   void validate(std::string_view path) const
   {
     if (auto const& max = max_version.get(); max && *max < min_version.get()) {
-      throw config_error(detail::framed(path, "max_version must not be below min_version"));
+      throw config_error("'" + join_path(path, max_version.key()) +
+                         "': must not be below min_version");
     }
     if (session_cache.get() && session_cache_per_endpoint.get() == 0) {
-      throw config_error(detail::framed(
-        path, "session_cache_per_endpoint must be greater than 0 with the session cache on"));
+      throw config_error("'" + join_path(path, session_cache_per_endpoint.key()) +
+                         "': must be greater than 0 with the session cache on");
     }
   }
 };
@@ -405,12 +406,13 @@ struct rest_options : block_base<rest_options> {
   void validate(std::string_view path) const
   {
     if (max_segment_bytes.get() < min_segment_bytes.get()) {
-      throw config_error(
-        detail::framed(path, "max_segment_bytes must be at least min_segment_bytes"));
+      throw config_error("'" + join_path(path, max_segment_bytes.key()) +
+                         "': must be at least min_segment_bytes");
     }
     if (auto const* connections = max_connections.get_if();
         connections != nullptr && queue_depth.get() < 2 * *connections) {
-      throw config_error(detail::framed(path, "queue_depth must be at least 2 * max_connections"));
+      throw config_error("'" + join_path(path, queue_depth.key()) +
+                         "': must be at least 2 * max_connections");
     }
   }
 };

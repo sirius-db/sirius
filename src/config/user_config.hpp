@@ -63,6 +63,10 @@ struct user_config : block_base<user_config> {
 [[nodiscard]] user_config read_user_config(std::string_view yaml,
                                            environment env = environment::prod);
 
+/// Read a configuration document already parsed into a node tree.
+[[nodiscard]] user_config read_user_config(const node& document,
+                                           environment env = environment::prod);
+
 /// The configuration of an empty file: every option at its fallback.
 [[nodiscard]] user_config default_user_config(environment env = environment::prod);
 

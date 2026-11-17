@@ -394,8 +394,8 @@ TEST_CASE("quantity text shapes", "[config][config_values]")
   REQUIRE(parse_error<bytes>("- 1 B") == "invalid byte value: '- 1 B'");
   REQUIRE(parse_error<std::chrono::milliseconds>("+5 ms") == "invalid time value: '+5 ms'");
   REQUIRE(parse_error<std::chrono::seconds>("1e3 s") == "unknown time suffix: 'e3 s'");
-  // Behaviour changes from yaml_reader.hpp: no hex, a case-insensitive binary 'i', and the whole
-  // suffix must be a unit.
+  // Behaviour changes from the former YAML reader: no hex, a case-insensitive binary 'i', and the
+  // whole suffix must be a unit.
   REQUIRE(parse_error<bytes>("0x1000") == "unknown byte suffix: 'x1000'");
   REQUIRE(parse_ok<bytes>("8GIB") == 8_GiB);
   REQUIRE(parse_error<bytes>("8Gigabytes") == "unknown byte suffix: 'Gigabytes'");
