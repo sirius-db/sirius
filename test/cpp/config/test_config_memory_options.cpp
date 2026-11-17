@@ -7,7 +7,12 @@
 #include "config/options/topology.hpp"
 #include "config/yaml.hpp"
 
+#include <cucascade/memory/config.hpp>
+
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -224,4 +229,153 @@ TEST_CASE("memory blocks write what they read", "[config][config_memory]")
   REQUIRE(all.memory.gpu.downgrade_trigger_fraction.user_defined());
   REQUIRE(all.memory.host.block_size.get() == 1_MiB);
   REQUIRE(all.topology.gpus.get<std::vector<int>>() == std::vector<int>{0, 2});
+}
+
+TEST_CASE("memory blocks keep upstream's unknown keys and pairs", "[config][config_memory]")
+{
+  REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      track_per_stream_reservation: true\n") ==
+          "unknown config key: 'track_per_stream_reservation' in sirius.memory.gpu");
+  REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      per_stream_reservation: true\n") ==
+          "unknown config key: 'per_stream_reservation' in sirius.memory.gpu");
+  for (auto const* pair : {"gpu:\n      reservation_limit_bytes: 1 GiB\n      "
+                           "reservation_limit_fraction: 0.5",
+                           "host:\n      reservation_limit_bytes: 1 GiB\n      "
+                           "reservation_limit_fraction: 0.5",
+                           "host:\n      capacity_bytes: 1 GiB\n      capacity_fraction: 0.5"}) {
+    INFO(pair);
+    REQUIRE_THAT(read_error(std::string("sirius:\n  memory:\n    ") + pair + "\n"),
+                 Catch::Matchers::EndsWith("are mutually exclusive"));
+  }
+  // A null alternative is absent.
+  auto const root = read(
+    "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: ~\n      usage_limit_fraction: 0.5\n");
+  REQUIRE(root.memory.gpu.usage_limit.get<double>() == 0.5);
+}
+
+TEST_CASE("which memory blocks count as configured", "[config][config_memory]")
+{
+  REQUIRE_FALSE(read("sirius:\n  memory:\n    gpu: ~\n").memory.configured());
+  auto const null_leaf = read("sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: ~\n");
+  REQUIRE(null_leaf.memory.configured());
+  REQUIRE_FALSE(null_leaf.memory.gpu.usage_limit.user_defined());  // not an explicit capacity
+  REQUIRE_FALSE(read("sirius:\n  space:\n    gpu: []\n").space.configured());
+
+  REQUIRE_FALSE(read("sirius: {}\n").space.gpu_capacities_configured());
+  REQUIRE(read("sirius:\n  space:\n    gpu:\n      - memory_capacity: 1 GiB\n")
+            .space.gpu_capacities_configured());
+  REQUIRE_FALSE(read("sirius:\n  space:\n    gpu:\n      - memory_capacity: 1 GiB\n"
+                     "      - memory_capacity: 0\n")
+                  .space.gpu_capacities_configured());
+}
+
+TEST_CASE("space entries default to cuCascade's values", "[config][config_memory]")
+{
+  auto const root = read("sirius:\n  space:\n    gpu: [{}]\n    host: [{}]\n    disk: [{}]\n");
+  auto const& gpu = root.space.gpu.at(0);
+  REQUIRE(gpu.device_id.get() == -1);
+  REQUIRE(gpu.downgrade_trigger_fraction.get() == 0.75);
+  REQUIRE(gpu.downgrade_stop_fraction.get() == 0.65);
+  REQUIRE(gpu.memory_capacity.get() == 0_B);
+  auto const& host = root.space.host.at(0);
+  REQUIRE(host.numa_id.get() == -1);
+  REQUIRE(host.block_size.get() == 1_MiB);
+  REQUIRE(host.pool_size.get() == cucascade::memory::default_pool_size);
+  auto const& disk = root.space.disk.at(0);
+  REQUIRE(disk.disk_id.get() == -1);
+  REQUIRE(disk.mount_path.get().empty());
+  REQUIRE(disk.memory_capacity.get() == 0_B);
+}
+
+TEST_CASE("the space path keeps today's ranges", "[config][config_memory]")
+{
+  // The zero checks agreed for sirius.memory do not apply to sirius.space entries.
+  auto const root = read(R"(sirius:
+  space:
+    gpu:
+      - reservation_limit_fraction: 0
+    host:
+      - reservation_limit_fraction: 0
+        block_size: 0
+        pool_size: 0
+)");
+  REQUIRE(root.space.gpu.at(0).reservation_limit_fraction.get() == 0.0);
+  REQUIRE(root.space.host.at(0).block_size.get() == 0_B);
+  REQUIRE(root.space.host.at(0).pool_size.get() == 0);
+}
+
+TEST_CASE("fraction boundaries", "[config][config_memory]")
+{
+  REQUIRE(read("sirius:\n  memory:\n    gpu:\n      usage_limit_fraction: 1.0\n")
+            .memory.gpu.usage_limit.get<double>() == 1.0);
+  REQUIRE(read("sirius:\n  memory:\n    host:\n      capacity_fraction: 1\n")
+            .memory.host.capacity.get<double>() == 1.0);
+  for (auto const* value : {"1.0000001", ".nan", ".inf", "-0.1"}) {
+    INFO(value);
+    REQUIRE_THAT(
+      read_error(std::string("sirius:\n  memory:\n    gpu:\n      usage_limit_fraction: ") + value +
+                 "\n"),
+      Catch::Matchers::ContainsSubstring("value out of range"));
+  }
+  REQUIRE(read_error("sirius:\n  memory:\n    host:\n      capacity_fraction: 1.5\n") ==
+          "'sirius.memory.host.capacity_fraction': value out of range: '1.5' (must be greater than "
+          "0.0 and at most 1.0)");
+  REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      downgrade_trigger_fraction: 0.6\n") ==
+          "'sirius.memory.gpu': downgrade_stop_fraction must be less than "
+          "downgrade_trigger_fraction");  // stop == trigger
+  // A null member takes its default before the pair rule runs.
+  REQUIRE(read("sirius:\n  memory:\n    gpu:\n      downgrade_trigger_fraction: ~\n"
+               "      downgrade_stop_fraction: 0.5\n")
+            .memory.gpu.downgrade_trigger_fraction.get() == 0.8);
+}
+
+TEST_CASE("topology shapes", "[config][config_memory]")
+{
+  REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: 0\n") ==
+          "'sirius.topology.gpu_ids': expected a sequence, got a scalar");
+  REQUIRE(read_error("sirius:\n  topology:\n    gpu_ids: [~]\n") ==
+          "'sirius.topology.gpu_ids': element 0: expected a scalar, got null");
+  auto const root = read("sirius:\n  topology:\n    num_gpus: 0\n    gpu_ids: ~\n");
+  REQUIRE(root.topology.gpus.user_defined());
+  REQUIRE(root.topology.gpus.get<std::size_t>() == 0);
+}
+
+TEST_CASE("byte values above INT64_MAX are rejected", "[config][config_memory]")
+{
+  // Upstream read sizes as uint64_t; an 8 EiB size is no real configuration.
+  REQUIRE_THAT(
+    read_error("sirius:\n  memory:\n    host:\n      block_size: 18446744073709551615\n"),
+    Catch::Matchers::ContainsSubstring("byte value out of range"));
+}
+
+TEST_CASE("space lists write what they read", "[config][config_memory]")
+{
+  constexpr std::string_view text = R"(sirius:
+  space:
+    gpu:
+      - device_id: 1
+        per_stream_reservation: true
+    disk:
+      - mount_path: /scratch
+        memory_capacity: 2 TiB
+)";
+  auto const root                 = read(text);
+  REQUIRE(parse_yaml(write_yaml(root, "sirius")) == parse_yaml(text));
+  auto const all = read(write_yaml(root, "sirius", true));
+  REQUIRE(all.space.gpu.at(0).downgrade_stop_fraction.user_defined());
+  REQUIRE(all.space.disk.at(0).memory_capacity.get() == 2_TiB);
+}
+
+TEST_CASE("validators reject NaN and check their bounds", "[config][config_memory]")
+{
+  double const nan = std::numeric_limits<double>::quiet_NaN();
+  REQUIRE_FALSE(fraction{}(nan));
+  REQUIRE_FALSE(positive_fraction{}(nan));
+  REQUIRE_FALSE(positive<double>{}(nan));
+  REQUIRE_FALSE(non_negative<double>{}(nan));
+  REQUIRE(non_negative<double>{}(0.0));
+  REQUIRE_FALSE(positive_fraction{}(0.0));
+  REQUIRE(positive<bytes>{}(1_B));
+  REQUIRE_FALSE(positive<bytes>{}(0_B));
+  REQUIRE(to_bytes(1024) == 1_KiB);
+  REQUIRE_THROWS_AS(to_bytes(std::numeric_limits<std::uint64_t>::max()), std::logic_error);
 }

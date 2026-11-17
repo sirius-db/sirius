@@ -46,7 +46,9 @@ class config_block {
 
   /// The mapping read() reads back to the same values: user-defined values only, plus fallbacks
   /// when @p include_fallbacks, in declaration order. Absent nested blocks and empty lists are
-  /// omitted; a nested block the user defined is kept even when empty.
+  /// omitted; a nested block the user defined is kept even when empty. A dump with fallbacks is a
+  /// snapshot to look at: reading it back makes every value, and every block it names,
+  /// user-defined.
   [[nodiscard]] virtual node write(bool include_fallbacks) const = 0;
 
   /// Throw std::logic_error for a declaration bug in this block or any block nested in it: an
@@ -108,6 +110,7 @@ struct is_config_option<config_option<Ts...>> : std::true_type {};
  *   their own errors first), rejects keys no field claims, then validates.
  * - An empty list reads and writes like an absent one; a null list element reads as an element
  *   with every fallback.
+ * - A block holds no values until it is read: read a null node to get the fallbacks.
  * - Derived must name itself: `struct x : block_base<x>`. Options a class derived from Derived
  *   adds are not part of the block unless its own fields() lists them.
  */

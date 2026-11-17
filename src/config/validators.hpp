@@ -46,7 +46,7 @@ struct positive {
 /// Accepts values at or above T{}.
 template <class T>
 struct non_negative {
-  [[nodiscard]] bool operator()(const T& value) const { return !(value < T{}); }
+  [[nodiscard]] bool operator()(const T& value) const { return T{} <= value; }  // NaN fails
   [[nodiscard]] static constexpr const char* description() noexcept
   {
     return "must not be negative";
