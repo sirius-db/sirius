@@ -285,6 +285,34 @@ TEST_CASE_METHOD(delim_rewrites_fixture,
 }
 
 TEST_CASE_METHOD(delim_rewrites_fixture,
+                 "delim rewrites - an outer side without a row estimate keeps its EXISTS",
+                 "[delim_cte_rewrites][plan]")
+{
+  std::string const subquery = "(SELECT sum(sa.amount)" + rows() + ")";
+  std::string const exists   = "EXISTS (SELECT 1" + rows() + ")";
+
+  // Control: the outer rows behind a projection, read from a table, whose row count is known.
+  auto const counted =
+    bound(*con,
+          twin_query(subquery, exists, "(SELECT nk, region FROM nations) n WHERE n.region = 'R1'"),
+          {.exists = true});
+  INFO(counted.text);
+  CHECK(counted.exists_answered == 1);
+
+  // The same shape over a table function that estimates nothing. DuckDB reports such a scan as
+  // one row, which would pass for the smallest of tables.
+  auto const uncounted = bound(*con,
+                               twin_query(subquery,
+                                          exists,
+                                          "(SELECT \"int\" AS nk, \"varchar\" AS region "
+                                          "FROM test_all_types()) n WHERE n.region = 'R1'"),
+                               {.exists = true});
+  INFO(uncounted.text);
+  CHECK(uncounted.exists_answered == 0);
+  CHECK(uncounted.mark_joins == 1);
+}
+
+TEST_CASE_METHOD(delim_rewrites_fixture,
                  "delim rewrites - a subquery's keys reach the table an equality ties to them",
                  "[delim_cte_rewrites][plan]")
 {
@@ -345,15 +373,15 @@ TEST_CASE_METHOD(delim_rewrites_fixture,
 }
 
 TEST_CASE_METHOD(delim_rewrites_fixture,
-                 "delim rewrites - both rules are off by default",
+                 "delim rewrites - both rules are on by default",
                  "[delim_cte_rewrites][plan]")
 {
   auto const plan = optimized(*con, twin_query());
   INFO(plan.text);
-  // DuckDB's plan: the subquery's tables are joined twice, the keys restrict `suppliers` only,
-  // and the EXISTS is kept.
-  CHECK(plan.sales_scans == 2);
-  CHECK(plan.outer_joins == 1);
+  // The subquery's tables are joined once, the keys restrict `suppliers` and `customers`, and the
+  // EXISTS is gone.
+  CHECK(plan.sales_scans == 1);
+  CHECK(plan.outer_joins == 0);
   CHECK(plan.semi_joins + plan.mark_joins == 2);
 }
 
@@ -364,8 +392,18 @@ TEST_CASE_METHOD(delim_rewrites_fixture,
   // Both rules on, so that only the query's destination keeps them from the plan.
   sirius::test::scoped_sirius_setting exists_switch(*con, "enable_exists_from_aggregate", true);
   sirius::test::scoped_sirius_setting carry_switch(*con, "enable_subquery_key_carry", true);
-  sirius::test::scoped_sirius_setting cpu(*con, "gpu_execution", false);
-  auto const plan = optimized(*con, twin_query());
-  INFO(plan.text);
-  CHECK(plan.sales_scans == 2);
+
+  SECTION("GPU execution is off")
+  {
+    sirius::test::scoped_sirius_setting cpu(*con, "gpu_execution", false);
+    auto const plan = optimized(*con, twin_query());
+    INFO(plan.text);
+    CHECK(plan.sales_scans == 2);
+  }
+  SECTION("the statement returns no rows, so Sirius never runs it")
+  {
+    auto const plan = optimized(*con, "CREATE TABLE revenue_copy AS " + twin_query());
+    INFO(plan.text);
+    CHECK(plan.sales_scans == 2);
+  }
 }

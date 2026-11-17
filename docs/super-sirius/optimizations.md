@@ -262,7 +262,14 @@ Every row the filter keeps has `x = y`, so the added join removes only rows the 
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
 
-**Config:** `enable_subquery_key_carry` (default `false`, see [Configuration](configuration.md)). Off by default for now: the rewrite is not yet tested on multiple GPUs, and a query that falls back to the CPU after the hook has run executes the rewritten plan.
+**CPU fallback:** this rule and the next one edit DuckDB's own plan, which DuckDB also builds its CPU plan from. They therefore run only for a statement that can reach the GPU: GPU execution on, Sirius initialized, and a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS` and `COPY` are left alone). When Sirius then does not run a query a rule changed, the CPU gets the plan DuckDB makes alone:
+
+- If GPU planning turns the query down, `OnFinalizePrepare` asks DuckDB to plan the statement again (`ATTEMPT_TO_REBIND`), and a decline latched on the connection keeps both optimizer hooks out of that second pass.
+- If the GPU fails while running the query, `PhysicalSiriusExecution` plans the statement's SQL again under the internal-query guard and runs that plan. An `EXECUTE` of a prepared statement cannot be planned from its text, so it runs the CPU plan built from the rewritten plan, which returns the same rows.
+
+`transparent_execution_stats::fallback_replans` counts both. `EXPLAIN` shows the rewritten plan, since it describes what the GPU is given.
+
+**Config:** `enable_subquery_key_carry` (default `true`, see [Configuration](configuration.md)).
 
 ### EXISTS Answered from an Aggregate Subquery
 
@@ -288,13 +295,13 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 - Both sides read the same rows: flattened into leaves and predicates, their scans are the same sources in the same order (`capture_bound_read_view`, selector included), their predicates are the same set, and the key is the same column.
 - NULL keys are handled alike: the subquery matches keys with `=`, so a null-safe `EXISTS` qualifies only when its side carries `IS NOT NULL` on the key column.
 - Only the join-back and the key read see the CTE's rows, and DuckDB's own conditions for restricting them hold.
-- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines.
+- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines. Every scan of `X` must also have a row estimate: DuckDB reports a scan whose table function gives none (CSV, Arrow and most extension scans) as one row, which would pass for a tiny table. A subquery scan without an estimate is left out of "largest".
 
 **Limits:** the two subqueries must list their tables in the same order. An `EXISTS` with no aggregate subquery over the same rows is untouched.
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp` (`match_exists_twin`), sharing `flatten` with the delim aggregate reuse (`src/planner/sirius_plan_flat_tree.cpp`); called from `src/transparent/sirius_optimizer_extension.cpp` for queries headed to the GPU.
 
-**Config:** `enable_exists_from_aggregate` (default `false`, see [Configuration](configuration.md)). Off by default for now, for the same two reasons as the rule above, and because a scan DuckDB has no row estimate for reports one row, which passes the size guard on `X`.
+**Config:** `enable_exists_from_aggregate` (default `true`, see [Configuration](configuration.md)). A CPU fallback is handled as for the rule above.
 
 ### Sorted-Key Grouped Aggregation
 

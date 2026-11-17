@@ -188,9 +188,15 @@ class SiriusConnectionState : public ClientContextState {
     staged_cte_reader_proofs_.reset();
     captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
+    plan_rewritten_ = false;
   }
 
   [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
+
+  /// \brief The pre-optimize hook edited DuckDB's plan in this planning attempt, so the CPU plan
+  /// DuckDB builds from it is not the one DuckDB would have made alone.
+  void mark_plan_rewritten() noexcept { plan_rewritten_ = true; }
+  [[nodiscard]] bool plan_rewritten() const noexcept { return plan_rewritten_; }
 
   /// \brief Current classification; provider_internal remains latched.
   [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
@@ -362,6 +368,7 @@ class SiriusConnectionState : public ClientContextState {
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
+  bool plan_rewritten_                                = false;
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
@@ -418,6 +425,9 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // Fallbacks, of either kind, for which DuckDB planned the statement again because Sirius had
+    // rewritten the plan before optimization: the CPU ran DuckDB's own plan, not the rewritten one.
+    uint64_t fallback_replans = 0;
     // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
     uint64_t exists_minmax_rewrites = 0;
     // Aggregates pushed below a join that only adds group-by payload, in captured plans.
@@ -921,6 +931,10 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record a fallback whose CPU plan DuckDB planned again, without Sirius's
+  /// pre-optimize rewrites.
+  void record_transparent_fallback_replan() noexcept;
+
   /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
   void record_exists_minmax_rewrites(uint64_t count) noexcept;
 
@@ -1076,6 +1090,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> transparent_fallback_replan_count_{0};
   std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> partial_aggregate_pushdown_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
