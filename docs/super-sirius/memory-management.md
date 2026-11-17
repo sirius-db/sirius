@@ -87,8 +87,11 @@ backend is not supported for reads or writes.
 A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
 (64 MiB of portable pinned staging per reactor). A cuFile one borrows its pinned host
 scratch from the HOST space of the GPU's NUMA node for each transfer and gives it back
-before the transfer settles; device-write bodies on a real GDS host go through the same
-registered GPU staging slots as scan reads. Destruction stops/drains reactor
+before the transfer settles; device-write bodies on a real GDS host go through registered
+GPU staging slots from the same process-wide pool as scan reads, but each reactor holds
+slots of its own: the default context reserves them when it starts at the first spill,
+after the GPU memory pools exist (see [cuFile staging memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+Destruction stops/drains reactor
 workers before releasing their staging. The weak default cache does not prolong that
 lifetime; spill representations and contexts must still be released before CUDA/RMM global
 teardown, including in debug builds. Each conversion retains its context, file object and

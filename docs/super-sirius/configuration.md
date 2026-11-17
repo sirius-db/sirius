@@ -277,6 +277,8 @@ cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uri
 **cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
 reactor teardown and its staging (a cuFile context borrows its pinned host scratch from the
 HOST space per transfer); see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+On a GDS host it also reserves registered GPU staging when it starts, after the GPU memory
+pools exist (see [staging memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 
 The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
 layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
@@ -795,12 +797,17 @@ once, and kept for the life of the process. With the defaults on GPFS that is ab
 **before** the GPU memory pools are created, so they come on top of
 `sirius.memory.gpu.usage_limit_*`; on a small GPU, lower the usage limit or
 `max_staging_bytes_per_device`. A flat pool (`cufile_n_reactors > 0`) allocates its
-slots as its reactors first stage a read, from whatever the pools left free. The POSIX
+slots as its reactors first stage a read, from whatever the pools left free. So does the
+[DISK tier's default context](#disk-memory-siriusmemorydisk) on a GDS host: a planned
+cuFile pool with cuCascade's defaults that, when it starts at the first spill, reserves
+16 reactors × 2 slots ≈ 260 MiB on every visible GPU, on top of the scan pool's slots
+(each reactor holds its own), so leave room for it in the `usage_limit_*` headroom. The POSIX
 fallback (small and host reads, and staged writes) stages through pinned host memory
 borrowed per transfer from the HOST space of the reactor's GPU's NUMA node: up to two
 8 MiB slots, counted against that space only while the transfer runs. If a slot
-cannot be allocated or registered, reads fall back to direct cuFile reads and a WARN says
-so. With `staging_mode: automatic` on a host without GDS, nothing is allocated.
+cannot be allocated or registered, reads (and DISK device writes) go directly through
+cuFile's own bounce buffers and a WARN says so. With `staging_mode: automatic` on a host
+without GDS, nothing is allocated.
 
 **Plan and counters.** At startup the pool plan (`cufile pool: ...`, with each GPU
 group's reactors, CPUs and staging) is logged at INFO, and each GDS setup problem
