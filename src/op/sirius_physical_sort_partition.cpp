@@ -255,6 +255,7 @@ void sirius_physical_sort_partition::on_finalize_operator()
       "Sort ranges: ranges={} empty={} rows_total={} bytes_total={} input_batches={} "
       "target_bytes={} "
       "est_total_bytes={} complete_input={} sample_batches={} sample_rows={} "
+      "sample_key_rows={} sample_stride={} "
       "repeated_boundaries={} rows_min={} rows_median={} rows_max={} bytes_min={} "
       "bytes_median={} bytes_max={} max_over_target={:.3f} largest_share={:.3f}",
       sizes.size(),
@@ -267,6 +268,8 @@ void sirius_physical_sort_partition::on_finalize_operator()
       sample.complete_input,
       sample.sample_batches,
       sample.sample_rows,
+      sample.sample_key_rows,
+      sample.sample_stride,
       sample.repeated_boundaries,
       rows_min,
       median(rows),

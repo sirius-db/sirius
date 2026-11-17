@@ -43,6 +43,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     bool complete_input               = false;
     std::size_t sample_batches        = 0;
     std::size_t sample_rows           = 0;
+    std::size_t sample_key_rows       = 0;
+    std::size_t sample_stride         = 1;
     std::size_t sample_bytes          = 0;
     std::size_t estimated_total_bytes = 0;
     std::size_t target_range_bytes    = 0;

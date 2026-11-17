@@ -20,21 +20,33 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/cudf_sort_order.hpp"
-#include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/merge.hpp>
 #include <cudf/reduction/unique_count.hpp>
 
 #include <algorithm>
+#include <numeric>
 
 namespace sirius {
 namespace op {
 
 namespace {
+
+constexpr std::size_t min_sample_key_rows          = 4096;
+constexpr std::size_t key_rows_per_range           = 64;
+constexpr std::size_t key_rows_per_batch_and_range = 10;
+constexpr std::size_t max_sample_key_rows          = 1048576;
+
+std::size_t capped_product(std::size_t a, std::size_t b)
+{
+  return b != 0 && a > max_sample_key_rows / b ? max_sample_key_rows
+                                               : std::min(a * b, max_sample_key_rows);
+}
 
 std::size_t count_repeated_boundaries(cudf::table const* boundaries, ::cuda::stream_ref stream)
 {
@@ -299,20 +311,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
-    // 3. Merge pre-sorted sample batches (ORDER_BY sorts each batch locally).
-    cudf::table_view merged_sample_view;
-    std::shared_ptr<::cucascade::data_batch> merged_sample_batch;
-    if (valid_batches.size() == 1) {
-      merged_sample_view = get_cudf_table_view(valid_batches[0]);
-    } else {
-      merged_sample_batch = gpu_merge_impl::merge_order_by(valid_batches,
-                                                           order_key_idx,
-                                                           column_order,
-                                                           null_precedence,
-                                                           stream,
-                                                           *space,
-                                                           batch_telemetry());
-      merged_sample_view  = get_cudf_table_view(merged_sample_batch->to_read_only());
+    // 3. Count rows without merging the full-width sample.
+    std::size_t total_rows = 0;
+    for (auto const& batch : valid_batches) {
+      total_rows += static_cast<std::size_t>(get_cudf_table_view(batch).num_rows());
     }
 
     // 4. Compute number of partitions
@@ -326,7 +328,6 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                        port->repo && port->repo->all_empty();
     }
 
-    size_t total_rows      = static_cast<size_t>(merged_sample_view.num_rows());
     size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
     size_t avg_rows_per_batch  = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
     size_t num_parts           = 1;
@@ -373,12 +374,63 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         num_parts);
     }
 
-    // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
-    std::vector<cudf::column_view> sort_key_cols;
-    for (int idx : order_key_idx) {
-      sort_key_cols.push_back(merged_sample_view.column(idx));
+    // 5. Keep regularly spaced key rows from every sorted sample batch.
+    auto const desired_key_rows =
+      std::min(max_sample_key_rows,
+               std::max({min_sample_key_rows,
+                         capped_product(key_rows_per_range, num_parts),
+                         capped_product(key_rows_per_batch_and_range,
+                                        capped_product(valid_batches.size(), num_parts))}));
+    auto const sample_stride = std::max<std::size_t>(
+      1, total_rows / desired_key_rows + (total_rows % desired_key_rows != 0));
+    std::vector<std::unique_ptr<cudf::table>> sampled_tables;
+    std::vector<cudf::table_view> sampled_views;
+    sampled_tables.reserve(valid_batches.size());
+    sampled_views.reserve(valid_batches.size());
+    for (auto const& batch : valid_batches) {
+      auto const table = get_cudf_table_view(batch);
+      std::vector<cudf::column_view> key_columns;
+      key_columns.reserve(order_key_idx.size());
+      for (int idx : order_key_idx) {
+        key_columns.push_back(table.column(idx));
+      }
+      auto const keys = cudf::table_view(key_columns);
+      std::vector<int32_t> indices;
+      for (std::size_t row = sample_stride / 2; row < static_cast<std::size_t>(table.num_rows());
+           row += sample_stride) {
+        indices.push_back(static_cast<int32_t>(row));
+      }
+      if (indices.empty()) { continue; }
+      auto index = index_column(indices, stream, space->get_default_allocator());
+      sampled_tables.push_back(cudf::gather(keys,
+                                            index->view(),
+                                            cudf::out_of_bounds_policy::DONT_CHECK,
+                                            stream,
+                                            space->get_default_allocator()));
+      sampled_views.push_back(sampled_tables.back()->view());
     }
-    cudf::table_view const sort_keys_view(sort_key_cols);
+    if (sampled_views.empty()) {
+      auto const table = get_cudf_table_view(valid_batches.front());
+      std::vector<cudf::column_view> key_columns;
+      for (int idx : order_key_idx) {
+        key_columns.push_back(table.column(idx));
+      }
+      sampled_views.emplace_back(key_columns);
+    }
+    std::unique_ptr<cudf::table> merged_keys;
+    if (sampled_views.size() > 1) {
+      std::vector<cudf::size_type> key_indices(order_key_idx.size());
+      std::iota(key_indices.begin(), key_indices.end(), 0);
+      merged_keys = cudf::merge(sampled_views,
+                                key_indices,
+                                column_order,
+                                null_precedence,
+                                stream,
+                                space->get_default_allocator());
+    }
+    cudf::table_view const sort_keys_view =
+      merged_keys ? merged_keys->view() : sampled_views.front();
+    auto const sample_key_rows = static_cast<std::size_t>(sort_keys_view.num_rows());
     auto made =
       _cross_rank_boundaries
         ? _cross_rank_boundaries->make(
@@ -391,6 +443,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     _range_stats                   = {.complete_input        = complete_input,
                                       .sample_batches        = valid_batches.size(),
                                       .sample_rows           = total_rows,
+                                      .sample_key_rows       = sample_key_rows,
+                                      .sample_stride         = sample_stride,
                                       .sample_bytes          = total_sample_bytes,
                                       .estimated_total_bytes = bytes_for_sizing,
                                       .target_range_bytes    = max_partition_bytes,
