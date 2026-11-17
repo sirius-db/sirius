@@ -64,7 +64,7 @@ only collide at a PORT that has more than one producer feeding it — and `trace
 (`late_mat_plan_pass.cpp`) gives ride-preserving handling to only PARTITION, CONCAT, HASH_JOIN,
 DYNAMIC_FILTER, the two group-by shapes, TOP_N/MERGE_TOP_N, FILTER, and PROJECTION. Every other
 operator type — UNION, CROSS_PRODUCT, and every join variant except HASH_JOIN (NESTED_LOOP_JOIN,
-BLOCKWISE_NL_JOIN, PIECEWISE_MERGE_JOIN, IE_JOIN, the delim joins, POSITIONAL_JOIN, ASOF_JOIN) —
+BLOCKWISE_NL_JOIN, PIECEWISE_MERGE_JOIN, IE_JOIN, POSITIONAL_JOIN, ASOF_JOIN) —
 falls to the walk's default (`return step::reads()`), which ends any ride there: no rowid crosses
 a UNION or a non-hash join, so neither can converge two independently-deferred batches on one
 port. HASH_JOIN is therefore the only multi-producer operator a ride can cross — which is exactly

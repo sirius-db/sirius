@@ -24,7 +24,6 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -278,22 +277,6 @@ static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
       return {std::move(unique_set)};
     }
 
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET: {
-      // A delim scan replays the enclosing delim join's duplicate-eliminated chunk, which
-      // Sirius materializes with a grouped aggregate over ALL delim columns
-      // (plan_delim_join builds the DISTINCT; wrap_delim_distinct globalizes it via
-      // PARTITION_DISTINCT → DISTINCT_MERGE), so the full row set is unique by
-      // construction — under EQUAL null semantics too, since GROUP BY collapses NULL keys
-      // into one group. Only the complete column set is a key; a subset can repeat.
-      auto& delim_get = op.Cast<duckdb::LogicalDelimGet>();
-      if (delim_get.chunk_types.empty()) { return {}; }
-      std::unordered_set<duckdb::idx_t> unique_set;
-      for (duckdb::idx_t i = 0; i < delim_get.chunk_types.size(); i++) {
-        unique_set.insert(i);
-      }
-      return {std::move(unique_set)};
-    }
-
     case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
       // These operators only truncate rows — no column remapping.
@@ -438,12 +421,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Inner-join residuals use the unprojected left/right schema in DuckDB v2.
   // Evaluate them before applying the join's output projection. Outer/semi/anti joins
-  // must evaluate residuals while matching rows. DELIM planning requires a bare join.
+  // must evaluate residuals while matching rows.
   if (std::any_of(op.conditions.begin(), op.conditions.end(), [](auto const& condition) {
         return !condition.IsComparison();
       })) {
-    if (op.type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-        op.join_type != duckdb::JoinType::INNER) {
+    if (op.join_type != duckdb::JoinType::INNER) {
       throw duckdb::NotImplementedException(
         "Sirius does not support arbitrary join conditions for this join type");
     }
@@ -674,8 +656,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     bool const needs_early_publication =
       op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
     bool const discovery_runs =
-      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-      !gpu_spaces.empty() && !host_spaces.empty() &&
+      build_evidence && !gpu_spaces.empty() && !host_spaces.empty() &&
       (!needs_early_publication || right_family_publication_enabled(op_params));
     if (discovery_runs) {
       bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
@@ -798,14 +779,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         targets.size() - scan_target_count,
         evidence,
         rhs_cardinality);
-    } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-               !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
+    } else if (build_evidence && !admitted_keys.empty() &&
+               (gpu_spaces.empty() || host_spaces.empty())) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");
-    } else if (dynamic_filter_enabled && !build_evidence &&
-               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-               !admitted_keys.empty()) {
+    } else if (dynamic_filter_enabled && !build_evidence && !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
         "no filter, opaque-build or semi-join evidence (build est {} rows).",
@@ -971,7 +950,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalComparisonJoin& op)
       // return plan_asof_join(op);
       throw duckdb::NotImplementedException("Asof join not supported in GPU");
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: return plan_comparison_join(op);
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN: return plan_delim_join(op);
     default:
       throw duckdb::InternalException("Unrecognized operator type for LogicalComparisonJoin");
   }

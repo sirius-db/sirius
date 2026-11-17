@@ -485,25 +485,13 @@ TEST_CASE("scan column origin - cross product forwards both sides only for value
   CHECK_FALSE(origin_of(*product, 0, kRows).has_value());
 }
 
-TEST_CASE("row-subset tracing refuses LEFT and DELIM joins", "[planner][scan_column_origin]")
+TEST_CASE("row-subset tracing refuses LEFT joins", "[planner][scan_column_origin]")
 {
-  SECTION("LEFT refuses")
-  {
-    auto join = make_join(duckdb::JoinType::LEFT,
-                          make_get(/*table_index=*/0, /*width=*/2),
-                          make_get(/*table_index=*/1, /*width=*/2));
-    join->ResolveOperatorTypes();
-    REQUIRE(resolve_pass_through_scan(*join, 0) == nullptr);
-  }
-  SECTION("DELIM join refuses even with row-subset semantics")
-  {
-    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
-      duckdb::JoinType::SEMI, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
-    join->children.push_back(make_get(/*table_index=*/0, /*width=*/2));
-    join->children.push_back(make_get(/*table_index=*/1, /*width=*/2));
-    join->ResolveOperatorTypes();
-    REQUIRE(resolve_pass_through_scan(*join, 0) == nullptr);
-  }
+  auto join = make_join(duckdb::JoinType::LEFT,
+                        make_get(/*table_index=*/0, /*width=*/2),
+                        make_get(/*table_index=*/1, /*width=*/2));
+  join->ResolveOperatorTypes();
+  REQUIRE(resolve_pass_through_scan(*join, 0) == nullptr);
 }
 
 TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
@@ -552,16 +540,6 @@ TEST_CASE("row-wise tracing crosses joins but not operators that choose rows",
       CHECK(origin_of(*projection, 0, kRowWise).has_value() == !narrowing);
       CHECK(origin_of(*projection, 0, kValues) == at{0, 0});
     }
-  }
-  SECTION("DELIM joins refuse")
-  {
-    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
-      duckdb::JoinType::INNER, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
-    join->children.push_back(make_get(0, 2));
-    join->children.push_back(make_get(1, 2));
-    join->ResolveOperatorTypes();
-    CHECK_FALSE(origin_of(*join, 0, kRowWise).has_value());
-    CHECK(origin_of(*join, 0, kValues) == at{0, 0});
   }
 }
 

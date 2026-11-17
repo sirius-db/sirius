@@ -17,7 +17,6 @@
 #include "planner/sirius_plan_delim_aggregate_reuse.hpp"
 
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -27,9 +26,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -57,15 +54,6 @@ using duckdb::ProjectionIndex;
 using duckdb::TableIndex;
 using duckdb::unique_ptr;
 using namespace sirius::planner::flat;  // NOLINT(google-build-using-namespace)
-
-std::size_t count_delim_gets(LogicalOperator const& op)
-{
-  std::size_t count = op.type == LogicalOperatorType::LOGICAL_DELIM_GET ? 1 : 0;
-  for (auto const& child : op.children) {
-    count += count_delim_gets(*child);
-  }
-  return count;
-}
 
 // ---------------------------------------------------------------------------------------------
 // Matching
@@ -98,14 +86,14 @@ bool reusable_aggregate(Expression const& expression)
 
 /// What the aggregate reads once rewritten, over the columns of a scan of the outer rows.
 struct reuse {
-  duckdb::idx_t key_column = 0;  ///< The outer rows' column the delim join is keyed on
+  duckdb::idx_t key_column = 0;  ///< The outer rows' column the subquery is keyed on
   bool key_nullable        = true;
   std::vector<std::vector<unique_ptr<Expression>>> arguments;  ///< Per aggregate
 };
 
-/// Whether @p aggregate's input, which reaches the outer rows' distinct values of their column
-/// @p key_column (null: whichever column @p keys records) through @p keys, can be replaced by the
-/// outer rows @p outer themselves, read through a CTE scan with table index @p scan_index.
+/// Whether @p aggregate's input, which reaches the outer rows' distinct values of the column
+/// @p keys records through @p keys, can be replaced by the outer rows @p outer themselves, read
+/// through a CTE scan with table index @p scan_index.
 ///
 /// The input is flattened into S, the subquery's own rows, restricted by `S.a = keys.k`. The
 /// outer rows must flatten into S' x P with
@@ -122,7 +110,6 @@ std::optional<reuse> match_aggregate(duckdb::ClientContext& context,
                                      duckdb::LogicalAggregate& aggregate,
                                      LogicalOperator& outer,
                                      key_source keys,
-                                     std::optional<duckdb::idx_t> key_column,
                                      TableIndex scan_index)
 {
   if (aggregate.children.size() != 1 || aggregate.groups.size() != 1 ||
@@ -134,7 +121,7 @@ std::optional<reuse> match_aggregate(duckdb::ClientContext& context,
   }
   flat_tree sub;
   if (!flatten(*aggregate.children[0], sub, &keys) || !keys.leaf) { return std::nullopt; }
-  if (!key_column) { key_column = keys.cte_column; }
+  auto const key_column = keys.cte_column;
   flat_tree rows;
   if (!flatten(outer, rows, nullptr)) { return std::nullopt; }
 
@@ -228,15 +215,15 @@ std::optional<reuse> match_aggregate(duckdb::ClientContext& context,
 
   // The outer rows' key column is a', or a column of P equated with it.
   auto const outputs = outer.GetColumnBindings();
-  if (*key_column >= outputs.size()) { return std::nullopt; }
-  auto const& key_output = *rows.columns.at(outputs[*key_column]);
+  if (key_column >= outputs.size()) { return std::nullopt; }
+  auto const& key_output = *rows.columns.at(outputs[key_column]);
   if (!is_column(key_output)) { return std::nullopt; }
   auto const key_binding = binding_of(key_output);
   if (!(key_binding == row_key) &&
       std::ranges::find(equated_with_key, key_binding) == equated_with_key.end()) {
     return std::nullopt;
   }
-  if (outer.types[*key_column] != aggregate.groups[0]->GetReturnType()) { return std::nullopt; }
+  if (outer.types[key_column] != aggregate.groups[0]->GetReturnType()) { return std::nullopt; }
 
   // The subquery groups by its key or by the key it is equal to.
   auto const group = resolve(*aggregate.groups[0], sub);
@@ -252,7 +239,7 @@ std::optional<reuse> match_aggregate(duckdb::ClientContext& context,
     if (is_column(value)) { output_of.emplace(binding_of(value), i); }
   }
   reuse result;
-  result.key_column   = *key_column;
+  result.key_column   = key_column;
   result.key_nullable = equated_with_key.empty();
   for (auto const& expression : aggregate.expressions) {
     auto& arguments = result.arguments.emplace_back();
@@ -328,92 +315,8 @@ void reuse_rows(duckdb::LogicalAggregate& aggregate, unique_ptr<LogicalOperator>
 struct rewriter {
   duckdb::ClientContext& context;
   duckdb::Binder& binder;
-  unique_ptr<LogicalOperator>& root;
   std::vector<duckdb::LogicalMaterializedCTE*> ctes;  ///< CTEs whose consumer is being visited
   std::size_t rewrites = 0;
-
-  /// `DELIM_JOIN(outer, ... AGGREGATE(input))` whose aggregate can read the outer rows becomes
-  /// `CTE(outer) { JOIN(CTE_SCAN, ... AGGREGATE(CTE_SCAN)) }` with the same conditions.
-  void delim_join(unique_ptr<LogicalOperator>& slot)
-  {
-    using duckdb::JoinType;
-    auto& delim = slot->Cast<duckdb::LogicalComparisonJoin>();
-    if (delim.children.size() != 2 || delim.duplicate_eliminated_columns.size() != 1 ||
-        !is_column(*delim.duplicate_eliminated_columns[0]) ||
-        std::ranges::any_of(delim.conditions, [](auto const& c) { return !c.IsComparison(); })) {
-      return;
-    }
-    auto const outer_idx = delim.delim_flipped ? std::size_t{1} : std::size_t{0};
-    if (!(delim.join_type == JoinType::INNER ||
-          (delim.join_type == JoinType::LEFT && outer_idx == 0) ||
-          (delim.join_type == JoinType::RIGHT && outer_idx == 1))) {
-      return;
-    }
-    auto& outer = delim.children[outer_idx];
-    auto& sub   = delim.children[1 - outer_idx];
-    if (count_delim_gets(*outer) != 0 || count_delim_gets(*sub) != 1) { return; }
-    // Above the aggregate, only projections and filters of its result.
-    auto* node = sub.get();
-    while ((node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
-            node->type == LogicalOperatorType::LOGICAL_FILTER) &&
-           node->children.size() == 1) {
-      node = node->children[0].get();
-    }
-    if (node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { return; }
-    auto& aggregate = node->Cast<duckdb::LogicalAggregate>();
-
-    auto const outputs = outer->GetColumnBindings();
-    auto const dup     = binding_of(*delim.duplicate_eliminated_columns[0]);
-    auto const found   = std::ranges::find(outputs, dup);
-    if (found == outputs.end()) { return; }
-    key_source keys;
-    keys.delim_get        = true;
-    auto const scan_index = binder.GenerateTableIndex();
-    auto plan             = match_aggregate(context,
-                                aggregate,
-                                *outer,
-                                keys,
-                                static_cast<duckdb::idx_t>(found - outputs.begin()),
-                                scan_index);
-    if (!plan) { return; }
-
-    // ---- Nothing below declines. ----
-    auto const cte_index = binder.GenerateTableIndex();
-    reuse_rows(aggregate, scan_rows(scan_index, cte_index, *outer), *plan);
-    auto const joined_index    = binder.GenerateTableIndex();
-    auto joined_rows           = scan_rows(joined_index, cte_index, *outer);
-    auto join                  = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(delim.join_type);
-    join->conditions           = std::move(delim.conditions);
-    join->left_projection_map  = std::move(delim.left_projection_map);
-    join->right_projection_map = std::move(delim.right_projection_map);
-    join->SetEstimatedCardinality(delim.estimated_cardinality);
-    join->children.resize(2);
-    join->children[outer_idx]     = std::move(joined_rows);
-    join->children[1 - outer_idx] = std::move(sub);
-    auto* definition              = outer.get();
-    auto const column_count       = outer->types.size();
-    auto cte                      = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(
-      duckdb::Identifier("__sirius_delim_rows_" + std::to_string(cte_index.index)),
-      cte_index,
-      column_count,
-      std::move(outer),
-      std::move(join),
-      duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
-    cte->SetEstimatedCardinality(delim.estimated_cardinality);
-    slot = std::move(cte);
-    slot->ResolveOperatorTypes();
-
-    // Everything that read the outer rows' columns, the join conditions included, reads the scan.
-    duckdb::vector<ColumnBinding> scanned;
-    for (std::size_t i = 0; i < outputs.size(); ++i) {
-      scanned.emplace_back(joined_index, ProjectionIndex(i));
-    }
-    duckdb::ColumnBindingReplacer replacer;
-    replacer.AddReplacements(outputs, scanned);
-    replacer.stop_operator = definition;
-    replacer.VisitOperator(*root);
-    ++rewrites;
-  }
 
   /// An aggregate restricted to a delim CTE's distinct keys reads that CTE instead.
   void cte_aggregate(LogicalOperator& node)
@@ -431,7 +334,7 @@ struct rewriter {
     key_source keys;
     keys.cte              = true;
     auto const scan_index = binder.GenerateTableIndex();
-    auto plan = match_aggregate(context, aggregate, outer, keys, std::nullopt, scan_index);
+    auto plan             = match_aggregate(context, aggregate, outer, keys, scan_index);
     if (!plan) { return; }
     reuse_rows(aggregate, scan_rows(scan_index, *probe.cte_index, outer), *plan);
     ++rewrites;
@@ -439,7 +342,6 @@ struct rewriter {
 
   void visit(unique_ptr<LogicalOperator>& slot)
   {
-    if (slot->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) { delim_join(slot); }
     if (slot->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { cte_aggregate(*slot); }
     bool const is_cte = slot->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE;
     for (std::size_t c = 0; c < slot->children.size(); ++c) {
@@ -459,11 +361,11 @@ std::size_t reuse_delim_rows_for_subquery_aggregates(
   duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
   plan->ResolveOperatorTypes();
-  rewriter pass{context, binder, plan, {}, 0};
+  rewriter pass{context, binder, {}, 0};
   pass.visit(plan);
   if (pass.rewrites > 0) {
     SIRIUS_LOG_INFO(
-      "[sirius_plan_delim_aggregate_reuse] Computed {} subquery aggregate(s) from the delim join's "
+      "[sirius_plan_delim_aggregate_reuse] Computed {} subquery aggregate(s) from the delim CTE's "
       "outer rows instead of rescanning the subquery's tables",
       pass.rewrites);
   }

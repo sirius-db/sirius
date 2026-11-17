@@ -23,7 +23,6 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"  // IWYU pragma: keep
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -99,8 +98,8 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
   std::unordered_set<const sirius_pipeline*> in_progress;
 
   auto emit = [&](auto&& self, const std::shared_ptr<sirius_pipeline>& pipeline) -> void {
-    // `in_progress` breaks dependency cycles (delim-join distribution edges); the
-    // pipeline is still emitted when its own frame completes.
+    // `in_progress` stops the walk on a dependency cycle; the pipeline is still emitted
+    // when its own frame completes.
     if (emitted.contains(pipeline.get()) || in_progress.contains(pipeline.get())) { return; }
     in_progress.insert(pipeline.get());
     for (const auto& producer : pipeline->dependencies) {
@@ -135,9 +134,9 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
 #ifdef DEBUG
   // Join dependencies are build-first (finalize_pipeline_structure) and the walk above
   // visits slot 0 first, so every build concat is emitted — and numbered — before its
-  // probe sibling and the ascending re-sort keeps it in slot 0. Delim-join cycle
-  // breaking is the one path that could reorder them; catch that here instead of
-  // silently regressing dynamic-filter publish-before-probe scheduling.
+  // probe sibling and the ascending re-sort keeps it in slot 0. Cycle breaking is the
+  // one path that could reorder them; catch that here instead of silently regressing
+  // dynamic-filter publish-before-probe scheduling.
   for (const auto& pipeline : pipelines) {
     if (pipeline->get_source()->type != op::SiriusPhysicalOperatorType::HASH_JOIN &&
         pipeline->get_source()->type != op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
@@ -261,66 +260,9 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
       continue;
     }
 
-    // A delim join is a fan-out sink: its base sink() pushes each input batch to both branch
-    // pipelines, which are first-class pipelines sourced from the delim join. Emit one edge per
-    // branch with the delim join as the producer; the sub-ops' outward edges (PARTITION_build →
-    // CONCAT_build, DISTINCT → PARTITION_distinct, column_data_scan → PARTITION_probe) come from
-    // the uniform tree-parent lookup below.
-    if (sink_op->type == T::RIGHT_DELIM_JOIN || sink_op->type == T::LEFT_DELIM_JOIN) {
-      auto& delim = sink_op->Cast<op::sirius_physical_delim_join>();
-      // Branch 1: the side that feeds the inner join (RHS build / LHS probe).
-      op::sirius_physical_operator* join_side = nullptr;
-      if (sink_op->type == T::RIGHT_DELIM_JOIN) {
-        join_side = sink_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
-      } else {
-        join_side = sink_op->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
-      }
-      // Branch 2: the duplicate-elimination (distinct) side.
-      op::sirius_physical_operator* distinct_op = delim.distinct;
-      for (auto* branch : {join_side, distinct_op}) {
-        if (!branch) { continue; }
-        auto it = dest_for_op.find(branch);
-        if (it == dest_for_op.end()) { continue; }
-        emit(*branch, sink_op, pipeline, it->second);
-      }
-      continue;
-    }
-
-    // A DELIM_JOIN's distinct chain top (MERGE_GROUP_BY) sits under DELIM_JOIN in the
-    // tree, but its merged output retargets to each delim_scan's downstream consumer
-    // (the inner-HJ probe partition). Only the distinct_root carries the
-    // `_owning_delim_join` back-pointer.
-    if (auto* owning_delim = sink_op->owning_delim_join()) {
-      for (auto& delim_scan_ref : owning_delim->delim_scans) {
-        auto& delim_scan  = delim_scan_ref.get();
-        auto* scan_parent = delim_scan.get_parent_op();
-        if (!scan_parent) { continue; }
-        auto cit = dest_for_op.find(scan_parent);
-        if (cit == dest_for_op.end()) { continue; }
-        emit(*scan_parent, sink_op, pipeline, cit->second);
-      }
-      continue;
-    }
-
     // Uniform tree-parent lookup for everything else.
     auto* parent_op = sink_op->get_parent_op();
     if (!parent_op) { continue; }
-
-    // A RIGHT_DELIM_JOIN's `delim.join` wires out to the RDJ's tree parent, skipping the
-    // RDJ itself. Otherwise it and the root HJ of
-    // `RDJ.children[0]` would both resolve to the RDJ pipeline, and the RDJ-sink
-    // emission's CONCAT fallback would close a cycle through the inner HJ's build CONCAT.
-    if ((parent_op->type == T::RIGHT_DELIM_JOIN) &&
-        parent_op->Cast<op::sirius_physical_delim_join>().join.get() == sink_op) {
-      auto* grand = parent_op->get_parent_op();
-      if (grand) {
-        auto it_gp = dest_for_op.find(grand);
-        if (it_gp != dest_for_op.end()) {
-          emit(*grand, sink_op, pipeline, it_gp->second);
-          continue;
-        }
-      }
-    }
 
     auto it = dest_for_op.find(parent_op);
     if (it == dest_for_op.end()) { continue; }
@@ -428,8 +370,8 @@ void sirius_pipeline_converter::configure_partition_consumers()
     if (sink) set_ids(sink.get());
     if (source) set_ids(source.get());
   }
-  // Sub-operators that emit or receive through a wiring without being a pipeline boundary (build
-  // CONCATs, delim-join internals), resolved the way materialize_repository_wiring resolves them.
+  // Operators that emit or receive through a wiring, resolved the way
+  // materialize_repository_wiring resolves them.
   for (auto const& wiring : repository_wirings_) {
     set_ids(wiring.source_op);
     auto const& dest = wiring.dest_pipeline;

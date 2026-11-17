@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_column_data_scan.hpp"
 
-#include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -56,25 +55,6 @@ void sirius_physical_column_data_scan::build_pipelines(
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
   switch (type) {
-    case SiriusPhysicalOperatorType::DELIM_SCAN: {
-      auto entry = state.delim_join_dependencies.find(*this);
-      D_ASSERT(entry != state.delim_join_dependencies.end());
-      // this chunk scan introduces a dependency to the current pipeline
-      // namely a dependency on the duplicate elimination pipeline to finish
-      auto delim_dependency = entry->second.get().shared_from_this();
-      auto delim_sink       = state.get_pipeline_sink(*delim_dependency);
-      D_ASSERT(delim_sink);
-      D_ASSERT(delim_sink->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-               delim_sink->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-      auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
-      current.add_dependency(delim_dependency);
-      // DELIM_SCAN is routing-only: `_owning_delim_join` on the distinct chain top
-      // redirects wiring into each delim_scan's consumer pipeline, and `is_ready`
-      // re-derives source from operators[0], so append nothing here.
-      D_ASSERT(delim_join.distinct_root);
-      (void)delim_join;
-      return;
-    }
     case SiriusPhysicalOperatorType::CTE_SCAN: {
       auto entry = state.cte_dependencies.find(*this);
       D_ASSERT(entry != state.cte_dependencies.end());

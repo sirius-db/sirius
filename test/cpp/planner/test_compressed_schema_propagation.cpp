@@ -21,7 +21,7 @@
  *        `prune_immediate_scan_restores`, `apply_compressed_schema_passes`) over hand-built
  *        physical operator trees: hash-join key restoration and per-join-type output-layout
  *        mapping, native boundaries for other operators, dynamic-filter scans, root restores,
- *        DELIM_JOIN sub-tree restoration, zero-benefit restore pruning (including the
+ *        zero-benefit restore pruning (including the
  *        aliased-duplicate guard), and the unmappable-type full clear.
  */
 
@@ -35,7 +35,6 @@
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -697,62 +696,6 @@ TEST_CASE("compressed_schema_propagation - root restore inserts a projection onl
   }
 }
 
-TEST_CASE("compressed_schema_propagation - DELIM_JOIN sub-trees are restored native",
-          "[compressed_schema_propagation]")
-{
-  auto join_sub = make_pure_reference_projection({0}, make_scan(1, {k_int8}));
-  auto delim    = duckdb::make_uniq<sirius::op::test_delim_join>(
-    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-    integer_types(1),
-    std::move(join_sub),
-    duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-    /*estimated_cardinality=*/1,
-    duckdb::optional_idx());
-  delim->distinct_root = make_scan(1, {k_int8});
-  delim->children.push_back(make_scan(1, {k_int8}));
-  duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
-
-  sirius::planner::propagate_compressed_schema(plan);
-
-  auto const& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
-  // The join sub-root advertises native output, with a restore projection inserted over its
-  // still-narrowed scan child.
-  REQUIRE(!delim_ref.join->has_physical_overrides());
-  auto const& sub_child = *delim_ref.join->children[0];
-  REQUIRE(sub_child.type == SiriusPhysicalOperatorType::PROJECTION);
-  REQUIRE(!sub_child.has_physical_overrides());
-  REQUIRE(sub_child.Cast<sirius::op::sirius_physical_projection>()
-            .select_list[0]
-            ->holds<sirius::ast::cast>());
-  // A scan-leaf sub-root is forced native by clearing its sidecar.
-  REQUIRE(delim_ref.distinct_root->type == SiriusPhysicalOperatorType::TABLE_SCAN);
-  REQUIRE(!delim_ref.distinct_root->has_physical_overrides());
-  // The DELIM_JOIN itself is a conservative boundary: children restored, own sidecar empty.
-  REQUIRE(!plan->has_physical_overrides());
-  REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
-}
-
-TEST_CASE("compressed_schema_propagation - sidecar fast path inspects DELIM_JOIN sub-trees",
-          "[compressed_schema_propagation]")
-{
-  auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
-    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-    integer_types(1),
-    make_scan(1, {k_int8}),
-    duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-    /*estimated_cardinality=*/1,
-    duckdb::optional_idx());
-  delim->distinct_root = make_scan(1);
-  delim->children.push_back(make_scan(1));
-  duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
-
-  sirius::planner::apply_compressed_schema_passes(plan);
-
-  auto const& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
-  REQUIRE(delim_ref.join->type == SiriusPhysicalOperatorType::TABLE_SCAN);
-  REQUIRE(!delim_ref.join->has_physical_overrides());
-}
-
 TEST_CASE("compressed_schema_propagation - pruning removes only zero-benefit restores",
           "[compressed_schema_propagation]")
 {
@@ -883,15 +826,12 @@ TEST_CASE("compressed_schema_propagation - an unmappable type clears every sidec
     std::move(unmappable_types),
     /*estimated_cardinality=*/1);
 
-  auto delim = duckdb::make_uniq<sirius::op::test_delim_join>(
-    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
-    integer_types(1),
-    std::move(unmappable),
-    duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
-    /*estimated_cardinality=*/1,
-    duckdb::optional_idx());
-  delim->children.push_back(make_scan(1, {k_int8}));
-  duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
+  // The narrowed scan and the unmappable operator are siblings under one parent.
+  auto parent = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::INVALID, integer_types(1), /*estimated_cardinality=*/1);
+  parent->children.push_back(make_scan(1, {k_int8}));
+  parent->children.push_back(std::move(unmappable));
+  duckdb::unique_ptr<sirius_physical_operator> plan = std::move(parent);
 
   sirius::planner::apply_compressed_schema_passes(plan);
 

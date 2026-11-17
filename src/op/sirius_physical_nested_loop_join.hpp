@@ -128,7 +128,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! Output column order: indices into right table columns (empty = identity 0,1,...,right_cols-1)
   duckdb::vector<std::size_t> right_output_col_idxs;
 
-  //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
+  //! DuckDB's `mark_types` of a MARK join; empty for other join types
   duckdb::vector<sirius::logical_type> delim_types;
 
  protected:
@@ -143,24 +143,8 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   bool is_source() const override { return true; }
 
  public:
-  //! True when this NLJ is the internal `delim.join` of a RIGHT_DELIM_JOIN; see the
-  //! identical field on `sirius_physical_hash_join`.
-  [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
-  void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
   [[nodiscard]] std::string_view input_port_for(
     sirius_physical_operator const& producer) const override;
-
-  // Sink Interface
-  //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule
-  //! applies. Mirrors HJ.
-  bool is_sink() const override
-  {
-    if (_is_delim_join_inner) { return false; }
-    return sirius_physical_operator::is_sink();
-  }
-
- protected:
-  bool _is_delim_join_inner = false;
 
  public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,

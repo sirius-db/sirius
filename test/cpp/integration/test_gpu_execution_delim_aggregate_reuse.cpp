@@ -25,7 +25,7 @@
 
 namespace {
 
-// Correlated MIN/MAX/AVG subqueries that Sirius computes from the delim join's outer rows. Parts 5
+// Correlated MIN/MAX/AVG subqueries that Sirius computes from the delim CTE's outer rows. Parts 5
 // and 7 appear twice, so the outer rows repeat their lineitems; some lineitems have a NULL part,
 // and some parts have no lineitems.
 class DelimAggregateReuseFixture : public sirius::test::GpuExecutionFixture {

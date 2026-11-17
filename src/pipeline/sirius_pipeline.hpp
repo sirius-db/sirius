@@ -58,10 +58,6 @@ class sirius_pipeline_build_state {
   constexpr static std::size_t BATCH_INCREMENT = 10000000000000;
 
  public:
-  //! Duplicate eliminated join scan dependencies
-  sirius::reference_map_t<const op::sirius_physical_operator,
-                          std::reference_wrapper<sirius_pipeline>>
-    delim_join_dependencies;
   //! Materialized CTE scan dependencies
   sirius::reference_map_t<const op::sirius_physical_operator,
                           std::reference_wrapper<sirius_pipeline>>
@@ -146,8 +142,8 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
             src->type};
   }
 
-  // Returns the next ports of the pipeline's sink operator, handling special-cased composite
-  // operators like left and right delim joins. Returns an empty vector if the sink is not set.
+  // Returns the next ports of the pipeline's sink operator, or an empty vector if the sink is
+  // not set.
   [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>
   get_next_ports_after_sink() const;
 

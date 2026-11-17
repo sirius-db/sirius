@@ -77,9 +77,7 @@ target_sources(
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp
           sirius_physical_cte.cpp
-          sirius_physical_delim_join.cpp
           sirius_physical_dense_count_join.cpp
-          sirius_physical_dummy_scan.cpp
           sirius_physical_empty_result.cpp
           sirius_physical_filter.cpp
           sirius_physical_gpu_values.cpp
