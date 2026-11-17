@@ -4,6 +4,7 @@ target_sources(
           connector_registry.cpp
           decimal_sum_input_bounds.cpp
           delim_cte_proof.cpp
+          delim_cte_rewrites.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
@@ -34,6 +35,7 @@ target_sources(
           sirius_plan_exists_rewrite.cpp
           sirius_plan_expression_get.cpp
           sirius_plan_filter.cpp
+          sirius_plan_flat_tree.cpp
           sirius_plan_get.cpp
           sirius_plan_limit.cpp
           sirius_plan_narrowing_policy.cpp

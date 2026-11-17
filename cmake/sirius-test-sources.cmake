@@ -126,6 +126,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_delim_aggregate_reuse.cpp
+    test/cpp/integration/test_gpu_execution_delim_cte_rewrites.cpp
     test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
     test/cpp/integration/test_gpu_execution_partial_aggregate_pushdown.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
@@ -303,6 +304,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_delim_aggregate_reuse.cpp
+    test/cpp/planner/test_delim_cte_rewrites.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_one_rank_parity.cpp
