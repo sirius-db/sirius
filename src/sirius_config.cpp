@@ -16,6 +16,7 @@
 
 #include "sirius_config.hpp"
 
+#include "config/user_config.hpp"
 #include "exec/config.hpp"
 #include "exec/thread_defaults.hpp"
 #include "exec/thread_util.hpp"
@@ -338,6 +339,26 @@ static std::string rest_yaml_key(std::string_view field)
   return std::string{field};
 }
 
+// cuCascade's rest::config::validate() on @p opt, its rejection named by YAML key below @p path.
+static std::optional<std::string> rest_config_error(cucascade::io::rest::config const& opt,
+                                                    std::string_view path)
+{
+  try {
+    opt.validate();
+  } catch (std::invalid_argument const& e) {
+    std::string_view what = e.what();
+    constexpr std::string_view prefix{"rest::config::"};
+    if (what.starts_with(prefix)) { what.remove_prefix(prefix.size()); }
+    auto const colon = what.find(": ");
+    if (colon == std::string_view::npos) {
+      return "'" + std::string(path) + "': " + std::string{what};
+    }
+    return "'" + std::string(path) + "." + rest_yaml_key(what.substr(0, colon)) +
+           "': " + std::string{what.substr(colon + 2)};
+  }
+  return std::nullopt;
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   namespace rest = cucascade::io::rest;
@@ -417,19 +438,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 
   // cuCascade's validate() enforces every range and cross-field rule exactly as the reactors
   // will; its errors name struct fields, reported here under their YAML keys.
-  try {
-    opt.validate();
-  } catch (std::invalid_argument const& e) {
-    std::string_view what = e.what();
-    constexpr std::string_view prefix{"rest::config::"};
-    if (what.starts_with(prefix)) { what.remove_prefix(prefix.size()); }
-    auto const colon = what.find(": ");
-    if (colon == std::string_view::npos) {
-      throw std::runtime_error("'rest': " + std::string{what});
-    }
-    throw std::runtime_error("'rest." + rest_yaml_key(what.substr(0, colon)) +
-                             "': " + std::string{what.substr(colon + 2)});
-  }
+  if (auto error = rest_config_error(opt, "rest")) { throw std::runtime_error(*error); }
 }
 
 // cuCascade does not validate slices_per_pass (a value above the slot count merely acts
@@ -1274,6 +1283,320 @@ try {
                                                       : source_path.string() + ": " + e.what());
 }
 
+parsed_sirius_config parsed_sirius_config::from_user_config(const config::user_config& user)
+try {
+  // The rules across blocks, also for a configuration built in code rather than read.
+  user.validate(config::user_config_root);
+
+  auto impl      = std::make_shared<Impl>();
+  auto& settings = impl->settings;
+  auto& named    = impl->explicit_threads;
+
+  // A bytes | fraction pair as the runtime keeps it.
+  auto const bytes_or_fraction = [](auto const& option) -> std::variant<double, std::uint64_t> {
+    if (auto const* bytes = option.template get_if<config::ubytes>()) { return bytes->count(); }
+    return option.template get<double>();
+  };
+  auto const assign_if_set = [](auto const& option, auto& target) {
+    if (auto const* value = option.get_if()) { target = *value; }
+  };
+
+  // -- topology
+  if (auto const* ids = user.topology.gpus.get_if<std::vector<int>>()) {
+    impl->topo.num_gpus_or_gpu_ids = *ids;
+  } else {
+    impl->topo.num_gpus_or_gpu_ids = user.topology.gpus.get<std::size_t>();
+  }
+  impl->topo.gpus_per_query = user.topology.gpus_per_query.get();
+  settings._gpus_per_query  = impl->topo.gpus_per_query;
+
+  // -- memory tiers
+  auto const& gpu                           = user.memory.gpu;
+  impl->gpu_cfg.usage_limit                 = bytes_or_fraction(gpu.usage_limit);
+  impl->gpu_cfg.reservation_limit           = bytes_or_fraction(gpu.reservation_limit);
+  impl->gpu_cfg.downgrade_trigger_fraction  = gpu.downgrade_trigger_fraction.get();
+  impl->gpu_cfg.downgrade_stop_fraction     = gpu.downgrade_stop_fraction.get();
+  auto const& host                          = user.memory.host;
+  impl->host_cfg.capacity                   = bytes_or_fraction(host.capacity);
+  impl->host_cfg.reservation_limit          = bytes_or_fraction(host.reservation_limit);
+  impl->host_cfg.downgrade_trigger_fraction = host.downgrade_trigger_fraction.get();
+  impl->host_cfg.downgrade_stop_fraction    = host.downgrade_stop_fraction.get();
+  impl->host_cfg.block_size                 = host.block_size.get().count();
+  impl->host_cfg.pool_size                  = host.pool_size.get();
+  if (auto const* pools = host.initial_number_pools.get_if()) {
+    impl->host_cfg.initial_number_pools = *pools;
+  }
+  auto const& disk                   = user.memory.disk;
+  impl->disk_cfg.id                  = disk.disk_id.get();
+  impl->disk_cfg.capacity_bytes      = disk.capacity_bytes.get().count();
+  impl->disk_cfg.downgrade_root_dirs = disk.downgrade_root_dirs.get();
+  settings._max_concurrent_queries   = user.max_concurrent_queries.get();
+
+  // -- executors
+  auto const& creator = user.executor.task_creator;
+  assign_if_set(creator.num_threads, settings._task_creator_config.thread_pool.num_threads);
+  settings._task_creator_config.thread_pool.cpu_affinity_list = creator.cpu_affinity.get();
+  named.task_creator                                          = creator.num_threads.user_defined();
+
+  auto const& pipeline = user.executor.pipeline;
+  assign_if_set(pipeline.num_threads, settings._gpu_pipeline_executor_config.num_threads);
+  named.pipeline = pipeline.num_threads.user_defined();
+
+  auto const& downgrade = user.executor.downgrade;
+  auto& downgrade_cfg   = settings._downgrade_executor_config;
+  assign_if_set(downgrade.num_threads, downgrade_cfg.thread_pool.num_threads);
+  downgrade_cfg.thread_pool.cpu_affinity_list = downgrade.cpu_affinity.get();
+  downgrade_cfg.monitor_period                = downgrade.monitor_period.get();
+  downgrade_cfg.copy_chunk_bytes              = downgrade.copy_chunk_bytes.get().count();
+  named.downgrade                             = downgrade.num_threads.user_defined();
+
+  // -- scan manager
+  auto const& sm = user.executor.scan_manager;
+  auto& sm_cfg   = settings._scan_manager_config;
+  assign_if_set(sm.num_threads, sm_cfg.thread_pool.num_threads);
+  sm_cfg.thread_pool.cpu_affinity_list = sm.cpu_affinity.get();
+  sm_cfg.backend                       = sm.backend.get();
+  assign_if_set(sm.uring_n_reactors, sm_cfg.uring_n_reactors);
+  assign_if_set(sm.rest_n_reactors, sm_cfg.rest_n_reactors);
+  sm_cfg.reserve_rest_reactor_cpus = sm.reserve_rest_reactor_cpus.get();
+  if (auto const* scans = sm.max_readahead_scans.get_if()) { sm_cfg.max_readahead_scans = *scans; }
+  if (auto const* strategy = sm.readahead_strategy.get_if()) {
+    sm_cfg.readahead_strategy = *strategy;
+  }
+  named.scan_manager = sm.num_threads.user_defined();
+  named.uring        = sm.uring_n_reactors.user_defined();
+  named.rest         = sm.rest_n_reactors.user_defined();
+
+  auto& uring = sm_cfg.uring;
+  if (auto const* scans = sm.uring.n_max_concurrent_scans.get_if()) {
+    uring.n_max_concurrent_scans          = *scans;
+    uring.n_max_concurrent_scans_explicit = true;
+  }
+  uring.slices_per_pass    = sm.uring.slices_per_pass.get();
+  uring.range_batch_slices = sm.uring.range_batch_slices.get();
+
+  auto const& r = sm.rest;
+  auto& rest    = sm_cfg.rest;
+  if (auto const* scans = r.n_max_concurrent_scans.get_if()) {
+    rest.n_max_concurrent_scans          = *scans;
+    rest.n_max_concurrent_scans_explicit = true;
+  }
+  rest.request_timeout_s       = static_cast<long>(r.request_timeout.get().count());
+  rest.stall_speed_limit_bytes = static_cast<long>(r.stall_speed_limit_bytes.get().count());
+  rest.stall_time_s            = static_cast<long>(r.stall_time.get().count());
+  rest.merge_max_gap           = r.merge_max_gap.get().count();
+  rest.min_segment_bytes       = r.min_segment_bytes.get().count();
+  rest.max_segment_bytes       = r.max_segment_bytes.get().count();
+  rest.footer_probe_bytes      = r.footer_probe_bytes.get().count();
+  rest.list_max_matches        = r.list_max_matches.get();
+  rest.list_max_scanned        = r.list_max_scanned.get();
+  rest.retry_backoff_base      = r.retry_backoff_base.get();
+  rest.retry_jitter            = r.retry_jitter.get();
+  rest.max_retry_attempts      = r.max_retry_attempts.get();
+  rest.max_auth_retry_attempts = r.max_auth_retry_attempts.get();
+  rest.honor_retry_after       = r.honor_retry_after.get();
+  assign_if_set(r.max_connections, rest.max_connections);
+  rest.conn_max_age      = r.conn_max_age.get();
+  rest.upkeep_interval   = r.upkeep_interval.get();
+  rest.upkeep_http1      = r.upkeep_http1.get();
+  rest.connect_timeout   = r.connect_timeout.get();
+  rest.dns_ttl           = r.dns_ttl.get();
+  rest.dns_accumulate    = r.dns_accumulate.get();
+  rest.dns_max_addresses = r.dns_max_addresses.get();
+  // Validated to fit an int when read.
+  rest.keepalive_idle_s     = static_cast<int>(r.keepalive_idle.get().count());
+  rest.keepalive_interval_s = static_cast<int>(r.keepalive_interval.get().count());
+  rest.keepalive_count      = r.keepalive_count.get();
+  if (auto const* mtu = r.min_mtu.get_if()) { rest.min_mtu = mtu->count(); }
+  rest.mtu_reject_max_attempts        = r.mtu_reject_max_attempts.get();
+  rest.close_with_rst                 = r.close_with_rst.get();
+  rest.receive_buffer_bytes           = r.receive_buffer_bytes.get().count();
+  rest.queue_depth                    = r.queue_depth.get();
+  rest.wait_mode                      = r.wait_mode.get();
+  rest.iowq_max_unbound               = r.iowq_max_unbound.get();
+  rest.fan_out                        = r.fan_out.get();
+  rest.interface                      = r.interface.get();
+  rest.pin_to_irq_cpus                = r.pin_to_irq_cpus.get();
+  rest.raise_reactor_priority         = r.raise_reactor_priority.get();
+  impl->explicit_rest_min_mtu         = r.min_mtu.user_defined();
+  impl->explicit_rest_max_connections = r.max_connections.user_defined();
+
+  auto const& t                       = r.tls;
+  rest.tls.ktls                       = t.ktls.get();
+  rest.tls.fallback_rx                = t.user_space_rx.get();
+  rest.tls.placement                  = t.recv_placement.get();
+  rest.tls.min_version                = t.min_version.get();
+  rest.tls.max_version                = t.max_version.get();
+  rest.tls.expect_no_pad              = t.expect_no_pad.get();
+  rest.tls.session_cache              = t.session_cache.get();
+  rest.tls.session_cache_per_endpoint = t.session_cache_per_endpoint.get();
+  rest.tls.max_connection_bytes       = t.max_connection_bytes.get().count();
+  rest.tls.ciphersuites               = t.ciphersuites.get();
+  rest.tls.cipher_list                = t.cipher_list.get();
+  rest.tls.groups                     = t.groups.get();
+  rest.tls.sni_override               = t.sni_override.get();
+  rest.tls.allow_tls13_without_rekey  = t.allow_tls13_without_rekey.get();
+
+  auto& cache                           = sm_cfg.cache;
+  cache.mode                            = sm.cache.mode.get();
+  cache.eviction                        = sm.cache.eviction.get();
+  cache.min_prefetching_budget_fraction = sm.cache.min_prefetching_budget_fraction.get();
+  cache.eviction_threshold_fraction     = sm.cache.eviction_threshold_fraction.get();
+  cache.apply_mode();
+
+  auto& prefetcher             = sm_cfg.memory_prefetcher;
+  prefetcher.enable            = sm.memory_prefetcher.enable.get();
+  prefetcher.num_threads       = sm.memory_prefetcher.num_threads.get();
+  prefetcher.min_free_fraction = sm.memory_prefetcher.min_free_fraction.get();
+  prefetcher.poll_interval_ms =
+    static_cast<std::size_t>(sm.memory_prefetcher.poll_interval.get().count());
+  prefetcher.drain_quiet_ms =
+    static_cast<std::size_t>(sm.memory_prefetcher.drain_quiet.get().count());
+
+  auto const& prep          = sm.preparation;
+  auto& prep_cfg            = sm_cfg.preparation;
+  auto const optional_count = [](auto const& option) -> std::optional<std::size_t> {
+    if (auto const* value = option.get_if()) { return *value; }
+    return std::nullopt;
+  };
+  prep_cfg.max_inflight_metadata_jobs = optional_count(prep.max_inflight_metadata_jobs);
+  prep_cfg.max_inflight_dv_jobs       = optional_count(prep.max_inflight_dv_jobs);
+  prep_cfg.lookahead_batches          = optional_count(prep.lookahead_batches);
+  prep_cfg.max_control_work           = optional_count(prep.max_control_work);
+  prep_cfg.drain_quantum              = optional_count(prep.drain_quantum);
+  prep_cfg.coordinator_workers        = optional_count(prep.coordinator_workers);
+  prep_cfg.native_reader_workers      = optional_count(prep.native_reader_workers);
+  prep_cfg.max_native_readers         = optional_count(prep.max_native_readers);
+  prep_cfg.interrupt_check_interval   = prep.interrupt_check_interval.get();
+  prep_cfg.partial_batch              = scan_manager::partial_batch_options{
+                 .min_fill_percent = prep.partial_batch.min_fill_percent.get(),
+                 .min_residence    = prep.partial_batch.min_residence.get(),
+                 .max_residence    = prep.partial_batch.max_residence.get()};
+  sm_cfg.apply_cache_mode();
+
+  // -- operators
+  auto const& op                          = user.operator_params;
+  auto& ops                               = settings._operator_params;
+  ops.enable_late_materialization         = op.enable_late_materialization.get();
+  ops.enable_fused_scan_filter            = op.enable_fused_scan_filter.get();
+  ops.enable_low_cardinality_groupby      = op.enable_low_cardinality_groupby.get();
+  ops.late_materialization_min_boundaries = op.late_materialization_min_boundaries.get();
+  ops.late_materialization_min_value_x_boundaries =
+    op.late_materialization_min_value_x_boundaries.get();
+  ops.late_materialization_count_defer = op.late_materialization_count_defer.get();
+  ops.late_materialization_min_value_compressed =
+    op.late_materialization_min_value_compressed.get();
+  ops.fused_scan.diagnostics                   = op.fused_scan_diagnostics.get();
+  ops.fused_scan.max_selectivity               = op.fused_scan_max_selectivity.get();
+  ops.fused_scan.full_route_max_selectivity    = op.fused_scan_full_route_max_selectivity.get();
+  ops.fused_scan.index_walk_max_selectivity    = op.fused_scan_index_walk_max_selectivity.get();
+  ops.fused_scan.max_membership_sources        = op.fused_scan_max_membership_sources.get();
+  ops.max_sort_partition_bytes                 = op.max_sort_partition_bytes.get().count();
+  ops.max_sort_partition_memory_fraction       = op.max_sort_partition_memory_fraction.get();
+  ops.max_broadcast_join_size                  = op.max_broadcast_join_size.get().count();
+  ops.mark_join_build_switch_ratio             = op.mark_join_build_switch_ratio.get();
+  ops.enable_dynamic_filter                    = op.enable_dynamic_filter.get();
+  ops.enable_dynamic_filter_multi_partition    = op.enable_dynamic_filter_multi_partition.get();
+  ops.enable_dynamic_zone_map_filter           = op.enable_dynamic_zone_map_filter.get();
+  ops.dynamic_filter_domain_coverage_threshold = op.dynamic_filter_domain_coverage_threshold.get();
+  ops.dynamic_filter_inlist_max_l2_fraction    = op.dynamic_filter_inlist_max_l2_fraction.get();
+  ops.dynamic_filter_keep_threshold            = op.dynamic_filter_keep_threshold.get();
+  ops.enable_pinned_zone_map_pruning           = op.enable_pinned_zone_map_pruning.get();
+  ops.enable_decimal_sum_stats_bound           = op.enable_decimal_sum_stats_bound.get();
+  ops.enable_compressed_materialization        = op.enable_compressed_materialization.get();
+  ops.enable_dense_count_join                  = op.enable_dense_count_join.get();
+  ops.enable_delim_aggregate_reuse             = op.enable_delim_aggregate_reuse.get();
+  ops.prove_unique_keys                        = op.pin_table_prove_unique_keys.get();
+  ops.unique_exact_max_bytes                   = op.pin_table_unique_exact_max_bytes.get().count();
+  ops.enable_exists_minmax_rewrite             = op.enable_exists_minmax_rewrite.get();
+  ops.enable_partial_aggregate_below_join      = op.enable_partial_aggregate_below_join.get();
+  ops.enable_subquery_key_carry                = op.enable_subquery_key_carry.get();
+  ops.enable_exists_from_aggregate             = op.enable_exists_from_aggregate.get();
+  ops.admission_bytes_per_gpu                  = op.admission_bytes_per_gpu.get().count();
+  ops.avg_variable_column_bytes                = op.avg_variable_column_bytes.get().count();
+  ops.enable_runtime_size_estimation           = op.enable_runtime_size_estimation.get();
+  ops.use_hw_decompression                     = op.use_hw_decompression.get();
+  // Unset batch sizes are derived from GPU memory when the configuration is resolved.
+  std::pair<config::config_option<config::ubytes> const*, uint64_t operator_params::*> const
+    batch_options[] = {
+      {&op.scan_task_batch_size, &operator_params::scan_task_batch_size},
+      {&op.hash_partition_bytes, &operator_params::hash_partition_bytes},
+      {&op.concat_batch_bytes, &operator_params::concat_batch_bytes},
+      {&op.cross_join_task_bytes, &operator_params::cross_join_task_bytes},
+      {&op.sort_sample_bytes, &operator_params::sort_sample_bytes},
+      {&op.max_build_hash_table_bytes, &operator_params::max_build_hash_table_bytes},
+      {&op.max_build_probe_resident_bytes, &operator_params::max_build_probe_resident_bytes}};
+  for (auto const& [option, member] : batch_options) {
+    if (auto const* value = option->get_if()) {
+      ops.*member = value->count();
+      impl->explicit_batch_settings.push_back(member);
+    }
+  }
+
+  // -- telemetry and compression
+  auto& telemetry              = settings._telemetry_config;
+  telemetry.enable_quent       = user.telemetry.enable_quent.get();
+  telemetry.enable_nvtx        = user.telemetry.enable_nvtx.get();
+  telemetry.output_directory   = user.telemetry.output_directory.get();
+  telemetry.engine_name        = user.telemetry.engine_name.get();
+  telemetry.nvtx_injection_lib = user.telemetry.nvtx_injection_lib.get();
+
+  auto const& c                             = user.compression;
+  auto& compression                         = settings._compression_config;
+  compression.enable_pin_table_compression  = c.enable_pin_table_compression.get();
+  compression.min_batch_size_bytes          = c.min_batch_size_bytes.get().count();
+  compression.max_compressed_fraction       = c.max_compressed_fraction.get();
+  compression.input_plan_dir                = c.input_plan_dir.get();
+  compression.enable_spill_compression      = c.enable_spill_compression.get();
+  compression.spill_min_batch_bytes         = c.spill_min_batch_bytes.get().count();
+  compression.spill_max_compressed_fraction = c.spill_max_compressed_fraction.get();
+  compression.spill_encode_reserve_fraction = c.spill_encode_reserve_fraction.get();
+
+  // -- memory spaces listed one by one: all GPU, then host, then disk spaces
+  for (auto const& space : user.space.gpu) {
+    cucascade::memory::gpu_memory_space_config cfg;
+    cfg.device_id                  = space.device_id.get();
+    cfg.per_stream_reservation     = space.per_stream_reservation.get();
+    cfg.reservation_limit_fraction = space.reservation_limit_fraction.get();
+    cfg.downgrade_trigger_fraction = space.downgrade_trigger_fraction.get();
+    cfg.downgrade_stop_fraction    = space.downgrade_stop_fraction.get();
+    cfg.memory_capacity            = space.memory_capacity.get().count();
+    settings._memory_space_configs.emplace_back(std::move(cfg));
+  }
+  for (auto const& space : user.space.host) {
+    cucascade::memory::host_memory_space_config cfg;
+    cfg.numa_id                    = space.numa_id.get();
+    cfg.reservation_limit_fraction = space.reservation_limit_fraction.get();
+    cfg.downgrade_trigger_fraction = space.downgrade_trigger_fraction.get();
+    cfg.downgrade_stop_fraction    = space.downgrade_stop_fraction.get();
+    cfg.memory_capacity            = space.memory_capacity.get().count();
+    cfg.block_size                 = space.block_size.get().count();
+    cfg.pool_size                  = space.pool_size.get();
+    cfg.initial_number_pools       = space.initial_number_pools.get();
+    settings._memory_space_configs.emplace_back(std::move(cfg));
+  }
+  for (auto const& space : user.space.disk) {
+    cucascade::memory::disk_memory_space_config cfg;
+    cfg.disk_id         = space.disk_id.get();
+    cfg.mount_paths     = space.mount_path.get();
+    cfg.memory_capacity = space.memory_capacity.get().count();
+    settings._memory_space_configs.emplace_back(std::move(cfg));
+  }
+  impl->use_effective_gpu_capacity = settings._memory_space_configs.empty()
+                                       ? gpu.usage_limit.user_defined()
+                                       : user.space.gpu_capacities_configured();
+  return parsed_sirius_config(std::move(impl));
+} catch (const config::config_error& e) {
+  throw configuration_input_error(e.what());
+}
+
+sirius_config create_sirius_config(const config::user_config& user,
+                                   const cucascade::memory::system_topology_info& topology,
+                                   const egress_nic_probe& probe)
+{
+  return parsed_sirius_config::from_user_config(user).resolve(topology, probe);
+}
+
 std::optional<cucascade::memory::nic_topology> discover_egress_nic(
   std::string_view configured_interface)
 {
@@ -1448,6 +1771,11 @@ try {
   if (!impl_->explicit_rest_max_connections) {
     auto& rest           = settings._scan_manager_config.rest;
     rest.max_connections = default_rest_max_connections(hw_topology.kernel_tls, rest.queue_depth);
+  }
+  // With the derived values in place, the REST settings pass cuCascade's own check.
+  if (auto error = rest_config_error(settings._scan_manager_config.rest,
+                                     "sirius.executor.scan_manager.rest")) {
+    throw configuration_input_error(*error);
   }
   validate_rest_fan_out(settings._scan_manager_config);
   settings.finalize_derived_config();
