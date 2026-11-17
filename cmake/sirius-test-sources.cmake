@@ -34,6 +34,7 @@ set(TEST_SOURCES
     test/cpp/compression/test_spill_compression.cpp
     test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_config_values.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
