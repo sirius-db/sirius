@@ -81,42 +81,59 @@ cucascade::memory::gpu_memory_space_config gpu_space(const sirius::sirius_config
 
 TEST_CASE("hardware thread defaults round and clamp each pool", "[config][thread_defaults]")
 {
-  // REST reactors are clamp(T/6, 16, 32) unless the pool is sized from the egress NIC.
+  // REST reactors are clamp(T/6, 8, 16) without kTLS and clamp(T/6, 4, 16) with it, unless the
+  // pool is sized from fewer than 16 NIC IRQ CPUs.
   struct example {
     unsigned int cpu;
     std::size_t gpus;
     sirius::exec::hardware_thread_defaults expected;
+    std::size_t rest_with_ktls;
   };
   for (auto const& row : {
-         example{0, 0, {4, 4, 1, 18, 16, 2}},
-         example{20, 1, {7, 4, 2, 18, 16, 2}},
-         example{31, 1, {8, 4, 3, 18, 16, 2}},
-         example{32, 1, {8, 4, 4, 18, 16, 4}},
-         example{39, 2, {7, 4, 2, 18, 16, 4}},
-         example{64, 8, {4, 4, 1, 18, 16, 4}},
-         example{96, 4, {8, 4, 3, 18, 16, 4}},
-         example{192, 8, {8, 4, 3, 18, 32, 4}},
-         example{std::numeric_limits<unsigned int>::max(), 1, {8, 4, 4, 18, 32, 4}},
-         example{32, std::numeric_limits<std::size_t>::max(), {4, 4, 1, 18, 16, 4}},
+         example{0, 0, {4, 4, 1, 18, 8, 2}, 4},
+         example{20, 1, {7, 4, 2, 18, 8, 2}, 4},
+         example{31, 1, {8, 4, 3, 18, 8, 2}, 5},
+         example{32, 1, {8, 4, 4, 18, 8, 4}, 5},
+         example{39, 2, {7, 4, 2, 18, 8, 4}, 6},
+         example{64, 8, {4, 4, 1, 18, 10, 4}, 10},
+         example{96, 4, {8, 4, 3, 18, 16, 4}, 16},
+         example{192, 8, {8, 4, 3, 18, 16, 4}, 16},
+         example{std::numeric_limits<unsigned int>::max(), 1, {8, 4, 4, 18, 16, 4}, 16},
+         example{32, std::numeric_limits<std::size_t>::max(), {4, 4, 1, 18, 8, 4}, 5},
        }) {
     CAPTURE(row.cpu, row.gpus);
+    auto const check_non_rest = [&](sirius::exec::hardware_thread_defaults const& actual) {
+      CHECK(actual.pipeline == row.expected.pipeline);
+      CHECK(actual.task_creator == row.expected.task_creator);
+      CHECK(actual.downgrade == row.expected.downgrade);
+      CHECK(actual.scan_manager == row.expected.scan_manager);
+      CHECK(actual.uring_reactors == row.expected.uring_reactors);
+    };
     auto const actual = sirius::exec::derive_thread_defaults(row.cpu, row.gpus);
-    CHECK(actual.pipeline == row.expected.pipeline);
-    CHECK(actual.task_creator == row.expected.task_creator);
-    CHECK(actual.downgrade == row.expected.downgrade);
-    CHECK(actual.scan_manager == row.expected.scan_manager);
+    check_non_rest(actual);
     CHECK(actual.rest_reactors == row.expected.rest_reactors);
-    CHECK(actual.uring_reactors == row.expected.uring_reactors);
 
-    // Sizing the REST pool from the NIC requests 0 (cuCascade: one reactor per IRQ CPU) and
-    // changes nothing else.
-    auto const from_nic = sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true);
-    CHECK(from_nic.rest_reactors == 0);
-    CHECK(from_nic.pipeline == row.expected.pipeline);
-    CHECK(from_nic.task_creator == row.expected.task_creator);
-    CHECK(from_nic.downgrade == row.expected.downgrade);
-    CHECK(from_nic.scan_manager == row.expected.scan_manager);
-    CHECK(from_nic.uring_reactors == row.expected.uring_reactors);
+    // Kernel TLS lowers the floor to 4 and changes nothing else.
+    auto const with_ktls = sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true);
+    check_non_rest(with_ktls);
+    CHECK(with_ktls.rest_reactors == row.rest_with_ktls);
+
+    // Fewer than 16 NIC IRQ CPUs: one reactor per IRQ CPU, still at least the floor.
+    for (auto const [irq_cpus, expected] : {std::pair<std::size_t, std::size_t>{1, 4},
+                                            {4, 4},
+                                            {6, 6},
+                                            {15, 15}}) {
+      CAPTURE(irq_cpus);
+      auto const from_nic = sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true, irq_cpus);
+      check_non_rest(from_nic);
+      CHECK(from_nic.rest_reactors == expected);
+    }
+    // 16 or more IRQ CPUs: the CPU-count default.
+    for (std::size_t const irq_cpus : {16, 17, 64}) {
+      CAPTURE(irq_cpus);
+      CHECK(sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true, irq_cpus).rest_reactors ==
+            row.rest_with_ktls);
+    }
   }
 }
 
@@ -276,6 +293,8 @@ TEST_CASE("resolved REST defaults follow kTLS, NIC IRQ steering and the NIC's MT
     std::optional<int> rest_n_reactors;
     std::optional<int> min_mtu;
     std::string interface;
+    std::optional<int> max_connections;
+    std::optional<int> queue_depth;
   };
   auto const make_root = [](named_keys const& named) {
     auto root         = YAML::Load(R"(sirius:
@@ -288,6 +307,8 @@ TEST_CASE("resolved REST defaults follow kTLS, NIC IRQ steering and the NIC's MT
     if (named.rest_n_reactors) { scan_manager["rest_n_reactors"] = *named.rest_n_reactors; }
     if (named.min_mtu) { scan_manager["rest"]["min_mtu"] = *named.min_mtu; }
     if (!named.interface.empty()) { scan_manager["rest"]["interface"] = named.interface; }
+    if (named.max_connections) { scan_manager["rest"]["max_connections"] = *named.max_connections; }
+    if (named.queue_depth) { scan_manager["rest"]["queue_depth"] = *named.queue_depth; }
     return root;
   };
   cucascade::memory::system_topology_info with_ktls{};
@@ -307,34 +328,60 @@ TEST_CASE("resolved REST defaults follow kTLS, NIC IRQ steering and the NIC's MT
       .resolve(topology, probe)
       .get_scan_manager_config();
   };
-  auto const fallback =
-    sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1).rest_reactors;
-  REQUIRE(fallback >= 16);
-  REQUIRE(fallback <= 32);
-  auto const steered = make_nic({2, 3, 4, 5}, {0, 1, 2, 3, 4, 5, 6, 7});
+  auto const cpu_range = [](int first, int count) {
+    std::vector<int> cpus(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+      cpus[static_cast<std::size_t>(i)] = first + i;
+    }
+    return cpus;
+  };
+  auto const hw = std::thread::hardware_concurrency();
+  // The CPU-count defaults: clamp(T/6, 8, 16) without kTLS, clamp(T/6, 4, 16) with it.
+  auto const fallback = sirius::exec::derive_thread_defaults(hw, 1).rest_reactors;
+  REQUIRE(fallback >= 8);
+  REQUIRE(fallback <= 16);
+  auto const fallback_ktls = sirius::exec::derive_thread_defaults(hw, 1, true).rest_reactors;
+  REQUIRE(fallback_ktls >= 4);
+  REQUIRE(fallback_ktls <= 16);
+  // Six queue IRQs steered to CPUs 2-7 of a 16-CPU node.
+  auto const steered = make_nic(cpu_range(2, 6), cpu_range(0, 16));
 
-  SECTION("kTLS loaded and IRQs steered: the pool is NIC-sized (0)")
+  SECTION("kTLS loaded and IRQs steered to fewer than 16 CPUs: one reactor per IRQ CPU")
   {
     nic = steered;
-    CHECK(resolve({}, with_ktls).rest_n_reactors == 0);
+    CHECK(resolve({}, with_ktls).rest_n_reactors == 6);
     // One lookup serves both the reactor count and rest.min_mtu.
     CHECK(probes == 1);
     CHECK(probed_interface.empty());
   }
+  SECTION("a NIC-sized pool keeps the kTLS floor of 4 reactors")
+  {
+    nic = make_nic({2, 3}, cpu_range(0, 16));
+    CHECK(resolve({}, with_ktls).rest_n_reactors == 4);
+  }
+  SECTION("15 IRQ CPUs map to 15 reactors; 16 or more fall back to the CPU-count default")
+  {
+    nic = make_nic(cpu_range(0, 15), cpu_range(0, 64));
+    CHECK(resolve({}, with_ktls).rest_n_reactors == 15);
+    nic = make_nic(cpu_range(0, 16), cpu_range(0, 64));
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback_ktls);
+    nic = make_nic(cpu_range(0, 32), cpu_range(0, 64));
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback_ktls);
+  }
   SECTION("the configured interface is the one probed")
   {
     nic = steered;
-    CHECK(resolve({.interface = "enp1s0"}, with_ktls).rest_n_reactors == 0);
+    CHECK(resolve({.interface = "enp1s0"}, with_ktls).rest_n_reactors == 6);
     CHECK(probed_interface == "enp1s0");
   }
-  SECTION("kTLS loaded but IRQs not steered, or no NIC: clamp(T/6, 16, 32)")
+  SECTION("kTLS loaded but IRQs not steered, or no NIC: clamp(T/6, 4, 16)")
   {
     nic = make_nic({0, 1, 2, 3}, {0, 1, 2, 3});
-    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback);
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback_ktls);
     nic.reset();
-    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback);
+    CHECK(resolve({}, with_ktls).rest_n_reactors == fallback_ktls);
   }
-  SECTION("no kTLS: clamp(T/6, 16, 32), whatever the NIC")
+  SECTION("no kTLS: clamp(T/6, 8, 16), whatever the NIC")
   {
     nic = steered;
     CHECK(resolve({}, without_ktls).rest_n_reactors == fallback);
@@ -343,6 +390,28 @@ TEST_CASE("resolved REST defaults follow kTLS, NIC IRQ steering and the NIC's MT
     probes = 0;
     CHECK(resolve({.min_mtu = 0}, without_ktls).rest_n_reactors == fallback);
     CHECK(probes == 0);
+  }
+  SECTION("rest.max_connections is 128 with kTLS and 64 without")
+  {
+    nic = steered;
+    CHECK(resolve({}, with_ktls).rest.max_connections == 128);
+    CHECK(resolve({}, without_ktls).rest.max_connections == 64);
+  }
+  SECTION("a named rest.max_connections wins")
+  {
+    for (int const named : {7, 64, 128, 200}) {
+      CAPTURE(named);
+      auto const expected = static_cast<std::size_t>(named);
+      CHECK(resolve({.max_connections = named}, with_ktls).rest.max_connections == expected);
+      CHECK(resolve({.max_connections = named}, without_ktls).rest.max_connections == expected);
+    }
+  }
+  SECTION("the derived rest.max_connections fits a named rest.queue_depth")
+  {
+    // 128 connections need queue_depth >= 256; a smaller named depth caps the default at half.
+    CHECK(resolve({.queue_depth = 200}, with_ktls).rest.max_connections == 100);
+    CHECK(resolve({.queue_depth = 200}, without_ktls).rest.max_connections == 64);
+    CHECK(resolve({.queue_depth = 256}, with_ktls).rest.max_connections == 128);
   }
   SECTION("a named reactor count wins")
   {

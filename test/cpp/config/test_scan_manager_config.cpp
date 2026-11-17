@@ -134,9 +134,10 @@ void require_load_error(std::string const& name,
 /// REST reactor count follows this machine's kTLS state and egress NIC.
 sirius::exec::hardware_thread_defaults machine_thread_defaults()
 {
-  auto const from_nic = sirius::rest_reactors_sized_from_nic(
-    cucascade::memory::discover_kernel_tls(), sirius::discover_egress_nic(""));
-  return sirius::exec::derive_thread_defaults(std::thread::hardware_concurrency(), 1, from_nic);
+  auto const kernel_tls = cucascade::memory::discover_kernel_tls();
+  auto const irq_cpus = sirius::rest_reactor_irq_cpus(kernel_tls, sirius::discover_egress_nic(""));
+  return sirius::exec::derive_thread_defaults(
+    std::thread::hardware_concurrency(), 1, kernel_tls.loaded, irq_cpus);
 }
 
 }  // namespace
@@ -1048,8 +1049,8 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
 TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport defaults",
           "[scan_manager][config][rest][tls]")
 {
-  // Sirius sets no REST transport defaults of its own beyond the derived ones (the scan budget and
-  // min_mtu): an empty block must leave every other field at cuCascade's struct default (compared
+  // Sirius sets no REST transport defaults of its own beyond the derived ones (the scan budget,
+  // min_mtu and max_connections): an empty block must leave every other field at cuCascade's struct default (compared
   // field by field, so a cuCascade default change needs no edit here).
   cucascade::io::rest::config const d{};
   for (auto const* body : {"        {}\n", "        tls: {}\n"}) {
@@ -1060,7 +1061,10 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.request_timeout_s == d.request_timeout_s);
     CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
     CHECK(r.stall_time_s == d.stall_time_s);
-    CHECK(r.max_connections == d.max_connections);
+    // Derived from this machine's kTLS state: 128 with kTLS loaded, 64 without.
+    CHECK(r.max_connections ==
+          sirius::default_rest_max_connections(cucascade::memory::discover_kernel_tls(),
+                                               d.queue_depth));
     CHECK(r.merge_max_gap == d.merge_max_gap);
     CHECK(r.upkeep_interval == d.upkeep_interval);
     CHECK(r.upkeep_http1 == d.upkeep_http1);

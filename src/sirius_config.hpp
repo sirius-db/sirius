@@ -447,12 +447,26 @@ using egress_nic_probe = std::function<std::optional<cucascade::memory::nic_topo
 [[nodiscard]] std::optional<cucascade::memory::nic_topology> discover_egress_nic(
   std::string_view configured_interface);
 
-/// Whether the REST reactor count is sized from the egress NIC rather than from the CPU count:
+/// Whether the REST reactor count may be sized from the egress NIC rather than from the CPU count:
 /// kernel TLS is loaded and the NIC's queue IRQs are steered to a strict subset of its NUMA node's
-/// cores.  The pool then has one reactor per IRQ CPU (cuCascade's @c rest_n_reactors = 0).
+/// cores.  When the NIC also has fewer than @c exec::rest_reactors_max IRQ CPUs, the default is one
+/// reactor per IRQ CPU (at least @c exec::rest_reactors_min_kernel_tls); see
+/// @c rest_reactor_irq_cpus and @c exec::derive_thread_defaults.
 [[nodiscard]] bool rest_reactors_sized_from_nic(
   cucascade::memory::kernel_tls_info const& kernel_tls,
   std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The IRQ CPU count the REST reactor default maps to: the egress NIC's IRQ CPU count when
+/// @c rest_reactors_sized_from_nic, otherwise 0 (the CPU-count default applies).
+[[nodiscard]] std::size_t rest_reactor_irq_cpus(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The @c rest.max_connections default: 128 with kernel TLS loaded, 64 (cuCascade's default)
+/// without.  Capped at half of @p queue_depth (each connection needs a primary and a cancel SQE),
+/// so an explicit smaller @c rest.queue_depth stays valid.
+[[nodiscard]] std::size_t default_rest_max_connections(
+  cucascade::memory::kernel_tls_info const& kernel_tls, std::size_t queue_depth) noexcept;
 
 /// The @c rest.min_mtu default for @p egress_nic: the NIC's MTU when the topology reports a
 /// jumbo-frame interface (an MTU above the standard Ethernet 1500), so a connection that negotiated

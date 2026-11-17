@@ -1037,6 +1037,8 @@ struct parsed_sirius_config::Impl {
   } explicit_threads;
   /// Whether the YAML named scan_manager.rest.min_mtu, an explicit 0 included.
   bool explicit_rest_min_mtu = false;
+  /// Whether the YAML named scan_manager.rest.max_connections.
+  bool explicit_rest_max_connections = false;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
 };
 
@@ -1170,7 +1172,9 @@ try {
       impl->explicit_threads.uring        = counts.has_value("uring_n_reactors");
       impl->explicit_threads.rest         = counts.has_value("rest_n_reactors");
       if (auto rest = counts.optional_node("rest")) {
-        impl->explicit_rest_min_mtu = yaml::reader(*rest).has_value("min_mtu");
+        yaml::reader rest_keys(*rest);
+        impl->explicit_rest_min_mtu         = rest_keys.has_value("min_mtu");
+        impl->explicit_rest_max_connections = rest_keys.has_value("max_connections");
       }
       from_yaml(*n, settings._scan_manager_config);
     }
@@ -1266,6 +1270,23 @@ bool rest_reactors_sized_from_nic(
   std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
 {
   return kernel_tls.loaded && egress_nic.has_value() && egress_nic->irqs_steered();
+}
+
+std::size_t rest_reactor_irq_cpus(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  return rest_reactors_sized_from_nic(kernel_tls, egress_nic) ? egress_nic->irq_cpus.size()
+                                                              : std::size_t{0};
+}
+
+std::size_t default_rest_max_connections(cucascade::memory::kernel_tls_info const& kernel_tls,
+                                         std::size_t queue_depth) noexcept
+{
+  constexpr std::size_t kernel_tls_connections = 128;
+  constexpr std::size_t user_tls_connections   = 64;
+  auto const wanted = kernel_tls.loaded ? kernel_tls_connections : user_tls_connections;
+  return std::clamp<std::size_t>(queue_depth / 2, 1, wanted);
 }
 
 std::size_t default_rest_min_mtu(
@@ -1376,10 +1397,10 @@ try {
   if ((!named.rest && hw_topology.kernel_tls.loaded) || !impl_->explicit_rest_min_mtu) {
     egress_nic = probe(settings._scan_manager_config.rest.interface);
   }
-  auto const rest_from_nic =
-    !named.rest && rest_reactors_sized_from_nic(hw_topology.kernel_tls, egress_nic);
-  auto const threads =
-    exec::derive_thread_defaults(std::thread::hardware_concurrency(), gpu_count, rest_from_nic);
+  auto const nic_irq_cpus =
+    named.rest ? std::size_t{0} : rest_reactor_irq_cpus(hw_topology.kernel_tls, egress_nic);
+  auto const threads = exec::derive_thread_defaults(
+    std::thread::hardware_concurrency(), gpu_count, hw_topology.kernel_tls.loaded, nic_irq_cpus);
   if (!named.pipeline) { settings._gpu_pipeline_executor_config.num_threads = threads.pipeline; }
   if (!named.task_creator) {
     settings._task_creator_config.thread_pool.num_threads = threads.task_creator;
@@ -1394,6 +1415,10 @@ try {
   if (!named.rest) { settings._scan_manager_config.rest_n_reactors = threads.rest_reactors; }
   if (!impl_->explicit_rest_min_mtu) {
     settings._scan_manager_config.rest.min_mtu = default_rest_min_mtu(egress_nic);
+  }
+  if (!impl_->explicit_rest_max_connections) {
+    auto& rest           = settings._scan_manager_config.rest;
+    rest.max_connections = default_rest_max_connections(hw_topology.kernel_tls, rest.queue_depth);
   }
   validate_rest_fan_out(settings._scan_manager_config);
   settings.finalize_derived_config();
