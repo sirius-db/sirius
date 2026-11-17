@@ -195,7 +195,10 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
   });
 }
 
-// Size exact filters for the smallest probe-device L2; return 0 if unavailable.
+/**
+ * @brief The smallest L2 cache size across the Replica GPUs, or the current GPU's when there
+ * are none; 0 when any size is unavailable
+ */
 std::size_t device_l2_cache_bytes(
   std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
 {
@@ -242,7 +245,7 @@ struct fanout_counts {
 };
 
 /**
- * @brief Pushes @p filters, indexed by admitted key, to every binding of every target of @p plan
+ * @brief Pushes `filters`, indexed by admitted key, to every binding of every target of `plan`
  * that still accepts filters.
  *
  * A zone map lowers to literals of its bound type against the probe column, so it goes only to a
@@ -327,16 +330,17 @@ void merge_without_filters(dynamic_filter_publish_plan const& plan) noexcept;
 //===----------------------------------------------------------------------===//
 struct dynamic_filter_publication_session::state {
   /**
-   * @brief The phases of a dynamic filter publication session:
+   * @brief The phases of a dynamic filter publication session.
+   *
    * Healthy: OPEN -> COLLECTING -> PUBLISHING -> TERMINAL, or OPEN -> TERMINAL (a decline, or a
    * begin that constructs nothing).
    * Corrupt: any state may transition to TERMINAL.
    */
   enum class phase {
-    OPEN,        // A producer may still register on the plan's channels
-    COLLECTING,  // Construction accepts contributions from certified build batches
-    PUBLISHING,  // The final contributor's task owns publication
-    TERMINAL  // The session has completed, cancelled, or failed; no further producer registration
+    OPEN,        ///< A producer may still register on the plan's channels
+    COLLECTING,  ///< Construction accepts contributions from certified build batches
+    PUBLISHING,  ///< The Publishing Task owns publication
+    TERMINAL  ///< The session has completed, cancelled, or failed; no further producer registration
   };
 
   explicit state(dynamic_filter_publish_plan value, dynamic_filter_stats* sink)
@@ -503,12 +507,12 @@ struct dynamic_filter_publication_session::state {
   }
 
   /**
-   * @brief Ends the attempt if no channel accepts filters, and returns whether it did. The caller
-   * holds the mutex.
+   * @brief Ends the attempt if no channel accepts filters, and returns whether it did.
    *
-   * Under `dynamic_filter_publication_policy::publish_when_empty_or_drained` the closed channels
-   * are counted but the attempt goes on: the other processes' cross-rank merge waits on this
-   * process's part.
+   * The caller holds the mutex. Under
+   * `dynamic_filter_publication_policy::publish_when_empty_or_drained` the closed channels are
+   * counted but the attempt goes on: the other processes' cross-rank merge waits on this process's
+   * part.
    */
   [[nodiscard]] bool end_if_channels_closed() noexcept
   {
@@ -523,7 +527,9 @@ struct dynamic_filter_publication_session::state {
 
   /**
    * @brief Ends the attempt if cancellation or closed channels forbid a fan-out, and returns
-   * whether it did. The caller holds the mutex.
+   * whether it did.
+   *
+   * The caller holds the mutex.
    */
   [[nodiscard]] bool end_if_fanout_forbidden() noexcept
   {
@@ -575,7 +581,9 @@ struct dynamic_filter_publication_session::state {
 
   /**
    * @brief Marks one contribution or publication active while claimed, and settles the session when
-   * it ends. Every contribute() and publish_if_final() holds an active_operation guard. The last
+   * it ends.
+   *
+   * Every contribute() and publish_if_final() holds an active_operation guard. The last
    * active operation settles the session, transitioning it to TERMINAL. This is deliberately
    * distinct from deciding the outcome: the decision (via end_attempt(result)) records the
    * accumulation_result, and then settle() ensures the producers finish.
@@ -601,8 +609,10 @@ struct dynamic_filter_publication_session::state {
   };
 
   /**
-   * @brief Constructs every planned filter on the root, replicates the exact filters and zone maps,
-   * then fans out. Runs on the task that owes the publication.
+   * @brief Constructs every planned filter on the Publishing GPU, replicates the exact filters and
+   * zone maps, then fans out.
+   *
+   * Runs on the Publishing Task.
    */
   void publish(cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
   {
@@ -611,7 +621,7 @@ struct dynamic_filter_publication_session::state {
         std::scoped_lock lock(mutex);
         if (accumulation_result || end_if_fanout_forbidden()) { return; }
       }
-      // Construction runs on the task's stream, so the task's GPU is the root.
+      // Construction runs on the task's stream, so the task's GPU is the Publishing GPU.
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
@@ -628,8 +638,8 @@ struct dynamic_filter_publication_session::state {
       std::vector<key_filters> per_key(plan.admitted_keys().size());
       {
         nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
-        // Bloom filters reached every replica GPU while finishing; the root's exact filters and
-        // zone maps are copied to the others here, before any channel sees them.
+        // Bloom filters reached every replica GPU while finishing; the Publishing GPU's exact
+        // filters and zone maps are copied to the others here, before any channel sees them.
         auto const replicate = [&](std::shared_ptr<sirius_dynamic_filter> const& filter) {
           if (!filter || filter->kind() == sirius_dynamic_filter_kind::BLOOM) { return; }
           auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());

@@ -16,9 +16,9 @@
 
 /*
  * Tests a hash join's publication session through the calls its build PARTITION makes: one
- * certified build batch, `begin`, a contribution, and the final contributor's publication. They pin
+ * certified build batch, `begin`, a contribution, and the Publishing Task's publication. They pin
  * the session-level outcomes the join depends on: publication in any join mode and in BUILD_PROBE
- * mode, replica narrowing, fail-open memory exhaustion, cancellation, drained targets, unexpected
+ * mode, replica narrowing, fail-open memory exhaustion, cancellation, closed channels, unexpected
  * errors, and the rights a session acquires or abandons.
  */
 
@@ -107,7 +107,7 @@ TEST_CASE("device memory exhaustion during construction fails open",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
   claim_fixture fixture;
-  // Past the small-list gate, so construction must lease device memory.
+  // Past the small IN-list limit, so construction must lease device memory.
   constexpr std::size_t kLargeBuildRows = 100000;
   auto batch = claim_fixture::make_build_batch_on(*fixture.gpu_space, kLargeBuildRows);
   {

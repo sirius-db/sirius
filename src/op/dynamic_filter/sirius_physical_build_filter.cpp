@@ -75,7 +75,7 @@ std::unique_ptr<operator_data> sirius_physical_build_filter::execute(
   auto const batches = input.get_read_only_batches();
   if (batches.empty()) { return output; }
   auto const& batch = batches.front();
-  // The output forwards the input unchanged, so the final contributor publishes at once.
+  // The output forwards the input unchanged, so the Publishing Task publishes at once.
   if (auto const id = _certifier.contribute(input, batch, stream);
       id && batch.get_memory_space() != nullptr) {
     _session.publish_if_final(*id, *batch.get_memory_space(), stream);

@@ -322,7 +322,7 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 }
 
 /**
- * @brief The shape of @p keys equal Bloom arrays, each sized on @p rows rows: what the construction
+ * @brief The shape of `keys` equal Bloom arrays, each sized on `rows` rows: what the construction
  * plan gives keys of equal valid rows.
  */
 struct bloom_geometry_shape {
@@ -338,7 +338,7 @@ struct bloom_geometry_shape {
 };
 
 /**
- * @brief The arrays of @p keys keys sized on @p rows rows, which must fit @p cap.
+ * @brief The arrays of `keys` keys sized on `rows` rows, which must fit `cap`.
  */
 [[nodiscard]] inline bloom_geometry_shape bloom_geometry(std::size_t rows,
                                                          std::size_t keys  = 2,
@@ -551,8 +551,9 @@ struct fixture {
   }
 
   /**
-   * @brief A plan whose one scan target binds key `i` of @p planned to build column `i`. No hash
-   * IN-list may take any L2, so every key larger than a small IN-list plans a Bloom filter.
+   * @brief A plan whose one scan channel binds key `i` of `planned` to build column `i`.
+   *
+   * No hash IN-list may take any L2, so every key larger than a small IN-list plans a Bloom filter.
    *
    * @param probe_types The recorded probe type of each binding; empty means the planned key types
    */

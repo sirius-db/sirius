@@ -107,13 +107,15 @@ constexpr std::size_t kProbeColumnIndex = 7;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
-/// What one publication added to the counters, and the targets that still accepted filters.
+/**
+ * @brief What one publication added to the counters, and the channels that still accepted filters.
+ */
 struct publication_result : sirius::op::dynamic_filter_stats_snapshot {
   std::size_t active_targets = 0;
 };
 
 /**
- * @brief Constructs and publishes @p plan's filters from @p table as one certified build batch,
+ * @brief Constructs and publishes `plan`'s filters from `table` as one certified build batch,
  * through the session a build PARTITION drives; exceptions propagate.
  */
 publication_result publish_for_test(dynamic_filter_publish_plan const& plan,
@@ -2198,8 +2200,7 @@ struct recording_merge final : sirius::op::cross_rank_filter_merge {
   std::vector<bool> handed;
   /// Whether merge() drops every key, as when another process sent none.
   bool drop_all = false;
-  /// Whether merge() throws after taking part, as when the exchange fails.
-  bool fail = false;
+  bool fail     = false;  ///< Whether merge() throws after taking part, as when the exchange fails
 
   void merge(std::span<std::shared_ptr<sirius::op::sirius_dynamic_filter>> membership,
              ::cuda::stream_ref) override
@@ -2224,7 +2225,9 @@ sirius::op::dynamic_filter_publication_policy merged_policy(std::size_t bloom_ke
           .publish_when_empty_or_drained = true};
 }
 
-/// A one-key plan of @p key publishing to @p channel, merged by @p merge when it is set.
+/**
+ * @brief A one-key plan of `key` publishing to `channel`, merged by `merge` when it is set.
+ */
 dynamic_filter_publish_plan one_key_plan(
   publisher_fixture& fixture,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> channel,

@@ -101,7 +101,9 @@ class observed_partition final : public op::sirius_physical_partition {
 /**
  * @brief The join's own build observer with a test-only fault: an armed observer refuses, once, the
  * memory a task needs after it contributed and before it publishes, as a mandatory allocation there
- * would. The forward path allocates nothing between those points, so this stands in for one.
+ * would.
+ *
+ * The forward path allocates nothing between those points, so this stands in for one.
  */
 class oom_before_publication final : public op::partition_input_observer {
  public:
@@ -277,8 +279,15 @@ struct harness {
   std::unique_ptr<sirius::creator::task_creator> creator;
   std::uint64_t next_task_id = 1;
 
-  /// @param partitions The build PARTITION's partitions; 1 runs the forward path, which never
-  /// scatters
+  /**
+   * @brief Builds the join and the build PARTITION's pipeline over `devices` GPUs; `start()`
+   * builds the task creator
+   *
+   * @param devices GPUs the harness's memory manages
+   * @param per_stream Whether the memory tracks reservations per stream
+   * @param partitions The build PARTITION's partitions; 1 runs the forward path, which never
+   * scatters
+   */
   explicit harness(std::size_t devices = 1, bool per_stream = false, std::size_t partitions = 2)
     : memory{{.devices             = devices,
               .per_stream_tracking = per_stream,

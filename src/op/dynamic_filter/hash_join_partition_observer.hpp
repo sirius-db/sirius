@@ -22,8 +22,10 @@
 namespace sirius::op {
 class sirius_physical_hash_join;
 
-/// Hash-join-owned observation of its explicitly bound build input: the join's dynamic-filter
-/// construction site on every layout.
+/**
+ * @brief Hash-join-owned observation of its explicitly bound build input: the join's dynamic-filter
+ * construction site on every layout.
+ */
 class hash_join_partition_observer final : public partition_input_observer {
  public:
   hash_join_partition_observer(sirius_physical_hash_join& join, sirius_physical_partition& input);

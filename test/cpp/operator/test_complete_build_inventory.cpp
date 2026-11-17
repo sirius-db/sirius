@@ -172,7 +172,9 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
 
 namespace {
 
-/// Spills @p batch to host memory, as the downgrade executor would.
+/**
+ * @brief Spills `batch` to host memory, as the downgrade executor would.
+ */
 void spill_to_host(acc::fixture const& fixture, acc::batch_ptr const& batch)
 {
   auto* host = fixture.manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).front();
@@ -327,8 +329,10 @@ class fake_compressed_representation final : public sirius::simpatico_compressed
   }
 };
 
-/// A batch of @p rows rows in GPU @p space: an all-null INT32 column and a valid DECIMAL64(-2)
-/// column.
+/**
+ * @brief A batch of `rows` rows in GPU `space`: an all-null INT32 column and a valid DECIMAL64(-2)
+ * column.
+ */
 acc::batch_ptr make_nullable_batch(cucascade::memory::memory_space& space, cudf::size_type rows)
 {
   auto const stream = space.acquire_stream();
@@ -347,7 +351,9 @@ acc::batch_ptr make_nullable_batch(cucascade::memory::memory_space& space, cudf:
     std::move(*table), space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
-/// `make_nullable_batch` on the first GPU of @p fixture.
+/**
+ * @brief `make_nullable_batch` on the first GPU of `fixture`.
+ */
 acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
 {
   return make_nullable_batch(fixture.gpu(0), rows);
@@ -396,7 +402,9 @@ TEST_CASE("an arrival reports each column's carrier and null count from GPU and 
 
 namespace {
 
-/// One GPU whose memory manager also spills to a disk tier in a temporary directory.
+/**
+ * @brief One GPU whose memory manager also spills to a disk tier in a temporary directory.
+ */
 struct disk_memory {
   std::filesystem::path directory;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
@@ -431,7 +439,9 @@ struct disk_memory {
     std::filesystem::remove_all(directory);
   }
 
-  /// Moves @p batch to the disk tier, as the downgrade executor would.
+  /**
+   * @brief Moves `batch` to the disk tier, as the downgrade executor would.
+   */
   void spill(cucascade::data_batch& batch) const
   {
     auto const stream = gpu->acquire_stream();
@@ -566,7 +576,7 @@ TEST_CASE("a column absent from some batch has no carriers and no null count",
 TEST_CASE("accumulated Bloom transfer chunks are aligned and cover non-aligned arrays",
           "[dynamic_filter][construction][bloom_budget]")
 {
-  // The bytes of one Bloom array sized on @p rows keys.
+  // The bytes of one Bloom array sized on `rows` keys.
   auto const raw_bytes_for = [](std::size_t rows) {
     return sirius::op::bloom_blocks_for(rows) * sirius::op::bloom_bytes_per_block;
   };

@@ -85,10 +85,10 @@ class dynamic_filter_publication_session final {
   void set_join_identity(dynamic_filter_join_identity identity) noexcept;
 
   /**
-   * @brief Plans and leases construction for @p inventory. Call on an untracked thread (the task
-   * creator) after certification.
+   * @brief Plans and leases construction for `inventory`.
    *
-   * OPEN only; otherwise a no-op that counts nothing. Seals the plan, plans every key
+   * Call on an untracked thread (the task creator) after certification. OPEN only; otherwise a
+   * no-op that counts nothing. Seals the plan, plans every key
    * (`plan_construction`), and leases the accumulators (`build_filter_construction::try_create`),
    * recording one `publication_attempts`. An empty build or plan, no replica GPU, or a refused
    * lease ends the attempt SKIPPED at once, so the session is Terminal; otherwise the session moves
@@ -99,8 +99,9 @@ class dynamic_filter_publication_session final {
   bool begin(complete_build_inventory inventory);
 
   /**
-   * @brief Records why the construction site declined its build input. OPEN only: counts @p reason
-   * and completes SKIPPED (Terminal); otherwise a no-op.
+   * @brief Records why the construction site declined its build input.
+   *
+   * OPEN only: counts `reason` and completes SKIPPED (Terminal); otherwise a no-op.
    */
   void decline(construction_decline reason) noexcept;
 
@@ -114,7 +115,7 @@ class dynamic_filter_publication_session final {
    * contribution completes the inventory.
    *
    * @param original_id The batch's original ID
-   * @param source A read accessor of the batch; the caller retires @p stream before releasing it
+   * @param source A read accessor of the batch; the caller retires `stream` before releasing it
    * @param stream The contributing task's stream
    */
   void contribute(std::uint64_t original_id,
@@ -122,12 +123,12 @@ class dynamic_filter_publication_session final {
                   ::cuda::stream_ref stream);
 
   /**
-   * @brief Publishes synchronously if @p original_id completed the inventory and still owns its
+   * @brief Publishes synchronously if `original_id` completed the inventory and still owns its
    * pending publication.
    *
    * A mandatory retry preserves the pending identity. The caller invokes this after constructing
-   * its output and before depositing it. Root filters and scratch come from @p task_space's
-   * allocator; all replicas are ready before any channel push.
+   * its output and before depositing it. Filters built on the Publishing GPU and scratch come from
+   * `task_space`'s allocator; all replicas are ready before any channel push.
    *
    * @param original_id Original input identity retained across preparation and retries
    * @param task_space The task's GPU memory space
@@ -162,7 +163,7 @@ class dynamic_filter_publication_session final {
   [[nodiscard]] std::size_t task_scratch_bound() const noexcept;
 
   /**
-   * @brief Whether the session has completed every producer right: published, skipped, failed, or
+   * @brief Whether every Producer of the session is Terminal: published, skipped, failed, or
    * cancelled.
    */
   [[nodiscard]] bool terminal() const noexcept;

@@ -137,7 +137,9 @@ planned plan_for(std::vector<key_case> const& cases,
   return {op::plan_construction(facts, keys, bindings, limit), std::move(keys)};
 }
 
-/// The kind a single batch of @p valid_rows valid keys of @p type gets.
+/**
+ * @brief The kind a single batch of `valid_rows` valid keys of `type` gets.
+ */
 membership_filter_kind single_batch_kind(cudf::data_type type,
                                          std::size_t valid_rows,
                                          std::size_t l2)

@@ -22,9 +22,13 @@ namespace sirius::op {
 
 class sirius_physical_partition;
 
-/// Input lifecycle observation. `before_transform` runs on every execute path before the output is
-/// built; `on_hash_input` runs only on the hash path, before scatter. Transform completion runs
-/// after the output is built, before sink.
+/**
+ * @brief Input lifecycle observation.
+ *
+ * `before_transform` runs on every execute path before the output is built; `on_hash_input` runs
+ * only on the hash path, before scatter. Transform completion runs after the output is built,
+ * before sink.
+ */
 class partition_input_observer {
  public:
   virtual ~partition_input_observer()                                             = default;
@@ -38,8 +42,10 @@ class partition_input_observer {
                                cucascade::memory::memory_space& space,
                                ::cuda::stream_ref stream)                         = 0;
   virtual void finalize_input()                                                   = 0;
-  /// Bytes a task of the observed input may take from its allocator beyond its input and output; 0
-  /// when the observer builds nothing.
+  /**
+   * @brief Bytes a task of the observed input may take from its allocator beyond its input and
+   * output; 0 when the observer builds nothing.
+   */
   [[nodiscard]] virtual std::size_t task_scratch_bytes() const noexcept = 0;
 };
 

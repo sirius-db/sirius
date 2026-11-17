@@ -16,7 +16,7 @@
 
 /*
  * Tests the `[dynamic_filter_key]` outcome line: its spelling, the structural join identity, the
- * deferred `post_unlock_actions` that carries it, and the one line per bound key that a
+ * deferred `post_unlock_actions` that carries it, and the one line per Admitted Key that a
  * publication session emits when it becomes terminal.
  */
 
@@ -184,7 +184,9 @@ TEST_CASE("post-unlock actions are move-only and log their lines once when dispa
 
 namespace {
 
-/// The one key line of a single-key session after @p act, with its identity set.
+/**
+ * @brief The one Key Outcome line of a single-key session after `act`, with its identity set.
+ */
 std::vector<std::string> session_lines(sirius::test::publication::claim_fixture& fixture,
                                        auto const& act)
 {

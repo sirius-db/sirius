@@ -221,7 +221,9 @@ void log_shadow_judgement(std::string_view at,
   return rmm::align_up(raw, alignment);
 }
 
-/// A Bloom filter for @p rows keys, or for `construction_limits::fixed_bloom_keys` when set.
+/**
+ * @brief A Bloom filter for `rows` keys, or for `construction_limits::fixed_bloom_keys` when set.
+ */
 [[nodiscard]] bloom_membership bloom_for(std::size_t rows, construction_limits const& limits)
 {
   auto const sized_rows = limits.fixed_bloom_keys != 0 ? limits.fixed_bloom_keys : rows;
