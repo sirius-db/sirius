@@ -37,6 +37,7 @@ set(TEST_SOURCES
     test/cpp/config/test_c_api_config.cpp
     test/cpp/plan/test_c_api_plan.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_config_block.cpp
     test/cpp/config/test_config_option.cpp
     test/cpp/config/test_config_values.cpp
     test/cpp/config/test_context.cpp
