@@ -592,3 +592,12 @@ TEST_CASE("accessors report what they hold", "[config][config_option]")
   REQUIRE(to_string(value_source::fallback) == "fallback");
   REQUIRE(to_string(option_scope::session) == "session");
 }
+
+TEST_CASE("a mandatory option is not required when its block is absent", "[config][config_option]")
+{
+  auto cert = option<std::string>("cert").mark_mandatory().build();
+  cert.load(node{}, "tls", environment::prod);
+  REQUIRE(cert.is_unset());
+  REQUIRE_THROWS_WITH(cert.load(node::mapping(), "tls", environment::prod),
+                      "'tls.cert': required but missing");
+}
