@@ -47,6 +47,146 @@ def arguments(**overrides):
 
 
 class ConcurrentBenchmarkTests(unittest.TestCase):
+    def test_configured_limit_uses_current_key_and_accepts_empty_sections(self):
+        for config, expected in (
+            ("", 1),
+            ("sirius:\n", 1),
+            ("sirius:\n  executor:\n", 1),
+            ("sirius:\n  executor:\n    scan_manager:\n", 1),
+            ("sirius:\n  max_concurrent_queries: 4\n  executor:\n", 4),
+            (
+                "sirius:\n  executor:\n    scan_manager:\n      max_concurrent_queries: 8\n",
+                1,
+            ),
+        ):
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "sirius.yaml"
+                path.write_text(config)
+                self.assertEqual(
+                    cb.configured_limit(path), (expected, str(path.resolve()))
+                )
+
+    def test_supervisor_configures_gpu_child_logging_before_launch(self):
+        for engine, inherited, expected_level in (
+            ("gpu", {}, "info"),
+            (
+                "both",
+                {"SIRIUS_LOG_LEVEL": "warn", "SIRIUS_LOG_BACKEND": "noop"},
+                "info",
+            ),
+            (
+                "gpu",
+                {"SIRIUS_LOG_LEVEL": "off", "SIRIUS_LOG_BACKEND": "duckdb"},
+                "info",
+            ),
+            ("gpu", {"SIRIUS_LOG_LEVEL": "error"}, "info"),
+            ("gpu", {"SIRIUS_LOG_LEVEL": "critical"}, "info"),
+            (
+                "gpu",
+                {"SIRIUS_LOG_LEVEL": "debug", "SIRIUS_LOG_BACKEND": "noop"},
+                "debug",
+            ),
+            ("both", {"SIRIUS_LOG_LEVEL": "trace"}, "trace"),
+            ("gpu", {"SIRIUS_LOG_LEVEL": "info"}, "info"),
+            ("cpu", {"SIRIUS_LOG_LEVEL": "warn", "SIRIUS_LOG_BACKEND": "noop"}, None),
+        ):
+            with (
+                self.subTest(engine=engine, inherited=inherited),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                directory = Path(tmp)
+                database = directory / "input.duckdb"
+                database.touch()
+                (directory / "metadata.json").write_text("{}")
+                parent_env = inherited | {
+                    "SIRIUS_LOG_DIR": "/unused/parent/logs",
+                    "UNCHANGED": "value",
+                }
+                expected_logging = (
+                    {
+                        "SIRIUS_LOG_BACKEND": "spdlog",
+                        "SIRIUS_LOG_LEVEL": expected_level,
+                        "SIRIUS_LOG_DIR": str(directory / "log_dir"),
+                    }
+                    if expected_level
+                    else None
+                )
+
+                def child(_command, **kwargs):
+                    # These values must be passed to the process before LOAD or timing.
+                    self.assertEqual(
+                        kwargs["env"], parent_env | (expected_logging or {})
+                    )
+                    self.assertEqual(dict(os.environ), parent_env)
+                    return SimpleNamespace(returncode=0)
+
+                with (
+                    patch.dict(os.environ, parent_env, clear=True),
+                    patch.object(cb, "configured_limit", return_value=(1, None)),
+                    patch.object(cb.subprocess, "run", side_effect=child) as launch,
+                    patch.object(cb, "audit_gpu_execution", return_value=True),
+                ):
+                    self.assertEqual(
+                        cb.supervise(
+                            arguments(engine=engine, input=str(database)),
+                            directory,
+                            None,
+                            False,
+                            None,
+                            None,
+                        ),
+                        0,
+                    )
+                    launch.assert_called_once()
+                    self.assertEqual(dict(os.environ), parent_env)
+                metadata = json.loads((directory / "metadata.json").read_text())
+                self.assertEqual(metadata["gpu_audit_logging"], expected_logging)
+
+    def test_supervisor_preserves_attributed_logs_on_child_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            database = directory / "input.duckdb"
+            database.touch()
+            (directory / "metadata.json").write_text("{}")
+            (directory / "log_dir").mkdir()
+
+            def child(_command, **_kwargs):
+                # Logs become available at child exit, including on a failed run.
+                (directory / "log_dir/sirius.log").write_text(
+                    "QueryBegin: instance=0xa connection=1 query=1 SQL: CALL sirius_set_query_label('readonly_s1_q1_i0')\n"
+                    "QueryBegin: instance=0xa connection=1 query=2 SQL: SELECT 1\n"
+                    "[window] end instance=0xa connection=1 window=10 query=2 outcome=unwind\n"
+                )
+                return SimpleNamespace(returncode=1)
+
+            with (
+                patch.object(cb, "configured_limit", return_value=(1, None)),
+                patch.object(cb.subprocess, "run", side_effect=child),
+                patch.object(
+                    cb, "split_keyed_logs", wraps=cb.split_keyed_logs
+                ) as split,
+            ):
+                self.assertEqual(
+                    cb.supervise(
+                        arguments(engine="gpu", input=str(database)),
+                        directory,
+                        None,
+                        False,
+                        None,
+                        None,
+                    ),
+                    1,
+                )
+                split.assert_called_once_with(directory)
+            self.assertIn(
+                "outcome=unwind",
+                (directory / "sirius/execution_logs/readonly_s1_q1_i0.log").read_text(),
+            )
+            self.assertEqual(
+                json.loads((directory / "metadata.json").read_text())["termination"],
+                "nonzero_exit",
+            )
+
     def test_gpu_workers_verify_fallback_before_measuring(self):
         for fallback_enabled in (False, True):
             with self.subTest(fallback_enabled=fallback_enabled):
@@ -130,9 +270,10 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             (True, False, "success", False),
             (True, True, "error", True),  # never upgrade a failed request
         ):
-            with self.subTest(
-                window=window, fallback=fallback, status=request_status
-            ), tempfile.TemporaryDirectory() as tmp:
+            with (
+                self.subTest(window=window, fallback=fallback, status=request_status),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
                 directory = Path(tmp)
                 (directory / "csv").mkdir()
                 (directory / "log_dir").mkdir()
@@ -176,6 +317,7 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
                     directory / "concurrent_summary.json",
                     {"engines": {"sirius": cb.summarize([record], 1, [])}},
                 )
+                cb.split_keyed_logs(directory)
                 self.assertEqual(cb.audit_gpu_execution(directory), expected)
                 summary = json.loads(
                     (directory / "concurrent_summary.json").read_text()
@@ -328,13 +470,18 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             )
 
             def child(command, **kwargs):
-                return SimpleNamespace(
-                    returncode=cb.run(json.loads(Path(command[-1]).read_text()))
-                )
+                split.assert_not_called()
+                result = cb.run(json.loads(Path(command[-1]).read_text()))
+                # Child work, including validation, must not process the logs.
+                split.assert_not_called()
+                return SimpleNamespace(returncode=result)
 
             with (
                 patch.object(cb, "configured_limit", return_value=(1, None)),
                 patch.object(cb.subprocess, "run", side_effect=child),
+                patch.object(
+                    cb, "split_keyed_logs", wraps=cb.split_keyed_logs
+                ) as split,
                 patch.object(perf, "drop_os_cache"),
                 patch.object(
                     perf,
@@ -345,6 +492,7 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
                 self.assertEqual(
                     cb.supervise(args, directory, None, True, None, None), 0
                 )
+                split.assert_called_once_with(directory)
             metadata = json.loads((directory / "metadata.json").read_text())
             self.assertEqual(metadata["concurrency_mode"], "cooperative")
             self.assertEqual(metadata["executions_per_engine"], 4)

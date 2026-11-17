@@ -161,13 +161,8 @@ def configured_limit(config_path):
     for path in candidates:
         if path.is_file():
             doc = yaml.safe_load(path.read_text()) or {}
-            sirius = doc.get("sirius", {})
-            legacy = (
-                sirius.get("executor", {})
-                .get("scan_manager", {})
-                .get("max_concurrent_queries", 1)
-            )
-            return sirius.get("max_concurrent_queries", legacy), str(path.resolve())
+            sirius = doc.get("sirius") or {}
+            return sirius.get("max_concurrent_queries", 1), str(path.resolve())
     return 1, None
 
 
@@ -264,6 +259,24 @@ def supervise(args, directory, config_path, validate, references, compression_pl
         os.environ["SIRIUS_CONFIG_FILE"] = str(destination)
     metadata_path = directory / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
+    child_env = os.environ.copy()
+    gpu_logging = None
+    if args.engine != "cpu":
+        # The post-exit audit needs INFO-level file records from the first LOAD.
+        # Override only the child's environment, retaining more verbose levels.
+        level = child_env.get("SIRIUS_LOG_LEVEL", "info")
+        if level not in ("trace", "debug", "info"):
+            level = "info"
+        gpu_logging = {
+            "SIRIUS_LOG_BACKEND": "spdlog",
+            "SIRIUS_LOG_LEVEL": level,
+            "SIRIUS_LOG_DIR": str(directory / "log_dir"),
+        }
+        child_env.update(gpu_logging)
+        print(
+            f"GPU audit logging: backend=spdlog level={level} directory={gpu_logging['SIRIUS_LOG_DIR']}",
+            flush=True,
+        )
     metadata.update(
         {
             "schema_version": 2,
@@ -302,6 +315,7 @@ def supervise(args, directory, config_path, validate, references, compression_pl
                 "in-memory-until-validation" if validate else "discard-after-fetch"
             ),
             "gpu_fallback": "disabled",
+            "gpu_audit_logging": gpu_logging,
         }
     )
     write_json(metadata_path, metadata)
@@ -324,6 +338,7 @@ def supervise(args, directory, config_path, validate, references, compression_pl
             [sys.executable, str(Path(__file__).resolve()), str(spec_path)],
             timeout=args.run_timeout or None,
             check=False,
+            env=child_env,
         )
         status = child.returncode
         if status:
@@ -339,6 +354,8 @@ def supervise(args, directory, config_path, validate, references, compression_pl
         status = 130
         termination = "interrupted"
     # The child has exited, so even buffered log records are now available.
+    # Attribute partial logs on failure too, to retain diagnostics for failed runs.
+    split_keyed_logs(directory)
     if status == 0 and not audit_gpu_execution(directory):
         status = 1
         termination = "gpu_execution_unverified"
@@ -363,7 +380,6 @@ def audit_gpu_execution(directory):
     with the worker's successful request and verified fallback policy certifies it.
     Run in the supervisor after child exit, outside all benchmark measurements.
     """
-    split_keyed_logs(directory)
     path = directory / "csv" / "concurrent_runtimes.csv"
     with path.open(newline="") as source:
         records = list(csv.DictReader(source))
@@ -892,7 +908,6 @@ def run(spec):
         raise RuntimeError(
             "input files changed during the benchmark; results are invalid"
         )
-    split_keyed_logs(directory)
     if capture:
         # Write actual measured rows after timing; unique paths retain every execution.
         for (engine, stream, q, iteration), rows in captures.items():

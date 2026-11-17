@@ -159,9 +159,14 @@ All GPU worker connections disable CPU fallback so failed GPU work cannot silent
 successful CPU measurement. Workers verify that policy before the start barrier. After the child
 exits and logs flush, the supervisor requires an attributed successful GPU execution window for
 each successful measured GPU request. A cleanup window alone does not certify SQL success.
-Missing evidence (including CPU execution with `SIRIUS_DISABLE=1`, disabled logging, or a
-non-file log backend) fails the run and marks those requests as errors. Use the spdlog file
-backend at info level or more verbose for concurrent GPU runs.
+Before launching the child, the supervisor sets its `SIRIUS_LOG_BACKEND=spdlog` and
+`SIRIUS_LOG_DIR` to the run's `log_dir/`. It preserves `SIRIUS_LOG_LEVEL=trace/debug/info`
+and replaces less verbose levels with `info`, so the audit has the required evidence from
+startup. These overrides apply only to the GPU benchmark child; CPU-only runs and the caller's
+logging environment are unchanged. Effective values are recorded in `metadata.json` under
+`gpu_audit_logging`. Log attribution runs once in the supervisor, after child exit, outside the
+child's `--run-timeout`. Missing evidence (including CPU execution with `SIRIUS_DISABLE=1`)
+still fails the run and marks those requests as errors.
 
 `SIRIUS_PRE_SQL` is rejected by the concurrent runner with `--engine gpu/both`, including
 single-client cooperative runs: worker sessions do not inherit root session options, and
