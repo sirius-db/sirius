@@ -556,8 +556,9 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
     CHECK(gpu.memory_capacity == capacity);
     CHECK(gpu.reservation_limit_fraction == 0.7);
     CHECK(config.get_operator_params().scan_task_batch_size == capacity / 40);
+    // The hash-table cap, 8x the 32 MiB partition, is above four scan batches.
     CHECK(config.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
-          4 * (capacity / 40));
+          8 * (32ULL << 20));
     CHECK(config.get_operator_params().hash_partition_bytes == (32ULL << 20));
   }
   SECTION("oversized byte limits fail resolution with source context")
@@ -589,7 +590,7 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
   }
 }
 
-TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
+TEST_CASE("dynamic-filter Bloom budget follows resolved scan size and hash-table cap",
           "[context_config][config][dynamic_filter]")
 {
   cucascade::memory::topology_discovery discovery;
@@ -603,7 +604,9 @@ TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
     params["scan_task_batch_size"] = scan_bytes;
     auto const parsed              = sirius::parsed_sirius_config::from_node(root);
     auto const resolved            = parsed.resolve(discovery.get_topology());
-    auto const expected            = scan_bytes > max_bytes / 4 ? max_bytes : 4 * scan_bytes;
+    auto const scan_term           = scan_bytes > max_bytes / 4 ? max_bytes : 4 * scan_bytes;
+    auto const expected =
+      std::max(scan_term, resolved.get_operator_params().max_build_hash_table_bytes);
     CHECK(resolved.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() == expected);
 
     // Resolution is repeatable and does not mutate the parsed settings.
@@ -613,5 +616,6 @@ TEST_CASE("dynamic-filter Bloom budget always follows resolved scan size",
   }
   params["max_dynamic_filter_bloom_bytes_per_gpu"] = "17MiB";
   CHECK_THROWS_WITH(sirius::parsed_sirius_config::from_node(root),
-                    Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size"));
+                    Catch::Matchers::ContainsSubstring(
+                      "derived from scan_task_batch_size and max_build_hash_table_bytes"));
 }

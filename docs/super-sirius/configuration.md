@@ -757,9 +757,14 @@ default is narrowed to
 An explicit value for either budget overrides its default. `SET hash_partition_bytes`
 does not re-derive either budget; `RESET` restores each registered startup default.
 
-The per-GPU dynamic-filter Bloom budget is always **4× the query's
-`scan_task_batch_size`**, including YAML scan-size overrides and internal test
-settings. Multiplication saturates at the maximum unsigned 64-bit byte count.
+The per-GPU dynamic-filter Bloom budget is the larger of **4× the query's
+`scan_task_batch_size`** and the query's **`max_build_hash_table_bytes`**, both read
+at planning, including YAML overrides, `SET`, and internal test settings. It caps the
+sum of one join's aligned Bloom arrays on each GPU for every build, single-partition,
+multi-partition, or right-family; a join whose Bloom arrays exceed it gets no Bloom
+filter (`bloom_cap`). With `max_build_hash_table_bytes` at 0 the budget is the scan
+term alone. The multiplication saturates at the maximum unsigned 64-bit byte count.
+Fixed-size Bloom filters of a cross-rank merge are exempt.
 The budget is engine-owned: `max_dynamic_filter_bloom_bytes_per_gpu` is no longer
 accepted in YAML or registered as a SQL setting. Remove the old key from existing
 configs. Use `enable_dynamic_filter: false` to disable dynamic filters.
@@ -773,7 +778,7 @@ configs. Use `enable_dynamic_filter: false` to disable dynamic filters.
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
-| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
+| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. Also the floor of the per-GPU dynamic-filter Bloom budget. |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
@@ -1072,7 +1077,7 @@ SET enable_compressed_materialization = false;
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |
+| `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B); also the floor of the per-GPU dynamic-filter Bloom budget |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build payload kept GPU-resident by a BUILD_PROBE join |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |

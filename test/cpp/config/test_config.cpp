@@ -20,6 +20,7 @@
 
 #include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -63,7 +64,7 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_hash_table_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_probe_resident_bytes == 8 * config::DEFAULT_BATCH_SIZE);
-  CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * params.scan_task_batch_size);
+  CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == params.max_build_hash_table_bytes);
 }
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")
@@ -838,7 +839,7 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("the dynamic-filter Bloom budget stays derived from the scan batch size",
+TEST_CASE("the dynamic-filter Bloom budget stays derived from the operator parameters",
           "[config_opt][dynamic_filter]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_multi.yaml";
@@ -850,19 +851,54 @@ TEST_CASE("the dynamic-filter Bloom budget stays derived from the scan batch siz
   }
 
   sirius_config cfg;
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
-        4 * cfg.get_operator_params().scan_task_batch_size);
+  auto const derived = [&cfg] {
+    auto const& params = cfg.get_operator_params();
+    return std::max(4 * params.scan_task_batch_size, params.max_build_hash_table_bytes);
+  };
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() == derived());
   cfg.load_from_file(path);
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
-        4 * cfg.get_operator_params().scan_task_batch_size);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() == derived());
   CHECK(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
   cfg.apply_defaults();
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() ==
-        4 * cfg.get_operator_params().scan_task_batch_size);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu() == derived());
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST_CASE(
+  "the dynamic-filter Bloom budget is the larger of four scan batches and the hash-table cap",
+  "[config_opt][dynamic_filter]")
+{
+  constexpr std::uint64_t mib = std::uint64_t{1} << 20;
+  operator_params params;
+
+  SECTION("the scan term wins")
+  {
+    params.scan_task_batch_size       = 8 * mib;
+    params.max_build_hash_table_bytes = 16 * mib;
+    CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 32 * mib);
+  }
+  SECTION("the hash-table cap wins")
+  {
+    params.scan_task_batch_size       = 8 * mib;
+    params.max_build_hash_table_bytes = 64 * mib;
+    CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 64 * mib);
+  }
+  SECTION("a zero hash-table cap leaves the scan term")
+  {
+    params.scan_task_batch_size       = 8 * mib;
+    params.max_build_hash_table_bytes = 0;
+    CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 32 * mib);
+  }
+  SECTION("the scan term saturates")
+  {
+    params.scan_task_batch_size       = std::numeric_limits<std::uint64_t>::max() / 2;
+    params.max_build_hash_table_bytes = 64 * mib;
+    CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() ==
+          std::numeric_limits<std::uint64_t>::max());
+  }
 }
 
 TEST_CASE("the dynamic-filter Bloom budget rejects YAML overrides", "[config_opt][dynamic_filter]")
@@ -879,7 +915,8 @@ TEST_CASE("the dynamic-filter Bloom budget rejects YAML overrides", "[config_opt
   sirius_config cfg;
   // The message names no retired option.
   CHECK_THROWS_WITH(cfg.load_from_file(path),
-                    Catch::Matchers::ContainsSubstring("always 4x scan_task_batch_size") &&
+                    Catch::Matchers::ContainsSubstring(
+                      "derived from scan_task_batch_size and max_build_hash_table_bytes") &&
                       !Catch::Matchers::ContainsSubstring("multi_partition"));
   std::error_code ec;
   std::filesystem::remove(path, ec);
