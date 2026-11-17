@@ -25,8 +25,10 @@ inline const operator_params& operator_defaults()
 }  // namespace detail
 
 /// `sirius.operator_params`: operator sizing and planning policy. Options a DuckDB SET overrides
-/// per connection are scope query; the file value is where a connection starts. The settings
-/// SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
+/// per connection are scope query; the file value is where a connection starts. The planner
+/// switches SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only; the batch sizes
+/// it guards the same way are not, as every derived batch size must be written for an effective
+/// configuration to resolve alike.
 struct operator_options : block_base<operator_options> {
   static const operator_params& defaults() { return detail::operator_defaults(); }
 
@@ -101,7 +103,7 @@ struct operator_options : block_base<operator_options> {
   // -- batch and partition sizes. Unset sizes derive from the GPU memory when the configuration
   // is resolved (max_build_hash_table_bytes from hash_partition_bytes).
   config_option<ubytes> scan_task_batch_size =
-    option<ubytes>("scan_task_batch_size").for_developers().validate(positive<ubytes>{}).build();
+    option<ubytes>("scan_task_batch_size").validate(positive<ubytes>{}).build();
   /// 0 = max_sort_partition_memory_fraction of the GPU memory.
   config_option<ubytes> max_sort_partition_bytes =
     option<ubytes>("max_sort_partition_bytes")
@@ -118,10 +120,8 @@ struct operator_options : block_base<operator_options> {
                                                  .validate(positive<ubytes>{})
                                                  .scope(option_scope::query)
                                                  .build();
-  config_option<ubytes> concat_batch_bytes =
-    option<ubytes>("concat_batch_bytes").for_developers().build();
-  config_option<ubytes> cross_join_task_bytes =
-    option<ubytes>("cross_join_task_bytes").for_developers().build();
+  config_option<ubytes> concat_batch_bytes    = option<ubytes>("concat_batch_bytes").build();
+  config_option<ubytes> cross_join_task_bytes = option<ubytes>("cross_join_task_bytes").build();
   config_option<ubytes> sort_sample_bytes =
     option<ubytes>("sort_sample_bytes").scope(option_scope::query).build();
   /// 0 turns BUILD_PROBE off, MARK joins included.

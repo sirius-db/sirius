@@ -51,26 +51,28 @@ Initial host pools target 10% of that node's RAM, capped by the host budget and 
 ### Effective configuration (`~/.sirius/config.yml`)
 
 When Sirius starts without a config file, it writes the configuration it runs with to
-`~/.sirius/config.yml` (replaced on every such start). Every value is spelled out: the
-defaults, and what was derived from this machine — thread and reactor counts, scan budgets, REST
-limits, preparation limits, operator batch sizes, the GPU count, initial host pools. Resolving that
-file again on the same machine runs with the same values. The file is a record and is not on
-the search path above; copy it to `~/.sirius/sirius.yaml` to make those values your configuration.
+`~/.sirius/config.yml` (replaced on every such start, readable by the owner only). Every value is
+spelled out: the defaults, and what was derived from this machine — thread and reactor counts,
+CPU affinities, scan budgets, REST limits, preparation limits, operator batch sizes, the GPU count,
+initial host pools. Resolving that file again on the same machine runs with the same values;
+derived values are this machine's, so the file may not suit another. The file is a record and is
+not on the search path above; copy it to `~/.sirius/sirius.yaml` to make those values your
+configuration.
 
 Developer-only settings (below) are written only by a build with **developer mode** on: configure
 with `-DSIRIUS_DEVELOPER_MODE=ON` (`pixi run cmake -DSIRIUS_DEVELOPER_MODE=ON build/release`, then
-`pixi run make`; the setting stays in the CMake cache). Set `SIRIUS_WRITE_EFFECTIVE_CONFIG=0` to skip writing the file
-(`sirius_unittest` does).
+`pixi run make`; the setting stays in the CMake cache). Left out, they resolve as they did the
+first time. Set `SIRIUS_WRITE_EFFECTIVE_CONFIG` to `0`, `false`, `off` or `no` to skip writing the
+file (`sirius_unittest` does).
 
 Developer-only settings: `sirius.space`, `sirius.executor.scan_manager.{rest, rest.tls, uring,
-preparation}`, and the `operator_params` that SQL exposes only under `SIRIUS_ENABLE_TEST_OPTIONS`
-(`scan_task_batch_size`, `concat_batch_bytes`, `cross_join_task_bytes`, `enable_dynamic_filter`,
-`enable_dynamic_filter_multi_partition`, `enable_dynamic_zone_map_filter`,
-`enable_pinned_zone_map_pruning`, `enable_decimal_sum_stats_bound`, `enable_dense_count_join`,
-`enable_delim_aggregate_reuse`, `enable_exists_minmax_rewrite`,
-`enable_partial_aggregate_below_join`, `enable_subquery_key_carry`,
-`enable_exists_from_aggregate`). They are read in every build; developer mode only decides whether
-the effective configuration shows them.
+preparation}`, and the planner switches that SQL exposes only under `SIRIUS_ENABLE_TEST_OPTIONS`
+(`enable_dynamic_filter`, `enable_dynamic_filter_multi_partition`,
+`enable_dynamic_zone_map_filter`, `enable_pinned_zone_map_pruning`,
+`enable_decimal_sum_stats_bound`, `enable_dense_count_join`, `enable_delim_aggregate_reuse`,
+`enable_exists_minmax_rewrite`, `enable_partial_aggregate_below_join`,
+`enable_subquery_key_carry`, `enable_exists_from_aggregate`). They are read in every build;
+developer mode only decides whether the effective configuration shows them.
 
 ### Concurrent query admission
 
