@@ -346,7 +346,7 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim CTE
   /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
   /// same. See `reuse_delim_rows_for_subquery_aggregates`.
   bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;

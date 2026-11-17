@@ -148,8 +148,6 @@ bool multiplies_rows(sirius_physical_operator const& node)
     case SiriusPhysicalOperatorType::BLOCKWISE_NL_JOIN:
     case SiriusPhysicalOperatorType::PIECEWISE_MERGE_JOIN:
     case SiriusPhysicalOperatorType::IE_JOIN:
-    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
-    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
     case SiriusPhysicalOperatorType::ASOF_JOIN: return true;
     default: return false;

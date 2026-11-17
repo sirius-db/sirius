@@ -321,7 +321,7 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 - **DuckDB v2 regex rewrites:** Whole-input backreference replacements, including the ClickBench Q28 URL pattern, are rewritten to `regexp_extract(..., 'k')` and currently require CPU fallback instead of using the GPU regex implementation. Tracked in [#2146](https://github.com/sirius-db/sirius/issues/2146).
 

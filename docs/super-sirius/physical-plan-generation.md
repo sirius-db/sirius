@@ -25,12 +25,10 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_CROSS_PRODUCT` | `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
 | `LOGICAL_ANY_JOIN` (INNER only) | `FILTER` over `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
-| `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
 | `LOGICAL_LIMIT` | `STREAMING_LIMIT`, optimized to `UNORDERED_STREAMING_LIMIT` for proven unordered input after GPU expansion | `src/planner/sirius_plan_limit.cpp` |
 | `LOGICAL_CHUNK_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_column_data_get.cpp` |
-| `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |
 | `LOGICAL_MATERIALIZED_CTE` | `CTE` | `src/planner/sirius_plan_cte.cpp` |
 | `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_cte_ref.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
@@ -185,7 +183,6 @@ Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators
 - `add_pipeline_operator()` — add intermediate operator
 - `create_child_pipeline()` — delegate to engine
-- `delim_join_dependencies` — maps scan operators to their delim join producer pipelines
 - `cte_dependencies` — maps CTE scan operators to their materialization pipelines
 - `cte_scan_consumers` — maps CTE scan operators to the pipelines that read them
 
@@ -213,7 +210,7 @@ children[0]->build_pipelines(current, meta_pipeline);  // Probe in current
 state.set_pipeline_source(current, *this);
 ```
 
-**Sink parents** (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN): the base `is_sink()` returns true for any operator whose tree parent is one of these, because the parent consumes each child's output through a repository. The parent therefore only creates its own meta-pipeline and lets each child's `build_pipelines()` terminate the child's pipeline (PARTITION shown; DENSE_COUNT_JOIN applies the same call to its counted and then preserved child):
+**Sink parents** (PARTITION, BUILD_FILTER, DENSE_COUNT_JOIN): the base `is_sink()` returns true for any operator whose tree parent is one of these, because the parent consumes each child's output through a repository. The parent therefore only creates its own meta-pipeline and lets each child's `build_pipelines()` terminate the child's pipeline (PARTITION shown; DENSE_COUNT_JOIN applies the same call to its counted and then preserved child):
 ```
 D_ASSERT(children[0]->is_sink());
 auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -370,7 +367,7 @@ graph LR
     P3 -->|"FULL"| DS["downstream"]
 ```
 
-DENSE_COUNT_JOIN is a sink parent (see [`build_pipelines()` Patterns](#build_pipelines-patterns)), so each direct child terminates its own producer pipeline and feeds one input port through a `FULL` barrier; the counted producer is built first. Each root may itself be a scan, a streaming chain over a scan, `[HASH_JOIN]` (fed by its own CONCAT/PARTITION chains), `[MERGE_GROUP_BY, FILTER]` (a fused merge under a HAVING filter), `[MERGE_SORT]`, or another `[DENSE_COUNT_JOIN]`. Delim-join, materialized-CTE and delim/CTE scan roots are declined at plan time because their output does not arrive through a child-owned pipeline, and a delim join is declined at any depth of an input because the DENSE_COUNT_JOIN task hint can poll a MARK hash join inside the delim subtree before its sizing partitions have run.
+DENSE_COUNT_JOIN is a sink parent (see [`build_pipelines()` Patterns](#build_pipelines-patterns)), so each direct child terminates its own producer pipeline and feeds one input port through a `FULL` barrier; the counted producer is built first. Each root may itself be a scan, a streaming chain over a scan, `[HASH_JOIN]` (fed by its own CONCAT/PARTITION chains), `[MERGE_GROUP_BY, FILTER]` (a fused merge under a HAVING filter), `[MERGE_SORT]`, or another `[DENSE_COUNT_JOIN]`. Materialized-CTE and CTE scan roots are declined at plan time because their output does not arrive through a child-owned pipeline, and a materialized CTE is declined at any depth of an input because the DENSE_COUNT_JOIN task hint can poll a MARK hash join inside that subtree before its sizing partitions have run.
 
 The repository to downstream uses `FULL` barrier (`PARTIAL` is only used when DENSE_COUNT_JOIN feeds the probe-side PARTITION of a HASH_JOIN outside the right family, see `sirius_physical_partition::input_barrier_for`).
 
@@ -409,65 +406,11 @@ graph LR
 
 Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
 
-- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`, `DENSE_COUNT_JOIN`) — multiple inputs or bespoke sink wiring. A streaming operator directly under a sink parent is itself the fusion terminal (e.g. `[MERGE_GROUP_BY, FILTER]` feeding a PARTITION or DENSE_COUNT_JOIN port).
+- **Join / CTE terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `DENSE_COUNT_JOIN`) — multiple inputs or bespoke sink wiring. A streaming operator directly under a sink parent is itself the fusion terminal (e.g. `[MERGE_GROUP_BY, FILTER]` feeding a PARTITION or DENSE_COUNT_JOIN port).
 - **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
-- **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
 - **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
 
 Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
-
-### DELIM_JOIN
-
-Decorrelated correlated-subquery join. Both variants hold two internal operators:
-- `join` — the HASH_JOIN doing the join-back (one child replaced by a cached-data scan)
-- `distinct_root` — the `MERGE_GROUP_BY → PARTITION_DISTINCT → DISTINCT` chain that dedups the correlated key for the subquery's DELIM_SCANs (`distinct` is a non-owning borrow of the bottom DISTINCT)
-
-The delim join is a **fan-out sink that performs no data transformation**: `execute()` is a pass-through, and its base `sink()` forwards each input batch unchanged to two branch pipelines — the DISTINCT branch and the join-feeding branch (`partition_join` for RIGHT, `column_data_scan` for LEFT). It owns the fan-out (two `next_port_after_sink` edges) and anchors the construct (the `distinct` / `join` / `column_data_scan` / `delim_scans` pointers and the DELIM_SCAN dependency); the dedup and the join happen in the sub-operators.
-
-#### RIGHT_DELIM_JOIN
-
-Ctor: extract the RHS from the internal join, replace it with a `dummy_scan` placeholder; the RHS becomes `children[0]`. `wrap_join` wraps the build side as `CONCAT_build → PARTITION_build → DUMMY_SCAN`, and `partition_join` points at that PARTITION_build. With intermediate operators before the delim join (`operators.size() > 0`), a pipeline breaker is inserted:
-
-```mermaid
-graph LR
-    PP["Pipeline Pre<br/>[source, ..., last_op]"] -->|"FULL"| PD["Pipeline Delim<br/>[RIGHT_DELIM_JOIN]"]
-    PD -.->|"FULL (partition_join)"| CP["Concat Pipeline<br/>[CONCAT]"]
-    PD -.->|"FULL (distinct)"| PDP["PD Pipeline<br/>[PARTITION]"]
-    CP -->|"FULL, 'build'"| PR["Probe Pipeline<br/>(at internal HASH_JOIN)"]
-    PDP -->|"FULL"| MR["Merge Pipeline<br/>[MERGE_GROUP_BY]"]
-    MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
-```
-
-With no intermediate operators, no breaker is needed — RIGHT_DELIM_JOIN is the current pipeline's sink directly.
-
-- `partition_join` (PARTITION_build) is a single-op pipeline fed by the fan-out; its build CONCAT feeds the HASH_JOIN `"build"` port.
-- Delim wrapping explicitly binds the internal join's inputs so its build (distinct) side drives the partition count; conversion does not infer the role from tree ancestry.
-
-#### LEFT_DELIM_JOIN
-
-Ctor: extract the LHS from the internal join, replace it with a `column_data_scan`; the LHS becomes `children[0]`. No breaker and no partition_join/concat pair.
-
-```mermaid
-graph LR
-    PM["Pipeline Main<br/>[source, ..., LEFT_DELIM_JOIN]"] -.->|"FULL (column_data_scan)"| DW["Downstream<br/>(probe pipeline reads cached LHS data)"]
-    PM -.->|"FULL (distinct)"| PDP["PD Pipeline<br/>[PARTITION]"]
-    PDP -->|"FULL"| MR["Merge Pipeline<br/>[MERGE_GROUP_BY]"]
-    MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
-```
-
-- `column_data_scan` is the source of the join's probe pipeline (`[column_data_scan, HASH_JOIN, ..., outer_sink]`), fed by the fan-out.
-- The internal HASH_JOIN's build side (the subquery) gets standard build splitting via `join->build_pipelines()`.
-
-#### Key Differences
-
-| Aspect | RIGHT_DELIM_JOIN | LEFT_DELIM_JOIN |
-|--------|-----------------|-----------------|
-| Side eliminated | RHS | LHS |
-| Internal join child replaced | RHS → `dummy_scan` | LHS → `column_data_scan` |
-| Pipeline breaker | Yes (if intermediate ops exist) | Never |
-| Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build handling (correlated subquery) |
-| Inner-join build subtree | CONCAT_build → PARTITION_build (`partition_join`) → DUMMY_SCAN placeholder; `partition_join` is a framework-scheduled pipeline fed by the fan-out | Real correlated-subquery subtree under CONCAT_build |
-| Cached data scan | N/A | `column_data_scan` feeds probe side |
 
 ## Part 4: Port Wiring
 

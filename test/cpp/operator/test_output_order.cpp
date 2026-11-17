@@ -15,7 +15,6 @@
  */
 
 #include "helper/type_conversions.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_limit.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -55,7 +54,6 @@ class order_node : public sirius_physical_operator {
 
 static_assert(std::is_abstract_v<sirius_physical_operator>);
 static_assert(std::is_abstract_v<sirius::op::sirius_physical_partition_consumer_operator>);
-static_assert(std::is_abstract_v<sirius::op::sirius_physical_delim_join>);
 static_assert(std::is_abstract_v<sirius::op::sirius_physical_result_collector>);
 }  // namespace
 

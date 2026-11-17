@@ -308,7 +308,7 @@ is why those modes are withheld outright.
 | anchors | `GPU_SCAN`; `GPU_VALUES` (also covers `COLUMN_DATA_SCAN`, `DUMMY_SCAN`, `EMPTY_RESULT`, rewritten to it at plan generation); any finished pipeline |
 | pass-through (recurse) | any single-ingress pipeline — `FILTER`, `PROJECTION`, sorts, aggregates, `CONCAT`, `PARTITION` |
 | fan-in | `HASH_JOIN` (INNER/LEFT/SEMI/ANTI/MARK) in **BUILD_PROBE mode only** |
-| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, delim joins, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary); any unfinished pipeline holding a `STREAMING_LIMIT`; `HASH_JOIN` in STANDARD or MIXED_JOIN mode |
+| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary); any unfinished pipeline holding a `STREAMING_LIMIT`; `HASH_JOIN` in STANDARD or MIXED_JOIN mode |
 
 Because the estimator works at pipeline granularity, single-input operators need no per-operator
 model: a pipeline's ratio is measured end-to-end, so whatever a projection or filter does to byte
@@ -339,7 +339,7 @@ sizes from an estimated total. It still waits if no estimate is available.
 `PARTITION → MERGE_GROUP_BY` remains `FULL`.
 
 Estimated totals are floored at the bytes already received. The feature is enabled only on the
-grouped-aggregation partition, so delim-join partitions retain their existing barrier.
+grouped-aggregation partition; every other partition keeps its barrier.
 
 ## Observability
 

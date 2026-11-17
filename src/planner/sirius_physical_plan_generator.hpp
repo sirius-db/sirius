@@ -54,7 +54,6 @@ class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
 class LogicalCopyToFile;
-class LogicalDelimGet;
 class LogicalDistinct;
 class LogicalDummyScan;
 class LogicalEmptyResult;
@@ -79,10 +78,9 @@ namespace sirius::planner {
 /// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: the outer
 /// rows become a CTE, LEFT JOINed against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery over `t`
 /// restricted to the CTE's distinct keys, plus a filter. Operators above that read the outer rows'
-/// columns are repointed to the CTE's scan. Subqueries DuckDB left as plain SEMI
-/// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
-/// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
-/// number of subqueries rewritten.
+/// columns are repointed to the CTE's scan. Subqueries over a table pinned in GPU memory are merged
+/// only when their SEMI or ANTI joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges
+/// them regardless. Returns the number of subqueries rewritten.
 std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
                                                  duckdb::Binder& binder,
                                                  duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
@@ -193,7 +191,6 @@ class sirius_physical_plan_generator {
     duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDistinct& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalDummyScan& expr);
@@ -254,8 +251,6 @@ class sirius_physical_plan_generator {
   // plan_asof_join(duckdb::LogicalComparisonJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_comparison_join(
     duckdb::LogicalComparisonJoin& op);
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
-    duckdb::LogicalComparisonJoin& op);
   //! Lowers distinct EXCEPT / INTERSECT to full-row deduplication over a null-safe ANTI / SEMI hash
   //! join, and their ALL forms to tag, UNION ALL, per-group tag sums, and
   //! `sirius_physical_replicate`.
@@ -311,7 +306,6 @@ class sirius_physical_plan_generator {
   //! plan was not captured with proofs; then no read is treated as restrictable.
   std::shared_ptr<delim_cte_proofs const> cte_reader_proofs;
 
-  std::size_t delim_index = 0;
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t next_scan_node_id = 0;
   scan_contract_provenance contract_provenance;
