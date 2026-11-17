@@ -1645,9 +1645,11 @@ TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
 TEST_CASE("metadata worker YAML records explicit counts even when equal to default",
           "[config][metadata_worker_defaults]")
 {
-  auto explicit_count = GENERATE(false, true);
+  auto mode           = GENERATE(0, 1, 2);  // Omitted, null, or explicitly equal to the default.
+  bool explicit_count = mode == 2;
   auto initial        = sirius::scan_manager::default_scan_manager_num_threads();
   auto body           = explicit_count ? "      num_threads: " + std::to_string(initial) + "\n"
+                        : mode == 1    ? "      num_threads: null\n"
                                        : "      backend: sirius\n";
   scoped_yaml yaml("sirius_metadata_worker_defaults.yaml", scan_manager_yaml(body));
   auto parsed        = sirius::parsed_sirius_config::from_file(yaml.path());

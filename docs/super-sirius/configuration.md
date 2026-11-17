@@ -1343,8 +1343,8 @@ is the bound.
 ### Metadata worker NUMA placement and asynchronous Parquet preparation
 
 The existing `scan_manager.num_threads` budget is divided across eligible NUMA domains
-associated with configured GPUs. When `num_threads` is omitted, its initial default is
-`max(4, hardware_concurrency() - 10)`; after discovering eligible domains, initialization
+associated with configured GPUs. When `num_threads` is omitted or null, its initial default
+is 18; after discovering eligible domains, initialization
 raises that default if necessary to provide at least one worker per domain. An explicitly
 supplied value is never raised: initialization rejects it when it cannot cover all eligible
 domains. Each worker binds once, before accepting work; there is no per-operation affinity
@@ -1382,9 +1382,9 @@ lazily). Setting that value to zero instead starts one coordinator thread per as
 or reader attempt. Native reads use their own `preparation.native_reader_workers` pool
 (two workers by default, started lazily). Each uring or REST reactor is another worker;
 reactor counts are per IO context. These workers are additional to pipeline, task-creator
-and downgrade threads. The automatic metadata-worker sizing formula reserves the default
-pipeline, task-creator, downgrade and uring workers; it is not a total process thread cap
-and does not subtract coordinator, native-reader or additional IO-context workers.
+and downgrade threads. Pool defaults are independently sized and capped; the scan-manager
+default of 18 is not a total process thread cap and does not subtract coordinator, native-reader
+or additional IO-context workers.
 
 Completed coalescing operations are consumed in rotating source order, with at most one
 completion per control turn. This prevents a repeatedly ready first source from bypassing
