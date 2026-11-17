@@ -377,7 +377,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
-| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
+| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -1348,16 +1348,28 @@ is 18; after discovering eligible domains, initialization
 raises that default if necessary to provide at least one worker per domain. An explicitly
 supplied value is never raised: initialization rejects it when it cannot cover all eligible
 domains. Each worker binds once, before accepting work; there is no per-operation affinity
-guard or extra coalescing pool. CPU sets intersect GPU topology, the cgroup v2 effective
-CPU allowance, and an explicit `scan_manager.cpu_affinity` when supplied. Discovery resolves
-the cgroup2 mount from `/proc/self/mountinfo` and walks from membership toward that
-mount root to find the nearest effective cpuset when a leaf has no cpuset controller files. A caller's
-incidental DuckDB thread affinity does not define this allowance. To restrict scan workers,
-use the explicit affinity configuration or a deployment cpuset; `taskset` on the caller alone
-is not a worker placement policy. Without readable cgroup v2 allowance the caller's affinity
-is the fallback, with a warning. Missing eligible GPU-local topology uses the allowed CPUs
-and reports that fallback rather than claiming locality. An empty CPU intersection fails
-initialization.
+guard or extra coalescing pool. cuCascade discovers the rank's main-thread CPU affinity
+and its effective cgroup v2 CPU allowance. Configuration resolution saves their intersection
+as the startup CPU boundary shared by metadata placement, worker startup and lazy REST and
+exchange construction. GPU-local CPU sets and explicit pool affinity may narrow this boundary;
+they cannot expand it. Reserved REST-reactor CPUs remain excluded from worker pools, subject
+to the documented explicit-affinity fallback.
+
+A `taskset` or `numactl --cpunodebind` launch is honored through the main thread's mask, even
+when several ranks share a broader cgroup. A later single-CPU DuckDB worker mask does not
+replace that boundary. Capture occurs at engine configuration resolution: the embedder must
+preserve the launch mask on the main thread until then. Changing the main thread's affinity
+before capture changes the boundary; this mechanism cannot reconstruct historical launch
+settings. Native/coordinator workers start lazily from the saved mask, and each startup scope
+restores its caller's previous affinity on success and failure without changing CUDA/TLS state.
+
+cuCascade resolves cgroup2 mount roots and inherited effective cpusets. If cgroup discovery is
+unavailable, it retains the main-thread affinity with a diagnostic. If the main thread's mask
+cannot be read, it falls back to caller affinity with a diagnostic. A known empty intersection
+fails initialization; no broader mask is substituted. Missing GPU-local topology uses the
+permitted CPU boundary and reports the locality fallback. CPU restrictions do not select GPUs
+or change memory-binding policy, and ranks sharing a socket are not automatically assigned
+exclusive CPU or memory shares.
 
 Each preparation source selects a stable worker domain from the query's eligible GPU
 domains. A manager-wide cursor rotates the starting domain across queries, including

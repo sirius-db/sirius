@@ -16,6 +16,8 @@
 
 #include "scan_manager/coordinator_pool.hpp"
 
+#include "exec/thread_util.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -119,7 +121,8 @@ struct coordinator_pool::state {
 };
 thread_local coordinator_pool::state* coordinator_pool::state::current_worker = nullptr;
 
-coordinator_pool::coordinator_pool(size_t workers) : state_(std::make_shared<state>(workers))
+coordinator_pool::coordinator_pool(size_t workers, std::vector<int> cpu_affinity)
+  : cpu_affinity_(std::move(cpu_affinity)), state_(std::make_shared<state>(workers))
 {
   workers_.reserve(workers);
 }
@@ -128,6 +131,7 @@ coordinator_pool::~coordinator_pool() { stop(); }
 void coordinator_pool::start_workers()
 {
   if (!workers_.empty()) return;
+  exec::thread_util::scoped_thread_affinity affinity(cpu_affinity_);
   try {
     for (size_t i = 0; i < state_->worker_count; ++i) {
       if (before_thread_) before_thread_(i);

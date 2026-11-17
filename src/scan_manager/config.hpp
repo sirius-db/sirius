@@ -262,12 +262,12 @@ struct scan_manager_config {
   /// interrupts and the reactors.  No effect when the reactors run unpinned.
   bool reserve_rest_reactor_cpus{true};
 
-  /// Engine-owned (not YAML): the CPU mask REST contexts are built and started
-  /// from, set to the configuring thread's affinity when the reactor CPUs are
-  /// reserved.  A routed REST context built lazily on a pool thread (whose mask
-  /// excludes the reserved CPUs) is built on a helper thread with this mask, so
-  /// it plans and pins exactly as at startup.  Empty: the caller's own mask.
-  std::vector<int> rest_placement_cpus;
+  /// Engine-owned rank CPU boundary, sampled from the main-thread affinity and cgroup
+  /// allowance at configuration resolution. Used by metadata and lazy I/O/control startup.
+  std::vector<int> startup_cpus;
+  /// Default CPU mask for lazy control/native workers, excluding reserved reactor CPUs.
+  /// Independent of the metadata pool's explicit cpu_affinity override.
+  std::vector<int> worker_startup_cpus;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:

@@ -743,7 +743,7 @@ TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reac
                              "        pin_to_irq_cpus: false\n");
   CHECK(unpinned.get_rest_reactor_cpus().empty());
   for (auto const& affinity : pool_affinities(unpinned)) {
-    CHECK(affinity.empty());
+    CHECK(affinity == unpinned.get_startup_cpus());
   }
 
   // The switch off: nothing reserved even where the reactors would pin.
@@ -765,11 +765,11 @@ TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reac
   });
   if (planned.empty() || !room) {
     CHECK(on.get_rest_reactor_cpus().empty());
-    CHECK(on.get_scan_manager_config().rest_placement_cpus.empty());
+    CHECK(on.get_scan_manager_config().startup_cpus == on.get_startup_cpus());
   } else {
     CHECK(on.get_rest_reactor_cpus() == planned);
     // REST contexts built later, from restricted pool threads, plan from the configuring mask.
-    CHECK(on.get_scan_manager_config().rest_placement_cpus == allowed);
+    CHECK(on.get_scan_manager_config().startup_cpus == on.get_startup_cpus());
     for (auto const& affinity : pool_affinities(on)) {
       CHECK_FALSE(affinity.empty());
       for (int const cpu : planned) {

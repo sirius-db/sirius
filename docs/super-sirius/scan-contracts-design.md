@@ -307,3 +307,13 @@ callbacks on the submitting coordinator. Completed operations are consumed in ro
 order, at most one per control turn; a repeatedly ready source cannot continually bypass another
 ready completion. These policies do not preempt running reads or bound shared admission delay.
 See configuration for CPU allowance, fallback rules and separate worker-thread budgets.
+
+### Shared startup CPU boundary
+
+CPU-allowance discovery belongs to cuCascade, separately from hardware topology. Sirius saves
+the intersection of the main-thread mask and deployment allowance when configuration resolves.
+Metadata domains, pool affinity and lazy I/O/control/exchange startup use that snapshot rather
+than rediscovering a boundary from whichever DuckDB worker makes the call. Explicit pool masks
+can narrow the snapshot, and REST-reactor reservations further restrict worker CPUs. Temporary
+startup scopes preserve the caller's CUDA/thread-local context and restore CPU affinity; they
+do not move coalescing back to the query owner or change memory policy.

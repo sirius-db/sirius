@@ -63,6 +63,7 @@
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
+#include <cucascade/memory/cpu_constraints.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/error_data.hpp>
@@ -1418,22 +1419,39 @@ sirius_scan_manager::sirius_scan_manager(
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
   : _query_lifecycle(lifecycle),
-    _config(validate_scan_manager_config(config)),
+    _config([&] {
+      auto resolved = validate_scan_manager_config(config);
+      if (resolved.startup_cpus.empty())
+        resolved.startup_cpus = cucascade::memory::discover_cpu_constraints().allowed_cpus;
+      auto& pool_cpus = resolved.thread_pool.cpu_affinity_list;
+      pool_cpus       = pool_cpus.empty()
+                          ? resolved.startup_cpus
+                          : cucascade::memory::intersect_cpu_affinity(pool_cpus, resolved.startup_cpus);
+      if (pool_cpus.empty())
+        throw std::invalid_argument("scan workers have no CPUs within the rank boundary");
+      resolved.worker_startup_cpus = resolved.worker_startup_cpus.empty()
+                                       ? resolved.startup_cpus
+                                       : cucascade::memory::intersect_cpu_affinity(
+                                           resolved.worker_startup_cpus, resolved.startup_cpus);
+      if (resolved.worker_startup_cpus.empty())
+        throw std::invalid_argument("scan control workers have no CPUs within the rank boundary");
+      return resolved;
+    }()),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
     _metadata_placement(
-      _topology_index
-        ? resolve_metadata_placement(*_topology_index, metadata_allowed_cpus(), _config)
-        : throw std::invalid_argument("scan manager requires topology")),
+      _topology_index ? resolve_metadata_placement(*_topology_index, _config.startup_cpus, _config)
+                      : throw std::invalid_argument("scan manager requires topology")),
     _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  {},
                  nullptr,
                  _metadata_placement.cpus),
     _native_readers(_config.preparation.resolved_native_workers(),
-                    _config.preparation.resolved_native_readers()),
-    _coordinators(_config.preparation.resolved_coordinator_workers()),
+                    _config.preparation.resolved_native_readers(),
+                    _config.worker_startup_cpus),
+    _coordinators(_config.preparation.resolved_coordinator_workers(), _config.worker_startup_cpus),
     _ioctx_registry(_config.to_io_config(), reservation_manager)
 {
   if (!_topology_index) {
@@ -2187,10 +2205,12 @@ std::unique_ptr<preparation_coordinator> sirius_scan_manager::make_preparation_c
   // first permitted manager domain, even when it is remote from the query's GPUs.
   if (domains.empty()) domains.push_back(0);
   rotate_metadata_domains(domains, _next_metadata_domain);
+  auto options                 = state.preparation;
+  options.control_cpu_affinity = _config.worker_startup_cpus;
   return std::make_unique<preparation_coordinator>(
     *state.completion,
     *state.dispatcher,
-    state.preparation,
+    std::move(options),
     &_native_readers,
     _config.preparation.resolved_coordinator_workers() ? &_coordinators : nullptr,
     std::move(domains));
@@ -2484,8 +2504,9 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // inherit it. First use may come from a pool thread whose mask excludes the CPUs reserved for
   // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
   // reservation was planned from.
-  if (type == cucascade::io::io_context_type::restful && !_config.rest_placement_cpus.empty()) {
-    exec::run_with_affinity(_config.rest_placement_cpus, build_and_start);
+  if (type == cucascade::io::io_context_type::restful && !_config.startup_cpus.empty()) {
+    exec::thread_util::scoped_thread_affinity affinity(_config.startup_cpus);
+    build_and_start();
   } else {
     build_and_start();
   }

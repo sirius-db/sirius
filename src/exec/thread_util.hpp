@@ -30,14 +30,14 @@ namespace thread_util = cucascade::exec::thread_util;
 /// Run @p work to completion on a new thread whose affinity is @p cpus, then rethrow what it
 /// threw.  Threads @p work starts inherit @p cpus; the caller's own mask is untouched.  Lets a
 /// thread restricted to a subset of CPUs build something that must plan from a wider mask.
-/// Should the mask not apply, @p work still runs, from the caller's mask.
+/// Throws before user work if the requested nonempty mask cannot be applied exactly.
 template <typename F>
 void run_with_affinity(std::span<int const> cpus, F&& work)
 {
   std::exception_ptr error;
   std::thread runner([&] {
-    std::ignore = thread_util::set_current_thread_affinity(cpus);
     try {
+      thread_util::scoped_thread_affinity affinity(cpus);
       work();
     } catch (...) {
       error = std::current_exception();

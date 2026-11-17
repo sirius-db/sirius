@@ -189,3 +189,31 @@ TEST_CASE("run_with_affinity runs work under the given mask and rethrows", "[exe
     sirius::exec::run_with_affinity(allowed, [] { throw std::runtime_error("build failed"); }),
     "build failed");
 }
+
+TEST_CASE("startup affinity scopes restore the caller after success and failure",
+          "[exec][thread_util][startup_affinity]")
+{
+  auto before = get_current_thread_affinity();
+  REQUIRE_FALSE(before.empty());
+  auto narrow = std::vector<int>{before.front()};
+  {
+    scoped_thread_affinity outer(narrow);
+    CHECK(get_current_thread_affinity() == narrow);
+    CHECK_THROWS_WITH(
+      [&] {
+        scoped_thread_affinity inner(before);
+        CHECK(get_current_thread_affinity() == before);
+        throw std::runtime_error("startup failed");
+      }(),
+      "startup failed");
+    CHECK(get_current_thread_affinity() == narrow);
+  }
+  CHECK(get_current_thread_affinity() == before);
+  CHECK_THROWS_AS(scoped_thread_affinity(std::vector<int>{CPU_SETSIZE}), std::invalid_argument);
+  bool ran = false;
+  CHECK_THROWS_AS(
+    sirius::exec::run_with_affinity(std::vector<int>{CPU_SETSIZE}, [&] { ran = true; }),
+    std::invalid_argument);
+  CHECK_FALSE(ran);
+  CHECK(get_current_thread_affinity() == before);
+}

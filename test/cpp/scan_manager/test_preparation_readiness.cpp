@@ -3855,3 +3855,32 @@ TEST_CASE("rejected routed metadata handoff commits its error before reader canc
   CHECK(out->close_calls == 1);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
+
+TEST_CASE("fallback control runner uses the saved startup mask",
+          "[coordinator][async_coalescing][startup_affinity]")
+{
+  using namespace sirius::exec::thread_util;
+  auto cpus = get_current_thread_affinity();
+  REQUIRE_FALSE(cpus.empty());
+  preparation_options options{2, 4, 8, 1};
+  options.control_cpu_affinity = cpus;
+  fixture f(2, 4, k_interrupt_check_interval, options);
+  std::vector<int> control_cpus;
+  f.coordinator.before_control_step_for_testing([&] {
+    if (control_cpus.empty()) control_cpus = get_current_thread_affinity();
+  });
+  auto out = std::make_shared<sink>();
+  f.source(std::make_shared<worker_accumulator>(1), out, single_job([] {
+             return std::make_unique<tagged>(1);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start([&] {
+    if (!set_current_thread_affinity(std::vector<int>{cpus.front()}))
+      throw std::runtime_error("cannot restrict query owner");
+  });
+  REQUIRE(out->await(1));
+  out->consume();
+  f.finish();
+  CHECK(control_cpus == cpus);
+  CHECK_FALSE(f.completion.has_error());
+}
