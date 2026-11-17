@@ -182,13 +182,16 @@ delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = oute
 Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
 
 ```
-FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projection map: the original columns)
-         NOT EXISTS: (that) IS NULL OR NOT (that)
- └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
-     ├─ outer rows
-     └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
-          ← INNER JOIN(T, DELIM_GET(k))
+CTE rows = outer rows
+ └─ FILTER   EXISTS:     mn <> rows.x OR mx <> rows.x    (per subquery; projection map: the original columns)
+             NOT EXISTS: (that) IS NULL OR NOT (that)
+     └─ LEFT JOIN on rows.k IS NOT DISTINCT FROM a.k
+         ├─ CTE_SCAN rows
+         └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+              ← SEMI JOIN(T, SELECT DISTINCT k FROM CTE_SCAN rows) on t.k = k
 ```
+
+This is the shape DuckDB itself gives a correlated scalar aggregate under `delim_join_as_cte = true`, so the merged plan has no delim join in either setting. Columns that operators above read from the outer rows are read from the CTE scan instead.
 
 `EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
 
