@@ -146,7 +146,10 @@ TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
 {
   run_ok("SET enable_duckdb_fallback = true;");
   auto const expected = query_rows(unused_cast_query());
+  auto const before   = sirius::test::get_transparent_execution_stats(*con);
   CHECK(query_rows(gpu_execution(unused_cast_query(), ", enable_optimizer = false")) == expected);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
 }
 
 TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
@@ -157,7 +160,10 @@ TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
   REQUIRE(expected == rows{{"1", "1", "40"}, {"2", "1", "20"}, {"3", "1", "30"}});
 
   run_ok("SET enable_duckdb_fallback = false;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
   CHECK(query_rows(gpu_execution(group_query(), ", enable_optimizer = false")) == expected);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   run_ok("SET enable_duckdb_fallback = true;");
 }
 
