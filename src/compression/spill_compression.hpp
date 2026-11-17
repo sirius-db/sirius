@@ -72,7 +72,7 @@ void apply_spill_compression_config(compression_config const& config);
 [[nodiscard]] bool spill_compression_applies(std::size_t bytes);
 
 /**
- * @brief The plan a spilled column is compressed with, chosen from its type and a sample.
+ * @brief Automatic per-column plan shared by spilling and pinning, chosen from type and sample.
  *
  * Fixed-width columns (including decimals and chrono types) up to 8 GiB are bitpacked;
  * larger ones exceed bitpack's encode scratch and are stored as is. Integer-valued
