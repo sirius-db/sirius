@@ -22,18 +22,6 @@ inline const operator_params& operator_defaults()
   return value;
 }
 
-/// Accepts counts that fit in an int64_t.
-struct fits_int64 {
-  [[nodiscard]] bool operator()(std::size_t value) const noexcept
-  {
-    return value <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
-  }
-  [[nodiscard]] static std::string description()
-  {
-    return "must be at most " + std::to_string(std::numeric_limits<std::int64_t>::max());
-  }
-};
-
 }  // namespace detail
 
 /// `sirius.operator_params`: operator sizing and planning policy. Options a DuckDB SET overrides
@@ -103,19 +91,20 @@ struct operator_options : block_base<operator_options> {
       .build();
   config_option<std::size_t> fused_scan_max_membership_sources =
     option<std::size_t>("fused_scan_max_membership_sources")
-      .validate(detail::fits_int64{})
+      .validate(
+        at_most<std::size_t>{static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())})
       .fallback(defaults().fused_scan.max_membership_sources)
       .scope(option_scope::query)
       .build();
 
   // -- batch and partition sizes. Unset sizes derive from the GPU memory when the configuration
   // is resolved (max_build_hash_table_bytes from hash_partition_bytes).
-  config_option<bytes> scan_task_batch_size =
-    option<bytes>("scan_task_batch_size").validate(positive<bytes>{}).build();
+  config_option<ubytes> scan_task_batch_size =
+    option<ubytes>("scan_task_batch_size").validate(positive<ubytes>{}).build();
   /// 0 = max_sort_partition_memory_fraction of the GPU memory.
-  config_option<bytes> max_sort_partition_bytes =
-    option<bytes>("max_sort_partition_bytes")
-      .fallback(to_bytes(defaults().max_sort_partition_bytes))
+  config_option<ubytes> max_sort_partition_bytes =
+    option<ubytes>("max_sort_partition_bytes")
+      .fallback(ubytes(defaults().max_sort_partition_bytes))
       .scope(option_scope::query)
       .build();
   config_option<double> max_sort_partition_memory_fraction =
@@ -124,23 +113,23 @@ struct operator_options : block_base<operator_options> {
       .fallback(defaults().max_sort_partition_memory_fraction)
       .scope(option_scope::query)
       .build();
-  config_option<bytes> hash_partition_bytes = option<bytes>("hash_partition_bytes")
-                                                .validate(positive<bytes>{})
-                                                .scope(option_scope::query)
-                                                .build();
-  config_option<bytes> concat_batch_bytes    = option<bytes>("concat_batch_bytes").build();
-  config_option<bytes> cross_join_task_bytes = option<bytes>("cross_join_task_bytes").build();
-  config_option<bytes> sort_sample_bytes =
-    option<bytes>("sort_sample_bytes").scope(option_scope::query).build();
+  config_option<ubytes> hash_partition_bytes = option<ubytes>("hash_partition_bytes")
+                                                 .validate(positive<ubytes>{})
+                                                 .scope(option_scope::query)
+                                                 .build();
+  config_option<ubytes> concat_batch_bytes    = option<ubytes>("concat_batch_bytes").build();
+  config_option<ubytes> cross_join_task_bytes = option<ubytes>("cross_join_task_bytes").build();
+  config_option<ubytes> sort_sample_bytes =
+    option<ubytes>("sort_sample_bytes").scope(option_scope::query).build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
-  config_option<bytes> max_build_hash_table_bytes =
-    option<bytes>("max_build_hash_table_bytes").scope(option_scope::query).build();
+  config_option<ubytes> max_build_hash_table_bytes =
+    option<ubytes>("max_build_hash_table_bytes").scope(option_scope::query).build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
-  config_option<bytes> max_build_probe_resident_bytes =
-    option<bytes>("max_build_probe_resident_bytes").scope(option_scope::query).build();
-  config_option<bytes> max_broadcast_join_size =
-    option<bytes>("max_broadcast_join_size")
-      .fallback(to_bytes(defaults().max_broadcast_join_size))
+  config_option<ubytes> max_build_probe_resident_bytes =
+    option<ubytes>("max_build_probe_resident_bytes").scope(option_scope::query).build();
+  config_option<ubytes> max_broadcast_join_size =
+    option<ubytes>("max_broadcast_join_size")
+      .fallback(ubytes(defaults().max_broadcast_join_size))
       .scope(option_scope::query)
       .build();
   /// 0 always uses filtered_join.
@@ -165,7 +154,7 @@ struct operator_options : block_base<operator_options> {
   /// Above 1 turns the coverage gate off.
   config_option<double> dynamic_filter_domain_coverage_threshold =
     option<double>("dynamic_filter_domain_coverage_threshold")
-      .validate(positive_finite{})
+      .validate(valid_domain_coverage_threshold{})
       .fallback(defaults().dynamic_filter_domain_coverage_threshold)
       .scope(option_scope::query)
       .build();
@@ -207,9 +196,9 @@ struct operator_options : block_base<operator_options> {
                                                       .scope(option_scope::query)
                                                       .build();
   /// 0 = a share of the pinning GPU memory space's capacity.
-  config_option<bytes> pin_table_unique_exact_max_bytes =
-    option<bytes>("pin_table_unique_exact_max_bytes")
-      .fallback(to_bytes(defaults().unique_exact_max_bytes))
+  config_option<ubytes> pin_table_unique_exact_max_bytes =
+    option<ubytes>("pin_table_unique_exact_max_bytes")
+      .fallback(ubytes(defaults().unique_exact_max_bytes))
       .scope(option_scope::query)
       .build();
   config_option<bool> enable_exists_minmax_rewrite =
@@ -230,15 +219,15 @@ struct operator_options : block_base<operator_options> {
 
   // -- admission
   /// 0 turns the estimate off: topology.gpus_per_query decides.
-  config_option<bytes> admission_bytes_per_gpu =
-    option<bytes>("admission_bytes_per_gpu")
-      .fallback(to_bytes(defaults().admission_bytes_per_gpu))
+  config_option<ubytes> admission_bytes_per_gpu =
+    option<ubytes>("admission_bytes_per_gpu")
+      .fallback(ubytes(defaults().admission_bytes_per_gpu))
       .scope(option_scope::query)
       .build();
-  config_option<bytes> avg_variable_column_bytes =
-    option<bytes>("avg_variable_column_bytes")
-      .validate(positive<bytes>{})
-      .fallback(to_bytes(defaults().avg_variable_column_bytes))
+  config_option<ubytes> avg_variable_column_bytes =
+    option<ubytes>("avg_variable_column_bytes")
+      .validate(positive<ubytes>{})
+      .fallback(ubytes(defaults().avg_variable_column_bytes))
       .scope(option_scope::query)
       .build();
   config_option<bool> enable_runtime_size_estimation =

@@ -127,9 +127,9 @@ struct tls_options : block_base<tls_options> {
       .fallback(defaults().session_cache_per_endpoint)
       .build();
   /// Bytes after which a connection is replaced; 0 = never.
-  config_option<bytes> max_connection_bytes = option<bytes>("max_connection_bytes")
-                                                .fallback(to_bytes(defaults().max_connection_bytes))
-                                                .build();
+  config_option<ubytes> max_connection_bytes = option<ubytes>("max_connection_bytes")
+                                                 .fallback(ubytes(defaults().max_connection_bytes))
+                                                 .build();
   config_option<std::string> ciphersuites =
     option<std::string>("ciphersuites").fallback(defaults().ciphersuites).build();
   config_option<std::string> cipher_list =
@@ -213,18 +213,18 @@ struct rest_options : block_base<rest_options> {
       .validate(non_negative<std::chrono::seconds>{})
       .fallback(std::chrono::seconds(defaults().stall_time_s))
       .build();
-  config_option<bytes> merge_max_gap =
-    option<bytes>("merge_max_gap").fallback(to_bytes(defaults().merge_max_gap)).build();
-  config_option<bytes> min_segment_bytes = option<bytes>("min_segment_bytes")
-                                             .validate(positive<bytes>{})
-                                             .fallback(to_bytes(defaults().min_segment_bytes))
-                                             .build();
-  config_option<bytes> max_segment_bytes =
-    option<bytes>("max_segment_bytes").fallback(to_bytes(defaults().max_segment_bytes)).build();
-  config_option<bytes> footer_probe_bytes =
-    option<bytes>("footer_probe_bytes")
-      .validate(between<bytes>{bytes{}, bytes(gibibytes(1))})
-      .fallback(to_bytes(defaults().footer_probe_bytes))
+  config_option<ubytes> merge_max_gap =
+    option<ubytes>("merge_max_gap").fallback(ubytes(defaults().merge_max_gap)).build();
+  config_option<ubytes> min_segment_bytes = option<ubytes>("min_segment_bytes")
+                                              .validate(positive<ubytes>{})
+                                              .fallback(ubytes(defaults().min_segment_bytes))
+                                              .build();
+  config_option<ubytes> max_segment_bytes =
+    option<ubytes>("max_segment_bytes").fallback(ubytes(defaults().max_segment_bytes)).build();
+  config_option<ubytes> footer_probe_bytes =
+    option<ubytes>("footer_probe_bytes")
+      .validate(between<ubytes>{ubytes{}, ubytes(gibibytes(1))})
+      .fallback(ubytes(defaults().footer_probe_bytes))
       .build();
   config_option<std::size_t> list_max_matches = option<std::size_t>("list_max_matches")
                                                   .validate(positive<std::size_t>{})
@@ -308,8 +308,10 @@ struct rest_options : block_base<rest_options> {
                                          .build();
   /// Unset: the egress NIC's MTU when it uses jumbo frames, else 0 (no check), derived when the
   /// configuration is resolved.
-  config_option<bytes> min_mtu =
-    option<bytes>("min_mtu").validate(between<bytes>{bytes{}, bytes(detail::max_min_mtu)}).build();
+  config_option<ubytes> min_mtu =
+    option<ubytes>("min_mtu")
+      .validate(between<ubytes>{ubytes{}, ubytes(detail::max_min_mtu)})
+      .build();
   config_option<unsigned> mtu_reject_max_attempts = option<unsigned>("mtu_reject_max_attempts")
                                                       .validate(positive<unsigned>{})
                                                       .fallback(defaults().mtu_reject_max_attempts)
@@ -318,10 +320,10 @@ struct rest_options : block_base<rest_options> {
     option<bool>("close_with_rst").fallback(defaults().close_with_rst).build();
 
   // -- transport
-  config_option<bytes> receive_buffer_bytes =
-    option<bytes>("receive_buffer_bytes")
-      .validate(between<bytes>{bytes(kibibytes(16)), bytes(mebibytes(4))})
-      .fallback(to_bytes(defaults().receive_buffer_bytes))
+  config_option<ubytes> receive_buffer_bytes =
+    option<ubytes>("receive_buffer_bytes")
+      .validate(between<ubytes>{ubytes(kibibytes(16)), ubytes(mebibytes(4))})
+      .fallback(ubytes(defaults().receive_buffer_bytes))
       .build();
   config_option<std::size_t> queue_depth = option<std::size_t>("queue_depth")
                                              .validate(between<std::size_t>{2, 32768})

@@ -19,7 +19,14 @@ void user_config::validate(std::string_view path) const
 node user_config::write(bool include_fallbacks) const
 {
   auto out = block_base<user_config>::write(include_fallbacks);
-  if (space.configured() && !memory.configured()) { out.erase("memory"); }
+  if (space.configured() && !memory.configured()) {
+    // Unused memory tiers would read back as configured; keep only the block the user wrote.
+    if (memory.user_defined()) {
+      out.set("memory", node::mapping());
+    } else {
+      out.erase("memory");
+    }
+  }
   return out;
 }
 

@@ -30,10 +30,10 @@ struct compression_options : block_base<compression_options> {
       .scope(option_scope::query)
       .build();
   /// Smaller chunks stay uncompressed; 0 = no threshold.
-  config_option<bytes> min_batch_size_bytes = option<bytes>("min_batch_size_bytes")
-                                                .fallback(to_bytes(defaults().min_batch_size_bytes))
-                                                .scope(option_scope::query)
-                                                .build();
+  config_option<ubytes> min_batch_size_bytes = option<ubytes>("min_batch_size_bytes")
+                                                 .fallback(ubytes(defaults().min_batch_size_bytes))
+                                                 .scope(option_scope::query)
+                                                 .build();
   /// Keep the compressed form only at or below this share of the original size.
   config_option<double> max_compressed_fraction = option<double>("max_compressed_fraction")
                                                     .validate(non_negative_finite{})
@@ -48,9 +48,9 @@ struct compression_options : block_base<compression_options> {
   /// SET spill_compression changes it for the whole process, so it is session-scoped.
   config_option<bool> enable_spill_compression =
     option<bool>("enable_spill_compression").fallback(defaults().enable_spill_compression).build();
-  config_option<bytes> spill_min_batch_bytes =
-    option<bytes>("spill_min_batch_bytes")
-      .fallback(to_bytes(defaults().spill_min_batch_bytes))
+  config_option<ubytes> spill_min_batch_bytes =
+    option<ubytes>("spill_min_batch_bytes")
+      .fallback(ubytes(defaults().spill_min_batch_bytes))
       .build();
   config_option<double> spill_max_compressed_fraction =
     option<double>("spill_max_compressed_fraction")

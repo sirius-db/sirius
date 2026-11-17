@@ -64,7 +64,7 @@ struct positive {
   [[nodiscard]] bool operator()(const T& value) const { return T{} < value; }
   [[nodiscard]] static constexpr const char* description() noexcept
   {
-    return "must be greater than 0";
+    return "must be greater than zero";
   }
 };
 
@@ -78,14 +78,22 @@ struct non_negative {
   }
 };
 
-/// A runtime default byte count as a config value. @throws std::logic_error above INT64_MAX.
-[[nodiscard]] inline bytes to_bytes(std::uint64_t count)
-{
-  if (count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-    throw std::logic_error("config: byte default out of range");
+/// Accepts values at or below a limit.
+template <class T>
+struct at_most {
+  T limit;
+  [[nodiscard]] bool operator()(const T& value) const { return !(limit < value); }
+  [[nodiscard]] std::string description() const
+  {
+    return "must be at most " + formatter<T>{}(limit);
   }
-  return bytes(static_cast<std::int64_t>(count));
-}
+};
+
+/// Accepts a non-empty string.
+struct non_empty {
+  [[nodiscard]] bool operator()(const std::string& value) const noexcept { return !value.empty(); }
+  [[nodiscard]] static constexpr const char* description() noexcept { return "must not be empty"; }
+};
 
 /// The downgrade pair rule shared by every memory tier: 0 < stop < trigger.
 /// @throws config_error naming @p path.

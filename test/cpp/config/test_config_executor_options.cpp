@@ -102,7 +102,7 @@ TEST_CASE("executor blocks reject bad values and retired keys", "[config][config
     REQUIRE(
       read_error(std::string("sirius:\n  executor:\n    ") + block + ":\n      num_threads: 0\n") ==
       std::string("'sirius.executor.") + block +
-        ".num_threads': value out of range: '0' (must be greater than 0)");
+        ".num_threads': value out of range: '0' (must be greater than zero)");
     REQUIRE(read_error(std::string("sirius:\n  executor:\n    ") + block +
                        ":\n      thread_name_prefix: x\n") ==
             std::string("unknown config key: 'thread_name_prefix' in sirius.executor.") + block);
@@ -157,7 +157,7 @@ TEST_CASE("thread counts and affinities are checked", "[config][config_executor]
   };
   REQUIRE(error("num_threads: -1") ==
           "'sirius.executor.downgrade.num_threads': value out of range: '-1' (must be greater than "
-          "0)");
+          "zero)");
   REQUIRE(error("num_threads: abc") ==
           "'sirius.executor.downgrade.num_threads': invalid integer value: 'abc'");
   REQUIRE(error("num_threads: 1.5") ==

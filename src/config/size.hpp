@@ -135,7 +135,10 @@ constexpr To size_cast(const basic_size<R, P>& size)
   return To(static_cast<typename To::rep>(static_cast<CT>(size.count()) * F::num / F::den));
 }
 
-using bytes     = basic_size<std::int64_t>;
+using bytes = basic_size<std::int64_t>;
+/// An unsigned byte count: the type of settings the engine keeps as size_t / uint64_t, so a
+/// configuration reaches the same range the engine (and a DuckDB UBIGINT setting) accepts.
+using ubytes    = basic_size<std::uint64_t>;
 using kilobytes = basic_size<std::int64_t, std::kilo>;
 using megabytes = basic_size<std::int64_t, std::mega>;
 using gigabytes = basic_size<std::int64_t, std::giga>;

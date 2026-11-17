@@ -56,9 +56,9 @@ struct gpu_space_options : block_base<gpu_space_options> {
       .fallback(detail::gpu_space_defaults().downgrade_stop_fraction)
       .build();
   /// 0 = no capacity configured (cuCascade's default).
-  config_option<bytes> memory_capacity =
-    option<bytes>("memory_capacity")
-      .fallback(to_bytes(detail::gpu_space_defaults().memory_capacity))
+  config_option<ubytes> memory_capacity =
+    option<ubytes>("memory_capacity")
+      .fallback(ubytes(detail::gpu_space_defaults().memory_capacity))
       .build();
 
   auto fields()
@@ -97,13 +97,12 @@ struct host_space_options : block_base<host_space_options> {
       .validate(fraction{})
       .fallback(detail::host_space_defaults().downgrade_stop_fraction)
       .build();
-  config_option<bytes> memory_capacity =
-    option<bytes>("memory_capacity")
-      .fallback(to_bytes(detail::host_space_defaults().memory_capacity))
+  config_option<ubytes> memory_capacity =
+    option<ubytes>("memory_capacity")
+      .fallback(ubytes(detail::host_space_defaults().memory_capacity))
       .build();
-  config_option<bytes> block_size = option<bytes>("block_size")
-                                      .fallback(to_bytes(detail::host_space_defaults().block_size))
-                                      .build();
+  config_option<ubytes> block_size =
+    option<ubytes>("block_size").fallback(ubytes(detail::host_space_defaults().block_size)).build();
   config_option<std::size_t> pool_size =
     option<std::size_t>("pool_size").fallback(detail::host_space_defaults().pool_size).build();
   config_option<std::size_t> initial_number_pools =
@@ -136,9 +135,9 @@ struct disk_space_options : block_base<disk_space_options> {
     option<int>("disk_id").fallback(detail::disk_space_defaults().disk_id).build();
   config_option<std::string> mount_path =
     option<std::string>("mount_path").fallback(detail::disk_space_defaults().mount_paths).build();
-  config_option<bytes> memory_capacity =
-    option<bytes>("memory_capacity")
-      .fallback(to_bytes(detail::disk_space_defaults().memory_capacity))
+  config_option<ubytes> memory_capacity =
+    option<ubytes>("memory_capacity")
+      .fallback(ubytes(detail::disk_space_defaults().memory_capacity))
       .build();
 
   auto fields() { return field_list(disk_id, mount_path, memory_capacity); }
@@ -164,7 +163,7 @@ struct space_options : block_base<space_options> {
   {
     if (gpu.empty()) { return false; }
     for (auto const& space : gpu) {
-      if (!(space.memory_capacity.get() > bytes::zero())) { return false; }
+      if (!(space.memory_capacity.get() > ubytes::zero())) { return false; }
     }
     return true;
   }
