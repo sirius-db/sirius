@@ -2400,7 +2400,14 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                                            std::string const& path) {
             return scans.parquet_footer(path);
           }}
-        : planner::parquet_footer_reader{});
+        : planner::parquet_footer_reader{},
+      op_params.enable_build_side_swap
+        ? planner::deferred_scan_policy{[&scans = sirius_ctx->get_scan_manager()](
+                                          std::string const& path) {
+                                          return scans.parquet_footer(path);
+                                        },
+                                        sirius_ctx->get_config().smallest_gpu_downgrade_threshold()}
+        : planner::deferred_scan_policy{});
   }
 }
 

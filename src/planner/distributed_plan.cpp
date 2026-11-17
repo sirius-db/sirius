@@ -219,8 +219,80 @@ struct rewriter {
   /// Each CTE_SCAN's rows are where its CTE's materialization put them.
   std::map<op::sirius_physical_operator const*, placement> cte_scans;
   parquet_footer_reader footers;
+  deferred_scan_policy deferred;
 
   exchange::stream_id stream() { return exchange::make_stream_id(query, next_stream++); }
+
+  /// The rows of @p files, from their footers; nothing when one cannot be read.
+  std::optional<std::uint64_t> footer_rows(std::vector<std::string> const& files) const
+  {
+    std::vector<std::optional<std::uint64_t>> rows(files.size());
+    std::atomic<std::size_t> next{0};
+    auto const read = [&] {
+      for (auto i = next++; i < files.size(); i = next++) {
+        try {
+          if (auto const file = deferred.footers(files[i]); file && file->num_rows >= 0) {
+            rows[i] = static_cast<std::uint64_t>(file->num_rows);
+          }
+        } catch (...) {
+          rows[i].reset();
+        }
+      }
+    };
+    {
+      std::vector<std::jthread> readers(std::min<std::size_t>(16, files.size()));
+      for (auto& reader : readers) {
+        reader = std::jthread(read);
+      }
+    }
+    std::uint64_t total = 0;
+    for (auto const& file_rows : rows) {
+      if (!file_rows) { return std::nullopt; }
+      total += *file_rows;
+    }
+    return total;
+  }
+
+  /// Tells the exchange of an INNER join whose probe side is a plain Parquet scan with no static
+  /// filter how many bytes of it reach this rank's join, so that a build that outgrows the scan
+  /// stops being held (partition_exchange::defer_scan). The rank's files are its share of the
+  /// table, and the hash exchange below the join hands each rank an equal share of the rows.
+  void defer_probe_scan(op::sirius_physical_hash_join const& join,
+                        op::sirius_physical_partition& probe)
+  {
+    if (!deferred.footers || join.join_type != duckdb::JoinType::INNER || !probe.exchange()) {
+      return;
+    }
+    auto const* node = probe.children[0].get();
+    while (node->type == T::PROJECTION || node->type == T::DYNAMIC_FILTER) {
+      node = node->children[0].get();
+    }
+    if (node->type != T::GPU_SCAN) { return; }
+    auto const* info = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+      &node->Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info());
+    if (info == nullptr || !info->partition_indices.empty() || info->field_mapping_requirements ||
+        info->physical_schema ||
+        (info->table_filters &&
+         (info->table_filters->HasFilters() || info->table_filters->HasMultiColumnFilters()))) {
+      return;
+    }
+    auto const rows = footer_rows(info->resolved_file_paths);
+    if (!rows) { return; }
+    auto const width = estimate_bytes_per_row(probe.types, estimated_var_bytes);
+    auto const world = static_cast<std::uint64_t>(service->world_size());
+    if (width == 0 || *rows > std::numeric_limits<std::uint64_t>::max() / width / world) { return; }
+    auto const bytes = *rows * width;
+    if (bytes * world < deferred.min_bytes) { return; }
+    probe.exchange()->defer_scan(probe, bytes);
+    // Operators have no ids yet.
+    SIRIUS_LOG_INFO(
+      "[deferred scan] an inner join's probe scan of {} files holds {} rows of {} bytes on this "
+      "rank; a build of {} bytes or more makes the scan the held side.",
+      info->resolved_file_paths.size(),
+      *rows,
+      width,
+      bytes);
+  }
 
   /// Gives the partial aggregate under @p merge the HAVING @p having above it, when the
   /// condition of complete_group_having holds on every rank for one of its group keys.
@@ -578,6 +650,7 @@ struct rewriter {
           return done(probe_rows == placement::rank0 ? placement::rank0 : placement::spread);
         }
         merge_filters_across_ranks(join);
+        defer_probe_scan(join, probe.Cast<op::sirius_physical_partition>());
         // Each side's rows meet their matches once both are exchanged on the join keys. A MARK
         // join's NULL build keys match nothing yet turn a missed probe row's mark NULL, so every
         // rank needs them; its sink also sends every rank one build row, so that a NULL probe
@@ -808,10 +881,12 @@ void distribute_plan(duckdb::unique_ptr<op::sirius_physical_operator>& plan,
                      cucascade::memory::memory_space& gpu,
                      std::uint64_t query,
                      exec::query_lifecycle_registry& lifecycle,
-                     parquet_footer_reader footers)
+                     parquet_footer_reader footers,
+                     deferred_scan_policy deferred)
 {
   rewriter r{service, &gpu, query, &lifecycle};
-  r.footers = std::move(footers);
+  r.footers  = std::move(footers);
+  r.deferred = std::move(deferred);
   try {
     auto const where = r.visit(plan);
     if (where != placement::rank0) {

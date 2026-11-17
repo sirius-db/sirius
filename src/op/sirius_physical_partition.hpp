@@ -91,6 +91,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] bool input_complete() const;
   [[nodiscard]] bool input_empty() const;
   partition_input_stats input_statistics(bool use_estimate = false);
+  /// The bytes pushed to this input so far, counted only after count_received_bytes().
+  [[nodiscard]] uint64_t received_bytes() const noexcept
+  {
+    return _received_bytes.load(std::memory_order_relaxed);
+  }
+  void count_received_bytes() noexcept { _count_received = true; }
 
  protected:
   void on_finalize_operator() override;
@@ -114,6 +120,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   sizing_basis _sizing_basis{sizing_basis::measured};
   uint64_t _sizing_bytes{0};
   std::atomic<uint64_t> _actual_bytes{0};
+  bool _count_received = false;
+  std::atomic<uint64_t> _received_bytes{0};
 };
 
 }  // namespace sirius::op

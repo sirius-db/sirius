@@ -79,6 +79,7 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                                 sizing.resident_bytes};
       auto strategy = empty ? partition_strategy{1, false, false, partition_placement::unpinned(1)}
                             : join.get_partition_strategy(in);
+      if (sizing.from_deferred_scan) { join.set_scan_holds_layout(); }
       bool build_arrives_whole = false;
       if (strategy.build_probe) {
         if (!build_concat) { throw std::logic_error("BUILD_PROBE requires a bound build CONCAT"); }

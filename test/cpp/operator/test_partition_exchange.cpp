@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
@@ -37,6 +38,15 @@ void attach(sirius_physical_operator& op, cucascade::shared_data_repository& rep
   port->type = MemoryBarrierType::FULL;
   op.add_port("default", std::move(port));
 }
+
+/// A source pipeline that is not finished until the test says so.
+class stub_pipeline : public sirius::pipeline::sirius_pipeline {
+ public:
+  using sirius_pipeline::sirius_pipeline;
+  bool is_pipeline_finished() const override { return finished; }
+
+  bool finished = false;
+};
 }  // namespace
 
 TEST_CASE("partition output metadata preserves sparse destinations through reconstruction",
@@ -80,4 +90,76 @@ TEST_CASE("concurrent partition requests share one layout decision", "[partition
   REQUIRE(right.layout());
   CHECK(*left.layout()->placement == *right.layout()->placement);
   CHECK(output_repo.num_partitions() == 4);
+}
+
+TEST_CASE("a sizing input that outgrows a deferred scan stops being held",
+          "[partition_exchange][unit]")
+{
+  sirius_physical_partition build(one_column(), 0, partition_spec{{0}});
+  sirius_physical_partition probe(one_column(), 0, partition_spec{{0}});
+  sirius::op::test_physical_operator target(
+    SiriusPhysicalOperatorType::PROJECTION, one_column(), 0);
+  sirius::op::test_physical_operator producer(
+    SiriusPhysicalOperatorType::PROJECTION, one_column(), 0);
+  cucascade::shared_data_repository build_repo, probe_repo, output_repo;
+  attach(build, build_repo);
+  attach(probe, probe_repo);
+  attach(target, output_repo);
+  build.add_next_port_after_sink({&target, "default"});
+  probe.add_next_port_after_sink({&target, "default"});
+  sirius::pipeline::pipeline_build_context context{nullptr};
+  auto source = std::make_shared<stub_pipeline>(context);
+  sirius::pipeline::sirius_pipeline_build_state state;
+  state.add_pipeline_operator(*source, producer);
+  build.get_port("default")->src_pipeline = source;
+
+  std::vector<partition_input_stats> sized_from;
+  partition_exchange::bind({&build, &probe}, 0, false, [&](auto const& stats, bool) {
+    sized_from = stats;
+    return std::vector<partition_layout>(2,
+                                         {partition_mode::hash, partition_placement::unpinned(4)});
+  });
+
+  SECTION("a sizing input smaller than the scan is still collected whole")
+  {
+    build.exchange()->defer_scan(probe, 1);
+    CHECK_FALSE(build.get_next_task_input_data());
+    CHECK_FALSE(build.layout());
+    CHECK_FALSE(build.exchange()->scan_holds());
+  }
+
+  SECTION("a sizing input as large as the scan gives way to it")
+  {
+    build.exchange()->defer_scan(probe, 0);
+    CHECK_FALSE(build.get_next_task_input_data());
+    REQUIRE(build.layout());
+    REQUIRE(probe.layout());
+    CHECK(build.exchange()->scan_holds());
+    REQUIRE(sized_from.size() == 2);
+    CHECK(sized_from[0].from_deferred_scan);
+    CHECK_FALSE(sized_from[0].measured_rows);
+    // Its barrier no longer holds it: it asks for its producer's next batch.
+    auto const hint = build.get_next_task_hint();
+    REQUIRE(hint);
+    CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+    CHECK(hint->producer == &producer);
+  }
+
+  SECTION("a complete sizing input sizes the layout itself")
+  {
+    source->finished = true;
+    build.exchange()->defer_scan(probe, 0);
+    CHECK_FALSE(build.get_next_task_input_data());
+    REQUIRE(build.layout());
+    CHECK_FALSE(build.exchange()->scan_holds());
+    REQUIRE(sized_from.size() == 2);
+    CHECK_FALSE(sized_from[0].from_deferred_scan);
+  }
+
+  SECTION("the sizing input cannot be the deferred scan")
+  {
+    build.exchange()->defer_scan(build, 0);
+    CHECK_FALSE(build.get_next_task_input_data());
+    CHECK_FALSE(build.layout());
+  }
 }

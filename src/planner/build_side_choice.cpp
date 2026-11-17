@@ -95,15 +95,13 @@ std::size_t swap_unfiltered_builds(duckdb::ClientContext& context,
     return swapped;
   }
   auto const build_rows  = build.EstimateCardinality(context);
-  auto const probe_rows  = probe.EstimateCardinality(context);
   auto const build_width = row_bytes(build);
-  auto const swap = build_rows > probe_rows && at_least(build_rows, build_width, min_build_bytes);
+  auto const swap        = at_least(build_rows, build_width, min_build_bytes);
   SIRIUS_LOG_INFO(
     "[build_side_choice] inner join with an unfiltered build of {} estimated rows of {} bytes and "
-    "a filtered probe of {} rows, swapped from {} bytes of build: {}.",
+    "a filtered probe, swapped from {} bytes of build: {}.",
     build_rows,
     build_width,
-    probe_rows,
     min_build_bytes,
     swap ? "swapped" : "kept");
   if (swap) {
