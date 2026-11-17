@@ -12,6 +12,7 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <unistd.h>
 #include <yaml-cpp/yaml.h>
 
 #include <chrono>
@@ -755,31 +756,64 @@ TEST_CASE("the effective configuration resolves to what it was derived from",
   }
 }
 
+TEST_CASE("the effective configuration file resolves alike in every build",
+          "[config][config_create]")
+{
+  int probes = 0;
+  struct machine {
+    const char* name;
+    cucascade::memory::system_topology_info topology;
+    sirius::egress_nic_probe probe;
+  };
+  machine const machines[] = {
+    {"this machine", this_machine(), no_nic},
+    {"kernel TLS and a jumbo-frame NIC", with_ktls(), counting_nic{&probes}}};
+  for (auto const& m : machines) {
+    for (bool const developer : {false, true}) {
+      INFO(m.name << (developer ? ", developer mode" : ""));
+      auto const resolved =
+        sirius::create_sirius_config(sirius::config::default_user_config(), m.topology, m.probe);
+      auto const text = sirius::effective_config_text(resolved, developer);
+      REQUIRE(text.starts_with("# "));
+      // Settings left out outside developer mode are re-derived as they were the first time.
+      auto const reread = sirius::config::read_user_config(text);
+      REQUIRE(describe(sirius::create_sirius_config(reread, m.topology, m.probe),
+                       /*in_effect=*/true) == describe(resolved, /*in_effect=*/true));
+      auto const document = sirius::config::parse_yaml(text);
+      auto const* root    = document.find("sirius");
+      REQUIRE(root != nullptr);
+      auto const* executor = root->find("executor");
+      REQUIRE(executor != nullptr);
+      auto const* sm = executor->find("scan_manager");
+      REQUIRE(sm != nullptr);
+      REQUIRE((sm->find("rest") != nullptr) == developer);
+    }
+  }
+}
+
 TEST_CASE("the effective configuration file", "[config][config_create]")
 {
-  auto const dir  = std::filesystem::temp_directory_path() / "sirius_effective_config_test";
+  auto const dir = std::filesystem::temp_directory_path() /
+                   ("sirius_effective_config_test_" + std::to_string(getpid()));
   auto const path = dir / "nested" / "config.yml";
   std::filesystem::remove_all(dir);
-  auto const user     = sirius::config::default_user_config();
-  auto const resolved = sirius::create_sirius_config(user, this_machine(), no_nic);
-  sirius::write_effective_config(path, user, resolved);
+  auto const resolved =
+    sirius::create_sirius_config(sirius::config::default_user_config(), this_machine(), no_nic);
+  sirius::write_effective_config(path, resolved);
   REQUIRE(std::filesystem::exists(path));
   auto const files = [&] {
     return std::distance(std::filesystem::directory_iterator(path.parent_path()),
                          std::filesystem::directory_iterator{});
   };
   REQUIRE(files() == 1);  // no temporary left behind
+  REQUIRE(slurp(path) == sirius::effective_config_text(resolved, sirius::config::developer_mode()));
 
   auto const written = sirius::config::read_user_config(slurp(path));
   REQUIRE(written.executor.pipeline.num_threads.get() ==
           resolved.get_gpu_pipeline_executor_config().num_threads);
   REQUIRE(written.max_concurrent_queries.get() == 1);  // fallbacks are spelled out too
-  auto const document = sirius::config::parse_yaml(slurp(path));
-  auto const* rest = document.find("sirius")->find("executor")->find("scan_manager")->find("rest");
-  // Developer-only settings appear only in developer mode.
-  REQUIRE((rest != nullptr) == sirius::config::developer_mode());
 
-  sirius::write_effective_config(path, user, resolved);  // a second start replaces it
+  sirius::write_effective_config(path, resolved);  // a second start replaces it
   REQUIRE(files() == 1);
   REQUIRE(sirius::config::read_user_config(slurp(path)).max_concurrent_queries.get() == 1);
   std::filesystem::remove_all(dir);

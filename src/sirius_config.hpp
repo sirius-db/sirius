@@ -764,12 +764,18 @@ class parsed_sirius_config {
                                                         const sirius_config& resolved);
 
 /**
- * @brief Write @p resolved's effective configuration (effective_user_config) to @p path as YAML,
- * every value spelled out; developer-only settings are included only in developer mode. Creates
- * the directory and replaces the file whole. @throws std::exception when it cannot be written.
+ * @brief The YAML text of the effective configuration of @p resolved, resolved from an empty
+ * configuration file: effective_user_config with every value spelled out, behind a comment saying
+ * what the file is. Developer-only settings are left out unless @p developer; the rest still
+ * resolves to the same values, since only fallbacks and values derived alike are left out.
  */
-void write_effective_config(const std::filesystem::path& path,
-                            const config::user_config& user,
-                            const sirius_config& resolved);
+[[nodiscard]] std::string effective_config_text(const sirius_config& resolved, bool developer);
+
+/**
+ * @brief Write effective_config_text (developer-only settings in developer mode only) to @p path:
+ * creates the directory and replaces the file whole. @throws std::exception when it cannot be
+ * written.
+ */
+void write_effective_config(const std::filesystem::path& path, const sirius_config& resolved);
 
 }  // namespace sirius

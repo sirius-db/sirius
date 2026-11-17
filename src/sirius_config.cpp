@@ -40,7 +40,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
-#include <atomic>
+#include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -52,6 +53,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -108,6 +110,24 @@ constexpr batch_setting batch_settings[] = {
   {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
   {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 8},
   {"max_build_probe_resident_bytes", &operator_params::max_build_probe_resident_bytes, 8}};
+
+/// The operator option @p setting is configured by, found by key so the two cannot disagree.
+template <class Options>
+auto& batch_option(Options& op, const batch_setting& setting)
+{
+  std::array const options{&op.scan_task_batch_size,
+                           &op.hash_partition_bytes,
+                           &op.concat_batch_bytes,
+                           &op.cross_join_task_bytes,
+                           &op.sort_sample_bytes,
+                           &op.max_build_hash_table_bytes,
+                           &op.max_build_probe_resident_bytes};
+  static_assert(std::tuple_size_v<decltype(options)> == std::size(batch_settings));
+  for (auto* option : options) {
+    if (option->key() == setting.name) { return *option; }
+  }
+  throw std::logic_error(std::string("no operator option for batch setting ") + setting.name);
+}
 
 }  // namespace
 
@@ -665,24 +685,9 @@ try {
   ops.avg_variable_column_bytes                = op.avg_variable_column_bytes.get().count();
   ops.enable_runtime_size_estimation           = op.enable_runtime_size_estimation.get();
   ops.use_hw_decompression                     = op.use_hw_decompression.get();
-  // Unset batch sizes are derived from GPU memory when the configuration is resolved; the
-  // options are found by the keys batch_settings names, so the two cannot disagree.
-  config::config_option<config::ubytes> const* const batch_options[] = {
-    &op.scan_task_batch_size,
-    &op.hash_partition_bytes,
-    &op.concat_batch_bytes,
-    &op.cross_join_task_bytes,
-    &op.sort_sample_bytes,
-    &op.max_build_hash_table_bytes,
-    &op.max_build_probe_resident_bytes};
-  static_assert(std::size(batch_options) == std::size(batch_settings));
+  // Unset batch sizes are derived from GPU memory when the configuration is resolved.
   for (auto const& setting : batch_settings) {
-    auto const option = std::ranges::find_if(
-      batch_options, [&](auto const* candidate) { return candidate->key() == setting.name; });
-    if (option == std::end(batch_options)) {
-      throw std::logic_error(std::string("no operator option for batch setting ") + setting.name);
-    }
-    if (auto const* value = (*option)->get_if()) {
+    if (auto const* value = batch_option(op, setting).get_if()) {
       ops.*setting.member = value->count();
       impl->explicit_batch_settings.push_back(setting.member);
     }
@@ -817,49 +822,54 @@ config::user_config effective_user_config(const config::user_config& user,
   derived(prep_options.native_reader_workers, prep_cfg.resolved_native_workers());
   derived(prep_options.max_native_readers, prep_cfg.resolved_native_readers());
 
-  auto& op                                                     = out.operator_params;
-  config::config_option<config::ubytes>* const batch_options[] = {
-    &op.scan_task_batch_size,
-    &op.hash_partition_bytes,
-    &op.concat_batch_bytes,
-    &op.cross_join_task_bytes,
-    &op.sort_sample_bytes,
-    &op.max_build_hash_table_bytes,
-    &op.max_build_probe_resident_bytes};
   for (auto const& setting : batch_settings) {
-    for (auto* option : batch_options) {
-      if (option->key() == setting.name) {
-        derived(*option, config::ubytes(resolved.get_operator_params().*setting.member));
-      }
-    }
+    derived(batch_option(out.operator_params, setting),
+            config::ubytes(resolved.get_operator_params().*setting.member));
   }
   return out;
 }
 
-void write_effective_config(const std::filesystem::path& path,
-                            const config::user_config& user,
-                            const sirius_config& resolved)
+std::string effective_config_text(const sirius_config& resolved, bool developer)
 {
-  auto const text = config::write_user_config(
-    effective_user_config(user, resolved),
-    config::write_options{/*fallbacks=*/true, /*developer=*/config::developer_mode()});
+  return "# The configuration Sirius ran with on this machine, written at startup because no\n"
+         "# config file was found; rewritten on every such start. Values derived from this\n"
+         "# machine's hardware are spelled out. To use it, copy it to ~/.sirius/sirius.yaml.\n" +
+         config::write_user_config(effective_user_config(config::default_user_config(), resolved),
+                                   config::write_options{/*fallbacks=*/true, developer});
+}
+
+void write_effective_config(const std::filesystem::path& path, const sirius_config& resolved)
+{
+  auto const text = effective_config_text(resolved, config::developer_mode());
   if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
-  // Replace the file whole, so a reader never sees half of it. The temporary is this writer's
-  // own: processes starting together would otherwise rename each other's half-written file.
-  static std::atomic<uint64_t> writes{0};
-  auto temporary = path;
-  temporary += ".tmp." + std::to_string(::getpid()) + "." + std::to_string(writes++);
+  // Replace the file whole, so a reader never sees half of it. mkstemp gives this writer a
+  // temporary no other process (on this host or one sharing the directory) can open.
+  auto pattern = path.string() + ".XXXXXX";
+  int const fd = ::mkstemp(pattern.data());
+  if (fd < 0) {
+    throw std::system_error(
+      errno, std::generic_category(), "cannot create a file next to " + path.string());
+  }
+  bool open = true;
   try {
-    {
-      std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-      out << text;
-      out.close();
-      if (!out) { throw std::runtime_error("cannot write " + temporary.string()); }
+    for (std::size_t written = 0; written < text.size();) {
+      auto const n = ::write(fd, text.data() + written, text.size() - written);
+      if (n < 0 && errno == EINTR) { continue; }
+      if (n < 0) {
+        throw std::system_error(errno, std::generic_category(), "cannot write " + pattern);
+      }
+      written += static_cast<std::size_t>(n);
     }
-    std::filesystem::rename(temporary, path);
+    // Released even when close() fails (Linux), so it is never closed twice.
+    open = false;
+    if (::close(fd) != 0) {
+      throw std::system_error(errno, std::generic_category(), "cannot write " + pattern);
+    }
+    std::filesystem::rename(pattern, path);
   } catch (...) {
+    if (open) { ::close(fd); }
     std::error_code ignored;
-    std::filesystem::remove(temporary, ignored);
+    std::filesystem::remove(pattern, ignored);
     throw;
   }
 }

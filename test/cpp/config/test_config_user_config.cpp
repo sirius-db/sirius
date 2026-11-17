@@ -234,12 +234,12 @@ TEST_CASE("a dump outside developer mode leaves developer-only settings out",
   REQUIRE(sm.find("cache") != nullptr);  // product settings keep their fallbacks
   auto const& op = *root.find("operator_params");
   REQUIRE(op.find("hash_partition_bytes") != nullptr);
-  REQUIRE(op.find("scan_task_batch_size") == nullptr);
+  REQUIRE(op.find("scan_task_batch_size") != nullptr);
   REQUIRE(op.find("enable_dynamic_filter") == nullptr);
   REQUIRE(root.find("max_concurrent_queries")->text() == "2");
 
   // Developer mode, and every in-process use that needs a faithful copy, keeps them.
   auto const all = parse_yaml(write_user_config(config, true));
   REQUIRE(all.find("sirius")->find("space") != nullptr);
-  REQUIRE(all.find("sirius")->find("operator_params")->find("scan_task_batch_size") != nullptr);
+  REQUIRE(all.find("sirius")->find("operator_params")->find("enable_dynamic_filter") != nullptr);
 }

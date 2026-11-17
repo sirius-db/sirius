@@ -209,11 +209,8 @@ TEST_CASE("every operator option's scope, fallback and audience", "[config][conf
   operator_options const op;
   auto const query   = option_scope::query;
   auto const session = option_scope::session;
-  // The settings SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
-  auto const developer = std::vector<std::string>{"scan_task_batch_size",
-                                                  "concat_batch_bytes",
-                                                  "cross_join_task_bytes",
-                                                  "enable_dynamic_filter",
+  // The planner switches SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
+  auto const developer = std::vector<std::string>{"enable_dynamic_filter",
                                                   "enable_dynamic_filter_multi_partition",
                                                   "enable_dynamic_zone_map_filter",
                                                   "enable_pinned_zone_map_pruning",
