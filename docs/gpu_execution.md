@@ -9,7 +9,7 @@ DuckDB extension using Pixi.
 
 ## Configuration
 
-`gpu_execution` reads an optional YAML config file; without one, built-in defaults apply. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+`gpu_execution` reads an optional YAML config file; without one, built-in defaults apply. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [value formats](super-sirius/configuration.md#value-formats). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Running
 
