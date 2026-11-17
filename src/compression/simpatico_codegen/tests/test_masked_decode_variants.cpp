@@ -1260,9 +1260,12 @@ bool render_checks()
               "FOR-rooted mask_consume must render via the generic seam");
 
   // 8. Launch geometry the launcher follows: the index walk serves one chunk
-  //    per warp, every other shape one chunk per block; the walk is
-  //    lane-strided over the two-word unpack and never synchronizes the
-  //    block, which its per-warp early returns rely on.
+  //    per warp, every other shape one chunk per block unless its spec says
+  //    otherwise (the plain Bitpack decode); the warp-mapped kernels never
+  //    synchronize the block, which their per-warp early returns rely on.
+  REQUIRE_MSG(s3.chunks_per_block == codegen::kTBSize / 32 &&
+                s3.source.find("__syncthreads") == std::string::npos,
+              "the plain bitpack decode must map one chunk per warp without block barriers");
   REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapeIndexConsume) == codegen::kTBSize / 32,
               "index walk must pack one chunk per warp");
   REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapePlain) == 1 &&
@@ -1279,8 +1282,8 @@ bool render_checks()
 
   // 9. The Bitpack ballot compares in the packed domain; only the int64 lane
   //    can pack more than 32 bits and so only it carries the decoded-domain
-  //    path. The Delta ballot stays on the generic seam, and no other render
-  //    carries the two-word helpers (their JIT keys must not move).
+  //    path. The Delta ballot stays on the generic seam, and no other masked
+  //    render carries the two-word helpers (their JIT keys must not move).
   const cdj::DecodeKernelSpec k1_32 = cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskOut);
   REQUIRE_MSG(k1.source.find("(packed domain)") != std::string::npos &&
                 k1.source.find("simpatico_bp_field32") != std::string::npos &&
@@ -1297,9 +1300,8 @@ bool render_checks()
   REQUIRE_MSG(dk1.source.find("selection mask (generic)") != std::string::npos &&
                 !carries_narrow_prelude(dk1),
               "the delta ballot must stay on the generic seam without the two-word helpers");
-  REQUIRE_MSG(!carries_narrow_prelude(s3) && !carries_narrow_prelude(k3) &&
-                !carries_narrow_prelude(k5) && !carries_narrow_prelude(k6) &&
-                !carries_narrow_prelude(kfor) &&
+  REQUIRE_MSG(!carries_narrow_prelude(k3) && !carries_narrow_prelude(k5) &&
+                !carries_narrow_prelude(k6) && !carries_narrow_prelude(kfor) &&
                 !carries_narrow_prelude(cdj::render(*bp, "int64_t", 8, cdj::kShapeSparseConsume)),
               "the two-word prelude must join only the kernels that use it");
 

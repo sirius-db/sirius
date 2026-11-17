@@ -36,4 +36,13 @@ namespace sirius::planner {
  */
 [[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
 
+/**
+ * @brief Tests for a SEMI or ANTI comparison join (either side variant) in the subtree.
+ *
+ * Such a join only removes rows, so it reduces the build like a filter does. DuckDB's join-filter
+ * test does not count it; without this, a table reduced only by a join (the shape
+ * `delim_join_as_cte` gives a correlated subquery's domain) publishes no filter.
+ */
+[[nodiscard]] bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op);
+
 }  // namespace sirius::planner

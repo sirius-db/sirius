@@ -22,7 +22,10 @@
 // vector to the (possibly cloned) batches underlying the read-only accessors, and the
 // target-space-aware bytes_to_materialize_input estimator.
 
+#include "api/simpatico_codegen.hpp"
 #include "catch.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -32,6 +35,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "transparent/replay_admission.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
@@ -59,6 +63,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -751,4 +756,71 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   scan->prepare_for_processing(f.gpu1, target_stream);
   CHECK(scan->get_cached_batch() == clone);
   target_stream.synchronize();
+}
+
+// A Simpatico-compressed pinned chunk has no cross-GPU copy step: its decoder reads the
+// compressed buffers where pin time left them. Decoding it from another GPU is a remote read
+// when the pools have peer access (this test then fails because nothing is refused) and an
+// illegal address when they do not (the process loses its CUDA context).
+TEST_CASE("compressed cached scan assigned away from its pin is refused before decoding",
+          "[batch_lock_utils][cached_scan_placement][multi_gpu]")
+{
+  if (skip_if_not_mgpu()) return;
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream source_stream;
+  ::cuda::stream_ref const source_stream_ref{source_stream};
+
+  // One bitpacked INT64 column compressed on gpu0, the shape pin_table(tier='gpu') stores.
+  auto table = sirius::create_cudf_table_with_random_data(kNumRows,
+                                                          {cudf::data_type{cudf::type_id::INT64}},
+                                                          {std::make_pair(0, 1000000)},
+                                                          source_stream_ref,
+                                                          f.gpu0->get_default_allocator());
+  source_stream.synchronize();
+  auto blob   = std::make_shared<sirius::compressed_device_blob>();
+  blob->table = simpatico::compress_with_plan(
+    table->view(),
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    source_stream_ref,
+    f.gpu0->get_default_allocator());
+  source_stream.synchronize();
+  auto batch =
+    cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                std::make_unique<sirius::compressed_device_representation>(
+                                  *f.gpu0,
+                                  std::move(blob),
+                                  std::vector<std::string>{"k"},
+                                  /*compressed_bytes=*/64,
+                                  /*uncompressed_bytes=*/kNumRows * sizeof(std::int64_t),
+                                  /*num_rows=*/static_cast<std::int64_t>(kNumRows)));
+  auto scan = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+
+  std::optional<sirius::transparent::late_failure_cause> refusal;
+  {
+    rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream target_stream;
+    try {
+      scan->prepare_for_processing(f.gpu1, target_stream);
+    } catch (sirius::transparent::classified_execution_error const& refused) {
+      refusal = refused.cause;
+    }
+    target_stream.synchronize();
+  }
+  REQUIRE(refusal.has_value());
+  CHECK(*refusal == sirius::transparent::late_failure_cause::gpu_error);
+
+  // The refusal touched nothing: the chunk is still compressed and still on its owner.
+  {
+    auto read = batch->to_read_only();
+    CHECK(read.get_memory_space() == f.gpu0);
+    CHECK(dynamic_cast<sirius::compressed_device_representation const*>(read.get_data()) !=
+          nullptr);
+  }
+
+  // The same input is still decodable where it lives.
+  scan->prepare_for_processing(f.gpu0, source_stream);
+  CHECK(scan->gpu_memory_space == f.gpu0);
+  source_stream.synchronize();
 }
