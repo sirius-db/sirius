@@ -11,13 +11,13 @@
 #include "op/scan/parquet_delete_reader.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "utils/local_ioctx.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
 #include <arpa/inet.h>  // IWYU pragma: keep
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_errors.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
 #include <duckdb/common/virtual_file_system.hpp>
@@ -650,7 +650,7 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
 
   sirius::op::scan::iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(uri);
-  auto unused_equality_io = std::make_shared<cucascade::io::kvikio_context>();
+  auto unused_equality_io = sirius::test::make_test_local_ioctx();
   auto read               = [&] {
     return sirius::op::scan::load_delete_payload(
       *fixture.con.context, "s3-table", unused_equality_io, discovery);

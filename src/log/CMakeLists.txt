@@ -1,5 +1,5 @@
-target_sources(sirius_objects PRIVATE duckdb_sink.cpp level.cpp logging.cpp
-                                      noop_sink.cpp)
+target_sources(sirius_objects PRIVATE cucascade_sink.cpp duckdb_sink.cpp
+                                      level.cpp logging.cpp noop_sink.cpp)
 
 # Keep spdlog's external fmt headers separate from DuckDB's bundled fmt headers.
 add_library(sirius_spdlog_sink OBJECT spdlog_owning_sink.cpp)

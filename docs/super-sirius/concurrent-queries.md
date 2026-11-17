@@ -18,9 +18,8 @@ The default is **1**. A permit covers query initialization, execution and resour
 Additional queries wait in a cancellable FIFO queue. A materialized result owns its returned
 buffers and does not keep the permit after execution finishes.
 
-The old `sirius.executor.scan_manager.max_concurrent_queries` key remains a deprecated alias.
-Conflicting values are rejected. This is a per-runtime limit, not a process-wide limit shared
-between independent DatabaseInstances.
+This is a per-runtime limit, not a process-wide limit shared between independent
+DatabaseInstances.
 
 Keep the default per-thread reservation tracking mode. `per_stream_reservation: true` is rejected
 when the limit exceeds one: conversions may change streams, and the underlying per-stream tracker

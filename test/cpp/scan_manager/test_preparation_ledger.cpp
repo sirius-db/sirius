@@ -144,7 +144,8 @@ class contract_ingestible : public sirius::op::scan::gpu_ingestible {
     ::cuda::stream_ref,
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
-    sirius::expression_query_policy) override
+    sirius::expression_query_policy,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     return {};
   }

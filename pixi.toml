@@ -27,6 +27,7 @@ cmake = "4.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cxx-compiler = "*"
+git = "*"
 make = "*"
 ninja = "*"
 sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
@@ -45,11 +46,13 @@ mold = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 croaring = "*"
+boto3 = ">=1.44.1,<2"
 
 [pypi-dependencies]
 rumdl = ">=0.2.44"
 
 [feature.dev-libs.dependencies]
+asio = "*"
 catch2 = "3.*"
 librmm = "*"
 libcurand-dev = "*"
@@ -61,9 +64,13 @@ spdlog = "1.*"
 sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
+meson = "=1.12.1"
 openssl = "*"
 xxhash = "0.8.*"
 libcurl = "*"
+tomlplusplus = "*"
+# RAPIDS 26.10 / UCXX 0.52 requires UCX <1.22.
+ucx = "=1.21.0"
 pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
@@ -120,7 +127,7 @@ args = [{ arg = "output_dir", default = "telemetry_data" }]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
-cuda-version = "13.4.*"
+cuda-version = "13.5.*"
 libcudf = "==26.10.02"
 libcuvs = "==26.10.00"
 
@@ -143,6 +150,8 @@ CUDAARCHS = "75-real;80-real;86-real;89-real;90a-real;100-real;120-real"
 VCPKG_CUDA_VERSION = "12"
 
 [feature.vcpkg.dependencies]
+autoconf = "*"
+automake = "*"
 # Enable S3 use for vcpkg cache
 awscli = "*"
 bison = "*"
@@ -150,6 +159,7 @@ libnvjitlink-dev = "*"
 cuda-nvrtc-dev = "*"
 libcurand-dev = "*"
 flex = "*"
+libtool = "*"
 patchelf = "*"
 zip = "*"
 
