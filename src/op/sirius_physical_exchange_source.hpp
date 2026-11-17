@@ -19,6 +19,7 @@
 #include "exchange/transport.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <functional>
 #include <memory>
 #include <set>
 
@@ -75,6 +76,13 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   /// Where to make the one empty batch handed on when the stream ends having brought nothing.
   void set_memory_space(cucascade::memory::memory_space& gpu);
 
+  /// Hands out no batch until @p ready returns true; asked for a task meanwhile, the source
+  /// waits on this rank's own producer. For a consumer that needs something this rank's producer
+  /// pipeline makes first: a peer that is ahead may send before this rank has it. A task of that
+  /// pipeline must be what makes @p ready true, since a finished task of it schedules this
+  /// source again. Set while planning; @p ready is called from the task creator's threads.
+  void hold_until(std::function<bool()> ready);
+
   /// Arrivals and the last sender's end schedule this pipeline's source, under a work lease of
   /// the query lifecycle when there is one.
   void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
@@ -92,8 +100,9 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 
-  /// READY with a batch (or an error) to hand out; else WAITING on this rank's unfinished
-  /// producer; else nothing until an arrival schedules it.
+  /// READY with a batch to hand out and nothing holding it (see hold_until()), or with an
+  /// error; else WAITING on this rank's unfinished producer; else nothing until an arrival
+  /// schedules it.
   [[nodiscard]] std::optional<task_creation_hint> get_next_task_hint() override;
 
   /// Nothing queued and nothing more to come from any sender. With the base check that this
@@ -119,6 +128,8 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
   std::shared_ptr<exchange::exchange_service> _service;
   exchange::stream_id _stream;
   std::shared_ptr<state> _state;
+  /// See hold_until(); empty: nothing is held.
+  std::function<bool()> _ready;
 };
 
 }  // namespace sirius::op

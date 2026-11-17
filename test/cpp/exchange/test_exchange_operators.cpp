@@ -45,6 +45,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -544,6 +545,55 @@ TEST_CASE("an exchange source hints READY with data, waits while open, ends when
   sink.finalize_operator();
   CHECK(source.all_ports_empty());
   CHECK_FALSE(source.get_next_task_hint().has_value());
+}
+
+TEST_CASE("a held exchange source hands out nothing until it is released, except its failure",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  std::atomic<bool> released{false};
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, 8, std::set<rank_t>{0, 1}, false);
+  source.hold_until([&] { return released.load(); });
+  // Both ranks send and end while the source is held: a peer may be that far ahead.
+  for (rank_t r = 0; r < 2; ++r) {
+    sirius_physical_exchange_sink sink(
+      key_value_types(), 0, c.all[r].service, 8, exchange_spec{.routing = mode::gather});
+    sink_batch(sink, key_value_batch(r, 0));
+    sink.finalize_operator();
+  }
+  // Rank 1's batch crosses the transport; wait until the source has heard both ends.
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (source.get_next_task_hint().has_value()) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  // Everything is here and nothing is handed out, yet the pipeline is not over.
+  CHECK(source.get_next_task_input_data() == nullptr);
+  CHECK_FALSE(source.all_ports_empty());
+
+  released        = true;
+  auto const hint = source.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == sirius::op::TaskCreationHint::READY);
+  auto got = flat(drain(source));
+  std::sort(got.begin(), got.end());
+  CHECK(got == all_keys(2, 1));
+
+  // A failure is not held back: the query must end.
+  sirius_physical_exchange_source failing(
+    key_value_types(), 0, c.all[0].service, sirius::exchange::make_stream_id(3, 1), {0, 1}, false);
+  failing.hold_until([] { return false; });
+  c.all[1].service->abort(3, "rank 1 failed");
+  auto const failed_by = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  for (auto h = failing.get_next_task_hint();
+       !h.has_value() || h->hint != sirius::op::TaskCreationHint::READY;
+       h = failing.get_next_task_hint()) {
+    REQUIRE(std::chrono::steady_clock::now() < failed_by);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  CHECK_THROWS_WITH(failing.get_next_task_input_data(),
+                    Catch::Matchers::ContainsSubstring("rank 1 failed"));
 }
 
 TEST_CASE("a stream that brings nothing hands on one empty batch, unless nothing is sent to it",

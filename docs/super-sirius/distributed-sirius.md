@@ -158,7 +158,14 @@ neither routed nor sent, so a range exchange needs no boundaries when no rank ha
   batches, as a local producer would: a hash join, for one, waits for a batch on each side. A rank
   that a gather does not target hands on none, since an aggregate there would make a row of
   nothing.
-- A failed exchange is the exception of the source's next task.
+- **Held** (`hold_until()`), a source hands out nothing until its condition holds, and waits on
+  this rank's own producer meanwhile. The source of an `ORDER BY`'s range exchange is held until
+  this rank's `SORT_SAMPLE` has stored its boundaries: every rank finishes the boundary
+  all-gather at its own time, and one that is ahead sends rows that this rank's `SORT_PARTITION`
+  cannot split yet. The boundary task belongs to the producer pipeline, whose finished tasks
+  schedule the source again. What arrives meanwhile waits in the source's port repository, where
+  it can spill. `SORT_PARTITION` throws if a batch reaches it earlier all the same.
+- A failed exchange is the exception of the source's next task, held or not.
 
 `exchange_service` is one process's end of every exchange. It holds what arrives for a stream
 before the stream's source is planned, and replays it when the source attaches.

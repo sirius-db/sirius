@@ -435,6 +435,10 @@ struct rewriter {
         auto& sink = insert(partition.children[0], std::move(spec), false);
         // The sample, now below the sink, takes its boundaries from every rank's sample.
         install_sort_boundaries(sample, sink, service, stream(), *gpu);
+        // SORT_PARTITION splits what arrives on this rank's boundaries, which its SORT_SAMPLE
+        // stores after the all-gather: a rank that has stored its own may send before then.
+        partition.children[0]->Cast<op::sirius_physical_exchange_source>().hold_until(
+          [&sample] { return sample.boundaries_computed(); });
         return done(placement::ranged);
       }
 

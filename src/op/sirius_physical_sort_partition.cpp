@@ -57,6 +57,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
+  // After a range exchange the sample runs in another pipeline. Passing rows through to
+  // partition 0 before it has stored this process's boundaries would mix every range into one
+  // partition: the exchange's source holds its batches until then.
+  if (_sample_op && _sample_op->cross_rank_boundaries() != nullptr &&
+      !_sample_op->boundaries_computed()) {
+    throw internal_exception("Sort partition: a batch arrived before the sort boundaries");
+  }
+
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",

@@ -701,6 +701,11 @@ Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
 
+In one process SORT_SAMPLE runs in the same pipeline, so the boundaries exist before any batch
+arrives. After a distributed plan's range exchange it does not, and the exchange's source holds
+its batches until the boundaries are stored (see [distributed-sirius.md](distributed-sirius.md));
+a batch that arrives before them is an error, not a pass-through to partition 0.
+
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **Files:** `src/op/sirius_physical_merge_sort.hpp`, `src/op/sirius_physical_merge_sort.cpp`, `src/op/merge/` (`merge_config`, `windowed_merge_input`, `windowed_merge`, `bounded_kway_merge`, `merge_chunk_position`, `detail/`)
 

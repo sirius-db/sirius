@@ -29,6 +29,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <op/sirius_physical_sort_partition.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
@@ -275,6 +276,38 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
     CHECK(hook->key_columns[0] == 0);
     CHECK(hook->num_parts[0] == 1);
   }
+}
+
+TEST_CASE("SORT_PARTITION refuses a batch before a cross-rank sample has stored its boundaries",
+          "[physical_sort_sample][sort_partition]")
+{
+  // After a range exchange the sample is in another pipeline, and a peer can send before this
+  // process has its boundaries. Passing such a batch through would put it in partition 0.
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  auto sample_op = make_sort_sample(100000);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+  sirius_physical_sort_partition partition_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    {0},
+    1000);
+  partition_op.set_sample_op(&sample_op);
+  pipelineable_operator_data input{std::vector<std::shared_ptr<cucascade::data_batch>>{
+    make_numeric_batch<int32_t>(*space, {1, 2, 3}, cudf::type_id::INT32)}};
+
+  // Its own sample, in its own pipeline: the batch passes through as one partition.
+  CHECK(batch_count(*partition_op.execute(input, cudf::get_default_stream())) == 1);
+
+  sample_op.set_cross_rank_boundaries(std::make_shared<recording_boundaries>());
+  CHECK_THROWS_WITH(partition_op.execute(input, cudf::get_default_stream()),
+                    Catch::Matchers::ContainsSubstring("before the sort boundaries"));
+
+  pipelineable_operator_data empty{std::vector<std::shared_ptr<cucascade::data_batch>>{}};
+  (void)sample_op.execute(empty, cudf::get_default_stream());
+  REQUIRE(sample_op.boundaries_computed());
+  CHECK(batch_count(*partition_op.execute(input, cudf::get_default_stream())) == 1);
 }
 
 TEST_CASE("sirius_physical_sort_sample with no input ends with one partition, whatever its keys",
