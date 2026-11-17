@@ -38,14 +38,20 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 - `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
 - Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 
-### Build Requirements
+## Using Sirius as a DuckDB Extension
 
-- Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+Sirius is available as a DuckDB core extension since **DuckDB v2.0.1**, on Linux (`linux_amd64` and `linux_arm64`). This is the quickest way to try Sirius: install and load it from any DuckDB client.
+
+```sql
+INSTALL sirius;
+LOAD sirius;
+```
+
+`LOAD sirius` picks the Sirius backend that matches your NVIDIA driver (CUDA 12 or CUDA 13) and downloads it on first use. Once it's loaded, supported queries run on the GPU with no query changes. For details on backends, CPU fallback, updating and settings, see the [Sirius extension page](https://duckdb.org/docs/2.0/core_extensions/sirius) in the DuckDB documentation.
 
 ## Installing a Prebuilt Sirius Release
 
-Getting started? Download one of our prebuilt extensions instead of building from source:
+Prebuilt Sirius extensions are also published as GitHub releases, which you can use without building from source:
 
 - [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): a maintainer-selected build, promoted manually
 - [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): tracks the newest successful build on `main` automatically, possible to encounter breaking changes
@@ -53,11 +59,16 @@ Getting started? Download one of our prebuilt extensions instead of building fro
 Both include full install instructions in the release notes: installing a matching DuckDB
 version, downloading the right binary for your platform, and a sample query to try it with.
 
-## Building and Running Sirius
+## Building Sirius from Source
 
-For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
+Build from source to use the latest code on `main`, make changes to Sirius, or run its tests. For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-Quick start:
+### Build Requirements
+
+- Git (to clone the repo)
+- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+
+### Quick Start
 
 ```bash
 git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
