@@ -44,22 +44,28 @@ constexpr std::uint64_t mib = 1024ULL * 1024;
 
 constexpr build_fold_limits roomy_limits{.max_resident_bytes = 1024 * mib};
 
-/// A 1000-row build at exactly the hash-table width per row, above a 1-byte CONCAT target.
+/**
+ * @brief A 1000-row build at exactly the hash-table width per row, above a 1-byte CONCAT target.
+ */
 constexpr build_fold_inputs foldable{.rows               = 1000,
                                      .resident_bytes     = 1000 * bytes_per_row,
                                      .concat_batch_bytes = 1,
                                      .num_gpus           = 1,
                                      .mode               = HASH_JOIN_MODE::STANDARD};
 
+/**
+ * @brief Applies `build_fold_policy::BOUNDED`, checking that it ignores dynamic-filter state.
+ */
 bool bounded(build_fold_inputs const& inputs, build_fold_limits limits = roomy_limits)
 {
-  bool const folds = decide_build_fold(inputs, limits, build_fold_policy::bounded, false);
-  // The bounded rule never reads dynamic-filter state.
-  REQUIRE(decide_build_fold(inputs, limits, build_fold_policy::bounded, true) == folds);
+  bool const folds = decide_build_fold(inputs, limits, build_fold_policy::BOUNDED, false);
+  REQUIRE(decide_build_fold(inputs, limits, build_fold_policy::BOUNDED, true) == folds);
   return folds;
 }
 
-/// The predicate `bind_partition_inputs` applied before `decide_build_fold`, restated verbatim.
+/**
+ * @brief The fold predicate `bind_partition_inputs` used before `decide_build_fold`, restated.
+ */
 bool predicate_before_rule(build_fold_inputs const& inputs,
                            build_fold_limits limits,
                            bool publishes_filters)
@@ -74,10 +80,10 @@ TEST_CASE("decide_build_fold never folds under the never policy", "[partition][b
 {
   auto const publishes_filters = GENERATE(false, true);
   CHECK_FALSE(
-    decide_build_fold(foldable, roomy_limits, build_fold_policy::never, publishes_filters));
+    decide_build_fold(foldable, roomy_limits, build_fold_policy::NEVER, publishes_filters));
   build_fold_inputs wide = foldable;
   wide.resident_bytes    = 512 * mib;
-  CHECK_FALSE(decide_build_fold(wide, roomy_limits, build_fold_policy::never, publishes_filters));
+  CHECK_FALSE(decide_build_fold(wide, roomy_limits, build_fold_policy::NEVER, publishes_filters));
 }
 
 TEST_CASE("decide_build_fold legacy policy equals the filter-coupled predicate",
@@ -99,7 +105,7 @@ TEST_CASE("decide_build_fold legacy policy equals the filter-coupled predicate",
             INFO("rows=" << r.value_or(0) << " known=" << r.has_value() << " resident=" << bytes
                          << " concat=" << target << " filters=" << publishes_filters);
             CHECK(decide_build_fold(
-                    inputs, limits, build_fold_policy::legacy_filter_coupled, publishes_filters) ==
+                    inputs, limits, build_fold_policy::LEGACY_FILTER_COUPLED, publishes_filters) ==
                   predicate_before_rule(inputs, limits, publishes_filters));
           }
         }
@@ -186,14 +192,14 @@ TEST_CASE("build_fold_policy names round-trip", "[partition][build_fold]")
 {
   static_assert(sirius::op::build_fold_policy_names.size() == 3);
   using sirius::op::parse_build_fold_policy;
-  for (auto const policy : {build_fold_policy::legacy_filter_coupled,
-                            build_fold_policy::never,
-                            build_fold_policy::bounded}) {
+  for (auto const policy : {build_fold_policy::LEGACY_FILTER_COUPLED,
+                            build_fold_policy::NEVER,
+                            build_fold_policy::BOUNDED}) {
     CHECK(parse_build_fold_policy(sirius::op::to_string(policy)) == policy);
   }
-  CHECK(sirius::op::to_string(build_fold_policy::legacy_filter_coupled) == "legacy_filter_coupled");
-  CHECK(sirius::op::to_string(build_fold_policy::never) == "never");
-  CHECK(sirius::op::to_string(build_fold_policy::bounded) == "bounded");
+  CHECK(sirius::op::to_string(build_fold_policy::LEGACY_FILTER_COUPLED) == "legacy_filter_coupled");
+  CHECK(sirius::op::to_string(build_fold_policy::NEVER) == "never");
+  CHECK(sirius::op::to_string(build_fold_policy::BOUNDED) == "bounded");
   CHECK_FALSE(parse_build_fold_policy("").has_value());
   CHECK_FALSE(parse_build_fold_policy("Bounded").has_value());
   CHECK_FALSE(parse_build_fold_policy("legacy").has_value());
@@ -201,7 +207,7 @@ TEST_CASE("build_fold_policy names round-trip", "[partition][build_fold]")
 
 TEST_CASE("operator defaults select the legacy build fold rule", "[partition][build_fold]")
 {
-  CHECK(sirius::operator_params{}.build_fold_policy == build_fold_policy::legacy_filter_coupled);
+  CHECK(sirius::operator_params{}.build_fold_policy == build_fold_policy::LEGACY_FILTER_COUPLED);
   CHECK(sirius::operator_params::with_batch_size(mib).build_fold_policy ==
-        build_fold_policy::legacy_filter_coupled);
+        build_fold_policy::LEGACY_FILTER_COUPLED);
 }

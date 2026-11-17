@@ -555,7 +555,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     auto const& params = duckdb::session_operator_params(*con.context);
-    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::LEGACY_FILTER_COUPLED);
     for (auto const* policy : {"never", "bounded", "legacy_filter_coupled"}) {
       result = con.Query(std::string("SET build_fold_policy = '") + policy + "'");
       REQUIRE(result != nullptr);
@@ -574,7 +574,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     CHECK(result->GetErrorType() == duckdb::ExceptionType::INVALID_INPUT);
     CHECK_THAT(result->GetError(),
                Catch::Matchers::ContainsSubstring("legacy_filter_coupled, never, bounded"));
-    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::LEGACY_FILTER_COUPLED);
     result = con.Query("SELECT 1");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -584,7 +584,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET build_fold_policy");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::legacy_filter_coupled);
+    REQUIRE(params.build_fold_policy == sirius::op::build_fold_policy::LEGACY_FILTER_COUPLED);
   }
 }
 

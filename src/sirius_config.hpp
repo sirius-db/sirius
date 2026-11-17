@@ -238,7 +238,7 @@ struct operator_params {
 
   /// Engine-owned rule deciding whether a single-partition STANDARD or MIXED_JOIN build folds into
   /// one batch (`op::decide_build_fold`). Test hooks select another rule for ablation.
-  op::build_fold_policy build_fold_policy = op::build_fold_policy::legacy_filter_coupled;
+  op::build_fold_policy build_fold_policy = op::build_fold_policy::LEGACY_FILTER_COUPLED;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is

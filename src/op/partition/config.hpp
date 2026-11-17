@@ -30,8 +30,11 @@
 
 namespace sirius::config {
 
-/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
-/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
+/**
+ * @brief Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
+ *
+ * Capacity rounding and auxiliary allocations are excluded; this is a planning estimate.
+ */
 inline constexpr std::uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 }  // namespace sirius::config
@@ -40,29 +43,26 @@ namespace sirius::op {
 
 /**
  * @brief Selects the rule `decide_build_fold` applies.
+ *
+ * `LEGACY_FILTER_COUPLED` is the rule that predates `decide_build_fold`: fold when the join
+ * publishes dynamic filters and the build fits the resident limit and the cuDF row limit. `NEVER`
+ * never folds. `decide_build_fold` states the exact `BOUNDED` conditions. No policy affects
+ * BUILD_PROBE joins, whose build is always one batch, or builds whose CONCAT is `concat_all` from
+ * planning.
  */
 enum class build_fold_policy : std::uint8_t {
-  /**
-   * @brief Fold when the join publishes dynamic filters and the build fits the resident limit and
-   * the cuDF row limit: the rule that predates `decide_build_fold`.
-   */
-  legacy_filter_coupled,
-  /** @brief Never fold; only builds that are `concat_all` from planning stay whole. */
-  never,
-  /**
-   * @brief Fold when the folded build is known to fit cuDF and the resident limit, its estimated
-   * hash table is no larger than the build, and folding changes the CONCAT's grouping.
-   */
-  bounded,
+  LEGACY_FILTER_COUPLED,  ///< Fold when the join publishes dynamic filters, within limits
+  NEVER,                  ///< Never fold
+  BOUNDED,                ///< Fold under the conditions `decide_build_fold` states
 };
 
 /**
  * @brief Every `build_fold_policy` with its spelling in the `build_fold_policy` setting.
  */
 inline constexpr std::array build_fold_policy_names{
-  std::pair{build_fold_policy::legacy_filter_coupled, std::string_view{"legacy_filter_coupled"}},
-  std::pair{build_fold_policy::never, std::string_view{"never"}},
-  std::pair{build_fold_policy::bounded, std::string_view{"bounded"}},
+  std::pair{build_fold_policy::LEGACY_FILTER_COUPLED, std::string_view{"legacy_filter_coupled"}},
+  std::pair{build_fold_policy::NEVER, std::string_view{"never"}},
+  std::pair{build_fold_policy::BOUNDED, std::string_view{"bounded"}},
 };
 
 /**

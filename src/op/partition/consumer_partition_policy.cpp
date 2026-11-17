@@ -48,7 +48,10 @@ void install_placement(sirius_physical_partition_consumer_operator& consumer,
   consumer.set_placement(std::make_shared<partition_placement const>(strategy.placement));
 }
 
-/// One `[build_fold]` line per decision, so measurements can be attributed to each join's fold.
+/**
+ * @brief Logs one `[build_fold]` line per decision, so measurements can be attributed to each
+ * join's fold.
+ */
 void log_build_fold(sirius_physical_hash_join const& join,
                     build_fold_inputs const& inputs,
                     bool publishes_filters,

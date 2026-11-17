@@ -45,9 +45,9 @@ bool decide_build_fold(build_fold_inputs const& inputs,
     // reap the benefits of dynamic filtering. Now, dynamic filters are constructed for all join
     // modes, so the coupling is no longer necessary. For the time being, keep continuity with
     // existing production, but revisit in the future.
-    case build_fold_policy::legacy_filter_coupled: return publishes_filters && fits;
-    case build_fold_policy::never: return false;
-    case build_fold_policy::bounded:
+    case build_fold_policy::LEGACY_FILTER_COUPLED: return publishes_filters && fits;
+    case build_fold_policy::NEVER: return false;
+    case build_fold_policy::BOUNDED:
       // clang-format off
       return fits &&
              memory::saturating_mul(*inputs.rows, config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW) <=

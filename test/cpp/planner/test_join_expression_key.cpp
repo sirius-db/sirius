@@ -483,14 +483,14 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   };
   using sirius::op::build_fold_policy;
 
-  CHECK(planned_policy(*con) == build_fold_policy::legacy_filter_coupled);
+  CHECK(planned_policy(*con) == build_fold_policy::LEGACY_FILTER_COUPLED);
   execute(*con, "SET build_fold_policy = 'never'");
-  CHECK(planned_policy(*con) == build_fold_policy::never);
-  CHECK(planned_policy(other) == build_fold_policy::legacy_filter_coupled);
+  CHECK(planned_policy(*con) == build_fold_policy::NEVER);
+  CHECK(planned_policy(other) == build_fold_policy::LEGACY_FILTER_COUPLED);
   execute(other, "SET build_fold_policy = 'bounded'");
-  CHECK(planned_policy(other) == build_fold_policy::bounded);
-  CHECK(planned_policy(*con) == build_fold_policy::never);
+  CHECK(planned_policy(other) == build_fold_policy::BOUNDED);
+  CHECK(planned_policy(*con) == build_fold_policy::NEVER);
   execute(*con, "RESET build_fold_policy");
-  CHECK(planned_policy(*con) == build_fold_policy::legacy_filter_coupled);
+  CHECK(planned_policy(*con) == build_fold_policy::LEGACY_FILTER_COUPLED);
   execute(other, "RESET build_fold_policy");
 }

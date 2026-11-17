@@ -1854,9 +1854,9 @@ TEST_CASE("the build fold policy decides whether a single-partition build CONCAT
           "[physical_partition][build_fold]")
 {
   auto const policy = GENERATE(
-    build_fold_policy::legacy_filter_coupled, build_fold_policy::never, build_fold_policy::bounded);
+    build_fold_policy::LEGACY_FILTER_COUPLED, build_fold_policy::NEVER, build_fold_policy::BOUNDED);
   bool const mixed_filter = GENERATE(false, true);
-  // A zero BUILD_PROBE table budget keeps an INNER join STANDARD; the default admits BUILD_PROBE,
+  // A zero BUILD_PROBE table budget keeps an INNER join STANDARD; the default allows BUILD_PROBE,
   // whose fold does not consult the rule. A mixed join never runs BUILD_PROBE.
   uint64_t const table_budget =
     GENERATE(uint64_t{0}, sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
@@ -1914,8 +1914,8 @@ TEST_CASE("the build fold policy decides whether a single-partition build CONCAT
     CHECK(decisions.empty());
     return;
   }
-  bool const expected = policy == build_fold_policy::bounded ||
-                        (policy == build_fold_policy::legacy_filter_coupled && mixed_filter);
+  bool const expected = policy == build_fold_policy::BOUNDED ||
+                        (policy == build_fold_policy::LEGACY_FILTER_COUPLED && mixed_filter);
   CHECK(build_concat.concat_all() == expected);
   REQUIRE(decisions.size() == 1);
   auto const& line = decisions.front();
