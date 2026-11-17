@@ -429,6 +429,7 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[pipeline][finalize_listener]` | The callbacks run when an operator's pipeline ends |
 | `[exchange][nixl]` | Two ranks in one process over NIXL |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
+| `scripts/distributed_test_order_by.sh` | `ORDER BY` end to end against DuckDB's answer, order included: several sort partitions per rank, every merge mode, `ASC`/`DESC`, NULL placement, string keys, ranks with no rows, `LIMIT`: `pixi run scripts/distributed_test_order_by.sh 4` |
 | `[dynamic_filter][probe]` | Merging two Blooms of one capacity |
 
 ## Files
@@ -444,4 +445,4 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/op/cross_rank_sort_boundaries.hpp`, `src/op/distributed/sample_all_gather_boundaries.*` | `SORT_SAMPLE`'s boundary interface; boundaries from every rank's sample |
 | `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
 | `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
-| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers |
+| `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh`, `distributed_test_order_by.sh` | Launchers |
