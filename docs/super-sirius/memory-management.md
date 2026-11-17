@@ -84,8 +84,11 @@ mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `ur
 `cufile`. These DISK contexts are independent of the scan backend; the removed kvikIO
 backend is not supported for reads or writes.
 
-Factory contexts own private staging rather than borrowing Sirius's HOST allocator
-(uring uses 64 MiB of portable pinned staging per reactor). Destruction stops/drains reactor
+A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
+(64 MiB of portable pinned staging per reactor). A cuFile one borrows its pinned host
+scratch from the HOST space of the GPU's NUMA node for each transfer and gives it back
+before the transfer settles; device-write bodies on a real GDS host go through the same
+registered GPU staging slots as scan reads. Destruction stops/drains reactor
 workers before releasing their staging. The weak default cache does not prolong that
 lifetime; spill representations and contexts must still be released before CUDA/RMM global
 teardown, including in debug builds. Each conversion retains its context, file object and
