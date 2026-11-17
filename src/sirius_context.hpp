@@ -22,6 +22,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "log/sink.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -56,6 +57,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -1127,6 +1129,28 @@ class SiriusContext : public ClientContextState {
 /// still select it. An unknown backend throws only when `db` is non-null, so the
 /// null (best-effort) path never throws.
 void install_configured_log_sink(DatabaseInstance* db);
+
+/// Makes a Sirius load all-or-nothing for the process-wide logging state. It holds
+/// `Config::logging_mutex` for the whole load, so loads and logging settings (`SET sirius_log_*`,
+/// the FFI) cannot interleave with it, and a load that is not committed restores the log sink and
+/// `Config::LOG_*` values it found.
+class logging_load_transaction {
+ public:
+  logging_load_transaction();
+  ~logging_load_transaction();
+  logging_load_transaction(logging_load_transaction const&)            = delete;
+  logging_load_transaction& operator=(logging_load_transaction const&) = delete;
+
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  std::unique_lock<std::recursive_mutex> log_lock_;
+  std::shared_ptr<sirius::log::sink> previous_sink_;
+  std::string previous_backend_;
+  std::string previous_dir_;
+  std::string previous_level_;
+  bool committed_ = false;
+};
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions

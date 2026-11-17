@@ -24,9 +24,11 @@
 
 #include <duckdb.hpp>  // IWYU pragma: keep
 
+#include <chrono>
 #include <memory>
 #include <source_location>
 #include <string>
+#include <thread>
 
 using sirius::log::level;
 
@@ -158,5 +160,36 @@ TEST_CASE("a successful load keeps the sink it installs", "[log]")
 
   duckdb::DuckDB db(nullptr);
   CHECK(sirius::log::get_sink() != previous);
+  CHECK(duckdb::Config::LOG_BACKEND == "duckdb");
+}
+
+TEST_CASE("a logging setting made during a failing load survives its rollback", "[log]")
+{
+  sink_restorer restore_sink;
+  log_backend_restorer restore_backend;
+  sirius::util::env_guard disable_env("SIRIUS_DISABLE", "1");
+  duckdb::Config::LOG_BACKEND = "noop";
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  std::thread setter;
+  bool set_ok = false;
+  {
+    duckdb::logging_load_transaction failing_load;
+    duckdb::Config::LOG_BACKEND = "spdlog";  // the load's own change
+    // Logging writers in other threads wait for the load to finish.
+    bool other_thread_locked = true;
+    std::thread([&] {
+      other_thread_locked = duckdb::Config::logging_mutex.try_lock();
+      if (other_thread_locked) { duckdb::Config::logging_mutex.unlock(); }
+    }).join();
+    CHECK_FALSE(other_thread_locked);
+    setter =
+      std::thread([&] { set_ok = !con.Query("SET sirius_log_backend = 'duckdb'")->HasError(); });
+    // Without the lock, the setter would usually finish here and be rolled back.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  setter.join();
+  CHECK(set_ok);
   CHECK(duckdb::Config::LOG_BACKEND == "duckdb");
 }

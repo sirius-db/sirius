@@ -2383,6 +2383,28 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
+logging_load_transaction::logging_load_transaction()
+  : log_lock_(Config::logging_mutex),
+    previous_sink_(sirius::log::get_sink()),
+    previous_backend_(Config::LOG_BACKEND),
+    previous_dir_(Config::LOG_DIR),
+    previous_level_(Config::LOG_LEVEL)
+{
+}
+
+logging_load_transaction::~logging_load_transaction()
+{
+  if (committed_) { return; }
+  Config::LOG_BACKEND = std::move(previous_backend_);
+  Config::LOG_DIR     = std::move(previous_dir_);
+  Config::LOG_LEVEL   = std::move(previous_level_);
+  try {
+    if (sirius::log::get_sink() != previous_sink_) { sirius::log::set_sink(previous_sink_); }
+  } catch (...) {
+    // Flushing the discarded sink failed; the load's own error is the one to report.
+  }
+}
+
 SiriusContextExtensionCallback::SiriusContextExtensionCallback(DatabaseInstance* db)
   : disabled_(sirius_disabled_by_env())
 {
