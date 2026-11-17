@@ -61,11 +61,13 @@ class bounds_accumulator final {
   };
 
   /**
-   * @brief Leases every numeric key's slots on every GPU of @p targets, without waiting on the
+   * @brief Leases every numeric key's slots on every GPU of `targets`, without waiting on the
    * host.
    *
    * @throw accumulation_invariant_error if a key's recorded type has no supported bounds
+   * @param keys The keys whose bounds are accumulated
    * @param batches Batches of the build: the number of slots per key
+   * @param targets The GPUs to lease slots on, with their memory spaces
    * @return The accumulator, or nullopt iff a lease was refused, after releasing everything built
    * so far
    */
@@ -76,13 +78,13 @@ class bounds_accumulator final {
 
   /**
    * @brief An upper bound on the task scratch one numeric key's `enqueue_add` takes from a batch of
-   * up to @p rows rows: the temporaries of its two reductions, for the widest storage type.
+   * up to `rows` rows: the temporaries of its two reductions, for the widest storage type.
    */
   [[nodiscard]] static std::size_t contribution_scratch_bytes(std::size_t rows);
 
   /**
-   * @brief An upper bound on what `finish` takes from its resource at once when @p
-   * narrowed_carriers carriers, summed over the keys, differ from their key's recorded type: the
+   * @brief An upper bound on what `finish` takes from its resource at once when
+   * `narrowed_carriers` carriers, summed over the keys, differ from their key's recorded type: the
    * restored pairs held for one read, and the temporaries of the restore in progress.
    */
   [[nodiscard]] static std::size_t finish_scratch_bytes(std::size_t narrowed_carriers) noexcept;
@@ -94,20 +96,20 @@ class bounds_accumulator final {
   bounds_accumulator& operator=(bounds_accumulator&&) noexcept;
 
   /**
-   * @brief Writes @p input's bounds of every key into slot @p batch_index.
+   * @brief Writes `input`'s bounds of every key into slot `batch_index`.
    *
    * Thread-safe across distinct batches. A batch without valid rows of a key leaves that key's slot
    * empty; that is known on the host from the column's null count. Numeric keys never wait on the
-   * host: temporaries come from @p scratch, and the partial's stream then waits for the writes.
+   * host: temporaries come from `scratch`, and the partial's stream then waits for the writes.
    * STRING keys wait for their two reductions, whose results land in pinned host memory rather than
-   * in @p scratch, then store the strings under an internal leaf mutex that is never held across
+   * in `scratch`, then store the strings under an internal leaf mutex that is never held across
    * CUDA work.
    *
-   * @pre Each batch index is contributed at most once, @p input holds every key column at its
-   * ordinal, and the caller retires @p stream before releasing @p input
-   * @throw accumulation_invariant_error if @p batch_index is out of range, @p stream belongs to
+   * @pre Each batch index is contributed at most once, `input` holds every key column at its
+   * ordinal, and the caller retires `stream` before releasing `input`
+   * @throw accumulation_invariant_error if `batch_index` is out of range, `stream` belongs to
    * another GPU, or a column's type has no supported bounds
-   * @return false, before anything is enqueued, iff @p device holds no partial
+   * @return false, before anything is enqueued, iff `device` holds no partial
    */
   [[nodiscard]] bool enqueue_add(std::size_t batch_index,
                                  cudf::table_view const& input,
@@ -120,21 +122,21 @@ class bounds_accumulator final {
    *
    * The bounds become device scalars only when a filter needs them (`to_scalars`), so the caller
    * decides where, and whether, that memory is taken.
+   *
+   * `storage_bounds` holds a numeric, temporal, decimal, or BOOL8 key's minimum and maximum by
+   * integer storage. `fits_membership_rep` is the `column_values_fit` rule applied to a DECIMAL128
+   * key's bounds against its int64 membership rep, and is true for every other type.
    */
   struct key_bounds {
-    /** @brief A numeric, temporal, decimal, or BOOL8 key's minimum and maximum by integer storage
-     */
-    using storage_bounds = std::pair<__int128_t, __int128_t>;
-    /** @brief A STRING key's minimum and maximum */
-    using string_bounds = std::pair<std::string, std::string>;
+    using storage_bounds =
+      std::pair<__int128_t, __int128_t>;  ///< Integer-storage bounds of a non-STRING key
+    using string_bounds =
+      std::pair<std::string, std::string>;  ///< A STRING key's minimum and maximum
 
-    /** @brief The key's recorded type */
-    cudf::data_type type;
-    /** @brief The smallest and the largest valid value */
-    std::variant<storage_bounds, string_bounds> values;
-    /** @brief Whether a DECIMAL128 key's values fit its int64 membership rep (the
-     * `column_values_fit` rule applied to the bounds); true for every other type */
-    bool fits_membership_rep;
+    cudf::data_type type;  ///< The key's recorded type
+    std::variant<storage_bounds, string_bounds>
+      values;                  ///< The smallest and the largest valid value
+    bool fits_membership_rep;  ///< Whether the values fit the membership rep
 
     /**
      * @brief Device bytes `to_scalars` takes from its resource: each bound's value (a STRING's
@@ -143,7 +145,7 @@ class bounds_accumulator final {
     [[nodiscard]] std::size_t device_bytes() const noexcept;
 
     /**
-     * @brief The minimum and the maximum as scalars of `type`, with storage from @p mr; never waits
+     * @brief The minimum and the maximum as scalars of `type`, with storage from `mr`; never waits
      * on the host.
      */
     [[nodiscard]] std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>
@@ -151,7 +153,7 @@ class bounds_accumulator final {
   };
 
   /**
-   * @brief Device bytes `key_bounds::to_scalars` takes for a key of fixed-width type @p recorded.
+   * @brief Device bytes `key_bounds::to_scalars` takes for a key of fixed-width type `recorded`.
    */
   [[nodiscard]] static std::size_t fixed_width_scalar_bytes(cudf::data_type recorded) noexcept;
 
@@ -160,11 +162,11 @@ class bounds_accumulator final {
    *
    * Waits on the host once for all slots of every GPU. A key that arrived at a carrier other than
    * its recorded type restores that carrier's pair with `restore_scalar` (which waits) and reads
-   * the restored values back, once for all such keys. Temporaries of that restore come from @p mr
+   * the restored values back, once for all such keys. Temporaries of that restore come from `mr`
    * and are released before returning. Must not run concurrently with `enqueue_add`: the caller
    * orders every contribution before it.
    *
-   * @pre The current device is the GPU of @p stream
+   * @pre The current device is the GPU of `stream`
    * @return One entry per key, in key order; none for a key without a valid row in any batch
    */
   [[nodiscard]] std::vector<std::optional<key_bounds>> finish(::cuda::stream_ref stream,

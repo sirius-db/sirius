@@ -61,7 +61,9 @@ namespace acc = sirius::test::accumulation;
 using sirius::test::columns::make_column;
 using sirius::test::columns::to_host;
 
-/// Prepares @p keys at the domain of @p domain_type into an exactly sized column.
+/**
+ * @brief Prepares `keys` at the domain of `domain_type` into an exactly sized column.
+ */
 std::unique_ptr<cudf::column> prepare(cudf::data_type domain_type,
                                       cudf::column_view const& keys,
                                       ::cuda::stream_ref stream)

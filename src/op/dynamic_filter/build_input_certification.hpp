@@ -41,28 +41,28 @@ class sirius_physical_operator;
 /**
  * @brief Why a build input cannot construct dynamic filters
  *
- * `dynamic_filter_publication_session` counts each reason (`input_shape` and `inventory_mismatch`
+ * `dynamic_filter_publication_session` counts each reason (`INPUT_SHAPE` and `INVENTORY_MISMATCH`
  * in `accumulations_skipped_inventory`, the others in `accumulations_declined_<reason>`) and names
  * it in the declined keys' `[dynamic_filter_key]` lines.
  */
 enum class construction_decline : std::uint8_t {
-  input_shape,         ///< Not one single-partition `default` FULL data port with a source
-  pipeline_barrier,    ///< A PIPELINE barrier (an ORDER BY producer) never holds the complete input
-  port_directive,      ///< A late-materialization directive defers input columns
-  inventory_mismatch,  ///< The ledger disagrees with the repository or cannot form an inventory
-  unreadable_arrival,  ///< An arrival whose rows or types the ledger cannot accept
-  compressed_arrival   ///< A compressed arrival, which exposes only its row count
+  INPUT_SHAPE,         ///< Not one single-partition `default` FULL data port with a source
+  PIPELINE_BARRIER,    ///< A PIPELINE barrier (an ORDER BY producer) never holds the complete input
+  PORT_DIRECTIVE,      ///< A late-materialization directive defers input columns
+  INVENTORY_MISMATCH,  ///< The ledger disagrees with the repository or cannot form an inventory
+  UNREADABLE_ARRIVAL,  ///< An arrival whose rows or types the ledger cannot accept
+  COMPRESSED_ARRIVAL   ///< A compressed arrival, which exposes only its row count
 };
 
 [[nodiscard]] constexpr std::string_view to_string(construction_decline reason) noexcept
 {
   switch (reason) {
-    case construction_decline::input_shape: return "input_shape";
-    case construction_decline::pipeline_barrier: return "pipeline_barrier";
-    case construction_decline::port_directive: return "port_directive";
-    case construction_decline::inventory_mismatch: return "inventory_mismatch";
-    case construction_decline::unreadable_arrival: return "unreadable_arrival";
-    case construction_decline::compressed_arrival: return "compressed_arrival";
+    case construction_decline::INPUT_SHAPE: return "input_shape";
+    case construction_decline::PIPELINE_BARRIER: return "pipeline_barrier";
+    case construction_decline::PORT_DIRECTIVE: return "port_directive";
+    case construction_decline::INVENTORY_MISMATCH: return "inventory_mismatch";
+    case construction_decline::UNREADABLE_ARRIVAL: return "unreadable_arrival";
+    case construction_decline::COMPRESSED_ARRIVAL: return "compressed_arrival";
   }
   return "invalid";
 }
@@ -81,12 +81,16 @@ struct build_port_facts {
   bool has_port_directive;         ///< Whether the site has a late-materialization directive
 };
 
-/// The source has not finished; decide again later.
+/**
+ * @brief The source has not finished; decide again later.
+ */
 struct certification_pending {
   [[nodiscard]] bool operator==(certification_pending const&) const = default;
 };
 
-/// Certify the ledger against `build_port_facts::repository_batches`.
+/**
+ * @brief Certify the ledger against `build_port_facts::repository_batches`.
+ */
 struct certification_proceed {
   [[nodiscard]] bool operator==(certification_proceed const&) const = default;
 };
@@ -105,7 +109,7 @@ using certification_decision =
 [[nodiscard]] certification_decision certify_decision(build_port_facts const& facts) noexcept;
 
 /**
- * @brief Reads @p site's input ports as `build_port_facts`
+ * @brief Reads `site`'s input ports as `build_port_facts`
  *
  * Reads whether the source finished before the repository's batch count, so a count read from a
  * finished source is final.

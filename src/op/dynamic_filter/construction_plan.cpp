@@ -51,7 +51,9 @@ std::vector<std::vector<binding_facts>> binding_facts_of(dynamic_filter_publish_
 
 namespace {
 
-/// Bytes one Bloom array of @p blocks blocks occupies, rounded up to the allocation alignment.
+/**
+ * @brief Bytes one Bloom array of `blocks` blocks occupies, rounded up to the allocation alignment.
+ */
 [[nodiscard]] std::optional<std::uint64_t> aligned_bloom_bytes(std::size_t blocks) noexcept
 {
   constexpr auto alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
@@ -62,7 +64,9 @@ namespace {
   return rmm::align_up(raw, alignment);
 }
 
-/// The membership filter `choose_membership_filter` selects for @p valid_rows valid keys.
+/**
+ * @brief The membership filter `choose_membership_filter` selects for `valid_rows` valid keys.
+ */
 [[nodiscard]] membership_plan choose_membership(cudf::data_type type,
                                                 std::size_t valid_rows,
                                                 construction_limits const& limits)
@@ -146,17 +150,17 @@ construction_plan plan_construction(
                                                   key,
                                                   facts.total_rows,
                                                   limits.domain_coverage_threshold,
-                                                  detail::publication_path::construction,
+                                                  detail::publication_path::CONSTRUCTION,
                                                   restorable && (readable || zone_possible));
     if (!restorable) {
       ++counts.keys_skipped_type_mismatch;
-      outcome.reason = dynamic_filter_key_reason::type_mismatch;
+      outcome.reason = dynamic_filter_key_reason::TYPE_MISMATCH;
       continue;
     }
     if (domain && !readable) { counts.bindings_skipped_incompatible_probe += key_bindings.size(); }
     if (gated) {
       ++counts.keys_skipped_domain_gate;
-      outcome.reason = dynamic_filter_key_reason::domain_gate;
+      outcome.reason = dynamic_filter_key_reason::DOMAIN_GATE;
       continue;
     }
 
@@ -183,9 +187,9 @@ construction_plan plan_construction(
     bool const has_membership = !std::holds_alternative<std::monostate>(planned.membership);
     planned.fit_pending = has_membership && construction_type.id() == cudf::type_id::DECIMAL128;
     if (domain && !readable) {
-      outcome.reason = dynamic_filter_key_reason::unreadable_probe;
+      outcome.reason = dynamic_filter_key_reason::UNREADABLE_PROBE;
     } else if (!has_membership && !zone_deliverable) {
-      outcome.reason = dynamic_filter_key_reason::unsupported_type;
+      outcome.reason = dynamic_filter_key_reason::UNSUPPORTED_TYPE;
     }
     if (has_membership || planned.needs_bounds()) { plan.keys.push_back(planned); }
   }
@@ -210,7 +214,7 @@ construction_plan plan_construction(
       planned.fit_pending = false;
       auto const line     = std::ranges::find(
         plan.outcomes, planned.admitted_key_index, &dynamic_filter_key_line::admitted_key_index);
-      line->outcome.reason = dynamic_filter_key_reason::bloom_cap;
+      line->outcome.reason = dynamic_filter_key_reason::BLOOM_CAP;
     }
     counts.keys_skipped_bloom_size_gate += bloom_keys;
     log::log_noexcept([&] {

@@ -31,7 +31,7 @@ namespace sirius::op::detail {
  * @brief Converts a zone-map bound at a narrowed carrier to the key's recorded storage type
  *
  * The bound goes through a one-row column and `cast_through_rep`, so a DATE bound takes the same
- * INT32 tunnel the build column would. Reads the result back, so it waits on @p stream.
+ * INT32 tunnel the build column would. Reads the result back, so it waits on `stream`.
  */
 [[nodiscard]] std::unique_ptr<cudf::scalar> restore_scalar(cudf::scalar const& bound,
                                                            cudf::data_type target,

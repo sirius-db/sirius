@@ -103,15 +103,17 @@ class dynamic_filter_publication_session final {
   void set_join_identity(dynamic_filter_join_identity identity) noexcept;
 
   /**
-   * @brief Starts accumulating against @p input's inventory, or records why its construction site
-   * declined. Call on an untracked thread (the task creator).
+   * @brief Starts accumulating against `input`'s inventory, or records why its construction site
+   * declined.
+   *
+   * Call on an untracked thread (the task creator).
    *
    * Selects the active keys, sizes their shared geometry, requires working peer DMA between every
    * pair of replica GPUs, and allocates zeroed per-GPU partial arrays under per-GPU leases. When it
    * returns false, the session behaves exactly as with accumulation disabled, so a later path may
    * still publish. Transitions the session OPEN -> COLLECTING.
    *
-   * @return true iff accumulation started; false when @p input is a `construction_decline`, no
+   * @return true iff accumulation started; false when `input` is a `construction_decline`, no
    * active key, a zero or over-cap geometry, no peer DMA, a refused lease, a recoverable failure,
    * or the session is not open. The reason is counted.
    */
@@ -228,12 +230,12 @@ class dynamic_filter_publication_session final {
 /**
  * @brief The counts one whole-build publication adds to `dynamic_filter_stats`, and the number of
  * targets that still accepted filters.
+ *
+ * `keys` has one outcome per admitted key of the plan; keys without a binding keep the default.
  */
 struct dynamic_filter_publication_outcome : dynamic_filter_stats_snapshot {
   std::size_t active_targets = 0;
-  /// One outcome per admitted key of the plan, by admitted-key index; keys without a binding keep
-  /// the default.
-  std::vector<dynamic_filter_key_outcome> keys;
+  std::vector<dynamic_filter_key_outcome> keys;  ///< One per admitted key, by admitted-key index
 };
 
 /**

@@ -72,7 +72,7 @@ struct batch_key_facts {
   std::vector<column_facts> columns;  ///< Its top-level columns, by ordinal
 
   /**
-   * @brief The facts of @p table, read from its column views without waiting on the host
+   * @brief The facts of `table`, read from its column views without waiting on the host
    */
   [[nodiscard]] static batch_key_facts of(cudf::table_view const& table);
 };
@@ -86,64 +86,55 @@ class build_filter_construction final {
    * @brief Where one claimed batch writes: its batch index, its GPU, and its exact keys' slices
    */
   struct contribution_ticket {
-    /** @brief The batch's index in the inventory's `batches()`: its bound slot */
-    std::size_t batch_index;
-    /** @brief The GPU that holds the batch */
-    rmm::cuda_device_id device;
-    /** @brief One slice per exact key, in the stager's key order */
-    std::vector<detail::exact_key_stager::slice> slices;
+    std::size_t batch_index;     ///< Index in the inventory's `batches()`: its bound slot
+    rmm::cuda_device_id device;  ///< The GPU that holds the batch
+    std::vector<detail::exact_key_stager::slice>
+      slices;  ///< One per exact key, in stager key order
   };
 
   /**
    * @brief The task that publishes: its GPU's memory space, stream, and allocator
+   *
+   * The room left in `space` is checked before each filter is built on the Publishing GPU, and
+   * publication scratch and those filters are charged to `scratch`.
    */
   struct publication_root {
-    /** @brief The root GPU's memory space; the room left in it is checked before each root filter
-     */
-    cucascade::memory::memory_space& space;
-    /** @brief The publishing task's stream, on the root GPU */
-    ::cuda::stream_ref stream;
-    /** @brief The publishing task's allocator: publication scratch and the root filters are charged
-     * to it */
-    rmm::device_async_resource_ref scratch;
+    cucascade::memory::memory_space& space;  ///< The Publishing GPU's memory space
+    ::cuda::stream_ref stream;  ///< The publishing task's stream, on the Publishing GPU
+    rmm::device_async_resource_ref scratch;  ///< The publishing task's allocator
   };
 
   /**
    * @brief The filters constructed for one planned key, ready for replication and fan-out
+   *
+   * `dropped` is `DECIMAL128_UNFIT`, `CONSTRUCTION_ADMISSION`, or `CONSTRUCTION_INVARIANT`, and
+   * empty when every planned filter was constructed.
    */
   struct constructed_key {
-    /** @brief The key's index in the plan's admitted keys */
-    std::size_t admitted_key_index;
-    /** @brief The key's zone map, if one was planned and constructed */
-    std::shared_ptr<sirius_dynamic_filter> zone_map;
-    /** @brief The key's membership filter, if one was planned and constructed */
-    std::shared_ptr<sirius_dynamic_filter> membership;
-    /** @brief The membership filter's domain, classified from the construction type */
-    std::optional<membership_key_domain> domain;
-    /** @brief Why a planned filter of the key was dropped (`decimal128_unfit`,
-     * `construction_admission`, or `construction_invariant`); empty when every planned filter was
-     * constructed */
-    std::optional<dynamic_filter_key_reason> dropped;
+    std::size_t admitted_key_index;                     ///< Index in the plan's admitted keys
+    std::shared_ptr<sirius_dynamic_filter> zone_map;    ///< Zone map, if planned and built
+    std::shared_ptr<sirius_dynamic_filter> membership;  ///< Membership filter, if planned and built
+    std::optional<membership_key_domain> domain;        ///< Classified from the construction type
+    std::optional<dynamic_filter_key_reason> dropped;   ///< Why a planned filter was dropped
   };
 
   /**
    * @brief Everything `finish` constructed
    */
   struct constructed_filters {
-    /** @brief One entry per planned key, in plan order */
-    std::vector<constructed_key> keys;
-    /** @brief `filters_skipped_construction_admission` and `filters_skipped_construction_invariant`
-     */
-    dynamic_filter_stats_snapshot counts;
-    /** @brief How the Bloom filters reached their replicas, when any key planned one */
-    std::optional<detail::accumulated_bloom_builder::publication_transport> transport;
+    std::vector<constructed_key> keys;     ///< One per planned key, in plan order
+    dynamic_filter_stats_snapshot counts;  ///< The `filters_skipped_construction_*` counters
+    std::optional<detail::accumulated_bloom_builder::publication_transport>
+      transport;  ///< How the Bloom filters reached their replicas, if any key planned one
   };
 
   /**
-   * @brief Leases every accumulator's storage for @p plan over @p inventory on every GPU of @p
-   * targets. Call on an untracked thread (the task creator); waits on the host for nothing.
+   * @brief Leases every accumulator's storage for `plan` over `inventory` on every GPU of
+   * `targets`.
    *
-   * @throw std::logic_error if a planned key's column is absent from @p inventory
+   * Call on an untracked thread (the task creator); waits on the host for nothing.
+   *
+   * @throw std::logic_error if a planned key's column is absent from `inventory`
    * @return The construction, or nullopt iff a lease was refused, after releasing everything built
    * so far
    */
@@ -172,14 +163,17 @@ class build_filter_construction final {
                                                            batch_key_facts const& actual) const;
 
   /**
-   * @brief Adds @p input's keys to every accumulator on the ticket's GPU, without a host wait
+   * @brief Adds `input`'s keys to every accumulator on the ticket's GPU, without a host wait
    * except for STRING zone-map bounds.
    *
-   * If an accumulator fails, the work already accepted on @p stream is joined before the failure
+   * If an accumulator fails, the work already accepted on `stream` is joined before the failure
    * propagates.
    *
-   * @pre @p ticket came from `reserve` for this batch, and the caller retires @p stream before
-   * releasing @p input
+   * @pre `ticket` came from `reserve` for this batch, and the caller retires `stream` before
+   * releasing `input`
+   * @param ticket The batch's ticket from `reserve`
+   * @param input The batch's table
+   * @param stream The contributing task's stream, on the ticket's GPU
    * @param scratch The contributing task's allocator, for temporaries
    * @return false, before anything is enqueued, iff the ticket's GPU holds no storage
    */
@@ -189,7 +183,7 @@ class build_filter_construction final {
                                 rmm::device_async_resource_ref scratch);
 
   /**
-   * @brief Constructs every planned filter on @p root; waits on the host.
+   * @brief Constructs every planned filter on `root`; waits on the host.
    *
    * Runs on the publishing task's thread, which holds the task's reservation on the root GPU. Bloom
    * filters come from their partials. Exact IN-lists and zone maps are built on the root task's
@@ -199,7 +193,7 @@ class build_filter_construction final {
    * bound (`in_list_storage_upper_bound`, or the bound scalars' bytes). A filter without that room,
    * or whose construction runs out of memory anyway, is dropped alone
    * (`filters_skipped_construction_admission`). A DECIMAL128 key whose merged bounds do not fit
-   * int64 publishes no membership filter (`decimal128_unfit`); a staged key that overflowed its
+   * int64 publishes no membership filter (`DECIMAL128_UNFIT`); a staged key that overflowed its
    * slices publishes none either (`filters_skipped_construction_invariant`).
    *
    * Waits on the host for the Bloom merge, the bound slots, the staging gather, the restore of

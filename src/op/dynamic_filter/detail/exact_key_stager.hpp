@@ -57,17 +57,16 @@ class exact_key_stager final {
  public:
   /**
    * @brief One exact key.
+   *
+   * The list's domain is classified from `type`, and each contribution's column must be one of its
+   * carriers. `kind` is `membership_filter_kind::small_in_list` or
+   * `membership_filter_kind::hash_in_list`.
    */
   struct key {
-    /** @brief The key's column in every contributed table */
-    cudf::size_type ordinal;
-    /** @brief The construction type: the list's domain is classified from it, and each
-     * contribution's column must be one of its carriers */
-    cudf::data_type type;
-    /** @brief `membership_filter_kind::small_in_list` or `membership_filter_kind::hash_in_list` */
-    membership_filter_kind kind;
-    /** @brief The key's valid rows across the whole build: the buffer's length */
-    std::size_t valid_rows;
+    cudf::size_type ordinal;      ///< The key's column in every contributed table
+    cudf::data_type type;         ///< The construction type
+    membership_filter_kind kind;  ///< Small or hash IN-list
+    std::size_t valid_rows;       ///< Valid rows of the whole build: the buffer's length
   };
 
   /**
@@ -79,7 +78,7 @@ class exact_key_stager final {
   };
 
   /**
-   * @brief Leases and zeroes every key's buffer and overflow word on every GPU of @p targets
+   * @brief Leases and zeroes every key's buffer and overflow word on every GPU of `targets`
    * without waiting on the host.
    *
    * @throw accumulation_invariant_error if a key's kind is not an IN-list, its type has no key
@@ -91,7 +90,7 @@ class exact_key_stager final {
 
   /**
    * @brief An upper bound on the task scratch one key's `enqueue_add` takes from a batch of up to
-   * @p rows rows: the valid-row ranks and the scan's temporaries.
+   * `rows` rows: the valid-row ranks and the scan's temporaries.
    */
   [[nodiscard]] static std::size_t contribution_scratch_bytes(std::size_t rows);
 
@@ -102,23 +101,23 @@ class exact_key_stager final {
   exact_key_stager& operator=(exact_key_stager&&) noexcept;
 
   /**
-   * @brief Writes @p input's valid rows of every key into that key's slice on @p device, without a
+   * @brief Writes `input`'s valid rows of every key into that key's slice on `device`, without a
    * host wait.
    *
-   * Thread-safe. Temporaries come from @p scratch and free stream-ordered on @p stream; the
+   * Thread-safe. Temporaries come from `scratch` and free stream-ordered on `stream`; the
    * partial's stream then waits for the writes, so every later read or free of the buffers follows
    * them. A valid row beyond its slice is not written; it sets the key's overflow word instead.
    *
-   * @pre @p input holds every key column at its ordinal at a carrier of the key's type, and the
-   * caller retires @p stream before releasing @p input
-   * @throw accumulation_invariant_error if @p stream belongs to another GPU, a slice lies outside
+   * @pre `input` holds every key column at its ordinal at a carrier of the key's type, and the
+   * caller retires `stream` before releasing `input`
+   * @throw accumulation_invariant_error if `stream` belongs to another GPU, a slice lies outside
    * its buffer, or a key column is not a carrier of its key, before anything is enqueued for it
    * @param slices One slice per key, in key order
    * @param input A build batch
-   * @param device The GPU that holds @p input
+   * @param device The GPU that holds `input`
    * @param stream The contributing task's stream
    * @param scratch The contributing task's allocator
-   * @return false, before anything is enqueued, iff @p device holds no partial
+   * @return false, before anything is enqueued, iff `device` holds no partial
    */
   [[nodiscard]] bool enqueue_add(std::span<slice const> slices,
                                  cudf::table_view const& input,
@@ -135,18 +134,18 @@ class exact_key_stager final {
   class gathered {
    public:
     /**
-     * @brief Whether key @p key_index staged more valid rows than its slices hold on some GPU, so
+     * @brief Whether key `key_index` staged more valid rows than its slices hold on some GPU, so
      * its rows are incomplete.
      */
     [[nodiscard]] bool overflowed(std::size_t key_index) const;
 
     /**
-     * @brief Enqueues the construction of key @p key_index's planned list on @p stream, with its
-     * storage from @p mr.
+     * @brief Enqueues the construction of key `key_index`'s planned list on `stream`, with its
+     * storage from `mr`.
      *
-     * The caller waits on @p stream before the list becomes visible or the stager is released.
+     * The caller waits on `stream` before the list becomes visible or the stager is released.
      *
-     * @pre @p stream is the stream `gather` ran on, or follows it
+     * @pre `stream` is the stream `gather` ran on, or follows it
      * @throw accumulation_invariant_error if the key overflowed: its list would have false
      * negatives
      */
@@ -163,17 +162,18 @@ class exact_key_stager final {
   };
 
   /**
-   * @brief Copies every other GPU's written slices into @p root's buffers and reads every overflow
+   * @brief Copies every other GPU's written slices into `root`'s buffers and reads every overflow
    * word.
    *
    * Waits on the host for the copies and the words together, after first waiting for any other GPU
    * that wrote slices (their copies may be staged through the host). Afterwards the root buffers
-   * hold every staged row and are ordered before later work on @p stream.
+   * hold every staged row and are ordered before later work on `stream`.
    *
-   * @pre Every `enqueue_add` returned; this is the only `gather` call; @p root is the current
+   * @pre Every `enqueue_add` returned; this is the only `gather` call; `root` is the current
    * device
-   * @param stream A stream of @p root
-   * @return The gathered rows, or nullopt when @p root holds no partial
+   * @param root The GPU whose buffers receive every slice
+   * @param stream A stream of `root`
+   * @return The gathered rows, or nullopt when `root` holds no partial
    */
   [[nodiscard]] std::optional<gathered> gather(rmm::cuda_device_id root, ::cuda::stream_ref stream);
 
@@ -183,7 +183,7 @@ class exact_key_stager final {
   [[nodiscard]] bool releasable_here() const noexcept;
 
   /**
-   * @brief Copies key @p key_index's buffer on @p device to the host, after the work queued on it.
+   * @brief Copies key `key_index`'s buffer on `device` to the host, after the work queued on it.
    *
    * For tests and diagnostics; waits on the host.
    *

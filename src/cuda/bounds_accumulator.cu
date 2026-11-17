@@ -51,14 +51,16 @@ namespace sirius::op::detail {
 
 namespace {
 
-/// Bytes of one slot: the batch's minimum, then its maximum, each in 16 bytes.
+/**
+ * @brief Bytes of one slot: the batch's minimum, then its maximum, each in 16 bytes.
+ */
 constexpr std::size_t k_bound_bytes = 16;
 constexpr std::size_t k_slot_bytes  = 2 * k_bound_bytes;
 
 using wide = __int128_t;  // Holds every bound storage value: signed, unsigned up to 64 bits, BOOL8
 
 /**
- * @brief Invokes @p fn with a value of the integer storage type of @p type's bounds.
+ * @brief Invokes `fn` with a value of the integer storage type of `type`'s bounds.
  *
  * @throw accumulation_invariant_error for a type without numeric bounds
  */
@@ -88,11 +90,13 @@ decltype(auto) dispatch_bound_storage(cudf::data_type type, Fn&& fn)
   }
 }
 
-/// A valid row's value, or @p identity for a null row, so a reduction skips the nulls.
+/**
+ * @brief A valid row's value, or `identity` for a null row, so a reduction skips the nulls.
+ */
 template <class T>
 struct masked_bound {
   T const* values;
-  cudf::bitmask_type const* mask;  // Null when the column has no nulls
+  cudf::bitmask_type const* mask;  ///< Null when the column has no nulls
   cudf::size_type offset;
   T identity;
 
@@ -102,7 +106,9 @@ struct masked_bound {
   }
 };
 
-/// Reduces @p column's valid values to their minimum at @p out and maximum at `out + 16` bytes.
+/**
+ * @brief Reduces `column`'s valid values to their minimum at `out` and maximum at `out + 16` bytes.
+ */
 template <class T>
 void enqueue_bounds(cudf::column_view const& column,
                     std::byte* out,
@@ -138,7 +144,9 @@ void enqueue_bounds(cudf::column_view const& column,
     true);
 }
 
-/// The storage value of @p type held in the low bytes of @p bytes, widened.
+/**
+ * @brief The storage value of `type` held in the low bytes of `bytes`, widened.
+ */
 [[nodiscard]] wide decode(cudf::data_type type, std::byte const* bytes)
 {
   return dispatch_bound_storage(type, [&](auto tag) {
@@ -148,7 +156,10 @@ void enqueue_bounds(cudf::column_view const& column,
   });
 }
 
-/// Builds a valid scalar of a fixed-width type from its integer storage value, without a host wait.
+/**
+ * @brief Builds a valid scalar of a fixed-width type from its integer storage value, without a host
+ * wait.
+ */
 struct scalar_from_storage {
   template <class T>
   std::unique_ptr<cudf::scalar> operator()(cudf::data_type type,
@@ -170,7 +181,9 @@ struct scalar_from_storage {
   }
 };
 
-/// The device address of a fixed-width scalar's value.
+/**
+ * @brief The device address of a fixed-width scalar's value.
+ */
 struct scalar_storage {
   template <class T>
   void const* operator()(cudf::scalar const& bound) const
@@ -185,7 +198,9 @@ struct scalar_storage {
   }
 };
 
-/// A valid scalar of @p type whose storage holds @p value.
+/**
+ * @brief A valid scalar of `type` whose storage holds `value`.
+ */
 [[nodiscard]] std::unique_ptr<cudf::scalar> make_bound(cudf::data_type type,
                                                        wide value,
                                                        ::cuda::stream_ref stream,
@@ -194,7 +209,9 @@ struct scalar_storage {
   return cudf::type_dispatcher(type, scalar_from_storage{}, type, value, stream, mr);
 }
 
-/// Byte-wise unsigned order: cuDF's ordering of strings.
+/**
+ * @brief Byte-wise unsigned order: cuDF's ordering of strings.
+ */
 [[nodiscard]] bool string_less(std::string const& left, std::string const& right)
 {
   return std::lexicographical_compare(
@@ -205,6 +222,9 @@ struct scalar_storage {
 
 }  // namespace
 
+//===----------------------------------------------------------------------------------===//
+// bounds_accumulator::impl
+//===----------------------------------------------------------------------------------===//
 struct bounds_accumulator::impl {
   /**
    * @brief What a batch's slot of one key holds, known on the host.
@@ -231,12 +251,12 @@ struct bounds_accumulator::impl {
 
   std::vector<key> keys;
   std::size_t batches;
-  std::vector<std::vector<slot>> slots;  // [key][batch]; each batch writes only its own entries
-  std::mutex leaf_mutex;  // Guards `strings`; a leaf, never held across CUDA work or a host wait.
+  std::vector<std::vector<slot>> slots;  ///< [key][batch]; each batch writes only its own entries
+  std::mutex leaf_mutex;  ///< Guards `strings`; a leaf, never held across CUDA work or a host wait.
   std::vector<std::vector<std::optional<std::pair<std::string, std::string>>>>
-    strings;  // [key][batch]
+    strings;  ///< [key][batch]
   std::atomic<bool> leak_storage{false};
-  std::vector<std::unique_ptr<accumulation_partial>> partials;  // Destroyed before leak_storage.
+  std::vector<std::unique_ptr<accumulation_partial>> partials;  ///< Destroyed before leak_storage.
 };
 
 bounds_accumulator::bounds_accumulator(std::unique_ptr<impl> state) noexcept
@@ -244,6 +264,9 @@ bounds_accumulator::bounds_accumulator(std::unique_ptr<impl> state) noexcept
 {
 }
 
+//===----------------------------------------------------------------------------------===//
+// bounds_accumulator
+//===----------------------------------------------------------------------------------===//
 bounds_accumulator::~bounds_accumulator()                                        = default;
 bounds_accumulator::bounds_accumulator(bounds_accumulator&&) noexcept            = default;
 bounds_accumulator& bounds_accumulator::operator=(bounds_accumulator&&) noexcept = default;

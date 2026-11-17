@@ -160,27 +160,26 @@ class accumulated_bloom_builder final {
   /**
    * @brief One key column: its ordinal in the build table, the type its filter is built over, and
    * its array size.
+   *
+   * The published filter's domain is classified from `type`, and each contribution's column must be
+   * one of its carriers (`membership_probe_compatible`). `blocks` is `bloom_blocks_for` the rows
+   * the array is sized for; the shared-geometry `try_create` ignores it.
    */
   struct key {
-    /** @brief The key's column in every contributed table */
-    cudf::size_type ordinal;
-    /** @brief The construction type: the published filter's domain is classified from it, and each
-     * contribution's column must be one of its carriers (`membership_probe_compatible`) */
-    cudf::data_type type;
-    /** @brief Bloom blocks of the key's array, `bloom_blocks_for` the rows it is sized for; ignored
-     * by the shared-geometry `try_create` */
-    std::size_t blocks = 0;
+    cudf::size_type ordinal;  ///< The key's column in every contributed table
+    cudf::data_type type;     ///< The construction type
+    std::size_t blocks = 0;   ///< Bloom blocks of the key's array
   };
 
   /**
-   * @brief Whether `dynamic_filter_publication_session` admits keys of type @p type for
+   * @brief Whether `dynamic_filter_publication_session` admits keys of type `type` for
    * accumulation today: INT32 and INT64 only.
    *
    * The builder itself accepts every `membership_key_supported` type; this narrower rule is the
    * session's and the planner's until they construct every key type from the build PARTITION.
    *
    * @param type The storage type of a build key column
-   * @return True if @p type is INT32 or INT64
+   * @return True if `type` is INT32 or INT64
    */
   [[nodiscard]] static constexpr bool supports(cudf::data_type type) noexcept
   {
@@ -188,7 +187,7 @@ class accumulated_bloom_builder final {
   }
 
   /**
-   * @brief Allocates zeroed arrays on every GPU of @p targets without waiting on the host.
+   * @brief Allocates zeroed arrays on every GPU of `targets` without waiting on the host.
    *
    * Each GPU's arrays are allocated under their own lease, attached to a new exclusive stream of
    * that GPU and sized to the exact allocation charge. The calling thread must hold no allocation
@@ -218,8 +217,8 @@ class accumulated_bloom_builder final {
     std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets);
 
   /**
-   * @brief An upper bound on the task scratch `finish` takes for @p keys (with their blocks set)
-   * replicated on @p replicas GPUs: the direct merge's chunk slots for every non-root source.
+   * @brief An upper bound on the task scratch `finish` takes for `keys` (with their blocks set)
+   * replicated on `replicas` GPUs: the direct merge's chunk slots for every non-root source.
    */
   [[nodiscard]] static std::size_t publication_scratch_bytes(std::span<key const> keys,
                                                              std::size_t replicas) noexcept;
@@ -231,10 +230,10 @@ class accumulated_bloom_builder final {
   accumulated_bloom_builder& operator=(accumulated_bloom_builder&&) noexcept;
 
   /**
-   * @brief Inserts @p input's key columns into @p device's partial, without a host wait or a device
+   * @brief Inserts `input`'s key columns into `device`'s partial, without a host wait or a device
    * allocation.
    *
-   * Thread-safe. @p stream first waits for the partial's zero fill; the partial's stream then waits
+   * Thread-safe. `stream` first waits for the partial's zero fill; the partial's stream then waits
    * for the inserts, so every later use or free of the arrays follows them.
    *
    * Each key's values are read at the column's carrier and converted per element to the key
@@ -242,16 +241,16 @@ class accumulated_bloom_builder final {
    * value narrows to the int64 rep unchecked: the caller must not publish that key unless the
    * build's bounds fit int64.
    *
-   * @pre @p input holds every key column at its ordinal at a carrier of the key's type, and the
-   * caller retires the stream before releasing @p input
-   * @throw accumulation_invariant_error if @p stream belongs to another GPU, before anything is
+   * @pre `input` holds every key column at its ordinal at a carrier of the key's type, and the
+   * caller retires the stream before releasing `input`
+   * @throw accumulation_invariant_error if `stream` belongs to another GPU, before anything is
    * enqueued, or if a key column is not a carrier of its key's type
    * @throw accumulation_cuda_error if a CUDA call fails, or `cucascade::cuda_error` if creating its
    * completion event fails; work already enqueued is joined first
    * @param input A build batch with the admitted key types
-   * @param device The GPU that holds @p input
+   * @param device The GPU that holds `input`
    * @param stream The contributing task's stream
-   * @return false, before anything is enqueued, iff @p device holds no partial
+   * @return false, before anything is enqueued, iff `device` holds no partial
    */
   [[nodiscard]] bool enqueue_add(cudf::table_view const& input,
                                  rmm::cuda_device_id device,
@@ -357,14 +356,14 @@ class accumulated_bloom_builder final {
     sirius_dynamic_bloom_filter const& filter, rmm::cuda_device_id device);
 
   /**
-   * @brief Copies @p filter's bit array on @p device to the host, whether `finish` returned it or
+   * @brief Copies `filter`'s bit array on `device` to the host, whether `finish` returned it or
    * it was built from a column, so tests can compare the two bit for bit.
    *
-   * A filter built from a column has no accumulated replica; its own array is copied on @p stream,
+   * A filter built from a column has no accumulated replica; its own array is copied on `stream`,
    * after the work queued there, so the copy follows the array's stream-ordered allocation.
    *
-   * @pre For a filter built from a column, @p stream is the stream it was built on, or follows it
-   * @return The contents, or nullopt if @p filter has no array on @p device
+   * @pre For a filter built from a column, `stream` is the stream it was built on, or follows it
+   * @return The contents, or nullopt if `filter` has no array on `device`
    */
   [[nodiscard]] static std::optional<replica_contents> inspect_replica(
     sirius_dynamic_bloom_filter const& filter,
@@ -396,7 +395,10 @@ class accumulated_bloom_builder final {
   struct impl;
   explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
 
-  /// Allocates and zeroes @p state's arrays on every GPU of @p targets; both `try_create` forms.
+  /**
+   * @brief Allocates and zeroes `state`'s arrays on every GPU of `targets`; both `try_create`
+   * forms.
+   */
   [[nodiscard]] static std::optional<accumulated_bloom_builder> create(
     std::unique_ptr<impl> state, std::span<dynamic_filter_replica_space const> targets);
 

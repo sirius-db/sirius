@@ -60,14 +60,14 @@ struct arrival_facts {
 };
 
 /**
- * @brief Reads @p batch's rows and per-column carriers and null counts, without waiting for its
+ * @brief Reads `batch`'s rows and per-column carriers and null counts, without waiting for its
  * data lock
  *
  * A GPU table is read through its column views, whose null counts are already on the host. A host
  * or disk table is read from its column metadata, where a negative null count means unknown.
  *
- * @return The facts, `construction_decline::compressed_arrival` for a compressed representation, or
- * `construction_decline::unreadable_arrival` for a batch that is locked, empty of data, or of any
+ * @return The facts, `construction_decline::COMPRESSED_ARRIVAL` for a compressed representation, or
+ * `construction_decline::UNREADABLE_ARRIVAL` for a batch that is locked, empty of data, or of any
  * other representation
  */
 [[nodiscard]] std::variant<arrival_facts, construction_decline> read_arrival(
@@ -75,12 +75,13 @@ struct arrival_facts {
 
 /**
  * @brief What one build column looks like across every batch of an inventory
+ *
+ * Both members are empty when the column is absent from some batch; `null_rows` is also empty when
+ * some batch's count is unknown.
  */
 struct key_column_facts {
-  /** @brief Distinct carriers in batch-ID order; empty when the column is absent from some batch */
-  std::vector<cudf::data_type> carriers;
-  /** @brief Total null rows; empty when the column is absent or some batch's count is unknown */
-  std::optional<std::size_t> null_rows;
+  std::vector<cudf::data_type> carriers;  ///< Distinct carriers, in batch-ID order
+  std::optional<std::size_t> null_rows;   ///< Total null rows
 };
 
 /**
@@ -134,7 +135,7 @@ class complete_build_inventory final {
   [[nodiscard]] batch_entry const* find(std::uint64_t batch_id) const noexcept;
 
   /**
-   * @brief The columns the batch at @p batch_index of `batches()` arrived with
+   * @brief The columns the batch at `batch_index` of `batches()` arrived with
    */
   [[nodiscard]] std::span<column_facts const> batch_columns(std::size_t batch_index) const noexcept;
 
@@ -147,7 +148,7 @@ class complete_build_inventory final {
   friend class build_arrival_ledger;
 
   /**
-   * @brief Sorts @p batches by ID and builds the inventory.
+   * @brief Sorts `batches` by ID and builds the inventory.
    *
    * @return nullopt for no batches, duplicate IDs, or a row total that overflows
    */
@@ -212,7 +213,7 @@ class build_arrival_ledger final {
    * @pre No further batch can arrive: the input port is FULL and its source pipeline has finished.
    * @return The inventory iff the ledger is still recording and recorded exactly
    * `facts.repository_batches` batches; otherwise the arrival's reason that closed the ledger, or
-   * `construction_decline::inventory_mismatch`. Arrivals are ignored afterwards.
+   * `construction_decline::INVENTORY_MISMATCH`. Arrivals are ignored afterwards.
    */
   [[nodiscard]] certified_build_input certify(certification facts) noexcept;
 
@@ -238,7 +239,9 @@ class build_arrival_ledger final {
   void close() noexcept;
 
   /**
-   * @brief Closes the ledger because of an arrival it cannot accept. The caller holds `_mutex`.
+   * @brief Closes the ledger because of an arrival it cannot accept.
+   *
+   * The caller holds `_mutex`.
    */
   void close(construction_decline reason) noexcept;
 
@@ -298,11 +301,11 @@ struct accumulated_bloom_geometry {
 };
 
 /**
- * @brief The transfer chunk for one array of @p raw_bytes: an eighth of the array, clamped to
+ * @brief The transfer chunk for one array of `raw_bytes`: an eighth of the array, clamped to
  * `accumulated_bloom_geometry`'s chunk bounds, rounded up to the allocation alignment, and at most
  * the aligned array.
  *
- * @pre @p raw_bytes rounded up to the allocation alignment does not overflow
+ * @pre `raw_bytes` rounded up to the allocation alignment does not overflow
  */
 [[nodiscard]] std::size_t accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept;
 

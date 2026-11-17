@@ -162,7 +162,7 @@ namespace {
 }
 
 /**
- * @brief The facts of a host or disk table described by @p columns
+ * @brief The facts of a host or disk table described by `columns`
  */
 [[nodiscard]] arrival_facts metadata_facts(
   std::vector<cucascade::memory::column_metadata> const& columns, cucascade::memory::Tier tier)
@@ -188,11 +188,11 @@ namespace {
 std::variant<arrival_facts, construction_decline> read_arrival(cucascade::data_batch& batch)
 {
   auto source = batch.try_to_read_only();
-  if (!source || source->get_data() == nullptr) { return construction_decline::unreadable_arrival; }
+  if (!source || source->get_data() == nullptr) { return construction_decline::UNREADABLE_ARRIVAL; }
   auto const* data = source->get_data();
   auto const tier  = source->get_current_tier();
   if (dynamic_cast<sirius::simpatico_compressed_representation const*>(data) != nullptr) {
-    return construction_decline::compressed_arrival;
+    return construction_decline::COMPRESSED_ARRIVAL;
   }
   if (dynamic_cast<cucascade::gpu_table_representation const*>(data) != nullptr) {
     auto const table = sirius::get_cudf_table_view(*source);
@@ -210,7 +210,7 @@ std::variant<arrival_facts, construction_decline> read_arrival(cucascade::data_b
   if (auto const* disk = dynamic_cast<cucascade::disk_data_representation const*>(data)) {
     return metadata_facts(disk->get_disk_table().columns, tier);
   }
-  return construction_decline::unreadable_arrival;
+  return construction_decline::UNREADABLE_ARRIVAL;
 }
 
 namespace {
@@ -256,14 +256,14 @@ void build_arrival_ledger::record(cucascade::data_batch& batch)
     auto& facts = std::get<arrival_facts>(arrival);
     // Host and disk facts are read, but only GPU arrivals are accepted for now.
     if (facts.tier != cucascade::memory::Tier::GPU) {
-      close(construction_decline::unreadable_arrival);
+      close(construction_decline::UNREADABLE_ARRIVAL);
       return;
     }
     _entries.push_back(
       {.entry = {batch.get_batch_id(), facts.rows}, .columns = std::move(facts.columns)});
   } catch (std::exception const&) {
     // Host allocation or metadata access failed: the ledger can no longer prove completeness.
-    close(construction_decline::unreadable_arrival);
+    close(construction_decline::UNREADABLE_ARRIVAL);
   }
 }
 
@@ -271,19 +271,19 @@ certified_build_input build_arrival_ledger::certify(certification facts) noexcep
 {
   std::scoped_lock lock(_mutex);
   if (_status != status::RECORDING) {
-    return _closed_by.value_or(construction_decline::inventory_mismatch);
+    return _closed_by.value_or(construction_decline::INVENTORY_MISMATCH);
   }
   _status = status::CLOSED;
   if (_entries.size() != facts.repository_batches) {
-    return construction_decline::inventory_mismatch;
+    return construction_decline::INVENTORY_MISMATCH;
   }
   try {
     auto inventory = complete_build_inventory::try_create(std::move(_entries));
-    if (!inventory) { return construction_decline::inventory_mismatch; }
+    if (!inventory) { return construction_decline::INVENTORY_MISMATCH; }
     _status = status::CERTIFIED;
     return std::move(*inventory);
   } catch (std::bad_alloc const&) {
-    return construction_decline::inventory_mismatch;
+    return construction_decline::INVENTORY_MISMATCH;
   }
 }
 

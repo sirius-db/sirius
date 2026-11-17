@@ -254,12 +254,12 @@ template <class Key>
 }
 
 /**
- * @brief Adds the valid rows of @p keys, a carrier of @p domain, to one accumulated array.
+ * @brief Adds the valid rows of `keys`, a carrier of `domain`, to one accumulated array.
  *
  * Values convert per element to the rep (`with_build_key_iterator`); STRING keys are fingerprinted
  * in-kernel, so nothing is allocated and nothing waits on the host.
  *
- * @throw detail::accumulation_invariant_error if @p keys is not a carrier of @p domain
+ * @throw detail::accumulation_invariant_error if `keys` is not a carrier of `domain`
  */
 template <class Key>
 void add_accumulated_keys(rmm::device_buffer& bits,
@@ -737,7 +737,9 @@ struct accumulated_bloom_builder::impl {
   {
   }
 
-  /// The largest chunk of any key: the size of one transfer slot.
+  /**
+   * @brief The largest chunk of any key: the size of one transfer slot.
+   */
   [[nodiscard]] std::size_t max_chunk_bytes() const noexcept
   {
     return std::ranges::max(shapes, {}, &shape::chunk_bytes).chunk_bytes;

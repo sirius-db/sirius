@@ -54,7 +54,9 @@ namespace acc  = sirius::test::accumulation;
 
 cudf::column_view empty_column(cudf::data_type type) { return {type, 0, nullptr, nullptr, 0}; }
 
-/// The reason @p result declined, or none when it certified an inventory.
+/**
+ * @brief The reason `result` declined, or none when it certified an inventory.
+ */
 std::optional<construction_decline> decline_of(sirius::op::certified_build_input const& result)
 {
   auto const* decline = std::get_if<construction_decline>(&result);
@@ -104,7 +106,7 @@ TEST_CASE("arrival ledger certifies exactly the pushed batches as a sorted inven
   SECTION("certification happens at most once")
   {
     REQUIRE(decline_of(arrivals.certify({.repository_batches = 3})) ==
-            construction_decline::inventory_mismatch);
+            construction_decline::INVENTORY_MISMATCH);
   }
   SECTION("a push after certification is an invariant violation")
   {
@@ -139,11 +141,11 @@ TEST_CASE("arrival ledger declines when the repository holds a batch it never sa
   ledger arrivals;
   arrivals.record(*recorded);
   REQUIRE(decline_of(arrivals.certify({.repository_batches = 2})) ==
-          construction_decline::inventory_mismatch);
+          construction_decline::INVENTORY_MISMATCH);
   // A declined ledger ignores later arrivals rather than failing the pushing task.
   REQUIRE_NOTHROW(arrivals.record(*fixture.make_batch(0, 10, 4)));
   REQUIRE(decline_of(arrivals.certify({.repository_batches = 2})) ==
-          construction_decline::inventory_mismatch);
+          construction_decline::INVENTORY_MISMATCH);
 }
 
 TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
@@ -178,7 +180,7 @@ TEST_CASE("arrival ledger is poisoned by unprovable arrivals without blocking",
     recorded.get();
   }
   REQUIRE(decline_of(arrivals.certify({.repository_batches = 2})) ==
-          construction_decline::unreadable_arrival);
+          construction_decline::UNREADABLE_ARRIVAL);
 }
 
 TEST_CASE("certified inventories need no downstream partition count and transfer on move",
@@ -261,7 +263,9 @@ TEST_CASE("a missing or changed key type stays unavailable while siblings remain
 
 namespace {
 
-/// A compressed representation that exposes only its row count, like a compressed spill.
+/**
+ * @brief A compressed representation that exposes only its row count, like a compressed spill.
+ */
 class fake_compressed_representation final : public sirius::simpatico_compressed_representation {
  public:
   explicit fake_compressed_representation(cucascade::memory::memory_space& space)
@@ -278,7 +282,9 @@ class fake_compressed_representation final : public sirius::simpatico_compressed
   }
 };
 
-/// A GPU batch of @p rows rows: an all-null INT32 column and a valid DECIMAL64(-2) column.
+/**
+ * @brief A GPU batch of `rows` rows: an all-null INT32 column and a valid DECIMAL64(-2) column.
+ */
 acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type rows)
 {
   auto& space       = fixture.gpu(0);
@@ -301,7 +307,9 @@ acc::batch_ptr make_nullable_batch(acc::fixture const& fixture, cudf::size_type 
 auto const k_int32     = cudf::data_type{cudf::type_id::INT32};
 auto const k_decimal64 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
 
-/// The facts @p batch's arrival reports; fails the test on a decline.
+/**
+ * @brief The facts `batch`'s arrival reports; fails the test on a decline.
+ */
 sirius::op::arrival_facts facts_of(cucascade::data_batch& batch)
 {
   auto arrival = sirius::op::read_arrival(batch);
@@ -393,13 +401,13 @@ TEST_CASE("a compressed arrival closes the ledger with its own reason",
                                 std::make_unique<fake_compressed_representation>(
                                   const_cast<cucascade::memory::memory_space&>(*host)));
   REQUIRE(std::get<construction_decline>(sirius::op::read_arrival(*compressed)) ==
-          construction_decline::compressed_arrival);
+          construction_decline::COMPRESSED_ARRIVAL);
 
   ledger arrivals;
   arrivals.record(*fixture.make_batch(0, 0, 4));
   arrivals.record(*compressed);
   REQUIRE(decline_of(arrivals.certify({.repository_batches = 2})) ==
-          construction_decline::compressed_arrival);
+          construction_decline::COMPRESSED_ARRIVAL);
 }
 
 TEST_CASE("an inventory keeps every batch's columns and summarizes them for policy",

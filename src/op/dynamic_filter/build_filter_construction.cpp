@@ -77,18 +77,15 @@ batch_key_facts batch_key_facts::of(cudf::table_view const& table)
 
 struct build_filter_construction::impl {
   construction_plan plan;
-  // Per planned key: its index among each accumulator's keys, or k_none.
-  std::vector<std::size_t> bloom_of;
-  std::vector<std::size_t> exact_of;
-  std::vector<std::size_t> bounds_of;
+  std::vector<std::size_t> bloom_of;   ///< Per planned key: index in `bloom`, or k_none
+  std::vector<std::size_t> exact_of;   ///< Per planned key: index in `stager`, or k_none
+  std::vector<std::size_t> bounds_of;  ///< Per planned key: index in `bounds`, or k_none
   std::optional<detail::accumulated_bloom_builder> bloom;
   std::optional<detail::exact_key_stager> stager;
   std::optional<detail::bounds_accumulator> bounds;
-  // The inventory's facts, by batch: what each claim must match.
-  std::vector<std::uint64_t> batch_rows;
-  std::vector<std::vector<column_facts>> batch_columns;
-  // Per exact key, per batch: the first row of the batch's slice.
-  std::vector<std::vector<std::size_t>> exact_offsets;
+  std::vector<std::uint64_t> batch_rows;                 ///< Per batch: rows a claim must match
+  std::vector<std::vector<column_facts>> batch_columns;  ///< Per batch: columns a claim must match
+  std::vector<std::vector<std::size_t>> exact_offsets;   ///< Per exact key, per batch: slice start
   std::size_t task_scratch      = 0;
   std::size_t root_construction = 0;
 };
@@ -351,7 +348,7 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
       }
     }
     ++result.counts.filters_skipped_construction_admission;
-    out.dropped = dynamic_filter_key_reason::construction_admission;
+    out.dropped = dynamic_filter_key_reason::CONSTRUCTION_ADMISSION;
   };
 
   for (std::size_t index = 0; index < keys.size(); ++index) {
@@ -362,7 +359,7 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
                             : &*merged[_impl->bounds_of[index]];
     // A DECIMAL128 key narrowed unchecked: it publishes membership only if its values fit.
     bool const fits = !planned.fit_pending || bounds == nullptr || bounds->fits_membership_rep;
-    if (!fits) { out.dropped = dynamic_filter_key_reason::decimal128_unfit; }
+    if (!fits) { out.dropped = dynamic_filter_key_reason::DECIMAL128_UNFIT; }
 
     if (auto const bloom = _impl->bloom_of[index]; bloom != k_none && fits) {
       out.membership = blooms->filters[bloom];
@@ -376,7 +373,7 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
           "its exact filter is dropped.",
           planned.admitted_key_index);
         ++result.counts.filters_skipped_construction_invariant;
-        out.dropped = dynamic_filter_key_reason::construction_invariant;
+        out.dropped = dynamic_filter_key_reason::CONSTRUCTION_INVARIANT;
       } else if (fits) {
         auto const domain     = *classify_membership_key(planned.construction_type);
         auto const valid_rows = std::get<exact_membership>(planned.membership).valid_rows;

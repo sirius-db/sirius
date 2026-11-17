@@ -113,12 +113,15 @@ constexpr attempt_counter targets_drained{&counts::publications_skipped_targets_
                                           "publications_skipped_targets_drained"};
 constexpr attempt_counter source_not_resident{&counts::publications_skipped_source_not_resident,
                                               "publications_skipped_source_not_resident"};
-/// Counts every failed or cancelled attempt, so it names the end of one without a specific counter.
+/**
+ * @brief Counts every failed or cancelled attempt, so it names the end of one without a specific
+ * counter.
+ */
 constexpr std::string_view publications_failed = "publications_failed";
 }  // namespace attempt_counters
 
 /**
- * @brief The counter `detail::count_failure` sets for a failure of @p kind that ends an attempt
+ * @brief The counter `detail::count_failure` sets for a failure of `kind` that ends an attempt
  */
 [[nodiscard]] constexpr std::string_view failure_counter_name(
   detail::accumulation_failure kind) noexcept
@@ -133,39 +136,39 @@ constexpr std::string_view publications_failed = "publications_failed";
 }
 
 /**
- * @brief The counter a certification decline of @p reason sets
+ * @brief The counter a certification decline of `reason` sets
  */
 [[nodiscard]] constexpr counter_field decline_counter(construction_decline reason) noexcept
 {
   using counts = dynamic_filter_stats_snapshot;
   switch (reason) {
-    case construction_decline::input_shape:
-    case construction_decline::inventory_mismatch: return &counts::accumulations_skipped_inventory;
-    case construction_decline::pipeline_barrier:
+    case construction_decline::INPUT_SHAPE:
+    case construction_decline::INVENTORY_MISMATCH: return &counts::accumulations_skipped_inventory;
+    case construction_decline::PIPELINE_BARRIER:
       return &counts::accumulations_declined_pipeline_barrier;
-    case construction_decline::port_directive:
+    case construction_decline::PORT_DIRECTIVE:
       return &counts::accumulations_declined_port_directive;
-    case construction_decline::unreadable_arrival:
+    case construction_decline::UNREADABLE_ARRIVAL:
       return &counts::accumulations_declined_unreadable_arrival;
-    case construction_decline::compressed_arrival:
+    case construction_decline::COMPRESSED_ARRIVAL:
       return &counts::accumulations_declined_compressed_arrival;
   }
   return &counts::accumulations_skipped_inventory;
 }
 
 /**
- * @brief The key reason for an attempt that ended with @p result before its filters reached the
+ * @brief The key reason for an attempt that ended with `result` before its filters reached the
  * fan-out
  */
 [[nodiscard]] constexpr dynamic_filter_key_reason attempt_reason(completion result) noexcept
 {
   switch (result) {
-    case completion::CANCELLED: return dynamic_filter_key_reason::attempt_cancel;
-    case completion::FAILED: return dynamic_filter_key_reason::attempt_fail;
+    case completion::CANCELLED: return dynamic_filter_key_reason::ATTEMPT_CANCEL;
+    case completion::FAILED: return dynamic_filter_key_reason::ATTEMPT_FAIL;
     case completion::PUBLISHED:
-    case completion::SKIPPED: return dynamic_filter_key_reason::attempt_skip;
+    case completion::SKIPPED: return dynamic_filter_key_reason::ATTEMPT_SKIP;
   }
-  return dynamic_filter_key_reason::attempt_skip;
+  return dynamic_filter_key_reason::ATTEMPT_SKIP;
 }
 
 /**
@@ -185,9 +188,11 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
 }
 
 /**
- * @brief Whether some binding of admitted key @p key_index could receive a membership filter over
- * @p domain: the plan-time part of `fan_out`'s rule, independent of whether the binding's channel
- * still accepts filters
+ * @brief Whether at least one probe binding of admitted key `key_index` can read a membership
+ * filter stored as `domain`
+ *
+ * Checks only type compatibility, which the plan fixes. Ignores whether the binding's channel
+ * still accepts filters, which `fan_out` also checks at run time.
  */
 [[nodiscard]] bool membership_reaches_a_binding(
   dynamic_filter_publish_plan const& plan,
@@ -204,8 +209,12 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
 }
 
 /**
- * @brief Whether some binding of admitted key @p key_index could receive a zone map whose bounds
- * have type @p bound_type: the plan-time part of `fan_out`'s rule
+ * @brief Whether at least one probe binding of admitted key `key_index` can read a zone map whose
+ * bounds have type `bound_type`
+ *
+ * Checks only what the plan fixes: the key does not preserve nulls, the target accepts zone maps,
+ * and the binding's type matches. Ignores whether the binding's channel still accepts filters,
+ * which `fan_out` also checks at run time.
  */
 [[nodiscard]] bool zone_map_reaches_a_binding(dynamic_filter_publish_plan const& plan,
                                               std::size_t key_index,
@@ -241,10 +250,9 @@ struct key_filters {
   std::shared_ptr<sirius_dynamic_filter> membership;
   /// The domain the membership filter was built over.
   std::optional<membership_key_domain> membership_domain;
-  /// The kind of the whole-build membership filter.
-  membership_filter_kind membership_kind = membership_filter_kind::none;
-  /// The whole-build membership filter's IN-list key count or Bloom array bytes.
-  std::size_t membership_size = 0;
+  membership_filter_kind membership_kind =
+    membership_filter_kind::none;   ///< Kind of the whole-build membership filter
+  std::size_t membership_size = 0;  ///< Its IN-list key count or Bloom array bytes
 };
 
 struct fanout_counts {
@@ -419,7 +427,9 @@ struct dynamic_filter_publication_session::state {
   }
 
   /**
-   * @brief Replaces every key line's outcome with @p outcome. The caller holds the mutex.
+   * @brief Replaces every key line's outcome with `outcome`.
+   *
+   * The caller holds the mutex.
    */
   void set_key_lines(dynamic_filter_key_outcome const& outcome) noexcept
   {
@@ -429,8 +439,10 @@ struct dynamic_filter_publication_session::state {
   }
 
   /**
-   * @brief Replaces every key line's outcome with its key's entry of @p by_key, indexed by admitted
-   * key. The caller holds the mutex.
+   * @brief Replaces every key line's outcome with its key's entry of `by_key`, indexed by admitted
+   * key.
+   *
+   * The caller holds the mutex.
    */
   void record_key_outcomes(std::span<dynamic_filter_key_outcome const> by_key) noexcept
   {
@@ -442,14 +454,15 @@ struct dynamic_filter_publication_session::state {
   }
 
   /**
-   * @brief Ends, with @p reason, every key line the attempt had not constructed when it ended. The
-   * caller holds the mutex.
+   * @brief Ends, with `reason`, every key line the attempt had not constructed when it ended.
+   *
+   * The caller holds the mutex.
    */
   void end_unconstructed_lines(dynamic_filter_key_reason reason, std::string_view counter) noexcept
   {
     for (auto& line : key_lines) {
       auto& outcome = line.outcome;
-      if (outcome.reason != dynamic_filter_key_reason::not_constructed) { continue; }
+      if (outcome.reason != dynamic_filter_key_reason::NOT_CONSTRUCTED) { continue; }
       outcome = {.rows          = outcome.rows,
                  .valid_rows    = outcome.valid_rows,
                  .reason        = reason,
@@ -489,8 +502,10 @@ struct dynamic_filter_publication_session::state {
   }
 
   /**
-   * @brief Counts a failure of @p kind, then ends the attempt: skipped when the failure is
-   * recoverable, failed otherwise. The caller holds the mutex.
+   * @brief Counts a failure of `kind`, then ends the attempt: skipped when the failure is
+   * recoverable, failed otherwise.
+   *
+   * The caller holds the mutex.
    */
   void end_attempt_on_failure(detail::accumulation_failure kind) noexcept
   {
@@ -672,7 +687,7 @@ struct dynamic_filter_publication_session::state {
         line.outcome.kind   = membership_filter_kind::bloom;
         line.outcome.size   = accumulated_bloom_bytes;
         line.outcome.pushed = pushed_bindings[line.admitted_key_index];
-        line.outcome.reason = dynamic_filter_key_reason::published;
+        line.outcome.reason = dynamic_filter_key_reason::PUBLISHED;
       }
       end_attempt(published ? completion::PUBLISHED : completion::SKIPPED);
     } catch (...) {
@@ -724,13 +739,12 @@ struct dynamic_filter_publication_session::state {
   // The ID of the batch whose contribution completed the inventory, while its task's publication is
   // owed and has not run.
   std::optional<std::uint64_t> pending_publication;
-  // One line per admitted key with a binding, moved out when the session becomes terminal.
-  std::vector<dynamic_filter_key_line> key_lines;
+  std::vector<dynamic_filter_key_line> key_lines;  ///< One per admitted key with a binding, moved
+                                                   ///< out when the session becomes terminal
   dynamic_filter_join_identity identity;
-  // The counter that ended the accumulation attempt, named by its unpublished key lines.
-  std::string_view ending_counter;
-  // Each accumulated key's Bloom array bytes.
-  std::size_t accumulated_bloom_bytes = 0;
+  std::string_view ending_counter;  ///< The counter that ended the accumulation attempt, named by
+                                    ///< its unpublished key lines
+  std::size_t accumulated_bloom_bytes = 0;  ///< Each accumulated key's Bloom array bytes
   phase current                       = phase::OPEN;
   /// Distributed: this rank has started its part in every key's merge, with filters or without.
   bool merge_started  = false;
@@ -885,7 +899,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
     if (auto const* decline = std::get_if<construction_decline>(&input)) {
       selection.*decline_counter(*decline) = 1;
       for (auto& key : decided) {
-        key = {.reason = dynamic_filter_key_reason::declined, .reason_detail = to_string(*decline)};
+        key = {.reason = dynamic_filter_key_reason::DECLINED, .reason_detail = to_string(*decline)};
       }
       return false;
     }
@@ -917,28 +931,28 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
                                    key,
                                    rows,
                                    plan.domain_coverage_threshold(),
-                                   detail::publication_path::accumulated,
+                                   detail::publication_path::ACCUMULATED,
                                    type_matches && supported && has_readable_binding);
       auto& decision = decided[index];
       decision.rows  = rows;
       if (!type_matches) {
         ++selection.keys_skipped_type_mismatch;
-        decision.reason = dynamic_filter_key_reason::type_mismatch;
+        decision.reason = dynamic_filter_key_reason::TYPE_MISMATCH;
         continue;
       }
       if (!supported) {
         ++selection.keys_skipped_bloom_unsupported;
-        decision.reason = dynamic_filter_key_reason::unsupported_type;
+        decision.reason = dynamic_filter_key_reason::UNSUPPORTED_TYPE;
         continue;
       }
       if (!has_readable_binding) {
         selection.bindings_skipped_incompatible_probe += bindings.size();
-        decision.reason = dynamic_filter_key_reason::unreadable_probe;
+        decision.reason = dynamic_filter_key_reason::UNREADABLE_PROBE;
         continue;
       }
       if (gated) {
         ++selection.keys_skipped_domain_gate;
-        decision.reason = dynamic_filter_key_reason::domain_gate;
+        decision.reason = dynamic_filter_key_reason::DOMAIN_GATE;
         continue;
       }
       if (rows == 0) { continue; }
@@ -956,7 +970,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
       detail::accumulated_bloom_geometry::try_create(sized_for, keys.size(), cap);
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
-      end_active_keys(active_keys, dynamic_filter_key_reason::bloom_cap);
+      end_active_keys(active_keys, dynamic_filter_key_reason::BLOOM_CAP);
       auto const required = detail::accumulated_bloom_geometry::try_create(
         sized_for, keys.size(), std::numeric_limits<std::uint64_t>::max());
       SIRIUS_LOG_INFO(
@@ -973,7 +987,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
     if (replicas.empty()) {
       selection.accumulations_skipped_admission = 1;
       end_active_keys(active_keys,
-                      dynamic_filter_key_reason::attempt_skip,
+                      dynamic_filter_key_reason::ATTEMPT_SKIP,
                       attempt_counters::skipped_admission.name);
       return false;
     }
@@ -987,7 +1001,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
         "refused.");
       selection.accumulations_skipped_admission = 1;
       end_active_keys(active_keys,
-                      dynamic_filter_key_reason::attempt_skip,
+                      dynamic_filter_key_reason::ATTEMPT_SKIP,
                       attempt_counters::skipped_admission.name);
       return false;
     }
@@ -1031,9 +1045,9 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
     auto const kind  = classify_failure(error);
     count_failure(selection, kind);
     for (auto& key : decided) {
-      if (key.reason != dynamic_filter_key_reason::not_constructed) { continue; }
-      key.reason        = recoverable(kind) ? dynamic_filter_key_reason::attempt_skip
-                                            : dynamic_filter_key_reason::attempt_fail;
+      if (key.reason != dynamic_filter_key_reason::NOT_CONSTRUCTED) { continue; }
+      key.reason        = recoverable(kind) ? dynamic_filter_key_reason::ATTEMPT_SKIP
+                                            : dynamic_filter_key_reason::ATTEMPT_FAIL;
       key.reason_detail = failure_counter_name(kind);
     }
     if (!recoverable(kind)) { std::rethrow_exception(error); }
@@ -1171,7 +1185,7 @@ void dynamic_filter_publication_session::observe_whole_build(
     post_unlock_actions actions;
     {
       std::scoped_lock lock(operation.mutex);
-      operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_fail,
+      operation.set_key_lines({.reason        = dynamic_filter_key_reason::ATTEMPT_FAIL,
                                .reason_detail = attempt_counters::publications_failed});
       actions.append(operation.complete(completion::FAILED, true));
     }
@@ -1203,7 +1217,7 @@ void dynamic_filter_publication_session::observe_whole_build(
             1, std::memory_order_relaxed);
         }
         // A sibling delivery that claims the reopened window replaces these outcomes.
-        operation.set_key_lines({.reason        = dynamic_filter_key_reason::attempt_skip,
+        operation.set_key_lines({.reason        = dynamic_filter_key_reason::ATTEMPT_SKIP,
                                  .reason_detail = attempt_counters::source_not_resident.name});
         // Reopened, the session merges from finish_input(), which then sees it open.
         if (!operation.input_closed) {
@@ -1259,7 +1273,7 @@ void dynamic_filter_publication_session::observe_whole_build(
                                                                            : completion::SKIPPED;
       operation.record_key_outcomes(outcome.keys);
       if (result == completion::CANCELLED) {
-        operation.end_unconstructed_lines(dynamic_filter_key_reason::attempt_cancel,
+        operation.end_unconstructed_lines(dynamic_filter_key_reason::ATTEMPT_CANCEL,
                                           attempt_counters::publications_failed);
       }
       actions.append(operation.complete(result, true));
@@ -1374,7 +1388,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       SIRIUS_LOG_DEBUG(
         "[publish_dynamic_filters] Skipping dynamic filter push: all target scans drained.");
       for (auto& key : outcome.keys) {
-        key = {.reason        = dynamic_filter_key_reason::attempt_skip,
+        key = {.reason        = dynamic_filter_key_reason::ATTEMPT_SKIP,
                .reason_detail = attempt_counters::targets_drained.name};
       }
       return outcome;
@@ -1424,10 +1438,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
                                      admitted_key,
                                      build_rows,
                                      plan.domain_coverage_threshold(),
-                                     detail::publication_path::ordinary,
+                                     detail::publication_path::ORDINARY,
                                      /*publishable=*/true)) {
         ++outcome.keys_skipped_domain_gate;
-        reported.reason = dynamic_filter_key_reason::domain_gate;
+        reported.reason = dynamic_filter_key_reason::DOMAIN_GATE;
         continue;
       }
 
@@ -1453,7 +1467,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
             admitted_key.build_key_ordinal,
             static_cast<int32_t>(arrived_type.id()));
           ++outcome.keys_skipped_type_mismatch;
-          reported.reason = dynamic_filter_key_reason::type_mismatch;
+          reported.reason = dynamic_filter_key_reason::TYPE_MISMATCH;
           continue;
         }
         // One rule for every key family. The membership filters classify on the runtime column,
@@ -1593,12 +1607,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       if (!filters.membership ||
           !membership_reaches_a_binding(plan, admitted_key_index, filters.membership_domain)) {
         if (filters.membership) {
-          reported.reason = dynamic_filter_key_reason::unreadable_probe;
+          reported.reason = dynamic_filter_key_reason::UNREADABLE_PROBE;
         } else if (membership_key_supported(col.type()) && !fits_rep) {
-          reported.reason = dynamic_filter_key_reason::decimal128_unfit;
+          reported.reason = dynamic_filter_key_reason::DECIMAL128_UNFIT;
         } else if (!filters.zone_map ||
                    !zone_map_reaches_a_binding(plan, admitted_key_index, filters.zone_map_type)) {
-          reported.reason = dynamic_filter_key_reason::unsupported_type;
+          reported.reason = dynamic_filter_key_reason::UNSUPPORTED_TYPE;
         }
       }
       if (filters.membership) {
@@ -1671,9 +1685,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       reported.zone_map =
         filters.zone_map && zone_map_reaches_a_binding(plan, index, filters.zone_map_type);
       reported.pushed = pushed_bindings[index];
-      if (reported.reason == dynamic_filter_key_reason::not_constructed &&
+      if (reported.reason == dynamic_filter_key_reason::NOT_CONSTRUCTED &&
           (reported.kind != membership_filter_kind::none || reported.zone_map)) {
-        reported.reason = dynamic_filter_key_reason::published;
+        reported.reason = dynamic_filter_key_reason::PUBLISHED;
       }
     }
     SIRIUS_LOG_INFO(

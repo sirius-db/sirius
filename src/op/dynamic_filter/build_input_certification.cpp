@@ -26,15 +26,15 @@ namespace sirius::op {
 certification_decision certify_decision(build_port_facts const& facts) noexcept
 {
   if (facts.data_ports != 1 || !facts.single_port_is_default || facts.repository_partitions != 1) {
-    return construction_decline::input_shape;
+    return construction_decline::INPUT_SHAPE;
   }
   if (facts.barrier == MemoryBarrierType::PIPELINE) {
-    return construction_decline::pipeline_barrier;
+    return construction_decline::PIPELINE_BARRIER;
   }
   if (facts.barrier != MemoryBarrierType::FULL || !facts.has_source_pipeline) {
-    return construction_decline::input_shape;
+    return construction_decline::INPUT_SHAPE;
   }
-  if (facts.has_port_directive) { return construction_decline::port_directive; }
+  if (facts.has_port_directive) { return construction_decline::PORT_DIRECTIVE; }
   if (!facts.source_finished) { return certification_pending{}; }
   return certification_proceed{};
 }

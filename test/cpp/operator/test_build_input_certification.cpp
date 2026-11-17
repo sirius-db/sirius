@@ -32,7 +32,9 @@ namespace op = sirius::op;
 using op::construction_decline;
 using op::MemoryBarrierType;
 
-/// A single-partition `default` FULL input whose finished source queued three batches.
+/**
+ * @brief A single-partition `default` FULL input whose finished source queued three batches.
+ */
 constexpr op::build_port_facts k_ready{.data_ports             = 1,
                                        .single_port_is_default = true,
                                        .repository_partitions  = 1,
@@ -77,7 +79,7 @@ TEST_CASE("an input of the wrong shape declines at once", "[dynamic_filter][cert
   SECTION("a partitioned repository") { facts.repository_partitions = 2; }
   SECTION("a PARTIAL barrier") { facts.barrier = MemoryBarrierType::PARTIAL; }
   SECTION("no source pipeline") { facts.has_source_pipeline = false; }
-  CHECK(decline_of(facts) == construction_decline::input_shape);
+  CHECK(decline_of(facts) == construction_decline::INPUT_SHAPE);
 }
 
 TEST_CASE("a PIPELINE barrier declines before the source finishes",
@@ -86,7 +88,7 @@ TEST_CASE("a PIPELINE barrier declines before the source finishes",
   auto facts            = k_ready;
   facts.barrier         = MemoryBarrierType::PIPELINE;
   facts.source_finished = false;
-  CHECK(decline_of(facts) == construction_decline::pipeline_barrier);
+  CHECK(decline_of(facts) == construction_decline::PIPELINE_BARRIER);
 }
 
 TEST_CASE("a late-materialization directive declines before the source finishes",
@@ -95,7 +97,7 @@ TEST_CASE("a late-materialization directive declines before the source finishes"
   auto facts               = k_ready;
   facts.has_port_directive = true;
   facts.source_finished    = false;
-  CHECK(decline_of(facts) == construction_decline::port_directive);
+  CHECK(decline_of(facts) == construction_decline::PORT_DIRECTIVE);
 }
 
 TEST_CASE("decline checks run in a fixed order", "[dynamic_filter][certification]")
@@ -103,17 +105,17 @@ TEST_CASE("decline checks run in a fixed order", "[dynamic_filter][certification
   auto facts               = k_ready;
   facts.has_port_directive = true;
   facts.barrier            = MemoryBarrierType::PIPELINE;
-  CHECK(decline_of(facts) == construction_decline::pipeline_barrier);
+  CHECK(decline_of(facts) == construction_decline::PIPELINE_BARRIER);
   facts.data_ports = 2;
-  CHECK(decline_of(facts) == construction_decline::input_shape);
+  CHECK(decline_of(facts) == construction_decline::INPUT_SHAPE);
 }
 
 TEST_CASE("every decline reason has a stable spelling", "[dynamic_filter][certification]")
 {
-  CHECK(op::to_string(construction_decline::input_shape) == "input_shape");
-  CHECK(op::to_string(construction_decline::pipeline_barrier) == "pipeline_barrier");
-  CHECK(op::to_string(construction_decline::port_directive) == "port_directive");
-  CHECK(op::to_string(construction_decline::inventory_mismatch) == "inventory_mismatch");
-  CHECK(op::to_string(construction_decline::unreadable_arrival) == "unreadable_arrival");
-  CHECK(op::to_string(construction_decline::compressed_arrival) == "compressed_arrival");
+  CHECK(op::to_string(construction_decline::INPUT_SHAPE) == "input_shape");
+  CHECK(op::to_string(construction_decline::PIPELINE_BARRIER) == "pipeline_barrier");
+  CHECK(op::to_string(construction_decline::PORT_DIRECTIVE) == "port_directive");
+  CHECK(op::to_string(construction_decline::INVENTORY_MISMATCH) == "inventory_mismatch");
+  CHECK(op::to_string(construction_decline::UNREADABLE_ARRIVAL) == "unreadable_arrival");
+  CHECK(op::to_string(construction_decline::COMPRESSED_ARRIVAL) == "compressed_arrival");
 }

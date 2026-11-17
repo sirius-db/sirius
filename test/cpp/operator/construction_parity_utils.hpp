@@ -64,7 +64,9 @@ namespace acc = sirius::test::accumulation;
  * @brief Test access to `build_filter_construction`'s tickets.
  */
 struct test_access {
-  /// Shortens exact key @p key's slice by one row, so its last valid row overflows.
+  /**
+   * @brief Shortens exact key `key`'s slice by one row, so its last valid row overflows.
+   */
   static void shrink_slice(op::build_filter_construction::contribution_ticket& ticket,
                            std::size_t key)
   {
@@ -72,14 +74,18 @@ struct test_access {
     --ticket.slices.at(key).rows;
   }
 
-  /// Points the ticket at a bound slot past the end, so the bounds accumulator rejects it.
+  /**
+   * @brief Points the ticket at a bound slot past the end, so the bounds accumulator rejects it.
+   */
   static void corrupt_batch(op::build_filter_construction::contribution_ticket& ticket)
   {
     ticket.batch_index = static_cast<std::size_t>(1) << 40;
   }
 };
 
-/// The smallest L2 of GPU 0, as the one-shot builder reads it.
+/**
+ * @brief The smallest L2 of GPU 0, as the one-shot builder reads it.
+ */
 [[nodiscard]] inline std::size_t l2_bytes()
 {
   int l2 = 0;
@@ -128,7 +134,9 @@ struct join {
   }
 };
 
-/// Build batches on GPU 0: each a table of the key columns, in key order.
+/**
+ * @brief Build batches on GPU 0: each a table of the key columns, in key order.
+ */
 [[nodiscard]] inline std::vector<acc::batch_ptr> make_batches(
   acc::fixture const& fixture, std::vector<std::vector<cudf::column_view>> const& tables)
 {
@@ -154,8 +162,11 @@ struct constructed {
 };
 
 /**
- * @brief Constructs @p subject's filters from @p batches through `build_filter_construction`.
+ * @brief Constructs `subject`'s filters from `batches` through `build_filter_construction`.
  *
+ * @param fixture The test fixture whose GPUs construct the filters
+ * @param subject The join whose filters are constructed
+ * @param batches The build batches
  * @param order The order batches contribute in, as indices into the inventory; empty is inventory
  * order
  * @param threads Contributing threads, each with its own stream; batches are dealt round-robin
@@ -223,7 +234,7 @@ struct constructed {
 }
 
 /**
- * @brief The filters the legacy one-shot builder publishes for @p subject over @p whole, by key.
+ * @brief The filters the legacy one-shot builder publishes for `subject` over `whole`, by key.
  */
 struct one_shot {
   std::vector<std::shared_ptr<op::sirius_dynamic_filter const>> membership;
@@ -266,7 +277,9 @@ struct one_shot {
   return result;
 }
 
-/// The bytes of a scalar's value: its storage, or its string.
+/**
+ * @brief The bytes of a scalar's value: its storage, or its string.
+ */
 [[nodiscard]] inline std::vector<std::byte> scalar_bytes(cudf::scalar const& bound,
                                                          ::cuda::stream_ref stream)
 {
@@ -289,9 +302,9 @@ struct one_shot {
 
 /**
  * @brief Requires two membership filters to be the same filter: kind, size, domain, Bloom bits, and
- * the mask over @p probe.
+ * the mask over `probe`.
  *
- * @p stream is the stream both filters were built on, or follows it.
+ * `stream` is the stream both filters were built on, or follows it.
  */
 inline void require_same_membership(op::sirius_dynamic_filter const* left,
                                     op::sirius_dynamic_filter const* right,
@@ -338,7 +351,9 @@ inline void require_same_membership(op::sirius_dynamic_filter const* left,
   CHECK(mask(left) == mask(right));
 }
 
-/// Requires two zone maps to hold the same bounds.
+/**
+ * @brief Requires two zone maps to hold the same bounds.
+ */
 inline void require_same_zone_map(op::sirius_dynamic_filter const* left,
                                   op::sirius_dynamic_filter const* right,
                                   ::cuda::stream_ref stream)
@@ -356,7 +371,9 @@ inline void require_same_zone_map(op::sirius_dynamic_filter const* left,
         scalar_bytes(*right_zones.front().max, stream));
 }
 
-/// The constructed entry for admitted key @p index, or null.
+/**
+ * @brief The constructed entry for admitted key `index`, or null.
+ */
 [[nodiscard]] inline op::build_filter_construction::constructed_key const* key_of(
   constructed const& result, std::size_t index)
 {

@@ -45,25 +45,29 @@
 namespace sirius::op {
 
 /**
- * @brief Writes the valid rows of @p keys, in row order and converted to @p domain's rep, into @p
- * out
+ * @brief Writes the valid rows of `keys`, in row order and converted to `domain`'s rep, into
+ * `out`
  *
  * Each element is converted from its carrier to the rep on the device (`with_build_key_iterator`);
  * STRING keys become the 64-bit fingerprints the filters' probes compute. A valid row's destination
  * is its rank among the valid rows. A row whose rank is at or beyond `out.size()` is not written;
- * instead the word at @p overflow is set to a nonzero value, so a caller that sized @p out from
+ * instead the word at `overflow` is set to a nonzero value, so a caller that sized `out` from
  * metadata detects a disagreement after its next synchronization without any neighbor being
  * overwritten.
  *
- * @pre @p keys is a carrier of @p domain whose values fit the rep (a DECIMAL128 column has passed
- * `membership_build_fits_rep`), and its storage stays valid until work enqueued on @p stream
+ * @pre `keys` is a carrier of `domain` whose values fit the rep (a DECIMAL128 column has passed
+ * `membership_build_fits_rep`), and its storage stays valid until work enqueued on `stream`
  * completes
- * @throw std::invalid_argument if @p out is not a non-nullable column of
+ * @throw std::invalid_argument if `out` is not a non-nullable column of
  * `membership_rep_type(domain)`
- * @throw std::logic_error if @p keys is not a carrier of @p domain
- * @param overflow Device word set when a valid row does not fit, or null when @p out is sized
- * exactly from @p keys
- * @param scratch Resource for temporaries, which free stream-ordered on @p stream
+ * @throw std::logic_error if `keys` is not a carrier of `domain`
+ * @param domain The key domain whose rep `out` holds
+ * @param keys The build key column
+ * @param out The destination, one element per valid row it has room for
+ * @param overflow Device word set when a valid row does not fit, or null when `out` is sized
+ * exactly from `keys`
+ * @param stream The stream the conversion is enqueued on
+ * @param scratch Resource for temporaries, which free stream-ordered on `stream`
  */
 void prepare_build_keys(membership_key_domain const& domain,
                         cudf::column_view const& keys,
@@ -81,13 +85,16 @@ struct prepared_build_column {
 };
 
 /**
- * @brief Classifies @p keys, checks that its values fit the rep, and prepares its `size() -
+ * @brief Classifies `keys`, checks that its values fit the rep, and prepares its `size() -
  * null_count()` valid rows into a new column
  *
  * Only the DECIMAL128 fit check waits on the host; preparation itself does not.
  *
+ * @throw std::invalid_argument if `keys` is unsupported or its values do not fit the key rep
  * @param filter_name Bracketed filter name used as the exception message prefix
- * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
+ * @param keys The build key column
+ * @param stream The stream the preparation is enqueued on
+ * @param mr Resource for the returned column and its temporaries
  */
 [[nodiscard]] prepared_build_column prepare_build_column(std::string_view filter_name,
                                                          cudf::column_view const& keys,

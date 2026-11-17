@@ -61,7 +61,9 @@ using sirius::test::columns::string_family;
 using sirius::test::columns::valid_rows;
 using sirius::test::columns::values;
 
-/// The bits the Bloom column constructor sets for @p keys on GPU 0.
+/**
+ * @brief The bits the Bloom column constructor sets for `keys` on GPU 0.
+ */
 std::vector<std::byte> column_bits(cudf::column_view const& keys, ::cuda::stream_ref stream)
 {
   op::sirius_dynamic_bloom_filter const bloom{
@@ -78,7 +80,9 @@ builder make_builder(acc::fixture const& fixture, std::vector<builder::key> keys
   return std::move(*result);
 }
 
-/// Contributes @p column as a one-column table on GPU 0's task stream and retires it.
+/**
+ * @brief Contributes `column` as a one-column table on GPU 0's task stream and retires it.
+ */
 void contribute(builder& accumulated,
                 acc::fixture const& fixture,
                 std::vector<cudf::column_view> const& columns)

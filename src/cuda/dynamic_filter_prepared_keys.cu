@@ -37,7 +37,9 @@ namespace sirius::op {
 
 namespace {
 
-/// Writes row `row` to the same position when it fits; the input has no nulls.
+/**
+ * @brief Writes row `row` to the same position when it fits; the input has no nulls.
+ */
 template <class KeyT, class Iter>
 struct bounded_dense_write {
   Iter keys;
@@ -55,7 +57,9 @@ struct bounded_dense_write {
   }
 };
 
-/// Writes valid row `row` to its rank among the valid rows when that rank fits.
+/**
+ * @brief Writes valid row `row` to its rank among the valid rows when that rank fits.
+ */
 template <class KeyT, class Iter>
 struct bounded_compacting_write {
   Iter keys;
@@ -78,7 +82,9 @@ struct bounded_compacting_write {
   }
 };
 
-/// 1 for a valid row, 0 for a null one.
+/**
+ * @brief 1 for a valid row, 0 for a null one.
+ */
 struct valid_flag {
   cudf::bitmask_type const* mask;
   cudf::size_type offset;

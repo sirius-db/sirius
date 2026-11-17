@@ -71,7 +71,9 @@ using sirius::test::columns::valid_row;
 using sirius::test::columns::valid_rows;
 using sirius::test::columns::values;
 
-/// Uneven split bounds of a build of @p rows rows: @p splits pieces, one of them empty when 5.
+/**
+ * @brief Uneven split bounds of a build of `rows` rows: `splits` pieces, one of them empty when 5.
+ */
 std::vector<cudf::size_type> split_bounds(std::size_t splits, std::size_t rows)
 {
   std::vector<cudf::size_type> bounds{0};
@@ -85,7 +87,9 @@ std::vector<cudf::size_type> split_bounds(std::size_t splits, std::size_t rows)
   return bounds;
 }
 
-/// Valid rows of the test build in rows [begin, end).
+/**
+ * @brief Valid rows of the test build in rows [begin, end).
+ */
 std::size_t valid_between(cudf::size_type begin, cudf::size_type end)
 {
   std::size_t count = 0;
@@ -95,7 +99,9 @@ std::size_t valid_between(cudf::size_type begin, cudf::size_type end)
   return count;
 }
 
-/// The bytes of @p column's rows at their element width.
+/**
+ * @brief The bytes of `column`'s rows at their element width.
+ */
 std::vector<std::byte> bytes_of(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   std::vector<std::byte> bytes(static_cast<std::size_t>(column.size()) *
@@ -109,7 +115,10 @@ std::vector<std::byte> bytes_of(cudf::column_view const& column, ::cuda::stream_
   return bytes;
 }
 
-/// A scalar's value, as its storage bytes or its string, comparable across scalars of one type.
+/**
+ * @brief A scalar's value, as its storage bytes or its string, comparable across scalars of one
+ * type.
+ */
 std::vector<std::byte> value_of(cudf::scalar const& bound, ::cuda::stream_ref stream)
 {
   REQUIRE(bound.is_valid(stream));
@@ -123,7 +132,9 @@ std::vector<std::byte> value_of(cudf::scalar const& bound, ::cuda::stream_ref st
   return bytes_of(column->view(), stream);
 }
 
-/// @p bounds as device scalars, so they compare with the oracle's.
+/**
+ * @brief `bounds` as device scalars, so they compare with the oracle's.
+ */
 std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>> scalars_of(
   bounds_accumulator::key_bounds const& bounds, ::cuda::stream_ref stream)
 {
@@ -131,7 +142,9 @@ std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>> scalars_
   return bounds.to_scalars(stream, cudf::get_current_device_resource_ref());
 }
 
-/// The minimum and maximum one reduction over @p column gives.
+/**
+ * @brief The minimum and maximum one reduction over `column` gives.
+ */
 std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>> oracle_bounds(
   cudf::column_view const& column, ::cuda::stream_ref stream)
 {

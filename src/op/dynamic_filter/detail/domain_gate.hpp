@@ -26,26 +26,32 @@
 
 namespace sirius::op::detail {
 
-/// Publication path named in domain-gate diagnostics.
-enum class publication_path : std::uint8_t { ordinary, accumulated, construction };
+/**
+ * @brief Publication path named in domain-gate diagnostics.
+ */
+enum class publication_path : std::uint8_t { ORDINARY, ACCUMULATED, CONSTRUCTION };
 
 [[nodiscard]] constexpr char const* to_string(publication_path path) noexcept
 {
   switch (path) {
-    case publication_path::ordinary: return "ordinary";
-    case publication_path::accumulated: return "accumulated";
-    case publication_path::construction: return "construction";
+    case publication_path::ORDINARY: return "ordinary";
+    case publication_path::ACCUMULATED: return "accumulated";
+    case publication_path::CONSTRUCTION: return "construction";
   }
   return "invalid";
 }
 
 /**
- * @brief Counts a bound @p key of a build with @p build_rows rows in `keys_considered`,
+ * @brief Counts a bound `key` of a build with `build_rows` rows in `keys_considered`,
  * `keys_with_known_domain` and `keys_build_exceeded_domain`, and logs the domain gate's decision.
  *
- * @param publishable False when the path has already rejected the key, so the gate never skips
- * it
+ * @param counts The counters to update
+ * @param key The admitted key
+ * @param build_rows The build's row count
  * @param threshold The plan's `dynamic_filter_domain_coverage_threshold`
+ * @param path The publication path named in the log
+ * @param publishable False when the path has already rejected the key, which the gate then never
+ * skips
  * @return Whether the domain coverage gate skips the key; the caller counts the skip where its own
  * checks order it
  */

@@ -40,7 +40,9 @@ namespace sirius::op::detail {
 
 namespace {
 
-/// Throws `accumulation_invariant_error` with @p mismatch unless @p stream belongs to @p device.
+/**
+ * @brief Throws `accumulation_invariant_error` with `mismatch` unless `stream` belongs to `device`.
+ */
 void require_stream_on(::cuda::stream_ref stream, rmm::cuda_device_id device, char const* mismatch)
 {
   int stream_device = -1;
@@ -48,7 +50,9 @@ void require_stream_on(::cuda::stream_ref stream, rmm::cuda_device_id device, ch
   if (stream_device != device.value()) { throw accumulation_invariant_error(mismatch); }
 }
 
-/// Arrays of one partial: key `k` owns its buffer at `2k` and its overflow word at `2k + 1`.
+/**
+ * @brief Arrays of one partial: key `k` owns its buffer at `2k` and its overflow word at `2k + 1`.
+ */
 constexpr std::size_t buffer_of(std::size_t key) noexcept { return 2 * key; }
 constexpr std::size_t word_of(std::size_t key) noexcept { return 2 * key + 1; }
 
@@ -60,20 +64,25 @@ struct exact_key_stager::impl {
   {
   }
 
-  /// Bytes of one row of key @p index at its rep.
+  /**
+   * @brief Bytes of one row of key `index` at its rep.
+   */
   [[nodiscard]] std::size_t rep_bytes(std::size_t index) const noexcept
   {
     return membership_rep_bytes(domains[index].rep);
   }
 
   std::vector<key> keys;
-  std::vector<membership_key_domain> domains;  // Per key, classified from its type
+  std::vector<membership_key_domain> domains;  ///< Per key, classified from its type
   std::atomic<bool> leak_storage{false};
-  std::vector<std::unique_ptr<accumulation_partial>> partials;  // Destroyed before leak_storage.
-  std::mutex written_mutex;  // Guards `written`; never held across CUDA work.
-  std::vector<std::vector<std::vector<slice>>> written;  // [partial][key]: slices written there
+  std::vector<std::unique_ptr<accumulation_partial>> partials;  ///< Destroyed before leak_storage.
+  std::mutex written_mutex;  ///< Guards `written`; never held across CUDA work.
+  std::vector<std::vector<std::vector<slice>>> written;  ///< [partial][key]: slices written there
 };
 
+//===----------------------------------------------------------------------------------===//
+// exact_key_stager
+//===----------------------------------------------------------------------------------===//
 exact_key_stager::exact_key_stager(std::unique_ptr<impl> state) noexcept : _impl{std::move(state)}
 {
 }

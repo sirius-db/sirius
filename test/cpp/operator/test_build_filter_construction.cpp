@@ -63,7 +63,9 @@ using sirius::test::columns::make_column;
 using sirius::test::columns::validity;
 using sirius::test::columns::values;
 
-/// Uneven splits of @p column into @p pieces batches; five pieces include an empty batch.
+/**
+ * @brief Uneven splits of `column` into `pieces` batches; five pieces include an empty batch.
+ */
 std::vector<std::vector<cudf::column_view>> split(cudf::column_view const& column,
                                                   std::size_t pieces)
 {
@@ -81,9 +83,10 @@ std::vector<std::vector<cudf::column_view>> split(cudf::column_view const& colum
 }
 
 /**
- * @brief The membership sizing a join is planned with. The one-shot builder always reads the device
- * L2, so every sizing uses it; a zero IN-list fraction makes a Bloom key of any build too large for
- * a small IN-list.
+ * @brief The membership sizing a join is planned with.
+ *
+ * The one-shot builder always reads the device L2, so every sizing uses it; a zero IN-list fraction
+ * makes a Bloom key of any build too large for a small IN-list.
  */
 struct sizing {
   std::string_view name;
@@ -92,7 +95,9 @@ struct sizing {
 
 std::array<sizing, 2> constexpr sizings{{{"bloom", 0.0}, {"exact", 0.125}}};
 
-/// Leases a construction for @p subject over @p batches, as a session's creator does.
+/**
+ * @brief Leases a construction for `subject` over `batches`, as a session's creator does.
+ */
 op::build_filter_construction create(acc::fixture const& fixture,
                                      cons::join const& subject,
                                      std::vector<acc::batch_ptr> const& batches)
@@ -111,7 +116,9 @@ op::build_filter_construction create(acc::fixture const& fixture,
   return std::move(*construction);
 }
 
-/// Finishes @p construction on GPU 0's publication stream.
+/**
+ * @brief Finishes `construction` on GPU 0's publication stream.
+ */
 op::build_filter_construction::constructed_filters finish(
   acc::fixture const& fixture, op::build_filter_construction& construction)
 {
@@ -123,7 +130,9 @@ op::build_filter_construction::constructed_filters finish(
   return std::move(*finished);
 }
 
-/// Contributes every batch of @p batches, in inventory order, on GPU 0's task stream.
+/**
+ * @brief Contributes every batch of `batches`, in inventory order, on GPU 0's task stream.
+ */
 void contribute_all(acc::fixture const& fixture,
                     op::build_filter_construction& construction,
                     std::vector<acc::batch_ptr> const& batches,
@@ -146,7 +155,9 @@ void contribute_all(acc::fixture const& fixture,
   }
 }
 
-/// Finishes @p construction on GPU 0 as the task that owns @p stream and its thread's tracker.
+/**
+ * @brief Finishes `construction` on GPU 0 as the task that owns `stream` and its thread's tracker.
+ */
 op::build_filter_construction::constructed_filters finish_on(
   acc::fixture const& fixture,
   op::build_filter_construction& construction,
@@ -186,7 +197,9 @@ class tracked_task {
   ::cuda::stream_ref _stream;
 };
 
-/// Requires @p left and @p right to hold the same filters for key 0.
+/**
+ * @brief Requires `left` and `right` to hold the same filters for key 0.
+ */
 void require_same_key(cons::constructed const& left,
                       cons::constructed const& right,
                       cudf::column_view const& probe,
@@ -418,7 +431,7 @@ TEST_CASE("an overflowed staging slice drops only that key's IN-list",
   auto const finished = finish(fixture, construction);
   CHECK(finished.keys[0].membership);
   CHECK_FALSE(finished.keys[1].membership);
-  CHECK(finished.keys[1].dropped == op::dynamic_filter_key_reason::construction_invariant);
+  CHECK(finished.keys[1].dropped == op::dynamic_filter_key_reason::CONSTRUCTION_INVARIANT);
   CHECK(finished.keys[1].zone_map);
   CHECK(finished.counts.filters_skipped_construction_invariant == 1);
 }
@@ -506,7 +519,7 @@ TEST_CASE("a DECIMAL128 key publishes membership only when its values fit int64"
       REQUIRE(key != nullptr);
       CHECK(key->zone_map);  // Bounds are exact at DECIMAL128 either way.
       CHECK(static_cast<bool>(key->membership) == !large);
-      CHECK((key->dropped == op::dynamic_filter_key_reason::decimal128_unfit) == large);
+      CHECK((key->dropped == op::dynamic_filter_key_reason::DECIMAL128_UNFIT) == large);
       auto const legacy = cons::publish_one_shot(fixture,
                                                  {decimal},
                                                  cudf::table_view{{keys->view()}},
@@ -574,7 +587,7 @@ TEST_CASE("a root filter without room left in the task's memory is dropped alone
            }).get();
   auto const finished = finish_on(fixture, construction, task);
   CHECK_FALSE(finished.keys[0].membership);
-  CHECK(finished.keys[0].dropped == op::dynamic_filter_key_reason::construction_admission);
+  CHECK(finished.keys[0].dropped == op::dynamic_filter_key_reason::CONSTRUCTION_ADMISSION);
   CHECK(finished.keys[0].zone_map);
   CHECK(finished.counts.filters_skipped_construction_admission == 1);
 }
@@ -604,7 +617,7 @@ TEST_CASE("a root filter whose construction runs out of the task's memory is dro
                              std::make_unique<cucascade::memory::fail_reservation_limit_policy>()};
   auto const finished = finish_on(fixture, construction, task);
   CHECK_FALSE(finished.keys[0].membership);
-  CHECK(finished.keys[0].dropped == op::dynamic_filter_key_reason::construction_admission);
+  CHECK(finished.keys[0].dropped == op::dynamic_filter_key_reason::CONSTRUCTION_ADMISSION);
   CHECK(finished.keys[0].zone_map);
   CHECK(finished.counts.filters_skipped_construction_admission == 1);
 }

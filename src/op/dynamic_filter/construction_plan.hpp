@@ -66,64 +66,65 @@ struct binding_facts {
 };
 
 /**
- * @brief The facts of every binding of every admitted key of @p plan, by admitted-key index
+ * @brief The facts of every binding of every admitted key of `plan`, by admitted-key index
  */
 [[nodiscard]] std::vector<std::vector<binding_facts>> binding_facts_of(
   dynamic_filter_publish_plan const& plan);
 
-/// An exact IN-list over the key's valid rows.
+/**
+ * @brief An exact IN-list over the key's valid rows.
+ */
 struct exact_membership {
   membership_filter_kind kind;  ///< `small_in_list` or `hash_in_list`
   std::size_t valid_rows;       ///< Keys the list stages
 };
 
-/// A Bloom filter.
+/**
+ * @brief A Bloom filter.
+ */
 struct bloom_membership {
   std::size_t sized_rows;  ///< Rows the filter is sized for: valid rows, or every row when unknown
   std::size_t blocks;      ///< `bloom_blocks_for(sized_rows)`
 };
 
-/// One key's membership filter, if any.
+/**
+ * @brief One key's membership filter, if any.
+ */
 using membership_plan = std::variant<std::monostate, exact_membership, bloom_membership>;
 
 /**
  * @brief The filters planned for one admitted key
+ *
+ * `construction_type` is the one carrier when it lands in the recorded type's family, otherwise the
+ * recorded type.
  */
 struct key_plan {
-  /** @brief The key's index in the plan's admitted keys */
-  std::size_t admitted_key_index;
-  /** @brief The key's column in every build batch */
-  cudf::size_type build_key_ordinal;
-  /** @brief The admitted key's recorded storage type: the type its zone-map bounds carry */
-  cudf::data_type recorded_type;
-  /** @brief The type the membership filter is built over: the one carrier when it lands in the
-   * recorded type's family, otherwise the recorded type */
-  cudf::data_type construction_type;
-  /** @brief The key's membership filter */
-  membership_plan membership;
-  /** @brief Whether a zone map is planned */
-  bool zone_map;
-  /** @brief Whether some binding accepts the planned zone map, so the key's line reports it */
-  bool zone_map_deliverable;
-  /** @brief A DECIMAL128 membership filter that publishes only if the merged bounds fit int64 */
-  bool fit_pending;
+  std::size_t admitted_key_index;     ///< The key's index in the plan's admitted keys
+  cudf::size_type build_key_ordinal;  ///< The key's column in every build batch
+  cudf::data_type recorded_type;      ///< The Recorded Type, which the zone-map bounds carry
+  cudf::data_type construction_type;  ///< The type the membership filter is built over
+  membership_plan membership;         ///< The key's membership filter
+  bool zone_map;                      ///< Whether a zone map is planned
+  bool zone_map_deliverable;          ///< Whether some binding accepts the planned zone map
+  bool fit_pending;                   ///< DECIMAL128 membership publishes only if bounds fit int64
 
-  /** @brief Whether the key's bounds must be accumulated */
+  /**
+   * @brief Whether the key's bounds must be accumulated
+   */
   [[nodiscard]] bool needs_bounds() const noexcept { return zone_map || fit_pending; }
 };
 
 /**
  * @brief The plan for every admitted key with a binding
+ *
+ * `keys` holds the keys with a planned membership filter or bounds. `outcomes` is in admitted-key
+ * order: a planned key's line is `NOT_CONSTRUCTED` until its filters reach the fan-out; any other
+ * line carries its final reason.
  */
 struct construction_plan {
-  /** @brief Keys with a planned membership filter or bounds, in admitted-key order */
-  std::vector<key_plan> keys;
-  /** @brief One line per admitted key with a binding, in admitted-key order. A planned key's line
-   * is `not_constructed` until its filters reach the fan-out; any other line carries its final
-   * reason. */
-  std::vector<dynamic_filter_key_line> outcomes;
-  /** @brief The selection counters the plan adds to `dynamic_filter_stats` */
-  dynamic_filter_stats_snapshot selection;
+  std::vector<key_plan> keys;                     ///< Keys with a planned filter, by admitted key
+  std::vector<dynamic_filter_key_line> outcomes;  ///< One line per admitted key with a binding
+  dynamic_filter_stats_snapshot selection;        ///< Selection counts for `dynamic_filter_stats`
 };
 
 /**
@@ -147,15 +148,15 @@ struct construction_plan {
  * every Bloom key drops its membership (`keys_skipped_bloom_size_gate`).
  *
  * Keys left with neither membership nor bounds are omitted from `construction_plan::keys` but keep
- * their line. Reasons follow the `[dynamic_filter_key]` rules: `unsupported_type` is reported only
+ * their line. Reasons follow the `[dynamic_filter_key]` rules: `UNSUPPORTED_TYPE` is reported only
  * when no zone map would reach a binding either.
  *
+ * @throw std::logic_error if an admitted key's build ordinal lies outside every batch's schema, or
+ * the spans' sizes differ
  * @param facts The inventory's facts
  * @param admitted_keys The plan's admitted keys
  * @param bindings Each admitted key's bindings; a key with none is not planned
  * @param limits The limits to apply
- * @throw std::logic_error if an admitted key's build ordinal lies outside every batch's schema, or
- * the spans' sizes differ
  */
 [[nodiscard]] construction_plan plan_construction(
   build_input_facts const& facts,

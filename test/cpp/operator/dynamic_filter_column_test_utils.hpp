@@ -43,7 +43,10 @@
 
 namespace sirius::test::columns {
 
-/// A column of @p type holding @p values bit-for-bit, with row `i` null iff `valid[i]` is false.
+/**
+ * @brief A column of `type` holding `values` bit-for-bit, with row `i` null iff `valid[i]` is
+ * false.
+ */
 template <class T>
 inline std::unique_ptr<cudf::column> make_column(cudf::data_type type,
                                                  std::vector<T> const& values,
@@ -75,7 +78,9 @@ inline std::unique_ptr<cudf::column> make_column(cudf::data_type type,
   return column;
 }
 
-/// The rows of @p column, which stores elements of @p T, copied to the host.
+/**
+ * @brief The rows of `column`, which stores elements of `T`, copied to the host.
+ */
 template <class T>
 inline std::vector<T> to_host(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
@@ -89,10 +94,14 @@ inline std::vector<T> to_host(cudf::column_view const& column, ::cuda::stream_re
   return values;
 }
 
-/// Rows of the key-family test builds.
+/**
+ * @brief Rows of the key-family test builds.
+ */
 inline constexpr std::size_t k_rows = 600;
 
-/// Whether row @p row of a test build is valid: every fifth row is null.
+/**
+ * @brief Whether row `row` of a test build is valid: every fifth row is null.
+ */
 inline bool valid_row(std::size_t row) { return row % 5 != 2; }
 
 inline std::vector<bool> validity(std::size_t rows)
@@ -113,7 +122,9 @@ inline std::size_t valid_rows(std::size_t rows)
   return count;
 }
 
-/// Distinct values that fit INT16, so every carrier below can hold them.
+/**
+ * @brief Distinct values that fit INT16, so every carrier below can hold them.
+ */
 template <class T>
 inline std::vector<T> values(std::size_t rows)
 {
@@ -124,9 +135,12 @@ inline std::vector<T> values(std::size_t rows)
   return out;
 }
 
-/// A key family: the type the filter is built over, the build column at its carrier, and the same
-/// keys as a column of the construction type for the column constructor. Each builder returns its
-/// column with the work on its stream complete, as `make_column` does.
+/**
+ * @brief A key family: the type the filter is built over, the build column at its carrier, and the
+ * same keys as a column of the construction type for the column constructor.
+ *
+ * Each builder returns its column with the work on its stream complete, as `make_column` does.
+ */
 struct family {
   std::string name;
   cudf::data_type construction;

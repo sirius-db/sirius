@@ -40,7 +40,7 @@ class [[nodiscard]] post_unlock_actions final {
   post_unlock_actions() noexcept = default;
 
   /**
-   * @brief Takes ownership of @p key_lines, to be logged by `dispatch`
+   * @brief Takes ownership of `key_lines`, to be logged by `dispatch`
    */
   explicit post_unlock_actions(std::vector<dynamic_filter_key_line> key_lines) noexcept;
 
@@ -52,7 +52,7 @@ class [[nodiscard]] post_unlock_actions final {
   ~post_unlock_actions() noexcept;
 
   /**
-   * @brief Moves @p other's work after this value's work
+   * @brief Moves `other`'s work after this value's work
    *
    * Allocates only when both values hold work.
    */

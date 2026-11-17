@@ -60,30 +60,30 @@ constexpr void fnv1a(std::uint64_t& hash, std::string_view bytes) noexcept
 [[nodiscard]] constexpr std::string_view to_token(dynamic_filter_key_reason reason) noexcept
 {
   switch (reason) {
-    case dynamic_filter_key_reason::published: return "-";
-    case dynamic_filter_key_reason::domain_gate: return "domain_gate";
-    case dynamic_filter_key_reason::type_mismatch: return "type_mismatch";
-    case dynamic_filter_key_reason::unsupported_type: return "unsupported_type";
-    case dynamic_filter_key_reason::unreadable_probe: return "unreadable_probe";
-    case dynamic_filter_key_reason::bloom_cap: return "bloom_cap";
-    case dynamic_filter_key_reason::decimal128_unfit: return "decimal128_unfit";
-    case dynamic_filter_key_reason::construction_admission: return "construction_admission";
-    case dynamic_filter_key_reason::construction_invariant: return "construction_invariant";
-    case dynamic_filter_key_reason::attempt_skip: return "attempt_skip_";
-    case dynamic_filter_key_reason::attempt_fail: return "attempt_fail_";
-    case dynamic_filter_key_reason::attempt_cancel: return "attempt_cancel_";
-    case dynamic_filter_key_reason::declined: return "declined_";
-    case dynamic_filter_key_reason::not_constructed: return "not_constructed";
+    case dynamic_filter_key_reason::PUBLISHED: return "-";
+    case dynamic_filter_key_reason::DOMAIN_GATE: return "domain_gate";
+    case dynamic_filter_key_reason::TYPE_MISMATCH: return "type_mismatch";
+    case dynamic_filter_key_reason::UNSUPPORTED_TYPE: return "unsupported_type";
+    case dynamic_filter_key_reason::UNREADABLE_PROBE: return "unreadable_probe";
+    case dynamic_filter_key_reason::BLOOM_CAP: return "bloom_cap";
+    case dynamic_filter_key_reason::DECIMAL128_UNFIT: return "decimal128_unfit";
+    case dynamic_filter_key_reason::CONSTRUCTION_ADMISSION: return "construction_admission";
+    case dynamic_filter_key_reason::CONSTRUCTION_INVARIANT: return "construction_invariant";
+    case dynamic_filter_key_reason::ATTEMPT_SKIP: return "attempt_skip_";
+    case dynamic_filter_key_reason::ATTEMPT_FAIL: return "attempt_fail_";
+    case dynamic_filter_key_reason::ATTEMPT_CANCEL: return "attempt_cancel_";
+    case dynamic_filter_key_reason::DECLINED: return "declined_";
+    case dynamic_filter_key_reason::NOT_CONSTRUCTED: return "not_constructed";
   }
   return "invalid";
 }
 
 [[nodiscard]] constexpr bool has_detail(dynamic_filter_key_reason reason) noexcept
 {
-  return reason == dynamic_filter_key_reason::attempt_skip ||
-         reason == dynamic_filter_key_reason::attempt_fail ||
-         reason == dynamic_filter_key_reason::attempt_cancel ||
-         reason == dynamic_filter_key_reason::declined;
+  return reason == dynamic_filter_key_reason::ATTEMPT_SKIP ||
+         reason == dynamic_filter_key_reason::ATTEMPT_FAIL ||
+         reason == dynamic_filter_key_reason::ATTEMPT_CANCEL ||
+         reason == dynamic_filter_key_reason::DECLINED;
 }
 
 }  // namespace

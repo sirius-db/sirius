@@ -117,13 +117,19 @@ class sirius_pipeline_converter {
   /// narrowest admission is exactly where it matters most.
   void restrict_dynamic_filter_replicas();
 
-  /// Gives every hash join's dynamic-filter session the identity its `[dynamic_filter_key]` lines
-  /// carry: the join's signature, its occurrence among joins with that signature in operator-ID
-  /// order, and its operator ID. Runs after `assign_operator_ids`.
+  /**
+   * @brief Gives every hash join's dynamic-filter session the identity its `[dynamic_filter_key]`
+   * lines carry: the join's signature, its occurrence among joins with that signature in
+   * operator-ID order, and its operator ID.
+   *
+   * Runs after `assign_operator_ids`.
+   */
   void identify_dynamic_filter_joins();
 
-  /// Every distinct hash join of the scheduled pipelines, including joins fused among a pipeline's
-  /// intermediate operators.
+  /**
+   * @brief Every distinct hash join of the scheduled pipelines, including joins fused among a
+   * pipeline's intermediate operators.
+   */
   [[nodiscard]] std::vector<op::sirius_physical_hash_join*> scheduled_hash_joins() const;
 
   const pipeline_build_context build_ctx_;

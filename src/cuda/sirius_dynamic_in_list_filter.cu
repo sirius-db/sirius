@@ -90,7 +90,9 @@ static_assert(kGrowthCandidates[0] >= kGrowthCandidates[1] &&
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
 
-/// The capacity the constructor requests for @p num_keys keys at @p factor slots per key.
+/**
+ * @brief The capacity the constructor requests for `num_keys` keys at `factor` slots per key.
+ */
 [[nodiscard]] std::size_t requested_capacity(std::size_t num_keys, std::size_t factor) noexcept
 {
   auto const capacity = num_keys > std::numeric_limits<std::size_t>::max() / factor

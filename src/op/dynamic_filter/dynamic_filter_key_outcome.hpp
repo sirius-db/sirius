@@ -49,91 +49,81 @@ namespace sirius::op {
 /**
  * @brief Why a key ended with the filters its line reports
  *
- * The three `attempt_*` reasons mean the whole publication attempt ended before this key's filters
- * reached the fan-out, and `declined` means the construction site declined its build input before
+ * The three `ATTEMPT_*` reasons mean the whole publication attempt ended before this key's filters
+ * reached the fan-out, and `DECLINED` means the construction site declined its build input before
  * any attempt (`construction_decline`); `dynamic_filter_key_outcome::reason_detail` names the
  * counter that recorded the attempt's end or the decline reason.
  */
 enum class dynamic_filter_key_reason : std::uint8_t {
-  published,         ///< Printed `-`: the key's filters reached the fan-out
-  domain_gate,       ///< The domain-coverage gate skipped the key
-  type_mismatch,     ///< The build column's type cannot carry the recorded key type
-  unsupported_type,  ///< No filter kind supports the key type
-  unreadable_probe,  ///< No binding can read the key's membership filter
-  bloom_cap,  ///< The accumulated Bloom arrays exceed `max_dynamic_filter_bloom_bytes_per_gpu`
-  decimal128_unfit,        ///< A DECIMAL128 build value lies outside the int64 membership rep
-  construction_admission,  ///< The root GPU refused the memory to build the filter
-  construction_invariant,  ///< Construction found more valid rows than the inventory recorded
-  attempt_skip,            ///< The attempt ended without a filter
-  attempt_fail,            ///< The attempt failed
-  attempt_cancel,          ///< The attempt was cancelled
-  declined,                ///< The construction site declined its build input
-  not_constructed  ///< No attempt constructed this key's filters, for example an empty build
+  PUBLISHED,         ///< Printed `-`: the key's filters reached the fan-out
+  DOMAIN_GATE,       ///< The domain-coverage gate skipped the key
+  TYPE_MISMATCH,     ///< The build column's type cannot carry the recorded key type
+  UNSUPPORTED_TYPE,  ///< No filter kind supports the key type
+  UNREADABLE_PROBE,  ///< No binding can read the key's membership filter
+  BLOOM_CAP,  ///< The accumulated Bloom arrays exceed `max_dynamic_filter_bloom_bytes_per_gpu`
+  DECIMAL128_UNFIT,        ///< A DECIMAL128 build value lies outside the int64 membership rep
+  CONSTRUCTION_ADMISSION,  ///< The root GPU refused the memory to build the filter
+  CONSTRUCTION_INVARIANT,  ///< Construction found more valid rows than the inventory recorded
+  ATTEMPT_SKIP,            ///< The attempt ended without a filter
+  ATTEMPT_FAIL,            ///< The attempt failed
+  ATTEMPT_CANCEL,          ///< The attempt was cancelled
+  DECLINED,                ///< The construction site declined its build input
+  NOT_CONSTRUCTED  ///< No attempt constructed this key's filters, for example an empty build
 };
 
 /**
  * @brief What one admitted key's publication produced
+ *
+ * `size` is 0 without a membership filter.
  */
 struct dynamic_filter_key_outcome {
-  /** @brief Build rows the key was judged on; 0 when it was never judged */
-  std::size_t rows = 0;
-  /** @brief Non-null build rows, when the path counted them */
-  std::optional<std::size_t> valid_rows;
-  /** @brief The membership filter some binding can read */
-  membership_filter_kind kind = membership_filter_kind::none;
-  /** @brief IN-list key count or Bloom array bytes; 0 without a membership filter */
-  std::size_t size = 0;
-  /** @brief Whether a zone map some binding accepts reached the fan-out */
-  bool zone_map = false;
-  /** @brief Bindings that received this key's membership filter or zone map */
-  std::size_t pushed = 0;
-  /** @brief Why the key ended this way */
-  dynamic_filter_key_reason reason = dynamic_filter_key_reason::not_constructed;
-  /** @brief The counter that ended an `attempt_*` reason's attempt, or a `declined` reason's
-   * `construction_decline` */
-  std::string_view reason_detail{};
+  std::size_t rows = 0;  ///< Build rows the key was judged on; 0 when it was never judged
+  std::optional<std::size_t> valid_rows;  ///< Non-null build rows, when the path counted them
+  membership_filter_kind kind =
+    membership_filter_kind::none;  ///< The membership filter some binding can read
+  std::size_t size   = 0;          ///< IN-list key count or Bloom array bytes
+  bool zone_map      = false;      ///< Whether a zone map some binding accepts reached the fan-out
+  std::size_t pushed = 0;  ///< Bindings that received this key's membership filter or zone map
+  dynamic_filter_key_reason reason =
+    dynamic_filter_key_reason::NOT_CONSTRUCTED;  ///< Why the key ended this way
+  std::string_view reason_detail{};              ///< The counter or decline behind the reason
 };
 
 /**
  * @brief Identifies one hash join across plans of the same query, independently of operator IDs
+ *
+ * `occurrence` is the join's position among the query's joins with the same signature, ordered by
+ * operator ID.
  */
 struct dynamic_filter_join_identity {
-  /** @brief `dynamic_filter_join_signature` of the join's type and conditions */
-  std::uint64_t signature = 0;
-  /** @brief The join's position among the query's joins with the same signature, by operator ID */
-  std::size_t occurrence = 0;
-  /** @brief The join's operator ID, for humans only; empty before the plan is numbered */
-  std::optional<std::size_t> operator_id;
+  std::uint64_t signature = 0;             ///< `dynamic_filter_join_signature` of the join
+  std::size_t occurrence  = 0;             ///< Position among joins with the same signature
+  std::optional<std::size_t> operator_id;  ///< Operator ID, for humans; empty until numbered
 };
 
 /**
  * @brief One `[dynamic_filter_key]` log line
  */
 struct dynamic_filter_key_line {
-  /** @brief The join that owns the key */
-  dynamic_filter_join_identity join;
-  /** @brief The key's index in its plan's admitted keys; not printed */
-  std::size_t admitted_key_index = 0;
-  /** @brief The key's original join-condition index */
-  std::size_t planner_condition_index = 0;
-  /** @brief The key's column in the build table */
-  cudf::size_type build_key_ordinal = 0;
-  /** @brief What the key's publication produced */
-  dynamic_filter_key_outcome outcome;
+  dynamic_filter_join_identity join;   ///< The join that owns the key
+  std::size_t admitted_key_index = 0;  ///< The key's index in its plan's admitted keys; not printed
+  std::size_t planner_condition_index = 0;  ///< The key's original join-condition index
+  cudf::size_type build_key_ordinal   = 0;  ///< The key's column in the build table
+  dynamic_filter_key_outcome outcome;       ///< What the key's publication produced
 };
 
 /**
- * @brief Spells @p line as its log message
+ * @brief Spells `line` as its log message
  *
  * The message is `[dynamic_filter_key] v=1 sig=<16 hex> occ=<n> join=<id|-> condition=<n>
  * build_ordinal=<n> rows=<n> valid=<n|unknown> kind=<none|bloom|small_in_list|hash_in_list>
- * size=<n> zone_map=<0|1> pushed=<n> reason=<token>`, where an `attempt_*` or `declined` reason is
+ * size=<n> zone_map=<0|1> pushed=<n> reason=<token>`, where an `ATTEMPT_*` or `DECLINED` reason is
  * followed by `_<detail>`. A change to this form must bump `v`.
  */
 [[nodiscard]] std::string to_string(dynamic_filter_key_line const& line);
 
 /**
- * @brief The 64-bit FNV-1a hash of @p join_type followed by each of @p conditions, each condition
+ * @brief The 64-bit FNV-1a hash of `join_type` followed by each of `conditions`, each condition
  * preceded by a unit-separator byte so that no two condition lists share a byte stream
  *
  * The planner passes `duckdb::JoinTypeToString` and each condition spelled `lhs <operator> rhs`, so

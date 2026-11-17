@@ -70,7 +70,9 @@ auto const k_empty  = type(cudf::type_id::EMPTY);
 
 constexpr std::size_t k_l2 = std::size_t{4} << 20;
 
-/// One key of a test plan: its recorded type, its column's facts, and its bindings.
+/**
+ * @brief One key of a test plan: its recorded type, its column's facts, and its bindings.
+ */
 struct key_case {
   cudf::data_type recorded;
   op::key_column_facts column;
@@ -80,7 +82,9 @@ struct key_case {
   bool proven_unique = false;
 };
 
-/// A binding whose probe reads the recorded type through a scan that accepts zone maps.
+/**
+ * @brief A binding whose probe reads the recorded type through a scan that accepts zone maps.
+ */
 op::binding_facts scan_binding(cudf::data_type probe)
 {
   return {.probe_type = probe, .accepts_zone_map = true};
@@ -107,7 +111,9 @@ op::construction_limits limits(std::size_t l2 = k_l2)
           .max_bloom_bytes_per_gpu   = std::uint64_t{256} << 20};
 }
 
-/// Plans @p cases, key `i` reading build ordinal `i`, over @p rows rows in one batch.
+/**
+ * @brief Plans `cases`, key `i` reading build ordinal `i`, over `rows` rows in one batch.
+ */
 planned plan_for(std::vector<key_case> const& cases,
                  std::size_t rows,
                  op::construction_limits const& limit = limits())
@@ -129,7 +135,9 @@ planned plan_for(std::vector<key_case> const& cases,
   return {op::plan_construction(facts, keys, bindings, limit), std::move(keys)};
 }
 
-/// The kind the one-shot publisher chooses for @p valid_rows valid keys of @p type.
+/**
+ * @brief The kind the one-shot publisher chooses for `valid_rows` valid keys of `type`.
+ */
 membership_filter_kind one_shot_kind(cudf::data_type type, std::size_t valid_rows, std::size_t l2)
 {
   return op::choose_membership_filter(
@@ -144,7 +152,9 @@ membership_filter_kind one_shot_kind(cudf::data_type type, std::size_t valid_row
      .supports_bloom        = op::membership_key_supported(type)});
 }
 
-/// The planned membership kind of admitted key @p index, or none when it has no membership.
+/**
+ * @brief The planned membership kind of admitted key `index`, or none when it has no membership.
+ */
 membership_filter_kind planned_kind(op::construction_plan const& plan, std::size_t index)
 {
   for (auto const& key : plan.keys) {
@@ -210,7 +220,7 @@ TEST_CASE("each key's membership kind equals the one-shot choice",
   auto const& outcome = outcome_of(result, 0);
   CHECK(outcome.rows == rows);
   CHECK(outcome.valid_rows == valid);
-  CHECK(outcome.reason == dynamic_filter_key_reason::not_constructed);
+  CHECK(outcome.reason == dynamic_filter_key_reason::NOT_CONSTRUCTED);
 }
 
 TEST_CASE("the hash IN-list stops at the configured L2 fraction",
@@ -284,8 +294,8 @@ TEST_CASE("a carrier that cannot restore skips only its key", "[dynamic_filter][
   CHECK(key_of(result, 0) == nullptr);
   CHECK(key_of(result, 1) == nullptr);
   CHECK(key_of(result, 2) != nullptr);
-  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::type_mismatch);
-  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::type_mismatch);
+  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::TYPE_MISMATCH);
+  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::TYPE_MISMATCH);
   CHECK_FALSE(outcome_of(result, 0).valid_rows);
 }
 
@@ -310,15 +320,15 @@ TEST_CASE("types no membership filter supports plan only a zone map",
     plan_for({plain_key(k_float), plain_key(k_bool), unaccepted}, 100, limit).plan;
 
   CHECK(key_of(result, 0) == nullptr);
-  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::unsupported_type);
+  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::UNSUPPORTED_TYPE);
   auto const* zone_only = key_of(result, 1);
   REQUIRE(zone_only != nullptr);
   CHECK(std::holds_alternative<std::monostate>(zone_only->membership));
   CHECK(zone_only->zone_map);
   CHECK(zone_only->zone_map_deliverable);
-  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::not_constructed);
+  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::NOT_CONSTRUCTED);
   // A zone map no binding accepts explains nothing, so the key reports its type.
-  CHECK(outcome_of(result, 2).reason == dynamic_filter_key_reason::unsupported_type);
+  CHECK(outcome_of(result, 2).reason == dynamic_filter_key_reason::UNSUPPORTED_TYPE);
   CHECK(result.selection.bindings_skipped_incompatible_probe == 0);
 }
 
@@ -330,7 +340,7 @@ TEST_CASE("a key no binding can read plans no membership", "[dynamic_filter][con
   unknown_probe.bindings = {scan_binding(k_empty)};
   auto const result      = plan_for({unreadable, unknown_probe}, 100).plan;
   CHECK(key_of(result, 0) == nullptr);
-  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::unreadable_probe);
+  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::UNREADABLE_PROBE);
   CHECK(result.selection.bindings_skipped_incompatible_probe == 2);
   CHECK(planned_kind(result, 1) !=
         membership_filter_kind::none);  // An unknown probe type is readable.
@@ -345,8 +355,8 @@ TEST_CASE("the domain gate judges only publishable keys", "[dynamic_filter][cons
   mismatched.column     = {.carriers = {k_int64}, .null_rows = 0};
   auto const result     = plan_for({covered, mismatched}, 100).plan;
   CHECK(key_of(result, 0) == nullptr);
-  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::domain_gate);
-  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::type_mismatch);
+  CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::DOMAIN_GATE);
+  CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::TYPE_MISMATCH);
   CHECK(result.selection.keys_skipped_domain_gate == 1);
   CHECK(result.selection.keys_skipped_type_mismatch == 1);
   CHECK(result.selection.keys_considered == 2);
@@ -400,7 +410,7 @@ TEST_CASE("the Bloom cap applies to the sum of the keys' aligned arrays",
     for (std::size_t index : {0, 1}) {
       CHECK(planned_kind(result, index) == membership_filter_kind::none);
       CHECK(key_of(result, index)->zone_map);  // The zone map survives the cap.
-      CHECK(outcome_of(result, index).reason == dynamic_filter_key_reason::bloom_cap);
+      CHECK(outcome_of(result, index).reason == dynamic_filter_key_reason::BLOOM_CAP);
     }
     CHECK(planned_kind(result, 2) == membership_filter_kind::small_in_list);
     CHECK(result.selection.keys_skipped_bloom_size_gate == 2);

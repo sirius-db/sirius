@@ -46,7 +46,9 @@ using op::membership_filter_kind;
 
 constexpr std::string_view k_prefix = "[dynamic_filter_key] ";
 
-/// The `[dynamic_filter_key]` messages @p sink recorded, in order.
+/**
+ * @brief The `[dynamic_filter_key]` messages `sink` recorded, in order.
+ */
 std::vector<std::string> key_lines(sirius::test::scoped_recording_log_sink const& sink)
 {
   std::vector<std::string> lines;
@@ -68,7 +70,7 @@ dynamic_filter_key_line sample_line()
                                       .size       = 90,
                                       .zone_map   = true,
                                       .pushed     = 2,
-                                      .reason     = dynamic_filter_key_reason::published}};
+                                      .reason     = dynamic_filter_key_reason::PUBLISHED}};
 }
 
 }  // namespace
@@ -84,7 +86,7 @@ TEST_CASE("a key line spells unknown values and attempt reasons", "[dynamic_filt
 {
   dynamic_filter_key_line line{.planner_condition_index = 0,
                                .build_key_ordinal       = 0,
-                               .outcome = {.reason        = dynamic_filter_key_reason::attempt_skip,
+                               .outcome = {.reason        = dynamic_filter_key_reason::ATTEMPT_SKIP,
                                            .reason_detail = "accumulations_incomplete"}};
   CHECK(op::to_string(line) ==
         "[dynamic_filter_key] v=1 sig=0000000000000000 occ=0 join=- condition=0 build_ordinal=0 "
@@ -98,15 +100,15 @@ TEST_CASE("a key line spells unknown values and attempt reasons", "[dynamic_filt
     auto const text            = op::to_string(line);
     return text.substr(text.rfind("reason=") + 7);
   };
-  CHECK(reason_of(domain_gate) == "domain_gate");
-  CHECK(reason_of(type_mismatch) == "type_mismatch");
-  CHECK(reason_of(unsupported_type) == "unsupported_type");
-  CHECK(reason_of(unreadable_probe) == "unreadable_probe");
-  CHECK(reason_of(bloom_cap) == "bloom_cap");
-  CHECK(reason_of(decimal128_unfit) == "decimal128_unfit");
-  CHECK(reason_of(not_constructed) == "not_constructed");
-  CHECK(reason_of(attempt_fail, "publications_failed") == "attempt_fail_publications_failed");
-  CHECK(reason_of(attempt_cancel, "publications_failed") == "attempt_cancel_publications_failed");
+  CHECK(reason_of(DOMAIN_GATE) == "domain_gate");
+  CHECK(reason_of(TYPE_MISMATCH) == "type_mismatch");
+  CHECK(reason_of(UNSUPPORTED_TYPE) == "unsupported_type");
+  CHECK(reason_of(UNREADABLE_PROBE) == "unreadable_probe");
+  CHECK(reason_of(BLOOM_CAP) == "bloom_cap");
+  CHECK(reason_of(DECIMAL128_UNFIT) == "decimal128_unfit");
+  CHECK(reason_of(NOT_CONSTRUCTED) == "not_constructed");
+  CHECK(reason_of(ATTEMPT_FAIL, "publications_failed") == "attempt_fail_publications_failed");
+  CHECK(reason_of(ATTEMPT_CANCEL, "publications_failed") == "attempt_cancel_publications_failed");
 
   line.outcome.kind = membership_filter_kind::small_in_list;
   CHECK(op::to_string(line).find(" kind=small_in_list ") != std::string::npos);
@@ -181,7 +183,9 @@ TEST_CASE("post-unlock actions are move-only and log their lines once when dispa
 
 namespace {
 
-/// The one key line of a single-key whole-build session after @p act, with its identity set.
+/**
+ * @brief The one key line of a single-key whole-build session after `act`, with its identity set.
+ */
 std::vector<std::string> whole_build_lines(sirius::test::publication::claim_fixture& fixture,
                                            auto const& act)
 {
@@ -347,7 +351,7 @@ TEST_CASE("an accumulation that ends without publishing logs why per key",
     fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
       fixture.make_plan(256 * acc::mib), &fixture.stats);
     REQUIRE_FALSE(
-      fixture.session->try_begin_accumulation(op::construction_decline::inventory_mismatch));
+      fixture.session->try_begin_accumulation(op::construction_decline::INVENTORY_MISMATCH));
     reason = "declined_inventory_mismatch";
     rows   = "0";
   }

@@ -310,11 +310,11 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                 rmm::device_async_resource_ref mr);
 
   /**
-   * @brief Builds a persistent set from keys already prepared at @p domain's rep (see
+   * @brief Builds a persistent set from keys already prepared at `domain`'s rep (see
    * `prepare_build_keys`)
    *
-   * @pre The storage for @p prepared remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * @pre The storage for `prepared` remains valid until work enqueued on `stream` completes.
+   * @throw std::invalid_argument if `prepared` is not a non-null column of
    * `membership_rep_type(domain)`
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
@@ -357,16 +357,22 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] bool has_persistent_set() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
-  /// Whether @p valid_rows valid keys of @p key_type can be stored; any count can.
+  /**
+   * @brief Whether `valid_rows` valid keys of `key_type` can be stored; any count can.
+   */
   [[nodiscard]] static bool supports(cudf::data_type key_type, std::size_t valid_rows) noexcept;
   /// Baseline footprint of a set over @p num_keys keys of @p key_type, sized at the key's rep.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
-  /// Slots of the set built over @p num_keys keys at @p capacity_factor slots per key: the
-  /// constructor's capacity rounded to a valid cuco extent.
+  /**
+   * @brief Slots of the set built over `num_keys` keys at `capacity_factor` slots per key: the
+   * constructor's capacity rounded to a valid cuco extent.
+   */
   [[nodiscard]] static std::size_t set_slots(std::size_t num_keys,
                                              std::size_t capacity_factor) noexcept;
-  /// Bytes of this filter's source set.
+  /**
+   * @brief Bytes of this filter's source set.
+   */
   [[nodiscard]] std::size_t storage_bytes() const noexcept;
 
  private:
@@ -378,7 +384,9 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const;
 
-  /// Builds the set from @p prepared at @p domain's rep; shared by both constructors.
+  /**
+   * @brief Builds the set from `prepared` at `domain`'s rep; shared by both constructors.
+   */
   void construct(membership_key_domain const& domain,
                  cudf::column_view const& prepared,
                  ::cuda::stream_ref stream,
@@ -417,11 +425,11 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
                                       rmm::device_async_resource_ref mr);
 
   /**
-   * @brief Copies 1 to `k_max_keys` keys already prepared at @p domain's rep (see
+   * @brief Copies 1 to `k_max_keys` keys already prepared at `domain`'s rep (see
    * `prepare_build_keys`) into device-local storage
    *
-   * @pre The storage for @p prepared remains valid until the copy on @p stream completes.
-   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * @pre The storage for `prepared` remains valid until the copy on `stream` completes.
+   * @throw std::invalid_argument if `prepared` is not a non-null column of
    * `membership_rep_type(domain)` with 1 to `k_max_keys` rows
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
@@ -469,7 +477,10 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
-  /// Whether @p valid_rows valid keys of @p key_type fit: 1 to `k_max_keys` of a supported type.
+  /**
+   * @brief Whether `valid_rows` valid keys of `key_type` fit: 1 to `k_max_keys` of a supported
+   * type.
+   */
   [[nodiscard]] static bool supports(cudf::data_type key_type, std::size_t valid_rows) noexcept;
 
  private:
@@ -481,7 +492,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const;
 
-  /// Copies @p prepared into the needle store; shared by both constructors.
+  /**
+   * @brief Copies `prepared` into the needle store; shared by both constructors.
+   */
   void construct(membership_key_domain const& domain,
                  cudf::column_view const& prepared,
                  ::cuda::stream_ref stream,
@@ -530,13 +543,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                               rmm::device_async_resource_ref mr);
 
   /**
-   * @brief Builds a Bloom filter from keys already prepared at @p domain's rep (see
+   * @brief Builds a Bloom filter from keys already prepared at `domain`'s rep (see
    * `prepare_build_keys`), sized for their count
    *
    * Sets the same bits the column constructor sets for the same valid keys.
    *
-   * @pre The storage for @p prepared remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p prepared is not a non-null column of
+   * @pre The storage for `prepared` remains valid until work enqueued on `stream` completes.
+   * @throw std::invalid_argument if `prepared` is not a non-null column of
    * `membership_rep_type(domain)`
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
@@ -618,7 +631,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 };
 
 /**
- * @brief An upper bound on the device storage either IN-list over @p num_keys keys at @p rep takes
+ * @brief An upper bound on the device storage either IN-list over `num_keys` keys at `rep` takes
  *
  * The hash IN-list's set at the largest capacity factor it may choose, rounded to a valid cuco
  * extent exactly as its constructor rounds, plus a small IN-list's needles, each charged at the

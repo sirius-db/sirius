@@ -361,8 +361,10 @@ template <class KeyT, class Lookup>
 // Build side
 //===----------------------------------------------------------------------===//
 
-/// Rejects @p prepared unless it is a non-null column of @p domain's rep type, as
-/// `prepare_build_keys` writes it.
+/**
+ * @brief Rejects `prepared` unless it is a non-null column of `domain`'s rep type, as
+ * `prepare_build_keys` writes it.
+ */
 inline void require_prepared(std::string_view filter_name,
                              membership_key_domain const& domain,
                              cudf::column_view const& prepared)
@@ -374,7 +376,9 @@ inline void require_prepared(std::string_view filter_name,
   }
 }
 
-/// The current CUDA device, which holds a filter's source replica.
+/**
+ * @brief The current CUDA device, which holds a filter's source replica.
+ */
 [[nodiscard]] inline int current_device(std::string_view filter_name)
 {
   int device = -1;
@@ -403,8 +407,10 @@ struct convert_to_rep {
   return cudf::hashing::xxhash_64(cudf::table_view{{keys}}, string_fingerprint_seed, stream, mr);
 }
 
-/// The fingerprint the string probes compute for row `row`, read from the column's offsets and
-/// bytes so no device view (and no host copy of one) is needed.
+/**
+ * @brief The fingerprint the string probes compute for row `row`, read from the column's offsets
+ * and bytes so no device view (and no host copy of one) is needed.
+ */
 template <class OffsetT>
 struct string_fingerprint_at {
   char const* chars;
@@ -419,10 +425,13 @@ struct string_fingerprint_at {
   }
 };
 
-/// Invokes @p fn(first) with a device iterator over the fingerprints of @p keys' rows, null rows
-/// included, computed in-kernel from the column's offsets and bytes. Unlike
-/// `materialize_string_fingerprints` it allocates nothing and never waits on the host. Does
-/// nothing for an empty column.
+/**
+ * @brief Invokes `fn(first)` with a device iterator over the fingerprints of `keys`' rows, null
+ * rows included, computed in-kernel from the column's offsets and bytes.
+ *
+ * Unlike `materialize_string_fingerprints` it allocates nothing and never waits on the host. Does
+ * nothing for an empty column.
+ */
 template <class Fn>
 void with_string_fingerprint_iterator(cudf::column_view const& keys,
                                       ::cuda::stream_ref stream,
