@@ -96,15 +96,13 @@ struct non_empty {
 };
 
 /// The downgrade pair rule shared by every memory tier: 0 < stop < trigger.
-/// @throws config_error naming @p path.
+/// @throws config_error naming @p path's downgrade_stop_fraction.
 inline void check_downgrade_fractions(std::string_view path, double trigger, double stop)
 {
-  if (stop <= 0.0) {
-    throw config_error(detail::framed(path, "downgrade_stop_fraction must be greater than zero"));
-  }
+  auto const stop_key = "'" + join_path(path, "downgrade_stop_fraction") + "': ";
+  if (stop <= 0.0) { throw config_error(stop_key + "must be greater than zero"); }
   if (stop >= trigger) {
-    throw config_error(
-      detail::framed(path, "downgrade_stop_fraction must be less than downgrade_trigger_fraction"));
+    throw config_error(stop_key + "must be less than downgrade_trigger_fraction");
   }
 }
 

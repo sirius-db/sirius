@@ -2,12 +2,20 @@
 
 #include "catch.hpp"
 #include "config/user_config.hpp"
+#include "config/yaml.hpp"
+#include "config/yaml_cpp.hpp"
 #include "sirius_config.hpp"
 
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/tls/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <yaml-cpp/yaml.h>
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -273,21 +281,21 @@ outcome resolved(Resolve&& resolve)
 
 /// Both resolve alike: the same description, or the same failure. Reading a file prefixes its
 /// messages with the file name.
-void require_same(const outcome& old_path, const outcome& new_path, std::string_view source)
+void require_same(const outcome& from_file, const outcome& from_user, std::string_view source)
 {
-  INFO("old error: " << old_path.error);
-  INFO("new error: " << new_path.error_type << ": " << new_path.error);
-  REQUIRE(new_path.description == old_path.description);
-  if (old_path.error.empty()) {
-    REQUIRE(new_path.error.empty());
+  INFO("file error: " << from_file.error);
+  INFO("user configuration error: " << from_user.error_type << ": " << from_user.error);
+  REQUIRE(from_user.description == from_file.description);
+  if (from_file.error.empty()) {
+    REQUIRE(from_user.error.empty());
     return;
   }
-  REQUIRE(new_path.error_type == "configuration_input_error");
-  auto expected = old_path.error;
+  REQUIRE(from_user.error_type == "configuration_input_error");
+  auto expected = from_file.error;
   if (!source.empty() && expected.starts_with(std::string(source) + ": ")) {
     expected.erase(0, source.size() + 2);
   }
-  REQUIRE(new_path.error == expected);
+  REQUIRE(from_user.error == expected);
 }
 
 /// A machine with kernel TLS loaded and a jumbo-frame egress NIC: the derived REST defaults the
@@ -322,22 +330,277 @@ TEST_CASE("a fixture file and its user configuration resolve alike", "[config][c
     auto const name = entry.path().filename().string();
     if (entry.path().extension() != ".yaml" || name.starts_with("invalid_")) { continue; }
     INFO(name);
-    auto const old_path = resolved([&] {
+    auto const from_file = resolved([&] {
       return sirius::parsed_sirius_config::from_file(entry.path()).resolve(topology, no_nic);
     });
-    auto const new_path = resolved([&] {
+    auto const from_user = resolved([&] {
       return sirius::create_sirius_config(
         sirius::config::read_user_config(slurp(entry.path())), topology, no_nic);
     });
-    require_same(old_path, new_path, entry.path().string());
+    require_same(from_file, from_user, entry.path().string());
     ++compared;
     if (name == "valid_every_key.yaml") {
       every_key_seen = true;
-      REQUIRE_FALSE(new_path.description.empty());  // every key, resolved
+      REQUIRE_FALSE(from_user.description.empty());  // every key, resolved
     }
   }
   REQUIRE(compared >= 30);
   REQUIRE(every_key_seen);
+}
+
+TEST_CASE("an invalid fixture file fails with its path named once", "[config][config_create]")
+{
+  std::size_t checked = 0;
+  for (auto const& entry : std::filesystem::directory_iterator(data_dir())) {
+    auto const name = entry.path().filename().string();
+    if (entry.path().extension() != ".yaml" || !name.starts_with("invalid_")) { continue; }
+    INFO(name);
+    auto const path    = entry.path().string();
+    auto const failure = resolved([&] {
+      return sirius::parsed_sirius_config::from_file(entry.path()).resolve(this_machine(), no_nic);
+    });
+    // Whether reading or resolving fails, the error keeps its type and names the file once.
+    REQUIRE(failure.error_type == "configuration_input_error");
+    REQUIRE(failure.error.starts_with(path + ": "));
+    REQUIRE(failure.error.find(path, path.size()) == std::string::npos);
+    ++checked;
+  }
+  REQUIRE(checked >= 50);
+}
+
+TEST_CASE("a document loaded by yaml-cpp converts as parse_yaml reads its text",
+          "[config][config_create]")
+{
+  std::size_t compared = 0;
+  for (auto const& entry : std::filesystem::directory_iterator(data_dir())) {
+    if (entry.path().extension() != ".yaml") { continue; }
+    INFO(entry.path().filename().string());
+    auto const text = slurp(entry.path());
+    std::optional<sirius::config::node> parsed;
+    try {
+      parsed = sirius::config::parse_yaml(text);
+    } catch (const sirius::config::config_error&) {
+      // A fixture parse_yaml rejects (duplicate keys, a second document) is not compared.
+      continue;
+    }
+    REQUIRE(sirius::config::from_yaml_cpp(YAML::Load(text)) == *parsed);
+    ++compared;
+  }
+  REQUIRE(compared >= 80);
+}
+
+TEST_CASE("every key of a configuration reaches its runtime field", "[config][config_create]")
+{
+  using namespace std::chrono_literals;
+  constexpr std::uint64_t KiB = 1ULL << 10;
+  constexpr std::uint64_t MiB = 1ULL << 20;
+  constexpr std::uint64_t GiB = 1ULL << 30;
+  constexpr std::uint64_t TiB = 1ULL << 40;
+  // valid_every_key.yaml sets every key away from its default; resolving it must land each value
+  // in its own runtime field.
+  auto const c = sirius::parsed_sirius_config::from_file(data_dir() / "valid_every_key.yaml")
+                   .resolve(this_machine(), no_nic);
+
+  std::size_t gpus = 0, hosts = 0, disks = 0;
+  for (auto const& space : c.get_memory_space_configs()) {
+    if (auto const* g = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+      ++gpus;
+      CHECK(g->device_id == 0);
+      CHECK(g->reservation_limit_fraction == 0.95);
+      CHECK(g->downgrade_trigger_fraction == 0.85);
+      CHECK(g->downgrade_stop_fraction == 0.5);
+    } else if (auto const* h = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      ++hosts;
+      CHECK(h->memory_capacity == 4 * GiB);
+      CHECK(h->reservation_limit_fraction == 0.9);
+      CHECK(h->downgrade_trigger_fraction == 0.85);
+      CHECK(h->downgrade_stop_fraction == 0.7);
+      CHECK(h->block_size == 2 * MiB);
+      CHECK(h->pool_size == 64);
+      CHECK(h->initial_number_pools == 2);
+    } else if (auto const* k = std::get_if<cucascade::memory::disk_memory_space_config>(&space)) {
+      ++disks;
+      CHECK(k->disk_id == 1);
+      CHECK(k->memory_capacity == 2 * TiB);
+      CHECK(k->mount_paths == "/tmp");
+    }
+  }
+  CHECK(gpus == 1);
+  CHECK(hosts >= 1);
+  CHECK(disks == 1);
+  CHECK(c.gpus_per_query() == 1);
+  CHECK(c.max_concurrent_queries() == 2);
+
+  auto const& creator = c.get_task_creator_config().thread_pool;
+  CHECK(creator.num_threads == 3);
+  CHECK(creator.cpu_affinity_list == std::vector<int>{0, 1});
+  CHECK(c.get_gpu_pipeline_executor_config().num_threads == 5);
+  auto const& downgrade = c.get_downgrade_executor_config();
+  CHECK(downgrade.thread_pool.num_threads == 2);
+  CHECK(downgrade.thread_pool.cpu_affinity_list == std::vector<int>{4});
+  CHECK(downgrade.monitor_period == 20ms);
+  CHECK(downgrade.copy_chunk_bytes == 512 * MiB);
+
+  auto const& sm = c.get_scan_manager_config();
+  CHECK(sm.thread_pool.num_threads == 6);
+  CHECK(sm.thread_pool.cpu_affinity_list == std::vector<int>{2, 3});
+  CHECK(sm.backend == sirius::scan_manager::io_backend::native);
+  CHECK(sm.uring_n_reactors == 3);
+  CHECK(sm.rest_n_reactors == 6);
+  CHECK_FALSE(sm.reserve_rest_reactor_cpus);
+  CHECK(sm.max_readahead_scans == 5);
+  CHECK(sm.readahead_strategy == sirius::scan_manager::prefetch_strategy::opportunistic);
+
+  CHECK(sm.uring.n_max_concurrent_scans == 7);
+  CHECK(sm.uring.n_max_concurrent_scans_explicit);
+  CHECK(sm.uring.slices_per_pass == 8);
+  CHECK(sm.uring.range_batch_slices == 4);
+
+  auto const& r = sm.rest;
+  CHECK(r.n_max_concurrent_scans == 12);
+  CHECK(r.n_max_concurrent_scans_explicit);
+  CHECK(r.request_timeout_s == 45);
+  CHECK(r.stall_speed_limit_bytes == 32768);
+  CHECK(r.stall_time_s == 20);
+  CHECK(r.merge_max_gap == 1 * MiB);
+  CHECK(r.min_segment_bytes == 2 * MiB);
+  CHECK(r.max_segment_bytes == 8 * MiB);
+  CHECK(r.footer_probe_bytes == 256 * KiB);
+  CHECK(r.list_max_matches == 5000);
+  CHECK(r.list_max_scanned == 50000);
+  CHECK(r.retry_backoff_base == 75ms);
+  CHECK(r.retry_jitter == 25ms);
+  CHECK(r.max_retry_attempts == 4);
+  CHECK(r.max_auth_retry_attempts == 2);
+  CHECK_FALSE(r.honor_retry_after);
+  CHECK(r.max_connections == 96);
+  CHECK(r.conn_max_age == 30s);
+  CHECK(r.upkeep_interval == 5000ms);
+  CHECK(r.upkeep_http1);
+  CHECK(r.connect_timeout == 2500ms);
+  CHECK(r.dns_ttl == 120s);
+  CHECK(r.dns_accumulate);
+  CHECK(r.dns_max_addresses == 32);
+  CHECK(r.keepalive_idle_s == 30);
+  CHECK(r.keepalive_interval_s == 10);
+  CHECK(r.keepalive_count == 3);
+  CHECK(r.min_mtu == 1400);
+  CHECK(r.mtu_reject_max_attempts == 4);
+  CHECK_FALSE(r.close_with_rst);
+  CHECK(r.receive_buffer_bytes == 512 * KiB);
+  CHECK(r.queue_depth == 512);
+  CHECK(r.wait_mode == cucascade::io::rest::reactor_wait_mode::uring);
+  CHECK(r.iowq_max_unbound == 4);
+  CHECK(r.fan_out == 3);
+  CHECK(r.interface == "lo");
+  CHECK_FALSE(r.pin_to_irq_cpus);
+  CHECK(r.raise_reactor_priority);
+
+  auto const& t = r.tls;
+  CHECK(t.ktls == cucascade::io::tls::ktls_mode::disable);
+  CHECK(t.fallback_rx == cucascade::io::tls::user_space_rx::library);
+  CHECK(t.placement == cucascade::io::tls::recv_placement::iowq);
+  CHECK(t.min_version == cucascade::io::tls::version_bound::tls1_2);
+  CHECK(t.max_version == cucascade::io::tls::version_bound::tls1_3);
+  CHECK_FALSE(t.expect_no_pad);
+  CHECK(t.session_cache);
+  CHECK(t.session_cache_per_endpoint == 16);
+  CHECK(t.max_connection_bytes == 1 * GiB);
+  CHECK(t.ciphersuites == "TLS_AES_256_GCM_SHA384");
+  CHECK(t.cipher_list == "ECDHE-RSA-AES256-GCM-SHA384");
+  CHECK(t.groups == "X25519");
+  CHECK(t.sni_override == "example.internal");
+  CHECK_FALSE(t.allow_tls13_without_rekey);
+
+  CHECK(sm.cache.mode == cucascade::io::cache::cache_mode::os);
+  CHECK(sm.cache.eviction == cucascade::io::cache::eviction_policy::idle);
+  CHECK(sm.cache.min_prefetching_budget_fraction == 0.1);
+  CHECK(sm.cache.eviction_threshold_fraction == 0.7);
+
+  auto const& m = sm.memory_prefetcher;
+  CHECK(m.enable);
+  CHECK(m.num_threads == 3);
+  CHECK(m.min_free_fraction == 0.3);
+  CHECK(m.poll_interval_ms == 4);
+  CHECK(m.drain_quiet_ms == 50);
+
+  auto const& p = sm.preparation;
+  CHECK(p.max_inflight_metadata_jobs == 128);
+  CHECK(p.max_inflight_dv_jobs == 8);
+  CHECK(p.lookahead_batches == 3);
+  CHECK(p.max_control_work == 5);
+  CHECK(p.drain_quantum == 6);
+  CHECK(p.coordinator_workers == 2);
+  CHECK(p.native_reader_workers == 3);
+  CHECK(p.max_native_readers == 9);
+  CHECK(p.interrupt_check_interval == 20ms);
+  REQUIRE(p.partial_batch.has_value());
+  CHECK(p.partial_batch->min_fill_percent == 60);
+  CHECK(p.partial_batch->min_residence == 40ms);
+  CHECK(p.partial_batch->max_residence == 1500ms);
+
+  auto const& tel = c.get_telemetry_config();
+  CHECK_FALSE(tel.enable_quent);
+  CHECK(tel.enable_nvtx);
+  CHECK(tel.output_directory == "every_key_telemetry");
+  CHECK(tel.engine_name == "everyKey");
+  CHECK(tel.nvtx_injection_lib == "/nonexistent/libnvtx_inject.so");
+
+  auto const& z = c.get_compression_config();
+  CHECK_FALSE(z.enable_pin_table_compression);
+  CHECK(z.min_batch_size_bytes == 2 * MiB);
+  CHECK(z.max_compressed_fraction == 0.6);
+  CHECK(z.input_plan_dir == "/nonexistent/plans");
+  CHECK(z.enable_spill_compression);
+  CHECK(z.spill_min_batch_bytes == 32 * MiB);
+  CHECK(z.spill_max_compressed_fraction == 0.5);
+  CHECK(z.spill_encode_reserve_fraction == 0.25);
+
+  auto const& o = c.get_operator_params();
+  CHECK_FALSE(o.enable_late_materialization);
+  CHECK_FALSE(o.enable_fused_scan_filter);
+  CHECK_FALSE(o.enable_low_cardinality_groupby);
+  CHECK(o.late_materialization_min_boundaries == 6);
+  CHECK(o.late_materialization_min_value_x_boundaries == 64);
+  CHECK(o.late_materialization_count_defer);
+  CHECK(o.late_materialization_min_value_compressed == 2);
+  CHECK(o.fused_scan.diagnostics);
+  CHECK(o.fused_scan.max_selectivity == 0.3);
+  CHECK(o.fused_scan.full_route_max_selectivity == 0.2);
+  CHECK(o.fused_scan.index_walk_max_selectivity == 0.25);
+  CHECK(o.fused_scan.max_membership_sources == 2);
+  CHECK(o.scan_task_batch_size == 64 * MiB);
+  CHECK(o.max_sort_partition_bytes == 128 * MiB);
+  CHECK(o.max_sort_partition_memory_fraction == 0.25);
+  CHECK(o.hash_partition_bytes == 96 * MiB);
+  CHECK(o.concat_batch_bytes == 48 * MiB);
+  CHECK(o.cross_join_task_bytes == 40 * MiB);
+  CHECK(o.sort_sample_bytes == 24 * MiB);
+  CHECK(o.max_build_hash_table_bytes == 512 * MiB);
+  CHECK(o.max_build_probe_resident_bytes == 384 * MiB);
+  CHECK(o.max_broadcast_join_size == 128 * MiB);
+  CHECK(o.mark_join_build_switch_ratio == 4.0);
+  CHECK_FALSE(o.enable_dynamic_filter);
+  CHECK_FALSE(o.enable_dynamic_filter_multi_partition);
+  CHECK(o.enable_dynamic_zone_map_filter);
+  CHECK(o.dynamic_filter_domain_coverage_threshold == 0.8);
+  CHECK(o.dynamic_filter_inlist_max_l2_fraction == 0.25);
+  CHECK(o.dynamic_filter_keep_threshold == 0.8);
+  CHECK_FALSE(o.enable_pinned_zone_map_pruning);
+  CHECK_FALSE(o.enable_decimal_sum_stats_bound);
+  CHECK_FALSE(o.enable_compressed_materialization);
+  CHECK_FALSE(o.enable_dense_count_join);
+  CHECK_FALSE(o.enable_delim_aggregate_reuse);
+  CHECK_FALSE(o.prove_unique_keys);
+  CHECK(o.unique_exact_max_bytes == 256 * MiB);
+  CHECK_FALSE(o.enable_exists_minmax_rewrite);
+  CHECK_FALSE(o.enable_partial_aggregate_below_join);
+  CHECK(o.enable_subquery_key_carry);
+  CHECK(o.enable_exists_from_aggregate);
+  CHECK(o.admission_bytes_per_gpu == 4 * GiB);
+  CHECK(o.avg_variable_column_bytes == 48);
+  CHECK(o.enable_runtime_size_estimation);
+  CHECK(o.use_hw_decompression);
 }
 
 TEST_CASE("explicit REST values gate what is derived from the NIC and kernel TLS",
@@ -410,7 +673,7 @@ TEST_CASE("a configuration built in code obeys every block's rules", "[config][c
   user.memory.gpu.downgrade_trigger_fraction.assign(0.5);  // below the default stop of 0.6
   REQUIRE_THROWS_WITH(
     sirius::create_sirius_config(user, this_machine(), no_nic),
-    "'sirius.memory.gpu': downgrade_stop_fraction must be less than downgrade_trigger_fraction");
+    "'sirius.memory.gpu.downgrade_stop_fraction': must be less than downgrade_trigger_fraction");
 
   auto spaces = sirius::config::read_user_config("sirius:\n  space:\n    gpu: [{}]\n");
   spaces.memory.gpu.usage_limit.assign(0.5);
