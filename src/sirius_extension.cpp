@@ -78,6 +78,8 @@ extern "C" int cudaProfilerStop();
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <array>
@@ -125,14 +127,18 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 
 namespace duckdb {
 
-constexpr char QUERY_LABEL_PARAM_KEY[] = "query_label";
+constexpr char QUERY_LABEL_PARAM_KEY[]      = "query_label";
+constexpr char ENABLE_OPTIMIZER_PARAM_KEY[] = "enable_optimizer";
 
 namespace {
 
@@ -366,7 +372,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // Bind-time discovery survives failures before execution can rebuild a plan.
   // A missing plan must never grant permission to replay.
   sirius::transparent::plan_source_policy source_policy{{}, false};
-  bool enable_optimizer;
+  bool enable_optimizer    = true;
   bool statement_read_only = true;
   // Schema captured at bind time; each execution rebuilds its
   // PreparedStatementData from these (parameterized execution is not
@@ -402,16 +408,25 @@ struct SiriusTableFunctionData : public TableFunctionData {
       context, SetScope::LOCAL, Value::BOOLEAN(original_enable_optimizer));
   }
 
+  //! Parses gpu_execution's SQL argument, which must hold exactly one statement.
+  static unique_ptr<SQLStatement> ParseStatement(ClientContext& context, const string& sql)
+  {
+    Parser parser(context);
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1) {
+      throw InvalidInputException("gpu_execution expects exactly one SQL statement, got %llu",
+                                  parser.statements.size());
+    }
+    return std::move(parser.statements[0]);
+  }
+
   unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context, bool* read_only = nullptr)
   {
     PrepareConnection(context);
     unique_ptr<LogicalOperator> plan;
     try {
-      Parser parser(context);
-      parser.ParseQuery(query);
-
       Planner planner(context);
-      planner.CreatePlan(std::move(parser.statements[0]));
+      planner.CreatePlan(ParseStatement(context, query));
       D_ASSERT(planner.plan);
       if (read_only) *read_only = planner.properties.IsReadOnly();
 
@@ -457,9 +472,12 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
                                                               vector<LogicalType>& return_types,
                                                               vector<Identifier>& names)
 {
-  auto result              = make_uniq<SiriusTableFunctionData>();
-  result->query            = input.inputs[0].ToString();
-  result->enable_optimizer = true;
+  auto result   = make_uniq<SiriusTableFunctionData>();
+  result->query = input.inputs[0].ToString();
+  if (auto it = input.named_parameters.find(ENABLE_OPTIMIZER_PARAM_KEY);
+      it != input.named_parameters.end() && !it->second.IsNull()) {
+    result->enable_optimizer = BooleanValue::Get(it->second);
+  }
 
   std::optional<std::string> query_label = std::nullopt;
   // take any query_label that was set using sirius_set_query_label SQL call
@@ -498,10 +516,8 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   // execution's window (GPUExecutionFunction) so every execution observes the
   // pin registry and configuration current at execute time — a plan built at
   // bind would carry pin-registry pointers a later unpin invalidates.
-  Parser parser(context);
-  parser.ParseQuery(result->query);
   Planner planner(context);
-  planner.CreatePlan(std::move(parser.statements[0]));
+  planner.CreatePlan(SiriusTableFunctionData::ParseStatement(context, result->query));
   D_ASSERT(planner.plan);
   if (planner.plan) {
     result->source_policy = sirius::transparent::derive_plan_source_policy(*planner.plan, context);
@@ -688,7 +704,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         throw std::runtime_error("Sirius CPU replay refused: " + gpu_error.RawMessage());
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
-      print_cpu_fallback_banner();
+      print_cpu_fallback_banner(gpu_error.RawMessage());
       auto cpu_replay = run_internal_cpu_fallback_query(
         context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {
@@ -1312,15 +1328,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     auto const unique_cfg = duckdb::query_operator_options(context);
     bool const compression_requested =
       data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
-    if (compression_requested && comp_cfg.input_plan_dir.empty()) {
-      SIRIUS_LOG_WARN(
-        "[pin_table] '{}': compression was requested but "
-        "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
-        data.args.name);
-    }
-    const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
     std::optional<std::string> plan_dsl;
-    if (compression_active) {
+    if (compression_requested && !comp_cfg.input_plan_dir.empty()) {
       namespace fs = std::filesystem;
       std::error_code ec;
       for (fs::directory_iterator it(comp_cfg.input_plan_dir, ec), end; !ec && it != end;
@@ -1364,7 +1373,11 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     }
 
     sirius::compression_pin_config pin_comp{};
-    if (compression_active) {
+    if (compression_requested) {
+      pin_comp.enabled                 = true;
+      pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
+      pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
+      pin_comp.column_names            = cache_info.column_names();
       if (plan_dsl.has_value()) {
         // The plan file carries one block per full-table column (schema order). A pin
         // may cache only a subset, so select the blocks for the pinned columns by their
@@ -1377,28 +1390,23 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         }
         auto selected = sirius::compression::select_plan_blocks(*plan_dsl, col_indices);
         if (selected.has_value()) {
-          pin_comp.enabled                 = true;
-          pin_comp.plan_dsl                = std::move(*selected);
-          pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
-          pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
-          pin_comp.column_names            = cache_info.column_names();
+          pin_comp.plan_dsl = std::move(*selected);
           SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                           data.args.name,
                           data.args.tier,
                           pin_comp.column_names.size());
         } else {
+          pin_comp.enabled = false;
           SIRIUS_LOG_WARN(
             "[pin_table] '{}': plan file does not cover all pinned columns; pinning uncompressed",
             data.args.name);
         }
       } else {
-        SIRIUS_LOG_WARN(
-          "[pin_table] '{}': compression was requested but no readable nonempty plan file was "
-          "found "
-          "in '{}'; "
-          "pinning uncompressed",
+        SIRIUS_LOG_INFO(
+          "[pin_table] '{}' tier={}: automatically selecting compression plans for {} column(s)",
           data.args.name,
-          comp_cfg.input_plan_dir);
+          data.args.tier,
+          pin_comp.column_names.size());
       }
     }
 
@@ -1483,7 +1491,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         pinned_column_types,
         pin_comp,
         {.expression_policy                 = pin_op_params.expression_policy(),
-         .capture_chunk_stats               = false,
+         .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
@@ -1491,13 +1499,43 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(dev_result.column_storage));
 
-      scan_mgr.insert_pinned_entry_device(
-        data.args.name,
-        std::move(cache_info),
-        std::move(dev_result.chunks),
-        *gpu_spaces_mut[0],
-        std::move(dev_result.column_storage),
-        pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+      if (pin_comp.plan_dsl.empty() &&
+          std::ranges::none_of(dev_result.chunks,
+                               [](auto const& chunk) { return chunk.compressed != nullptr; })) {
+        // Raw-only results must retain ordinary column-major insertion: re-pinning
+        // additional columns merges them, and cached zone maps remain available.
+        // These columns are private to this result; moving their buffers makes this
+        // normalization independent of payload size, without another GPU copy.
+        std::vector<std::unique_ptr<cudf::table>> tables;
+        std::vector<cucascade::memory::memory_space*> spaces;
+        for (auto& chunk : dev_result.chunks) {
+          std::vector<std::unique_ptr<cudf::column>> columns;
+          for (auto& column : chunk.columns) {
+            columns.push_back(std::make_unique<cudf::column>(std::move(*column)));
+          }
+          tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+          spaces.push_back(chunk.memory_space);
+        }
+        std::ignore = scan_mgr.insert_pinned_entry(
+          data.args.name,
+          std::move(cache_info),
+          std::move(tables),
+          std::move(spaces),
+          std::move(pinned_column_types),
+          std::move(dev_result.chunk_stats),
+          std::move(dev_result.column_storage),
+          pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+      } else {
+        scan_mgr.insert_pinned_entry_device(
+          data.args.name,
+          std::move(cache_info),
+          std::move(dev_result.chunks),
+          *gpu_spaces_mut[0],
+          std::move(dev_result.column_storage),
+          pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)),
+          std::move(pinned_column_types),
+          std::move(dev_result.chunk_stats));
+      }
     } else {
       // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
       // (with its GPU placement) and pin them in place.
@@ -2493,7 +2531,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusRegistration::GPUExecutionBind,
                               SiriusRegistration::GPUExecutionInitGlobal);
   gpu_execution.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
-    options.Add("enable_optimizer", LogicalType::BOOLEAN);
+    options.Add(ENABLE_OPTIMIZER_PARAM_KEY, LogicalType::BOOLEAN);
     options.Add(QUERY_LABEL_PARAM_KEY, LogicalType::VARCHAR);
   });
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
@@ -3158,6 +3196,32 @@ static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope,
                    params->enable_exists_minmax_rewrite);
 }
 
+static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto* params                                = get_operator_params(context, scope);
+  params->enable_partial_aggregate_below_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN to {}",
+                   params->enable_partial_aggregate_below_join);
+}
+
+static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->enable_subquery_key_carry = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SUBQUERY_KEY_CARRY to {}",
+                   params->enable_subquery_key_carry);
+}
+
+static void SetEnableExistsFromAggregate(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_exists_from_aggregate = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_FROM_AGGREGATE to {}",
+                   params->enable_exists_from_aggregate);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3266,17 +3330,6 @@ static void SetEnableDecimalSumStatsBound(ClientContext& context, SetScope scope
   params->enable_decimal_sum_stats_bound = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DECIMAL_SUM_STATS_BOUND to {}",
                    params->enable_decimal_sum_stats_bound);
-}
-
-static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context, scope);
-  if (params->use_hw_decompression != BooleanValue::Get(parameter)) {
-    throw InvalidInputException(
-      "use_hw_decompression is startup-only; configure sirius.operator_params.use_hw_decompression "
-      "in YAML");
-  }
-  SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
 }
 
 static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
@@ -3779,6 +3832,28 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnableExistsMinmaxRewrite);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_partial_aggregate_below_join",
+                    "aggregate below an inner join that only adds group-by payload",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
+                    SetEnablePartialAggregateBelowJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_subquery_key_carry",
+                    "carry a correlated subquery's keys to the tables an equality ties to them",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_subquery_key_carry),
+                    SetEnableSubqueryKeyCarry);
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_exists_from_aggregate",
+    "answer a correlated EXISTS from a scalar aggregate subquery over the same rows",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_exists_from_aggregate),
+    SetEnableExistsFromAggregate);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "dense_count_join_max_bytes",
                     "internal test hook for the dense count-join histogram budget",
                     LogicalType::UBIGINT,
@@ -4024,8 +4099,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "pin_table_compression",
     "Default for pin_table calls that omit the compression named "
-    "parameter. Takes effect only when pin_table_input_compression_plan_dir "
-    "is non-empty and contains a matching table plan",
+    "parameter. Enabled by default; automatically selects plans when no table plan is supplied",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
     SetEnablePinTableCompression);
@@ -4042,8 +4116,10 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "pin_table_input_compression_plan_dir",
     "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "May be set before a compression-enabled pin_table call. Tables with no matching file are "
-    "pinned uncompressed. No effect on spill compression.",
+    "A readable, nonempty matching file overrides automatic plan selection. "
+    "An empty directory setting or missing file uses the spill-selection heuristic; "
+    "a selected plan that does not cover pinned columns leaves the pin uncompressed. "
+    "No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
@@ -4051,7 +4127,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
     "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
-    "inert until compression is enabled and a matching plan resolves",
+    "applies to automatic plans and explicit table plans when compression is enabled",
     LogicalType::UBIGINT,
     Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
@@ -4060,7 +4136,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     "pin_table_compression_max_compressed_fraction",
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
     "finite, non-negative fraction of the batch's original size (values above 1 permit "
-    "expansion); inert until compression is enabled and a matching plan resolves",
+    "expansion); applies to automatic plans and explicit table plans when compression is enabled",
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
@@ -4126,16 +4202,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
-
-  config.AddExtensionOption(
-    "use_hw_decompression",
-    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default "
-    "(opt-in). When enabled and every GPU reports hardware-decompression support in cucascade "
-    "topology, Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context. Only "
-    "enable this on GPUs known to support hardware decompression",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.use_hw_decompression),
-    SetUseHwDecompression);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",
@@ -4225,6 +4291,7 @@ static void check_cuda_driver_version()
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  logging_load_transaction logging_transaction;
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -4237,7 +4304,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>(&db);
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
@@ -4248,11 +4315,6 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
-
-  // The ctor already installed the db-independent backend; reinstall now that the
-  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
-  // unknown backend name is reported here rather than swallowed by the ctor.
-  install_configured_log_sink(&db);
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
@@ -4298,6 +4360,7 @@ static void LoadInternal(ExtensionLoader& loader)
     publish_transparent_optimizer_mask(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
+  logging_transaction.commit();
 }
 
 }  // namespace duckdb

@@ -77,9 +77,10 @@ class Binder;
 namespace sirius::planner {
 
 /// Rewrite nested decorrelated `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
-/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: a LEFT
-/// DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery plus a filter. The replacement
-/// emits the same column bindings as the nodes it replaces. Subqueries DuckDB left as plain SEMI
+/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: the outer
+/// rows become a CTE, LEFT JOINed against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery over `t`
+/// restricted to the CTE's distinct keys, plus a filter. Operators above that read the outer rows'
+/// columns are repointed to the CTE's scan. Subqueries DuckDB left as plain SEMI
 /// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
 /// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
 /// number of subqueries rewritten.

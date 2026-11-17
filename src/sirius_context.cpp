@@ -1726,6 +1726,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .executions             = transparent_execution_count_.load(std::memory_order_relaxed),
     .runtime_fallbacks      = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
     .exists_minmax_rewrites = exists_minmax_rewrite_count_.load(std::memory_order_relaxed),
+    .partial_aggregate_pushdowns =
+      partial_aggregate_pushdown_count_.load(std::memory_order_relaxed),
     .provider_internal_skips =
       transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
@@ -1935,6 +1937,11 @@ void SiriusContext::record_exists_minmax_rewrites(uint64_t count) noexcept
   exists_minmax_rewrite_count_.fetch_add(count, std::memory_order_relaxed);
 }
 
+void SiriusContext::record_partial_aggregate_pushdowns(uint64_t count) noexcept
+{
+  partial_aggregate_pushdown_count_.fetch_add(count, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_certificate_incomplete() noexcept
 {
   transparent_certificate_incomplete_count_.fetch_add(1, std::memory_order_relaxed);
@@ -2011,16 +2018,21 @@ bool compressed_materialization_enabled(ClientContext& context)
   return sirius::operator_params{}.enable_compressed_materialization;
 }
 
-void print_cpu_fallback_banner()
+void print_cpu_fallback_banner(std::string_view reason)
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
   const char* red = tty ? "\033[1;31m" : "";
   const char* off = tty ? "\033[0m" : "";
+  std::string line(reason);
+  std::replace(line.begin(), line.end(), '\n', ' ');
+  std::replace(line.begin(), line.end(), '\r', ' ');
   std::fprintf(stdout,
                "%s=============================================\n"
                "Error in Sirius GPU execution, fallback to DuckDB\n"
+               "Reason: %s\n"
                "=============================================%s\n",
                red,
+               line.c_str(),
                off);
   std::fflush(stdout);
 }
@@ -2487,7 +2499,29 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
-SiriusContextExtensionCallback::SiriusContextExtensionCallback()
+logging_load_transaction::logging_load_transaction()
+  : log_lock_(Config::logging_mutex),
+    previous_sink_(sirius::log::get_sink()),
+    previous_backend_(Config::LOG_BACKEND),
+    previous_dir_(Config::LOG_DIR),
+    previous_level_(Config::LOG_LEVEL)
+{
+}
+
+logging_load_transaction::~logging_load_transaction()
+{
+  if (committed_) { return; }
+  Config::LOG_BACKEND = std::move(previous_backend_);
+  Config::LOG_DIR     = std::move(previous_dir_);
+  Config::LOG_LEVEL   = std::move(previous_level_);
+  try {
+    if (sirius::log::get_sink() != previous_sink_) { sirius::log::set_sink(previous_sink_); }
+  } catch (...) {
+    // Flushing the discarded sink failed; the load's own error is the one to report.
+  }
+}
+
+SiriusContextExtensionCallback::SiriusContextExtensionCallback(DatabaseInstance* db)
   : disabled_(sirius_disabled_by_env())
 {
   std::lock_guard log_lock(Config::logging_mutex);
@@ -2512,11 +2546,9 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   if (backend_env) { Config::LOG_BACKEND = backend_env; }
   if (log_dir_env) { Config::LOG_DIR = log_dir_env; }
   if (level_env) { Config::LOG_LEVEL = level_env; }
-  // Install now (no db yet) so spdlog/noop capture the logs emitted by
-  // read_config_file_if_exists() below; the duckdb backend needs a db (installed
-  // later).
+  // Install now so the sink captures the logs emitted by read_config_file_if_exists() below.
   try {
-    install_configured_log_sink(nullptr);
+    install_configured_log_sink(db);
   } catch (...) {
     Config::LOG_BACKEND = previous_log_backend;
     Config::LOG_DIR     = previous_log_dir;

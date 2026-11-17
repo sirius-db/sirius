@@ -123,17 +123,29 @@ TEST_CASE("the default host capacity is one third of the GPU's NUMA node per GPU
   }
   SECTION("prepin_fraction raises the pools pinned at start")
   {
-    auto const plain = host_spaces(resolve(
-      "sirius: {topology: {gpu_ids: [0]}, memory: {host: {capacity_bytes: 4Gi}}}", topology));
+    auto const plain =
+      host_spaces(resolve("sirius: {topology: {gpu_ids: [0]}, memory: {host: {capacity_bytes: "
+                          "4Gi, initial_number_pools: 4}}}",
+                          topology));
     REQUIRE(plain.size() == 1);
-    CHECK(plain[0].initial_number_pools == cucascade::memory::default_initial_number_pools);
+    CHECK(plain[0].initial_number_pools == 4);
     auto const pinned =
       host_spaces(resolve("sirius: {topology: {gpu_ids: [0]}, memory: {host: {capacity_bytes: "
-                          "4Gi, prepin_fraction: 0.5}}}",
+                          "4Gi, initial_number_pools: 4, prepin_fraction: 0.5}}}",
                           topology));
     REQUIRE(pinned.size() == 1);
     // 2 GiB in pools of 128 blocks of 1 MiB.
     CHECK(pinned[0].initial_number_pools == 16);
+    // It never lowers the count derived from the NUMA node's memory.
+    auto const derived = host_spaces(resolve(
+      "sirius: {topology: {gpu_ids: [0]}, memory: {host: {capacity_bytes: 4Gi}}}", topology));
+    auto const derived_pinned =
+      host_spaces(resolve("sirius: {topology: {gpu_ids: [0]}, memory: {host: {capacity_bytes: "
+                          "4Gi, prepin_fraction: 0.01}}}",
+                          topology));
+    REQUIRE(derived.size() == 1);
+    REQUIRE(derived_pinned.size() == 1);
+    CHECK(derived_pinned[0].initial_number_pools == derived[0].initial_number_pools);
     REQUIRE_THROWS(sirius::parsed_sirius_config::from_node(
       YAML::Load("sirius: {memory: {host: {prepin_fraction: 1.5}}}")));
   }
