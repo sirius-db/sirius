@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-duration="${1:?usage: nightly.sh DURATION [OUTPUT_ROOT]}"
+duration="${1:?usage: nightly.sh DURATION [OUTPUT_ROOT] [PRIOR_SIGNATURES]}"
 repo="$(git rev-parse --show-toplevel)"
 root="${2:-$repo/test/fuzz/out/nightly}"
 prior="${3:-$root/prior-signatures.txt}"
@@ -22,7 +22,9 @@ set +e
 pixi run fuzz corpus --shell "$shell" --extension "$extension" \
   --out "$root/corpus.json" | tee "$root/corpus.log"
 corpus_rc=${PIPESTATUS[0]}
-pixi run fuzz run --no-doctor --seed 20261116 --workers 2 \
+# A new seed each day; set FUZZ_SEED to repeat a run.
+seed="${FUZZ_SEED:-$(date -u +%Y%m%d)}"
+pixi run fuzz run --no-doctor --seed "$seed" --workers 2 \
   --duration "$duration" --set oracle.reduce_max_steps=5 \
   --set oracle.query_timeout_seconds=60 --fail-on-findings \
   "${prior_args[@]}" \

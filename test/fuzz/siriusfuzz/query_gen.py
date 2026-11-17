@@ -1850,6 +1850,17 @@ class QueryGenerator:
         )
         return ScalarSubquery(sub, kind=kind)
 
+    def _window_tiebreak(self, col: ColumnRef) -> Expr | None:
+        """An order key for a column the GPU window does not take directly."""
+        if not self.f.window_cast_tiebreaks:
+            return None
+        t = col.type
+        if t.kind == "int" and not t.signed and t.bits < 64:
+            return Cast(col, st.BIGINT)
+        if t.kind == "decimal" and t.precision <= 16:
+            return Cast(col, st.decimal_type(18, t.scale))
+        return None
+
     def _gen_window(self, scope: Scope, depth: int) -> Expr:
         rng = self.rng
         self._note("window")
@@ -1917,11 +1928,24 @@ class QueryGenerator:
                 and not self.f.float_exact_keys
             ):
                 return Window("rank", None, part, order, kind="int")
+            # Rows tied on every usable key can differ in the other columns,
+            # so the order must cover those too or the result is not
+            # deterministic.
+            usable = {id(c) for c in order_cols}
+            rest = [
+                self._window_tiebreak(c)
+                for t in scope.tables
+                for c in t.columns
+                if id(c) not in usable
+            ]
+            if any(t is None for t in rest):
+                return Window("rank", None, part, order, kind="int")
             order.extend(
                 OrderItem(c, desc=rng.random() < 0.5)
                 for c in order_cols
                 if c is not first
             )
+            order.extend(OrderItem(t) for t in rest)
         else:
             order = []
         if name == "row_number":

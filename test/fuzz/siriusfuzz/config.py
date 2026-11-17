@@ -239,6 +239,9 @@ class Complexity:
 class Features:
     window_functions: bool = True
     window_gaps: bool = gap_switch(False)
+    # Cast unsigned and narrow DECIMAL columns into extra window order keys.
+    # Off until measured on the GPU; without it such scopes get rank().
+    window_cast_tiebreaks: bool = False
     float_exact_keys: bool = gap_switch(False)
     distinct: bool = True
     grouping_sets: bool = True
@@ -304,6 +307,9 @@ class EdgeValues:
     )  # #2085/#2592: nonfinite floating aggregates mismatch
     rounding_ties: bool = gap_switch(False)
     date_extremes: bool = True
+    date_beyond_ns: bool = gap_switch(
+        False
+    )  # unfiled 26b3b402: GPU date_trunc wraps for dates outside the ns range
     unicode_case: bool = gap_switch(
         False
     )  # #2598: GPU case mapping differs for ß and İ

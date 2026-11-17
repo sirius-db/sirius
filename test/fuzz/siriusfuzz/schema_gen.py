@@ -423,8 +423,12 @@ class DataGenerator:
                 choices += [2.5, 0.125, -1.5]
             return rng.choice(choices) if choices else None
         if typ.kind == "date" and ev.date_extremes:
+            # Without date_beyond_ns the extremes stay inside what a
+            # nanosecond timestamp can hold.
             return rng.choice(
                 [dt.date(1970, 1, 1), dt.date(1, 1, 1), dt.date(9999, 12, 31)]
+                if ev.date_beyond_ns
+                else [dt.date(1970, 1, 1), dt.date(1677, 9, 22), dt.date(2262, 4, 11)]
             )
         if typ.kind == "timestamp" and ev.date_extremes:
             return rng.choice(

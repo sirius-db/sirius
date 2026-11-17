@@ -29,6 +29,7 @@ struct = false
 [features]
 window_functions = true
 window_gaps = false
+window_cast_tiebreaks = false  # unmeasured on GPU; rank() replaces row_number()/running frames where ties could show
 float_exact_keys = false
 distinct = true
 grouping_sets = true
@@ -168,6 +169,7 @@ negative_zero = true
 nan_inf = false   # nonfinite floating aggregates differ; gaps mode only
 rounding_ties = false
 date_extremes = true
+date_beyond_ns = false  # 26b3b402: GPU date_trunc wraps on 9999-12-31
 unicode_case = false
 long_string = false
 

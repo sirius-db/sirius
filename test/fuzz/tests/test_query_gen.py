@@ -3,6 +3,7 @@ feature coverage (every enabled feature must be emitted)."""
 
 import collections
 import dataclasses
+import datetime as dt
 import pathlib
 import random
 import re
@@ -590,7 +591,64 @@ class Phase2dJoinBudget(unittest.TestCase):
         self.assertGreater(arith, 0)
 
 
+class WindowTies(unittest.TestCase):
+    def windows(self, enabled):
+        cfg = load_config(
+            None,
+            [
+                f"features.window_cast_tiebreaks={str(enabled).lower()}",
+                "data.rows=[20,30]",
+            ],
+        )
+        found = []
+        for seed in range(6):
+            dg = DataGenerator(cfg, random.Random(seed))
+            qg = QueryGenerator(cfg, dg.generate(seed), random.Random(seed), dg)
+            for _ in range(300):
+                found += [n for n in walk(qg.generate()) if isinstance(n, Window)]
+        return found
+
+    @staticmethod
+    def cast_keys(window):
+        return [o for o in window.order_by if isinstance(o.expr, Cast)]
+
+    def test_no_cast_keys_by_default(self):
+        self.assertFalse(any(self.cast_keys(w) for w in self.windows(False)))
+
+    def test_cast_keys_restore_running_frames(self):
+        off = self.windows(False)
+        on = self.windows(True)
+        self.assertTrue(any(self.cast_keys(w) for w in on))
+        self.assertGreater(
+            sum(bool(w.frame) for w in on), sum(bool(w.frame) for w in off)
+        )
+
+
 class Phase2cEdgeValues(unittest.TestCase):
+    def test_far_dates_need_gap_switch(self):
+        far = {dt.date(1, 1, 1), dt.date(9999, 12, 31)}
+        for enabled in (False, True):
+            cfg = load_config(
+                None,
+                [
+                    f"data.edge_values.date_beyond_ns={str(enabled).lower()}",
+                    "data.edge_values.probability=0.5",
+                    "data.rows=[200,200]",
+                ],
+            )
+            seen = set()
+            for seed in range(4):
+                ds = DataGenerator(cfg, random.Random(seed)).generate(seed)
+                seen |= {
+                    v
+                    for t in ds.tables
+                    for row in t.rows
+                    for v in row
+                    if type(v) is dt.date
+                }
+            self.assertTrue(seen)
+            self.assertEqual(bool(seen & far), enabled)
+
     def test_single_long_string_on_small_tier(self):
         cfg = load_config(
             None,
