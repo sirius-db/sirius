@@ -4,14 +4,15 @@
 #include "config/parser.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <initializer_list>
 #include <limits>
 #include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace sirius::config::quantity {
 
@@ -96,10 +97,11 @@ std::string tick_name(const kind& k)
  * @brief Parse a decimal number with an optional unit suffix into a whole count of ticks of
  * Period, exactly.
  *
- * The number is `[-]digits[.digits]` (no exponent); the suffix, separated by optional
+ * The number is `[-]digits[.digits]` (no exponent, no '+'); the suffix, separated by optional
  * whitespace, is one of @p k.units. A bare number is in the target's own unit (Period). The value
  * is scaled with integer arithmetic only, and anything that is not a whole number of ticks (e.g.
- * 0.1 B, or 1.5 s into std::chrono::seconds) is rejected rather than rounded.
+ * 0.1 B, or 1.5 s into std::chrono::seconds) is rejected rather than rounded. Every count Rep can
+ * hold is accepted, including a signed Rep's minimum.
  *
  * @tparam Rep integral representation of the target.
  * @tparam Period std::ratio: seconds or bytes per tick.
@@ -127,10 +129,22 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
     text.remove_prefix(1);
   }
 
-  // Mantissa digits, with the fraction's trailing zeros dropped so "1.50" scales like "1.5".
-  constexpr uint_t max = std::numeric_limits<uint_t>::max();
-  uint_t mantissa = 0, scale = 1;
-  std::size_t i = 0, pending_zeros = 0;
+  // value = significand * 10^int_zeros / 10^fraction_digits. Zeros are held back until a nonzero
+  // digit follows them, so trailing zeros of the integer part stay factors of ten (1e20 ns fits in
+  // seconds) and trailing zeros of the fraction vanish ("1.50" scales like "1.5").
+  constexpr uint_t max        = std::numeric_limits<uint_t>::max();
+  uint_t significand          = 0;
+  std::size_t int_zeros       = 0;  // trailing zeros of the integer part, not yet in significand
+  std::size_t frac_zeros      = 0;  // zeros after the dot, not yet in significand
+  std::size_t fraction_digits = 0;
+  auto shift                  = [&](std::size_t zeros) {
+    for (; zeros > 0; --zeros) {
+      if (significand > max / 10) { return false; }
+      significand *= 10;
+    }
+    return true;
+  };
+  std::size_t i = 0;
   bool dot = false, digits = false;
   for (; i < text.size(); ++i) {
     char const c = text[i];
@@ -140,22 +154,17 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
     }
     if (c < '0' || c > '9') { break; }
     digits = true;
-    if (dot && c == '0') {
-      ++pending_zeros;
+    if (c == '0') {
+      ++(dot ? frac_zeros : int_zeros);
       continue;
     }
-    for (; pending_zeros > 0; --pending_zeros) {
-      if (mantissa > max / 10 || scale > max / 10) { return out_of_range(); }
-      mantissa *= 10;
-      scale *= 10;
-    }
-    auto const digit = static_cast<uint_t>(c - '0');
-    if (mantissa > (max - digit) / 10) { return out_of_range(); }
-    mantissa = mantissa * 10 + digit;
-    if (dot) {
-      if (scale > max / 10) { return out_of_range(); }
-      scale *= 10;
-    }
+    // A nonzero digit makes every held-back zero before it significant.
+    if (!shift(int_zeros) || !shift(frac_zeros)) { return out_of_range(); }
+    fraction_digits += dot ? frac_zeros + 1 : 0;
+    int_zeros = frac_zeros = 0;
+    auto const digit       = static_cast<uint_t>(c - '0');
+    if (significand > (max - digit) / 10) { return out_of_range(); }
+    significand = significand * 10 + digit;
   }
   if (!digits) { return invalid(); }
 
@@ -173,7 +182,6 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
       return parse_status::failure("unknown " + std::string(k.suffix_noun) + ": " +
                                    detail::quoted(suffix));
     }
-    // Express the unit in ticks of Period: (num/den) / (P::num/P::den).
     unit_num = match->num;
     unit_den = match->den;
   } else {
@@ -182,13 +190,17 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
     unit_den = Period::den;
   }
 
-  if (negative && mantissa != 0 && (!k.allow_negative || std::is_unsigned_v<Rep>)) {
+  if (negative && significand != 0 && (!k.allow_negative || std::is_unsigned_v<Rep>)) {
     return parse_status::failure(std::string(k.noun) + " must be non-negative");
   }
 
-  // ticks = mantissa / scale * unit_num / unit_den * P::den / P::num, exactly.
-  std::array<uint_t, 3> numerators{mantissa, unit_num, static_cast<uint_t>(Period::den)};
-  std::array<uint_t, 3> denominators{scale, unit_den, static_cast<uint_t>(Period::num)};
+  // ticks = significand * 10^int_zeros / 10^fraction_digits * unit_num / unit_den * P::den /
+  // P::num, exactly: cancel every denominator factor against the numerator factors; whatever is
+  // left of a denominator means the value is not a whole number of ticks.
+  std::vector<uint_t> numerators{significand, unit_num, static_cast<uint_t>(Period::den)};
+  numerators.insert(numerators.end(), int_zeros, 10);
+  std::vector<uint_t> denominators{unit_den, static_cast<uint_t>(Period::num)};
+  denominators.insert(denominators.end(), fraction_digits, 10);
   for (auto& denominator : denominators) {
     for (auto& numerator : numerators) {
       auto const divisor = std::gcd(numerator, denominator);
@@ -200,13 +212,20 @@ parse_status parse(std::string_view text, Rep& out, const kind& k)
                                    tick_name<Period>(k) + " (it would need rounding)");
     }
   }
-  auto const limit = static_cast<uint_t>(std::numeric_limits<Rep>::max());
-  uint_t count     = 1;
+  // A signed Rep holds one more negative tick than positive ones.
+  uint_t const limit = static_cast<uint_t>(std::numeric_limits<Rep>::max()) +
+                       (negative && std::is_signed_v<Rep> ? 1 : 0);
+  uint_t count = 1;
   for (auto const numerator : numerators) {
-    if (numerator != 0 && count > limit / numerator) { return out_of_range(); }
+    if (numerator == 0) {
+      count = 0;
+      break;
+    }
+    if (count > limit / numerator) { return out_of_range(); }
     count *= numerator;
   }
-  out = negative ? static_cast<Rep>(-static_cast<std::intmax_t>(count)) : static_cast<Rep>(count);
+  // Modular negation, then the conversion to Rep (well defined since C++20): -2^63 included.
+  out = static_cast<Rep>(negative ? uint_t{0} - count : count);
   return {};
 }
 
@@ -218,10 +237,11 @@ template <class Rep, class Period>
 std::string format(Rep count, const kind& k)
 {
   static_assert(std::is_integral_v<Rep>);
-  bool const negative = count < 0;
-  // Magnitude in ticks; the cast through intmax avoids negating Rep's minimum in Rep.
+  bool negative = false;
+  if constexpr (std::is_signed_v<Rep>) { negative = count < 0; }
+  // Magnitude in ticks, by modular negation so Rep's minimum is well defined.
   uint_t const ticks =
-    negative ? static_cast<uint_t>(-static_cast<std::intmax_t>(count)) : static_cast<uint_t>(count);
+    negative ? uint_t{0} - static_cast<uint_t>(count) : static_cast<uint_t>(count);
   std::string const sign = negative ? "-" : "";
   if (ticks == 0) {
     auto const tick = tick_name<Period>(k);

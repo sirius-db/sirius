@@ -5,6 +5,7 @@
 #include "config/quantity.hpp"
 
 #include <chrono>
+#include <concepts>
 #include <string>
 #include <string_view>
 
@@ -14,6 +15,7 @@ namespace sirius::config {
 /// case-insensitively and include today's long spellings (msec, sec, seconds, minutes, hr, ...).
 /// Exact: 1.5 s into std::chrono::seconds is rejected rather than truncated.
 template <class Rep, class Period>
+  requires std::integral<Rep> && (!std::same_as<Rep, bool>)
 struct parser<std::chrono::duration<Rep, Period>> {
   parse_status operator()(std::string_view text, std::chrono::duration<Rep, Period>& out) const
   {
@@ -26,6 +28,7 @@ struct parser<std::chrono::duration<Rep, Period>> {
 
 /// The largest unit that represents the value exactly: 1500ms -> "1500 ms", 120s -> "2 min".
 template <class Rep, class Period>
+  requires std::integral<Rep> && (!std::same_as<Rep, bool>)
 struct formatter<std::chrono::duration<Rep, Period>> {
   std::string operator()(const std::chrono::duration<Rep, Period>& value) const
   {
