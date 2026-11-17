@@ -302,7 +302,8 @@ struct option_alternative {
  * Loading rules:
  * - at most one alternative may be present; a present null counts as absent;
  * - a present value that does not parse or validate is an error, never a fallback;
- * - a required option must be present: a fallback does not satisfy it;
+ * - a required option must be present when its block is (a null block is an absent one, and
+ *   then nothing is required); a fallback does not satisfy it;
  * - absent and optional: the fallback (value_source::fallback) or nothing (value_source::unset);
  * - for_prod() options are left unset outside environment::prod, without looking at the file:
  *   a value there is neither checked nor kept, so writing the configuration back drops it;
@@ -392,7 +393,8 @@ class config_option {
   }
 
   /**
-   * @brief Load from the mapping @p block, whose dotted path is @p path ("" at the root).
+   * @brief Load from the mapping @p block, whose dotted path is @p path ("" at the root); a null
+   * @p block is an absent one.
    * @throws config_error naming the offending key; an exception from a custom parser or
    * validator is reported the same way. std::bad_alloc passes through.
    */
@@ -411,7 +413,7 @@ class config_option {
       throw config_error(
         detail::framed(path, quote_list(present, " and ") + " are mutually exclusive"));
     }
-    if (present.empty() && _required) {
+    if (present.empty() && _required && !block.is_null()) {
       if constexpr (sizeof...(Ts) == 1) {
         throw config_error("'" + join_path(path, key()) + "': required but missing");
       } else {
