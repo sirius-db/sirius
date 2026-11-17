@@ -9,6 +9,7 @@
 #include <concepts>
 #include <cstddef>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -584,6 +585,44 @@ class option_builder {
         return node::scalar(std::string(std::invoke(fn, value)));
       };
     }
+    return *this;
+  }
+
+  /// Read and write the last alternative as one of @p table's spellings, for a type without
+  /// string_to_enum / enum_to_string (e.g. a third-party enum, or std::optional of one). The first
+  /// spelling of a value is the one written; anything else is rejected with the list.
+  option_builder& choices(
+    std::initializer_list<
+      std::pair<std::string_view, std::tuple_element_t<sizeof...(Ts) - 1, std::tuple<Ts...>>>>
+      table)
+  {
+    using T = std::tuple_element_t<sizeof...(Ts) - 1, std::tuple<Ts...>>;
+    std::vector<std::pair<std::string, T>> entries;
+    for (auto const& [spelling, value] : table) {
+      entries.emplace_back(std::string(spelling), value);
+    }
+    auto& alt  = last();
+    alt.parser = [entries](const node& n, T& out) -> parse_status {
+      if (!n.is_scalar()) {
+        return parse_status::failure("expected a scalar, got " + std::string(n.kind_name()));
+      }
+      std::string expected;
+      for (auto const& [spelling, value] : entries) {
+        if (n.text() == spelling) {
+          out = value;
+          return {};
+        }
+        expected += (expected.empty() ? "" : ", ") + spelling;
+      }
+      return parse_status::failure("invalid enum value " + detail::quoted(n.text()) +
+                                   " (expected " + expected + ")");
+    };
+    alt.writer = [entries](const T& value) {
+      for (auto const& [spelling, candidate] : entries) {
+        if (candidate == value) { return node::scalar(spelling); }
+      }
+      throw std::logic_error("config option: value has no spelling among its choices");
+    };
     return *this;
   }
 

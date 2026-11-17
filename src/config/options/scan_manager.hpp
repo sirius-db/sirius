@@ -1,0 +1,591 @@
+// Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "config/block.hpp"
+#include "config/option.hpp"
+#include "config/size.hpp"
+#include "config/validators.hpp"
+#include "scan_manager/config.hpp"
+#include "scan_manager/preparation_options.hpp"
+
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/tls/config.hpp>
+#include <cucascade/io/uring/config.hpp>
+
+#include <chrono>
+#include <cstddef>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace sirius::config {
+
+namespace detail {
+
+inline const scan_manager::scan_manager_config& scan_manager_defaults()
+{
+  static const scan_manager::scan_manager_config value{};
+  return value;
+}
+
+inline const scan_manager::partial_batch_options& partial_batch_defaults()
+{
+  static const scan_manager::partial_batch_options value{};
+  return value;
+}
+
+/// Accepts counts that fit in an unsigned int (the type cuCascade keeps them in).
+struct fits_unsigned {
+  [[nodiscard]] bool operator()(std::size_t value) const noexcept
+  {
+    return value <= std::numeric_limits<unsigned>::max();
+  }
+  [[nodiscard]] static std::string description()
+  {
+    return "must be at most " + std::to_string(std::numeric_limits<unsigned>::max());
+  }
+};
+
+}  // namespace detail
+
+/// `sirius.executor.scan_manager.uring`: the local-disk IO reactors.
+struct uring_options : block_base<uring_options> {
+  /// Unset: one scan per pipeline thread, derived when the configuration is resolved; an explicit
+  /// 0 keeps local readahead off.
+  config_option<std::size_t> n_max_concurrent_scans =
+    option<std::size_t>("n_max_concurrent_scans").build();
+  /// 0 = no cap: fill every free staging slot.
+  config_option<std::size_t> slices_per_pass =
+    option<std::size_t>("slices_per_pass")
+      .validate([](std::size_t v) -> parse_status {
+        if (v <= cucascade::io::uring::max_slices_per_pass) { return {}; }
+        return parse_status::failure(
+          "must be between 0 and " + std::to_string(cucascade::io::uring::max_slices_per_pass) +
+          " (0 = no cap: fill every free staging slot), got " + std::to_string(v));
+      })
+      .fallback(detail::scan_manager_defaults().uring.slices_per_pass)
+      .build();
+  /// 0 = no split.
+  config_option<std::size_t> range_batch_slices =
+    option<std::size_t>("range_batch_slices")
+      .fallback(detail::scan_manager_defaults().uring.range_batch_slices)
+      .build();
+
+  auto fields() { return field_list(n_max_concurrent_scans, slices_per_pass, range_batch_slices); }
+};
+
+/// `sirius.executor.scan_manager.rest.tls`: TLS for object-store connections. Trust settings belong
+/// to the object store configuration, not to this file.
+struct tls_options : block_base<tls_options> {
+  using ktls_mode     = cucascade::io::tls::ktls_mode;
+  using rx_mode       = cucascade::io::tls::user_space_rx;
+  using placement     = cucascade::io::tls::recv_placement;
+  using version_bound = cucascade::io::tls::version_bound;
+
+  static const cucascade::io::tls::config& defaults()
+  {
+    return detail::scan_manager_defaults().rest.tls;
+  }
+
+  config_option<ktls_mode> ktls = option<ktls_mode>("ktls")
+                                    .choices({{"prefer", ktls_mode::prefer},
+                                              {"require", ktls_mode::require},
+                                              {"disable", ktls_mode::disable}})
+                                    .fallback(defaults().ktls)
+                                    .build();
+  config_option<rx_mode> user_space_rx =
+    option<rx_mode>("user_space_rx")
+      .choices({{"record_layer", rx_mode::record_layer}, {"library", rx_mode::library}})
+      .fallback(defaults().fallback_rx)
+      .build();
+  config_option<placement> recv_placement = option<placement>("recv_placement")
+                                              .choices({{"automatic", placement::automatic},
+                                                        {"inline", placement::inline_},
+                                                        {"iowq", placement::iowq}})
+                                              .fallback(defaults().placement)
+                                              .build();
+  config_option<version_bound> min_version =
+    option<version_bound>("min_version")
+      .choices({{"tls1.2", version_bound::tls1_2}, {"tls1.3", version_bound::tls1_3}})
+      .fallback(defaults().min_version)
+      .build();
+  /// auto: the library's highest.
+  config_option<std::optional<version_bound>> max_version =
+    option<std::optional<version_bound>>("max_version")
+      .choices({{"auto", std::nullopt},
+                {"tls1.2", version_bound::tls1_2},
+                {"tls1.3", version_bound::tls1_3}})
+      .fallback(defaults().max_version)
+      .build();
+  config_option<bool> expect_no_pad =
+    option<bool>("expect_no_pad").fallback(defaults().expect_no_pad).build();
+  config_option<bool> session_cache =
+    option<bool>("session_cache").fallback(defaults().session_cache).build();
+  config_option<unsigned> session_cache_per_endpoint =
+    option<unsigned>("session_cache_per_endpoint")
+      .fallback(defaults().session_cache_per_endpoint)
+      .build();
+  /// Bytes after which a connection is replaced; 0 = never.
+  config_option<bytes> max_connection_bytes = option<bytes>("max_connection_bytes")
+                                                .fallback(to_bytes(defaults().max_connection_bytes))
+                                                .build();
+  config_option<std::string> ciphersuites =
+    option<std::string>("ciphersuites").fallback(defaults().ciphersuites).build();
+  config_option<std::string> cipher_list =
+    option<std::string>("cipher_list").fallback(defaults().cipher_list).build();
+  config_option<std::string> groups =
+    option<std::string>("groups").fallback(defaults().groups).build();
+  config_option<std::string> sni_override =
+    option<std::string>("sni_override").fallback(defaults().sni_override).build();
+  config_option<bool> allow_tls13_without_rekey = option<bool>("allow_tls13_without_rekey")
+                                                    .fallback(defaults().allow_tls13_without_rekey)
+                                                    .build();
+
+  auto fields()
+  {
+    constexpr auto trust =
+      "trust is owned by object_store; set ca_bundle_path through "
+      "sirius_config::set_object_store_config() (kept when a SQL secret is selected), or "
+      "NIX_SSL_CERT_FILE / SSL_CERT_FILE / SSL_CERT_DIR in the process environment "
+      "(a usable NIX_SSL_CERT_FILE takes precedence over SSL_CERT_FILE); SQL secrets carry no CA";
+    return field_list(
+      removed("verify",
+              "trust is owned by object_store; set VERIFY_SSL on the selected CREATE SECRET (TYPE "
+              "SIRIUS_S3, ...) or tls_verify through sirius_config::set_object_store_config() "
+              "instead"),
+      removed("ca_file", trust),
+      removed("ca_dir", trust),
+      removed("ca_blob", trust),
+      ktls,
+      user_space_rx,
+      recv_placement,
+      min_version,
+      max_version,
+      expect_no_pad,
+      session_cache,
+      session_cache_per_endpoint,
+      max_connection_bytes,
+      ciphersuites,
+      cipher_list,
+      groups,
+      sni_override,
+      allow_tls13_without_rekey);
+  }
+};
+
+/// `sirius.executor.scan_manager.rest`: the object-store (REST) IO reactors. cuCascade checks the
+/// ranges and cross-field rules (rest::config::validate()) once derived defaults are in place,
+/// when the configuration is resolved.
+struct rest_options : block_base<rest_options> {
+  static const cucascade::io::rest::config& defaults()
+  {
+    return detail::scan_manager_defaults().rest;
+  }
+
+  // -- scans and requests
+  /// Unset: twice the pipeline threads (at least 8), derived when the configuration is resolved.
+  config_option<std::size_t> n_max_concurrent_scans =
+    option<std::size_t>("n_max_concurrent_scans").build();
+  config_option<std::chrono::seconds> request_timeout =
+    option<std::chrono::seconds>("request_timeout_s")
+      .fallback(std::chrono::seconds(defaults().request_timeout_s))
+      .build();
+  /// A transfer slower than this for stall_time_s is abandoned.
+  config_option<bytes> stall_speed_limit_bytes =
+    option<bytes>("stall_speed_limit_bytes")
+      .fallback(bytes(defaults().stall_speed_limit_bytes))
+      .build();
+  config_option<std::chrono::seconds> stall_time =
+    option<std::chrono::seconds>("stall_time_s")
+      .fallback(std::chrono::seconds(defaults().stall_time_s))
+      .build();
+  config_option<bytes> merge_max_gap =
+    option<bytes>("merge_max_gap").fallback(to_bytes(defaults().merge_max_gap)).build();
+  config_option<bytes> min_segment_bytes =
+    option<bytes>("min_segment_bytes").fallback(to_bytes(defaults().min_segment_bytes)).build();
+  config_option<bytes> max_segment_bytes =
+    option<bytes>("max_segment_bytes").fallback(to_bytes(defaults().max_segment_bytes)).build();
+  config_option<bytes> footer_probe_bytes =
+    option<bytes>("footer_probe_bytes").fallback(to_bytes(defaults().footer_probe_bytes)).build();
+  config_option<std::size_t> list_max_matches =
+    option<std::size_t>("list_max_matches").fallback(defaults().list_max_matches).build();
+  config_option<std::size_t> list_max_scanned =
+    option<std::size_t>("list_max_scanned").fallback(defaults().list_max_scanned).build();
+
+  // -- retry policy
+  config_option<std::chrono::milliseconds> retry_backoff_base =
+    option<std::chrono::milliseconds>("retry_backoff_base_ms")
+      .fallback(defaults().retry_backoff_base)
+      .build();
+  config_option<std::chrono::milliseconds> retry_jitter =
+    option<std::chrono::milliseconds>("retry_jitter_ms").fallback(defaults().retry_jitter).build();
+  config_option<std::size_t> max_retry_attempts = option<std::size_t>("max_retry_attempts")
+                                                    .validate(detail::fits_unsigned{})
+                                                    .fallback(defaults().max_retry_attempts)
+                                                    .build();
+  config_option<std::size_t> max_auth_retry_attempts =
+    option<std::size_t>("max_auth_retry_attempts")
+      .validate(detail::fits_unsigned{})
+      .fallback(defaults().max_auth_retry_attempts)
+      .build();
+  config_option<bool> honor_retry_after =
+    option<bool>("honor_retry_after").fallback(defaults().honor_retry_after).build();
+
+  // -- connection pool
+  /// Unset: half the queue depth, up to 128 with kernel TLS or 64 without, derived when the
+  /// configuration is resolved.
+  config_option<std::size_t> max_connections = option<std::size_t>("max_connections").build();
+  config_option<std::chrono::seconds> conn_max_age =
+    option<std::chrono::seconds>("conn_max_age_s").fallback(defaults().conn_max_age).build();
+  config_option<std::chrono::milliseconds> upkeep_interval =
+    option<std::chrono::milliseconds>("upkeep_interval_ms")
+      .fallback(defaults().upkeep_interval)
+      .build();
+  config_option<bool> upkeep_http1 =
+    option<bool>("upkeep_http1").fallback(defaults().upkeep_http1).build();
+  config_option<std::chrono::milliseconds> connect_timeout =
+    option<std::chrono::milliseconds>("connect_timeout_ms")
+      .fallback(defaults().connect_timeout)
+      .build();
+  config_option<std::chrono::seconds> dns_ttl =
+    option<std::chrono::seconds>("dns_ttl_s").fallback(defaults().dns_ttl).build();
+  config_option<bool> dns_accumulate =
+    option<bool>("dns_accumulate").fallback(defaults().dns_accumulate).build();
+  config_option<std::size_t> dns_max_addresses =
+    option<std::size_t>("dns_max_addresses").fallback(defaults().dns_max_addresses).build();
+  config_option<std::chrono::seconds> keepalive_idle =
+    option<std::chrono::seconds>("keepalive_idle_s")
+      .fallback(std::chrono::seconds(defaults().keepalive_idle_s))
+      .build();
+  config_option<std::chrono::seconds> keepalive_interval =
+    option<std::chrono::seconds>("keepalive_interval_s")
+      .fallback(std::chrono::seconds(defaults().keepalive_interval_s))
+      .build();
+  /// 0 = the kernel's default.
+  config_option<int> keepalive_count =
+    option<int>("keepalive_count").fallback(defaults().keepalive_count).build();
+  /// Unset: the egress NIC's MTU when it uses jumbo frames, else 0 (no check), derived when the
+  /// configuration is resolved.
+  config_option<bytes> min_mtu                    = option<bytes>("min_mtu").build();
+  config_option<unsigned> mtu_reject_max_attempts = option<unsigned>("mtu_reject_max_attempts")
+                                                      .fallback(defaults().mtu_reject_max_attempts)
+                                                      .build();
+  config_option<bool> close_with_rst =
+    option<bool>("close_with_rst").fallback(defaults().close_with_rst).build();
+
+  // -- transport
+  config_option<bytes> receive_buffer_bytes = option<bytes>("receive_buffer_bytes")
+                                                .fallback(to_bytes(defaults().receive_buffer_bytes))
+                                                .build();
+  config_option<std::size_t> queue_depth =
+    option<std::size_t>("queue_depth").fallback(defaults().queue_depth).build();
+  config_option<cucascade::io::rest::reactor_wait_mode> wait_mode =
+    option<cucascade::io::rest::reactor_wait_mode>("wait_mode")
+      .choices({{"epoll", cucascade::io::rest::reactor_wait_mode::epoll},
+                {"uring", cucascade::io::rest::reactor_wait_mode::uring}})
+      .fallback(defaults().wait_mode)
+      .build();
+  /// 0 = the kernel's default.
+  config_option<unsigned> iowq_max_unbound =
+    option<unsigned>("iowq_max_unbound").fallback(defaults().iowq_max_unbound).build();
+
+  // -- placement
+  config_option<std::size_t> fan_out =
+    option<std::size_t>("fan_out").fallback(defaults().fan_out).build();
+  /// Empty: the default route's interface.
+  config_option<std::string> interface =
+    option<std::string>("interface").fallback(defaults().interface).build();
+  config_option<bool> pin_to_irq_cpus =
+    option<bool>("pin_to_irq_cpus").fallback(defaults().pin_to_irq_cpus).build();
+  config_option<bool> raise_reactor_priority =
+    option<bool>("raise_reactor_priority").fallback(defaults().raise_reactor_priority).build();
+
+  tls_options tls;
+
+  auto fields()
+  {
+    constexpr auto moved = "removed; use sirius_config::set_object_store_config() instead";
+    return field_list(removed("ca_bundle_path", moved),
+                      removed("tls_verify", moved),
+                      n_max_concurrent_scans,
+                      request_timeout,
+                      stall_speed_limit_bytes,
+                      stall_time,
+                      merge_max_gap,
+                      min_segment_bytes,
+                      max_segment_bytes,
+                      footer_probe_bytes,
+                      list_max_matches,
+                      list_max_scanned,
+                      retry_backoff_base,
+                      retry_jitter,
+                      max_retry_attempts,
+                      max_auth_retry_attempts,
+                      honor_retry_after,
+                      max_connections,
+                      conn_max_age,
+                      upkeep_interval,
+                      upkeep_http1,
+                      connect_timeout,
+                      dns_ttl,
+                      dns_accumulate,
+                      dns_max_addresses,
+                      keepalive_idle,
+                      keepalive_interval,
+                      keepalive_count,
+                      min_mtu,
+                      mtu_reject_max_attempts,
+                      close_with_rst,
+                      receive_buffer_bytes,
+                      queue_depth,
+                      wait_mode,
+                      iowq_max_unbound,
+                      fan_out,
+                      interface,
+                      pin_to_irq_cpus,
+                      raise_reactor_priority,
+                      sub("tls", tls));
+  }
+};
+
+/// `sirius.executor.scan_manager.cache`: the read cache in front of the IO backends.
+struct cache_options : block_base<cache_options> {
+  using cache_mode      = cucascade::io::cache::cache_mode;
+  using eviction_policy = cucascade::io::cache::eviction_policy;
+
+  /// `sirius` is the deprecated spelling of `cucs`.
+  config_option<cache_mode> mode =
+    option<cache_mode>("mode")
+      .parser([](std::string_view text, cache_mode& out) -> parse_status {
+        if (text == "sirius") {
+          out = cache_mode::cucs;
+          return {};
+        }
+        return parser<cache_mode>{}(text, out);
+      })
+      .fallback(detail::scan_manager_defaults().cache.mode)
+      .build();
+  config_option<eviction_policy> eviction =
+    option<eviction_policy>("eviction")
+      .fallback(detail::scan_manager_defaults().cache.eviction)
+      .build();
+  config_option<double> min_prefetching_budget_fraction =
+    option<double>("min_prefetching_budget_fraction")
+      .validate(fraction{})
+      .fallback(detail::scan_manager_defaults().cache.min_prefetching_budget_fraction)
+      .build();
+  config_option<double> eviction_threshold_fraction =
+    option<double>("eviction_threshold_fraction")
+      .validate(fraction{})
+      .fallback(detail::scan_manager_defaults().cache.eviction_threshold_fraction)
+      .build();
+
+  auto fields()
+  {
+    return field_list(mode, eviction, min_prefetching_budget_fraction, eviction_threshold_fraction);
+  }
+};
+
+/// `sirius.executor.scan_manager.memory_prefetcher`: copies cached input toward the GPU while
+/// memory is free.
+struct memory_prefetcher_options : block_base<memory_prefetcher_options> {
+  static const scan_manager::memory_prefetcher_config& defaults()
+  {
+    return detail::scan_manager_defaults().memory_prefetcher;
+  }
+
+  config_option<bool> enable = option<bool>("enable").fallback(defaults().enable).build();
+  config_option<std::size_t> num_threads = option<std::size_t>("num_threads")
+                                             .validate(positive<std::size_t>{})
+                                             .fallback(defaults().num_threads)
+                                             .build();
+  config_option<double> min_free_fraction = option<double>("min_free_fraction")
+                                              .validate(fraction{})
+                                              .fallback(defaults().min_free_fraction)
+                                              .build();
+  config_option<std::chrono::milliseconds> poll_interval =
+    option<std::chrono::milliseconds>("poll_interval_ms")
+      .validate(positive<std::chrono::milliseconds>{})
+      .fallback(std::chrono::milliseconds(defaults().poll_interval_ms))
+      .build();
+  config_option<std::chrono::milliseconds> drain_quiet =
+    option<std::chrono::milliseconds>("drain_quiet_ms")
+      .validate(non_negative<std::chrono::milliseconds>{})
+      .fallback(std::chrono::milliseconds(defaults().drain_quiet_ms))
+      .build();
+
+  auto fields()
+  {
+    return field_list(enable, num_threads, min_free_fraction, poll_interval, drain_quiet);
+  }
+};
+
+/// `sirius.executor.scan_manager.preparation.partial_batch`: when a partly filled batch is
+/// published anyway. Always on.
+struct partial_batch_options : block_base<partial_batch_options> {
+  config_option<std::size_t> min_fill_percent =
+    option<std::size_t>("min_fill_percent")
+      .validate(between<std::size_t>{1, 100})
+      .fallback(detail::partial_batch_defaults().min_fill_percent)
+      .build();
+  config_option<std::chrono::milliseconds> min_residence =
+    option<std::chrono::milliseconds>("min_residence")
+      .validate(positive<std::chrono::milliseconds>{})
+      .fallback(detail::partial_batch_defaults().min_residence)
+      .build();
+  config_option<std::chrono::milliseconds> max_residence =
+    option<std::chrono::milliseconds>("max_residence")
+      .fallback(detail::partial_batch_defaults().max_residence)
+      .build();
+
+  auto fields() { return field_list(min_fill_percent, min_residence, max_residence); }
+
+  void validate(std::string_view path) const
+  {
+    if (max_residence.get() < min_residence.get()) {
+      throw config_error(detail::framed(path, "max_residence must be at least min_residence"));
+    }
+  }
+};
+
+/// `sirius.executor.scan_manager.preparation`: how scans prepare their inputs. Unset limits are
+/// resolved from the scan worker count when the scan manager starts.
+struct preparation_options : block_base<preparation_options> {
+  /// 0 = unlimited.
+  config_option<std::size_t> max_inflight_metadata_jobs =
+    option<std::size_t>("max_inflight_metadata_jobs").build();
+  /// 0 = unlimited.
+  config_option<std::size_t> max_inflight_dv_jobs =
+    option<std::size_t>("max_inflight_dv_jobs").build();
+  config_option<std::size_t> lookahead_batches =
+    option<std::size_t>("lookahead_batches").validate(positive<std::size_t>{}).build();
+  config_option<std::size_t> max_control_work =
+    option<std::size_t>("max_control_work").validate(positive<std::size_t>{}).build();
+  config_option<std::size_t> drain_quantum =
+    option<std::size_t>("drain_quantum").validate(positive<std::size_t>{}).build();
+  /// 0 = a dedicated coordinator per attempt.
+  config_option<std::size_t> coordinator_workers =
+    option<std::size_t>("coordinator_workers").build();
+  config_option<std::size_t> native_reader_workers =
+    option<std::size_t>("native_reader_workers").validate(positive<std::size_t>{}).build();
+  config_option<std::size_t> max_native_readers =
+    option<std::size_t>("max_native_readers").validate(positive<std::size_t>{}).build();
+  config_option<std::chrono::milliseconds> interrupt_check_interval =
+    option<std::chrono::milliseconds>("interrupt_check_interval")
+      .validate(positive<std::chrono::milliseconds>{})
+      .fallback(scan_manager::k_interrupt_check_interval)
+      .build();
+  partial_batch_options partial_batch;
+
+  auto fields()
+  {
+    return field_list(max_inflight_metadata_jobs,
+                      max_inflight_dv_jobs,
+                      lookahead_batches,
+                      max_control_work,
+                      drain_quantum,
+                      coordinator_workers,
+                      native_reader_workers,
+                      max_native_readers,
+                      sub("partial_batch", partial_batch),
+                      interrupt_check_interval);
+  }
+
+  void validate(std::string_view path) const
+  {
+    // Unset counts take the defaults scan_manager::preparation_config resolves them to.
+    scan_manager::preparation_config resolved;
+    if (auto const* workers = native_reader_workers.get_if()) {
+      resolved.native_reader_workers = *workers;
+    }
+    if (auto const* readers = max_native_readers.get_if()) {
+      resolved.max_native_readers = *readers;
+    }
+    if (resolved.resolved_native_readers() < resolved.resolved_native_workers()) {
+      throw config_error(
+        detail::framed(path, "max_native_readers must be at least native_reader_workers"));
+    }
+  }
+};
+
+/// `sirius.executor.scan_manager`: the scan workers and the IO backends behind them.
+struct scan_manager_options : block_base<scan_manager_options> {
+  /// Unset: the fixed scan-worker default, derived when the configuration is resolved.
+  config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
+  config_option<std::vector<int>> cpu_affinity =
+    option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
+  /// `sirius` is the deprecated spelling of `native`.
+  config_option<scan_manager::io_backend> backend =
+    option<scan_manager::io_backend>("backend")
+      .parser([](std::string_view text, scan_manager::io_backend& out) -> parse_status {
+        if (text == "kvikio") {
+          return parse_status::failure(
+            "backend: kvikio has been removed; use backend: native instead");
+        }
+        return parser<scan_manager::io_backend>{}(text, out);
+      })
+      .fallback(detail::scan_manager_defaults().backend)
+      .build();
+  /// Unset: derived from the CPU count when the configuration is resolved.
+  config_option<std::size_t> uring_n_reactors =
+    option<std::size_t>("uring_n_reactors").validate(positive<std::size_t>{}).build();
+  /// Unset: derived from the egress NIC and the CPU count when the configuration is resolved;
+  /// 0 lets cuCascade size each pool from the NIC.
+  config_option<std::size_t> rest_n_reactors = option<std::size_t>("rest_n_reactors").build();
+  config_option<bool> reserve_rest_reactor_cpus =
+    option<bool>("reserve_rest_reactor_cpus")
+      .fallback(detail::scan_manager_defaults().reserve_rest_reactor_cpus)
+      .build();
+  /// Unset: the cache and the backend decide; 0 turns readahead off.
+  config_option<std::size_t> max_readahead_scans =
+    option<std::size_t>("max_readahead_scans").build();
+  /// Unset: the backend's preference.
+  config_option<scan_manager::prefetch_strategy> readahead_strategy =
+    option<scan_manager::prefetch_strategy>("readahead_strategy").build();
+
+  uring_options uring;
+  rest_options rest;
+  cache_options cache;
+  memory_prefetcher_options memory_prefetcher;
+  preparation_options preparation;
+
+  auto fields()
+  {
+    return field_list(
+      removed("object_store",
+              "no longer YAML-loadable; use CREATE SECRET (TYPE SIRIUS_S3, ...) or "
+              "sirius_config::set_object_store_config()"),
+      removed("kvikio", "removed; remove this block and use backend: native instead"),
+      num_threads,
+      cpu_affinity,
+      backend,
+      uring_n_reactors,
+      rest_n_reactors,
+      reserve_rest_reactor_cpus,
+      max_readahead_scans,
+      readahead_strategy,
+      sub("uring", uring),
+      sub("rest", rest),
+      sub("cache", cache),
+      sub("memory_prefetcher", memory_prefetcher),
+      sub("preparation", preparation));
+  }
+
+  void validate(std::string_view path) const
+  {
+    // An explicit reactor count bounds the fan-out; the default fan-out is clamped instead. An
+    // unnamed count is only known once the configuration is resolved, which checks it again.
+    auto const* reactors = rest_n_reactors.get_if();
+    auto const fan_out   = rest.fan_out.get();
+    if (reactors != nullptr && *reactors > 0 && fan_out > *reactors &&
+        fan_out != rest_options::defaults().fan_out) {
+      throw config_error("'" + join_path(join_path(path, "rest"), "fan_out") +
+                         "': must be at most rest_n_reactors (" + std::to_string(*reactors) + ")");
+    }
+  }
+};
+
+}  // namespace sirius::config
