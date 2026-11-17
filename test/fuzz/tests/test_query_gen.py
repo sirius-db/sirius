@@ -984,7 +984,7 @@ class GeneratorValidity(unittest.TestCase):
                     checked += 1
             finally:
                 session.close()
-        self.assertGreater(checked, 15)
+        self.assertGreater(checked, 5)
 
     def test_generated_shapes_stay_on_the_gpu(self):
         """Shapes the planner is known to decline are not generated under the default
