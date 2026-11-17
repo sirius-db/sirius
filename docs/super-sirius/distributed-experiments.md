@@ -233,17 +233,23 @@ FROM (SELECT DISTINCT file_name, row_group_id, row_group_num_rows
 
 ## Reference numbers
 
-GB200, 4 ranks per node, all 22 TPC-H queries, seconds cold / warm, every answer checked, one
-run each.
+GB200, 4 ranks per node, the sum of the 22 TPC-H query times in seconds.
 
-| Scale | Lineitem row groups | 1 node | 2 nodes | 4 nodes |
+| Scale | Scans | 1 node | 2 nodes | 4 nodes |
 |---|---|---|---|---|
-| SF10000 | 1M rows | 202.4 / 197.2 | 111.1 / 107.3 | |
-| SF10000 | 115k rows | 452.2 / 413.8 | | |
-| SF30000 | | | 406.4 / 389.3 | 220.7 / 203.5 |
+| SF10000 | GDS | 94.7 | 54.4 | 36.3 |
+| SF30000 | GDS | 321.7 | 184.8 | 109.2 |
+| SF100000 | GDS | 1,641.1 | 747.7 | 336.8 |
+| SF10000 | default backend | 237.1 | | |
+| SF30000 | default backend | 720.4 | | |
+| SF100000 | default backend | 3,263.0 | | |
 
-The SF30000 runs predate downstream-first priority. SF100000 on 4 nodes has no full result:
-best per query, cold, Q18 28.8, Q3 27.3, Q9 59.8, Q21 86.3, Q1 35.4 s.
+- **GDS** is `scan_manager.backend: gds`, set up as in the [GDS runbook](gds-runbook.md). On one
+  node it is 2.50x, 2.24x and 1.99x faster than the default backend at the three scales. Its
+  integration is not finished.
+- **SF100000 on one node:** Q9 and Q13 do not fit in memory and spill to disk (about 2.5 TB and
+  0.6 TB), so that run has spill compression on.
+- The build of these runs carries the planner rewrites for Q2, Q11, Q13, Q17 and Q18.
 
 ## Past 16 ranks
 
