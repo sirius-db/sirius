@@ -108,12 +108,12 @@ struct claim_fixture {
                        .key_bindings             = {{.admitted_key_index   = 0,
                                                      .channel_push_ordinal = kProbeColumnIndex,
                                                      .probe_storage_type   = probe_type}}});
-    dynamic_filter_publish_plan::admitted_key key{.planner_condition_index      = 0,
-                                                  .build_key_ordinal            = build_key_ordinal,
-                                                  .storage_type                 = kInt64,
-                                                  .key_shape                    = {},
-                                                  .build_key_domain_cardinality = 0,
-                                                  .build_key_proven_unique      = false};
+    dynamic_filter_publish_plan::admitted_key key{.planner_condition_index = 0,
+                                                  .build_key_ordinal       = build_key_ordinal,
+                                                  .storage_type            = kInt64,
+                                                  .key_shape               = {},
+                                                  .build_key_domain        = {.cardinality = 0},
+                                                  .build_key_proven_unique = false};
     std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces{{*gpu_space, *host_space}};
     dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(replica_spaces)};
 

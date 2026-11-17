@@ -19,6 +19,7 @@
 #include "duckdb/common/optionally_owned_ptr.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "op/cte_reader_role.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -56,6 +57,9 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
 
   std::size_t cte_index;
+
+  //! For a CTE_SCAN of a delim CTE whose rewrite was proven restrictable: which read this is.
+  cte_reader_role reader_role = cte_reader_role::unknown;
 
   duckdb::optional_idx delim_index;
 

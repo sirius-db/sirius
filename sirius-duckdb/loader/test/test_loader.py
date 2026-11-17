@@ -249,13 +249,24 @@ class LoaderTests(unittest.TestCase):
         )
 
     def test_unavailable_repository(self):
-        status = self.assert_fallback(
+        load = (
             f"SET autoinstall_extension_repository={quote(self.root / 'missing')};"
-            f"LOAD {quote(self.loader)};",
+            f"LOAD {quote(self.loader)};"
+        )
+        status = self.assert_fallback(
+            load,
             "Sirius selected sirius_cuda13 for CUDA driver version 13.0",
             autoinstall=True,
         )
         self.assertEqual(status["backend"], "sirius_cuda13")
+        result = self.query(load, autoinstall=True)
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+        self.assertRegex(
+            result.stderr,
+            r"^Sirius: installing sirius_cuda13\. .*\n"
+            r"Sirius: installing sirius_cuda13 failed after \d+\.\d s\.\n"
+            r"Sirius: queries run on DuckDB's CPU engine; .*sirius_status\(\).*\n$",
+        )
 
     def test_selected_backend_already_loaded(self):
         result = self.query(
@@ -332,9 +343,22 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [{"backend": 13}])
+        self.assertRegex(
+            result.stderr,
+            r"^Sirius: installing sirius_cuda13\. .*\n"
+            r"Sirius: installed sirius_cuda13 in \d+\.\d s\.\n$",
+        )
         self.assertTrue(
             list((self.root / "installed").rglob("sirius_cuda13.duckdb_extension"))
         )
+        # Installed backends load without a message.
+        result = self.query(
+            f"SET autoinstall_extension_repository={quote(repository)};"
+            f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",
+            autoinstall=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_loader_has_no_cuda_or_engine_dependency(self):
         result = subprocess.run(
