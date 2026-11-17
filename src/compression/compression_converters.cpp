@@ -265,7 +265,9 @@ std::unique_ptr<cucascade::idata_representation> decompress_remote_device_to_gpu
   auto route                 = memory::device_transfer_route::none;
   // The pin synchronized its stream after writing the payload, so the source has no pending
   // writer. A peer copy is asynchronous on `stream`; a host-staged copy completes before it
-  // returns.
+  // returns. A host-staged copy that cannot get its staging throws
+  // memory::host_staging_out_of_memory, which retryable_decode passes on unchanged so that the
+  // task retries without growing its GPU reservation.
   simpatico::payload_fetch_fn fetch =
     [&](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
       auto const* const slice = blob->find_slice(off);

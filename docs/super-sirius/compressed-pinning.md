@@ -49,7 +49,9 @@ there, as it does for a host-tier compressed chunk. The copy is a peer copy wher
 pools have peer access and is staged through pinned host memory otherwise
 (`memory::enqueue_device_copy`). The pinned chunk stays on its GPU and is only read. Such a
 scan pays a transfer of the compressed bytes per query, and its reservation covers the copied
-compressed bytes together with the decoded output.
+compressed bytes together with the decoded output. When that pinned host memory runs out, the
+task is retried without growing its GPU reservation (see
+[Pipeline Execution](pipeline-execution.md#reschedule-handling-oom-and-cuda-launch-failures)).
 
 ## Decode-time equality pushdown
 
