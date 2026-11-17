@@ -3,6 +3,7 @@
 
 #include "config/block.hpp"
 #include "config/option.hpp"
+#include "config/options/scan_manager.hpp"
 #include "config/size.hpp"
 #include "config/validators.hpp"
 #include "exec/config.hpp"
@@ -22,7 +23,7 @@ inline const exec::downgrade_executor_config& downgrade_defaults()
 
 /// `sirius.executor.task_creator`: the threads that turn ready inputs into GPU tasks.
 struct task_creator_options : block_base<task_creator_options> {
-  /// Unset: derived from the machine when the configuration is resolved.
+  /// Unset: the resolver's fixed default.
   config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
   config_option<std::vector<int>> cpu_affinity =
     option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
@@ -70,16 +71,19 @@ struct downgrade_options : block_base<downgrade_options> {
   auto fields() { return field_list(num_threads, cpu_affinity, monitor_period, copy_chunk_bytes); }
 };
 
-/// `sirius.executor`: the engine's thread pools.
+/// `sirius.executor`: the engine's thread pools and the scan manager.
 struct executor_options : block_base<executor_options> {
   task_creator_options task_creator;
+  scan_manager_options scan_manager;
   pipeline_options pipeline;
   downgrade_options downgrade;
 
   auto fields()
   {
-    return field_list(
-      sub("task_creator", task_creator), sub("pipeline", pipeline), sub("downgrade", downgrade));
+    return field_list(sub("task_creator", task_creator),
+                      sub("scan_manager", scan_manager),
+                      sub("pipeline", pipeline),
+                      sub("downgrade", downgrade));
   }
 };
 

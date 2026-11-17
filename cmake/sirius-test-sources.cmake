@@ -41,6 +41,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config_executor_options.cpp
     test/cpp/config/test_config_memory_options.cpp
     test/cpp/config/test_config_option.cpp
+    test/cpp/config/test_config_scan_manager_options.cpp
     test/cpp/config/test_config_values.cpp
     test/cpp/config/test_config_yaml.cpp
     test/cpp/config/test_context.cpp
