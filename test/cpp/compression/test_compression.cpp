@@ -381,6 +381,8 @@ TEST_CASE("pin_table compression - automatic GPU staging failure keeps complete 
   auto const glob = sirius::test::mgpu::parquet_glob(tmp);
   auto const pin =
     "CALL pin_table('" + glob + "', tier='gpu', name='t_stage', cols=['k','v'], compression=true)";
+  // The staging fault is thread-local; execute pin_table on the thread that arms it.
+  run_ok(con, "SET threads=1", "keep staging fault on the calling thread");
   run_ok(con, "SET enable_compressed_materialization=false", "native carriers");
   run_ok(con, "SET enable_pinned_zone_map_pruning=true", "capture statistics");
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes=0", "remove size gate");
