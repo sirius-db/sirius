@@ -63,7 +63,7 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
-Queries with unsupported operators fall back silently to DuckDB CPU execution. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
+Queries with unsupported operators fall back silently to DuckDB CPU execution, unless `enable_duckdb_fallback` is `false`. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
 
 ```sql
 SET gpu_execution = false;          -- this connection only

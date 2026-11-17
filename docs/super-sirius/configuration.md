@@ -1130,12 +1130,12 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
-Accumulation holds each GPU's arrays, at most the cap, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch and byte cap are YAML settings; like the other switches in this section, their `SET` variables exist only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+Accumulation holds each GPU's arrays, at most four times `scan_task_batch_size`, until safe release after build tasks drain; published filters can remain until query teardown. The arrays are not spillable. Publication also allocates short-lived scratch on the final PARTITION task's allocator: at most two transfer chunks (8 MiB each at most) per contributing non-root GPU. The task's ignore-limit policy may admit that scratch beyond its reservation against global capacity. Initialization admission failure or safely recoverable scratch OOM skips the optional filter. The multi-partition switch is a YAML setting; like the other switches in this section, its `SET` variable exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 
-The `SET` variables `enable_dynamic_filter`, `enable_dynamic_zone_map_filter`,
-`enable_dynamic_filter_multi_partition` and `max_dynamic_filter_bloom_bytes_per_gpu` are
-registered only when the process explicitly enables Sirius test options; they are not part of the
-normal user surface. The three thresholds are always registered.
+The `SET` variables `enable_dynamic_filter`, `enable_dynamic_zone_map_filter` and
+`enable_dynamic_filter_multi_partition` are registered only when the process explicitly enables
+Sirius test options; they are not part of the normal user surface. The three thresholds are always
+registered.
 
 ### Distributed Execution
 
