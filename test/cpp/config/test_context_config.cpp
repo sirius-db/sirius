@@ -119,10 +119,8 @@ TEST_CASE("hardware thread defaults round and clamp each pool", "[config][thread
     CHECK(with_ktls.rest_reactors == row.rest_with_ktls);
 
     // Fewer than 16 NIC IRQ CPUs: one reactor per IRQ CPU, still at least the floor.
-    for (auto const [irq_cpus, expected] : {std::pair<std::size_t, std::size_t>{1, 4},
-                                            {4, 4},
-                                            {6, 6},
-                                            {15, 15}}) {
+    for (auto const [irq_cpus, expected] :
+         {std::pair<std::size_t, std::size_t>{1, 4}, {4, 4}, {6, 6}, {15, 15}}) {
       CAPTURE(irq_cpus);
       auto const from_nic = sirius::exec::derive_thread_defaults(row.cpu, row.gpus, true, irq_cpus);
       check_non_rest(from_nic);

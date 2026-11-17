@@ -66,14 +66,15 @@ inline constexpr std::size_t rest_reactors_min_user_tls = 8;
   auto const bounded = [](std::uint64_t n, std::uint64_t lo, std::uint64_t hi) {
     return static_cast<int>(std::clamp(n, lo, hi));
   };
-  auto const rest_base =
-    nic_irq_cpus > 0 && nic_irq_cpus < rest_reactors_max ? static_cast<std::uint64_t>(nic_irq_cpus) : t / 6;
-  auto const rest_min = kernel_tls ? rest_reactors_min_kernel_tls : rest_reactors_min_user_tls;
-  return {.pipeline       = bounded(3 * t / (8 * g), 4, 8),
-          .task_creator   = 4,
-          .downgrade      = bounded(t / (8 * g), 1, 4),
-          .scan_manager   = 18,
-          .rest_reactors  = static_cast<std::size_t>(
+  auto const rest_base = nic_irq_cpus > 0 && nic_irq_cpus < rest_reactors_max
+                           ? static_cast<std::uint64_t>(nic_irq_cpus)
+                           : t / 6;
+  auto const rest_min  = kernel_tls ? rest_reactors_min_kernel_tls : rest_reactors_min_user_tls;
+  return {.pipeline      = bounded(3 * t / (8 * g), 4, 8),
+          .task_creator  = 4,
+          .downgrade     = bounded(t / (8 * g), 1, 4),
+          .scan_manager  = 18,
+          .rest_reactors = static_cast<std::size_t>(
             std::clamp<std::uint64_t>(rest_base, rest_min, rest_reactors_max)),
           .uring_reactors = t >= 32 ? 4U : 2U};
 }

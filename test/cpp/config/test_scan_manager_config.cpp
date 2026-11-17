@@ -1050,8 +1050,8 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
           "[scan_manager][config][rest][tls]")
 {
   // Sirius sets no REST transport defaults of its own beyond the derived ones (the scan budget,
-  // min_mtu and max_connections): an empty block must leave every other field at cuCascade's struct default (compared
-  // field by field, so a cuCascade default change needs no edit here).
+  // min_mtu and max_connections): an empty block must leave every other field at cuCascade's struct
+  // default (compared field by field, so a cuCascade default change needs no edit here).
   cucascade::io::rest::config const d{};
   for (auto const* body : {"        {}\n", "        tls: {}\n"}) {
     CAPTURE(body);
@@ -1062,9 +1062,8 @@ TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport default
     CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
     CHECK(r.stall_time_s == d.stall_time_s);
     // Derived from this machine's kTLS state: 128 with kTLS loaded, 64 without.
-    CHECK(r.max_connections ==
-          sirius::default_rest_max_connections(cucascade::memory::discover_kernel_tls(),
-                                               d.queue_depth));
+    CHECK(r.max_connections == sirius::default_rest_max_connections(
+                                 cucascade::memory::discover_kernel_tls(), d.queue_depth));
     CHECK(r.merge_max_gap == d.merge_max_gap);
     CHECK(r.upkeep_interval == d.upkeep_interval);
     CHECK(r.upkeep_http1 == d.upkeep_http1);
