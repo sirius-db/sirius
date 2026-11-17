@@ -4,10 +4,10 @@
 #include "config/enum_concepts.hpp"
 
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -114,6 +114,8 @@ struct formatter<bool> {
 };
 
 // ---- integers: decimal, optional sign, no wrap-around into unsigned types ------------------
+// Character types are integers here too: they read and write numbers, not characters. Hex and
+// octal spellings, which yaml-cpp's conversion accepted, are not: "010" is ten.
 
 template <class T>
   requires std::integral<T> && (!std::same_as<T, bool>)
@@ -192,9 +194,11 @@ struct parser<T> {
     T value{};
     auto const* const last  = text.data() + text.size();
     auto const [end, error] = std::from_chars(text.data(), last, value);
-    // from_chars accepts its own inf/nan spellings; anything else must be fully consumed.
+    // Only the spellings above name inf and nan; from_chars' own (e.g. "nan(abc)") are rejected,
+    // as is a second sign. Subnormals parse; a value too small or too large for T does not.
     if (text.empty() || error == std::errc::invalid_argument || end != last ||
-        text.front() == '+' || text.front() == '-') {
+        text.front() == '+' || text.front() == '-' ||
+        (error == std::errc{} && !std::isfinite(value))) {
       return parse_status::failure("invalid number: " + detail::quoted(original));
     }
     if (error == std::errc::result_out_of_range) {
@@ -254,6 +258,7 @@ struct parser<T> {
   }
 };
 
+/// @throws std::logic_error when enum_to_string has no spelling for the value.
 template <string_enum T>
 struct formatter<T> {
   std::string operator()(T value) const

@@ -10,9 +10,11 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <ratio>
 #include <string>
 #include <string_view>
-#include <vector>
+#include <type_traits>
 
 using namespace sirius::config;
 using namespace sirius::config::size_literals;
@@ -48,6 +50,17 @@ void require_round_trip(const T& value)
   REQUIRE(parse_ok<T>(text) == value);
 }
 
+/// A failed parse leaves the output as it was.
+template <class T>
+void require_untouched(std::string_view text, const T& sentinel)
+{
+  T value           = sentinel;
+  auto const status = parser<T>{}(text, value);
+  INFO("text: '" << text << "'");
+  REQUIRE_FALSE(status);
+  REQUIRE(value == sentinel);
+}
+
 enum class test_speed { slow, fast };
 
 bool string_to_enum(std::string_view text, test_speed& out)
@@ -71,13 +84,35 @@ bool enum_to_string(test_speed value, std::string& out)
 
 enum class test_level : int { low = 1, high = 2 };
 
+/// No converters and no opt-in: not a config value.
+enum class test_plain { a, b };
+
+/// A converter with the wrong shape (by value, optional result) is not picked up.
+enum class test_misdeclared { a };
+[[maybe_unused]] std::optional<test_misdeclared> string_to_enum(std::string_view)
+{
+  return std::nullopt;
+}
+
+/// Opted in, but without a fixed underlying type: not every integer is a value.
+enum test_unfixed { unfixed_a, unfixed_b };
+
 }  // namespace
+
+namespace sirius::config {
+template <>
+inline constexpr bool enable_int_enum<test_level> = true;
+template <>
+inline constexpr bool enable_int_enum<test_unfixed> = true;
+}  // namespace sirius::config
 
 static_assert(string_enum<test_speed>);
 static_assert(int_enum<test_level>);
 static_assert(parsable<bytes> && parsable<mebibytes> && parsable<std::chrono::milliseconds>);
 static_assert(parsable<test_speed> && parsable<test_level> && parsable<double>);
-static_assert(!parsable<std::vector<int>>);
+static_assert(!parsable<test_plain> && !parsable<test_misdeclared> && !parsable<test_unfixed>);
+static_assert(!parsable<std::chrono::duration<double>> && !parsable<basic_size<double>>);
+static_assert(!std::is_constructible_v<bytes, double>);
 
 TEST_CASE("basic_size converts, compares and adds across units", "[config][config_values]")
 {
@@ -268,4 +303,135 @@ TEST_CASE("enums without converters use the underlying integer", "[config][confi
   REQUIRE(parse_ok<test_level>("2") == test_level::high);
   REQUIRE(formatter<test_level>{}(test_level::low) == "1");
   REQUIRE(parse_error<test_level>("high") == "invalid integer value: 'high'");
+}
+
+TEST_CASE("a failed parse leaves the output untouched", "[config][config_values]")
+{
+  require_untouched<bytes>("0.1 B", 7_B);
+  require_untouched<bytes>("-1 B", 7_B);
+  require_untouched<std::chrono::milliseconds>("0.5 ms", 7ms);
+  require_untouched<int>("x", 7);
+  require_untouched<std::size_t>("-1", std::size_t{7});
+  require_untouched<double>("1e400", 7.0);
+  require_untouched<bool>("maybe", true);
+  require_untouched<test_speed>("sluggish", test_speed::fast);
+  require_untouched<test_level>("high", test_level::low);
+}
+
+TEST_CASE("quantities reach the limits of their representation", "[config][config_values]")
+{
+  using std::chrono::milliseconds;
+  // Signed extremes, both ways.
+  REQUIRE(parse_ok<milliseconds>("-9223372036854775808 ms") == milliseconds::min());
+  REQUIRE(parse_ok<milliseconds>("9223372036854775807") == milliseconds::max());
+  REQUIRE_THAT(parse_error<milliseconds>("-9223372036854775809 ms"),
+               Catch::Matchers::ContainsSubstring("out of range"));
+  require_round_trip(milliseconds::min());
+  require_round_trip(milliseconds::max());
+  require_round_trip(bytes(std::numeric_limits<std::int64_t>::max()));
+
+  // Unsigned counts: the full range, and no negatives.
+  using ubytes = basic_size<std::uint64_t>;
+  REQUIRE(parse_ok<ubytes>("18446744073709551615 B").count() ==
+          std::numeric_limits<std::uint64_t>::max());
+  REQUIRE(parse_ok<ubytes>("17179869183 GiB").count() == 18446744072635809792ULL);
+  REQUIRE_THAT(parse_error<ubytes>("17179869184 GiB"),
+               Catch::Matchers::ContainsSubstring("out of range"));
+  require_round_trip(ubytes(std::numeric_limits<std::uint64_t>::max()));
+  REQUIRE(parse_error<std::chrono::duration<std::uint32_t>>("-1 s") ==
+          "time value must be non-negative");
+
+  // Exact values whose digits alone would overflow, and fractions finer than any unit.
+  REQUIRE(parse_ok<std::chrono::seconds>("100000000000000000000 ns").count() == 100000000000);
+  REQUIRE_THAT(parse_error<bytes>("0.00000000000000000001 B"),
+               Catch::Matchers::ContainsSubstring("would need rounding"));
+  REQUIRE_THAT(parse_error<bytes>("1000000000000000000000 B"),
+               Catch::Matchers::ContainsSubstring("out of range"));
+  REQUIRE(parse_ok<bytes>("0.000000000001 TB") == 1_B);
+}
+
+TEST_CASE("quantities convert between units with num and den above one", "[config][config_values]")
+{
+  using std::chrono::minutes;
+  REQUIRE(parse_ok<minutes>("2 h") == minutes(120));
+  REQUIRE_THAT(parse_error<minutes>("90 s"),
+               Catch::Matchers::ContainsSubstring("whole number of min"));
+  REQUIRE(parse_ok<kilobytes>("1000 B") == 1_KB);
+  REQUIRE_THAT(parse_error<kilobytes>("1 KiB"),
+               Catch::Matchers::ContainsSubstring("whole number of KB"));
+
+  using three_halves = std::chrono::duration<std::int64_t, std::ratio<3, 2>>;
+  REQUIRE(parse_ok<three_halves>("3 s").count() == 2);
+  REQUIRE(parse_error<three_halves>("1 s") ==
+          "'1 s' is not a whole number of ticks (it would need rounding)");
+  REQUIRE(formatter<three_halves>{}(three_halves(2)) == "3 s");
+  REQUIRE(formatter<three_halves>{}(three_halves(3)) == "4500 ms");
+  require_round_trip(three_halves(3));
+
+  // No unit is a whole number of 1/3 s ticks: written as a bare tick count.
+  using thirds = std::chrono::duration<std::int64_t, std::ratio<1, 3>>;
+  REQUIRE(formatter<thirds>{}(thirds(1)) == "1");
+  require_round_trip(thirds(1));
+  REQUIRE(parse_ok<thirds>("2 s").count() == 6);
+}
+
+TEST_CASE("negative durations parse exactly", "[config][config_values]")
+{
+  REQUIRE(parse_ok<std::chrono::milliseconds>("-1.5 s") == -1500ms);
+  REQUIRE(parse_ok<std::chrono::nanoseconds>("-0.0001 ms").count() == -100);
+  REQUIRE(parse_ok<std::chrono::seconds>("-0 s") == 0s);
+  REQUIRE(formatter<bytes>{}(0_B) == "0 B");
+  REQUIRE_THROWS_AS(formatter<bytes>{}(bytes(-1)), std::logic_error);  // sizes are never negative
+}
+
+TEST_CASE("quantity text shapes", "[config][config_values]")
+{
+  REQUIRE(parse_ok<bytes>("1 \t GiB") == 1_GiB);
+  REQUIRE(parse_ok<bytes>("1\nGiB") == 1_GiB);
+  REQUIRE(parse_ok<bytes>("1.") == 1_B);
+  REQUIRE(parse_error<bytes>(".") == "invalid byte value: '.'");
+  REQUIRE(parse_error<bytes>("-.") == "invalid byte value: '-.'");
+  REQUIRE(parse_error<bytes>("- 1 B") == "invalid byte value: '- 1 B'");
+  REQUIRE(parse_error<std::chrono::milliseconds>("+5 ms") == "invalid time value: '+5 ms'");
+  REQUIRE(parse_error<std::chrono::seconds>("1e3 s") == "unknown time suffix: 'e3 s'");
+  // Behaviour changes from yaml_reader.hpp: no hex, a case-insensitive binary 'i', and the whole
+  // suffix must be a unit.
+  REQUIRE(parse_error<bytes>("0x1000") == "unknown byte suffix: 'x1000'");
+  REQUIRE(parse_ok<bytes>("8GIB") == 8_GiB);
+  REQUIRE(parse_error<bytes>("8Gigabytes") == "unknown byte suffix: 'Gigabytes'");
+}
+
+TEST_CASE("integer edge cases", "[config][config_values]")
+{
+  REQUIRE(parse_ok<std::int8_t>("-128") == std::numeric_limits<std::int8_t>::min());
+  REQUIRE(parse_error<std::int8_t>("128") == "integer out of range: '128'");
+  REQUIRE(parse_ok<std::int16_t>("-32768") == std::numeric_limits<std::int16_t>::min());
+  REQUIRE(parse_ok<unsigned>("+0") == 0U);
+  REQUIRE(parse_ok<int>("010") == 10);  // decimal, not octal
+  REQUIRE(parse_error<int>("0x10") == "invalid integer value: '0x10'");
+  REQUIRE(parse_error<std::int64_t>(std::string(400, '9')) ==
+          "integer out of range: '" + std::string(400, '9') + "'");
+  require_round_trip(std::numeric_limits<std::int64_t>::min());
+  require_round_trip(std::numeric_limits<std::uint64_t>::max());
+}
+
+TEST_CASE("floating point edge cases", "[config][config_values]")
+{
+  for (double value : {5e-324,
+                       2.2250738585072009e-308,
+                       1e-310,
+                       std::numeric_limits<double>::max(),
+                       std::numeric_limits<double>::lowest()}) {
+    require_round_trip(value);
+  }
+  REQUIRE(std::signbit(parse_ok<double>(formatter<double>{}(-0.0))));
+  for (float value : {1e-45F, 0.1F, std::numeric_limits<float>::max()}) {
+    require_round_trip(value);
+  }
+  REQUIRE(parse_error<double>("1e400") == "number out of range: '1e400'");
+  REQUIRE(parse_error<double>("1e-400") == "number out of range: '1e-400'");
+  REQUIRE(parse_error<double>("nan(abc)") == "invalid number: 'nan(abc)'");
+  REQUIRE(parse_error<double>("0x1p3") == "invalid number: '0x1p3'");
+  REQUIRE(std::isnan(parse_ok<double>("-nan")));
+  REQUIRE(formatter<double>{}(-std::numeric_limits<double>::infinity()) == "-.inf");
 }

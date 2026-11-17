@@ -15,7 +15,8 @@ namespace sirius::config {
 ///
 /// parser<E> and formatter<E> use them, so an option of such an enum needs no custom parser.
 /// string_to_enum may accept aliases (e.g. a deprecated spelling); enum_to_string picks the one
-/// the writer emits.
+/// the writer emits. Declare both in the enum's own header, so every translation unit that
+/// parses the enum sees them.
 template <class T>
 concept string_enum =
   std::is_enum_v<T> && requires(std::string_view text, T& value, std::string& s) {
@@ -23,8 +24,19 @@ concept string_enum =
     { enum_to_string(value, s) } -> std::same_as<bool>;
   };
 
-/// An enum without spelling converters: read and written as its underlying integer.
+/// Opt-in for reading and writing an enum without spelling converters as its underlying integer:
+///
+///     template <> inline constexpr bool sirius::config::enable_int_enum<my_enum> = true;
+///
+/// Without it such an enum is not a config value at all, so an enum whose converters are missing,
+/// misdeclared or not visible fails to compile instead of silently reading integers.
 template <class T>
-concept int_enum = std::is_enum_v<T> && !string_enum<T>;
+inline constexpr bool enable_int_enum = false;
+
+/// An enum read and written as its underlying integer: opted in, without converters, and with a
+/// fixed underlying type (so every integer of that type is a valid value).
+template <class T>
+concept int_enum = std::is_enum_v<T> && !string_enum<T> && enable_int_enum<T> &&
+                   requires { T{std::underlying_type_t<T>{}}; };
 
 }  // namespace sirius::config

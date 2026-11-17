@@ -7,8 +7,10 @@
 #include <compare>
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <ratio>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -18,8 +20,11 @@ namespace sirius::config {
 /**
  * @brief A byte count with a compile-time unit, modelled on std::chrono::duration.
  *
- * Conversions that cannot lose information are implicit (GiB -> bytes); the others need
- * size_cast. Values of different units compare and add in their common unit.
+ * Conversions that cannot lose precision are implicit (GiB -> bytes); the others need
+ * size_cast. Values of different units compare and add in their common unit. As with
+ * std::chrono, conversions and arithmetic do not check for overflow: parse a configured value
+ * straight into the type the setting is declared with (parser<basic_size> range-checks there)
+ * rather than into a coarser unit that is converted afterwards.
  *
  * @tparam Rep the count type.
  * @tparam Period std::ratio: bytes per tick.
@@ -46,7 +51,15 @@ class basic_size {
   using period = typename Period::type;
 
   constexpr basic_size() = default;
-  constexpr explicit basic_size(const Rep& count) : _count(count) {}
+
+  /// A count of ticks. As for std::chrono::duration, a floating-point count needs a
+  /// floating-point Rep.
+  template <class R2>
+    requires std::convertible_to<const R2&, Rep> &&
+             (std::floating_point<Rep> || !std::floating_point<R2>)
+  constexpr explicit basic_size(const R2& count) : _count(static_cast<Rep>(count))
+  {
+  }
 
   /// Implicit only when every tick of @p other is a whole number of ticks of this unit.
   template <class R2, class P2>
@@ -132,23 +145,35 @@ using mebibytes = basic_size<std::int64_t, std::ratio<1LL << 20>>;
 using gibibytes = basic_size<std::int64_t, std::ratio<1LL << 30>>;
 using tebibytes = basic_size<std::int64_t, std::ratio<1LL << 40>>;
 
+namespace detail {
+/// A literal too large for the count is a compile error, not a wrapped value.
+consteval std::int64_t size_literal_count(unsigned long long v)
+{
+  if (v > static_cast<unsigned long long>(std::numeric_limits<std::int64_t>::max())) {
+    throw "size literal out of range";  // not a constant expression: rejected at compile time
+  }
+  return static_cast<std::int64_t>(v);
+}
+}  // namespace detail
+
 namespace size_literals {
 // clang-format off
-constexpr bytes     operator""_B(unsigned long long v)   { return bytes(static_cast<std::int64_t>(v)); }
-constexpr kilobytes operator""_KB(unsigned long long v)  { return kilobytes(static_cast<std::int64_t>(v)); }
-constexpr megabytes operator""_MB(unsigned long long v)  { return megabytes(static_cast<std::int64_t>(v)); }
-constexpr gigabytes operator""_GB(unsigned long long v)  { return gigabytes(static_cast<std::int64_t>(v)); }
-constexpr terabytes operator""_TB(unsigned long long v)  { return terabytes(static_cast<std::int64_t>(v)); }
-constexpr kibibytes operator""_KiB(unsigned long long v) { return kibibytes(static_cast<std::int64_t>(v)); }
-constexpr mebibytes operator""_MiB(unsigned long long v) { return mebibytes(static_cast<std::int64_t>(v)); }
-constexpr gibibytes operator""_GiB(unsigned long long v) { return gibibytes(static_cast<std::int64_t>(v)); }
-constexpr tebibytes operator""_TiB(unsigned long long v) { return tebibytes(static_cast<std::int64_t>(v)); }
+consteval bytes     operator""_B(unsigned long long v)   { return bytes(config::detail::size_literal_count(v)); }
+consteval kilobytes operator""_KB(unsigned long long v)  { return kilobytes(config::detail::size_literal_count(v)); }
+consteval megabytes operator""_MB(unsigned long long v)  { return megabytes(config::detail::size_literal_count(v)); }
+consteval gigabytes operator""_GB(unsigned long long v)  { return gigabytes(config::detail::size_literal_count(v)); }
+consteval terabytes operator""_TB(unsigned long long v)  { return terabytes(config::detail::size_literal_count(v)); }
+consteval kibibytes operator""_KiB(unsigned long long v) { return kibibytes(config::detail::size_literal_count(v)); }
+consteval mebibytes operator""_MiB(unsigned long long v) { return mebibytes(config::detail::size_literal_count(v)); }
+consteval gibibytes operator""_GiB(unsigned long long v) { return gibibytes(config::detail::size_literal_count(v)); }
+consteval tebibytes operator""_TiB(unsigned long long v) { return tebibytes(config::detail::size_literal_count(v)); }
 // clang-format on
 }  // namespace size_literals
 
 /// "1.5 GiB", "512M", "1048576" (bare: ticks of the target unit). Exact: a value that is not a
 /// whole number of ticks is rejected, as is a negative one.
 template <class Rep, class Period>
+  requires std::integral<Rep> && (!std::same_as<Rep, bool>)
 struct parser<basic_size<Rep, Period>> {
   parse_status operator()(std::string_view text, basic_size<Rep, Period>& out) const
   {
@@ -160,10 +185,15 @@ struct parser<basic_size<Rep, Period>> {
 };
 
 /// The largest unit that represents the value exactly: 1610612736 B -> "1536 MiB".
+/// @throws std::logic_error for a negative size, which no configuration can spell.
 template <class Rep, class Period>
+  requires std::integral<Rep> && (!std::same_as<Rep, bool>)
 struct formatter<basic_size<Rep, Period>> {
   std::string operator()(const basic_size<Rep, Period>& value) const
   {
+    if constexpr (std::is_signed_v<Rep>) {
+      if (value.count() < 0) { throw std::logic_error("formatter: negative size"); }
+    }
     return quantity::format<Rep, Period>(value.count(), quantity::size_kind);
   }
 };
