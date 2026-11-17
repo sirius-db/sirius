@@ -27,6 +27,11 @@
 
 #include <cudf/search.hpp>
 
+#include <algorithm>
+#include <format>
+#include <numeric>
+#include <sstream>
+
 namespace sirius {
 namespace op {
 
@@ -177,21 +182,107 @@ void sirius_physical_sort_partition::sink(const operator_data& output, ::cuda::s
   // their indices; merge-sort skips them after the FULL barrier.
   std::call_once(_initialize_partitions, [&] {
     auto count = _sample_op ? _sample_op->get_num_partitions() : std::size_t{1};
+    {
+      std::lock_guard lock(_range_sizes_mutex);
+      _range_sizes.resize(count);
+    }
     for (auto const& next : next_port_after_sink) {
       auto* repo = next.next_operator->get_port(next.next_operator_port_name)->repo;
       if (count > repo->num_partitions()) { repo->set_num_partitions(count); }
     }
   });
   for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto const rows =
+      static_cast<std::size_t>(get_cudf_table_view(batches[i]->to_read_only()).num_rows());
+    auto const bytes = batches[i]->to_read_only().get_data()->get_size_in_bytes();
     for (auto const& next : next_port_after_sink) {
       next.next_operator->push_data_batch_partitioned(
         next.next_operator_port_name, batches[i], slices.partitions[i]);
+    }
+    {
+      std::lock_guard lock(_range_sizes_mutex);
+      if (slices.partitions[i] >= _range_sizes.size()) {
+        _range_sizes.resize(slices.partitions[i] + 1);
+      }
+      auto& size = _range_sizes[slices.partitions[i]];
+      size.rows += rows;
+      size.bytes += bytes;
+      ++size.slices;
     }
   }
 }
 
 void sirius_physical_sort_partition::on_finalize_operator()
 {
+  sirius::log::log_noexcept([&] {
+    auto sizes        = get_range_sizes();
+    auto const sample = _sample_op ? _sample_op->get_range_sample_stats()
+                                   : sirius_physical_sort_sample::range_sample_stats{};
+    sizes.resize(std::max(sizes.size(), sample.num_ranges));
+    std::vector<std::size_t> rows, bytes;
+    rows.reserve(sizes.size());
+    bytes.reserve(sizes.size());
+    std::size_t empty = 0, rows_total = 0, bytes_total = 0;
+    std::ostringstream detail;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      auto const& size = sizes[i];
+      rows.push_back(size.rows);
+      bytes.push_back(size.bytes);
+      rows_total += size.rows;
+      bytes_total += size.bytes;
+      empty += size.rows == 0;
+      if (i != 0) { detail << ','; }
+      detail << i << ":rows=" << size.rows << ":bytes=" << size.bytes;
+    }
+    std::sort(rows.begin(), rows.end());
+    std::sort(bytes.begin(), bytes.end());
+    auto const median = [](std::vector<std::size_t> const& values) {
+      if (values.empty()) { return 0.0; }
+      if (values.size() % 2 != 0) { return static_cast<double>(values[values.size() / 2]); }
+      return static_cast<double>(values[values.size() / 2 - 1]) / 2.0 +
+             static_cast<double>(values[values.size() / 2]) / 2.0;
+    };
+    auto const rows_min        = rows.empty() ? 0 : rows.front();
+    auto const bytes_min       = bytes.empty() ? 0 : bytes.front();
+    auto const rows_max        = rows.empty() ? 0 : rows.back();
+    auto const bytes_max       = bytes.empty() ? 0 : bytes.back();
+    auto const max_over_target = sample.target_range_bytes == 0
+                                   ? 0.0
+                                   : static_cast<double>(bytes_max) / sample.target_range_bytes;
+    auto const largest_share =
+      bytes_total == 0 ? 0.0 : static_cast<double>(bytes_max) / bytes_total;
+    auto const summary = std::format(
+      "Sort ranges: ranges={} empty={} rows_total={} bytes_total={} input_batches={} "
+      "target_bytes={} "
+      "est_total_bytes={} complete_input={} sample_batches={} sample_rows={} "
+      "repeated_boundaries={} rows_min={} rows_median={} rows_max={} bytes_min={} "
+      "bytes_median={} bytes_max={} max_over_target={:.3f} largest_share={:.3f}",
+      sizes.size(),
+      empty,
+      rows_total,
+      bytes_total,
+      _sample_op ? _sample_op->get_input_batch_count() : 0,
+      sample.target_range_bytes,
+      sample.estimated_total_bytes,
+      sample.complete_input,
+      sample.sample_batches,
+      sample.sample_rows,
+      sample.repeated_boundaries,
+      rows_min,
+      median(rows),
+      rows_max,
+      bytes_min,
+      median(bytes),
+      bytes_max,
+      max_over_target,
+      largest_share);
+    if (sizes.size() > 1) {
+      SIRIUS_LOG_INFO("{}", summary);
+    } else {
+      SIRIUS_LOG_DEBUG("{}", summary);
+    }
+    SIRIUS_LOG_DEBUG("Sort range sizes: {}", detail.str());
+  });
   if (_sample_op) { _sample_op->clear_partition_boundaries(); }
 }
 

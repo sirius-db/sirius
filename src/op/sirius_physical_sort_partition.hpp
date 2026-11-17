@@ -47,6 +47,18 @@ class sirius_physical_sort_sample;
 
 class sirius_physical_sort_partition : public sirius_physical_operator {
  public:
+  struct range_size {
+    std::size_t rows   = 0;
+    std::size_t bytes  = 0;
+    std::size_t slices = 0;
+  };
+
+  [[nodiscard]] std::vector<range_size> get_range_sizes() const
+  {
+    std::lock_guard lock(_range_sizes_mutex);
+    return _range_sizes;
+  }
+
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
   {
     return sirius::OrderPreservationType::NO_ORDER;
@@ -91,6 +103,8 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
  private:
   sirius_physical_sort_sample* _sample_op = nullptr;
   std::once_flag _initialize_partitions;
+  mutable std::mutex _range_sizes_mutex;
+  std::vector<range_size> _range_sizes;
 };
 
 }  // namespace op

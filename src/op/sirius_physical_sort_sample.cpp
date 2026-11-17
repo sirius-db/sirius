@@ -27,6 +27,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/reduction/unique_count.hpp>
 
 #include <algorithm>
 
@@ -34,6 +35,13 @@ namespace sirius {
 namespace op {
 
 namespace {
+
+std::size_t count_repeated_boundaries(cudf::table const* boundaries, ::cuda::stream_ref stream)
+{
+  if (!boundaries || boundaries->num_rows() == 0) { return 0; }
+  auto const view = boundaries->view();
+  return view.num_rows() - cudf::unique_count(view, cudf::null_equality::EQUAL, stream);
+}
 
 uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
 {
@@ -182,7 +190,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   const auto state = _boundary_state.load(std::memory_order_acquire);
 
   // After boundaries are computed, process one batch at a time (passthrough mode).
-  if (state == BoundaryState::DONE) { return sirius_physical_operator::get_next_task_input_data(); }
+  if (state == BoundaryState::DONE) {
+    auto input = sirius_physical_operator::get_next_task_input_data();
+    if (input) {
+      auto const& batches =
+        dynamic_cast<pipelineable_operator_data const&>(*input).get_data_batches();
+      _input_batches.fetch_add(batches.size(), std::memory_order_relaxed);
+    }
+    return input;
+  }
 
   // Boundary input already claimed by the in-flight boundary task.
   if (state == BoundaryState::SCHEDULED) { return nullptr; }
@@ -200,6 +216,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
   while (true) {
     auto batch = p->repo->pop_next_data_batch();
     if (!batch) { break; }
+    _input_batches.fetch_add(1, std::memory_order_relaxed);
     accumulated_bytes += get_batch_bytes(batch);
     input_batch.push_back(std::move(batch));
     if (accumulated_bytes >= _sort_sample_bytes) { break; }
@@ -247,8 +264,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       _cross_rank_boundaries
         ? _cross_rank_boundaries->make({{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream)
         : sort_boundaries{};
-    _num_partitions       = made.num_partitions;
-    _partition_boundaries = std::move(made.table);
+    _num_partitions                = made.num_partitions;
+    _partition_boundaries          = std::move(made.table);
+    auto const repeated_boundaries = count_repeated_boundaries(_partition_boundaries.get(), stream);
+    _range_stats = {.num_ranges = _num_partitions, .repeated_boundaries = repeated_boundaries};
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -309,8 +328,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
     size_t total_rows      = static_cast<size_t>(merged_sample_view.num_rows());
     size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
-    size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
-    size_t num_parts          = 1;
+    size_t avg_rows_per_batch  = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
+    size_t num_parts           = 1;
+    size_t bytes_for_sizing    = total_sample_bytes;
+    size_t max_partition_bytes = 0;
     bool const can_size = complete_input || (estimated_cardinality > 0 && avg_rows_per_batch > 0);
     if (!can_size) {
       SIRIUS_LOG_WARN(
@@ -320,16 +341,15 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         avg_rows_per_batch);
     } else {
       size_t total_batch_count = valid_batches.size();
-      size_t bytes_for_sizing  = total_sample_bytes;
       if (!complete_input) {
         total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
         bytes_for_sizing  = avg_batch_bytes * total_batch_count;
       }
-      size_t available_memory    = space->get_available_memory(stream);
-      size_t max_partition_bytes = _max_partition_bytes_override > 0
-                                     ? _max_partition_bytes_override
-                                     : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           _max_partition_memory_fraction);
+      size_t available_memory = space->get_available_memory(stream);
+      max_partition_bytes     = _max_partition_bytes_override > 0
+                                  ? _max_partition_bytes_override
+                                  : static_cast<size_t>(static_cast<double>(available_memory) *
+                                                    _max_partition_memory_fraction);
 
       if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
         num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
@@ -365,8 +385,17 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
             {sort_keys_view, total_sample_bytes, _sort_sample_bytes, num_parts, batch_telemetry()},
             stream)
         : local_boundaries(sort_keys_view, num_parts, space, stream);
-    _num_partitions       = made.num_partitions;
-    _partition_boundaries = std::move(made.table);
+    _num_partitions                = made.num_partitions;
+    _partition_boundaries          = std::move(made.table);
+    auto const repeated_boundaries = count_repeated_boundaries(_partition_boundaries.get(), stream);
+    _range_stats                   = {.complete_input        = complete_input,
+                                      .sample_batches        = valid_batches.size(),
+                                      .sample_rows           = total_rows,
+                                      .sample_bytes          = total_sample_bytes,
+                                      .estimated_total_bytes = bytes_for_sizing,
+                                      .target_range_bytes    = max_partition_bytes,
+                                      .num_ranges            = _num_partitions,
+                                      .repeated_boundaries   = repeated_boundaries};
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
     // execute() returns, so _partition_boundaries is visible before partition runs.
