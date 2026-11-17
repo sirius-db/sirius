@@ -444,9 +444,14 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   // The result is gathered to rank 0 in rank order.
   REQUIRE(plans[0]->type == T::EXCHANGE_SOURCE);
   CHECK(plans[0]->Cast<sirius::op::sirius_physical_exchange_source>().ordered());
-  CHECK(
-    plans[0]->children.at(0)->Cast<sirius::op::sirius_physical_exchange_sink>().spec().routing ==
-    exchange_spec::mode::gather);
+  for (auto const& plan : plans) {
+    // Every rank's sink numbers its batches by MERGE_SORT's positions.
+    auto const& gather =
+      plan->children.at(0)->Cast<sirius::op::sirius_physical_exchange_sink>().spec();
+    CHECK(gather.routing == exchange_spec::mode::gather);
+    CHECK(gather.ordered);
+    CHECK(plan->children.at(0)->children.at(0)->type == T::MERGE_SORT);
+  }
   auto* partition = find(*plans[0], T::SORT_PARTITION);
   REQUIRE(partition);
   REQUIRE(sink_below(*partition));

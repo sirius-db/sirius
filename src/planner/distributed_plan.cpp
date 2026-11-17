@@ -164,6 +164,8 @@ struct rewriter {
         senders.insert(r);
       }
     }
+    // An ordered source releases each sender's batches by the numbers its sink gives them.
+    spec.ordered = ordered;
     shape += "X" + std::to_string(static_cast<int>(spec.routing)) + "/";
     for (auto const key : spec.key_columns) {
       shape += std::to_string(key) + ",";

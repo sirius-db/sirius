@@ -41,8 +41,10 @@ namespace sirius::op {
  * producers while the source waits, and keeps this pipeline open until they finish.
  *
  * Unordered, each batch becomes a task as it arrives. Ordered, nothing is released until every
- * sender has ended; then everything goes out as one task, by sender rank and within a sender in
- * send order, which is what a gather after a range-partitioned sort needs.
+ * sender has ended; then everything goes out as one task, by sender rank and within a sender by
+ * batch number, which is what a gather after a range-partitioned sort needs: rank i holds the
+ * i-th range, and its sink numbers its batches by MERGE_SORT's positions (exchange_spec::ordered),
+ * or in send order when they carry none.
  *
  * The stream ends once every expected sender has ended. A failed exchange surfaces as the
  * exception of the next task this source hands out.
@@ -53,7 +55,7 @@ class sirius_physical_exchange_source : public sirius_physical_operator {
 
   /// @param senders The ranks that send on @p stream: every rank, or none on a rank a gather
   ///        does not target.
-  /// @param ordered Release by (rank, batch) once every sender has ended.
+  /// @param ordered Release by (rank, batch number) once every sender has ended.
   sirius_physical_exchange_source(duckdb::vector<sirius::logical_type> types,
                                   std::size_t estimated_cardinality,
                                   std::shared_ptr<exchange::exchange_service> service,

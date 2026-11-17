@@ -23,6 +23,7 @@
 #include "exchange/loopback_fabric.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/merge/merge_chunk_position.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_exchange_sink.hpp"
 #include "op/sirius_physical_exchange_source.hpp"
@@ -50,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -133,9 +135,13 @@ std::vector<std::int64_t> keys_of(cucascade::data_batch& batch)
   return utils::copy_column_to_host<std::int64_t>(sirius::get_cudf_table_view(ro).column(0));
 }
 
-void sink_batch(sirius_physical_exchange_sink& sink, std::shared_ptr<cucascade::data_batch> batch)
+/// Sinks @p batch as one task's output, at @p position when given.
+void sink_batch(sirius_physical_exchange_sink& sink,
+                std::shared_ptr<cucascade::data_batch> batch,
+                std::optional<std::size_t> position = std::nullopt)
 {
-  pipelineable_operator_data data{std::vector<std::shared_ptr<cucascade::data_batch>>{batch}};
+  pipelineable_operator_data data{std::vector<std::shared_ptr<cucascade::data_batch>>{batch},
+                                  position};
   auto const routed = sink.execute(data, utils::default_stream());
   sink.sink(*routed, utils::default_stream());
 }
@@ -358,6 +364,149 @@ TEST_CASE("an ordered gather hands rank 0 everything at once, by rank then batch
   // The other ranks expect no sender: their streams are over from the start.
   CHECK(drain(*sources[1]).empty());
   CHECK(drain(*sources[2]).empty());
+}
+
+TEST_CASE("an ordered gather releases each rank's batches by position, not by send order",
+          "[exchange][operators]")
+{
+  // MERGE_SORT's tasks finish in any order: partitions merge concurrently, and a windowed
+  // partition's next chunk can be sent before the one before it. Each rank holds `partitions`
+  // partitions of `chunks` chunks, with keys rising in (partition, chunk), and sinks them in an
+  // order that is neither.
+  auto const world = GENERATE(rank_t{2}, rank_t{4});
+  ranks c(world);
+  int const partitions = 3;
+  int const chunks     = 4;
+  exchange_spec spec;
+  spec.routing           = mode::gather;
+  spec.target            = 0;
+  spec.ordered           = true;
+  stream_id const stream = sirius::exchange::make_stream_id(20, 1);
+  std::set<rank_t> senders;
+  for (rank_t r = 0; r < world; ++r) {
+    senders.insert(r);
+  }
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, stream, senders, /*ordered=*/true);
+  std::vector<std::unique_ptr<sirius_physical_exchange_sink>> sinks;
+  for (rank_t r = 0; r < world; ++r) {
+    sinks.push_back(std::make_unique<sirius_physical_exchange_sink>(
+      key_value_types(), 0, c.all[r].service, stream, spec));
+  }
+  // Ranks take turns, highest first, each walking its batches in a stride that visits every one:
+  // neither ranks nor positions arrive in order.
+  int const per_rank = partitions * chunks;
+  for (int step = 0; step < per_rank; ++step) {
+    for (rank_t r = world; r-- > 0;) {
+      int const i = (step * 5 + 7 + static_cast<int>(r)) % per_rank;
+      sink_batch(*sinks[r],
+                 key_value_batch(r, i),
+                 sirius::op::merge::make_merge_chunk_position(i / chunks, i % chunks));
+    }
+  }
+  for (auto& sink : sinks) {
+    sink->finalize_operator();
+  }
+  auto tasks = drain(source);
+  REQUIRE(tasks.size() == 1);
+  CHECK(tasks[0] == all_keys(world, per_rank));
+}
+
+TEST_CASE("an ordered gather orders one-shot positions, which number partitions alone",
+          "[exchange][operators]")
+{
+  ranks c(2);
+  exchange_spec spec;
+  spec.routing           = mode::gather;
+  spec.target            = 0;
+  spec.ordered           = true;
+  stream_id const stream = sirius::exchange::make_stream_id(21, 1);
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, stream, std::set<rank_t>{0, 1}, true);
+  for (rank_t r = 2; r-- > 0;) {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, stream, spec);
+    for (int const i : {2, 0, 3, 1}) {
+      sink_batch(sink, key_value_batch(r, i), static_cast<std::size_t>(i));
+    }
+    sink.finalize_operator();
+  }
+  auto tasks = drain(source);
+  REQUIRE(tasks.size() == 1);
+  CHECK(tasks[0] == all_keys(2, 4));
+}
+
+TEST_CASE("an ordered gather refuses positions it cannot order by", "[exchange][operators]")
+{
+  ranks c(2);
+  exchange_spec spec;
+  spec.routing = mode::gather;
+  spec.target  = 0;
+  spec.ordered = true;
+
+  SECTION("two batches at one position")
+  {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[1].service, 22, spec);
+    pipelineable_operator_data data{std::vector<std::shared_ptr<cucascade::data_batch>>{
+                                      key_value_batch(1, 0), key_value_batch(1, 1)},
+                                    std::size_t{0}};
+    CHECK_THROWS_WITH(sink.execute(data, utils::default_stream()),
+                      Catch::Matchers::ContainsSubstring("2 batches at position 0"));
+  }
+  SECTION("batches with and without a position")
+  {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[1].service, 23, spec);
+    sink_batch(sink, key_value_batch(1, 0), std::size_t{0});
+    CHECK_THROWS_WITH(sink_batch(sink, key_value_batch(1, 1)),
+                      Catch::Matchers::ContainsSubstring("with and without a position"));
+    sink.finalize_operator();
+  }
+  SECTION("one position twice fails the source's next task")
+  {
+    // Rank 0 to itself: handed over on the sending thread, so the failure is there at once.
+    sirius_physical_exchange_source source(
+      key_value_types(), 0, c.all[0].service, 24, std::set<rank_t>{0}, true);
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[0].service, 24, spec);
+    sink_batch(sink, key_value_batch(0, 0), std::size_t{5});
+    sink_batch(sink, key_value_batch(0, 1), std::size_t{5});
+    sink.finalize_operator();
+    CHECK_THROWS_WITH(source.get_next_task_input_data(),
+                      Catch::Matchers::ContainsSubstring("two batches numbered 5"));
+  }
+}
+
+TEST_CASE("an ordered gather of batches without positions keeps each rank's send order",
+          "[exchange][operators]")
+{
+  ranks c(3);
+  exchange_spec spec;
+  spec.routing = mode::gather;
+  spec.target  = 0;
+  spec.ordered = true;
+  auto sources = exchange_all(c, 25, spec, 3, /*ordered=*/true, false);
+  auto tasks   = drain(*sources[0]);
+  REQUIRE(tasks.size() == 1);
+  CHECK(tasks[0] == all_keys(3, 3));
+}
+
+TEST_CASE("an unordered gather sends positioned batches like any other", "[exchange][operators]")
+{
+  // Positions matter to an ordered gather alone: elsewhere two batches may share one.
+  ranks c(2);
+  exchange_spec spec;
+  spec.routing = mode::gather;
+  spec.target  = 0;
+  sirius_physical_exchange_source source(
+    key_value_types(), 0, c.all[0].service, 26, std::set<rank_t>{0, 1}, false);
+  for (rank_t r = 0; r < 2; ++r) {
+    sirius_physical_exchange_sink sink(key_value_types(), 0, c.all[r].service, 26, spec);
+    for (int i = 0; i < 3; ++i) {
+      sink_batch(sink, key_value_batch(r, i), std::size_t{0});
+    }
+    sink.finalize_operator();
+  }
+  auto got = flat(drain(source));
+  std::sort(got.begin(), got.end());
+  CHECK(got == all_keys(2, 3));
 }
 
 TEST_CASE("an unordered gather delivers every row to its target", "[exchange][operators]")
@@ -1027,6 +1176,8 @@ TEST_CASE("an exchange sink rejects a spec that does not fit", "[exchange][opera
           .null_precedence         = {cudf::null_order::BEFORE}});
   reject({.routing = mode::broadcast, .null_keys_to_every_rank = true});
   reject({.routing = mode::gather, .target = 2});
+  reject({.routing = mode::broadcast, .ordered = true});
+  reject({.routing = mode::hash, .key_columns = {0}, .ordered = true});
 
   exchange_spec range{.routing         = mode::range,
                       .key_columns     = {0},

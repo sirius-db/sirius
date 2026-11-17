@@ -440,8 +440,10 @@ class pipelineable_operator_data : public operator_data {
 class routed_operator_data : public pipelineable_operator_data {
  public:
   routed_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-                       std::vector<std::size_t> destinations)
-    : pipelineable_operator_data(std::move(batches)), _destinations(std::move(destinations))
+                       std::vector<std::size_t> destinations,
+                       std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(batches), position),
+      _destinations(std::move(destinations))
   {
     if (get_data_batches().size() != _destinations.size()) {
       throw std::invalid_argument("routed_operator_data: destination/batch count mismatch");

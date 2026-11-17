@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -102,7 +103,8 @@ class transport {
   /// Called from the engine thread and from send()/close() callers at the same time, so they must
   /// be thread-safe, and must not call send() or close(): the engine thread would wait on itself.
   struct callbacks {
-    /// @p batch numbers the batches of one stream from one sender, from 0, in send() order.
+    /// @p batch is the batch's number among those of one stream from one sender: from 0 in send()
+    /// order, or the number its send() gave.
     std::function<void(
       stream_id, rank_t from, std::uint64_t batch, std::shared_ptr<cucascade::data_batch>)>
       on_batch;
@@ -164,8 +166,14 @@ class transport {
 
   /// Sends @p batch, on the GPU, to rank @p to on @p stream. Batches of one stream to one rank
   /// may be delivered in any order. A batch with no rows is dropped for a peer and not counted.
+  /// @param number What on_batch() reports as the batch's number, for a sender whose batches have
+  ///        an order other than its send() order; none: its place in send() order. A stream's
+  ///        sends to one rank give a number either all or never, and never the same one twice.
   /// @throws the transport's error once it has failed.
-  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
+  void send(stream_id stream,
+            rank_t to,
+            std::shared_ptr<cucascade::data_batch> batch,
+            std::optional<std::uint64_t> number = std::nullopt);
 
   /// No more batches of @p stream to rank @p to. Call once per stream and rank, after its last
   /// send(): a second close, or a send after it, fails the transport on the peer. The stream's

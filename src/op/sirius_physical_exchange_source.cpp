@@ -125,8 +125,10 @@ struct sirius_physical_exchange_source::receiver : exchange::inbound {
         s->error = std::make_exception_ptr(
           sirius::internal_exception("exchange source: an unexpected batch from rank {}", from));
       } else if (s->ordered) {
-        s->held.emplace(std::make_pair(from, batch), std::move(data));
-        return;  // released once every sender has ended
+        // Released once every sender has ended. A number seen twice would drop a batch.
+        if (s->held.emplace(std::make_pair(from, batch), std::move(data)).second) { return; }
+        s->error = std::make_exception_ptr(sirius::internal_exception(
+          "exchange source: rank {} sent two batches numbered {}", from, batch));
       } else if (s->repo != nullptr) {
         auto const lease = s->lifecycle->try_acquire_work(s->query_id);
         if (!lease) { return; }  // the query is ending, and nothing will take this batch

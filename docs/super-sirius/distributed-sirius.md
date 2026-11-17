@@ -138,7 +138,7 @@ the launchers in `scripts/` remove mirrors whose process is gone before they sta
 | `hash` | by a hash of the key columns | PARTITION's key casts; its own seed, so PARTITION's split of each rank's share stays even. With `null_keys_to_every_rank`, a row with a NULL in a key column goes to every rank |
 | `range` | by the key columns against world − 1 boundaries | Input batches sorted on the keys; each rank's rows are one sorted run, cut at `lower_bound` as `SORT_PARTITION` cuts |
 | `broadcast` | every row to every rank | |
-| `gather` | every row to one rank | |
+| `gather` | every row to one rank | With `ordered`, each batch travels under the position of the task output it came from |
 
 Finalizing the sink ends the stream to every rank that may receive it. A batch with no rows is
 neither routed nor sent, so a range exchange needs no boundaries when no rank has rows.
@@ -150,7 +150,8 @@ neither routed nor sent, so a range exchange needs no boundaries when no rank ha
   rank's own scans.
 - **Unordered,** each batch is a task on arrival.
 - **Ordered,** nothing is released until every sender has ended. Then everything goes out as one
-  task, by rank and then send order.
+  task, by rank and then batch number. Rank i holds the i-th range of the sort order, so this is
+  the global order once each rank's batches are numbered in that rank's order (below).
 - **Under `MERGE_AGGREGATE` or `MERGE_TOP_N`** the source ends its own pipeline, as a partial
   aggregate would, so the merge runs once over every rank's partials.
 - **A stream that brings nothing** still hands on one empty batch, shaped like the stream's
@@ -161,6 +162,25 @@ neither routed nor sent, so a range exchange needs no boundaries when no rank ha
 
 `exchange_service` is one process's end of every exchange. It holds what arrives for a stream
 before the stream's source is planned, and replays it when the source attaches.
+
+**Order through the final gather.** A rank's `MERGE_SORT` tasks finish in any order: partitions
+are merged concurrently, and a windowed partition schedules its next chunk before the current
+task hands its chunk on. The order is in each output's position, `(partition << 32) | chunk`
+(see [MERGE_SORT](operators.md#sirius_physical_merge_sort--merge_sort)), which the single-process
+sink sorts by. The ordered gather keeps it the same way:
+
+- `distribute_plan()` marks the sink of an ordered gather (`exchange_spec::ordered`).
+- That sink sends each batch with its task output's position as the batch number
+  (`transport::send(..., number)`), in place of the transport's count of sends. The number rides
+  in the frame notifications that already name the batch, so the wire format is unchanged, and
+  the end of stream still carries how many batches were sent.
+- The source keeps what it holds keyed by (rank, number), so sorting happens where the batches
+  already wait for every sender to end. Nothing is buffered on the sending rank, and a rank may
+  keep any number of partitions and chunks.
+
+A position names one batch: two batches at one position, a position sent twice, or a stream that
+mixes batches with and without positions fails the query rather than guess an order. Output
+without positions (no `MERGE_SORT` below the gather) is numbered in send order, as before.
 
 ### Collectives (`src/exchange/all_gather.*`)
 
@@ -204,7 +224,7 @@ single-process plan already partitions:
 | `MERGE_AGGREGATE → UNGROUPED_AGGREGATE` | `gather` to rank 0, between them |
 | `MERGE_TOP_N → TOP_N` | `gather` to rank 0, between them; a row outside its rank's top N is outside the overall top N |
 | `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY` | `range` between `SORT_PARTITION` and a distributed `SORT_SAMPLE` |
-| the result | `gather` to rank 0, ordered after a distributed sort |
+| the result | `gather` to rank 0; after a distributed sort, ordered by rank and by `MERGE_SORT`'s positions within a rank |
 
 `GPU_SCAN`, `FILTER`, `PROJECTION` and `DYNAMIC_FILTER` keep their input's placement. A `CTE`
 places nothing itself: each rank materializes its share, and the `CTE_SCAN`s under the consumer side
@@ -399,8 +419,8 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | Tag | Covers |
 |---|---|
 | `[exchange][wire]`, `[exchange][batch_io]` | Headers and refusals; batches through 64 KiB to 1 MiB frames to the GPU and host |
-| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; no room; failed writes |
-| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
+| `[exchange][transport]` | All-to-all on 3 and 4 ranks over the loopback fabric; one credit per peer; shuffled notifications; batch numbers given by the sender; no room; failed writes |
+| `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather (by position when tasks finish out of order), early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
 | `[exchange][planner]` | The plan rewrite: where exchanges go, refusals, the plan-shape check, a rank whose planning fails |

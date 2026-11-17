@@ -826,7 +826,9 @@ one `run_state` per run, the next output chunk index and an `in_flight` flag.
 - **Positions.** The output position is `(partition << 32) | chunk`
   (`merge::make_merge_chunk_position()`), which orders chunks by partition, then by chunk. It
   throws when either part reaches 2^32. In `auto` and `windowed` mode one-shot partitions use the
-  same encoding with chunk 0. In `one_shot` mode the position is the partition index.
+  same encoding with chunk 0. In `one_shot` mode the position is the partition index. In a
+  distributed plan the position travels with the batch through the gather to rank 0
+  (see "Order through the final gather" in [distributed-sirius.md](distributed-sirius.md)).
 - **Commit → pop → `schedule(this)`.** After the merge returns, the task calls
   `windowed_merger::rebase_consumed()`, which drops the merger's references to the batches read to
   the end and rebases its cursors to the remaining ones. It then commits under `_drain_mutex`: it
