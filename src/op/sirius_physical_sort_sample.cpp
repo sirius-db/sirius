@@ -19,7 +19,10 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/sort_range_count.hpp"
+#include "pipeline/data_size_estimator.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
@@ -30,6 +33,8 @@
 #include <cudf/reduction/unique_count.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace sirius {
@@ -317,62 +322,91 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       total_rows += static_cast<std::size_t>(get_cudf_table_view(batch).num_rows());
     }
 
-    // 4. Compute number of partitions
-    bool complete_input = false;
-    auto port_ids       = get_port_ids();
+    // 4. Size ranges from a finished input, runtime projection, or planner fallback.
+    auto const rows_for_bytes = [&](std::size_t bytes) {
+      if (total_sample_bytes == 0 || total_rows == 0) { return std::size_t{0}; }
+      auto const projected =
+        std::ceil(static_cast<long double>(bytes) * total_rows / total_sample_bytes);
+      auto const limit = static_cast<long double>(std::numeric_limits<std::size_t>::max());
+      return projected >= limit ? std::numeric_limits<std::size_t>::max()
+                                : static_cast<std::size_t>(projected);
+    };
+    bool complete_input           = false;
+    bool upstream_finished        = false;
+    std::size_t waiting_bytes     = 0;
+    std::size_t waiting_rows      = 0;
+    std::size_t unknown_row_bytes = 0;
+    auto port_ids                 = get_port_ids();
     if (!port_ids.empty()) {
       auto* port = get_port(port_ids[0]);
-      // Check completion before repository emptiness: once completion is visible,
-      // the upstream pipeline cannot publish another batch.
-      complete_input = port && port->src_pipeline && port->src_pipeline->is_pipeline_finished() &&
-                       port->repo && port->repo->all_empty();
+      if (port && port->repo) {
+        // Once upstream completion is visible, it publishes no more batches to this repository.
+        upstream_finished = port->src_pipeline && port->src_pipeline->is_pipeline_finished();
+        complete_input    = upstream_finished && port->repo->all_empty();
+        for (std::size_t part = 0; part < port->repo->num_partitions(); ++part) {
+          for (auto batch_id : port->repo->get_batch_ids(part)) {
+            auto batch = port->repo->get_data_batch_by_id(batch_id, part);
+            if (!batch) { continue; }
+            auto const size = get_batch_rows_and_bytes(*batch);
+            waiting_bytes   = memory::saturating_add(waiting_bytes, size.bytes);
+            if (size.rows) {
+              waiting_rows = memory::saturating_add(waiting_rows, *size.rows);
+            } else {
+              unknown_row_bytes = memory::saturating_add(unknown_row_bytes, size.bytes);
+            }
+          }
+        }
+      }
     }
-
-    size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
-    size_t avg_rows_per_batch  = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
-    size_t num_parts           = 1;
-    size_t bytes_for_sizing    = total_sample_bytes;
-    size_t max_partition_bytes = 0;
-    bool const can_size = complete_input || (estimated_cardinality > 0 && avg_rows_per_batch > 0);
-    if (!can_size) {
-      SIRIUS_LOG_WARN(
-        "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
-        "defaulting to 1 partition",
-        estimated_cardinality,
-        avg_rows_per_batch);
+    auto const observed_bytes    = memory::saturating_add(total_sample_bytes, waiting_bytes);
+    std::size_t bytes_for_sizing = observed_bytes;
+    std::size_t rows_for_sizing  = total_rows;
+    std::string_view est_source  = "observed";
+    if (upstream_finished) {
+      est_source      = "measured";
+      rows_for_sizing = memory::saturating_add(rows_for_sizing, waiting_rows);
+      rows_for_sizing = memory::saturating_add(rows_for_sizing, rows_for_bytes(unknown_row_bytes));
     } else {
-      size_t total_batch_count = valid_batches.size();
-      if (!complete_input) {
-        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
+      auto projected = port_ids.empty()
+                         ? std::optional<pipeline::data_size_estimate>{}
+                         : pipeline::estimate_port_total_input_bytes(*this, port_ids[0]);
+      if (projected) {
+        est_source       = "projected";
+        bytes_for_sizing = std::max(projected->bytes, observed_bytes);
+      } else if (total_rows > 0 && estimated_cardinality > 0) {
+        est_source        = "planner";
+        auto const scaled = std::ceil(static_cast<long double>(total_sample_bytes) *
+                                      estimated_cardinality / total_rows);
+        auto const limit  = static_cast<long double>(std::numeric_limits<std::size_t>::max());
+        bytes_for_sizing  = std::max(scaled >= limit ? std::numeric_limits<std::size_t>::max()
+                                                    : static_cast<std::size_t>(scaled),
+                                    observed_bytes);
       }
-      size_t available_memory = space->get_available_memory(stream);
-      max_partition_bytes     = _max_partition_bytes_override > 0
-                                  ? _max_partition_bytes_override
-                                  : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                    _max_partition_memory_fraction);
-
-      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
-        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
-      }
-      num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
-
-      SIRIUS_LOG_DEBUG(
-        "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
-        "avg_rows_per_batch={}, "
-        "avg_batch_bytes={}, total_batch_count={}, "
-        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
-        complete_input,
-        estimated_cardinality,
-        total_rows,
-        avg_rows_per_batch,
-        avg_batch_bytes,
-        total_batch_count,
-        bytes_for_sizing,
-        available_memory,
-        max_partition_bytes,
-        num_parts);
+      rows_for_sizing = std::max(total_rows, rows_for_bytes(bytes_for_sizing));
     }
+
+    auto const available_memory = space->get_available_memory(stream);
+    auto const max_partition_bytes =
+      _max_partition_bytes_override > 0
+        ? _max_partition_bytes_override
+        : static_cast<std::size_t>(static_cast<double>(available_memory) *
+                                   _max_partition_memory_fraction);
+    auto const num_parts =
+      choose_sort_range_count(bytes_for_sizing, rows_for_sizing, max_partition_bytes, total_rows);
+    SIRIUS_LOG_DEBUG(
+      "Sort sample: est_source={}, complete_input={}, sample_rows={}, waiting_rows={}, "
+      "waiting_bytes={}, bytes_for_sizing={}, rows_for_sizing={}, available_memory={}, "
+      "max_partition_bytes={}, num_partitions={}",
+      est_source,
+      complete_input,
+      total_rows,
+      waiting_rows,
+      waiting_bytes,
+      bytes_for_sizing,
+      rows_for_sizing,
+      available_memory,
+      max_partition_bytes,
+      num_parts);
 
     // 5. Keep regularly spaced key rows from every sorted sample batch.
     auto const desired_key_rows =
@@ -447,6 +481,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                       .sample_stride         = sample_stride,
                                       .sample_bytes          = total_sample_bytes,
                                       .estimated_total_bytes = bytes_for_sizing,
+                                      .est_source            = est_source,
                                       .target_range_bytes    = max_partition_bytes,
                                       .num_ranges            = _num_partitions,
                                       .repeated_boundaries   = repeated_boundaries};

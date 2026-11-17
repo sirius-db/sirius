@@ -27,6 +27,7 @@
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
+#include <op/sort_range_count.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
 
@@ -420,7 +421,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
 }
 
-TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
+TEST_CASE("sirius_physical_sort_sample sizes partial input without duplicate boundaries",
           "[physical_sort_sample]")
 {
   auto* space = get_default_gpu_space();
@@ -469,8 +470,40 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   REQUIRE(repo->all_empty() == expect_repo_empty);
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
-  CHECK(sample_op.get_num_partitions() == rows_per_batch);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
+  auto const expected_ranges = upstream_finished ? 3 : rows_per_batch;
+  CHECK(sample_op.get_num_partitions() == expected_ranges);
+  CHECK(sample_op.get_partition_boundaries().num_rows() == expected_ranges - 1);
+}
+
+TEST_CASE("sirius_physical_sort_sample scales planner bytes by sampled rows",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t rows_per_batch = 30;
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+  auto sample_op = sirius_physical_sort_sample(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    /*estimated_cardinality=*/75,
+    /*sort_sample_bytes=*/rows_per_batch * sizeof(int32_t),
+    /*max_partition_bytes=*/100);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 1, rows_per_batch);
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(false);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == 3);
+  CHECK(sample_op.get_range_sample_stats().est_source == "planner");
 }
 
 TEST_CASE("sirius_physical_sort_sample records key-row stride", "[physical_sort_sample]")
@@ -488,4 +521,12 @@ TEST_CASE("sirius_physical_sort_sample records key-row stride", "[physical_sort_
   CHECK(stats.sample_rows == 60000);
   CHECK(stats.sample_stride == 15);
   CHECK(stats.sample_key_rows == 3999);
+}
+
+TEST_CASE("Sort range count respects bytes, rows, and sample size", "[physical_sort_sample]")
+{
+  CHECK(choose_sort_range_count(800, 100, 100, 100) == 8);
+  CHECK(choose_sort_range_count(10, 6000000000ULL, 100, 6000000000ULL) == 6);
+  CHECK(choose_sort_range_count(10, 6000000000ULL, 0, 6000000000ULL) == 6);
+  CHECK(choose_sort_range_count(1000, 100, 100, 3) == 3);
 }
