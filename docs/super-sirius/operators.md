@@ -640,6 +640,10 @@ Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to 
 
 Each range slice is published to its original repository partition, retaining indices even when
 intermediate ranges are empty. A FULL barrier separates SORT_PARTITION from MERGE_SORT.
+The operator counts rows, data bytes, and slices per range when `sink()` publishes each slice.
+At finalization, `Sort ranges:` logs the claimed input batch count, sample size, target
+and observed range sizes, while
+`Sort range sizes:` lists each range's row and byte counts at DEBUG level.
 
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
 **File:** `src/op/sirius_physical_merge_sort.hpp`

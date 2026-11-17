@@ -28,6 +28,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -38,6 +39,25 @@ namespace op {
 
 class sirius_physical_sort_sample : public sirius_physical_operator {
  public:
+  struct range_sample_stats {
+    bool complete_input               = false;
+    std::size_t sample_batches        = 0;
+    std::size_t sample_rows           = 0;
+    std::size_t sample_bytes          = 0;
+    std::size_t estimated_total_bytes = 0;
+    std::size_t target_range_bytes    = 0;
+    std::size_t num_ranges            = 1;
+    std::size_t repeated_boundaries   = 0;
+  };
+
+  [[nodiscard]] range_sample_stats const& get_range_sample_stats() const noexcept
+  {
+    return _range_stats;
+  }
+  [[nodiscard]] std::uint64_t get_input_batch_count() const noexcept
+  {
+    return _input_batches.load(std::memory_order_relaxed);
+  }
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
   {
     return sirius::OrderPreservationType::NO_ORDER;
@@ -165,6 +185,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;
+  range_sample_stats _range_stats;
+  std::atomic<std::uint64_t> _input_batches{0};
 
   //! Boundary computation lifecycle: NOT_DONE → SCHEDULED (input claimed) → DONE.
   //! get_next_task_input_data() transitions to SCHEDULED under the task-creation lock;

@@ -290,6 +290,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
+    test/cpp/operator/test_sort_range_layout.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_gpu_values.cpp
     test/cpp/operator/test_output_order.cpp
