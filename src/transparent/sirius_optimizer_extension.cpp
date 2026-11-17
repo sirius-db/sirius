@@ -21,6 +21,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/join_dimension_after_aggregate.hpp"
 #include "transparent/narrow_outer_join_counts.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/push_narrowing_expressions.hpp"
@@ -312,6 +313,13 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     if (operator_option_enabled(context,
                                 &sirius::operator_params::enable_narrowing_expression_pushdown)) {
       push_narrowing_expressions(*copy, input.optimizer.binder);
+    }
+    if (operator_option_enabled(context, &sirius::operator_params::enable_late_dimension_join)) {
+      // Lookup columns that fit in one GPU do not make a join spill. With the GPU memory
+      // unknown, nothing moves.
+      if (auto const budget = gpu_memory_budget(context); budget > 0) {
+        join_dimensions_after_aggregate(context, copy, input.optimizer.binder, budget);
+      }
     }
     conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {

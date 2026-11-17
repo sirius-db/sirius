@@ -3046,6 +3046,14 @@ static void SetEnableBuildSideSwap(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_BUILD_SIDE_SWAP to {}", params->enable_build_side_swap);
 }
 
+static void SetEnableLateDimensionJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_late_dimension_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_LATE_DIMENSION_JOIN to {}",
+                   params->enable_late_dimension_join);
+}
+
 static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                         = get_operator_params(context, scope);
@@ -3556,6 +3564,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_build_side_swap),
                     SetEnableBuildSideSwap);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_late_dimension_join",
+                    "runtime override for joining lookup tables after the aggregation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_late_dimension_join),
+                    SetEnableLateDimensionJoin);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_complete_group_having",

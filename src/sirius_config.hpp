@@ -340,6 +340,10 @@ struct operator_params {
   /// `swap_unfiltered_builds`.
   bool enable_build_side_swap = false;
 
+  /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
+  /// `join_dimensions_after_aggregate`.
+  bool enable_late_dimension_join = false;
+
   /// Distributed execution: apply a HAVING above a grouped aggregate's merge to the partial
   /// groups that the Parquet footers prove already whole (see op::complete_group_having).
   bool enable_complete_group_having = true;
