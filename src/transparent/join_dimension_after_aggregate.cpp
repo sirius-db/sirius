@@ -237,15 +237,17 @@ std::optional<late_join> match_lookup(aggregate_site const& site,
     if (reads_any(*expression, carriers)) { return std::nullopt; }
   }
 
-  // What the rows stop carrying: the lookup columns the join emits, less the foreign key when
-  // the join did not emit it already.
-  auto const outputs = join.GetColumnBindings();
+  // What the rows stop carrying: each lookup column the join emits, less the copy of the foreign
+  // key that takes its place.
+  auto const outputs    = join.GetColumnBindings();
+  std::uint64_t emitted = 0;
+  std::uint64_t copies  = 0;
   for (std::size_t i = 0; i < scanned.size(); ++i) {
-    if (contains(outputs, scanned[i])) { match.carried_width += width_of(scan.types[i]); }
+    if (!contains(outputs, scanned[i])) { continue; }
+    emitted += width_of(scan.types[i]);
+    copies += width_of(key_type);
   }
-  if (!contains(outputs, *foreign_key)) {
-    match.carried_width -= std::min(match.carried_width, width_of(key_type));
-  }
+  match.carried_width = emitted - std::min(emitted, copies);
   if (!at_least(site.rows, match.carried_width, site.min_carried_bytes)) {
     SIRIUS_LOG_INFO(
       "Kept a lookup join below its aggregate: {} rows carry {} bytes of its columns each, below "

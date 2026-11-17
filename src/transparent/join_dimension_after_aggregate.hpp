@@ -50,8 +50,8 @@ inline constexpr duckdb::idx_t max_late_join_rows = 1'000'000;
 /// The late join and the second aggregate are extra work, worth it only when the looked-up
 /// columns are large against GPU memory, which is what makes a join below the aggregate spill. A
 /// lookup join therefore moves only when the rows DuckDB estimates into the aggregate, times the
-/// bytes of lookup columns each stops carrying (less the foreign key it starts carrying), reach
-/// @p min_carried_bytes. At most one lookup join is moved per aggregate.
+/// bytes of lookup columns each stops carrying (less a copy of the foreign key for each, which
+/// takes its place), reach @p min_carried_bytes. At most one lookup join is moved per aggregate.
 ///
 /// @return The number of lookup joins moved above their aggregate.
 std::size_t join_dimensions_after_aggregate(duckdb::ClientContext& context,
