@@ -7,7 +7,6 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <filesystem>
 #include <fstream>
@@ -272,9 +271,8 @@ outcome resolved(Resolve&& resolve)
   }
 }
 
-/// Both paths resolve alike: the same description, or the same failure. The YAML path prefixes
-/// its messages with the file name and rewraps them as std::runtime_error; the typed path keeps
-/// configuration_input_error.
+/// Both resolve alike: the same description, or the same failure. Reading a file prefixes its
+/// messages with the file name.
 void require_same(const outcome& old_path, const outcome& new_path, std::string_view source)
 {
   INFO("old error: " << old_path.error);
@@ -315,8 +313,7 @@ struct counting_nic {
 
 }  // namespace
 
-TEST_CASE("create_sirius_config resolves every fixture as resolve() does",
-          "[config][config_create]")
+TEST_CASE("a fixture file and its user configuration resolve alike", "[config][config_create]")
 {
   auto const& topology = this_machine();
   std::size_t compared = 0;
@@ -343,32 +340,44 @@ TEST_CASE("create_sirius_config resolves every fixture as resolve() does",
   REQUIRE(every_key_seen);
 }
 
-TEST_CASE("the derived REST defaults are gated by the same explicit values",
+TEST_CASE("explicit REST values gate what is derived from the NIC and kernel TLS",
           "[config][config_create]")
 {
   auto const topology = with_ktls();
-  for (std::string_view text :
-       {"sirius: {}\n",
-        "sirius:\n  executor:\n    scan_manager:\n      rest:\n        min_mtu: 0\n",
-        "sirius:\n  executor:\n    scan_manager:\n      rest:\n        max_connections: 128\n",
-        "sirius:\n  executor:\n    scan_manager:\n      rest_n_reactors: 4\n",
-        "sirius:\n  executor:\n    scan_manager:\n      rest_n_reactors: 4\n      rest:\n"
-        "        min_mtu: 0\n        max_connections: 64\n        n_max_concurrent_scans: 8\n"
-        "      uring:\n        n_max_concurrent_scans: 0\n",
-        "sirius:\n  operator_params:\n    hash_partition_bytes: 1MiB\n"}) {
-    INFO(text);
-    int old_probes = 0, new_probes = 0;
-    auto const old_path = resolved([&] {
-      return sirius::parsed_sirius_config::from_node(YAML::Load(std::string(text)))
-        .resolve(topology, counting_nic{&old_probes});
-    });
-    auto const new_path = resolved([&] {
-      return sirius::create_sirius_config(
-        sirius::config::read_user_config(text), topology, counting_nic{&new_probes});
-    });
-    require_same(old_path, new_path, "");
-    REQUIRE(new_probes == old_probes);
-  }
+  auto const resolve  = [&](std::string_view text, int& probes) {
+    return sirius::create_sirius_config(
+             sirius::config::read_user_config(text), topology, counting_nic{&probes})
+      .get_scan_manager_config();
+  };
+  int probes   = 0;
+  auto derived = resolve("sirius: {}\n", probes);
+  REQUIRE(derived.rest.min_mtu == 9000);         // the jumbo-frame NIC's MTU
+  REQUIRE(derived.rest.max_connections == 128);  // kernel TLS: half the queue, up to 128
+  REQUIRE(probes == 1);
+
+  probes     = 0;
+  auto named = resolve(
+    "sirius:\n  executor:\n    scan_manager:\n      rest_n_reactors: 4\n"
+    "      rest:\n        min_mtu: 0\n        max_connections: 64\n"
+    "        n_max_concurrent_scans: 8\n      uring:\n"
+    "        n_max_concurrent_scans: 0\n",
+    probes);
+  REQUIRE(probes == 0);  // nothing left to derive from the NIC
+  REQUIRE(named.rest.min_mtu == 0);
+  REQUIRE(named.rest.max_connections == 64);
+  REQUIRE(named.rest_n_reactors == 4);
+  REQUIRE(named.rest.n_max_concurrent_scans == 8);
+  REQUIRE(named.rest.n_max_concurrent_scans_explicit);
+  REQUIRE(named.uring.n_max_concurrent_scans == 0);
+  REQUIRE(named.uring.n_max_concurrent_scans_explicit);
+
+  auto const operators =
+    sirius::create_sirius_config(sirius::config::read_user_config(
+                                   "sirius:\n  operator_params:\n    hash_partition_bytes: 1MiB\n"),
+                                 topology,
+                                 no_nic)
+      .get_operator_params();
+  REQUIRE(operators.max_build_hash_table_bytes == 8ULL << 20);  // derived from the named size
 }
 
 TEST_CASE("an empty or never-read configuration resolves as the default one",
@@ -431,13 +440,12 @@ TEST_CASE("REST limits that depend on a derived value are checked after derivati
           "[config][config_create]")
 {
   // An unnamed max_connections derives from queue_depth (half of it), so a small queue no longer
-  // fails against the struct default of 64, as the YAML reader still does.
+  // fails against the struct default of 64.
   constexpr std::string_view text =
     "sirius:\n  executor:\n    scan_manager:\n      rest:\n        queue_depth: 100\n";
   auto const config =
     sirius::create_sirius_config(sirius::config::read_user_config(text), this_machine(), no_nic);
   REQUIRE(config.get_scan_manager_config().rest.max_connections == 50);
-  REQUIRE_THROWS(sirius::parsed_sirius_config::from_node(YAML::Load(std::string(text))));
 }
 
 TEST_CASE("a NIC MTU above what min_mtu may name derives no check", "[config][config_create]")

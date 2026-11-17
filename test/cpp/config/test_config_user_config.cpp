@@ -104,46 +104,9 @@ TEST_CASE("telemetry and compression options", "[config][config_user]")
   REQUIRE(config.compression.enable_spill_compression.scope() == option_scope::session);
 }
 
-TEST_CASE("every fixture reads or fails as it did with the old reader", "[config][config_user]")
-{
-  std::vector<std::filesystem::path> files;
-  for (auto const& entry : std::filesystem::directory_iterator(data_dir())) {
-    if (entry.path().extension() == ".yaml") { files.push_back(entry.path()); }
-  }
-  std::ranges::sort(files);
-  REQUIRE(files.size() > 50);
-
-  std::map<std::string, std::string> differences;
-  for (auto const& path : files) {
-    std::string old_error, new_error;
-    bool old_ok = true, new_ok = true;
-    try {
-      (void)sirius::parsed_sirius_config::from_file(path);
-    } catch (const std::exception& e) {
-      old_ok    = false;
-      old_error = e.what();
-    }
-    try {
-      (void)read_user_config(slurp(path));
-    } catch (const config_error& e) {
-      new_ok    = false;
-      new_error = e.what();
-    }
-    if (old_ok != new_ok) {
-      differences[path.filename().string()] =
-        (old_ok ? std::string("old accepted") : "old rejected (" + old_error + ")") + "; " +
-        (new_ok ? std::string("new accepted") : "new rejected (" + new_error + ")");
-    }
-  }
-  for (auto const& [file, difference] : differences) {
-    UNSCOPED_INFO(file << ": " << difference);
-  }
-  REQUIRE(differences.empty());
-}
-
 TEST_CASE("fixture verdicts follow their names", "[config][config_user]")
 {
-  // Independent of the old reader: invalid_* fixtures are rejected, every other one reads.
+  // invalid_* fixtures are rejected, every other one reads.
   std::size_t rejected = 0, accepted = 0;
   for (auto const& entry : std::filesystem::directory_iterator(data_dir())) {
     if (entry.path().extension() != ".yaml") { continue; }

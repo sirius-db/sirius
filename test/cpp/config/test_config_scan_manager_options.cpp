@@ -288,20 +288,20 @@ TEST_CASE("REST ranges are checked when the file is read", "[config][config_scan
 TEST_CASE("REST and TLS rules across keys", "[config][config_scan_manager]")
 {
   REQUIRE(read_error("      rest:\n        max_segment_bytes: 1 MiB\n") ==
-          "'sirius.executor.scan_manager.rest': max_segment_bytes must be at least "
+          "'sirius.executor.scan_manager.rest.max_segment_bytes': must be at least "
           "min_segment_bytes");
   REQUIRE(read_error("      rest:\n        max_connections: 64\n        queue_depth: 100\n") ==
-          "'sirius.executor.scan_manager.rest': queue_depth must be at least 2 * max_connections");
+          "'sirius.executor.scan_manager.rest.queue_depth': must be at least 2 * max_connections");
   // With max_connections derived, queue_depth is checked when the configuration is resolved.
   REQUIRE(
     read("      rest:\n        queue_depth: 100\n").executor.scan_manager.rest.queue_depth.get() ==
     100);
   REQUIRE(read_error("      rest:\n        tls:\n          min_version: tls1.3\n"
                      "          max_version: tls1.2\n") ==
-          "'sirius.executor.scan_manager.rest.tls': max_version must not be below min_version");
+          "'sirius.executor.scan_manager.rest.tls.max_version': must not be below min_version");
   REQUIRE(read_error("      rest:\n        tls:\n          session_cache: true\n"
                      "          session_cache_per_endpoint: 0\n") ==
-          "'sirius.executor.scan_manager.rest.tls': session_cache_per_endpoint must be greater "
+          "'sirius.executor.scan_manager.rest.tls.session_cache_per_endpoint': must be greater "
           "than 0 with the session cache on");
 }
 

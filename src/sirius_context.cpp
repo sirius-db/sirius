@@ -922,6 +922,11 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
   prev_pinned_mr_.reset();
 }
 
+void SiriusContext::initialize(const sirius::config::user_config& config)
+{
+  initialize(sirius::parsed_sirius_config::from_user_config(config));
+}
+
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }

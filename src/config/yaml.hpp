@@ -49,6 +49,12 @@ void read_yaml(config_block& block,
                std::string_view root_key,
                environment env);
 
+/// read_yaml for a document already parsed into a node tree.
+void read_yaml(config_block& block,
+               const node& document,
+               std::string_view root_key,
+               environment env);
+
 /// The YAML document read_yaml reads back to @p block's values: `<root_key>:` holding the block's
 /// user-defined values, plus its fallbacks when @p include_fallbacks.
 [[nodiscard]] std::string write_yaml(const config_block& block,
