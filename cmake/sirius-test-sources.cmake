@@ -40,6 +40,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config_block.cpp
     test/cpp/config/test_config_option.cpp
     test/cpp/config/test_config_values.cpp
+    test/cpp/config/test_config_yaml.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
