@@ -19,6 +19,7 @@
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
+#include "cuda/device_health.hpp"
 #include "device_compressed_blob.hpp"
 #include "spill_compression.hpp"
 #include "telemetry/nvtx.hpp"
@@ -285,6 +286,11 @@ std::unique_ptr<cucascade::idata_representation> decompress_remote_device_to_gpu
       ++copied_buffers;
     };
 
+  // The peer copies read the owner's buffers, so both ways out of here wait for `stream` first:
+  // the caller dropping its share of the chunk must not race them. Either wait can see a status
+  // that leaves this GPU unusable. The executor latches runtime failure only from an exception
+  // that carries the status, and cucascade::cuda_error (thrown by the copy and by
+  // CUCASCADE_CUDA_TRY) carries none, so both waits raise such a status as fatal_device_error.
   std::unique_ptr<cucascade::idata_representation> decoded;
   try {
     decoded = reconstruct_and_decompress_to_gpu(blob->header,
@@ -294,14 +300,20 @@ std::unique_ptr<cucascade::idata_representation> decompress_remote_device_to_gpu
                                                 rep.visibility_mask(),
                                                 space,
                                                 stream);
-    // The peer copies read the owner's buffers. Finish them before returning, so that the
-    // caller dropping its share of the chunk cannot race them.
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   } catch (...) {
-    // Best effort for the same reason; a second failure must not replace the first.
-    if (cudaStreamSynchronize(stream.get()) != cudaSuccess) { (void)cudaGetLastError(); }
+    // A fatal status stays on the GPU it hit, so this wait also sees one that a copy into this
+    // GPU reported without its status. It replaces the original failure, which is nested in it;
+    // any other second failure must not replace the first.
+    auto const status = cudaStreamSynchronize(stream.get());
+    if (status != cudaSuccess) {
+      (void)cudaGetLastError();
+      if (fatal_cuda_status(status)) { std::throw_with_nested(fatal_device_error{status}); }
+    }
     throw;
   }
+  auto const status = cudaStreamSynchronize(stream.get());
+  check_cuda_health(status);
+  CUCASCADE_CUDA_TRY(status);
 
   g_chunks_decoded_on_another_gpu.fetch_add(1, std::memory_order_relaxed);
   SIRIUS_LOG_DEBUG(
