@@ -16,6 +16,8 @@ vcpkg_from_github(
   disable-openmp.patch
   fix-host-refine-template-arguments.patch
   exclude-sources.patch
+  # Unfiltered brute-force search no longer links cuSPARSE.
+  split-filtered-brute-force.patch
   HEAD_REF
   main)
 
