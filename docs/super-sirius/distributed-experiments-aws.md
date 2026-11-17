@@ -13,8 +13,8 @@ GPU as on eight, so the numbers compare.
 
 **Tested:** `g7e.24xlarge` only (4 x RTX PRO 6000 Blackwell 96 GB, 96 vCPUs, 999 GiB RAM,
 2 x 3.5 TB instance-store NVMe, x86_64, driver 595.91.07), TPC-H SF3000 with 1, 2 and 4 ranks,
-at commit `e11487d2` of `experimental/distributed-sirius`, a later state of this code. That
-commit started the gateway and the ranks by hand. The launch script and
+at commit `e11487d2`, a state of this branch from before it was rebuilt on a newer `main` (its
+history no longer holds that commit). That commit started the gateway and the ranks by hand. The launch script and
 `scripts/compare_answers.py` are newer: steps 5 to 7 were run as written here on a GB200 machine
 at SF100, not on an instance. Other `g7e` sizes were not run: check step 1 on yours.
 

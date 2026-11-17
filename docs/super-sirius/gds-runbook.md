@@ -84,9 +84,9 @@ export UCX_TLS=cuda_copy,cuda_ipc,tcp,self UCX_NET_DEVICES=bond0 UCX_MODULES=^ib
 | `SIRIUS_GDS=1` | `scripts/sirius_rank_node.sh` gives each rank a cuFile configuration that cannot fall back to POSIX reads, and binds the rank to the CPUs of its GPU's socket |
 | `SIRIUS_GATEWAY_MIN_RANKS` | The first statement waits for this many ranks (4 on one node, 8 on two). The default is 1, and a rank that registers after the first statement restarts every rank |
 | `SIRIUS_RANK_LOG_ROOT` | One log folder per rank. Put it on a file system other than the one the scans read, so that the logs survive when that one stops answering |
-| `UCX_TLS`, `UCX_NET_DEVICES`, `UCX_MODULES` | Keep UCX off the storage NICs. By default `scripts/nixl_env.sh` gives UCX the host's fastest RDMA ports that are in no bond, and on these nodes those are the NICs GPFS and cuFile read through. `UCX_NET_DEVICES` names the interface the ranks reach each other on (`bond0` here), and `UCX_MODULES=^ib,rdmacm` tells UCX to leave out its `ib` and `rdmacm` modules |
+| `UCX_TLS`, `UCX_NET_DEVICES`, `UCX_MODULES` | Keep UCX off the storage NICs. By default `scripts/launcher_env.sh` gives UCX the host's fastest RDMA ports that are in no bond, and on these nodes those are the NICs GPFS and cuFile read through. `UCX_NET_DEVICES` names the interface the ranks reach each other on (`bond0` here), and `UCX_MODULES=^ib,rdmacm` tells UCX to leave out its `ib` and `rdmacm` modules |
 
-- With that `UCX_TLS`, `scripts/nixl_env.sh` sets `UCX_RCACHE_ENABLE=n` by itself; see
+- With that `UCX_TLS`, `scripts/launcher_env.sh` sets `UCX_RCACHE_ENABLE=n` by itself; see
   [Settings and build](distributed-sirius.md#settings-and-build) for why.
 - The UCX settings are a precaution. Every GDS run since the evening of 2026-11-10 used them (the
   first stall, earlier that day, was without them), and the stall below happens with them too.
