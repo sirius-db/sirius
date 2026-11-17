@@ -58,6 +58,9 @@ class Joins:
     null_safe_keys: bool = True
     max_tables: int = 6
     cartesian_max_rows: int = 50_000
+    # Worst-case rows a chain of four or more tables may produce through
+    # inner/left/right joins; further joins in the chain are semi/anti.
+    chain_max_rows: int = 200_000
     any_join: bool = True
     any_mixed: bool = gap_switch(
         False
@@ -309,7 +312,7 @@ class EdgeValues:
     date_extremes: bool = True
     date_beyond_ns: bool = gap_switch(
         False
-    )  # unfiled 26b3b402: GPU date_trunc wraps for dates outside the ns range
+    )  # #2631: GPU date_trunc(minute) differs on DATE 9999-12-31
     unicode_case: bool = gap_switch(
         False
     )  # #2598: GPU case mapping differs for ß and İ
@@ -475,6 +478,8 @@ class FuzzConfig:
             )
         if f.joins.cartesian_max_rows < 1:
             raise ConfigError("features.joins.cartesian_max_rows must be positive")
+        if f.joins.chain_max_rows < 1:
+            raise ConfigError("features.joins.chain_max_rows must be positive")
         if not 0 <= f.joins.star_share <= 1:
             raise ConfigError("features.joins.star_share must be between 0 and 1")
         if not 0 <= f.joins.any_join_share <= 1:

@@ -133,6 +133,7 @@ class QueryGenerator:
         self.rng = rng
         self.data = data_gen or DataGenerator(config, random.Random(rng.random()))
         self.stats: Counter[str] = Counter()
+        self._key_frequency: dict[str, int | None] = {}
         self.join_types = list(self.f.joins.types)
         if self.f.full_join and "full" not in self.join_types:
             self.join_types.append("full")
@@ -849,6 +850,7 @@ class QueryGenerator:
         tree: Join | TableRef | Derived = first
         scope = Scope([first_scope], outer=outer)
         left_rows = first_scope.row_upper_bound
+        chain_rows = left_rows
         star = (
             n >= 3
             and self.f.joins.star_share > 0
@@ -913,11 +915,25 @@ class QueryGenerator:
                 if self_variant
                 else (rng.choice(self.join_types) if self.join_types else "inner")
             )
-            if safe_long_chain:
-                # Default tables repeat k, so equality alone does not bound
-                # multi-join fan-out. Semi/anti joins preserve left cardinality.
-                jt = rng.choice(("semi", "anti"))
             right_rows = right_scope.row_upper_bound
+            if safe_long_chain and jt not in ("semi", "anti"):
+                # Tables repeat k, so an equality on k can still multiply rows.
+                # Keep the join type while the worst case stays small; past
+                # that, semi/anti joins preserve the left cardinality.
+                fanout = self._max_key_frequency(right_scope.table_name)
+                bound = (
+                    chain_rows * fanout + (right_rows or 0)
+                    if chain_rows is not None and fanout is not None
+                    else None
+                )
+                if (
+                    jt in ("inner", "left", "right")
+                    and bound is not None
+                    and bound <= self.f.joins.chain_max_rows
+                ):
+                    chain_rows = bound
+                else:
+                    jt = rng.choice(("semi", "anti"))
             cartesian_ok = (
                 left_rows is not None
                 and right_rows is not None
@@ -1081,6 +1097,20 @@ class QueryGenerator:
             )
         return cols
 
+    def _max_key_frequency(self, table_name: str | None) -> int | None:
+        """Most rows sharing one k in a base table; None when not known."""
+        if table_name is None:
+            return None
+        if table_name not in self._key_frequency:
+            table = self.ds.table(table_name)
+            names = [c.name for c in table.columns]
+            self._key_frequency[table_name] = (
+                max(Counter(row[names.index("k")] for row in table.rows).values())
+                if table.rows and "k" in names
+                else None
+            )
+        return self._key_frequency[table_name]
+
     def _gen_join_cond(
         self,
         scope: Scope,
@@ -1102,7 +1132,7 @@ class QueryGenerator:
             return None
         if unique_key_only:
             # Reusable payload values can explode on the CPU before a query
-            # reaches the GPU. Keep these semi/anti joins on k.
+            # reaches the GPU. Long chains join on k, whose fan-out is bounded.
             keys = [(l, r) for l, r in pairs if l.name == r.name == "k"]
             if keys:
                 l, r = rng.choice(keys)

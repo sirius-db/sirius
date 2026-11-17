@@ -52,6 +52,7 @@ inequality = true
 null_safe_keys = true     # IS NOT DISTINCT FROM keys
 max_tables = 6
 cartesian_max_rows = 50000
+chain_max_rows = 200000  # worst-case rows from inner/left/right joins in a 4+ table chain
 any_join = true
 any_mixed = false
 any_join_share = 1.0  # bounded to small inputs; enough emissions for campaign coverage
@@ -169,7 +170,7 @@ negative_zero = true
 nan_inf = false   # nonfinite floating aggregates differ; gaps mode only
 rounding_ties = false
 date_extremes = true
-date_beyond_ns = false  # 26b3b402: GPU date_trunc wraps on 9999-12-31
+date_beyond_ns = false  # #2631: GPU date_trunc(minute) differs on 9999-12-31
 unicode_case = false
 long_string = false
 

@@ -27,7 +27,7 @@ is run manually; it is not installed in a scheduler.
 | `data.parquet.timestamp_ms` | Parquet tables containing `TIMESTAMP_MS` | #2595 | saved bundle |
 | `data.edge_values.nan_inf`, `features.aggregates.float_division_minmax` | nonfinite MIN/MAX inputs, including computed NaN | #2085, #2592 | `2085-nan-grouped-minmax.sql`, `2592-nan-ungrouped-max.sql` |
 | `data.edge_values.unicode_case` | Unicode case mappings | #2598 | `2598-unicode-case.sql` |
-| `data.edge_values.date_beyond_ns` | DATE values outside the nanosecond timestamp range (years 1 and 9999) | unfiled `26b3b402` | `26b3b402-date-trunc-far-date.sql` |
+| `data.edge_values.date_beyond_ns` | DATE values outside the nanosecond timestamp range (years 1 and 9999) | #2631 | `2631-date-trunc-far-date.sql` |
 | `features.scalar_functions.regexp_backreferences` | repeated match backreferences after multibyte text | unfiled `0fca855a` | `0fca855a-regex-backreference.sql` |
 
 The filtered MIN (#2593), floating AVG (#2591), and EXCEPT ALL/TopN (#2596)

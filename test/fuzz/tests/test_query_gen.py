@@ -591,6 +591,53 @@ class Phase2dJoinBudget(unittest.TestCase):
         self.assertGreater(arith, 0)
 
 
+class LongChainFanout(unittest.TestCase):
+    def chains(self, cap):
+        cfg = load_config(
+            None, [f"features.joins.chain_max_rows={cap}", "data.rows=[50,400]"]
+        )
+        found = []
+        for seed in range(6):
+            dg = DataGenerator(cfg, random.Random(seed))
+            ds = dg.generate(seed)
+            qg = QueryGenerator(cfg, ds, random.Random(seed), dg)
+            for _ in range(400):
+                for node in walk(qg.generate()):
+                    if not isinstance(node, Select):
+                        continue
+                    joins = []
+                    tree = node.from_
+                    while isinstance(tree, Join):
+                        joins.append(tree)
+                        tree = tree.left
+                    if len(joins) >= 3 and isinstance(tree, TableRef):
+                        found.append((ds, tree, joins[::-1]))
+        return found
+
+    def test_cap_of_one_row_leaves_only_semi_and_anti(self):
+        chains = self.chains(1)
+        self.assertTrue(chains)
+        for _, _, joins in chains:
+            self.assertTrue(all(j.join_type in ("semi", "anti") for j in joins))
+
+    def test_plain_joins_stay_within_the_cap(self):
+        cap = 200_000
+        chains = self.chains(cap)
+        plain = 0
+        for ds, first, joins in chains:
+            rows = len(ds.table(first.table).rows)
+            for j in joins:
+                if j.join_type in ("semi", "anti"):
+                    continue
+                plain += 1
+                table = ds.table(j.right.table)
+                k = [c.name for c in table.columns].index("k")
+                fanout = max(collections.Counter(r[k] for r in table.rows).values())
+                rows = rows * fanout + len(table.rows)
+            self.assertLessEqual(rows, cap)
+        self.assertGreater(plain, len(chains) // 2)
+
+
 class WindowTies(unittest.TestCase):
     def windows(self, enabled):
         cfg = load_config(
