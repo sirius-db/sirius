@@ -17,6 +17,9 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
+
+#include <string>
 
 namespace {
 
@@ -27,6 +30,16 @@ class CteFixture : public sirius::test::GpuExecutionFixture {
     run_ok(
       "CREATE TABLE ct AS SELECT range::BIGINT AS k, (range % 5)::BIGINT AS g FROM range(50);");
     run_ok("CHECKPOINT;");
+  }
+
+  /// The error @p sql fails with.
+  std::string query_error(std::string const& sql)
+  {
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    if (!result->HasError()) { UNSCOPED_INFO("expected an error, got: " << result->ToString()); }
+    REQUIRE(result->HasError());
+    return result->GetError();
   }
 };
 
@@ -94,4 +107,42 @@ TEST_CASE_METHOD(CteFixture,
   REQUIRE(rows[0].size() == 2);
   REQUIRE(rows[0][0] == "1");
   REQUIRE(rows[0][1] == "42");
+}
+
+// Sirius has no operators for the delim joins DuckDB makes of correlated subqueries when
+// `delim_join_as_cte` is off, so a query it would run is an error there, not a silent CPU run.
+TEST_CASE_METHOD(CteFixture,
+                 "gpu_execution rejects delim_join_as_cte = false",
+                 "[integration][gpu_execution][cte]")
+{
+  std::string const expected = "delim_join_as_cte = true";
+  std::string const plain    = "SELECT count(*) FROM ct WHERE k > 10";
+  std::string const correlated =
+    "SELECT count(*) FROM ct o WHERE k > (SELECT avg(k) FROM ct i WHERE i.g = o.g)";
+
+  run_ok("PREPARE under_default AS " + plain + ";");
+  run_ok("EXECUTE under_default;");
+  // Refused with or without a subquery, and whether or not a CPU fallback is allowed.
+  for (bool const fallback : {true, false}) {
+    CAPTURE(fallback);
+    sirius::test::scoped_sirius_setting allow{*con, "enable_duckdb_fallback", fallback};
+    sirius::test::scoped_sirius_setting off{*con, "delim_join_as_cte", false};
+    CHECK(query_error(plain).find(expected) != std::string::npos);
+    CHECK(query_error(correlated).find(expected) != std::string::npos);
+  }
+  {
+    sirius::test::scoped_sirius_setting off{*con, "delim_join_as_cte", false};
+    // A statement prepared under the default is planned again when it runs.
+    CHECK(query_error("EXECUTE under_default;").find(expected) != std::string::npos);
+
+    // Statements Sirius does not run are unaffected: DML, and any query once the GPU is off.
+    run_ok("CREATE TABLE cte_copy AS " + correlated + ";");
+    run_ok("SET gpu_execution = false;");
+    run_ok(correlated + ";");
+    run_ok("SET gpu_execution = true;");
+  }
+  // The session recovers once the setting is back.
+  compare_gpu_vs_cpu(plain);
+  compare_gpu_vs_cpu(correlated);
+  run_ok("EXECUTE under_default;");
 }

@@ -119,6 +119,20 @@ TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
 }
 
 TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
+                 "gpu_execution table function rejects delim_join_as_cte = false",
+                 "[integration][gpu_execution][table_function]")
+{
+  auto const expected = query_rows(group_query());
+  run_ok("SET delim_join_as_cte = false;");
+  auto const error = query_error(gpu_execution(group_query()));
+  CHECK(error.find("delim_join_as_cte = true") != std::string::npos);
+
+  // The session recovers once the setting is back.
+  run_ok("SET delim_join_as_cte = true;");
+  CHECK(query_rows(gpu_execution(group_query())) == expected);
+}
+
+TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
                  "gpu_execution honors enable_optimizer",
                  "[integration][gpu_execution][table_function]")
 {

@@ -2029,6 +2029,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   if (statement_type == StatementType::COPY_STATEMENT && !is_gpu_copy_candidate(prepared)) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
+  // From here on Sirius would run the query. An error, not a fallback: the CPU would answer
+  // every query of the session without the user learning why.
+  sirius::transparent::require_delim_join_as_cte(context);
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
