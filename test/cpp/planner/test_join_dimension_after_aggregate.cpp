@@ -86,7 +86,7 @@ void rewrite(duckdb::OptimizerExtensionInput& input,
 /// Parquet files read through views, as Sirius plans TPC-H.
 ///
 /// TPC-H Q9's tables: nations 3 and 4 share one name; supplier 9 has no nation and supplier 10 one
-/// that is not in the table.
+/// that is not in the table. Every supplier supplies every part, and every second part is green.
 ///
 /// Readings of meters at sites, in batches: the lookup table `sites` has a VARCHAR key, and sites
 /// S0 and S1 share one label and zone; meter 38 has no site and meter 39 one that is not in the
@@ -124,10 +124,10 @@ struct late_join_fixture {
       "partial_aggregate_pushdown,grouping_sets,aggregate_reuse,distinct_aggregate_rewrite,"
       "scalar_fn_pushdown,late_materialization'");
     parquet_table("lineitem",
-                  "SELECT (i % 500)::BIGINT AS l_orderkey, (i % 11)::BIGINT AS l_suppkey, ((i % "
-                  "50) + 1)::DECIMAL(15, 2) AS l_quantity, (i * 1.5)::DECIMAL(15, 2) AS "
-                  "l_extendedprice, ((i % 10) / 100.0)::DECIMAL(15, 2) AS l_discount FROM "
-                  "range(4000) t(i)");
+                  "SELECT (i % 500)::BIGINT AS l_orderkey, (i % 37)::BIGINT AS l_partkey, (i % "
+                  "11)::BIGINT AS l_suppkey, ((i % 50) + 1)::DECIMAL(15, 2) AS l_quantity, (i * "
+                  "1.5)::DECIMAL(15, 2) AS l_extendedprice, ((i % 10) / 100.0)::DECIMAL(15, 2) AS "
+                  "l_discount FROM range(4000) t(i)");
     parquet_table("orders",
                   "SELECT i::BIGINT AS o_orderkey, DATE '1995-01-01' + i::INTEGER AS o_orderdate "
                   "FROM range(500) t(i)");
@@ -137,6 +137,12 @@ struct late_join_fixture {
     parquet_table("nation",
                   "SELECT i::BIGINT AS n_nationkey, CASE WHEN i >= 3 THEN 'SHARED' ELSE 'N' || i "
                   "END AS n_name, (i % 2)::BIGINT AS n_regionkey FROM range(5) t(i)");
+    parquet_table("part",
+                  "SELECT i::BIGINT AS p_partkey, CASE WHEN i % 2 = 0 THEN 'dark green' ELSE "
+                  "'pale red' END AS p_name FROM range(37) t(i)");
+    parquet_table("partsupp",
+                  "SELECT (i % 37)::BIGINT AS ps_partkey, (i % 11)::BIGINT AS ps_suppkey, ((i * "
+                  "13) % 100 + 1)::DECIMAL(15, 2) AS ps_supplycost FROM range(407) t(i)");
     parquet_table("readings",
                   "SELECT (i % 40)::BIGINT AS meter, (i % 21)::BIGINT AS batch, i::BIGINT AS "
                   "reading FROM range(3000) t(i)");
@@ -205,12 +211,23 @@ TEST_CASE_METHOD(late_join_fixture,
                  "a lookup table that only names GROUP BY keys is joined after the aggregate",
                  "[planner][join_dimension_after_aggregate]")
 {
+  SECTION("TPC-H Q9")
+  {
+    expect_moved(
+      1,
+      "select nation, o_year, sum(amount) as sum_profit from (select n_name as nation, "
+      "extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) - "
+      "ps_supplycost * l_quantity as amount from part, supplier, lineitem, partsupp, orders, "
+      "nation where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey "
+      "and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey and "
+      "p_name like '%green%') as profits group by nation, o_year order by nation, o_year desc",
+      names_and_years);
+  }
   SECTION("TPC-H Q9's shape") { expect_moved(1, by_nation_and_year(), names_and_years); }
   SECTION("min, max and a narrow sum")
   {
-    expect_moved(1,
-                 by_nation_and_year("min(l_quantity), max(amount), sum(l_quantity)"),
-                 names_and_years);
+    expect_moved(
+      1, by_nation_and_year("min(l_quantity), max(amount), sum(l_quantity)"), names_and_years);
   }
   SECTION("two lookup columns after another key")
   {
@@ -259,8 +276,8 @@ TEST_CASE_METHOD(late_join_fixture,
                  by_nation_and_year("sum(case when nation = 'N1' then amount else 0 end)"),
                  names_and_years},
          variant{"avg", by_nation_and_year("avg(amount)"), names_and_years},
-         variant{"count(DISTINCT)", by_nation_and_year("count(distinct l_suppkey)"),
-                 names_and_years},
+         variant{
+           "count(DISTINCT)", by_nation_and_year("count(distinct l_suppkey)"), names_and_years},
          variant{"sum(DISTINCT)", by_nation_and_year("sum(distinct l_quantity)"), names_and_years},
          variant{"a LEFT join, which keeps the suppliers without a nation",
                  by_nation_and_year("sum(amount)", "left join nation on s_nationkey = n_nationkey"),
