@@ -137,9 +137,11 @@ struct pushdown_fixture {
     con = std::make_unique<Connection>(*db);
     for (char const* sql :
          {"CREATE TABLE customer (c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, "
-          "c_nationkey INTEGER, c_acctbal DECIMAL(15, 2), c_region INTEGER, c_clerk VARCHAR)",
+          "c_nationkey INTEGER, c_acctbal DECIMAL(15, 2), c_region INTEGER, c_clerk VARCHAR, "
+          "c_weight DOUBLE)",
           "INSERT INTO customer SELECT range, 'Customer#' || range, 'Street ' || range, "
-          "range % 25, range * 1.5, range % 3, 'Clerk#' || (range % 10) FROM range(1, 301)",
+          "range % 25, range * 1.5, range % 3, 'Clerk#' || (range % 10), range * 0.5 "
+          "FROM range(1, 301)",
           "CREATE TABLE nation (n_nationkey INTEGER, n_name VARCHAR)",
           "INSERT INTO nation SELECT range, 'N' || range FROM range(25)",
           "CREATE TABLE orders (o_orderkey BIGINT, o_custkey BIGINT, o_region INTEGER, "
@@ -303,6 +305,16 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(pushed("SELECT c_custkey, c_name, min(spent) FROM customer, "
                "(SELECT o_custkey, min(o_totalprice) AS spent FROM orders GROUP BY o_custkey) "
                "WHERE o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);
+  // A join key computed from a DOUBLE: 0.0 and -0.0 group together, but the key can tell them
+  // apart. The bare column and a key computed from an integer are fine.
+  auto const joined_on = [](std::string const& condition) {
+    return "SELECT c_custkey, c_name, sum(o_totalprice) FROM orders, customer WHERE " + condition +
+           " GROUP BY c_custkey, c_name";
+  };
+  CHECK(pushed(joined_on("o_weight = c_weight")) == 1);
+  CHECK(pushed(joined_on("o_custkey + 1 = c_custkey")) == 1);
+  CHECK(pushed(joined_on("1.0 / o_weight = c_weight")) == 0);
+  CHECK(pushed(joined_on("CAST(o_weight AS VARCHAR) = c_clerk")) == 0);
   // An outer join pads the aggregated side, and an ungrouped aggregate has nothing to carry.
   CHECK(pushed("SELECT c_custkey, c_name, sum(o_totalprice) FROM customer LEFT JOIN orders "
                "ON o_custkey = c_custkey GROUP BY c_custkey, c_name") == 0);

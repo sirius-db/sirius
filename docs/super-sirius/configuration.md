@@ -1080,7 +1080,7 @@ SET enable_compressed_materialization = false;
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
-| `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). |
+| `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see

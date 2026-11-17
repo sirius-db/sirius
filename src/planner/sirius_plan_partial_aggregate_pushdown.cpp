@@ -114,6 +114,53 @@ void append_columns_read(duckdb::LogicalComparisonJoin const& join,
   }
 }
 
+/// The columns @p join's conditions read through an expression, not as a bare column.
+void append_columns_computed_from(duckdb::LogicalComparisonJoin const& join,
+                                  std::vector<ColumnBinding>& columns)
+{
+  auto const append = [&](Expression const& expression) {
+    if (!is_column(expression)) { append_columns_read(expression, columns); }
+  };
+  for (auto const& condition : join.conditions) {
+    if (condition.IsComparison()) {
+      append(condition.GetLHS());
+      append(condition.GetRHS());
+    } else {
+      append_columns_read(condition.GetJoinExpression(), columns);
+    }
+  }
+}
+
+/// Whether values of @p type that group together are the same value to every expression. Zeros of
+/// either sign group together but `1 / x` tells them apart, and intervals and zoned times that
+/// compare equal can be stored differently.
+bool equal_means_identical(LogicalType const& type)
+{
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::HUGEINT:
+    case duckdb::LogicalTypeId::UTINYINT:
+    case duckdb::LogicalTypeId::USMALLINT:
+    case duckdb::LogicalTypeId::UINTEGER:
+    case duckdb::LogicalTypeId::UBIGINT:
+    case duckdb::LogicalTypeId::UHUGEINT:
+    case duckdb::LogicalTypeId::DECIMAL:
+    case duckdb::LogicalTypeId::DATE:
+    case duckdb::LogicalTypeId::TIME:
+    case duckdb::LogicalTypeId::TIMESTAMP:
+    case duckdb::LogicalTypeId::TIMESTAMP_SEC:
+    case duckdb::LogicalTypeId::TIMESTAMP_MS:
+    case duckdb::LogicalTypeId::TIMESTAMP_NS:
+    case duckdb::LogicalTypeId::TIMESTAMP_TZ:
+    case duckdb::LogicalTypeId::UUID: return true;
+    default: return false;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The aggregate's input
 // ---------------------------------------------------------------------------------------------
@@ -442,6 +489,18 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
   if (result.keys.size() >= aggregate.groups.size() ||
       result.keys.size() > join_keys + k_max_extra_keys) {
     return decline("it would group by too many columns");
+  }
+  // A join that computes its key sees one row of each group where it saw every row. That is the
+  // same only when the rows of a group cannot differ in the columns the key is computed from.
+  std::vector<ColumnBinding> computed_from;
+  for (auto const& step : result.path) {
+    append_columns_computed_from(*step.join, computed_from);
+  }
+  for (std::size_t k = 0; k < result.keys.size(); ++k) {
+    if (!equal_means_identical(result.key_types[k]) &&
+        std::ranges::find(computed_from, result.keys[k]) != computed_from.end()) {
+      return decline("a join computes its key from a column whose equal values can differ");
+    }
   }
   for (auto const& step : result.path) {
     if (!keeps_rows(context, *step.join->children[1 - step.side])) {

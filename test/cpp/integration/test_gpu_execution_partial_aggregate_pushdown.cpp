@@ -159,3 +159,23 @@ TEST_CASE_METHOD(PartialAggregatePushdownFixture,
     "WHERE c_custkey = o_custkey GROUP BY c_custkey, c_nationkey");
   CHECK(pushdowns() == before);
 }
+
+TEST_CASE_METHOD(PartialAggregatePushdownFixture,
+                 "gpu_execution keeps zeros of either sign apart under a computed join key",
+                 "[integration][gpu_execution][partial_agg_pushdown]")
+{
+  // 0.0 and -0.0 group together, but 1 / k sends them to different rows of dims. Summing per k
+  // first would give one of the two names the total of both.
+  run_ok("CREATE TABLE facts (k DOUBLE, v DECIMAL(15, 2));");
+  run_ok("INSERT INTO facts VALUES (0.0, 1.00), (-0.0, 2.00), (0.0, 4.00), (0.5, 8.00);");
+  run_ok("CREATE TABLE dims (k DOUBLE, name VARCHAR, extra VARCHAR);");
+  run_ok(
+    "INSERT INTO dims VALUES ('Infinity'::DOUBLE, 'pos', 'p'), ('-Infinity'::DOUBLE, 'neg', 'n'), "
+    "(2.0, 'two', 't');");
+  run_ok("CHECKPOINT;");
+  auto const before = pushdowns();
+  compare_gpu_vs_cpu(
+    "SELECT d.name, d.extra, sum(f.v) AS total FROM facts f JOIN dims d ON 1.0 / f.k = d.k "
+    "GROUP BY d.name, d.extra");
+  CHECK(pushdowns() == before);
+}

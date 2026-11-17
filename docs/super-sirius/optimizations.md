@@ -229,6 +229,7 @@ DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported
 - Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
 - The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
 - Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
+- A join that computes its key from a column of `S` (`1 / x`, a cast) does so only from integer, DECIMAL, BOOLEAN, DATE, TIME, TIMESTAMP or UUID columns. Values of other types can group together and still differ: `0.0` and `-0.0` are one group, but `1 / x` sends them to opposite infinities. A bare column of any fixed-width type is fine.
 - `S` is not already grouped.
 
 **Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
