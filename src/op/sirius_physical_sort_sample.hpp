@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace sirius {
@@ -47,6 +48,7 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     std::size_t sample_stride         = 1;
     std::size_t sample_bytes          = 0;
     std::size_t estimated_total_bytes = 0;
+    std::string_view est_source       = "planner";
     std::size_t target_range_bytes    = 0;
     std::size_t num_ranges            = 1;
     std::size_t repeated_boundaries   = 0;

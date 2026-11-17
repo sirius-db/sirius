@@ -630,7 +630,7 @@ Samples input batches to compute P-1 partition boundary rows for range partition
 Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE → SCHEDULED → DONE`.
 - `get_next_task_hint()` waits in `NOT_DONE` until enough sample bytes are available (or the upstream finishes), then signals READY; it returns `std::nullopt` while `SCHEDULED` so at most one boundary task is in flight.
 - `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
-- `execute()` gathers regularly spaced key rows from each pre-sorted sample batch, merges those keys, computes boundaries, and moves to `DONE`. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
+- `execute()` gathers regularly spaced key rows from each pre-sorted sample batch, merges those keys, computes boundaries, and moves to `DONE`. Range sizing uses measured input when upstream is finished, otherwise the runtime byte estimate when available, then the planner estimate. It also caps expected rows per range at half cuDF's column limit. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
