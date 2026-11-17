@@ -324,12 +324,29 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
     ~job_ticket()
     {
       if (!active || completed) return;
-      bool cancelled;
+      bool cancelled, metadata;
       {
         std::lock_guard lock(st->gate->mutex);
         cancelled = st->gate->closed;
+        metadata  = st->sources[st->slots[index].source_id].hooks.execution ==
+                   execution_domain::metadata_worker;
       }
       if (!cancelled) {
+        if (metadata && std::uncaught_exceptions() && !st->dispatcher->stop_requested()) {
+          // A rejected owning handoff unwinds before the dispatcher's error
+          // callback. Leave reader cancellation to that callback, after it has
+          // committed the original submission error. Release this abandoned
+          // claim directly: settle() would allocate a ready-result entry and
+          // could replace that error with another allocation failure.
+          retired_slot retired;
+          {
+            std::lock_guard lock(st->gate->mutex);
+            if (auto const& unit = st->slots[index].unit) unit->cancel_under_gate();
+            retired = st->release_slot(index);
+            st->gate->notify_under_lock();
+          }
+          return;
+        }
         // An exception leaving claim/enqueue is reported by the runner; preserve that first cause.
         if (!std::uncaught_exceptions()) {
           try {

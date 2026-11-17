@@ -40,9 +40,12 @@ waits retain reserved worker capacity in this baseline. The later memory-progres
 introduces worker release during reservation retries. Equal GPU shares are not promised.
 IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 
-The shared scan metadata pool also uses strict query-age priority: older queries' queued tasks
-run before newer queries' tasks, with FIFO ordering within a query. Workers return to the shared
-queue after each task; running tasks are not preempted. Consequently, a newly admitted query's
+The shared scan metadata/coalescing pool uses strict query-age priority among queued tasks
+eligible for a worker's domain: older queries' tasks run before newer queries' tasks. Within
+each query, the dispatcher preserves FIFO order within each pending work class (metadata or
+coalescing) and alternates classes when both have work. Overall enqueue order across classes
+is not preserved. Workers return to the shared queue after each task; running tasks are not
+preempted. Consequently, a newly admitted query's
 metadata work can wait while older queries continue supplying work to that pool. Admission permits
 concurrent execution but does not guarantee an equal share of metadata workers or bounded metadata
 startup latency for each query.

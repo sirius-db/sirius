@@ -1644,8 +1644,9 @@ void sirius_scan_manager::prepare_for_query(
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
-  // first and preserves FIFO order within each query's priority.
+  // whole pool across its eligible domains. Dispatchers yield between tasks; the shared
+  // pool selects older queries first among work eligible for each worker. Within a query,
+  // pending metadata/coalescing classes alternate, with FIFO order within each class.
   auto const priority = sirius::query_priority_bits(query_id);
   state->dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads(), priority);

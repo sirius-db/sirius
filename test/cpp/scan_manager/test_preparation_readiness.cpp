@@ -3728,24 +3728,32 @@ TEST_CASE("rejected coalescing commits its error before cancelling a running rea
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
-TEST_CASE("dispatcher cancellation while unwinding still retires pending coalescing",
+TEST_CASE("dispatcher cancellation while unwinding still retires pending preparation",
           "[coordinator][async_coalescing][review_20261116]")
 {
-  fixture f(1);
+  bool coalescing = GENERATE(false, true);
+  preparation_options options{2, 4, 8, 1};
+  fixture f(1, 4, k_interrupt_check_interval, options);
   auto worker = f.make_hold(), accepted = f.make_hold();
   auto out = std::make_shared<sink>();
-  f.source(std::make_shared<worker_accumulator>(1), out, single_job([] {
-             return std::make_unique<tagged>(1);
-           }));
+  if (coalescing)
+    f.source(std::make_shared<worker_accumulator>(1), out, single_job([] {
+               return std::make_unique<tagged>(1);
+             }));
+  else
+    f.source(std::make_shared<worker_accumulator>(1), out, finite_jobs(2, [worker](int id) {
+               if (id == 0) worker->wait();
+               return std::make_unique<tagged>(id);
+             }));
   bool blocker_submitted = false;
   f.coordinator.before_control_step_for_testing([&] {
     auto stats = f.coordinator.snapshot();
-    if (stats.results_peak && !blocker_submitted) {
+    if (coalescing && stats.results_peak && !blocker_submitted) {
       f.dispatcher.wait_for_all();
       f.dispatcher.enqueue([worker] { worker->wait(); });
       blocker_submitted = true;
     }
-    if (stats.coalescing_submitted) accepted->wait();
+    if (coalescing ? stats.coalescing_submitted != 0 : stats.jobs_peak == 2) accepted->wait();
   });
   auto guard = f.shutdown_guard();
   f.start();
@@ -3772,6 +3780,77 @@ TEST_CASE("dispatcher cancellation while unwinding still retires pending coalesc
   worker->release();
   accepted->release();
   f.finish();
+  CHECK(out->count() == 0);
+  CHECK(out->close_calls == 1);
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+}
+
+TEST_CASE("rejected routed metadata handoff commits its error before reader cancellation",
+          "[coordinator][scoped_dispatcher][review_regression][review_f9]")
+{
+  auto allowed = sirius::exec::thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  preparation_options options{3, 4, 8, 1};
+  fixture f(2, 4, k_interrupt_check_interval, options, nullptr, nullptr, {{allowed.front()}});
+  auto worker = f.make_hold(), reader = f.make_hold(), accepted = f.make_hold();
+  auto out = std::make_shared<sink>();
+  required_input_set required;
+  required.set(static_cast<size_t>(required_input::footer));
+  auto pending_unit =
+    std::make_shared<preparation_unit>(unit_key{1, 3}, required, f.coordinator.publication_gate());
+  std::atomic<bool> original_at_cancel{false};
+  std::atomic<unsigned> notifications{0}, pending_executions{0};
+  f.source(
+    std::make_shared<worker_accumulator>(100),
+    out,
+    [&, id = 0]() mutable -> preparation_coordinator::claim_result {
+      if (id == 3) return preparation_exhausted{};
+      auto current = id++;
+      return preparation_coordinator::job{
+        [&, current](preparation_stop_token stop) -> std::unique_ptr<sirius::op::scan::scan_info> {
+          if (current == 0) {
+            worker->wait();
+          } else if (current == 1) {
+            std::stop_callback observer(stop.token(), [&] {
+              original_at_cancel = bool(f.completion.terminal_error());
+              ++notifications;
+              // Deliver the competing error before stop() can return, making
+              // capture-disposal ordering deterministic rather than timing-based.
+              f.completion.report_error(std::make_exception_ptr(
+                std::system_error(std::make_error_code(std::errc::operation_canceled))));
+              reader->release();
+            });
+            reader->wait();
+            throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+          } else {
+            ++pending_executions;
+          }
+          return std::make_unique<tagged>(current);
+        },
+        current == 2 ? pending_unit : nullptr};
+    });
+  f.coordinator.before_control_step_for_testing([&] {
+    // Two workers are held and the third metadata job has returned from
+    // dispatcher enqueue, so its ticket is owned only by accepted pending work.
+    if (f.coordinator.snapshot().jobs_peak == 3) accepted->wait();
+  });
+  auto done  = f.completion.get_awaitable();
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(accepted->await());
+  REQUIRE(worker->await());
+  REQUIRE(reader->await());
+  f.pool.stop();
+  worker->release();  // Its routed handoff owns the pending ticket before rejection.
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  CHECK_THROWS_WITH(done.get(), "thread pool is stopped");
+  CHECK(original_at_cancel);
+  accepted->release();
+  f.finish();
+  f.dispatcher.wait_for_all();
+  CHECK(notifications == 1);
+  CHECK(pending_executions == 0);
+  CHECK(pending_unit->record().state == unit_state::cancelled);
   CHECK(out->count() == 0);
   CHECK(out->close_calls == 1);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
