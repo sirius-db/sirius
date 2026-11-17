@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -25,8 +26,10 @@ constexpr std::size_t max_depth = 64;
 /// document of nested aliases could otherwise expand without bound.
 constexpr std::size_t max_values = 100'000;
 
+/// Where @p mark is in the text; nothing for a node built in code, which has no position.
 std::string at(const YAML::Mark& mark)
 {
+  if (mark.is_null()) { return {}; }
   return " (line " + std::to_string(mark.line + 1) + ", column " + std::to_string(mark.column + 1) +
          ")";
 }
@@ -60,18 +63,18 @@ class converter {
       case YAML::NodeType::Map: {
         node::mapping_type entries;
         entries.reserve(yaml.size());
+        std::unordered_set<std::string> keys;
+        keys.reserve(yaml.size());
         for (auto const& entry : yaml) {
           if (!entry.first.IsScalar()) {
             throw config_error(detail::framed(path, "mapping keys must be non-null scalars") +
                                at(entry.first.Mark()));
           }
           auto key = entry.first.Scalar();
-          for (auto const& [existing, value] : entries) {
-            if (existing == key) {
-              throw config_error("duplicate config key: '" + key + "'" +
-                                 (path.empty() ? std::string() : " in " + path) +
-                                 at(entry.first.Mark()));
-            }
+          if (!keys.insert(key).second) {
+            throw config_error("duplicate config key: '" + key + "'" +
+                               (path.empty() ? std::string() : " in " + path) +
+                               at(entry.first.Mark()));
           }
           auto value = convert(entry.second, join_path(path, key), depth + 1);
           entries.emplace_back(std::move(key), std::move(value));

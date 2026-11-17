@@ -512,7 +512,8 @@ struct partial_batch_options : block_base<partial_batch_options> {
   void validate(std::string_view path) const
   {
     if (max_residence.get() < min_residence.get()) {
-      throw config_error(detail::framed(path, "max_residence must be at least min_residence"));
+      throw config_error("'" + join_path(path, max_residence.key()) +
+                         "': must be at least min_residence");
     }
   }
 };
@@ -571,8 +572,8 @@ struct preparation_options : block_base<preparation_options> {
       resolved.max_native_readers = *readers;
     }
     if (resolved.resolved_native_readers() < resolved.resolved_native_workers()) {
-      throw config_error(
-        detail::framed(path, "max_native_readers must be at least native_reader_workers"));
+      throw config_error("'" + join_path(path, max_native_readers.key()) +
+                         "': must be at least native_reader_workers");
     }
   }
 };

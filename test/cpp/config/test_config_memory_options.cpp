@@ -136,12 +136,12 @@ TEST_CASE("GPU memory takes bytes or a fraction", "[config][config_memory]")
 TEST_CASE("downgrade fractions keep 0 < stop < trigger", "[config][config_memory]")
 {
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      downgrade_stop_fraction: 0.9\n") ==
-          "'sirius.memory.gpu': downgrade_stop_fraction must be less than "
+          "'sirius.memory.gpu.downgrade_stop_fraction': must be less than "
           "downgrade_trigger_fraction");
   REQUIRE(read_error("sirius:\n  memory:\n    host:\n      downgrade_stop_fraction: 0\n") ==
-          "'sirius.memory.host': downgrade_stop_fraction must be greater than zero");
+          "'sirius.memory.host.downgrade_stop_fraction': must be greater than zero");
   REQUIRE(read_error("sirius:\n  space:\n    gpu:\n      - downgrade_trigger_fraction: 0.5\n") ==
-          "'sirius.space.gpu[0]': downgrade_stop_fraction must be less than "
+          "'sirius.space.gpu[0].downgrade_stop_fraction': must be less than "
           "downgrade_trigger_fraction");
 }
 
@@ -320,7 +320,7 @@ TEST_CASE("fraction boundaries", "[config][config_memory]")
           "'sirius.memory.host.capacity_fraction': value out of range: '1.5' (must be greater than "
           "0.0 and at most 1.0)");
   REQUIRE(read_error("sirius:\n  memory:\n    gpu:\n      downgrade_trigger_fraction: 0.6\n") ==
-          "'sirius.memory.gpu': downgrade_stop_fraction must be less than "
+          "'sirius.memory.gpu.downgrade_stop_fraction': must be less than "
           "downgrade_trigger_fraction");  // stop == trigger
   // A null member takes its default before the pair rule runs.
   REQUIRE(read("sirius:\n  memory:\n    gpu:\n      downgrade_trigger_fraction: ~\n"

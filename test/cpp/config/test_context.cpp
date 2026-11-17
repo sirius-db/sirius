@@ -985,7 +985,7 @@ TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[siri
     INFO("fixture=" << invalid.fixture);
     sirius::sirius_config config;
     REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
-                        Catch::Matchers::ContainsSubstring("topology") &&
+                        Catch::Matchers::ContainsSubstring("'sirius.topology") &&
                           Catch::Matchers::ContainsSubstring(invalid.expected));
   }
 }
@@ -1173,10 +1173,12 @@ TEST_CASE("Sirius keeps executor thread-name prefixes internal", "[sirius][confi
     const char* context;
   };
   constexpr std::array cases{
-    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml", "task_creator"},
-    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "sirius.executor.pipeline"},
-    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "downgrade"},
-    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml", "scan_manager"},
+    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml",
+                   "in sirius.executor.task_creator"},
+    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "in sirius.executor.pipeline"},
+    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "in sirius.executor.downgrade"},
+    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml",
+                   "in sirius.executor.scan_manager"},
   };
 
   for (auto const& test : cases) {

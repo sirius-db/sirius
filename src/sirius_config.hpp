@@ -466,6 +466,7 @@ class configuration_input_error : public std::runtime_error {
 class parsed_sirius_config;
 
 namespace config {
+class node;
 struct user_config;
 }  // namespace config
 
@@ -668,9 +669,16 @@ struct sirius_config {
 class parsed_sirius_config {
  public:
   parsed_sirius_config();
+  /// The YAML file at @p path, which holds one document. @throws configuration_input_error naming
+  /// @p path when it cannot be read, is not well-formed YAML, or a value or a rule fails.
   static parsed_sirius_config from_file(const std::filesystem::path& path);
+  /// A document yaml-cpp has loaded; errors name @p source_path when given.
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
+  /// A document config::parse_yaml has read; errors name @p source_path when given.
+  /// @throws configuration_input_error when a value or a rule fails.
+  static parsed_sirius_config from_document(const config::node& document,
+                                            const std::filesystem::path& source_path = {});
   /// The same intent from the typed user configuration: its user-defined values are read back, so
   /// fallbacks fill in the rest and every block's rules hold, also for a configuration built in
   /// code. @throws configuration_input_error when a value or a rule fails.

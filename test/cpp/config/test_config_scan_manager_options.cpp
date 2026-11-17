@@ -205,10 +205,10 @@ TEST_CASE("scan manager cross-field rules", "[config][config_scan_manager]")
             .executor.scan_manager.rest.fan_out.get() == 8);
 
   REQUIRE(read_error("      preparation:\n        native_reader_workers: 65\n") ==
-          "'sirius.executor.scan_manager.preparation': max_native_readers must be at least "
+          "'sirius.executor.scan_manager.preparation.max_native_readers': must be at least "
           "native_reader_workers");
   REQUIRE(read_error("      preparation:\n        partial_batch:\n          min_residence: 3s\n") ==
-          "'sirius.executor.scan_manager.preparation.partial_batch': max_residence must be at "
+          "'sirius.executor.scan_manager.preparation.partial_batch.max_residence': must be at "
           "least min_residence");
 }
 
@@ -325,15 +325,15 @@ TEST_CASE("explicit zeros count as user-defined, nulls do not", "[config][config
 
 TEST_CASE("more scan manager rows", "[config][config_scan_manager]")
 {
-  // R7 with the default worker count of 2, and explicit counts.
+  // max_native_readers against the default worker count of 2, and against explicit counts.
   REQUIRE_THAT(
     read_error("      preparation:\n        max_native_readers: 1\n"),
-    Catch::Matchers::EndsWith("max_native_readers must be at least native_reader_workers"));
+    Catch::Matchers::EndsWith("max_native_readers': must be at least native_reader_workers"));
   REQUIRE_THAT(
     read_error("      preparation:\n        native_reader_workers: 3\n"
                "        max_native_readers: 2\n"),
-    Catch::Matchers::EndsWith("max_native_readers must be at least native_reader_workers"));
-  // R10 boundaries.
+    Catch::Matchers::EndsWith("max_native_readers': must be at least native_reader_workers"));
+  // rest.fan_out against rest_n_reactors, at the boundaries.
   (void)read("      rest_n_reactors: 1\n      rest:\n        fan_out: 2\n");  // default, by value
   (void)read("      rest_n_reactors: 4\n      rest:\n        fan_out: 4\n");
   (void)read("      rest_n_reactors: ~\n      rest:\n        fan_out: 8\n");
@@ -343,9 +343,9 @@ TEST_CASE("more scan manager rows", "[config][config_scan_manager]")
                       std::string(body) + "\n");
   };
   REQUIRE_THAT(pb("max_residence: 0"),
-               Catch::Matchers::EndsWith("max_residence must be at least min_residence"));
+               Catch::Matchers::EndsWith("max_residence': must be at least min_residence"));
   REQUIRE_THAT(pb("max_residence: 49ms"),
-               Catch::Matchers::EndsWith("max_residence must be at least min_residence"));
+               Catch::Matchers::EndsWith("max_residence': must be at least min_residence"));
   REQUIRE_THAT(pb("min_residence: -1ms"),
                Catch::Matchers::ContainsSubstring("must be greater than zero"));
   REQUIRE_THAT(pb("min_fill_percent: 101"),

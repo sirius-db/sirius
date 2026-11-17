@@ -17,6 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "config/user_config.hpp"
+#include "config/yaml.hpp"
 #include "config/yaml_cpp.hpp"
 #include "exec/config.hpp"
 #include "exec/thread_defaults.hpp"
@@ -33,20 +34,23 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <unistd.h>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
-#include <cmath>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <initializer_list>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -362,15 +366,21 @@ void sirius_config::apply_defaults()
 
 parsed_sirius_config parsed_sirius_config::from_file(const std::filesystem::path& path)
 {
-  YAML::Node root;
+  std::string text;
   try {
-    root = YAML::LoadFile(path.string());
-  } catch (const std::bad_alloc&) {
-    throw;
-  } catch (const std::exception& e) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { throw configuration_input_error(path.string() + ": cannot open the file"); }
+    text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+  } catch (const std::ios_base::failure&) {
+    throw configuration_input_error(path.string() + ": cannot read the file");
+  }
+  config::node document;
+  try {
+    document = config::parse_yaml(text);
+  } catch (const config::config_error& e) {
     throw configuration_input_error(path.string() + ": " + e.what());
   }
-  return from_node(root, path);
+  return from_document(document, path);
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -384,17 +394,27 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
 parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root,
                                                      const std::filesystem::path& source_path)
+{
+  config::node document;
+  try {
+    document = config::from_yaml_cpp(root);
+  } catch (const config::config_error& e) {
+    throw configuration_input_error(source_path.empty() ? e.what()
+                                                        : source_path.string() + ": " + e.what());
+  }
+  return from_document(document, source_path);
+}
+
+parsed_sirius_config parsed_sirius_config::from_document(const config::node& document,
+                                                         const std::filesystem::path& source_path)
 try {
-  auto const user = config::read_user_config(config::from_yaml_cpp(root));
-  return from_user_config(user, source_path);
-} catch (const std::bad_alloc&) {
-  throw;
+  return from_user_config(config::read_user_config(document), source_path);
+} catch (const config::config_error& e) {
+  throw configuration_input_error(source_path.empty() ? e.what()
+                                                      : source_path.string() + ": " + e.what());
 } catch (const configuration_input_error& e) {
   if (source_path.empty()) { throw; }
   throw configuration_input_error(source_path.string() + ": " + e.what());
-} catch (const std::exception& e) {
-  throw configuration_input_error(source_path.empty() ? e.what()
-                                                      : source_path.string() + ": " + e.what());
 }
 
 parsed_sirius_config parsed_sirius_config::from_user_config(const config::user_config& input)
