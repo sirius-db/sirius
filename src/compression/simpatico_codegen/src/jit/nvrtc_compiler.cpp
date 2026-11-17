@@ -34,10 +34,14 @@ int arch_cc_for_current_device()
   int dev = 0;
   if (cudaGetDevice(&dev) != cudaSuccess)
     throw std::runtime_error("arch_cc_for_current_device: cudaGetDevice failed");
-  cudaDeviceProp prop{};
-  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
-    throw std::runtime_error("arch_cc_for_current_device: cudaGetDeviceProperties failed");
-  return prop.major * 10 + prop.minor;
+  // Every decode launch asks, so query the two attributes rather than the whole (slow)
+  // cudaGetDeviceProperties.
+  int major = 0;
+  int minor = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
+    throw std::runtime_error("arch_cc_for_current_device: cudaDeviceGetAttribute failed");
+  return major * 10 + minor;
 }
 
 namespace {

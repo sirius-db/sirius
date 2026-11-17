@@ -31,6 +31,7 @@
 #include <catch.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <numeric>
@@ -326,6 +327,95 @@ TEST_CASE("cumulative evaluator matches the model for every direction and NULL o
     cudf::data_type{cudf::type_id::DECIMAL64, -2}, keyed, dir, true, stream, mr);
   check_against_model<__int128_t>(
     cudf::data_type{cudf::type_id::DECIMAL128, -2}, keyed, dir, true, stream, mr);
+  // Floating point extrema, without NaN. The sums are checked separately.
+  check_against_model<float>(
+    cudf::data_type{cudf::type_id::FLOAT32}, keyed, dir, false, stream, mr);
+  check_against_model<double>(
+    cudf::data_type{cudf::type_id::FLOAT64}, keyed, dir, false, stream, mr);
+}
+
+namespace {
+// Checks a floating point result column against @p expected, where NaN matches NaN and nullopt
+// matches NULL.
+template <typename T>
+void check_float_column(cudf::column_view view,
+                        std::vector<std::optional<T>> const& expected,
+                        ::cuda::stream_ref stream)
+{
+  CHECK(view.type() == cudf::data_type{cudf::type_to_id<T>()});
+  auto const values = host<T>(view, stream);
+  auto const valid  = validity(view, stream);
+  for (std::size_t row = 0; row < expected.size(); ++row) {
+    INFO("row " << row);
+    REQUIRE(valid[row] == expected[row].has_value());
+    if (!expected[row]) { continue; }
+    if (std::isnan(*expected[row])) {
+      CHECK(std::isnan(values[row]));
+    } else {
+      CHECK(values[row] == *expected[row]);
+    }
+  }
+}
+}  // namespace
+
+TEMPLATE_TEST_CASE("cumulative evaluator orders NaN above every value in min and max",
+                   "[window_evaluator][window_cumulative][gpu]",
+                   float,
+                   double)
+{
+  rmm::cuda_stream owning_stream;
+  auto stream      = static_cast<::cuda::stream_ref>(owning_stream);
+  auto mr          = cudf::get_current_device_resource_ref();
+  auto const nan   = std::numeric_limits<TestType>::quiet_NaN();
+  auto const inf   = std::numeric_limits<TestType>::infinity();
+  auto const type  = cudf::data_type{cudf::type_to_id<TestType>()};
+  auto const int32 = cudf::data_type{cudf::type_id::INT32};
+  // The NULL rows hold NaN under their mask, which must not count as NaN.
+  SECTION("with PARTITION BY")
+  {
+    // Partition 0 is NULL, NaN, 2, NaN, 1. Partition 1 is NaN, NaN. Partition 2 is 3, NULL, 4.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(column<int32_t>({0, 0, 0, 0, 0, 1, 1, 2, 2, 2}, int32, stream, mr));
+    columns.push_back(column<int32_t>({1, 2, 3, 4, 5, 1, 2, 1, 2, 3}, int32, stream, mr));
+    columns.push_back(
+      column<TestType>({nan, nan, 2, nan, 1, nan, nan, 3, nan, 4},
+                       type,
+                       stream,
+                       mr,
+                       {false, true, true, true, true, true, true, true, false, true}));
+    cudf::table input(std::move(columns));
+    auto result = evaluate_cumulative_window(input.view(),
+                                             {0},
+                                             make_order({1}, ascending_nulls_last),
+                                             {{function::min, 2}, {function::max, 2}},
+                                             stream,
+                                             mr);
+    // A running max is NaN from the first NaN on. A running min is NaN while every non-NULL value
+    // so far is NaN, and NULL before the first non-NULL value.
+    check_float_column<TestType>(
+      result->view().column(0), {std::nullopt, nan, 2, 2, 1, nan, nan, 3, 3, 3}, stream);
+    check_float_column<TestType>(
+      result->view().column(1), {std::nullopt, nan, nan, nan, nan, nan, nan, 3, 3, 4}, stream);
+  }
+  SECTION("without PARTITION BY, next to infinities")
+  {
+    // Infinity orders below NaN.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(column<int32_t>({1, 2, 3, 4, 5}, int32, stream, mr));
+    columns.push_back(column<TestType>(
+      {nan, 3, nan, -inf, inf}, type, stream, mr, {false, true, true, true, true}));
+    cudf::table input(std::move(columns));
+    auto result = evaluate_cumulative_window(input.view(),
+                                             {},
+                                             make_order({0}, ascending_nulls_last),
+                                             {{function::min, 1}, {function::max, 1}},
+                                             stream,
+                                             mr);
+    check_float_column<TestType>(
+      result->view().column(0), {std::nullopt, 3, 3, -inf, -inf}, stream);
+    check_float_column<TestType>(
+      result->view().column(1), {std::nullopt, 3, nan, nan, nan}, stream);
+  }
 }
 
 TEST_CASE("cumulative evaluator takes extrema of dates",
@@ -528,7 +618,5 @@ TEST_CASE("cumulative evaluator rejects invalid requests",
   CHECK_THROWS_AS(call({}, make_order({2}, ascending_nulls_last), {{function::sum, 1}}),
                   std::invalid_argument);
   CHECK_THROWS_AS(call({}, order, {{function::avg, 1}}), std::invalid_argument);
-  // Floating point extrema are not supported.
-  CHECK_THROWS_AS(call({}, order, {{function::min, 1}}), std::invalid_argument);
-  CHECK_THROWS_AS(call({}, order, {{function::max, 1}}), std::invalid_argument);
+  CHECK_NOTHROW(call({}, order, {{function::min, 1}, {function::max, 1}}));
 }

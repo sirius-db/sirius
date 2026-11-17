@@ -17,8 +17,10 @@
 #include "catch.hpp"
 #include "sirius_config.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -45,6 +47,120 @@ struct scoped_yaml {
 };
 
 }  // namespace
+
+TEST_CASE("Host initial pools resolve from NUMA RAM unless explicitly configured",
+          "[topology_config][config][host_pool]")
+{
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto topology = discovery.get_topology();
+  REQUIRE_FALSE(topology.gpus.empty());
+  topology.gpus.resize(1);
+  topology.num_gpus       = 1;
+  auto const numa_id      = topology.gpus.front().numa_node;
+  topology.numa_nodes     = {{.id = numa_id, .memory_capacity = 64ULL << 30, .has_cpus = true}};
+  topology.num_numa_nodes = 1;
+
+  std::string host_settings     = "capacity_bytes: 48Gi";
+  std::size_t expected_pools    = 51;
+  std::size_t expected_capacity = 48ULL << 30;
+  std::string expected_error;
+  SECTION("default uses discovered NUMA RAM") {}
+  SECTION("larger NUMA capacity changes the initial count")
+  {
+    topology.numa_nodes.front().memory_capacity = 128ULL << 30;
+    expected_pools                              = 102;
+  }
+  SECTION("custom pool dimensions change the initial count")
+  {
+    host_settings += ", block_size: 2Mi, pool_size: 256";
+    expected_pools = 12;
+  }
+  SECTION("block alignment is applied before counting pools")
+  {
+    topology.numa_nodes.front().memory_capacity = 1600;
+    host_settings     = "capacity_bytes: 160, block_size: 1, pool_size: 1";
+    expected_capacity = 160;
+    expected_pools    = 160 / alignof(std::max_align_t);
+  }
+  SECTION("block alignment overflow is rejected")
+  {
+    host_settings += ", block_size: " + std::to_string(std::numeric_limits<std::size_t>::max());
+    expected_error = "invalid block_size or pool_size";
+  }
+  SECTION("pool byte size overflow is rejected")
+  {
+    // Keep the count within YAML's signed range so resolution checks the byte-size overflow.
+    constexpr std::size_t block_size = 1ULL << 20;
+    constexpr auto pool_size         = std::numeric_limits<std::size_t>::max() / block_size + 1;
+    host_settings +=
+      ", block_size: " + std::to_string(block_size) + ", pool_size: " + std::to_string(pool_size);
+    expected_error = "pool size in bytes overflows";
+  }
+  SECTION("default host budget uses ninety percent of NUMA RAM")
+  {
+    host_settings.clear();
+    expected_capacity = static_cast<std::size_t>(static_cast<double>(64ULL << 30) * 0.9);
+  }
+  SECTION("smaller host budget caps initial allocation")
+  {
+    host_settings     = "capacity_bytes: 2Gi";
+    expected_pools    = 16;
+    expected_capacity = 2ULL << 30;
+  }
+  SECTION("explicit count overrides automatic sizing")
+  {
+    host_settings += ", initial_number_pools: 3";
+    expected_pools = 3;
+  }
+  SECTION("explicit positive count does not require discovered RAM")
+  {
+    host_settings += ", initial_number_pools: 3";
+    topology.numa_nodes.front().memory_capacity = 0;
+    expected_pools                              = 3;
+  }
+  SECTION("automatic count can round down to zero")
+  {
+    host_settings     = "capacity_bytes: 64Mi";
+    expected_pools    = 0;
+    expected_capacity = 64ULL << 20;
+  }
+  SECTION("explicit zero disables preallocation without requiring discovered RAM")
+  {
+    host_settings += ", initial_number_pools: 0";
+    topology.numa_nodes.front().memory_capacity = 0;
+    expected_pools                              = 0;
+  }
+  SECTION("automatic sizing rejects unknown RAM")
+  {
+    topology.numa_nodes.front().memory_capacity = 0;
+    expected_error                              = "set initial_number_pools explicitly";
+  }
+  scoped_yaml yaml("sirius_initial_host_pools.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: 1 }\n"
+                   "  memory:\n"
+                   "    gpu: { usage_limit_bytes: 1Gi }\n"
+                   "    host: { " +
+                     host_settings + " }\n");
+  auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
+  if (!expected_error.empty()) {
+    REQUIRE_THROWS_WITH(parsed.resolve(topology),
+                        Catch::Matchers::ContainsSubstring(expected_error));
+    return;
+  }
+  auto resolved          = parsed.resolve(topology);
+  std::size_t host_count = 0;
+  for (auto const& space : resolved.get_memory_space_configs()) {
+    if (auto const* host = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      CHECK(host->initial_number_pools == expected_pools);
+      CHECK(host->memory_capacity == expected_capacity);
+      ++host_count;
+    }
+  }
+  CHECK(host_count == 1);
+}
 
 TEST_CASE("parsed hardware configuration resolves independently after copying",
           "[topology_config][config]")

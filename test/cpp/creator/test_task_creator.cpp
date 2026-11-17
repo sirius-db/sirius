@@ -17,7 +17,10 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "utils/telemetry_utils.hpp"
@@ -26,6 +29,7 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -214,6 +218,13 @@ class testable_task_creator : public task_creator {
   }
 
   [[nodiscard]] bool is_running() const { return _running.load(); }
+
+  /// Stands in for prepare_for_query, which needs a whole planned query.
+  void register_global_state(std::size_t operator_id,
+                             std::shared_ptr<sirius_pipeline_task_global_state> state)
+  {
+    get_query_task_global_state(_query_id)->global_states.emplace(operator_id, std::move(state));
+  }
 
   // Expose protected method for testing
   using task_creator::get_operator_for_next_task;
@@ -482,4 +493,68 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // REQUIRE(creator.get_schedule_count() == 1);
   // REQUIRE(scheduled_nodes.size() == 1);
   // REQUIRE(scheduled_nodes[0] == hint_op.get());
+}
+
+TEST_CASE("task_creator creates the boundary task of a distributed SORT_SAMPLE with no input",
+          "[task_creator]")
+{
+  test_fixture fixture;
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.emplace_back(duckdb::OrderType::ASCENDING,
+                      duckdb::OrderByNullType::NULLS_FIRST,
+                      duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                        duckdb::LogicalType::INTEGER, duckdb::idx_t{0}));
+  // A SORT_SAMPLE that takes its boundaries from other processes owes its boundary task.
+  struct one_partition final : sirius::op::cross_rank_sort_boundaries {
+    sirius::op::sort_boundaries make(request const&, ::cuda::stream_ref) override { return {}; }
+  };
+  sirius_physical_sort_sample sample(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    /*estimated_cardinality=*/1000,
+    /*sort_sample_bytes=*/1 << 20,
+    /*max_partition_bytes=*/0);
+  sample.set_cross_rank_boundaries(std::make_shared<one_partition>());
+  sample.operator_id = 0;
+
+  // This rank's upstream finished without producing a batch.
+  cucascade::shared_data_repository repo;
+  auto upstream = fixture.create_mock_pipeline();
+  upstream->set_finished(true);
+  auto port          = std::make_unique<sirius_physical_operator::port>();
+  port->type         = MemoryBarrierType::PIPELINE;
+  port->repo         = &repo;
+  port->src_pipeline = upstream;
+  sample.add_port("input", std::move(port));
+
+  auto pipeline = fixture.create_mock_pipeline();
+  sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*pipeline, sample);
+  sample.set_pipeline(pipeline);
+
+  testable_task_creator creator(
+    fixture.lifecycle, 1, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+  pipeline->set_query_id(creator.query_id());
+  creator.register_global_state(sample.operator_id,
+                                std::make_shared<gpu_pipeline_task_global_state>(
+                                  pipeline, sirius::test::make_test_telemetry_context()));
+  creator.start_thread_pool();
+  creator.task_creator::schedule(&sample);
+
+  auto* queue         = fixture.pipeline_exec.get_pipeline_task_queue();
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (queue->empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  creator.stop_thread_pool();
+
+  REQUIRE(queue->size() == 1);
+  auto task = queue->try_pop();
+  REQUIRE(task.has_value());
+  auto* local = dynamic_cast<gpu_pipeline_task_local_state*>((*task)->local_state());
+  REQUIRE(local != nullptr);
+  auto* input = dynamic_cast<pipelineable_operator_data*>(local->_input_data.get());
+  REQUIRE(input != nullptr);
+  CHECK(input->get_data_batches().empty());
 }
