@@ -91,6 +91,7 @@ void numeric_sources(simpatico::stream_pool& pool,
   std::vector<std::int32_t> first_twenty(20);
   std::iota(first_twenty.begin(), first_twenty.end(), 0);
   sc::scan_filter_request request;
+  request.fused_scan.max_membership_sources = 4;
   request.routes            = {sc::decode_route::bitpack_mask, sc::decode_route::full};
   request.source_generation = 42;
   request.filters.push_back({0, {0, 19}});
@@ -115,6 +116,24 @@ void numeric_sources(simpatico::stream_pool& pool,
            "direct FULL remains legal on a compact-capable bitpack plan");
   }
   output.reset();
+
+  // A full-width output uses this request's own threshold on every decode.
+  for (bool const accept : {false, true, false}) {
+    request.fused_scan.full_route_max_selectivity =
+      (20.0 / static_cast<double>(row_count)) * (accept ? 2.0 : 0.5);
+    output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied == accept, "full-route selectivity threshold is per request");
+    if (accept) {
+      verify_values(output->view(), first_twenty, stream);
+    } else {
+      expect(result.status == sc::scan_filter_status::declined_unselective &&
+               output->num_rows() == row_count,
+             "full-route threshold decline returns every row");
+    }
+    output.reset();
+  }
+  request.fused_scan.full_route_max_selectivity = 0.10;
 
   request.filters.front().pred = {0, row_count - 1};
   output =
@@ -295,6 +314,7 @@ void membership_cascade(simpatico::stream_pool& pool,
 
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 199}});
     probe_trace trace;
@@ -319,7 +339,8 @@ void membership_cascade(simpatico::stream_pool& pool,
   // A keep mask alone primes the cascade.
   {
     sc::scan_filter_request request;
-    request.routes = {sc::decode_route::full, sc::decode_route::full};
+    request.fused_scan.max_membership_sources = 4;
+    request.routes                            = {sc::decode_route::full, sc::decode_route::full};
     std::vector<std::uint32_t> keep((row_count + 31) / 32, 0);
     for (int i = 0; i < row_count; i += 2)
       keep[i / 32] |= std::uint32_t{1} << (i % 32);
@@ -342,6 +363,7 @@ void membership_cascade(simpatico::stream_pool& pool,
   // A probe that throws after an earlier probe queued work and declined.
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 19}});
     auto const limit =
@@ -383,6 +405,7 @@ void membership_cascade(simpatico::stream_pool& pool,
     request.routes = {sc::decode_route::full, sc::decode_route::full};
     probe_trace trace;
     request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
+    request.fused_scan.max_membership_sources = 4;
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     sc::scan_filter_result result;
     auto output =
@@ -402,6 +425,7 @@ void membership_cascade(simpatico::stream_pool& pool,
     probe_trace trace;
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.fused_scan.max_membership_sources = 4;
     sc::scan_filter_result result;
     auto output =
       simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
@@ -439,6 +463,7 @@ void membership_measurement(simpatico::stream_pool& pool,
   // The cascade after a range: each probe sees the rows the range and the earlier probes kept.
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 199}});
     request.measure_membership = true;
@@ -467,6 +492,7 @@ void membership_measurement(simpatico::stream_pool& pool,
     request.routes             = {sc::decode_route::full, sc::decode_route::full};
     request.measure_membership = true;
     probe_trace trace;
+    request.fused_scan.max_membership_sources = 4;
     request.membership_filters.push_back({1, traced_probe(trace, 10100, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
@@ -889,13 +915,6 @@ void dict_codes_gather(simpatico::stream_pool& pool,
 int main()
 {
   try {
-    // Policy values cache on first read; use a dedicated process, not mutations
-    // of environment knobs between cases in a shared engine test binary.
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "4", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", "0.35", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", "0.10", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL", "0.15", 1);
     // cuDF intentionally retains its default pinned pool until process exit.
     // Use individually freed pinned allocations so this standalone fixture can
     // check complete teardown without suppressing process-global pool leaks.

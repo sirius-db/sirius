@@ -23,7 +23,7 @@ The script runs three steps:
 |---|---|
 | `shards` | Two Catch2 shards per visible GPU in parallel. Each shard sees one GPU, sets `SIRIUS_TEST_SINGLE_GPU=1` and uses `cpp/integration/integration-shard.yaml`. `[multi_gpu]` and hidden tests are excluded. |
 | `multi_gpu` | The `[multi_gpu]` tests with all GPUs visible. Skipped with fewer than two GPUs. |
-| `late_mat` | The `[late_mat]`, `[deferred_query]` and `[native_filter]` tests with `SIRIUS_EXP_LATE_MAT=1`. |
+| `late_mat` | The `[late_mat]`, `[deferred_query]` and `[native_filter]` tests; late materialization is enabled by default. |
 
 It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each process writes `unittest.log` and `sirius.log` to its own subdirectory of `build/release/test/cpp/log/`, for example `shard-0/` or `late_mat/`.
 

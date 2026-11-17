@@ -94,6 +94,8 @@ struct membership_snapshot {
  * split's own state.
  */
 struct membership_attach_options {
+  bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   /// The scan latched decode-time compaction as unprofitable, so offer no probes.
   bool selection_unprofitable = false;
   /// The split carries an MVCC keep-mask that the representation does not compose into the decode.
@@ -157,6 +159,7 @@ void attach_membership_probes(Representation& rep,
  */
 class scan_operator_input : public op::operator_data {
  public:
+  scan_execution_context execution;
   enum class prefetch_start { immediate, deferred };
   /// Hint the IO layer about every range this split will read, then publish it
   /// to @p readahead -- in that order, which is why both belong here.
@@ -335,6 +338,9 @@ class scan_operator_input : public op::operator_data {
   }
 
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Immutable query policy, set before estimating or preparing this split.
+  bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   std::variant<std::monostate, std::shared_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
   /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =

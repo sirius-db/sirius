@@ -8,5 +8,5 @@
   "license": "LicenseRef-Proprietary",
   "name": "cusparse",
   "supports": "linux & (x64 | arm64)",
-  "version": "12.8.1.7"
+  "version": "12.9.4.2"
 }
