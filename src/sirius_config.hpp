@@ -30,6 +30,7 @@
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -228,6 +229,7 @@ struct operator_params {
   /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
   /// Defaults to 8x startup-resolved hash_partition_bytes unless explicitly configured.
   /// SET hash_partition_bytes does not re-derive it; 0 disables BUILD_PROBE including MARK.
+  /// Also the floor of the per-GPU Bloom budget (max_dynamic_filter_bloom_bytes_per_gpu()).
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
   /// Per-GPU decoded build payload budget for BUILD_PROBE. The folded batch stays read-locked
@@ -261,11 +263,12 @@ struct operator_params {
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
-  /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
-  /// Saturate overflow; YAML and SQL cannot override the budget independently.
+  /// Engine-owned per-GPU cap on the sum of one join's Bloom arrays: the larger of 4x this query's
+  /// scan batch size (saturating) and max_build_hash_table_bytes. YAML and SQL cannot override the
+  /// budget independently.
   [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
   {
-    return memory::saturating_mul(4, scan_task_batch_size);
+    return std::max(memory::saturating_mul(4, scan_task_batch_size), max_build_hash_table_bytes);
   }
 
   /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.

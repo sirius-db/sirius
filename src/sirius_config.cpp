@@ -680,7 +680,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (r.has("max_dynamic_filter_bloom_bytes_per_gpu")) {
     throw std::runtime_error(
       "'operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget is "
-      "always 4x scan_task_batch_size; remove this key");
+      "derived from scan_task_batch_size and max_build_hash_table_bytes; remove this key");
   }
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",

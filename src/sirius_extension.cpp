@@ -3835,7 +3835,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum per-GPU estimated BUILD_PROBE hash-table bytes (measured "
                             "build rows x 16 B) for a hash join to build a reusable hash table "
-                            "(i.e. BUILD_PROBE mode)",
+                            "(i.e. BUILD_PROBE mode); also the floor of the per-GPU dynamic-filter "
+                            "Bloom budget",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);

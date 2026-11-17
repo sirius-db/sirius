@@ -29,8 +29,9 @@ inline constexpr double default_dynamic_filter_domain_coverage_threshold = 0.9;
  * @brief Fallback per-GPU cap on one join's accumulated Bloom arrays.
  *
  * Four times the hardware-independent 800 MiB scan batch fallback. Query
- * planning supplies 4x the query's scan_task_batch_size. This fallback is only
- * for standalone publication policies, not a user-configurable budget.
+ * planning supplies the larger of 4x the query's scan_task_batch_size and its
+ * max_build_hash_table_bytes. This fallback is only for standalone publication
+ * policies, not a user-configurable budget.
  */
 inline constexpr std::uint64_t default_max_dynamic_filter_bloom_bytes_per_gpu =
   4ULL * (800ULL << 20);

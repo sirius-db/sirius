@@ -293,18 +293,34 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
   }
 
-  SECTION("a single-partition build over a lowered Bloom cap gets no Bloom and matches the CPU")
+  SECTION("a Bloom over four scan batches and the hash-table cap is refused and matches the CPU")
   {
     sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
-    sirius::test::scoped_setting whole_build(*con, "max_build_hash_table_bytes", 64 * 1024 * 1024);
+    // The Bloom budget is the larger of 4x the 64 KiB scan batch and the 256 KiB hash-table cap:
+    // 256 KiB, below the Bloom filter of about 410 KiB this build needs.
+    sirius::test::scoped_setting small_table(*con, "max_build_hash_table_bytes", 256 * 1024);
     sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
-    // The Bloom budget is 4x the scan batch size: 256 KiB, below the Bloom this build needs.
-    sirius::test::scoped_setting lowered_cap(*con, "scan_task_batch_size", 64 * 1024);
+    sirius::test::scoped_setting small_scan(*con, "scan_task_batch_size", 64 * 1024);
     auto const run = run_on_gpu(*con, query);
     REQUIRE(run.rows == cpu_rows);
     REQUIRE(run.after.keys_skipped_bloom_size_gate > run.before.keys_skipped_bloom_size_gate);
     REQUIRE(run.after.membership_filters_built == run.before.membership_filters_built);
     REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
+  }
+
+  SECTION("a Bloom over four scan batches but within the hash-table cap is built")
+  {
+    sirius::test::scoped_setting whole_partition(*con, "hash_partition_bytes", 64 * 1024 * 1024);
+    // The 1 MiB hash-table cap is the budget, above the Bloom filter this build needs.
+    sirius::test::scoped_setting small_table(*con, "max_build_hash_table_bytes", 1024 * 1024);
+    sirius::test::scoped_setting force_bloom(*con, "dynamic_filter_inlist_max_l2_fraction", 0);
+    // Four scan batches are 256 KiB, below the Bloom filter this build needs.
+    sirius::test::scoped_setting small_scan(*con, "scan_task_batch_size", 64 * 1024);
+    auto const run = run_on_gpu(*con, query);
+    REQUIRE(run.rows == cpu_rows);
+    REQUIRE(run.after.keys_skipped_bloom_size_gate == run.before.keys_skipped_bloom_size_gate);
+    REQUIRE(run.after.membership_filters_built > run.before.membership_filters_built);
+    REQUIRE(run.after.filters_pushed > run.before.filters_pushed);
   }
 
   SECTION("a single-partition build constructs its filters at the PARTITION")

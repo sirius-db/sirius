@@ -1098,7 +1098,8 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.sort_sample_bytes == batch);
   REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
   REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
-  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * batch);
+  // The hash-table cap, 8x the batch, is above four scan batches.
+  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() == 8 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -1271,7 +1272,7 @@ TEST_CASE("startup BUILD_PROBE budgets remain independent through SET and RESET"
   require_budgets(index_default, resident_default);
 }
 
-TEST_CASE("dynamic-filter Bloom budget follows scan size through SET and RESET",
+TEST_CASE("dynamic-filter Bloom budget follows scan size and hash-table cap through SET and RESET",
           "[sirius][config][operator_defaults][dynamic_filter][isolated_context]")
 {
   std::optional<std::string> original_test_options;
@@ -1303,15 +1304,25 @@ TEST_CASE("dynamic-filter Bloom budget follows scan size through SET and RESET",
     CHECK(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
           expected);
   };
-  constexpr uint64_t startup_budget = 32ULL << 20;
-  require_budget(startup_budget);
+  constexpr uint64_t scan_budget = 32ULL << 20;
+  auto const startup_hash_table =
+    duckdb::session_operator_params(*con.context).max_build_hash_table_bytes;
+  require_budget(std::max(scan_budget, startup_hash_table));
+  // Without a hash-table cap the budget is the scan term alone.
+  execute("SET max_build_hash_table_bytes = 0");
+  require_budget(scan_budget);
   execute("SET scan_task_batch_size = 99");
   require_budget(4 * 99);
   REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 123")->HasError());
   REQUIRE(con.Query("RESET max_dynamic_filter_bloom_bytes_per_gpu")->HasError());
   execute("RESET scan_task_batch_size");
-  require_budget(startup_budget);
+  require_budget(scan_budget);
   CHECK(duckdb::session_operator_params(*con.context).scan_task_batch_size == (8ULL << 20));
+  // A hash-table cap above four scan batches raises the budget to it.
+  execute("SET max_build_hash_table_bytes = 67108864");
+  require_budget(64ULL << 20);
+  execute("RESET max_build_hash_table_bytes");
+  require_budget(std::max(scan_budget, startup_hash_table));
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
@@ -1743,8 +1754,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->Collection().GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->Collection().GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->Collection().GetValue(20, 0).GetValue<uint64_t>() == 9 * mib);
+  // The Bloom budget is the 6 MiB hash-table cap, above four 1 MiB scan batches.
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
-          4 * mib);
+          6 * mib);
   for (auto const* name : {"enable_late_materialization",
                            "enable_fused_scan_filter",
                            "enable_low_cardinality_groupby"}) {
@@ -1807,7 +1819,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     REQUIRE(rejected->HasError());
     REQUIRE(
       duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
-      4 * mib);
+      6 * mib);
   }
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
@@ -1908,7 +1920,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET enable_dynamic_filter");
   REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
   REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu() ==
-          4 * mib);
+          6 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
