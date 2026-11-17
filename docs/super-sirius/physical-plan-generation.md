@@ -39,7 +39,9 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (distinct forms) | `HASH_GROUP_BY` over `HASH_JOIN` (null-safe ANTI / SEMI) | `src/planner/sirius_plan_set_operation.cpp` |
 
-`LOGICAL_DELIM_JOIN` reaches Sirius because Sirius loads with DuckDB's `delim_join_as_cte` defaulting to `false`. With the setting at DuckDB v2's own default (`true`), the same subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins; see [DuckDB Settings Changed by Sirius](configuration.md#duckdb-settings-changed-by-sirius).
+With DuckDB's default `delim_join_as_cte = true`, decorrelated subqueries arrive as `LOGICAL_MATERIALIZED_CTE` plus `LOGICAL_CTE_REF` and ordinary semi, anti and mark joins. `LOGICAL_DELIM_JOIN` reaches Sirius only when a session sets `delim_join_as_cte = false`.
+
+DuckDB clears each delim CTE's `filter_dependency` before it runs any extension's pre-optimize hook. That proof lets its `CTEFilterPusher` and `CTEJoinFilterPusher` filter a delim CTE's body, so without it they skip delim CTEs, in CPU plans too. Sirius's pre-optimize hook does not reshape the plan, so it ends by giving the proof back (`restore_cte_filter_dependencies` in `planner/delim_cte_proof.cpp`), derived with DuckDB's rule. Sirius also counts Parquet scans as repeatable, which DuckDB does not, so with Sirius loaded DuckDB pushes into delim CTE bodies over Parquet as well, in its CPU plans too. This runs for every query, whether or not GPU execution is on.
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN` other than INNER, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`.

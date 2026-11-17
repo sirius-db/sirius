@@ -227,6 +227,22 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
+                 "whole-partition DECIMAL AVG of equal values is one value",
+                 "[integration][gpu_execution][window_sql]")
+{
+  // Partition g holds g copies of one value, so every partition's average is that value. The
+  // DISTINCT catches a last-bit difference that the tolerant comparison would accept.
+  run_ok(
+    "CREATE TABLE eq AS SELECT g::INTEGER g, 626554.3479::DECIMAL(18,4) v "
+    "FROM range(1, 21) a(g), range(20) b(i) WHERE i < g");
+  run_ok("CHECKPOINT");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  compare_window("SELECT DISTINCT a FROM (SELECT avg(v) OVER (PARTITION BY g) a FROM eq)");
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.fallbacks == before.fallbacks);
+}
+
+TEST_CASE_METHOD(WindowFixture,
                  "empty whole-partition SQL windows return zero rows",
                  "[integration][gpu_execution][window_sql]")
 {

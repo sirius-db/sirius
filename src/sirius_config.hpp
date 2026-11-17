@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "compression/simpatico_codegen/src/codegen/selection/decompression_pushdown_policy.hpp"
 #include "config.hpp"
 #include "creator/config.hpp"
+#include "exchange/host_staging.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -29,11 +32,14 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -173,6 +179,8 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
+
 /// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
 /// table into one scan and a per-key MIN/MAX aggregate.
 constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
@@ -243,7 +251,19 @@ enum class sort_merge_mode : uint8_t {
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and 8x that size for BUILD_PROBE budgets.
+  /// Connection-local optimization policy, snapshotted before query execution.
+  bool enable_late_materialization    = true;
+  bool enable_fused_scan_filter       = true;
+  bool enable_low_cardinality_groupby = true;
+
+  /// Connection-local deferral thresholds, copied into each query's planning policy.
+  int late_materialization_min_boundaries                  = 4;
+  std::int64_t late_materialization_min_value_x_boundaries = 128;
+  bool late_materialization_count_defer                    = false;
+  std::int64_t late_materialization_min_value_compressed   = 1;
+  codegen::fused_scan_policy fused_scan;
+
+  /// Construct defaults with a shared batch size and 8x BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
@@ -361,16 +381,34 @@ struct operator_params {
   /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
   bool enable_dynamic_filter_multi_partition = true;
 
-  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
-  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
-    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
+  /// Saturate overflow; YAML and SQL cannot override the budget independently.
+  [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
+  {
+    return memory::saturating_mul(4, scan_task_batch_size);
+  }
+
+  /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.
+  /// Fewer than two run in one process. Every rank runs the same SQL over every file of each table
+  /// and scans its own share of the files; rank 0 returns the result.
+  std::vector<std::string> exchange_peers;
+  /// This process's rank among exchange_peers.
+  uint32_t exchange_rank = 0;
+  /// Distributed execution: whether the exchange host-stages its writes to peers.
+  exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
+
+  /// More than one rank: plans are split across processes and exchange rows.
+  [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
-  /// above 1 disable the gate.
-  double dynamic_filter_domain_coverage_threshold = 0.9;
+  /// Skip an eligible key when its complete build meets this known row-domain coverage. A key is
+  /// eligible when proven unique, or declared through `pin_table(..., unique_cols => [...])` on a
+  /// matching materialized Parquet pin. Unknown or zero domains disable the gate, as do values
+  /// above 1.
+  double dynamic_filter_domain_coverage_threshold =
+    sirius::op::default_dynamic_filter_domain_coverage_threshold;
 
   /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
   /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.
@@ -426,6 +464,11 @@ struct operator_params {
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
+  /// same. See `reuse_delim_rows_for_subquery_aggregates`.
+  bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
 
   /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
   /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
@@ -525,6 +568,27 @@ class configuration_input_error : public std::runtime_error {
 
 class parsed_sirius_config;
 
+/// The CPUs a REST pool built from (@c rest_n_reactors, @c rest) would pin to, sorted:
+/// cuCascade's @c planned_reactor_cpus in production.  May throw.
+using rest_reactor_cpu_planner =
+  std::function<std::vector<int>(std::size_t n_reactors, cucascade::io::rest::config const& rest)>;
+
+/**
+ * @brief Remove the CPUs the pinned REST reactors will take from each of @p pools.
+ *
+ * A pool without an affinity starts from @p allowed (the configuring thread's mask); a pool
+ * whose affinity lies entirely on reactor CPUs keeps it rather than losing every CPU.
+ *
+ * @return The reserved CPUs, sorted; empty when nothing is reserved (the switch is off, planning
+ * failed, the reactors run unpinned, or they would take every allowed CPU), and the pools are
+ * then left untouched.
+ */
+[[nodiscard]] std::vector<int> reserve_cpus_for_rest_reactors(
+  scan_manager::scan_manager_config const& scan_manager,
+  rest_reactor_cpu_planner const& plan,
+  std::vector<int> const& allowed,
+  std::span<exec::thread_pool_config* const> pools);
+
 struct sirius_config {
   sirius_config()  = default;
   ~sirius_config() = default;
@@ -569,6 +633,13 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
+  /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
+  /// thread pool's affinity; empty when nothing is reserved.
+  [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept
+  {
+    return _rest_reactor_cpus;
+  }
+
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
@@ -601,9 +672,10 @@ struct sirius_config {
     return _compression_config;
   }
 
-  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
-  /// Limits each query to the first @c gpus_per_query entries of the sorted
-  /// active-GPU list; the rest are left available for future concurrent queries.
+  /// Initial GPU admission cap per query. 0 = use all active GPUs (default).
+  /// Initially limits admission to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list. Admission can then add GPUs holding compressed GPU-tier pins
+  /// that match a scanned source, even if those pins ultimately do not serve the scan.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
@@ -629,6 +701,12 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Restrict the GPU pipeline, scan manager, task creator and downgrade pools
+  /// to the CPUs the REST reactors will not pin to (see
+  /// @c scan_manager_config::reserve_rest_reactor_cpus).  Called from
+  /// @ref finalize_derived_config.
+  void reserve_rest_reactor_cpus();
+
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -643,6 +721,8 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
+  std::vector<int> _rest_reactor_cpus;
 };
 
 /// Checks that @p directory can take spill files: it is a directory (created if it is missing)

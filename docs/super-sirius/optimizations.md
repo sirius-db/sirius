@@ -151,6 +151,21 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Subquery Aggregates from the Delim Join's Rows
+
+**Motivation:** DuckDB decorrelates `l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` (TPC-H q17) and q2's `MIN(ps_supplycost)` over the EUROPE suppliers into a delim join whose subquery side joins the outer rows' distinct keys back to a fresh scan of the subquery's tables. When the outer rows already hold every subquery row for their key, that second scan, and the join against the keys, are redundant.
+
+**Mechanism:** a logical rewrite on the transparent path's copy of DuckDB's optimized plan, before Sirius plans it. `DELIM_JOIN(O, ... AGGREGATE(I))` becomes `CTE(O) { JOIN(CTE_SCAN, ... AGGREGATE(CTE_SCAN)) }` with the same join type and conditions: the outer rows are materialized once and grouped by their key. Under `delim_join_as_cte = true`, where DuckDB has already made `O` a CTE and restricts `I` by a SEMI join against `SELECT DISTINCT key FROM CTE_SCAN`, the aggregate's input becomes a scan of that CTE instead. The aggregate keeps its table indexes, so nothing above it changes.
+
+**When it applies:** both sides are flattened into a product of leaves filtered by the conjunction of their predicates. `I` must be the subquery's rows `S` restricted by one `S.a = key` equality, and `O` must be `S' x P` where every leaf of `S` maps to exactly one scan of the same table view (or of the same CTE) in `S'`, the predicates over `S'` alone are exactly `S`'s, and every predicate across `S'` and `P` reads `S'` only through `a`. The join key must be `a` or a column of `P` equated with it. Then the outer rows with key `k` are `S`'s rows with `a = k`, each repeated the same number of times, which leaves MIN and MAX unchanged, and AVG too when its input is an INTEGER, a BIGINT, or a DECIMAL of width 5 to 18 (a DOUBLE sum depends on the order rows are added in). Repetition also scales AVG's sum: DuckDB sums those inputs in 128 bits, which no row count can overflow, while SMALLINT and DECIMAL(1-4) sum in 64 bits and HUGEINT and DECIMAL(19-38) in 128 bits, either of which can overflow on repeated rows where the original aggregate does not. A `key IS NOT NULL` filter replaces the subquery's `=` when no join already rejects NULL keys. Anything else declines: SUM, COUNT, DISTINCT or filtered aggregates, extra filters on either side, correlation on another column, an aggregate argument the outer rows do not output, or more than one duplicate-eliminated column.
+
+**Code path:**
+- `src/planner/sirius_plan_delim_aggregate_reuse.cpp` — matcher (`match_aggregate`) and both rewrites
+- `src/transparent/sirius_optimizer_extension.cpp` — runs it on the captured plan copy, planning without it if it throws
+- `src/transparent/read_view_registry.cpp` — read-view validation accepts a plan that reads an identical view fewer times
+
+**Config:** `enable_delim_aggregate_reuse` (default: `true`, see [Configuration](configuration.md)).
+
 ### Correlated EXISTS MIN/MAX Rewrite
 
 **Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
@@ -221,7 +236,7 @@ Because the merged plan reads one view fewer times than the original, `compare_r
 
 **Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
 
-### Low-Cardinality Grouped Aggregation (experimental)
+### Low-Cardinality Grouped Aggregation
 
 **Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
 
@@ -238,7 +253,7 @@ It applies only to one or two non-null one-character STRING keys, at most 64 gro
 - `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
 
-**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+**Config:** `enable_low_cardinality_groupby` (SQL or YAML, enabled by default; see [Configuration](configuration.md#grouped-aggregation)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
 
 ### Distinct Hash Join (PR #558)
 
@@ -466,7 +481,7 @@ result materialization restore native carriers.
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
 
-### Late Materialization (unreleased, experimental)
+### Late Materialization
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
 reads them — through joins that copy them beside their keys, partitions that write them to a
@@ -493,10 +508,12 @@ distinctness proof.
 - `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
-**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+**Config:** `enable_late_materialization` controls the feature (SQL or YAML, enabled by default);
 The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
-that a group-by-rowid ride needs. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
-floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+that a group-by-rowid ride needs. The connection-local `late_materialization_min_boundaries`,
+`late_materialization_min_value_x_boundaries`, `late_materialization_min_value_compressed`, and
+`late_materialization_count_defer` settings tune the floors and the count-on-deferred path.
+Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.
 
@@ -606,7 +623,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
 
-**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives its own libcurl multi handle), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
+**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives HTTP/1.1 connection pools on its own io_uring ring, with kTLS or user-space TLS for HTTPS endpoints), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
 
 **Code path:**
 - `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST reactor and context over the shared `templated_ioctx` base

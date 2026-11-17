@@ -30,6 +30,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "planner/delim_cte_proof.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -78,6 +79,11 @@ namespace sirius {
 class sirius_engine;
 }  // namespace sirius
 
+namespace sirius::exchange {
+class distributed_session;
+class exchange_service;
+}  // namespace sirius::exchange
+
 namespace duckdb {
 
 class Connection;
@@ -115,6 +121,9 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
+    planned_distributed_query = 0;
     // DuckDB has finished/abandoned the previous statement before starting another.
     // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
     pinned_update_guard_.reset();
@@ -134,6 +143,11 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<sirius::compression_config> compression_overrides;
   std::shared_ptr<const sirius::operator_params> execution_options;
   bool execution_window_active{false};
+  /// The execution window open on this connection, 0 when none.
+  uint64_t active_window{0};
+  /// The distributed query this connection planned before its execution window opened; the
+  /// window adopts it. Cleared at each statement's start, so a plan that never ran leaves nothing.
+  uint64_t planned_distributed_query{0};
 
   /// \brief Report @p error, not the interrupt it raised, when the CPU replay failed.
   ///
@@ -169,6 +183,8 @@ class SiriusConnectionState : public ClientContextState {
     ++planning_generation_;
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
 
@@ -214,11 +230,32 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
-  /// planning generation.
+  /// planning generation, together with the CTE reader proofs the pre-optimize hook staged for
+  /// the same optimizer run.
   void set_captured_plan(unique_ptr<LogicalOperator> plan)
   {
-    captured_plan_       = std::move(plan);
-    captured_generation_ = planning_generation_;
+    captured_plan_              = std::move(plan);
+    captured_generation_        = planning_generation_;
+    captured_cte_reader_proofs_ = std::move(staged_cte_reader_proofs_);
+    staged_cte_reader_proofs_.reset();
+  }
+
+  /// \brief Stage the CTE reader proofs collected by the pre-optimize hook. They are kept only if
+  /// the optimizer hook captures the plan of the same run (`set_captured_plan`).
+  void stage_cte_reader_proofs(
+    std::shared_ptr<sirius::planner::delim_cte_proofs const> proofs) noexcept
+  {
+    staged_cte_reader_proofs_ = std::move(proofs);
+  }
+
+  /// \brief Consume the proofs captured with the plan iff they belong to the CURRENT planning
+  /// attempt. Without proofs, no CTE read is treated as restrictable.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const>
+  take_captured_cte_reader_proofs_if_current() noexcept
+  {
+    auto proofs = std::move(captured_cte_reader_proofs_);
+    captured_cte_reader_proofs_.reset();
+    return captured_generation_ == planning_generation_ ? std::move(proofs) : nullptr;
   }
 
   void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
@@ -256,6 +293,8 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_.reset();
     captured_original_views_.reset();
+    staged_cte_reader_proofs_.reset();
+    captured_cte_reader_proofs_.reset();
   }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
@@ -315,6 +354,9 @@ class SiriusConnectionState : public ClientContextState {
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
   std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
+  /// Delim-CTE reader proofs: staged by the pre-optimize hook, captured with the plan.
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> staged_cte_reader_proofs_;
+  std::shared_ptr<sirius::planner::delim_cte_proofs const> captured_cte_reader_proofs_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -761,6 +803,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Rebuild scan caches with HOST downgrade borrowers quiesced, then rebind and resume them.
+  /// The caller must hold exclusive maintenance admission, as for scan-manager cache resets.
+  void reset_caches();
+
   /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
@@ -793,6 +839,47 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
+
+  /// \brief This process's exchange for distributed execution, connected to every peer of the
+  /// current settings on first use.
+  /// @throws sirius::invalid_input_exception when the settings change after it connected, or
+  ///         Sirius was built without NIXL.
+  [[nodiscard]] std::shared_ptr<sirius::exchange::exchange_service> get_exchange_service(
+    sirius::operator_params const& params);
+
+  /// \brief Numbers a distributed query planned on @p context, from 1, and ties it to the
+  /// connection's execution window. Every rank runs the same statements, so the same query gets
+  /// the same number, and its exchanges the same stream ids. That holds for one statement stream
+  /// only, so one connection per process runs distributed queries.
+  /// @throws sirius::invalid_input_exception when another connection already runs them.
+  [[nodiscard]] uint64_t next_distributed_query(ClientContext& context);
+
+  /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
+  /// one takes over, and numbering continues where it stopped.
+  void release_distributed_connection(ClientContext& context);
+
+  /// \brief The distributed query execution window @p window runs, or 0.
+  [[nodiscard]] uint64_t distributed_query_of(sirius::query_id_t window);
+
+  /// \brief Test hook: @p service becomes this process's exchange, as if connected; null drops it.
+  void set_exchange_service_for_testing(
+    std::shared_ptr<sirius::exchange::exchange_service> service);
+
+  /// \brief This process's distributed session, or null until its first distributed use (a
+  /// distributed plan, or SET sirius_exchange_rank with the peers set). Once set, it stays until
+  /// this context is destroyed.
+  [[nodiscard]] sirius::exchange::distributed_session* distributed() const noexcept
+  {
+    return distributed_.load(std::memory_order_acquire);
+  }
+
+  /// \brief @p context's open execution window runs distributed query @p query, which an earlier
+  /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
+  void adopt_distributed_query(ClientContext& context, uint64_t query);
+
+  /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
+  /// peer's run of it fails too, rather than waiting for this rank's batches.
+  void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -874,6 +961,7 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  void rebind_fs_cache_on_host_executors();
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring
   /// (and before returning) re-checks BOTH runtime health and the acquiring
@@ -968,9 +1056,11 @@ class SiriusContext : public ClientContextState {
   // stops and destroys them before resetting the scheduler. Member declaration order
   // preserves that lifetime relationship during destruction as well.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
+  // HOST downgrade executors borrow the default ioctx's cache. Declare its owner before
+  // them so initialize() failure also stops/destroys the borrowers before the cache.
+  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
-  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
   std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
     std::make_shared<sirius::event::query_event_publisher>()};
@@ -1012,6 +1102,16 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
+
+  /// distributed(), created on first use.
+  sirius::exchange::distributed_session& distributed_session_for_use();
+  std::mutex distributed_create_mutex_;
+  /// The session behind distributed(). It stays until this context is destroyed, so after the
+  /// first distributed use each execution window takes the session's lock twice: when its query
+  /// work retires and when the window ends. terminate() shuts its exchange down before the memory
+  /// manager: its transport uses the memory spaces.
+  std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
+  std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

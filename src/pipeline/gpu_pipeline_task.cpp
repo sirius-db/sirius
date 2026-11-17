@@ -181,7 +181,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
 }
 
 /// Put a deferred bundle's values back, just before the operator that reads
-/// them runs (env gate: SIRIUS_EXP_LATE_MAT, via the directive being installed).
+/// them runs (query setting: enable_late_materialization, via the directive being installed).
 ///
 /// Null means "use the input as it is": this operator carries no consuming half,
 /// or the batches are not the ones the directive was installed for. A port can
@@ -517,6 +517,16 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
           throw thrust::system_error(static_cast<int>(cudaErrorLaunchOutOfResources),
                                      thrust::cuda_category(),
                                      "injected GPU task launch failure");
+      }
+      if (auto* scan_input =
+            dynamic_cast<op::scan::scan_operator_input*>(operator_input_output_data.get())) {
+        scan_input->execution.attempt = uint64_t{local_state.retry_count} + 1;
+        // Retry tasks retain the original task identity; allocator addresses
+        // can be reused by a later input in the same scan.
+        scan_input->execution.logical_input =
+          local_state.original_task_id.value_or(get_task_id()) + 1;
+        if (auto completion = get_completion_handler())
+          scan_input->execution.stop = completion->execution_stop_token();
       }
       operator_input_output_data = run_one_operator(
         op,

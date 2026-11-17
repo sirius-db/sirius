@@ -611,9 +611,6 @@ TEST_CASE("pin_table compression - decode-time pure-filter column omission prese
           "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
-  if (!sirius::decompression_pushdown_enabled()) {
-    WARN("filtered-decode env gate off in this process; only the plain decode is exercised");
-  }
 
   auto [tmp, yaml_path] = make_comp_env("dropfilter");
 

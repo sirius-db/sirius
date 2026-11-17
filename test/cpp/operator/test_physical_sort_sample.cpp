@@ -27,6 +27,7 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -107,6 +108,20 @@ void attach_port(sirius_physical_sort_sample& sample_op,
   port->dest_pipeline = nullptr;
   sample_op.add_port("input", std::move(port));
 }
+
+/// Records each request and returns one partition.
+class recording_boundaries final : public cross_rank_sort_boundaries {
+ public:
+  sort_boundaries make(request const& request, ::cuda::stream_ref) override
+  {
+    key_columns.push_back(request.sample_keys.num_columns());
+    num_parts.push_back(request.num_parts);
+    return {};
+  }
+
+  std::vector<cudf::size_type> key_columns;
+  std::vector<std::size_t> num_parts;
+};
 
 std::size_t batch_count(const operator_data& data)
 {
@@ -206,17 +221,79 @@ TEST_CASE("sirius_physical_sort_sample is ready when upstream finished with empt
 
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
-  src_pipeline->set_finished(true);
+  src_pipeline->set_finished(false);
   attach_port(sample_op, *repo, src_pipeline);
 
-  // Upstream finished but produced no batches — must not block waiting for sample bytes.
-  auto hint = sample_op.get_next_task_hint();
-  REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::READY);
-  REQUIRE(hint->producer == &sample_op);
+  SECTION("not distributed")
+  {
+    src_pipeline->set_finished(true);
+    // Upstream finished but produced no batches — must not block waiting for sample bytes.
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    REQUIRE(hint->hint == TaskCreationHint::READY);
+    REQUIRE(hint->producer == &sample_op);
 
-  // No batches to pull; execute() should still be able to mark boundaries done.
-  REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+    // No batches to pull; execute() should still be able to mark boundaries done.
+    REQUIRE(sample_op.get_next_task_input_data() == nullptr);
+    CHECK_FALSE(sample_op.runs_without_input());
+  }
+
+  SECTION("with a cross-rank hook: a boundary task with no input, which asks the hook")
+  {
+    auto hook = std::make_shared<recording_boundaries>();
+    sample_op.set_cross_rank_boundaries(hook);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
+
+    // The boundary task is owed before upstream finishes, but cannot run yet.
+    CHECK_FALSE(sample_op.all_ports_empty());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    src_pipeline->set_finished(true);
+    auto hint = sample_op.get_next_task_hint();
+    REQUIRE(hint.has_value());
+    CHECK(hint->hint == TaskCreationHint::READY);
+
+    auto input = sample_op.get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    CHECK(batch_count(*input) == 0);
+    CHECK(sample_op.runs_without_input());
+    CHECK(sample_op.get_next_task_input_data() == nullptr);
+
+    // The boundary task is claimed: the hook can no longer change.
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(std::make_shared<recording_boundaries>()),
+                    std::logic_error);
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(nullptr), std::logic_error);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
+
+    (void)sample_op.execute(*input, cudf::get_default_stream());
+    CHECK(sample_op.boundaries_computed());
+    CHECK(sample_op.get_num_partitions() == 1);
+    CHECK_FALSE(sample_op.runs_without_input());
+    CHECK_THROWS_AS(sample_op.set_cross_rank_boundaries(nullptr), std::logic_error);
+    CHECK(sample_op.cross_rank_boundaries() == hook.get());
+    REQUIRE(hook->key_columns.size() == 1);
+    CHECK(hook->key_columns[0] == 0);
+    CHECK(hook->num_parts[0] == 1);
+  }
+}
+
+TEST_CASE("sirius_physical_sort_sample with no input ends with one partition, whatever its keys",
+          "[physical_sort_sample]")
+{
+  // A key that is not a column reference fails only once there is a sample to cut.
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.emplace_back(
+    duckdb::OrderType::ASCENDING,
+    duckdb::OrderByNullType::NULLS_LAST,
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1)));
+  sirius_physical_sort_sample sample_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    1000);
+  pipelineable_operator_data empty{std::vector<std::shared_ptr<cucascade::data_batch>>{}};
+  REQUIRE_NOTHROW(sample_op.execute(empty, cudf::get_default_stream()));
+  CHECK(sample_op.boundaries_computed());
+  CHECK(sample_op.get_num_partitions() == 1);
 }
 
 TEST_CASE("sirius_physical_sort_sample get_next_task_hint returns nullopt while scheduled",
@@ -464,6 +541,92 @@ TEST_CASE("sirius_physical_sort_sample publishes boundaries that are complete on
   CHECK(again.column(0).data<int32_t>() == boundaries.column(0).data<int32_t>());
 
   REQUIRE(cudaStreamSynchronize(task_stream.value()) == cudaSuccess);
+  sample_op.clear_partition_boundaries();
+  CHECK(sample_op.num_boundary_rows() == 0);
+}
+
+namespace {
+
+/// Cuts the sample it is given into `parts` partitions, as a table on `space`'s GPU.
+class cutting_boundaries final : public cross_rank_sort_boundaries {
+ public:
+  cutting_boundaries(memory_space& space, std::size_t parts) : _space(&space), _parts(parts) {}
+
+  sort_boundaries make(request const& request, ::cuda::stream_ref stream) override
+  {
+    ++calls;
+    requested_parts = request.num_parts;
+    return {_parts,
+            sirius_physical_sort_sample::evenly_spaced(request.sample_keys,
+                                                       0,
+                                                       request.sample_keys.num_rows(),
+                                                       _parts,
+                                                       stream,
+                                                       _space->get_default_allocator())};
+  }
+
+  int calls                   = 0;
+  std::size_t requested_parts = 0;
+
+ private:
+  memory_space* _space;
+  std::size_t _parts;
+};
+
+}  // namespace
+
+// The boundaries a cross-rank hook returns are kept like the operator's own: on the host, with a
+// copy per GPU on request.
+TEST_CASE("sirius_physical_sort_sample keeps a cross-rank hook's boundaries on the host",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  rmm::cuda_stream reader_stream;
+
+  constexpr std::size_t rows_per_batch = 4000;
+  std::vector<int32_t> values(rows_per_batch);
+  std::iota(values.begin(), values.end(), 0);
+  auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  std::size_t batch_bytes;
+  {
+    auto read_only = batch->to_read_only();
+    batch_bytes    = read_only.get_data()->get_size_in_bytes();
+  }
+
+  // The operator alone would keep two partitions; the hook decides on four.
+  auto sample_op = make_sort_sample(/*sort_sample_bytes=*/batch_bytes,
+                                    /*max_partition_bytes=*/batch_bytes / 2 + 1);
+  auto hook      = std::make_shared<cutting_boundaries>(*space, 4);
+  sample_op.set_cross_rank_boundaries(hook);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(std::move(batch), 0);
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(true);
+  attach_port(sample_op, *repo, src_pipeline);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  REQUIRE(sample_op.boundaries_computed());
+  CHECK(hook->calls == 1);
+  CHECK(hook->requested_parts == 2);
+  REQUIRE(sample_op.get_num_partitions() == 4);
+  REQUIRE(sample_op.num_boundary_rows() == 3);
+
+  auto boundaries = sample_op.get_partition_boundaries(*space, reader_stream.view());
+  REQUIRE(boundaries.num_columns() == 1);
+  REQUIRE(boundaries.num_rows() == 3);
+  std::vector<int32_t> host(3, -1);
+  REQUIRE(cudaMemcpyAsync(host.data(),
+                          boundaries.column(0).data<int32_t>(),
+                          host.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost,
+                          reader_stream.value()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
+  CHECK(host == std::vector<int32_t>{1000, 2000, 3000});
+
   sample_op.clear_partition_boundaries();
   CHECK(sample_op.num_boundary_rows() == 0);
 }

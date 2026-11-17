@@ -228,6 +228,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                            stream,
                                                            *space,
                                                            batch_telemetry(),
+                                                           cudf::DEFAULT_HASH_SEED,
                                                            _spec.preserve_input_order);
   std::vector<std::size_t> destinations(partitioned_results.size());
   std::iota(destinations.begin(), destinations.end(), std::size_t{0});

@@ -146,6 +146,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
     test/cpp/memory/test_device_transfer_fault.cpp
+    test/cpp/scan/test_arrow_discard_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp
@@ -170,6 +171,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--allow-multiple-definition"
     "LINKER:--wrap=cudaStreamWaitEvent"
     "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=cudaEventSynchronize"
     "LINKER:--wrap=cudaMemPoolGetAccess"
     "LINKER:--wrap=cudaMemcpyAsync"
     "LINKER:--wrap=cudaMemcpyBatchAsync"
@@ -252,8 +254,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(parquet_benchmark)
 
 target_link_options(parquet_benchmark PRIVATE
@@ -292,8 +293,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(prefetch_benchmark)
 
 target_link_options(prefetch_benchmark PRIVATE
@@ -335,8 +335,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(prefetch_hybrid_scan_benchmark)
 
 target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
@@ -375,8 +374,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(columnar_parquet_poc)
 
 target_link_options(columnar_parquet_poc PRIVATE
@@ -415,8 +413,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(retirer_benchmark)
 
 target_link_options(retirer_benchmark PRIVATE
@@ -456,8 +453,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(s3_throughput_test)
 
 target_link_options(s3_throughput_test PRIVATE
@@ -499,8 +495,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(s3_autotune_throughput_bench)
 
 target_link_options(s3_autotune_throughput_bench PRIVATE
@@ -540,8 +535,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(range_prefetch_benchmark)
 
 target_link_options(range_prefetch_benchmark PRIVATE

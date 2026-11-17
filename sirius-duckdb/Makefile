@@ -10,6 +10,14 @@ SIRIUS_DUCKDB_EXPLICIT_VERSION := $(if $(filter d54cbbe3df17e8e5ce68312f483b4155
 override EXT_FLAGS += -DDUCKDB_EXPLICIT_VERSION=$(SIRIUS_DUCKDB_EXPLICIT_VERSION)
 ifeq ($(SIRIUS_DUCKDB_LINKAGE),static)
 export VCPKG_CUDA_ARCHITECTURES ?= $(CUDAARCHS)
+# Conda's CUDA activation adds the toolkit include dir, whose CCCL (2.x on CUDA 12)
+# would shadow the newer one vcpkg installs.
+ifneq ($(strip $(CONDA_PREFIX)),)
+CONDA_CUDA_INCLUDE := -I$(CONDA_PREFIX)/targets/%/include
+export CFLAGS := $(filter-out $(CONDA_CUDA_INCLUDE),$(CFLAGS))
+export CXXFLAGS := $(filter-out $(CONDA_CUDA_INCLUDE),$(CXXFLAGS))
+export CPPFLAGS := $(filter-out $(CONDA_CUDA_INCLUDE),$(CPPFLAGS))
+endif
 override EXT_FLAGS += -DVCPKG_MANIFEST_INSTALL=ON -DVCPKG_INSTALL_OPTIONS=--clean-buildtrees-after-build
 else ifneq ($(strip $(VCPKG_TOOLCHAIN_PATH)),)
 override EXT_FLAGS += -DVCPKG_MANIFEST_INSTALL=OFF
