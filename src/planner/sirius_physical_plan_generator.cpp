@@ -376,6 +376,8 @@ void collect_iceberg_schema(std::vector<duckdb::MultiFileColumnDefinition> const
   }
 }
 
+}  // namespace
+
 //! Make every equality-delete key readable by the scan without changing what it outputs. Keys
 //! the query does not read are appended behind `projected_output_count`, so the plan gives them
 //! the DELETE_KEY role and the output projection drops them. Only `info` changes.
@@ -425,6 +427,8 @@ void widen_scan_for_equality_keys(sirius::op::scan::parquet_ingestible_table_inf
       info.projection_ids.push_back(*position);
   }
 }
+
+namespace {
 
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
 //! data, resolved here at plan time.

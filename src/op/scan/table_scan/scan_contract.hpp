@@ -211,6 +211,7 @@ enum class verdict_reason : uint16_t {
   iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
   iceberg_equality_budget,           // delete set above the plan-time budget
   iceberg_equality_multi_gpu,        // delete tables are built on one device only
+  iceberg_equality_remote,           // a delete file is not on the local file system
   provider_admission_refused
 };
 
@@ -270,6 +271,9 @@ struct physical_check_counters {
   std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
   std::optional<uint64_t> statement_dv_limit_for_testing;
   std::optional<int64_t> statement_equality_limit_for_testing;
+  // Stands in for the number of configured GPUs at the equality-delete plan gate.
+  std::optional<std::size_t> equality_gpu_count_for_testing;
+  std::optional<std::size_t> equality_files_per_data_file_limit_for_testing;
   std::function<void(scan_manager::scan_envelope&)> preparation_envelope_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
@@ -478,8 +482,8 @@ struct iceberg_equality_plan {
   // of the `files` that apply. A scanned file absent from this map must be refused.
   std::unordered_map<std::string, std::vector<uint32_t>> by_data_file;
   struct key {
-    std::size_t primary_index;   // Index into the bound schema (P-space).
-    duckdb::LogicalTypeId type;  // Bound type; delete-file key columns are normalized to it.
+    std::size_t primary_index;  // Index into the bound schema (P-space).
+    duckdb::LogicalType type;   // Bound type; delete-file key columns are normalized to it.
   };
   // Field ID of every key in any `equality_ids` -> its bound column. Filled by the plan gate.
   std::unordered_map<int32_t, key> keys;

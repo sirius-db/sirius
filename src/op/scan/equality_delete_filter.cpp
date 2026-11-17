@@ -45,7 +45,6 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
 
-  // The caller decides which groups apply to this batch; this only matches rows to deleted keys.
   auto const& group = _delete_data->equality_delete_groups.at(_group_index);
   auto const keys   = group.delete_table->view();
   if (_data_key_indices.size() != static_cast<std::size_t>(keys.num_columns())) {

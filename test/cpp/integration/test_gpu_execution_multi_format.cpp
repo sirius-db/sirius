@@ -800,8 +800,9 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
   // those tables must execute as GPU_SCAN — asserting the route is what distinguishes "the GPU
   // applied the deletes" from "the GPU quietly handed the table back to DuckDB", since both
-  // return the same rows. Equality deletes match on key values and need the key columns
-  // force-projected into the scan, which is not wired; the gate still sends them to CPU.
+  // return the same rows. Equality deletes are applied on the GPU as well; expect_equality_rows
+  // asserts that route. The shapes the gate still declines (an unsupported key, several GPUs, a
+  // remote delete file, the ceilings) each have a case that asserts the decline and its reason.
   static constexpr gpu_route kPositionalDeleteRoute = gpu_route::gpu;
   static constexpr gpu_route kDeletionVectorRoute   = gpu_route::gpu;
 
@@ -1034,7 +1035,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
                         sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven,
                         sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported,
                         sirius::op::scan::verdict_reason::iceberg_equality_budget,
-                        sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu}) {
+                        sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu,
+                        sirius::op::scan::verdict_reason::iceberg_equality_remote}) {
       auto index = static_cast<std::size_t>(reason);
       CHECK(after.semantic_declines[index] == before.semantic_declines[index]);
     }
@@ -1834,6 +1836,113 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
 }
 
+TEST_CASE_METHOD(
+  GPUExecutionIcebergEqRulesFixture,
+  "gpu_execution iceberg - equality keys of date, timestamp, boolean and timestamp_ns type",
+  "[integration][gpu_execution][iceberg]")
+{
+  // One sibling snapshot per key type, each deleting id 2 by that key alone.
+  auto path = table("iceberg_v2_eq_typed_keys");
+  struct key_case {
+    char const* key;
+    int64_t sequence;
+  };
+  for (auto const& c : {key_case{"date", 2}, key_case{"timestamp", 3}, key_case{"boolean", 4}}) {
+    INFO("key: " << c.key);
+    auto scan = "iceberg_scan('" + path +
+                "', snapshot_from_id = " + std::to_string(8800000000000000 + c.sequence) + ")";
+    expect_equality_rows("SELECT id FROM " + scan + " ORDER BY id;", {{"1"}, {"3"}});
+  }
+  // timestamp_ns exists from format version 3 on, so it has a table of its own.
+  auto v3 = table("iceberg_v3_eq_timestamp_ns_key");
+  require_delete_files(v3, 1);
+  expect_equality_rows("SELECT id FROM " + pinned_scan(v3) + " ORDER BY id;", {{"1"}, {"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - equality keys outside the supported types decline",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // One sibling snapshot per key, each deleting id 2 by that key alone. These keys are refused
+  // before any delete file is opened.
+  auto path = table("iceberg_v2_eq_unsupported_keys");
+  auto index =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_key_unsupported);
+  struct key_case {
+    char const* key;
+    int64_t sequence;
+    bool duckdb_applies;
+  };
+  for (auto const& c : {key_case{"decimal", 2, true},
+                        key_case{"float", 3, true},
+                        key_case{"struct member", 4, false},
+                        key_case{"dropped column", 5, true}}) {
+    INFO("key: " << c.key);
+    auto scan = "iceberg_scan('" + path +
+                "', snapshot_from_id = " + std::to_string(8800000000000000 + c.sequence) + ")";
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    // DuckDB's reader at the verified extension build does not apply a delete keyed on a struct
+    // member. The row it keeps is its answer; this path only has to hand the scan over.
+    expect_iceberg_rows("SELECT id FROM " + scan + " ORDER BY id;",
+                        gpu_route::plan_fallback,
+                        c.duckdb_applies
+                          ? std::vector<std::vector<std::string>>{{"1"}, {"3"}}
+                          : std::vector<std::vector<std::string>>{{"1"}, {"2"}, {"3"}});
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  }
+}
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergEqRulesFixture,
+  "gpu_execution iceberg - equality deletes decline when several GPUs are configured",
+  "[integration][gpu_execution][iceberg]")
+{
+  // The delete tables live on one device. This process runs on one GPU, so the device count the
+  // gate sees is overridden: what is covered is the refusal, not how devices are counted.
+  auto scan     = pinned_scan(table("iceberg_v2_eq_wide_delete_file"));
+  auto query    = "SELECT fruit, count FROM " + scan + " ORDER BY count;";
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->equality_gpu_count_for_testing);
+  auto index =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu);
+
+  counters->equality_gpu_count_for_testing = 2;
+  auto before                              = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows(
+    query, gpu_route::plan_fallback, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+  // A table without equality deletes never reaches that gate.
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(v2_path) + " ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+
+  counters->equality_gpu_count_for_testing = 1;
+  expect_equality_rows(query, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - a remote equality delete declines before it is opened",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Only the delete file's URI is remote, and nothing exists there. With the fallback off the
+  // refusal is the statement's error, so no reader goes on to open it.
+  auto path = table("iceberg_v2_eq_remote_delete");
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(path));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("is not a local file"));
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_remote);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                  "gpu_execution iceberg - equality deletes above the statement ceiling decline",
                  "[integration][gpu_execution][iceberg]")
@@ -1886,6 +1995,53 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
         std::vector<std::vector<std::string>>{{"1"}, {"1"}, {"3"}, {"3"}, {"5"}, {"5"}});
   CHECK(declines() == before_declines);
   CHECK(loads() == before_loads + 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - too many equality deletes on one data file decline",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The fixture's one data file is subject to two delete files.
+  auto query = "SELECT fruit, count FROM " + pinned_scan(table("iceberg_v2_eq_multi_delete_file")) +
+               " ORDER BY count;";
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->equality_files_per_data_file_limit_for_testing);
+  auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_budget);
+
+  counters->equality_files_per_data_file_limit_for_testing = 1;
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  expect_iceberg_rows(
+    query, gpu_route::plan_fallback, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+
+  counters->equality_files_per_data_file_limit_for_testing = 2;
+  expect_equality_rows(query, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}}, 2);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
+                 "gpu_execution iceberg - a delete table that does not fit falls back cleanly",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto query = "SELECT fruit, count FROM " + pinned_scan(table("iceberg_v2_eq_wide_delete_file")) +
+               " ORDER BY count;";
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  auto spaces =
+    context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE_FALSE(spaces.empty());
+  auto* space = context->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU,
+                                                               spaces.front()->get_id().device_id);
+  auto const available = space->get_available_memory();
+  {
+    // With the whole device reserved, the build's first allocation is refused.
+    auto held = space->make_reservation_upto(space->get_max_memory());
+    REQUIRE(held);
+    expect_iceberg_rows(
+      query, gpu_route::plan_fallback, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  }
+  CHECK(space->get_available_memory() == available);
+  expect_equality_rows(query, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
 }
 
 //===----------------------------------------------------------------------===//

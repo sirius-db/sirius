@@ -56,7 +56,6 @@ struct IcebergDeleteFileEntry {
   std::string referenced_data_file;   // data file this DV applies to (V3, empty if absent)
   int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
-  int64_t sequence_number{0};         // inherited data sequence number (equality deletes)
   int64_t file_size_in_bytes{-1};
   int64_t record_count{-1};  // deleted positions the manifest claims (V3, -1 if absent)
 
@@ -110,15 +109,9 @@ inventory_result read_delete_inventory(duckdb::ClientContext&,
                                        std::string_view injection           = {},
                                        std::string_view expected_table_uuid = {});
 
-/// Ceilings on the equality deletes a statement loads, shaped like the deletion-vector ceilings in
-/// puffin_reader.hpp: one per delete file, one per statement, charged from the manifests'
-/// `record_count` before any delete file is opened. A table above them is declined.
-///
-/// Sized to retain what the deletion-vector statement ceiling retains, about 2 GiB (256M
-/// positions x 8 B). A built group retains 24 B per INT64 key row, 32 B for two INT64 keys and
-/// about 31 B for a 10-character string key (measured, libcudf 26.10), so 64M rows is 1.5-2 GiB.
-/// Unlike decoded positions this memory is on the device and outside the scan's reservations.
-/// `record_count` bounds rows, not bytes; the byte ceiling on delete files covers long keys.
+/// Ceilings on the equality deletes one statement loads, charged from the manifests' record
+/// counts and file sizes before any delete file is opened; a table above them is declined. The
+/// byte ceiling exists because a row count does not bound variable-width keys.
 inline constexpr int64_t kMaxEqualityDeleteRowsPerFile       = 32LL * 1024 * 1024;
 inline constexpr int64_t kMaxEqualityDeleteRowsPerStatement  = 64LL * 1024 * 1024;
 inline constexpr int64_t kMaxEqualityDeleteBytesPerStatement = 1024LL * 1024 * 1024;
@@ -136,6 +129,11 @@ struct equality_delete_charge {
   iceberg_equality_plan const& plan,
   equality_delete_charge& total,
   int64_t statement_row_limit = kMaxEqualityDeleteRowsPerStatement);
+
+/// The cuDF type an equality-delete key bound as @p type is compared in, or nullopt for a type
+/// this path does not compare: a data file and a delete file must decode the key identically.
+[[nodiscard]] std::optional<cudf::data_type> equality_key_cudf_type(
+  duckdb::LogicalType const& type);
 
 /// A scan plan that contradicts the inventory, or that this reader cannot interpret.
 struct equality_plan_error : std::runtime_error {
@@ -167,9 +165,7 @@ struct EqualityDeleteGroup {
   std::vector<int32_t> key_field_ids;
   /// Bound-schema (P-space) index of each key, parallel to @ref key_field_ids.
   std::vector<std::size_t> key_primary_indices;
-  /// The delete files merged into this group; diagnostics only.
-  std::vector<std::string> delete_files;
-  /// Build side = delete_table. NULL keys compare equal.
+  /// Build side = delete_table.
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
 };
 
@@ -235,18 +231,5 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
 
 /// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.
 uint64_t iceberg_delete_data_uncached_read_count();
-
-/**
- * @brief Extract a column_name → field_id map from a parquet FileMetaData.
- *
- * Walks the flattened schema depth-first and collects field IDs for leaf
- * columns (num_children == 0).  Columns without a field_id are omitted.
- *
- * @param file_meta  Parquet file metadata (from read_parquet_footers or
- *                   parquet_scan_task_global_state::_file_metadatas).
- * @return Map of column name to Iceberg field ID.
- */
-std::unordered_map<std::string, int32_t> extract_field_id_map(
-  cudf::io::parquet::FileMetaData const& file_meta);
 
 }  // namespace sirius::op::scan

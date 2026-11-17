@@ -40,6 +40,7 @@ class sirius_physical_table_scan;
 namespace scan {
 enum class dynamic_filter_apply_mode;
 class gpu_ingestible;
+class parquet_ingestible_table_info;
 }  // namespace scan
 }  // namespace op
 }  // namespace sirius
@@ -174,6 +175,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_iceberg_scan(
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet&,
                                                                duckdb::ClientContext&,
                                                                scan_contract_provenance&);
+/// Reads every equality-delete key of @p plan into the scan without changing its output.
+void widen_scan_for_equality_keys(op::scan::parquet_ingestible_table_info& info,
+                                  op::scan::iceberg_equality_plan const& plan);
 /// Verify the nested multi-file wrapper against this host's Parquet implementation.
 /// Does not verify the outer provider's function_info or binding identity.
 bool verified_parquet_interface(duckdb::FunctionData const*, duckdb::ClientContext&);

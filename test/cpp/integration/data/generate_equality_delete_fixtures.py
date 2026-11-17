@@ -4,6 +4,7 @@
 Run from the repo root:
     python3 test/cpp/integration/data/generate_equality_delete_fixtures.py
     python3 test/cpp/integration/data/generate_equality_delete_fixtures.py --verify
+    python3 test/cpp/integration/data/generate_equality_delete_fixtures.py NAME...   (only these)
 
 Each fixture isolates one rule a reader gets silently wrong. The rows a WRONG reader returns
 are listed beside the right ones, so a failure says which rule broke:
@@ -27,6 +28,18 @@ are listed beside the right ones, so a failure says which rule broke:
                                     file store INT32; newer files store INT64.
   iceberg_v2_eq_double_key          A DOUBLE key. The GPU path declines it; the fixture pins the
                                     refusal and the rows DuckDB returns.
+  iceberg_v2_eq_typed_keys          One snapshot per key type beyond int, long and string that the
+                                    GPU path reads: date, timestamp and boolean. The snapshots are
+                                    siblings, so each carries exactly one equality delete.
+  iceberg_v3_eq_timestamp_ns_key    A timestamp_ns key. The type exists from format version 3 on,
+                                    and the extension plans a V3 table only with row lineage, so
+                                    this table is V3 and carries first-row-id and next-row-id.
+  iceberg_v2_eq_unsupported_keys    The same layout for the keys the GPU path declines: decimal,
+                                    float, a struct member and a column the table has since
+                                    dropped.
+  iceberg_v2_eq_remote_delete       The equality delete is recorded under an s3:// URI; data and
+                                    metadata are local. The GPU path reads equality deletes from
+                                    local files only and must decline before opening it.
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
@@ -57,8 +70,9 @@ def _avro(path):
 class Table:
     """One fixture: accumulates commits, then writes metadata that describes all of them."""
 
-    def __init__(self, name, schemas, partition_specs=None):
+    def __init__(self, name, schemas, partition_specs=None, format_version=2):
         self.name, self.root, self.rel = name, DATA / name, REL / name
+        self.format_version, self.next_row_id = format_version, 0
         self.schemas = schemas  # list of [(field_id, name, iceberg_type)]
         self.specs = partition_specs or [[]]
         self.snapshots, self.manifests, self.seq = [], [], 0
@@ -188,18 +202,29 @@ class Table:
     def snapshot_id(self, seq):
         return 8800000000000000 + seq
 
-    def commit(self, operation, manifests, replace=False):
+    def commit(self, operation, manifests, replace=False, sibling=False):
         """manifests: [(file name, content, spec_id, entries)]. replace drops earlier DATA
-        manifests, as a manifest rewrite does."""
+        manifests, as a manifest rewrite does. A sibling snapshot lists its manifests without
+        handing them on to later commits."""
         import fastavro
 
         self.seq += 1
         if replace:
             self.manifests = [m for m in self.manifests if m["content"] != 0]
-        self.manifests += [self._manifest(*m) for m in manifests]
+        listed = self.manifests + [self._manifest(*m) for m in manifests]
+        if not sibling:
+            self.manifests = listed
         name = f"snap-{self.snapshot_id(self.seq)}-{self.seq}-ml.avro"
         with open(self.root / "metadata" / name, "wb") as fh:
-            fastavro.writer(fh, self.list_schema, self.manifests, codec="null")
+            fastavro.writer(fh, self.list_schema, listed, codec="null")
+        added_rows = sum(
+            count
+            for _, _, _, entries in manifests
+            for status, _, (_, count, _), kind, *_ in entries
+            if status == 1 and kind == 0
+        )
+        lineage = {"first-row-id": self.next_row_id, "added-rows": added_rows}
+        self.next_row_id += added_rows
         self.snapshots.append(
             {
                 "snapshot-id": self.snapshot_id(self.seq),
@@ -208,6 +233,7 @@ class Table:
                 "manifest-list": str(self.rel / "metadata" / name),
                 "summary": {"operation": operation},
                 "schema-id": len(self.schemas) - 1,
+                **(lineage if self.format_version >= 3 else {}),
                 **(
                     {"parent-snapshot-id": self.snapshot_id(self.seq - 1)}
                     if self.seq > 1
@@ -259,6 +285,8 @@ class Table:
                 ],
             }
         )
+        if self.format_version >= 3:
+            meta.update({"format-version": 3, "next-row-id": self.next_row_id})
         # A fixed UUID per fixture: hash() is salted per process.
         meta["table-uuid"] = "e0e0e0e0-0000-4000-8000-%012x" % (
             sum(ord(c) * 131**k for k, c in enumerate(self.name)) % 16**12
@@ -525,7 +553,169 @@ def build_double_key():
     t.finish()
 
 
-# name -> (builder, rows a correct reader returns, sorted)
+# What each sibling snapshot of iceberg_v2_eq_unsupported_keys deletes row id=2 by:
+# snapshot sequence -> (label, equality field id).
+UNSUPPORTED_KEYS = {
+    2: ("decimal", 4),
+    3: ("float", 6),
+    4: ("struct member", 8),
+    5: ("dropped column", 9),
+}
+# The same for iceberg_v2_eq_typed_keys.
+TYPED_KEYS = {2: ("date", 2), 3: ("timestamp", 3), 4: ("boolean", 4)}
+
+
+def build_typed_keys():
+    import datetime
+
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v2_eq_typed_keys",
+        [
+            [
+                (1, "id", "long"),
+                (2, "day", "date"),
+                (3, "ts", "timestamp"),
+                (4, "flag", "boolean"),
+            ]
+        ],
+    )
+    day = datetime.date(2024, 1, 1)
+    second = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    columns = {
+        1: ("id", pa.int64(), [1, 2, 3]),
+        2: ("day", pa.date32(), [day + datetime.timedelta(days=d) for d in range(3)]),
+        3: (
+            "ts",
+            pa.timestamp("us"),
+            [second + datetime.timedelta(seconds=d) for d in range(3)],
+        ),
+        4: ("flag", pa.bool_(), [True, False, True]),
+    }
+    data = t.parquet(
+        "data-1.parquet", [(i, n, ty, v) for i, (n, ty, v) in columns.items()]
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    for seq, (_, key) in TYPED_KEYS.items():
+        name, arrow_type, values = columns[key]
+        delete = t.parquet(
+            f"delete-eq-{seq}.parquet", [(key, name, arrow_type, [values[1]])]
+        )
+        t.commit(
+            "delete",
+            [(f"m-delete-{seq}.avro", 1, 0, [(1, None, delete, 2, None, [key])])],
+            sibling=True,
+        )
+    t.finish()
+
+
+def build_timestamp_ns_key():
+    import datetime
+
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v3_eq_timestamp_ns_key",
+        [[(1, "id", "long"), (2, "ts", "timestamp_ns")]],
+        format_version=3,
+    )
+    second = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    stamps = [second + datetime.timedelta(seconds=d) for d in range(3)]
+    data = t.parquet(
+        "data-1.parquet",
+        [(1, "id", pa.int64(), [1, 2, 3]), (2, "ts", pa.timestamp("ns"), stamps)],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    delete = t.parquet(
+        "delete-eq-2.parquet", [(2, "ts", pa.timestamp("ns"), [stamps[1]])]
+    )
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [2])])])
+    t.finish()
+
+
+def build_unsupported_keys():
+    import datetime
+    import decimal
+
+    import pyarrow as pa
+
+    point = {
+        "type": "struct",
+        "fields": [{"id": 8, "name": "x", "required": False, "type": "long"}],
+    }
+    live = [
+        (1, "id", "long"),
+        (2, "day", "date"),
+        (3, "ts", "timestamp"),
+        (4, "amount", "decimal(9, 2)"),
+        (5, "flag", "boolean"),
+        (6, "ratio", "float"),
+        (7, "point", point),
+    ]
+    # The first schema still has `gone`; the current one dropped it. Its field ID stays in the
+    # data file and in the delete file keyed on it.
+    t = Table("iceberg_v2_eq_unsupported_keys", [live + [(9, "gone", "long")], live])
+    x = pa.field("x", pa.int64(), metadata={"PARQUET:field_id": "8"})
+    day = datetime.date(2024, 1, 1)
+    second = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    columns = {
+        1: ("id", pa.int64(), [1, 2, 3]),
+        2: ("day", pa.date32(), [day + datetime.timedelta(days=d) for d in range(3)]),
+        3: (
+            "ts",
+            pa.timestamp("us"),
+            [second + datetime.timedelta(seconds=d) for d in range(3)],
+        ),
+        4: (
+            "amount",
+            pa.decimal128(9, 2),
+            [decimal.Decimal(v) for v in ("1.50", "2.50", "3.50")],
+        ),
+        5: ("flag", pa.bool_(), [True, False, True]),
+        6: ("ratio", pa.float32(), [1.5, 2.5, 3.5]),
+        7: ("point", pa.struct([x]), [{"x": 10}, {"x": 20}, {"x": 30}]),
+        9: ("gone", pa.int64(), [100, 200, 300]),
+    }
+    data = t.parquet(
+        "data-1.parquet", [(i, n, ty, v) for i, (n, ty, v) in columns.items()]
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    for seq, (_, key) in UNSUPPORTED_KEYS.items():
+        column = 7 if key == 8 else key  # the struct member is stored inside its struct
+        name, arrow_type, values = columns[column]
+        delete = t.parquet(
+            f"delete-eq-{seq}.parquet", [(column, name, arrow_type, [values[1]])]
+        )
+        t.commit(
+            "delete",
+            [(f"m-delete-{seq}.avro", 1, 0, [(1, None, delete, 2, None, [key])])],
+            sibling=True,
+        )
+    t.finish()
+
+
+def build_remote_delete():
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_remote_delete", fruit_schema())
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+            (2, "count", pa.int64(), [1, 2, 3]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    # Recorded in the manifest and never written: nothing may open it.
+    delete = ("s3://sirius-equality-delete.invalid/delete-eq-2.parquet", 1, 540)
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t.finish()
+
+
+# name -> (builder, expectation). The expectation is the rows a correct reader returns for the
+# current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
+# for a table DuckDB cannot read from this machine.
 FIXTURES = {
     "iceberg_v2_eq_wide_delete_file": (
         build_wide_delete_file,
@@ -553,6 +743,16 @@ FIXTURES = {
         [(1, "a"), (2, "b2"), (3, "c"), (6, "f")],
     ),
     "iceberg_v2_eq_double_key": (build_double_key, [("apple", 1.5), ("cherry", 3.5)]),
+    "iceberg_v2_eq_typed_keys": (
+        build_typed_keys,
+        {seq: [(1,), (3,)] for seq in TYPED_KEYS},
+    ),
+    "iceberg_v3_eq_timestamp_ns_key": (build_timestamp_ns_key, {2: [(1,), (3,)]}),
+    "iceberg_v2_eq_unsupported_keys": (
+        build_unsupported_keys,
+        {seq: [(1,), (3,)] for seq in UNSUPPORTED_KEYS},
+    ),
+    "iceberg_v2_eq_remote_delete": (build_remote_delete, None),
 }
 
 
@@ -560,15 +760,35 @@ def verify(name, expected):
     """Check the fixture against DuckDB's Iceberg reader -- the oracle the GPU path is held to."""
     import duckdb
 
+    if expected is None:
+        print(f"  {name}: skipped - not readable from this machine")
+        return True
     con = duckdb.connect()
     con.execute("LOAD iceberg")
-    rows = con.sql(f"SELECT * FROM iceberg_scan('{REL / name}')").fetchall()
     key = lambda row: tuple((v is None, v) for v in row)  # noqa: E731
-    if sorted(rows, key=key) != sorted(expected, key=key):
-        print(f"  {name}: FAIL - got {sorted(rows, key=key)}", file=sys.stderr)
-        return False
-    print(f"  {name}: OK - {len(rows)} rows")
-    return True
+    scans = {"": ("*", expected)}
+    if isinstance(expected, dict):
+        scans = {
+            f", snapshot_from_id = {8800000000000000 + seq}": ("id", rows)
+            for seq, rows in expected.items()
+        }
+    ok = True
+    for selector, (columns, want) in scans.items():
+        try:
+            rows = con.sql(
+                f"SELECT {columns} FROM iceberg_scan('{REL / name}'{selector})"
+            ).fetchall()
+        except duckdb.Error as error:
+            rows = [("ERROR", str(error).splitlines()[0])]
+        if sorted(rows, key=key) != sorted(want, key=key):
+            print(
+                f"  {name}{selector}: FAIL - got {sorted(rows, key=key)}",
+                file=sys.stderr,
+            )
+            ok = False
+        else:
+            print(f"  {name}{selector}: OK - {len(rows)} rows")
+    return ok
 
 
 def main():
@@ -576,14 +796,18 @@ def main():
     ap.add_argument(
         "--verify", action="store_true", help="validate only, write nothing"
     )
+    ap.add_argument("names", nargs="*", help="fixtures to build (default: all)")
     args = ap.parse_args()
+    if unknown := [name for name in args.names if name not in FIXTURES]:
+        ap.error(f"unknown fixtures: {', '.join(unknown)}")
+    selected = {n: f for n, f in FIXTURES.items() if not args.names or n in args.names}
     if not args.verify:
-        for name, (build, _) in FIXTURES.items():
+        for name, (build, _) in selected.items():
             build()
             print(f"wrote {name}")
         print("validating:")
     ok = True
-    for name, (_, expected) in FIXTURES.items():
+    for name, (_, expected) in selected.items():
         ok &= verify(name, expected)
     return 0 if ok else 1
 
