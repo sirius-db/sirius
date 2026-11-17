@@ -123,7 +123,10 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -697,7 +700,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         throw std::runtime_error("Sirius CPU replay refused: " + gpu_error.RawMessage());
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
-      print_cpu_fallback_banner();
+      print_cpu_fallback_banner(gpu_error.RawMessage());
       auto cpu_replay = run_internal_cpu_fallback_query(
         context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {
@@ -4074,6 +4077,7 @@ static void check_cuda_driver_version()
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  logging_load_transaction logging_transaction;
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -4081,7 +4085,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>(&db);
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
@@ -4092,11 +4096,6 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
-
-  // The ctor already installed the db-independent backend; reinstall now that the
-  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
-  // unknown backend name is reported here rather than swallowed by the ctor.
-  install_configured_log_sink(&db);
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
@@ -4142,6 +4141,7 @@ static void LoadInternal(ExtensionLoader& loader)
     publish_transparent_optimizer_mask(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
+  logging_transaction.commit();
 }
 
 }  // namespace duckdb
