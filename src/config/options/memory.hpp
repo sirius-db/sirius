@@ -99,11 +99,12 @@ struct host_memory_options : block_base<host_memory_options> {
   }
 };
 
-/// `sirius.memory.disk`: the disk tier batches spill to. Off unless downgrade_root_dirs is set.
+/// `sirius.memory.disk`: the disk tier batches spill to. Off unless downgrade_root_dirs is set and
+/// capacity_bytes is nonzero.
 struct disk_memory_options : block_base<disk_memory_options> {
   config_option<int> disk_id = option<int>("disk_id").fallback(0).build();
   config_option<bytes> capacity_bytes =
-    option<bytes>("capacity_bytes").fallback(to_bytes(std::size_t{1024} << 30)).build();
+    option<bytes>("capacity_bytes").fallback(tebibytes(1)).build();
   /// The spill directory; empty turns the disk tier off.
   config_option<std::string> downgrade_root_dirs =
     option<std::string>("downgrade_root_dirs").fallback(std::string{}).build();
