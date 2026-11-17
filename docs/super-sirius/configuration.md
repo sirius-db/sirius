@@ -433,9 +433,6 @@ sirius:
 Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
 key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
 
-`uring.prefetch_reactors` is deprecated: the reactor priority tiers replaced prefetch-reactor partitioning, so the key is
-accepted and ignored with a warning, and will be removed.
-
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 The native REST backend speaks HTTP/1.1 over io_uring; it does not use libcurl.
@@ -787,8 +784,10 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
+| `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
@@ -830,9 +829,8 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
@@ -962,14 +960,15 @@ requires startup configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_backend` | `spdlog`; `duckdb` in released extensions | Log sink: `spdlog`, `duckdb`, or `noop` |
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
 | `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
-- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
-  `sirius_log_level` and `sirius_log_flush_seconds`.
-- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+- **`spdlog`** (default in source builds): writes the daily-rotated
+  `<sirius_log_dir>/sirius_<date>.log`, honouring `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`** (default in the released `sirius_cuda12`/`sirius_cuda13` extensions, which are
+  built with `-DSIRIUS_DISTRIBUTION_DEFAULTS=ON`): routes logs into DuckDB's own logging under the `Sirius` log type; enable and
   read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
@@ -984,9 +983,11 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 `SIRIUS_LOG_LEVEL` environment variables.
 
 The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
-If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
-the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
-the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+If none is set, it leaves the current log sink unchanged. In source builds, if only
+`SIRIUS_LOG_LEVEL` is set, the default `spdlog` backend writes to `./log/sirius_<date>.log`; if
+only `SIRIUS_LOG_DIR` is set, the default `spdlog` backend writes there. Libraries built with
+`SIRIUS_DISTRIBUTION_DEFAULTS` default to `duckdb`, so they need `SIRIUS_LOG_BACKEND=spdlog` for
+file logs. An unknown backend leaves the current sink in
 place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
@@ -1079,6 +1080,9 @@ SET enable_compressed_materialization = false;
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
+| `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
+| `enable_subquery_key_carry` | false | Under `delim_join_as_cte`, restrict every table a subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins; see [Optimizations](optimizations.md#subquery-keys-carried-across-an-equality). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_subquery_key_carry` in YAML. |
+| `enable_exists_from_aggregate` | false | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group; see [Optimizations](optimizations.md#exists-answered-from-an-aggregate-subquery). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_exists_from_aggregate` in YAML. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see

@@ -22,13 +22,37 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <unordered_map>
 
 namespace duckdb {
 class ClientContext;
-}
+class LogicalComparisonJoin;
+class LogicalCTERef;
+class LogicalMaterializedCTE;
+}  // namespace duckdb
 
 namespace sirius::planner {
+
+/// The parts of one delim CTE as DuckDB's delim-to-CTE rewrite produces it:
+///   CTE __duckdb_delim_N (children[0] = outer rows,
+///     children[1] = CTE __duckdb_delim_dedup_M (children[0] = DISTINCT over a read of N,
+///       children[1] = the join-back: probe = a read of N, build = the subquery)).
+struct delim_cte_parts {
+  duckdb::LogicalMaterializedCTE* dedup    = nullptr;
+  duckdb::LogicalComparisonJoin* join_back = nullptr;
+  duckdb::LogicalCTERef* outer_row_read    = nullptr;
+  duckdb::LogicalCTERef* key_read          = nullptr;
+};
+
+/// The parts of @p cte when it is a delim CTE in the shape above, recognised by the names DuckDB
+/// generates and by that shape. Its materialized outer rows (`children[0]`) are not inspected.
+std::optional<delim_cte_parts> match_delim_cte(duckdb::LogicalMaterializedCTE& cte);
+
+/// DuckDB's conditions for restricting a delim CTE's rows (`MaterializeDelimJoinAsCTE`): the
+/// join-back keeps an outer row only through that row, and the subquery depends only on repeatable
+/// inputs partitioned by the keys. Parquet scans count as repeatable.
+bool can_restrict(delim_cte_parts const& parts, duckdb::ClientContext& context);
 
 /// Reads of delim CTEs whose rows may be restricted, keyed by the `LogicalCTERef::table_index` of
 /// the read: the outer-row read, and the key read that only computes those rows' domain.
@@ -55,8 +79,8 @@ delim_cte_proofs collect_delim_cte_proofs(duckdb::ClientContext& context,
 /// Give back the `filter_dependency` DuckDB cleared before Sirius's pre-optimize hook, on every
 /// delim CTE the rule above proves. DuckDB's CTE filter pushers (`CTEFilterPusher`,
 /// `CTEJoinFilterPusher`) then work as they do without Sirius loaded, and also over Parquet, which
-/// DuckDB on its own never proves. Only valid while the plan is still the one DuckDB's rewrite
-/// produced, so call it last in the hook. Returns the number of CTEs given a dependency.
+/// DuckDB on its own never proves. Describes the plan it is given, so call it last in the hook,
+/// after anything that changes a delim CTE. Returns the number of CTEs given a dependency.
 std::size_t restore_cte_filter_dependencies(duckdb::ClientContext& context,
                                             duckdb::LogicalOperator& plan);
 
