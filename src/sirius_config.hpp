@@ -753,4 +753,23 @@ class parsed_sirius_config {
   const cucascade::memory::system_topology_info& topology,
   const egress_nic_probe& probe = discover_egress_nic);
 
+/**
+ * @brief The user configuration that reproduces @p resolved: @p user's values and fallbacks, plus
+ * every value resolution derived from the machine for an option @p user left unset (thread and
+ * reactor counts, scan budgets, REST limits, preparation limits, batch sizes, the GPU count, and
+ * the initial host pools when every NUMA node got the same count). Resolving it again on the same
+ * machine gives a configuration that runs with the same values.
+ */
+[[nodiscard]] config::user_config effective_user_config(const config::user_config& user,
+                                                        const sirius_config& resolved);
+
+/**
+ * @brief Write @p resolved's effective configuration (effective_user_config) to @p path as YAML,
+ * every value spelled out; developer-only settings are included only in developer mode. Creates
+ * the directory and replaces the file whole. @throws std::exception when it cannot be written.
+ */
+void write_effective_config(const std::filesystem::path& path,
+                            const config::user_config& user,
+                            const sirius_config& resolved);
+
 }  // namespace sirius

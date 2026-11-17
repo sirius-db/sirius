@@ -1250,6 +1250,9 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   void read_config_file_if_exists();
 
   bool disabled_{false};
+  /// Whether a config file was loaded; without one, the effective configuration is written to
+  /// ~/.sirius/config.yml once the context is up.
+  bool config_file_found_{false};
   sirius::parsed_sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };

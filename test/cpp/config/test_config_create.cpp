@@ -113,7 +113,10 @@ void describe_pool(describer& d, const std::string& name, const sirius::exec::th
     name + ".cpus", p.cpu_affinity_list);
 }
 
-std::string describe(const sirius::sirius_config& c)
+/// With @p in_effect, what the engine runs with rather than how it is stored: preparation limits
+/// as the scan manager resolves them when it starts, and no record of which scan budgets were
+/// named.
+std::string describe(const sirius::sirius_config& c, bool in_effect = false)
 {
   describer d;
   for (auto const& space : c.get_memory_space_configs()) {
@@ -151,12 +154,14 @@ std::string describe(const sirius::sirius_config& c)
     "sm.placement", sm.rest_placement_cpus)("sm.readahead", sm.max_readahead_scans)(
     "sm.strategy", sm.readahead_strategy)("sm.width", sm.pipeline_width);
   auto const& u = sm.uring;
-  d("uring.scans", u.n_max_concurrent_scans)("uring.explicit", u.n_max_concurrent_scans_explicit)(
-    "uring.odirect", u.use_odirect)("uring.slices", u.slices_per_pass)(
+  d("uring.scans", u.n_max_concurrent_scans);
+  if (!in_effect) { d("uring.explicit", u.n_max_concurrent_scans_explicit); }
+  d("uring.odirect", u.use_odirect)("uring.slices", u.slices_per_pass)(
     "uring.batch", u.range_batch_slices)("uring.service", u.low_service_interval);
   auto const& r = sm.rest;
-  d("rest.scans", r.n_max_concurrent_scans)("rest.explicit", r.n_max_concurrent_scans_explicit)(
-    "rest.timeout", r.request_timeout_s)("rest.stall_speed", r.stall_speed_limit_bytes)(
+  d("rest.scans", r.n_max_concurrent_scans);
+  if (!in_effect) { d("rest.explicit", r.n_max_concurrent_scans_explicit); }
+  d("rest.timeout", r.request_timeout_s)("rest.stall_speed", r.stall_speed_limit_bytes)(
     "rest.stall_time", r.stall_time_s)("rest.ca_bundle", r.ca_bundle_path)(
     "rest.tls_verify", r.tls_verify)("rest.connections", r.max_connections)(
     "rest.gap", r.merge_max_gap)("rest.upkeep", r.upkeep_interval)(
@@ -200,11 +205,19 @@ std::string describe(const sirius::sirius_config& c)
     "prefetch.free", m.min_free_fraction)("prefetch.poll", m.poll_interval_ms)("prefetch.quiet",
                                                                                m.drain_quiet_ms);
   auto const& p = sm.preparation;
-  d("prep.meta", p.max_inflight_metadata_jobs)("prep.dv", p.max_inflight_dv_jobs)(
-    "prep.lookahead", p.lookahead_batches)("prep.control", p.max_control_work)(
-    "prep.drain", p.drain_quantum)("prep.coordinators", p.coordinator_workers)(
-    "prep.workers", p.native_reader_workers)("prep.readers", p.max_native_readers)(
-    "prep.interrupt", p.interrupt_check_interval)("prep.partial", p.partial_batch.has_value());
+  if (in_effect) {
+    auto const r = p.resolve(sm.thread_pool.num_threads);
+    d("prep.meta", r.max_inflight_metadata_jobs)("prep.dv", r.max_inflight_dv_jobs)(
+      "prep.lookahead", r.lookahead_batches)("prep.control", r.max_control_work)(
+      "prep.drain", r.drain_quantum)("prep.coordinators", p.resolved_coordinator_workers())(
+      "prep.workers", p.resolved_native_workers())("prep.readers", p.resolved_native_readers());
+  } else {
+    d("prep.meta", p.max_inflight_metadata_jobs)("prep.dv", p.max_inflight_dv_jobs)(
+      "prep.lookahead", p.lookahead_batches)("prep.control", p.max_control_work)(
+      "prep.drain", p.drain_quantum)("prep.coordinators", p.coordinator_workers)(
+      "prep.workers", p.native_reader_workers)("prep.readers", p.max_native_readers);
+  }
+  d("prep.interrupt", p.interrupt_check_interval)("prep.partial", p.partial_batch.has_value());
   if (p.partial_batch) {
     d("prep.fill", p.partial_batch->min_fill_percent)(
       "prep.min_res", p.partial_batch->min_residence)("prep.max_res",
@@ -722,4 +735,52 @@ TEST_CASE("a NIC MTU above what min_mtu may name derives no check", "[config][co
   auto const config =
     sirius::create_sirius_config(sirius::config::default_user_config(), this_machine(), huge_mtu);
   REQUIRE(config.get_scan_manager_config().rest.min_mtu == 0);
+}
+
+TEST_CASE("the effective configuration resolves to what it was derived from",
+          "[config][config_create]")
+{
+  for (auto const& user :
+       {sirius::config::default_user_config(),
+        sirius::config::read_user_config(slurp(data_dir() / "valid_every_key.yaml"))}) {
+    auto const resolved  = sirius::create_sirius_config(user, this_machine(), no_nic);
+    auto const effective = sirius::effective_user_config(user, resolved);
+    // Hardware-derived values are spelled out...
+    REQUIRE(effective.executor.pipeline.num_threads.user_defined());
+    REQUIRE(effective.executor.scan_manager.rest.max_connections.user_defined());
+    REQUIRE(effective.operator_params.hash_partition_bytes.user_defined());
+    // ...and resolving them changes nothing the engine runs with.
+    REQUIRE(describe(sirius::create_sirius_config(effective, this_machine(), no_nic),
+                     /*in_effect=*/true) == describe(resolved, /*in_effect=*/true));
+  }
+}
+
+TEST_CASE("the effective configuration file", "[config][config_create]")
+{
+  auto const dir  = std::filesystem::temp_directory_path() / "sirius_effective_config_test";
+  auto const path = dir / "nested" / "config.yml";
+  std::filesystem::remove_all(dir);
+  auto const user     = sirius::config::default_user_config();
+  auto const resolved = sirius::create_sirius_config(user, this_machine(), no_nic);
+  sirius::write_effective_config(path, user, resolved);
+  REQUIRE(std::filesystem::exists(path));
+  auto const files = [&] {
+    return std::distance(std::filesystem::directory_iterator(path.parent_path()),
+                         std::filesystem::directory_iterator{});
+  };
+  REQUIRE(files() == 1);  // no temporary left behind
+
+  auto const written = sirius::config::read_user_config(slurp(path));
+  REQUIRE(written.executor.pipeline.num_threads.get() ==
+          resolved.get_gpu_pipeline_executor_config().num_threads);
+  REQUIRE(written.max_concurrent_queries.get() == 1);  // fallbacks are spelled out too
+  auto const document = sirius::config::parse_yaml(slurp(path));
+  auto const* rest = document.find("sirius")->find("executor")->find("scan_manager")->find("rest");
+  // Developer-only settings appear only in developer mode.
+  REQUIRE((rest != nullptr) == sirius::config::developer_mode());
+
+  sirius::write_effective_config(path, user, resolved);  // a second start replaces it
+  REQUIRE(files() == 1);
+  REQUIRE(sirius::config::read_user_config(slurp(path)).max_concurrent_queries.get() == 1);
+  std::filesystem::remove_all(dir);
 }

@@ -18,6 +18,7 @@
 
 #include "compression/spill_compression.hpp"
 #include "config.hpp"
+#include "config/user_config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
@@ -98,6 +99,10 @@ namespace {
 static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
 static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
+/// Written to ~/.sirius when Sirius starts without a config file: what it runs with.
+static constexpr std::string_view EFFECTIVE_CONFIG_FILE_NAME = "config.yml";
+/// Set to 0 to keep Sirius from writing the effective configuration (tests do).
+static constexpr std::string_view EFFECTIVE_CONFIG_ENV_NAME = "SIRIUS_WRITE_EFFECTIVE_CONFIG";
 
 optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
 {
@@ -210,6 +215,30 @@ std::optional<std::string> get_config_file_path()
   }
 
   return std::nullopt;
+}
+
+/// Record what Sirius runs with in ~/.sirius/config.yml when the user gave no config file. A
+/// failure to write is logged, never fatal.
+void write_effective_config_file(const sirius::sirius_config& resolved)
+{
+  if (auto const* write = std::getenv(std::string(EFFECTIVE_CONFIG_ENV_NAME).c_str());
+      write != nullptr && std::string_view{write} == "0") {
+    return;
+  }
+  auto const* home = std::getenv("HOME");
+  if (home == nullptr) {
+    SIRIUS_LOG_WARN("HOME is not set; not writing the effective configuration");
+    return;
+  }
+  auto const path = std::filesystem::path(home) / std::string(CONFIG_FILE_DIR) /
+                    std::string(EFFECTIVE_CONFIG_FILE_NAME);
+  try {
+    sirius::write_effective_config(path, sirius::config::default_user_config(), resolved);
+    SIRIUS_LOG_INFO("Wrote the effective configuration to {}", path.string());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+      "Could not write the effective configuration to {}: {}", path.string(), e.what());
+  }
 }
 
 bool sirius_disabled_by_env()
@@ -2539,6 +2568,7 @@ void SiriusContextExtensionCallback::initialize_context()
 
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
+  if (!config_file_found_) { write_effective_config_file(context->get_config()); }
   context_ = std::move(context);
 }
 
@@ -2596,7 +2626,8 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
-    config_ = sirius::parsed_sirius_config::from_file(*config_path);
+    config_            = sirius::parsed_sirius_config::from_file(*config_path);
+    config_file_found_ = true;
     SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
