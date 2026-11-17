@@ -47,7 +47,6 @@ class Expression;
 class FunctionData;
 class LogicalType;
 class Value;
-class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalAnyJoin;
@@ -130,14 +129,7 @@ class sirius_physical_plan_generator {
   ~sirius_physical_plan_generator();
 
   duckdb::LogicalDependencyList dependencies;
-  //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
-  //! This data structure is used to establish it.
-  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
-    recursive_cte_tables;
-  //! Used to reference the recurring tables
-  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
-    recurring_cte_tables;
-  //! Materialized CTE ids must be collected.
+  //! The CTE_SCANs planned so far for each materialized CTE, keyed by the CTE's table index.
   duckdb::unordered_map<
     duckdb::TableIndex,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>

@@ -31,7 +31,9 @@ class sirius_meta_pipeline;
 
 namespace op {
 
-//! The sirius_physical_column_data_scan scans a ColumnDataCollection
+//! A scan of rows produced elsewhere in the plan. As COLUMN_DATA_SCAN it holds a host
+//! ColumnDataCollection (VALUES), which the plan generator replaces with GPU_VALUES. As CTE_SCAN
+//! or DELIM_SCAN it holds nothing: it only marks where the producer's batches are routed.
 class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
   [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override

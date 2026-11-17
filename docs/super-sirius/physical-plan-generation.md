@@ -33,7 +33,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |
 | `LOGICAL_MATERIALIZED_CTE` | `CTE` | `src/planner/sirius_plan_cte.cpp` |
-| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
+| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_cte_ref.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 | `LOGICAL_EXCEPT` / `LOGICAL_INTERSECT` (`ALL` forms only) | `REPLICATE` over `PROJECTION`, `HASH_GROUP_BY` and `UNION` | `src/planner/sirius_plan_set_operation.cpp` |
@@ -179,7 +179,7 @@ Build order rules:
 
 ### `sirius_pipeline_build_state`
 
-**File:** `src/pipeline/sirius_pipeline_build_state.hpp`
+**File:** `src/pipeline/sirius_pipeline.hpp`
 
 Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators
@@ -187,6 +187,7 @@ Provides controlled write access to pipeline internals during construction:
 - `create_child_pipeline()` — delegate to engine
 - `delim_join_dependencies` — maps scan operators to their delim join producer pipelines
 - `cte_dependencies` — maps CTE scan operators to their materialization pipelines
+- `cte_scan_consumers` — maps CTE scan operators to the pipelines that read them
 
 ### `build_pipelines()` Patterns
 
