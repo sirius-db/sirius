@@ -259,7 +259,7 @@ Every row the filter keeps has `x = y`, so the added join removes only rows the 
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
 
-**Config:** `enable_subquery_key_carry` (default `true`, see [Configuration](configuration.md)).
+**Config:** `enable_subquery_key_carry` (default `false`, see [Configuration](configuration.md)). Off by default for now: the rewrite is not yet tested on multiple GPUs, and a query that falls back to the CPU after the hook has run executes the rewritten plan.
 
 ### EXISTS Answered from an Aggregate Subquery
 
@@ -291,7 +291,7 @@ The aggregate has a group for a key exactly when `S` has a row for it, which is 
 
 **Code path:** `src/planner/delim_cte_rewrites.cpp` (`match_exists_twin`), sharing `flatten` with the delim aggregate reuse (`src/planner/sirius_plan_flat_tree.cpp`); called from `src/transparent/sirius_optimizer_extension.cpp` for queries headed to the GPU.
 
-**Config:** `enable_exists_from_aggregate` (default `true`, see [Configuration](configuration.md)).
+**Config:** `enable_exists_from_aggregate` (default `false`, see [Configuration](configuration.md)). Off by default for now, for the same two reasons as the rule above, and because a scan DuckDB has no row estimate for reports one row, which passes the size guard on `X`.
 
 ### Sorted-Key Grouped Aggregation
 

@@ -345,9 +345,25 @@ TEST_CASE_METHOD(delim_rewrites_fixture,
 }
 
 TEST_CASE_METHOD(delim_rewrites_fixture,
+                 "delim rewrites - both rules are off by default",
+                 "[delim_cte_rewrites][plan]")
+{
+  auto const plan = optimized(*con, twin_query());
+  INFO(plan.text);
+  // DuckDB's plan: the subquery's tables are joined twice, the keys restrict `suppliers` only,
+  // and the EXISTS is kept.
+  CHECK(plan.sales_scans == 2);
+  CHECK(plan.outer_joins == 1);
+  CHECK(plan.semi_joins + plan.mark_joins == 2);
+}
+
+TEST_CASE_METHOD(delim_rewrites_fixture,
                  "delim rewrites - a query that stays on the CPU keeps DuckDB's plan",
                  "[delim_cte_rewrites][plan]")
 {
+  // Both rules on, so that only the query's destination keeps them from the plan.
+  sirius::test::scoped_sirius_setting exists_switch(*con, "enable_exists_from_aggregate", true);
+  sirius::test::scoped_sirius_setting carry_switch(*con, "enable_subquery_key_carry", true);
   sirius::test::scoped_sirius_setting cpu(*con, "gpu_execution", false);
   auto const plan = optimized(*con, twin_query());
   INFO(plan.text);

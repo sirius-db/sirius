@@ -78,7 +78,10 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   SECTION("the rules change the plan of these queries")
   {
-    auto const twin                 = scalar + outer_rows + exists;
+    auto const twin = scalar + outer_rows + exists;
+    // Both rules are off by default.
+    sirius::test::scoped_sirius_setting exists_on(*con, "enable_exists_from_aggregate", true);
+    sirius::test::scoped_sirius_setting carry_on(*con, "enable_subquery_key_carry", true);
     std::size_t without_exists_rule = 0;
     std::size_t without_carry       = 0;
     {

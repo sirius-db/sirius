@@ -139,11 +139,14 @@ constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
 /// Restrict every table a delim subquery ties to its correlation column by an equality, before
-/// DuckDB orders the joins.
-constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = true;
+/// DuckDB orders the joins. Off for now: the rewrite is not tested on multiple GPUs, and a query
+/// that falls back to the CPU after the pre-optimize hook runs the rewritten plan.
+constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = false;
 
-/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows.
-constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = true;
+/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows. Off for now,
+/// for the same reasons, and because a scan without a row estimate reports one row and so passes
+/// the rewrite's size guard.
+constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = false;
 
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
