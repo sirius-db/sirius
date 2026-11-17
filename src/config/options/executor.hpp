@@ -63,9 +63,9 @@ struct downgrade_options : block_base<downgrade_options> {
       .fallback(detail::downgrade_defaults().monitor_period)
       .build();
   /// Copy granularity of GPU-to-host spills; 0 submits a batch's copies at once.
-  config_option<bytes> copy_chunk_bytes =
-    option<bytes>("copy_chunk_bytes")
-      .fallback(to_bytes(detail::downgrade_defaults().copy_chunk_bytes))
+  config_option<ubytes> copy_chunk_bytes =
+    option<ubytes>("copy_chunk_bytes")
+      .fallback(ubytes(detail::downgrade_defaults().copy_chunk_bytes))
       .build();
 
   auto fields() { return field_list(num_threads, cpu_affinity, monitor_period, copy_chunk_bytes); }

@@ -140,3 +140,102 @@ TEST_CASE("every fixture reads or fails as it did with the old reader", "[config
   }
   REQUIRE(differences.empty());
 }
+
+TEST_CASE("fixture verdicts follow their names", "[config][config_user]")
+{
+  // Independent of the old reader: invalid_* fixtures are rejected, every other one reads.
+  std::size_t rejected = 0, accepted = 0;
+  for (auto const& entry : std::filesystem::directory_iterator(data_dir())) {
+    if (entry.path().extension() != ".yaml") { continue; }
+    auto const name    = entry.path().filename().string();
+    bool const invalid = name.starts_with("invalid_");
+    bool ok            = true;
+    try {
+      (void)read_user_config(slurp(entry.path()));
+    } catch (const config_error&) {
+      ok = false;
+    }
+    INFO(name);
+    REQUIRE(ok == !invalid);
+    ++(ok ? accepted : rejected);
+  }
+  REQUIRE(rejected >= 40);
+  REQUIRE(accepted >= 30);
+}
+
+TEST_CASE("max_concurrent_queries", "[config][config_user]")
+{
+  REQUIRE(read_user_config("sirius:\n  max_concurrent_queries: 4\n").max_concurrent_queries.get() ==
+          4);
+  REQUIRE(read_error("sirius:\n  max_concurrent_queries: 0\n") ==
+          "'sirius.max_concurrent_queries': value out of range: '0' (must be greater than zero)");
+  REQUIRE_THAT(read_error("sirius:\n  max_concurrent_queries: -1\n"),
+               Catch::Matchers::ContainsSubstring("value out of range"));
+  REQUIRE(read_error("sirius:\n  max_concurrent_queries: many\n") ==
+          "'sirius.max_concurrent_queries': invalid integer value: 'many'");
+  REQUIRE(default_user_config().max_concurrent_queries.scope() == option_scope::session);
+}
+
+TEST_CASE("which memory and space combinations conflict", "[config][config_user]")
+{
+  (void)read_user_config("sirius:\n  memory: {}\n  space:\n    gpu: [{}]\n");
+  (void)read_user_config("sirius:\n  memory:\n    gpu: ~\n  space:\n    gpu: [{}]\n");
+  for (std::string_view text : {"sirius:\n  memory:\n    host: {}\n  space:\n    host: [{}]\n",
+                                "sirius:\n  memory:\n    disk: {}\n  space:\n    disk: [{}]\n",
+                                "sirius:\n  memory:\n    gpu: {}\n  space:\n    gpu: [~]\n"}) {
+    INFO(text);
+    REQUIRE_THAT(read_error(text), Catch::Matchers::EndsWith("are mutually exclusive"));
+  }
+}
+
+TEST_CASE("memory set in code counts as configured", "[config][config_user]")
+{
+  auto config = read_user_config("sirius:\n  space:\n    gpu: [{}]\n");
+  REQUIRE_FALSE(config.memory.configured());
+  config.memory.gpu.usage_limit.assign(0.5);
+  REQUIRE(config.memory.configured());
+  REQUIRE_THROWS_AS(config.validate(user_config_root), config_error);
+  // The user's value is written, not dropped.
+  REQUIRE(parse_yaml(write_user_config(config)).find("sirius")->find("memory") != nullptr);
+}
+
+TEST_CASE("an empty memory block next to space lists survives a dump", "[config][config_user]")
+{
+  constexpr std::string_view text =
+    "sirius:\n  memory: {}\n  space:\n    gpu:\n      - device_id: 0\n";
+  auto const config = read_user_config(text);
+  REQUIRE(parse_yaml(write_user_config(config)) == parse_yaml(text));
+  auto const all = read_user_config(write_user_config(config, true));
+  REQUIRE(all.memory.user_defined());
+  REQUIRE_FALSE(all.memory.configured());
+
+  config_block const& erased = config;
+  REQUIRE(erased.write(true).find("memory")->entries().empty());
+}
+
+TEST_CASE("a failed read leaves the configuration as it was", "[config][config_user]")
+{
+  auto config = read_user_config("sirius:\n  max_concurrent_queries: 3\n");
+  REQUIRE_THROWS_AS(
+    read_yaml(
+      config, "sirius:\n  max_concurrent_queries: 0\n", user_config_root, environment::prod),
+    config_error);
+  REQUIRE(config.max_concurrent_queries.get() == 3);
+}
+
+TEST_CASE("telemetry and compression rows", "[config][config_user]")
+{
+  REQUIRE(read_error("sirius:\n  telemetry:\n    engine_name: ''\n") ==
+          "'sirius.telemetry.engine_name': value out of range: '' (must not be empty)");
+  for (auto const* entry : {"spill_max_compressed_fraction: .nan",
+                            "spill_max_compressed_fraction: -0.1",
+                            "min_batch_size_bytes: -1"}) {
+    INFO(entry);
+    (void)read_error(std::string("sirius:\n  compression:\n    ") + entry + "\n");
+  }
+  auto const defaults = default_user_config();
+  REQUIRE_FALSE(defaults.telemetry.enable_nvtx.get());
+  REQUIRE(defaults.telemetry.nvtx_injection_lib.get().empty());
+  auto const off = read_user_config("sirius:\n  telemetry:\n    enable_quent: false\n");
+  REQUIRE_FALSE(read_user_config(write_user_config(off)).telemetry.enable_quent.get());
+}

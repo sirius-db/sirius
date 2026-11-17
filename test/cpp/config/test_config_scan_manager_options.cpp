@@ -185,10 +185,10 @@ TEST_CASE("scan manager values are checked", "[config][config_scan_manager]")
           "'sirius.executor.scan_manager.cache.mode': invalid enum value 'memory'");
   REQUIRE(read_error("      memory_prefetcher:\n        poll_interval_ms: 0\n") ==
           "'sirius.executor.scan_manager.memory_prefetcher.poll_interval_ms': value out of range: "
-          "'0 ms' (must be greater than 0)");
+          "'0 ms' (must be greater than zero)");
   REQUIRE(read_error("      preparation:\n        lookahead_batches: 0\n") ==
           "'sirius.executor.scan_manager.preparation.lookahead_batches': value out of range: '0' "
-          "(must be greater than 0)");
+          "(must be greater than zero)");
   REQUIRE(
     read_error("      preparation:\n        partial_batch:\n          min_fill_percent: 0\n") ==
     "'sirius.executor.scan_manager.preparation.partial_batch.min_fill_percent': value out of "
@@ -347,11 +347,11 @@ TEST_CASE("more scan manager rows", "[config][config_scan_manager]")
   REQUIRE_THAT(pb("max_residence: 49ms"),
                Catch::Matchers::EndsWith("max_residence must be at least min_residence"));
   REQUIRE_THAT(pb("min_residence: -1ms"),
-               Catch::Matchers::ContainsSubstring("must be greater than 0"));
+               Catch::Matchers::ContainsSubstring("must be greater than zero"));
   REQUIRE_THAT(pb("min_fill_percent: 101"),
                Catch::Matchers::ContainsSubstring("must be between 1 and 100"));
   REQUIRE_THAT(read_error("      preparation:\n        interrupt_check_interval: 0\n"),
-               Catch::Matchers::ContainsSubstring("must be greater than 0"));
+               Catch::Matchers::ContainsSubstring("must be greater than zero"));
   // Prefetcher, cache, strategy and counts.
   for (auto const* body : {"memory_prefetcher:\n        num_threads: 0",
                            "memory_prefetcher:\n        min_free_fraction: 1.5",
@@ -414,10 +414,10 @@ TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_
   REQUIRE(o.request_timeout.get().count() == r.request_timeout_s);
   REQUIRE(o.stall_speed_limit_bytes.get().count() == r.stall_speed_limit_bytes);
   REQUIRE(o.stall_time.get().count() == r.stall_time_s);
-  REQUIRE(o.merge_max_gap.get().count() == static_cast<std::int64_t>(r.merge_max_gap));
-  REQUIRE(o.min_segment_bytes.get().count() == static_cast<std::int64_t>(r.min_segment_bytes));
-  REQUIRE(o.max_segment_bytes.get().count() == static_cast<std::int64_t>(r.max_segment_bytes));
-  REQUIRE(o.footer_probe_bytes.get().count() == static_cast<std::int64_t>(r.footer_probe_bytes));
+  REQUIRE(o.merge_max_gap.get().count() == static_cast<std::uint64_t>(r.merge_max_gap));
+  REQUIRE(o.min_segment_bytes.get().count() == static_cast<std::uint64_t>(r.min_segment_bytes));
+  REQUIRE(o.max_segment_bytes.get().count() == static_cast<std::uint64_t>(r.max_segment_bytes));
+  REQUIRE(o.footer_probe_bytes.get().count() == static_cast<std::uint64_t>(r.footer_probe_bytes));
   REQUIRE(o.list_max_matches.get() == r.list_max_matches);
   REQUIRE(o.list_max_scanned.get() == r.list_max_scanned);
   REQUIRE(o.retry_backoff_base.get() == r.retry_backoff_base);
@@ -438,7 +438,7 @@ TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_
   REQUIRE(o.mtu_reject_max_attempts.get() == r.mtu_reject_max_attempts);
   REQUIRE(o.close_with_rst.get() == r.close_with_rst);
   REQUIRE(o.receive_buffer_bytes.get().count() ==
-          static_cast<std::int64_t>(r.receive_buffer_bytes));
+          static_cast<std::uint64_t>(r.receive_buffer_bytes));
   REQUIRE(o.queue_depth.get() == r.queue_depth);
   REQUIRE(o.wait_mode.get() == r.wait_mode);
   REQUIRE(o.iowq_max_unbound.get() == r.iowq_max_unbound);
@@ -457,7 +457,7 @@ TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_
   REQUIRE(o.tls.session_cache.get() == t.session_cache);
   REQUIRE(o.tls.session_cache_per_endpoint.get() == t.session_cache_per_endpoint);
   REQUIRE(o.tls.max_connection_bytes.get().count() ==
-          static_cast<std::int64_t>(t.max_connection_bytes));
+          static_cast<std::uint64_t>(t.max_connection_bytes));
   REQUIRE(o.tls.ciphersuites.get() == t.ciphersuites);
   REQUIRE(o.tls.cipher_list.get() == t.cipher_list);
   REQUIRE(o.tls.groups.get() == t.groups);

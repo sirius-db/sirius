@@ -17,18 +17,18 @@ namespace sirius::config {
 /// `sirius.memory.gpu`: every selected GPU's memory space.
 struct gpu_memory_options : block_base<gpu_memory_options> {
   /// The space's capacity: absolute bytes or a fraction of the GPU's memory.
-  config_option<bytes, double> usage_limit = option<bytes>("usage_limit_bytes")
-                                               .or_type<double>("usage_limit_fraction")
-                                               .validate(fraction{})
-                                               .fallback(0.95)
-                                               .build();
+  config_option<ubytes, double> usage_limit = option<ubytes>("usage_limit_bytes")
+                                                .or_type<double>("usage_limit_fraction")
+                                                .validate(fraction{})
+                                                .fallback(0.95)
+                                                .build();
 
   /// How much of the capacity reservations may take: bytes or a fraction of it.
-  config_option<bytes, double> reservation_limit = option<bytes>("reservation_limit_bytes")
-                                                     .or_type<double>("reservation_limit_fraction")
-                                                     .validate(positive_fraction{})
-                                                     .fallback(1.0)
-                                                     .build();
+  config_option<ubytes, double> reservation_limit = option<ubytes>("reservation_limit_bytes")
+                                                      .or_type<double>("reservation_limit_fraction")
+                                                      .validate(positive_fraction{})
+                                                      .fallback(1.0)
+                                                      .build();
 
   config_option<double> downgrade_trigger_fraction =
     option<double>("downgrade_trigger_fraction").validate(fraction{}).fallback(0.8).build();
@@ -51,28 +51,28 @@ struct gpu_memory_options : block_base<gpu_memory_options> {
 /// `sirius.memory.host`: one pinned host memory space per NUMA node.
 struct host_memory_options : block_base<host_memory_options> {
   /// Each space's capacity: absolute bytes, or a fraction of its NUMA node's memory.
-  config_option<bytes, double> capacity = option<bytes>("capacity_bytes")
-                                            .validate(positive<bytes>{})
-                                            .or_type<double>("capacity_fraction")
-                                            .validate(positive_fraction{})
-                                            .fallback(0.9)
-                                            .build();
+  config_option<ubytes, double> capacity = option<ubytes>("capacity_bytes")
+                                             .validate(positive<ubytes>{})
+                                             .or_type<double>("capacity_fraction")
+                                             .validate(positive_fraction{})
+                                             .fallback(0.9)
+                                             .build();
 
-  config_option<bytes, double> reservation_limit = option<bytes>("reservation_limit_bytes")
-                                                     .or_type<double>("reservation_limit_fraction")
-                                                     .validate(positive_fraction{})
-                                                     .fallback(1.0)
-                                                     .build();
+  config_option<ubytes, double> reservation_limit = option<ubytes>("reservation_limit_bytes")
+                                                      .or_type<double>("reservation_limit_fraction")
+                                                      .validate(positive_fraction{})
+                                                      .fallback(1.0)
+                                                      .build();
 
   config_option<double> downgrade_trigger_fraction =
     option<double>("downgrade_trigger_fraction").validate(fraction{}).fallback(0.9).build();
   config_option<double> downgrade_stop_fraction =
     option<double>("downgrade_stop_fraction").validate(fraction{}).fallback(0.8).build();
 
-  config_option<bytes> block_size = option<bytes>("block_size")
-                                      .validate(positive<bytes>{})
-                                      .fallback(to_bytes(cucascade::memory::default_block_size))
-                                      .build();
+  config_option<ubytes> block_size = option<ubytes>("block_size")
+                                       .validate(positive<ubytes>{})
+                                       .fallback(ubytes(cucascade::memory::default_block_size))
+                                       .build();
   config_option<std::size_t> pool_size = option<std::size_t>("pool_size")
                                            .validate(positive<std::size_t>{})
                                            .fallback(cucascade::memory::default_pool_size)
@@ -103,8 +103,8 @@ struct host_memory_options : block_base<host_memory_options> {
 /// capacity_bytes is nonzero.
 struct disk_memory_options : block_base<disk_memory_options> {
   config_option<int> disk_id = option<int>("disk_id").fallback(0).build();
-  config_option<bytes> capacity_bytes =
-    option<bytes>("capacity_bytes").fallback(tebibytes(1)).build();
+  config_option<ubytes> capacity_bytes =
+    option<ubytes>("capacity_bytes").fallback(tebibytes(1)).build();
   /// The spill directory; empty turns the disk tier off.
   config_option<std::string> downgrade_root_dirs =
     option<std::string>("downgrade_root_dirs").fallback(std::string{}).build();
@@ -121,10 +121,10 @@ struct memory_options : block_base<memory_options> {
 
   auto fields() { return field_list(sub("gpu", gpu), sub("host", host), sub("disk", disk)); }
 
-  /// Whether any tier block is present.
-  [[nodiscard]] bool configured() const noexcept
+  /// Whether any tier is in use: present in the file (even empty) or holding a user value.
+  [[nodiscard]] bool configured() const
   {
-    return gpu.user_defined() || host.user_defined() || disk.user_defined();
+    return gpu.has_user_values() || host.has_user_values() || disk.has_user_values();
   }
 };
 

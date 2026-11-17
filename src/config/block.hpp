@@ -60,6 +60,10 @@ class config_block {
   /// empty mapping counts; a null value does not).
   [[nodiscard]] bool user_defined() const noexcept { return _user_defined; }
 
+  /// Whether the user defined this block or any value in it, read or assigned: user_defined(),
+  /// a user-defined option, a nested block with user values, or a non-empty list.
+  [[nodiscard]] virtual bool has_user_values() const = 0;
+
  protected:
   config_block()                                   = default;
   config_block(const config_block&)                = default;
@@ -132,6 +136,14 @@ class block_base : public config_block {
     auto fields = const_cast<Derived&>(static_cast<const Derived&>(*this)).fields();
     std::apply([&](auto&... field) { (write_field(field, out, include_fallbacks), ...); }, fields);
     return out;
+  }
+
+  [[nodiscard]] bool has_user_values() const override
+  {
+    if (_user_defined) { return true; }
+    auto fields = const_cast<Derived&>(static_cast<const Derived&>(*this)).fields();
+    return std::apply([](const auto&... field) { return (holds_user_values(field) || ...); },
+                      fields);
   }
 
   void check_declaration() const override
@@ -310,6 +322,11 @@ class block_base : public config_block {
   static void check_nested(const config_option<Ts...>&)
   {
   }
+  template <class... Ts>
+  static bool holds_user_values(const config_option<Ts...>& option)
+  {
+    return option.user_defined();
+  }
 
   // -- nested blocks
 
@@ -344,6 +361,11 @@ class block_base : public config_block {
   static void check_nested(const nested_block<B>& field)
   {
     field.block->check_declaration();
+  }
+  template <class B>
+  static bool holds_user_values(const nested_block<B>& field)
+  {
+    return field.block->has_user_values();
   }
 
   // -- lists of blocks
@@ -395,6 +417,11 @@ class block_base : public config_block {
   {
     B{}.check_declaration();
   }
+  template <class B>
+  static bool holds_user_values(const block_list<B>& field)
+  {
+    return !field.blocks->empty();
+  }
 
   // -- removed keys
 
@@ -411,6 +438,7 @@ class block_base : public config_block {
   static void read_field(const removed_key&, const node&, std::string_view, environment) {}
   static void write_field(const removed_key&, node&, bool) {}
   static void check_nested(const removed_key&) {}
+  static bool holds_user_values(const removed_key&) { return false; }
 };
 
 }  // namespace sirius::config

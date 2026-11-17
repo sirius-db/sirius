@@ -113,7 +113,7 @@ TEST_CASE("GPU memory takes bytes or a fraction", "[config][config_memory]")
   auto const root = read(
     "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 8 GiB\n"
     "      reservation_limit_fraction: 0.5\n");
-  REQUIRE(root.memory.gpu.usage_limit.get<bytes>() == 8_GiB);
+  REQUIRE(root.memory.gpu.usage_limit.get<ubytes>() == 8_GiB);
   REQUIRE(root.memory.gpu.usage_limit.user_defined());
   REQUIRE(root.memory.gpu.reservation_limit.get<double>() == 0.5);
   REQUIRE(root.memory.configured());
@@ -162,7 +162,7 @@ TEST_CASE("host memory rejects values cuCascade cannot use", "[config][config_me
   auto const root = read(
     "sirius:\n  memory:\n    host:\n      capacity_bytes: 16 GiB\n"
     "      block_size: 2 MiB\n      initial_number_pools: 3\n");
-  REQUIRE(root.memory.host.capacity.get<bytes>() == 16_GiB);
+  REQUIRE(root.memory.host.capacity.get<ubytes>() == 16_GiB);
   REQUIRE(root.memory.host.block_size.get() == 2_MiB);
   REQUIRE(root.memory.host.initial_number_pools.get() == 3);
 }
@@ -339,11 +339,14 @@ TEST_CASE("topology shapes", "[config][config_memory]")
   REQUIRE(root.topology.gpus.get<std::size_t>() == 0);
 }
 
-TEST_CASE("byte values above INT64_MAX are rejected", "[config][config_memory]")
+TEST_CASE("byte values reach UINT64_MAX, as the engine's fields do", "[config][config_memory]")
 {
-  // Upstream read sizes as uint64_t; an 8 EiB size is no real configuration.
+  auto const root =
+    read("sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 18446744073709551615\n");
+  REQUIRE(root.memory.gpu.usage_limit.get<ubytes>().count() ==
+          std::numeric_limits<std::uint64_t>::max());
   REQUIRE_THAT(
-    read_error("sirius:\n  memory:\n    host:\n      block_size: 18446744073709551615\n"),
+    read_error("sirius:\n  memory:\n    host:\n      block_size: 18446744073709551616\n"),
     Catch::Matchers::ContainsSubstring("byte value out of range"));
 }
 
@@ -376,6 +379,4 @@ TEST_CASE("validators reject NaN and check their bounds", "[config][config_memor
   REQUIRE_FALSE(positive_fraction{}(0.0));
   REQUIRE(positive<bytes>{}(1_B));
   REQUIRE_FALSE(positive<bytes>{}(0_B));
-  REQUIRE(to_bytes(1024) == 1_KiB);
-  REQUIRE_THROWS_AS(to_bytes(std::numeric_limits<std::uint64_t>::max()), std::logic_error);
 }
