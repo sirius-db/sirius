@@ -127,6 +127,9 @@ int main(int argc, char* argv[])
   // Keep test-only DuckDB options out of normal Sirius builds and sessions. This process opts in
   // before constructing the shared databases used by the runtime-fallback integration tests.
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  // Starting without a config file writes ~/.sirius/config.yml; tests leave the home directory
+  // alone unless asked.
+  setenv("SIRIUS_WRITE_EFFECTIVE_CONFIG", "0", 0);
 
   // Install the crash backtrace handler up front so it covers the whole test
   // run, independent of when (or whether) the extension's LoadInternal runs.

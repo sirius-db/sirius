@@ -746,6 +746,118 @@ sirius_config create_sirius_config(const config::user_config& user,
   return parsed_sirius_config::from_user_config(user).resolve(topology, probe);
 }
 
+config::user_config effective_user_config(const config::user_config& user,
+                                          const sirius_config& resolved)
+{
+  config::user_config out;
+  out.read(user.write(false), config::user_config_root, config::environment::prod);
+  // What resolution derived for an option the user left to it, as the user would have written it.
+  auto const derived = [](auto& option, auto value) {
+    if (!option.user_defined()) { option.assign(std::move(value)); }
+  };
+  // Affinities lose the CPUs the REST reactors pin to, so the effective lists always apply.
+  auto const in_effect = [](auto& option, auto value) {
+    if (!option.get_if() || *option.get_if() != value) { option.assign(std::move(value)); }
+  };
+
+  std::size_t gpu_spaces = 0;
+  std::vector<std::size_t> host_pools;
+  for (auto const& space : resolved.get_memory_space_configs()) {
+    if (std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space)) { ++gpu_spaces; }
+    if (auto const* host = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      host_pools.push_back(host->initial_number_pools);
+    }
+  }
+  if (!out.space.configured()) {
+    derived(out.topology.gpus, gpu_spaces);
+    // One count for every NUMA node, when the derived counts agree.
+    if (!host_pools.empty() &&
+        std::ranges::adjacent_find(host_pools, std::ranges::not_equal_to{}) == host_pools.end()) {
+      derived(out.memory.host.initial_number_pools, host_pools.front());
+    }
+  }
+
+  auto& executor = out.executor;
+  derived(executor.task_creator.num_threads,
+          resolved.get_task_creator_config().thread_pool.num_threads);
+  in_effect(executor.task_creator.cpu_affinity,
+            resolved.get_task_creator_config().thread_pool.cpu_affinity_list);
+  derived(executor.pipeline.num_threads, resolved.get_gpu_pipeline_executor_config().num_threads);
+  auto const& downgrade = resolved.get_downgrade_executor_config();
+  derived(executor.downgrade.num_threads, downgrade.thread_pool.num_threads);
+  in_effect(executor.downgrade.cpu_affinity, downgrade.thread_pool.cpu_affinity_list);
+
+  auto const& sm_cfg = resolved.get_scan_manager_config();
+  auto& sm           = executor.scan_manager;
+  derived(sm.num_threads, sm_cfg.thread_pool.num_threads);
+  in_effect(sm.cpu_affinity, sm_cfg.thread_pool.cpu_affinity_list);
+  derived(sm.uring_n_reactors, sm_cfg.uring_n_reactors);
+  derived(sm.rest_n_reactors, sm_cfg.rest_n_reactors);
+  derived(sm.uring.n_max_concurrent_scans, sm_cfg.uring.n_max_concurrent_scans);
+  derived(sm.rest.n_max_concurrent_scans, sm_cfg.rest.n_max_concurrent_scans);
+  derived(sm.rest.max_connections, sm_cfg.rest.max_connections);
+  derived(sm.rest.min_mtu, config::ubytes(sm_cfg.rest.min_mtu));
+
+  // The preparation limits as the scan manager resolves them from its worker count.
+  auto const& prep_cfg = sm_cfg.preparation;
+  auto const prep      = prep_cfg.resolve(sm_cfg.thread_pool.num_threads);
+  auto& prep_options   = sm.preparation;
+  derived(prep_options.max_inflight_metadata_jobs, prep.max_inflight_metadata_jobs);
+  derived(prep_options.max_inflight_dv_jobs, prep.max_inflight_dv_jobs);
+  derived(prep_options.lookahead_batches, prep.lookahead_batches);
+  derived(prep_options.max_control_work, prep.max_control_work);
+  derived(prep_options.drain_quantum, prep.drain_quantum);
+  derived(prep_options.coordinator_workers, prep_cfg.resolved_coordinator_workers());
+  derived(prep_options.native_reader_workers, prep_cfg.resolved_native_workers());
+  derived(prep_options.max_native_readers, prep_cfg.resolved_native_readers());
+
+  auto& op                                                     = out.operator_params;
+  config::config_option<config::ubytes>* const batch_options[] = {
+    &op.scan_task_batch_size,
+    &op.hash_partition_bytes,
+    &op.concat_batch_bytes,
+    &op.cross_join_task_bytes,
+    &op.sort_sample_bytes,
+    &op.max_build_hash_table_bytes,
+    &op.max_build_probe_resident_bytes};
+  for (auto const& setting : batch_settings) {
+    for (auto* option : batch_options) {
+      if (option->key() == setting.name) {
+        derived(*option, config::ubytes(resolved.get_operator_params().*setting.member));
+      }
+    }
+  }
+  return out;
+}
+
+void write_effective_config(const std::filesystem::path& path,
+                            const config::user_config& user,
+                            const sirius_config& resolved)
+{
+  auto const text = config::write_user_config(
+    effective_user_config(user, resolved),
+    config::write_options{/*fallbacks=*/true, /*developer=*/config::developer_mode()});
+  if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
+  // Replace the file whole, so a reader never sees half of it. The temporary is this writer's
+  // own: processes starting together would otherwise rename each other's half-written file.
+  static std::atomic<uint64_t> writes{0};
+  auto temporary = path;
+  temporary += ".tmp." + std::to_string(::getpid()) + "." + std::to_string(writes++);
+  try {
+    {
+      std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+      out << text;
+      out.close();
+      if (!out) { throw std::runtime_error("cannot write " + temporary.string()); }
+    }
+    std::filesystem::rename(temporary, path);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
+}
+
 std::optional<cucascade::memory::nic_topology> discover_egress_nic(
   std::string_view configured_interface)
 {
