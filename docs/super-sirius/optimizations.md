@@ -221,7 +221,7 @@ AGGREGATE(groups; sum(x))                 AGGREGATE(groups; sum(partial))
 
 DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported_optimizers.hpp`). It carries aggregate states through `combine` and `finalize`, which the GPU cannot run, and it only considers the join directly under the aggregate, which in q10 is `nation`.
 
-**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.61 s instead of 1.36 s with its columns pinned on the GPU, and in 1.52 s instead of 1.63 s unpinned, the same as when the SQL is rewritten by hand. TPC-DS q11 at SF100 goes from 0.28 s to 0.17 s pinned.
+**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.30 s instead of 0.39 s with its columns pinned on the GPU, and in 1.52 s instead of 1.64 s unpinned. TPC-DS q11 at SF100 goes from 0.29 s to 0.18 s pinned, and the TPC-Havoc Q18 variants that filter a per-order total with `HAVING` from about 14.7 s to 10.3 s unpinned.
 
 **When it applies:**
 - Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
