@@ -407,7 +407,18 @@ TEST_CASE("integer edge cases", "[config][config_values]")
   REQUIRE(parse_error<std::int8_t>("128") == "integer out of range: '128'");
   REQUIRE(parse_ok<std::int16_t>("-32768") == std::numeric_limits<std::int16_t>::min());
   REQUIRE(parse_ok<unsigned>("+0") == 0U);
-  REQUIRE(parse_ok<int>("010") == 10);  // decimal, not octal
+  REQUIRE(parse_error<int>("010") ==
+          "invalid integer value: '010' (leading zeros are not allowed)");
+  REQUIRE(parse_error<int>("-007") ==
+          "invalid integer value: '-007' (leading zeros are not allowed)");
+  REQUIRE(parse_ok<int>("0") == 0);
+  REQUIRE(parse_ok<int>("-0") == 0);
+  REQUIRE(parse_error<bytes>("010 MiB") ==
+          "invalid byte value: '010 MiB' (leading zeros are not allowed)");
+  REQUIRE(parse_error<std::chrono::milliseconds>("010") ==
+          "invalid time value: '010' (leading zeros are not allowed)");
+  REQUIRE(parse_ok<bytes>("0.5 KiB") == 512_B);
+  REQUIRE(parse_ok<bytes>("0 B") == 0_B);
   REQUIRE(parse_error<int>("0x10") == "invalid integer value: '0x10'");
   REQUIRE(parse_error<std::int64_t>(std::string(400, '9')) ==
           "integer out of range: '" + std::string(400, '9') + "'");

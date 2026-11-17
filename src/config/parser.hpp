@@ -115,7 +115,8 @@ struct formatter<bool> {
 
 // ---- integers: decimal, optional sign, no wrap-around into unsigned types ------------------
 // Character types are integers here too: they read and write numbers, not characters. Hex and
-// octal spellings, which yaml-cpp's conversion accepted, are not: "010" is ten.
+// leading-zero spellings are rejected: yaml-cpp's conversion read "0x10" as hex and "010" as
+// octal, and reading "010" as ten instead would change a value silently.
 
 template <class T>
   requires std::integral<T> && (!std::same_as<T, bool>)
@@ -134,6 +135,10 @@ struct parser<T> {
     auto const [end, error] = std::from_chars(text.data(), last, magnitude);
     if (text.empty() || error == std::errc::invalid_argument || end != last) {
       return parse_status::failure("invalid integer value: " + detail::quoted(trim(original)));
+    }
+    if (text.size() > 1 && text.front() == '0') {
+      return parse_status::failure("invalid integer value: " + detail::quoted(trim(original)) +
+                                   " (leading zeros are not allowed)");
     }
     if (error == std::errc::result_out_of_range) { return out_of_range(original); }
     if (negative && magnitude != 0) {
