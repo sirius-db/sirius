@@ -247,6 +247,29 @@ Sirius loads its settings from a YAML config file, searched in this order:
 
 If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
+## Disk Spilling
+
+Disk spilling is disabled by default: `sirius.memory.disk.downgrade_root_dirs` is empty,
+so there is no default spill directory. GPU data can still spill to host memory without
+a disk tier.
+
+To enable spilling from host memory to disk, add a spill directory on a fast local mount
+(NVMe preferred) to your `sirius.yaml` before starting Sirius:
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: "/mnt/nvme/sirius-spill"
+      capacity_bytes: 1Ti
+```
+
+Replace the path with a writable directory on your machine. `capacity_bytes` limits the
+disk spill tier and defaults to 1 TiB; it must be greater than zero to enable the tier.
+If your config is elsewhere, set `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading
+the extension. See the [disk memory configuration](super-sirius/configuration.md#disk-memory-siriusmemorydisk)
+for all disk settings.
+
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
 Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer where enabled) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.

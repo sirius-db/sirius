@@ -312,6 +312,9 @@ per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`
 The thread-pool sub-blocks use these common keys; pipeline affinity is the
 hardware-derived exception described below:
 
+In the default formulas, T counts logical CPU hardware threads and G counts configured GPUs.
+See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits, and examples.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
@@ -319,7 +322,7 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`). Task creation
+Thread pool (fixed default `num_threads: 4`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
 on demand and prioritizes source-side pipelines first. The former
 `sirius.executor.task_creator.strategy` and
@@ -328,11 +331,11 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`). No extra keys.
+Thread pool only (default `num_threads: clamp(floor(3T/(8G)), 4, 8)` per GPU). No extra keys.
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 1`) plus:
+Thread pool (default `num_threads: clamp(floor(T/(8G)), 1, 4)`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -367,11 +370,11 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
+| `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**>= 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. |
+| `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
@@ -423,7 +426,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
+| `n_max_concurrent_scans` | int (**>= 0**) | `pipeline.num_threads` | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it as the pipeline pool size (one scan per pipeline thread); under `opportunistic`, the default for local reads, the pipeline width is the budget the readahead schedules against. An explicit value wins, and an explicit `0` keeps the readahead off for local reads. An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 4 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `4` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 4 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
 | `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
 
@@ -457,8 +460,8 @@ Certificate verification is controlled by `tls_verify`, or by `VERIFY_SSL` on a 
 The `rest.tls` block below controls protocol/offload policy only, not trust.
 
 Sirius sets no transport defaults of its own: every default below is cuCascade's
-`rest::config` default (the one exception is `n_max_concurrent_scans`). Each key is
-range-checked when the config loads, and the loaded block is then checked with
+`rest::config` default (the exceptions are `n_max_concurrent_scans`, `min_mtu` and
+`max_connections`, which Sirius derives). Each key is range-checked when the config loads, and the loaded block is then checked with
 cuCascade's own `rest::config::validate()`, so cross-field rules (`queue_depth`
 against `max_connections`, `max_segment_bytes` against `min_segment_bytes`, the TLS
 session-cache rule) fail at load time, naming the YAML key. Sirius hands the loaded
@@ -501,7 +504,7 @@ so staging is proportional to the device work in flight.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_connections` | int (**1..4096**) | 64 | Keep-alive connections per reactor (one in-flight request each), not a process-wide cap. Past the point where the link is full, more connections only split the bandwidth into thinner streams; add reactors (`rest_n_reactors`) instead. |
+| `max_connections` | int (**1..4096**) | 128 with kTLS loaded, 64 without | Keep-alive connections per reactor (one in-flight request each), not a process-wide cap. Unnamed, Sirius derives it from cuCascade's topology (`kernel_tls.loaded`), capped at half of `queue_depth` so a smaller named `queue_depth` stays valid; a named value wins. Past the point where the link is full, more connections only split the bandwidth into thinner streams; add reactors (`rest_n_reactors`) instead. |
 | `conn_max_age_s` | int (seconds, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the window in which the query-start warm-up skips a repeat of the bucket it warmed last (60 s when `0`). `0` = no idle cutoff. |
 | `upkeep_http1` | bool | false | Send idle upkeep: while a reactor is idle, one zero-key `ListObjectsV2` per established connection every `upkeep_interval_ms`, staggered across the interval, so the endpoint does not idle-close the pool. Off by default, as libcurl's upkeep is a no-op on HTTP/1.1. |
 | `upkeep_interval_ms` | int (ms, **>= 0**) | 15000 | Upkeep period; only acts with `upkeep_http1`. `0` disables upkeep. |
@@ -512,7 +515,7 @@ so staging is proportional to the device work in flight.
 | `keepalive_idle_s` | int (seconds, **> 0**) | 60 | TCP keepalive (always on): idle time before the first probe. |
 | `keepalive_interval_s` | int (seconds, **> 0**) | 60 | TCP keepalive: time between probes. |
 | `keepalive_count` | int (**>= 0**) | 0 | TCP keepalive: probes before the connection is dropped; `0` = kernel default. |
-| `min_mtu` | bytes (**0..65607**) | 0 | Reject connections whose effective MTU is below this many bytes. `0` = off. See below. |
+| `min_mtu` | bytes (**0..65607**) | the egress NIC's MTU when above 1500 (jumbo frames), else 0 | Reject connections whose effective MTU is below this many bytes. `0` = off. Unnamed, Sirius derives it from cuCascade's topology: the MTU of the egress NIC (`rest.interface`, else the default route's interface) when that is a jumbo-frame MTU, otherwise `0`; a named value, `0` included, wins. See below. |
 | `mtu_reject_max_attempts` | int (**>= 1**) | 8 | Consecutive `min_mtu` rejections of one request after which the connection is accepted anyway. |
 | `close_with_rst` | bool | true | Close every socket with an RST (`SO_LINGER {on, 0}`), so none lingers in `TIME_WAIT` / `FIN_WAIT`. |
 
@@ -531,8 +534,10 @@ negotiate small TCP segments, which costs per-byte decryption time. Right after 
 connect, the effective MTU is `TCP_MAXSEG` + 40 (IPv4) or 60 (IPv6) header bytes, + 12
 with TCP timestamps; a connection below `min_mtu` is reset and the next DNS address is
 tried, up to `mtu_reject_max_attempts` times per request, after which the connection is
-accepted. The REST counters (`rest_ioctx::stats()`) report `mtu_rejects`,
-`mtu_fallbacks` and the smallest and largest MSS observed.
+accepted. Unnamed, the check is on only for a jumbo-frame NIC, at that NIC's own MTU (for
+example 9000), and off for a standard-MTU NIC or without NIC information. The REST counters
+(`rest_ioctx::stats()`) report `mtu_rejects`, `mtu_fallbacks` and the smallest and largest MSS
+observed.
 
 **Transport and placement**
 
@@ -633,8 +638,9 @@ pinned prefetching cache (`fs_cache`).
 
 Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
 file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
-existing pinned host-memory pool. With `max_readahead_scans` unset, REST read-ahead
-uses its backend budget; local uring read-ahead remains off by default.
+existing pinned host-memory pool. With `max_readahead_scans` unset, read-ahead uses the
+serving backend's budget: max(8, 2 × `pipeline.num_threads`) for REST and `pipeline.num_threads`
+for local uring (an explicit `uring.n_max_concurrent_scans: 0` keeps it off).
 
 `eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
 pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
@@ -908,10 +914,35 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
-| `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
-| `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
+| `task_creator` | `executor.task_creator` | 4 (fixed) | `task_creator` | Task creation from scheduling requests |
+| `gpu_pipeline_executor` | `executor.pipeline` | clamp(floor(3T/(8G)), 4, 8) per GPU | `gpu_pipeline` | GPU pipeline task execution |
+| `downgrade_executor` | `executor.downgrade` | clamp(floor(T/(8G)), 1, 4) per executor | `downgrade` | Data tier migration (GPU→Host) |
+| `scan_manager` | `executor.scan_manager` | 18 (fixed) | `scan_manager` | Scan metadata production (IO reactors are separate) |
+
+Here T is the logical CPU hardware-thread count and G is the number of configured GPU memory
+spaces, before any per-query GPU limit. Unknown CPU counts and zero configured GPUs use one.
+Each expression is rounded down once and clamped independently. Pipeline and downgrade split
+T/(2G) as 75% and 25% before applying their limits. HOST downgrade executors inherit the same
+downgrade setting. These independently capped pools do not form a total CPU-thread budget.
+Task creator and scan manager stay fixed at 4 and 18 threads, independent of T and G.
+
+uring reactors default to 2 below 32 CPU hardware threads and 4 otherwise. REST reactors default
+to clamp(floor(T/6), 8, 16) without kernel TLS (kTLS) and clamp(floor(T/6), 4, 16) with it. When
+cuCascade's topology discovery reports kTLS loaded and the egress NIC's queue IRQs are steered to a
+strict subset of its NUMA node's cores on fewer than 16 CPUs, the default is instead one reactor per
+IRQ CPU (at least 4). Omitted or null YAML counts use these defaults; explicit counts take
+precedence, including `rest_n_reactors: 0` for cuCascade's NIC-based automatic sizing. Resolution happens before deriving the pipeline-dependent REST and uring
+readahead budgets and reserving reactor CPUs.
+
+| CPU threads | GPUs | Pipeline / GPU | Task creator | Downgrade / executor | Scan manager | REST | uring |
+|---|---|---|---|---|---|---|---|
+| 20 | 1 | 7 | 4 | 2 | 18 | 8 | 2 |
+| 32 | 1 | 8 | 4 | 4 | 18 | 8 | 4 |
+| 96 | 4 | 8 | 4 | 3 | 18 | 16 | 4 |
+| 192 | 8 | 8 | 4 | 3 | 18 | 16 | 4 |
+
+The REST column is without kTLS. With kTLS loaded it is 4, 5, 16 and 16, unless the NIC's steered
+IRQ CPUs (fewer than 16) set it to one reactor per IRQ CPU, at least 4.
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
@@ -1278,7 +1309,7 @@ sirius:
         enable: true
         num_threads: 3       # 2 is the swept default; 3 buys q21 ~3% under 8 pipeline threads
     pipeline:
-      num_threads: 8         # default 4; cliff at 12 (q1/q6 regress)
+      num_threads: 8         # default was 4 when measured; cliff at 12 (q1/q6 regress)
 ```
 
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
