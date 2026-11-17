@@ -196,10 +196,12 @@ void read_yaml(config_block& block,
   block.read(*root, root_key, env);
 }
 
-std::string write_yaml(const config_block& block, std::string_view root_key, bool include_fallbacks)
+std::string write_yaml(const config_block& block,
+                       std::string_view root_key,
+                       const write_options& options)
 {
   node document = node::mapping();
-  document.set(std::string(root_key), block.write(include_fallbacks));
+  document.set(std::string(root_key), block.write(options));
   return emit_yaml(document);
 }
 

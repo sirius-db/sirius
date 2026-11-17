@@ -51,6 +51,8 @@ inline between<std::chrono::seconds> keepalive_seconds()
 
 /// `sirius.executor.scan_manager.uring`: the local-disk IO reactors.
 struct uring_options : block_base<uring_options> {
+  static constexpr bool developer_block = true;
+
   /// Unset: one scan per pipeline thread, derived when the configuration is resolved; an explicit
   /// 0 keeps local readahead off.
   config_option<std::size_t> n_max_concurrent_scans =
@@ -78,6 +80,8 @@ struct uring_options : block_base<uring_options> {
 /// `sirius.executor.scan_manager.rest.tls`: TLS for object-store connections. Trust settings belong
 /// to the object store configuration, not to this file.
 struct tls_options : block_base<tls_options> {
+  static constexpr bool developer_block = true;
+
   using ktls_mode     = cucascade::io::tls::ktls_mode;
   using rx_mode       = cucascade::io::tls::user_space_rx;
   using placement     = cucascade::io::tls::recv_placement;
@@ -190,6 +194,8 @@ struct tls_options : block_base<tls_options> {
 /// cuCascade's (rest::config::validate()); resolving the configuration runs that check again with
 /// the derived values in place.
 struct rest_options : block_base<rest_options> {
+  static constexpr bool developer_block = true;
+
   static const cucascade::io::rest::config& defaults()
   {
     return detail::scan_manager_defaults().rest;
@@ -492,6 +498,8 @@ struct memory_prefetcher_options : block_base<memory_prefetcher_options> {
 /// `sirius.executor.scan_manager.preparation.partial_batch`: when a partly filled batch is
 /// published anyway. Always on.
 struct partial_batch_options : block_base<partial_batch_options> {
+  static constexpr bool developer_block = true;
+
   config_option<std::size_t> min_fill_percent =
     option<std::size_t>("min_fill_percent")
       .validate(between<std::size_t>{1, 100})
@@ -521,6 +529,8 @@ struct partial_batch_options : block_base<partial_batch_options> {
 /// `sirius.executor.scan_manager.preparation`: how scans prepare their inputs. Unset limits are
 /// resolved from the scan worker count when the scan manager starts.
 struct preparation_options : block_base<preparation_options> {
+  static constexpr bool developer_block = true;
+
   /// 0 = unlimited.
   config_option<std::size_t> max_inflight_metadata_jobs =
     option<std::size_t>("max_inflight_metadata_jobs").build();

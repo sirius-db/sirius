@@ -202,3 +202,44 @@ TEST_CASE("telemetry and compression rows", "[config][config_user]")
   auto const off = read_user_config("sirius:\n  telemetry:\n    enable_quent: false\n");
   REQUIRE_FALSE(read_user_config(write_user_config(off)).telemetry.enable_quent.get());
 }
+
+TEST_CASE("a dump outside developer mode leaves developer-only settings out",
+          "[config][config_user]")
+{
+  auto const config = read_user_config(R"(sirius:
+  max_concurrent_queries: 2
+  space:
+    gpu: [{device_id: 0}]
+  executor:
+    scan_manager:
+      uring_n_reactors: 2
+      rest:
+        queue_depth: 512
+      uring:
+        slices_per_pass: 8
+      preparation:
+        lookahead_batches: 3
+  operator_params:
+    hash_partition_bytes: 64MiB
+    scan_task_batch_size: 64MiB
+)");
+  auto const prod   = parse_yaml(write_user_config(config, write_options{true, false}));
+  auto const& root  = *prod.find("sirius");
+  REQUIRE(root.find("space") == nullptr);
+  auto const& sm = *root.find("executor")->find("scan_manager");
+  REQUIRE(sm.find("uring_n_reactors") != nullptr);
+  REQUIRE(sm.find("rest") == nullptr);
+  REQUIRE(sm.find("uring") == nullptr);
+  REQUIRE(sm.find("preparation") == nullptr);
+  REQUIRE(sm.find("cache") != nullptr);  // product settings keep their fallbacks
+  auto const& op = *root.find("operator_params");
+  REQUIRE(op.find("hash_partition_bytes") != nullptr);
+  REQUIRE(op.find("scan_task_batch_size") == nullptr);
+  REQUIRE(op.find("enable_dynamic_filter") == nullptr);
+  REQUIRE(root.find("max_concurrent_queries")->text() == "2");
+
+  // Developer mode, and every in-process use that needs a faithful copy, keeps them.
+  auto const all = parse_yaml(write_user_config(config, true));
+  REQUIRE(all.find("sirius")->find("space") != nullptr);
+  REQUIRE(all.find("sirius")->find("operator_params")->find("scan_task_batch_size") != nullptr);
+}

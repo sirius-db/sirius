@@ -56,7 +56,7 @@ struct user_config : block_base<user_config> {
 
   /// As block_base::write, except that a memory block holding only fallbacks is left out when
   /// space lists describe the memory, so the dump reads back.
-  [[nodiscard]] node write(bool include_fallbacks) const override;
+  [[nodiscard]] node write(const write_options& options) const override;
 };
 
 /// Read the YAML text of a configuration file. @throws yaml_syntax_error / config_error.
@@ -70,9 +70,13 @@ struct user_config : block_base<user_config> {
 /// The configuration of an empty file: every option at its fallback.
 [[nodiscard]] user_config default_user_config(environment env = environment::prod);
 
-/// The YAML text read_user_config reads back to @p config: the user's values, plus every fallback
-/// when @p include_fallbacks.
+/// The YAML text read_user_config reads back to @p config: the user's values, plus what @p options
+/// adds (every fallback, developer-only settings).
 [[nodiscard]] std::string write_user_config(const user_config& config,
-                                            bool include_fallbacks = false);
+                                            const write_options& options = {});
+
+/// Whether this build runs in developer mode (CMake SIRIUS_DEVELOPER_MODE): configuration dumps
+/// then include developer-only settings.
+[[nodiscard]] bool developer_mode() noexcept;
 
 }  // namespace sirius::config

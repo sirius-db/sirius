@@ -25,7 +25,8 @@ inline const operator_params& operator_defaults()
 }  // namespace detail
 
 /// `sirius.operator_params`: operator sizing and planning policy. Options a DuckDB SET overrides
-/// per connection are scope query; the file value is where a connection starts.
+/// per connection are scope query; the file value is where a connection starts. The settings
+/// SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
 struct operator_options : block_base<operator_options> {
   static const operator_params& defaults() { return detail::operator_defaults(); }
 
@@ -100,7 +101,7 @@ struct operator_options : block_base<operator_options> {
   // -- batch and partition sizes. Unset sizes derive from the GPU memory when the configuration
   // is resolved (max_build_hash_table_bytes from hash_partition_bytes).
   config_option<ubytes> scan_task_batch_size =
-    option<ubytes>("scan_task_batch_size").validate(positive<ubytes>{}).build();
+    option<ubytes>("scan_task_batch_size").for_developers().validate(positive<ubytes>{}).build();
   /// 0 = max_sort_partition_memory_fraction of the GPU memory.
   config_option<ubytes> max_sort_partition_bytes =
     option<ubytes>("max_sort_partition_bytes")
@@ -117,8 +118,10 @@ struct operator_options : block_base<operator_options> {
                                                  .validate(positive<ubytes>{})
                                                  .scope(option_scope::query)
                                                  .build();
-  config_option<ubytes> concat_batch_bytes    = option<ubytes>("concat_batch_bytes").build();
-  config_option<ubytes> cross_join_task_bytes = option<ubytes>("cross_join_task_bytes").build();
+  config_option<ubytes> concat_batch_bytes =
+    option<ubytes>("concat_batch_bytes").for_developers().build();
+  config_option<ubytes> cross_join_task_bytes =
+    option<ubytes>("cross_join_task_bytes").for_developers().build();
   config_option<ubytes> sort_sample_bytes =
     option<ubytes>("sort_sample_bytes").scope(option_scope::query).build();
   /// 0 turns BUILD_PROBE off, MARK joins included.
@@ -141,14 +144,18 @@ struct operator_options : block_base<operator_options> {
       .build();
 
   // -- dynamic filters
-  config_option<bool> enable_dynamic_filter =
-    option<bool>("enable_dynamic_filter").fallback(defaults().enable_dynamic_filter).build();
+  config_option<bool> enable_dynamic_filter = option<bool>("enable_dynamic_filter")
+                                                .for_developers()
+                                                .fallback(defaults().enable_dynamic_filter)
+                                                .build();
   config_option<bool> enable_dynamic_filter_multi_partition =
     option<bool>("enable_dynamic_filter_multi_partition")
+      .for_developers()
       .fallback(defaults().enable_dynamic_filter_multi_partition)
       .build();
   config_option<bool> enable_dynamic_zone_map_filter =
     option<bool>("enable_dynamic_zone_map_filter")
+      .for_developers()
       .fallback(defaults().enable_dynamic_zone_map_filter)
       .build();
   /// Above 1 turns the coverage gate off.
@@ -174,10 +181,12 @@ struct operator_options : block_base<operator_options> {
   // -- pinning, compression and planning rewrites
   config_option<bool> enable_pinned_zone_map_pruning =
     option<bool>("enable_pinned_zone_map_pruning")
+      .for_developers()
       .fallback(defaults().enable_pinned_zone_map_pruning)
       .build();
   config_option<bool> enable_decimal_sum_stats_bound =
     option<bool>("enable_decimal_sum_stats_bound")
+      .for_developers()
       .fallback(defaults().enable_decimal_sum_stats_bound)
       .build();
   config_option<bool> enable_compressed_materialization =
@@ -185,10 +194,13 @@ struct operator_options : block_base<operator_options> {
       .fallback(defaults().enable_compressed_materialization)
       .scope(option_scope::query)
       .build();
-  config_option<bool> enable_dense_count_join =
-    option<bool>("enable_dense_count_join").fallback(defaults().enable_dense_count_join).build();
+  config_option<bool> enable_dense_count_join = option<bool>("enable_dense_count_join")
+                                                  .for_developers()
+                                                  .fallback(defaults().enable_dense_count_join)
+                                                  .build();
   config_option<bool> enable_delim_aggregate_reuse =
     option<bool>("enable_delim_aggregate_reuse")
+      .for_developers()
       .fallback(defaults().enable_delim_aggregate_reuse)
       .build();
   config_option<bool> pin_table_prove_unique_keys = option<bool>("pin_table_prove_unique_keys")
@@ -203,17 +215,21 @@ struct operator_options : block_base<operator_options> {
       .build();
   config_option<bool> enable_exists_minmax_rewrite =
     option<bool>("enable_exists_minmax_rewrite")
+      .for_developers()
       .fallback(defaults().enable_exists_minmax_rewrite)
       .build();
   config_option<bool> enable_partial_aggregate_below_join =
     option<bool>("enable_partial_aggregate_below_join")
+      .for_developers()
       .fallback(defaults().enable_partial_aggregate_below_join)
       .build();
   config_option<bool> enable_subquery_key_carry = option<bool>("enable_subquery_key_carry")
+                                                    .for_developers()
                                                     .fallback(defaults().enable_subquery_key_carry)
                                                     .build();
   config_option<bool> enable_exists_from_aggregate =
     option<bool>("enable_exists_from_aggregate")
+      .for_developers()
       .fallback(defaults().enable_exists_from_aggregate)
       .build();
 
