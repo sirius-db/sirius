@@ -6,6 +6,7 @@
 #include "config/options/topology.hpp"
 #include "config/yaml.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <source_location>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace sirius::config;
 using namespace sirius::config::size_literals;
@@ -202,15 +204,32 @@ TEST_CASE("operator options write what they read", "[config][config_operator]")
   REQUIRE(all.operator_params.scan_task_batch_size.is_unset());  // derived, never written
 }
 
-TEST_CASE("every operator option's scope and fallback", "[config][config_operator]")
+TEST_CASE("every operator option's scope, fallback and audience", "[config][config_operator]")
 {
   operator_options const op;
   auto const query   = option_scope::query;
   auto const session = option_scope::session;
-  auto check         = [](const auto& option, option_scope scope, bool has_fallback) {
+  // The settings SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
+  auto const developer = std::vector<std::string>{"scan_task_batch_size",
+                                                  "concat_batch_bytes",
+                                                  "cross_join_task_bytes",
+                                                  "enable_dynamic_filter",
+                                                  "enable_dynamic_filter_multi_partition",
+                                                  "enable_dynamic_zone_map_filter",
+                                                  "enable_pinned_zone_map_pruning",
+                                                  "enable_decimal_sum_stats_bound",
+                                                  "enable_dense_count_join",
+                                                  "enable_delim_aggregate_reuse",
+                                                  "enable_exists_minmax_rewrite",
+                                                  "enable_partial_aggregate_below_join",
+                                                  "enable_subquery_key_carry",
+                                                  "enable_exists_from_aggregate"};
+  auto check           = [&](const auto& option, option_scope scope, bool has_fallback) {
     INFO(option.key());
     REQUIRE(option.scope() == scope);
     REQUIRE(option.fallback().has_value() == has_fallback);
+    REQUIRE(option.is_developer() ==
+            (std::find(developer.begin(), developer.end(), option.key()) != developer.end()));
   };
   check(op.enable_late_materialization, query, true);
   check(op.enable_fused_scan_filter, query, true);

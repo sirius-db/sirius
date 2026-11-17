@@ -16,9 +16,9 @@ void user_config::validate(std::string_view path) const
   }
 }
 
-node user_config::write(bool include_fallbacks) const
+node user_config::write(const write_options& options) const
 {
-  auto out = block_base<user_config>::write(include_fallbacks);
+  auto out = block_base<user_config>::write(options);
   if (space.configured() && !memory.configured()) {
     // Unused memory tiers would read back as configured; keep only the block the user wrote.
     if (memory.user_defined()) {
@@ -51,9 +51,18 @@ user_config default_user_config(environment env)
   return config;
 }
 
-std::string write_user_config(const user_config& config, bool include_fallbacks)
+std::string write_user_config(const user_config& config, const write_options& options)
 {
-  return write_yaml(config, user_config_root, include_fallbacks);
+  return write_yaml(config, user_config_root, options);
+}
+
+bool developer_mode() noexcept
+{
+#ifdef SIRIUS_DEVELOPER_MODE
+  return true;
+#else
+  return false;
+#endif
 }
 
 }  // namespace sirius::config

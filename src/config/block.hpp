@@ -18,6 +18,28 @@ namespace sirius::config {
 template <class Derived>
 class block_base;
 
+/// What a configuration dump contains.
+struct write_options {
+  /// Also the fallbacks of options the user left alone, not only user-defined values.
+  bool include_fallbacks = false;
+  /// Also developer-only options and blocks (see config_option::is_developer()).
+  bool include_developer = true;
+
+  write_options() = default;
+  /// The common case, `write(true)`: every value, developer ones included.
+  write_options(bool fallbacks)
+    : include_fallbacks(fallbacks) {}  // NOLINT(google-explicit-constructor)
+  write_options(bool fallbacks, bool developer)
+    : include_fallbacks(fallbacks), include_developer(developer)
+  {
+  }
+};
+
+/// A block that holds developer-only settings declares
+/// `static constexpr bool developer_block = true;`: a dump outside developer mode leaves it out.
+template <class Block>
+concept developer_block = requires { requires Block::developer_block; };
+
 /**
  * @brief A configuration block as file adapters see it: read from a node, written to a node.
  *
@@ -45,11 +67,12 @@ class config_block {
   virtual void read(const node& n, std::string_view path, environment env) = 0;
 
   /// The mapping read() reads back to the same values: user-defined values only, plus fallbacks
-  /// when @p include_fallbacks, in declaration order. Absent nested blocks and empty lists are
+  /// when options.include_fallbacks, without developer-only options and blocks unless
+  /// options.include_developer, in declaration order. Absent nested blocks and empty lists are
   /// omitted; a nested block the user defined is kept even when empty. A dump with fallbacks is a
   /// snapshot to look at: reading it back makes every value, and every block it names,
   /// user-defined.
-  [[nodiscard]] virtual node write(bool include_fallbacks) const = 0;
+  [[nodiscard]] virtual node write(const write_options& options) const = 0;
 
   /// Throw std::logic_error for a declaration bug in this block or any block nested in it: an
   /// empty key, or a key claimed twice (by options, nested blocks, lists or removed keys).
@@ -129,12 +152,12 @@ class block_base : public config_block {
     self() = std::move(next);
   }
 
-  [[nodiscard]] node write(bool include_fallbacks) const override
+  [[nodiscard]] node write(const write_options& options) const override
   {
     node out = node::mapping();
     // fields() only ties references (see the class comment): nothing is modified through them.
     auto fields = const_cast<Derived&>(static_cast<const Derived&>(*this)).fields();
-    std::apply([&](auto&... field) { (write_field(field, out, include_fallbacks), ...); }, fields);
+    std::apply([&](auto&... field) { (write_field(field, out, options), ...); }, fields);
     return out;
   }
 
@@ -314,9 +337,12 @@ class block_base : public config_block {
     option.load(n, path, env);
   }
   template <class... Ts>
-  static void write_field(const config_option<Ts...>& option, node& out, bool include_fallbacks)
+  static void write_field(const config_option<Ts...>& option,
+                          node& out,
+                          const write_options& options)
   {
-    option.write(out, include_fallbacks);
+    if (option.is_developer() && !options.include_developer) { return; }
+    option.write(out, options.include_fallbacks);
   }
   template <class... Ts>
   static void check_nested(const config_option<Ts...>&)
@@ -350,9 +376,12 @@ class block_base : public config_block {
     field.block->read(child != nullptr ? *child : absent, join_path(path, field.key), env);
   }
   template <class B>
-  static void write_field(const nested_block<B>& field, node& out, bool include_fallbacks)
+  static void write_field(const nested_block<B>& field, node& out, const write_options& options)
   {
-    auto child = field.block->write(include_fallbacks);
+    if constexpr (developer_block<B>) {
+      if (!options.include_developer) { return; }
+    }
+    auto child = field.block->write(options);
     if (!child.entries().empty() || field.block->user_defined()) {
       out.set(field.key, std::move(child));
     }
@@ -402,13 +431,16 @@ class block_base : public config_block {
     *field.blocks = std::move(blocks);
   }
   template <class B>
-  static void write_field(const block_list<B>& field, node& out, bool include_fallbacks)
+  static void write_field(const block_list<B>& field, node& out, const write_options& options)
   {
+    if constexpr (developer_block<B>) {
+      if (!options.include_developer) { return; }
+    }
     if (field.blocks->empty()) { return; }
     node::sequence_type elements;
     elements.reserve(field.blocks->size());
     for (auto const& block : *field.blocks) {
-      elements.push_back(block.write(include_fallbacks));
+      elements.push_back(block.write(options));
     }
     out.set(field.key, node::sequence(std::move(elements)));
   }
@@ -436,7 +468,7 @@ class block_base : public config_block {
     }
   }
   static void read_field(const removed_key&, const node&, std::string_view, environment) {}
-  static void write_field(const removed_key&, node&, bool) {}
+  static void write_field(const removed_key&, node&, const write_options&) {}
   static void check_nested(const removed_key&) {}
   static bool holds_user_values(const removed_key&) { return false; }
 };

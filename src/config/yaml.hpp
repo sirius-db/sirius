@@ -56,9 +56,9 @@ void read_yaml(config_block& block,
                environment env);
 
 /// The YAML document read_yaml reads back to @p block's values: `<root_key>:` holding the block's
-/// user-defined values, plus its fallbacks when @p include_fallbacks.
+/// user-defined values, plus what @p options adds.
 [[nodiscard]] std::string write_yaml(const config_block& block,
                                      std::string_view root_key,
-                                     bool include_fallbacks = false);
+                                     const write_options& options = {});
 
 }  // namespace sirius::config
