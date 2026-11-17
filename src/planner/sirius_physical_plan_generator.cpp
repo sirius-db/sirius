@@ -2422,8 +2422,12 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
             sirius::op::scan::capture_bound_read_views(dropped, context));
         });
     }
-    if (!sirius_ctx || duckdb::query_operator_options(context)->enable_build_side_swap) {
-      sirius::planner::swap_unfiltered_builds(context, *op);
+    if (sirius_ctx && duckdb::query_operator_options(context)->enable_build_side_swap) {
+      // With the GPU memory unknown, nothing is swapped.
+      if (auto const budget = sirius_ctx->get_config().smallest_gpu_downgrade_threshold();
+          budget > 0) {
+        sirius::planner::swap_unfiltered_builds(context, *op, budget);
+      }
     }
   }
   {

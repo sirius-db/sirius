@@ -336,8 +336,8 @@ struct operator_params {
   /// See `push_narrowing_expressions`.
   bool enable_narrowing_expression_pushdown = true;
 
-  /// Build an inner join on its filtered side when the unfiltered side is larger. See
-  /// `swap_unfiltered_builds`.
+  /// Build an inner join on its filtered side when the unfiltered side is larger and does not fit
+  /// in one GPU. See `swap_unfiltered_builds`.
   bool enable_build_side_swap = false;
 
   /// Join a lookup table whose columns are only GROUP BY keys after the aggregation. See
@@ -465,6 +465,10 @@ struct sirius_config {
 
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
+
+  /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving
+  /// data off it. 0 when no GPU capacity is configured.
+  [[nodiscard]] std::uint64_t smallest_gpu_downgrade_threshold() const;
 
   [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
 

@@ -24,6 +24,7 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace sirius::planner {
@@ -56,13 +57,35 @@ void flip(duckdb::LogicalComparisonJoin& join)
   std::swap(join.left_projection_map, join.right_projection_map);
 }
 
+/// The bytes of one row @p op returns. A variable-size column counts as 16 bytes, the rule of
+/// push_narrowing_expressions.
+std::uint64_t row_bytes(duckdb::LogicalOperator& op)
+{
+  op.ResolveOperatorTypes();
+  std::uint64_t bytes = 0;
+  for (auto const& type : op.types) {
+    auto const physical = type.InternalType();
+    bytes += duckdb::TypeIsConstantSize(physical) ? duckdb::GetTypeIdSize(physical) : 16;
+  }
+  return bytes;
+}
+
+/// Whether @p rows rows of @p width bytes each are at least @p bytes, without overflow.
+bool at_least(std::uint64_t rows, std::uint64_t width, std::uint64_t bytes)
+{
+  if (width == 0) { return bytes == 0; }
+  return rows >= bytes / width + (bytes % width == 0 ? 0 : 1);
+}
+
 }  // namespace
 
-std::size_t swap_unfiltered_builds(duckdb::ClientContext& context, duckdb::LogicalOperator& plan)
+std::size_t swap_unfiltered_builds(duckdb::ClientContext& context,
+                                   duckdb::LogicalOperator& plan,
+                                   std::uint64_t min_build_bytes)
 {
   std::size_t swapped = 0;
   for (auto& child : plan.children) {
-    swapped += swap_unfiltered_builds(context, *child);
+    swapped += swap_unfiltered_builds(context, *child, min_build_bytes);
   }
   if (!swappable(plan)) { return swapped; }
   auto& probe = *plan.children[0];
@@ -71,14 +94,17 @@ std::size_t swap_unfiltered_builds(duckdb::ClientContext& context, duckdb::Logic
       !build_subtree_is_filtering(probe)) {
     return swapped;
   }
-  auto const build_rows = build.EstimateCardinality(context);
-  auto const probe_rows = probe.EstimateCardinality(context);
-  auto const swap       = build_rows > probe_rows;
+  auto const build_rows  = build.EstimateCardinality(context);
+  auto const probe_rows  = probe.EstimateCardinality(context);
+  auto const build_width = row_bytes(build);
+  auto const swap = build_rows > probe_rows && at_least(build_rows, build_width, min_build_bytes);
   SIRIUS_LOG_INFO(
-    "[build_side_choice] inner join with an unfiltered build of {} estimated rows and a filtered "
-    "probe of {}: {}.",
+    "[build_side_choice] inner join with an unfiltered build of {} estimated rows of {} bytes and "
+    "a filtered probe of {} rows, swapped from {} bytes of build: {}.",
     build_rows,
+    build_width,
     probe_rows,
+    min_build_bytes,
     swap ? "swapped" : "kept");
   if (swap) {
     flip(plan.Cast<duckdb::LogicalComparisonJoin>());

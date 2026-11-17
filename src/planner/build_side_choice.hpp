@@ -20,6 +20,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace sirius::planner {
 
@@ -30,10 +31,17 @@ namespace sirius::planner {
 /// (150 billion rows, held until the lineitem side arrives) and probes with the 33 billion rows
 /// that survive the part filter. Swapped, orders is scanned once, behind the join's Bloom filter.
 ///
-/// A join is swapped only when its build has no filter at all, its probe has one, and DuckDB
-/// estimates more rows for the build than for the probe.
+/// A join is swapped only when its build has no filter at all, its probe has one, DuckDB
+/// estimates more rows for the build than for the probe, and the build's estimated rows times
+/// the bytes of the columns it returns reach @p min_build_bytes. The build is the side a join
+/// holds whole until its probe arrives, so a build that fits in GPU memory costs nothing to hold
+/// and keeps the side DuckDB chose. The sides are compared by rows and not by bytes because
+/// DuckDB's estimate for the filtered side is too high (7 times for q9 at SF100000), which is
+/// what made it choose the unfiltered side.
 ///
 /// @return The number of swapped joins.
-std::size_t swap_unfiltered_builds(duckdb::ClientContext& context, duckdb::LogicalOperator& plan);
+std::size_t swap_unfiltered_builds(duckdb::ClientContext& context,
+                                   duckdb::LogicalOperator& plan,
+                                   std::uint64_t min_build_bytes);
 
 }  // namespace sirius::planner
