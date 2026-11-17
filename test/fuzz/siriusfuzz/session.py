@@ -2,17 +2,18 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 # See the LICENSE file at the repo root for the full text.
-"""One DuckDB shell process per session, driven over pipes.
+"""DuckDB shell processes driven over pipes.
 
 The shell is built at ``sirius-duckdb/build/release/duckdb``; the Sirius extension
 is loaded separately.
 Each statement is followed by a marker on stdout and on stderr, written with the
 shell's dot commands so they never pass through SQL; the JSON result and the
-error text are delimited exactly. A timed-out statement gets the shell killed, a
-GPU fault takes it down, and either way the next statement starts a fresh shell
-and re-attaches the datasets, which are files on disk (in-memory tables never
-reach the GPU scan). Queries run with ``enable_duckdb_fallback = false`` so
-fallbacks surface as errors.
+error text are delimited exactly. A timed-out statement gets its shell killed;
+the next statement restarts that shell and re-attaches the dataset. GPU sessions
+use a separate CPU-only shell for read-only datasets, so CPU timeouts leave the
+GPU runtime intact. Datasets are files on disk (in-memory tables never reach
+the GPU scan). GPU queries use ``enable_duckdb_fallback = false`` so fallbacks
+surface as errors.
 """
 
 from __future__ import annotations
@@ -164,9 +165,15 @@ class ShellResult:
 class Shell:
     """A DuckDB shell in batch JSON mode, one statement at a time."""
 
-    def __init__(self, binary: str, log_path: pathlib.Path | None = None):
+    def __init__(
+        self,
+        binary: str,
+        log_path: pathlib.Path | None = None,
+        env: dict[str, str] | None = None,
+    ):
         self.binary = binary
         self.log_path = log_path
+        self.env = env
         self.proc: subprocess.Popen | None = None
         self.events: queue.Queue = queue.Queue()
         self.counter = 0
@@ -190,6 +197,7 @@ class Shell:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                env=self.env,
             )
         except OSError as exc:
             raise SessionError(f"cannot start the DuckDB shell {self.binary}: {exc}")
@@ -467,6 +475,17 @@ class Session:
         self.gpu_available = not cpu_only
         self.evidence_path = evidence_path
         self.shell = Shell(shell, log_path)
+        cpu_log = (
+            log_path.with_name(f"{log_path.stem}-cpu{log_path.suffix}")
+            if log_path
+            else None
+        )
+        self.cpu_shell = (
+            Shell(shell, cpu_log, env={**os.environ, "SIRIUS_DISABLE": "1"})
+            if self.gpu_available
+            else None
+        )
+        self.cpu_mirror_aliases: set[str] = set()
         self.active_settings: dict[str, Any] = {}
         self.evidence: dict[str, Any] = {}
         self.stage = "evaluation"
@@ -487,6 +506,8 @@ class Session:
         # Registers the TEST ONLY fault-injection option used as the interception canary.
         os.environ.setdefault("SIRIUS_ENABLE_TEST_OPTIONS", "1")
         self._start()
+        if self.cpu_shell:
+            self._start_cpu()
 
     def _configure_sirius(self) -> None:
         if not self.gpu_available:
@@ -548,7 +569,8 @@ class Session:
             self.execute("SET enable_duckdb_fallback = false")
         self.duckdb_version = self.scalar("SELECT version()")
         for alias, path in self.attached.items():
-            self.execute(f"ATTACH {sql_literal(str(path))} AS {alias}")
+            read_only = " (READ_ONLY)" if alias in self.cpu_mirror_aliases else ""
+            self.execute(f"ATTACH {sql_literal(str(path))} AS {alias}{read_only}")
         if self.current_alias:
             self.execute(f"USE {self.current_alias}")
         for name, value in self.active_settings.items():
@@ -558,6 +580,25 @@ class Session:
             self._pin_tables(pins)
         if self.current_alias:
             self.execute(f"USE {self.current_alias}")
+
+    def _start_cpu(self) -> None:
+        """Restore the CPU-only shell without rebuilding the GPU runtime."""
+        assert self.cpu_shell is not None
+        self.cpu_shell.start()
+        for alias in self.cpu_mirror_aliases:
+            path = self.attached[alias]
+            self._cpu_execute(f"ATTACH {sql_literal(str(path))} AS {alias} (READ_ONLY)")
+        if self.current_alias in self.cpu_mirror_aliases:
+            self._cpu_execute(f"USE {self.current_alias}")
+
+    def _cpu_execute(self, sql: str, timeout: float = 120) -> ShellResult:
+        assert self.cpu_shell is not None
+        result = self.cpu_shell.execute(sql, timeout)
+        if result.status != "ok":
+            raise SessionError(
+                result.error or result.log or f"CPU shell {result.status}"
+            )
+        return result
 
     def _disable_gpu(self) -> bool:
         """Switch GPU execution off; False when the shell has no Sirius in it."""
@@ -587,6 +628,8 @@ class Session:
                 self.drop_dataset()
             except Exception:
                 pass
+        if self.cpu_shell:
+            self.cpu_shell.stop()
         self.shell.stop()
 
     def set_gpu(self, enabled: bool) -> None:
@@ -595,8 +638,12 @@ class Session:
 
     # -- statements -------------------------------------------------------------
 
-    def _ensure_alive(self, state: dict[str, Any] | None = None) -> None:
-        if not self.shell.alive:
+    def _ensure_alive(
+        self, state: dict[str, Any] | None = None, cpu: bool = False
+    ) -> None:
+        shell = self.cpu_shell if cpu else self.shell
+        assert shell is not None
+        if not shell.alive:
             started = time.monotonic()
             self.restarts += 1
             if self.evidence_path:
@@ -611,7 +658,10 @@ class Session:
                         "budget": START_TIMEOUT_SECONDS + TEARDOWN_SECONDS,
                     },
                 )
-            self._start()
+            if cpu:
+                self._start_cpu()
+            else:
+                self._start()
             self.timings["shell_restart"] += time.monotonic() - started
 
     def execute(self, sql: str, timeout: float = 600.0) -> ShellResult:
@@ -657,6 +707,17 @@ class Session:
         self.execute("CHECKPOINT")
         self.timings["data_loading"] += time.monotonic() - started
         self.apply_dataset_variants(alias, variants or {})
+        if self.cpu_shell and not (variants or {}).get("pin"):
+            # Two read-only attachments can share the checked-point database.
+            # This lets a CPU timeout kill only the CPU shell.
+            self.execute("USE memory")
+            self.execute(f"DETACH {alias}")
+            self.execute(f"ATTACH {sql_literal(str(path))} AS {alias} (READ_ONLY)")
+            self.execute(f"USE {alias}")
+            self._ensure_alive(cpu=True)
+            self._cpu_execute(f"ATTACH {sql_literal(str(path))} AS {alias} (READ_ONLY)")
+            self._cpu_execute(f"USE {alias}")
+            self.cpu_mirror_aliases.add(alias)
 
     def _pin_tables(self, pins: dict[str, dict[str, Any]]) -> None:
         if not self.gpu_available:
@@ -696,11 +757,19 @@ class Session:
 
     def use(self, alias: str) -> None:
         self.execute(f"USE {alias}")
+        if alias in self.cpu_mirror_aliases:
+            self._ensure_alive(cpu=True)
+            self._cpu_execute(f"USE {alias}")
         self.current_alias = alias
 
     def drop_dataset(self, alias: str | None = None) -> None:
         aliases = [alias] if alias else list(self.attached)
         for a in aliases:
+            if a in self.cpu_mirror_aliases:
+                if self.cpu_shell and self.cpu_shell.alive:
+                    self._cpu_execute("USE memory")
+                    self._cpu_execute(f"DETACH {a}")
+                self.cpu_mirror_aliases.discard(a)
             if self.shell.alive:
                 try:
                     self.execute(f"USE {a}")
@@ -767,12 +836,14 @@ class Session:
             "shell_restarts_before": self.restarts,
         }
         out = self._run_once(sql, gpu, timeout, state)
-        if out.status == "error" and _GPU_RUNTIME_GONE in out.error.lower():
+        if gpu and out.status == "error" and _GPU_RUNTIME_GONE in out.error.lower():
             # An earlier query broke the runtime: judge this one on a fresh shell.
             self.shell.kill()
             out = self._run_once(sql, gpu, timeout, state)
-        if out.status == "error" and any(
-            m in out.error.lower() for m in _GPU_DEAD_MARKERS
+        if (
+            gpu
+            and out.status == "error"
+            and any(m in out.error.lower() for m in _GPU_DEAD_MARKERS)
         ):
             self.shell.kill()  # the next run starts a fresh shell
         return self._record(phase, state, out)
@@ -780,12 +851,16 @@ class Session:
     def _run_once(
         self, sql: str, gpu: bool, timeout: float, state: dict[str, Any]
     ) -> RunResult:
-        self._ensure_alive(state)
+        cpu = not gpu and self.current_alias in self.cpu_mirror_aliases
+        self._ensure_alive(state, cpu=cpu)
         state["started_at"] = time.time()  # the run's budget starts after any restart
         if self.evidence_path:
             write_json(self.evidence_path, state)
-        self.set_gpu(gpu)
-        res = self.shell.execute(sql, timeout)
+        if not cpu:
+            self.set_gpu(gpu)
+        shell = self.cpu_shell if cpu else self.shell
+        assert shell is not None
+        res = shell.execute(sql, timeout)
         if res.status == "ok":
             columns = [ColumnInfo(name, UNKNOWN_TYPE) for name in res.columns]
             out = RunResult("ok", ResultSet(columns, res.rows), elapsed=res.elapsed)
@@ -798,7 +873,7 @@ class Session:
             out = RunResult(
                 "crash", error=res.error, elapsed=res.elapsed, exitcode=res.exitcode
             )
-        if self.shell.alive:
+        if not cpu and self.shell.alive:
             self.set_gpu(False)
         return out
 
@@ -820,10 +895,13 @@ class Session:
 
     def describe(self, sql: str) -> list[ColumnInfo] | None:
         """Exact output types (CPU side); None when DESCRIBE itself fails."""
-        if not self.shell.alive:
-            return None
-        self.set_gpu(False)
-        res = self.shell.execute(f"DESCRIBE {sql}", timeout=120)
+        cpu = self.current_alias in self.cpu_mirror_aliases
+        self._ensure_alive(cpu=cpu)
+        if not cpu:
+            self.set_gpu(False)
+        shell = self.cpu_shell if cpu else self.shell
+        assert shell is not None
+        res = shell.execute(f"DESCRIBE {sql}", timeout=120)
         if res.status != "ok":
             return None
         rows = [dict(zip(res.columns, row)) for row in res.rows]

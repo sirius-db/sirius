@@ -205,6 +205,8 @@ gaps-only because mixed arithmetic ANY joins can hit GPU AST type error
 `5a54110e` and outer ON filters can hit an arbitrary-join planner decline.
 `max_tables` permits rare five
 and six table chains, and `star_share` chooses joins back to the first table.
+Four-or-more-table chains use semi/anti joins on `k` and no fact table: default
+tables repeat `k`, so equality alone does not bound their fan-out.
 `any_join_share` controls the share of eligible INNER joins that use an ANY
 condition, so a focused acceptance run can collect enough samples.
 `self_join_share` similarly controls explicit self joins. Grouped joins carry
@@ -220,13 +222,20 @@ feature is expected to stay on the GPU, so a plan-time fallback is a finding. Wh
 feature, flip its flag to `true` there. `--set key.path=value` overrides any key for one run, and
 `show-config` prints the effective result.
 
+`variants.per_query` selects how many Sirius settings to vary on a sampled
+comparison; `variants.share` is the fraction of successful CPU/GPU comparisons
+sampled at all (default 1.0). For example, `--set variants.share=0.5` runs
+variants on about half the compared queries.
+
 `known_issues.toml` quarantines confirmed divergences by regex; every entry carries an issue link.
 
 **Phase 2b SQL shapes.** `features.window_functions` generates whole-partition `sum`, `avg`,
 `count`, `min`, and `max`; ordered `rank`, `dense_rank`, and `row_number`; and running
 `sum`, `count`, `min`, and `max` with an explicit unbounded-preceding ROWS frame. It also
 generates multiple window specifications and a derived-table top-N-per-group filter. These
-queries use direct base-table inputs and the unique `k` column as a deterministic tie-breaker.
+queries use direct base-table inputs. `features.window_cast_tiebreaks` adds exact cast
+order keys for unsigned and narrow DECIMAL columns; otherwise scopes without
+complete order keys use `rank` instead of order-sensitive running windows.
 `features.window_gaps` adds declined default and bounded frames and running `avg` in gaps mode.
 
 `features.aggregates.filter` adds `FILTER (WHERE ...)` to roughly one fifth of grouped and
