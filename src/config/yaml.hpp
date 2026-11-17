@@ -20,22 +20,29 @@ class yaml_syntax_error : public config_error {
 /**
  * @brief Parse a YAML document into a node tree.
  *
- * Scalars keep their text (quoted or not); `~`, `null` and an empty value become null nodes;
- * anchors and aliases are resolved. An empty document is null.
+ * - Scalars keep their text, quoted or not; tags are ignored (`!!str 1` is the text "1").
+ * - Plain `~`, `null`, `Null`, `NULL` and an empty value are null; quoted ones stay text.
+ * - Aliases are resolved into copies, up to 100000 values in all; merge keys (`<<: *a`) are not
+ *   merged, so `<<` is an ordinary (and unknown) key.
+ * - Exactly one document; trailing empty documents are ignored. An empty text is null.
  *
- * @throws yaml_syntax_error for malformed YAML.
- * @throws config_error for a duplicate key or a non-scalar key in a mapping.
+ * @throws yaml_syntax_error for malformed YAML, a second document, nesting deeper than 64 levels
+ * (also an alias inside the value it names), or too many values.
+ * @throws config_error for a duplicate key or a non-scalar key in a mapping (with its position).
  */
 [[nodiscard]] node parse_yaml(std::string_view text);
 
-/// Emit @p n as a block-style YAML document that parse_yaml reads back to an equal tree.
+/// Emit @p n as a block-style YAML document that parse_yaml reads back to an equal tree. Text
+/// must be valid UTF-8: the emitter replaces invalid sequences in quoted text.
 [[nodiscard]] std::string emit_yaml(const node& n);
 
 /**
  * @brief Read the YAML document @p text into @p block: the document must be a mapping holding
- * exactly @p root_key (e.g. "sirius"), whose value is the block's mapping.
+ * only @p root_key (e.g. "sirius"), whose value is the block's mapping. A missing or null root
+ * value is an error (write `sirius: {}` for an empty configuration).
  *
- * @throws yaml_syntax_error / config_error as parse_yaml and config_block::read.
+ * @throws yaml_syntax_error / config_error as parse_yaml and config_block::read; @p block is
+ * unchanged on failure.
  */
 void read_yaml(config_block& block,
                std::string_view text,
@@ -43,7 +50,7 @@ void read_yaml(config_block& block,
                environment env);
 
 /// The YAML document read_yaml reads back to @p block's values: `<root_key>:` holding the block's
-/// file values, plus its fallbacks when @p include_fallbacks.
+/// user-defined values, plus its fallbacks when @p include_fallbacks.
 [[nodiscard]] std::string write_yaml(const config_block& block,
                                      std::string_view root_key,
                                      bool include_fallbacks = false);

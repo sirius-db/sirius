@@ -5,7 +5,9 @@
 #include "config/yaml.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace sirius::config;
@@ -81,7 +83,7 @@ TEST_CASE("parse_yaml rejects malformed text and duplicate keys", "[config][conf
 {
   REQUIRE_THROWS_AS(parse_yaml("a: [1, 2"), yaml_syntax_error);
   REQUIRE_THROWS_WITH(parse_yaml("sirius:\n  a: 1\n  a: 2\n"),
-                      "duplicate config key: 'a' in sirius");
+                      "duplicate config key: 'a' in sirius (line 3, column 3)");
 }
 
 TEST_CASE("emit_yaml reads back to the same tree", "[config][config_yaml]")
@@ -134,7 +136,10 @@ sirius:
 TEST_CASE("read_yaml checks the document shape", "[config][config_yaml]")
 {
   REQUIRE(read_error("other: 1\n") == "unknown config key: 'other'");
-  REQUIRE(read_error("") == "expected a mapping at the top level, got null");
+  REQUIRE(read_error("") == "missing top-level 'sirius' key");
+  REQUIRE(read_error("# only a comment\n") == "missing top-level 'sirius' key");
+  REQUIRE(read_error("sirius:\n") == "missing top-level 'sirius' key");  // null root, as before
+  REQUIRE(read_error("sirius: 5\n") == "'sirius': expected a mapping, got a scalar");
   REQUIRE(read_error("- 1\n") == "expected a mapping at the top level, got a sequence");
   REQUIRE(read_error("{}") == "missing top-level 'sirius' key");
   REQUIRE(read_error("sirius:\n  pipeline:\n    num_threads: x\n") ==
@@ -143,9 +148,9 @@ TEST_CASE("read_yaml checks the document shape", "[config][config_yaml]")
     read_error("sirius:\n  space:\n    - capacity_bytes: 1 KB\n      capacity_fraction: 0.1\n") ==
     "'sirius.space[0]': 'capacity_bytes' and 'capacity_fraction' are mutually exclusive");
 
-  // An empty root block is valid: every option takes its fallback.
+  // An empty root mapping is valid: every option takes its fallback.
   root_options root;
-  read_yaml(root, "sirius:\n", "sirius", environment::prod);
+  read_yaml(root, "sirius: {}\n", "sirius", environment::prod);
   REQUIRE(root.max_concurrent_queries.is_fallback());
 }
 
@@ -177,4 +182,135 @@ TEST_CASE("write_yaml round-trips file values and optionally fallbacks", "[confi
   REQUIRE(all.disk.period.get() == 100ms);
   REQUIRE(all.spaces.at(0).capacity.get<bytes>() == 1_TiB);
   REQUIRE(all.spaces.at(0).period.get() == 120000ms);
+}
+
+TEST_CASE("aliases are bounded", "[config][config_yaml]")
+{
+  // yaml-cpp loads an alias inside the value it names as a cycle.
+  for (std::string_view text : {"a: &x [*x]\n", "&x {a: *x}\n", "a: &x\n  b: *x\n"}) {
+    INFO(text);
+    REQUIRE_THROWS_AS(parse_yaml(text), yaml_syntax_error);
+  }
+
+  // Nested aliases expand exponentially; the value budget stops them early.
+  std::string laughs = "a0: &a0 x\n";
+  for (int level = 1; level <= 9; ++level) {
+    auto const name = "a" + std::to_string(level);
+    auto const prev = "*a" + std::to_string(level - 1);
+    laughs += name + ": &" + name + " [";
+    for (int i = 0; i < 9; ++i) {
+      laughs += (i == 0 ? "" : ", ") + prev;
+    }
+    laughs += "]\n";
+  }
+  REQUIRE_THROWS_WITH(parse_yaml(laughs),
+                      "YAML document has more than 100000 values once its aliases are expanded");
+
+  auto const doc = parse_yaml("base: &b {x: 1}\ncopy: *b\n");
+  REQUIRE(doc.find("copy")->find("x")->text() == "1");
+}
+
+TEST_CASE("one document only", "[config][config_yaml]")
+{
+  REQUIRE_THROWS_WITH(parse_yaml("a: 1\n---\na: 2\n"), "expected one YAML document, got 2");
+  REQUIRE_THROWS_AS(parse_yaml("a: 1\n---\n[oops\n"), yaml_syntax_error);
+  REQUIRE(parse_yaml("a: 1\n---\n").find("a")->text() == "1");  // trailing empty document
+  REQUIRE(parse_yaml("   \n").is_null());
+}
+
+TEST_CASE("null-like text stays text when quoted", "[config][config_yaml]")
+{
+  auto const doc = parse_yaml("a: \"null\"\nb: '~'\nc: \"\"\nd: !!str ~\ne: NULL\nf: nUll\n");
+  REQUIRE(doc.find("a")->text() == "null");
+  REQUIRE(doc.find("b")->text() == "~");
+  REQUIRE(doc.find("c")->text().empty());
+  REQUIRE(doc.find("d")->text() == "~");
+  REQUIRE(doc.find("e")->is_null());
+  REQUIRE(doc.find("f")->text() == "nUll");
+  // Merge keys are not merged.
+  REQUIRE(parse_yaml("b: &b {x: 1}\nc:\n  <<: *b\n").find("c")->find("<<") != nullptr);
+}
+
+TEST_CASE("key errors carry their position", "[config][config_yaml]")
+{
+  REQUIRE_THROWS_WITH(parse_yaml("? [a, b]\n: v\n"),
+                      "mapping keys must be non-null scalars (line 1, column 3)");
+  REQUIRE_THROWS_WITH(parse_yaml("s:\n  - a: 1\n    a: 2\n"),
+                      "duplicate config key: 'a' in s[0] (line 3, column 5)");
+
+  // A duplicate key is a bad configuration, not a syntax error; both are config errors.
+  try {
+    (void)parse_yaml("a: 1\na: 2\n");
+    FAIL("expected an error");
+  } catch (const yaml_syntax_error&) {
+    FAIL("a duplicate key is not a syntax error");
+  } catch (const config_error&) {
+  }
+  REQUIRE_THROWS_AS(parse_yaml("a: [1"), config_error);
+  REQUIRE_THROWS_WITH(parse_yaml(std::string(600, '[')), "YAML document nested too deeply");
+}
+
+TEST_CASE("emit_yaml round-trips keys and nested shapes", "[config][config_yaml]")
+{
+  node tree = node::mapping();
+  for (auto const& key : std::vector<std::string>{"a: b",
+                                                  "#c",
+                                                  "- x",
+                                                  "",
+                                                  "multi\nline",
+                                                  std::string(1100, 'k'),
+                                                  "--- x",
+                                                  "... y",
+                                                  "tab\there",
+                                                  std::string("nul\0byte", 8)}) {
+    tree.set(key, node::scalar("v"));
+  }
+  tree.set("seq",
+           node::sequence({node{},
+                           node::mapping(),
+                           node::sequence(),
+                           node::sequence({node::scalar("1"), node::sequence({node::scalar("2")})}),
+                           node::scalar(std::string(5000, 'x')),
+                           node::scalar("\x01\x7f")}));
+  auto const text = emit_yaml(tree);
+  INFO(text);
+  REQUIRE(parse_yaml(text) == tree);
+
+  for (auto const& root : {node::scalar("---"), node::scalar("..."), node::scalar("plain")}) {
+    REQUIRE(parse_yaml(emit_yaml(root)) == root);
+  }
+}
+
+TEST_CASE("read_yaml leaves the block as it was on failure", "[config][config_yaml]")
+{
+  root_options root;
+  read_yaml(root, "sirius:\n  max_concurrent_queries: 3\n", "sirius", environment::prod);
+  REQUIRE_THROWS_AS(read_yaml(root, "sirius: [oops", "sirius", environment::prod), config_error);
+  REQUIRE_THROWS_AS(read_yaml(root, "other: 1\n", "sirius", environment::prod), config_error);
+  REQUIRE_THROWS_AS(
+    read_yaml(root, "sirius:\n  max_concurrent_queries: x\n", "sirius", environment::prod),
+    config_error);
+  REQUIRE(root.max_concurrent_queries.get() == 3);
+}
+
+TEST_CASE("read_yaml forwards the environment", "[config][config_yaml]")
+{
+  struct prod_options : block_base<prod_options> {
+    config_option<int> level = option<int>("level").fallback(1).for_prod().build();
+    auto fields() { return field_list(level); }
+  };
+  prod_options block;
+  read_yaml(block, "sirius:\n  level: 5\n", "sirius", environment::dev);
+  REQUIRE(block.level.is_unset());
+  read_yaml(block, "sirius:\n  level: 5\n", "sirius", environment::prod);
+  REQUIRE(block.level.get() == 5);
+}
+
+TEST_CASE("write_yaml of a block nobody read", "[config][config_yaml]")
+{
+  root_options root;
+  REQUIRE(parse_yaml(write_yaml(root, "sirius")) == node::mapping({{"sirius", node::mapping()}}));
+  root_options reread;
+  read_yaml(reread, write_yaml(root, "sirius"), "sirius", environment::prod);
+  REQUIRE(reread.max_concurrent_queries.is_fallback());
 }
