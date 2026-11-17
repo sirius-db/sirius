@@ -433,9 +433,6 @@ sirius:
 Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
 key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
 
-`uring.prefetch_reactors` is deprecated: the reactor priority tiers replaced prefetch-reactor partitioning, so the key is
-accepted and ignored with a warning, and will be removed.
-
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 The native REST backend speaks HTTP/1.1 over io_uring; it does not use libcurl.
@@ -787,6 +784,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
 | `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
@@ -831,9 +829,8 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |

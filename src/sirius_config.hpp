@@ -372,8 +372,6 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
-constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
-
 struct telemetry_config {
   /// Off in released extensions (SIRIUS_DISTRIBUTION_DEFAULTS), on otherwise.
   static bool const default_enable_quent;
@@ -383,7 +381,6 @@ struct telemetry_config {
   /// enable_quent is false.
   bool enable_nvtx{false};
 
-  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses

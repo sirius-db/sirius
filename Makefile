@@ -19,11 +19,10 @@ MAIN_BUILD_TARGETS ?= sirius_library
 
 BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
-.PHONY: all sirius-duckdb release debug reldebug relwithdebinfo debug-release \
+.PHONY: all sirius-duckdb release debug relwithdebinfo \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
-	test test_release test_debug test_reldebug clean list-presets \
-	s3-test s3-test-large s3-tpch \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker \
+	test test_release test_debug test_relwithdebinfo clean list-presets \
+	s3-test s3-test-large s3-test-aws \
 	slot-gate-test
 
 CMAKE_INPUTS := CMakePresets.json cmake/CMakePresets.json CMakeLists.txt $(wildcard cmake/*.cmake)
@@ -49,10 +48,6 @@ release: build/release/build.ninja
 
 debug: build/debug/build.ninja
 	$(CMAKE) --build --preset debug --target $(BUILD_TARGETS)
-
-reldebug: relwithdebinfo
-
-debug-release: relwithdebinfo
 
 relwithdebinfo: build/relwithdebinfo/build.ninja
 	$(CMAKE) --build --preset relwithdebinfo --target $(BUILD_TARGETS)
@@ -93,7 +88,7 @@ test_release: sirius-duckdb
 test_debug: debug
 	$(RUN_UNIT_TESTS) --build-dir build/debug $(UNITTEST_ARGS)
 
-test_reldebug: relwithdebinfo
+test_relwithdebinfo: relwithdebinfo
 	$(RUN_UNIT_TESTS) --build-dir build/relwithdebinfo $(UNITTEST_ARGS)
 
 clean:
@@ -135,10 +130,6 @@ list-presets:
 #
 # The S3 targets pass `--order decl`, so cases run in declaration order;
 # Catch2 3.9.0 and later would otherwise pick a random order.
-#
-# Deprecated names, kept for one round: `s3-tpch` (its suites also run in
-# s3-test and s3-test-large), `s3-test-aws-sigv4` (runs s3-test-aws, which
-# selects the same cases) and `s3-test-aws-broker` (no case carries [broker]).
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -193,19 +184,6 @@ s3-test-large:
 	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) --order decl "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
 	$(S3_TEST_BIN) --order decl "[s3][sql][large][large-nocache]"
 
-# Deprecated: the tiny TPC-H suite runs in s3-test and the SF1 suite in
-# s3-test-large. Kept for one round with its old selection (uploads the SF1
-# TPC-H fixture with SIRIUS_TEST_S3_TPCH=1 and runs both suites).
-s3-tpch:
-	@echo "s3-tpch is deprecated: the TPC-H suites run in s3-test (tiny) and s3-test-large (SF1)." >&2
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@set -e; \
-	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
-	$(S3_TEST_BIN) --order decl "[s3][integration][sql][tpch]"
-
 # Manual real-AWS gates. These never start the local backend and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
 # real bucket, and assume-role TEMPORARY credentials including the session
@@ -219,12 +197,3 @@ s3-test-aws:
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) --order decl "[s3][aws]"
-
-# Deprecated: selects the same cases as s3-test-aws.
-s3-test-aws-sigv4:
-	@echo "s3-test-aws-sigv4 is deprecated: use s3-test-aws, which selects the same cases." >&2
-	@$(MAKE) --no-print-directory s3-test-aws
-
-# Deprecated: no test case carries [broker], so this target runs nothing.
-s3-test-aws-broker:
-	@echo "s3-test-aws-broker is deprecated and runs nothing: no test case carries [broker]." >&2
