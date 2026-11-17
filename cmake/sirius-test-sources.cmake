@@ -35,6 +35,7 @@ set(TEST_SOURCES
     test/cpp/config/test_c_api_config.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_config_block.cpp
+    test/cpp/config/test_config_create.cpp
     test/cpp/config/test_config_executor_options.cpp
     test/cpp/config/test_config_memory_options.cpp
     test/cpp/config/test_config_operator_options.cpp

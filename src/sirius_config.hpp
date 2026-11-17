@@ -465,6 +465,10 @@ class configuration_input_error : public std::runtime_error {
 
 class parsed_sirius_config;
 
+namespace config {
+struct user_config;
+}  // namespace config
+
 /// The egress NIC a REST pool would use (the configured @c rest.interface, else the default
 /// route's interface), as cuCascade discovers it; @c nullopt when there is none or it cannot be
 /// read.  cuCascade's own discovery in production.
@@ -667,6 +671,9 @@ class parsed_sirius_config {
   static parsed_sirius_config from_file(const std::filesystem::path& path);
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
+  /// The same intent from the typed user configuration. @throws configuration_input_error for a
+  /// rule across its blocks.
+  static parsed_sirius_config from_user_config(const config::user_config& user);
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
@@ -683,5 +690,19 @@ class parsed_sirius_config {
   explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
   std::shared_ptr<const Impl> impl_;
 };
+
+/**
+ * @brief Resolve what the user configured against this machine: memory spaces through the
+ * cuCascade configurator, hardware-derived defaults for every value the user left unset (thread
+ * and reactor counts, batch sizes, REST limits from the egress NIC), and the checks that need
+ * them.
+ *
+ * @param probe finds the egress NIC when a value derived from it is unset; tests inject one.
+ * @throws configuration_input_error when the configuration cannot work on @p topology.
+ */
+[[nodiscard]] sirius_config create_sirius_config(
+  const config::user_config& user,
+  const cucascade::memory::system_topology_info& topology,
+  const egress_nic_probe& probe = discover_egress_nic);
 
 }  // namespace sirius
