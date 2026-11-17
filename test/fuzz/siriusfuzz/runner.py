@@ -393,6 +393,8 @@ class Evaluator:
             choices = list(self.forced_variant.items())
         elif not self.variants or self.cfg.variants.per_query <= 0:
             return
+        elif self.cfg.variants.share < 1 and self.rng.random() >= self.cfg.variants.share:
+            return
         else:
             names = self.rng.sample(
                 sorted(self.variants),

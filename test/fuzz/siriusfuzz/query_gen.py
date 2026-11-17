@@ -838,7 +838,7 @@ class QueryGenerator:
             if n >= 5:
                 self._note("join:long_chain")
         allow_fact = outer is None and depth == 0
-        safe_long_chain = mode == "full" and n >= 5
+        safe_long_chain = mode == "full" and n >= 4
         first, first_scope = self._gen_from_item(
             depth,
             ctes,
@@ -859,6 +859,7 @@ class QueryGenerator:
             if (
                 join_index == 0
                 and self.f.joins.self_join
+                and not safe_long_chain
                 and first_scope.table_name is not None
                 and rng.random() < self.f.joins.self_join_share
             ):
@@ -912,6 +913,10 @@ class QueryGenerator:
                 if self_variant
                 else (rng.choice(self.join_types) if self.join_types else "inner")
             )
+            if safe_long_chain:
+                # Default tables repeat k, so equality alone does not bound
+                # multi-join fan-out. Semi/anti joins preserve left cardinality.
+                jt = rng.choice(("semi", "anti"))
             right_rows = right_scope.row_upper_bound
             cartesian_ok = (
                 left_rows is not None
@@ -1096,8 +1101,8 @@ class QueryGenerator:
         if not pairs:
             return None
         if unique_key_only:
-            # Five/six-way joins over reusable payload values can explode on the CPU
-            # before the query reaches the GPU. Dimension k values are unique.
+            # Reusable payload values can explode on the CPU before a query
+            # reaches the GPU. Keep these semi/anti joins on k.
             keys = [(l, r) for l, r in pairs if l.name == r.name == "k"]
             if keys:
                 l, r = rng.choice(keys)

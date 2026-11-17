@@ -240,8 +240,8 @@ class Features:
     window_functions: bool = True
     window_gaps: bool = gap_switch(False)
     # Cast unsigned and narrow DECIMAL columns into extra window order keys.
-    # Off until measured on the GPU; without it such scopes get rank().
-    window_cast_tiebreaks: bool = False
+    # Admitted on GB300; without it such scopes get rank().
+    window_cast_tiebreaks: bool = True
     float_exact_keys: bool = gap_switch(False)
     distinct: bool = True
     grouping_sets: bool = True
@@ -376,6 +376,7 @@ class Oracle:
 @dataclass
 class Variants:
     per_query: int = 2
+    share: float = 1.0
     settings: dict[str, list[Any]] = field(
         default_factory=lambda: {
             "expression_evaluator_strategy": [
@@ -569,6 +570,8 @@ class FuzzConfig:
             raise ConfigError("data.strings.max_len must be between 1 and 65537")
         if self.variants.per_query < 0:
             raise ConfigError("variants.per_query must be >= 0")
+        if not 0 <= self.variants.share <= 1:
+            raise ConfigError("variants.share must be between 0 and 1")
 
 
 # Keys that are Python keywords carry a trailing underscore in the dataclasses.
