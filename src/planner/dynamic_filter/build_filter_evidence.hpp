@@ -50,7 +50,7 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Whether a RIGHT_SEMI or RIGHT_ANTI join can publish dynamic filters under @p params.
+ * @brief Whether a RIGHT_SEMI or RIGHT_ANTI join can publish dynamic filters under `params`.
  *
  * Such a join sizes its partitions from the whole probe input, so its filters must be out before
  * the probe is read. It can whenever dynamic filters are enabled.

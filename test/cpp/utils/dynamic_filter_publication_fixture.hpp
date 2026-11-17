@@ -187,16 +187,20 @@ struct claim_fixture {
       space, keys, cudf::type_id::INT64);
   }
 
-  /// The default build batch: kBuildRows keys in the fixture's GPU-0 space.
+  /**
+   * @brief The default build batch: `kBuildRows` keys in the fixture's GPU-0 space.
+   */
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
   {
     return make_build_batch_on(*gpu_space);
   }
 
   /**
-   * @brief Constructs and publishes the join's filters from @p batch as its build PARTITION would:
-   * certify the one-batch build, begin, contribute on a task stream, and publish as the final
-   * contributor. Exceptions propagate.
+   * @brief Constructs and publishes the join's filters from `batch` as its build PARTITION would:
+   * certify the one-batch build, begin, contribute on a task stream, and publish as the Publishing
+   * Task.
+   *
+   * Exceptions propagate.
    */
   void construct_from(std::shared_ptr<cucascade::data_batch> const& batch)
   {
@@ -217,11 +221,15 @@ struct claim_fixture {
     stream.sync();
   }
 
-  /// Constructs from the default build batch.
+  /**
+   * @brief Constructs from the default build batch.
+   */
   void construct() { construct_from(make_build_batch()); }
 
-  /// The same build batch, converted in place to the host tier (the shape of a batch downgraded
-  /// before it is read).
+  /**
+   * @brief The same build batch, converted in place to the host tier (the shape of a batch
+   * downgraded before it is read).
+   */
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_host_build_batch()
   {
     auto batch     = make_build_batch();

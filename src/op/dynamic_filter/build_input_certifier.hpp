@@ -58,6 +58,8 @@ class sirius_physical_operator;
 class build_input_certifier final {
  public:
   /**
+   * @brief Binds the certifier to `site` and its join's `session`.
+   *
    * @param site The construction site whose input ports are read; it outlives this certifier
    * @param session Its join's session; it outlives this certifier
    */
@@ -68,7 +70,7 @@ class build_input_certifier final {
   build_input_certifier& operator=(build_input_certifier const&) = delete;
 
   /**
-   * @brief Records @p batch, pushed into @p port_id, when that port is the site's FULL `default`
+   * @brief Records `batch`, pushed into `port_id`, when that port is the site's FULL `default`
    * port.
    */
   void on_arrival(std::string_view port_id, cucascade::data_batch& batch);
@@ -84,7 +86,7 @@ class build_input_certifier final {
   [[nodiscard]] bool decide();
 
   /**
-   * @brief Contributes @p batch, the batch of task input @p input, to the attempt `decide` began.
+   * @brief Contributes `batch`, the batch of task input `input`, to the attempt `decide` began.
    *
    * A task input that is not exactly one original batch, or a site with a late-materialization
    * directive, ends the attempt instead (`dynamic_filter_publication_session::decline_task_input`).

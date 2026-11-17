@@ -17,10 +17,10 @@
 /*
  * Tests `build_filter_construction`: filters constructed from any split of a certified build, in
  * any order and from several streams, equal those of the same build as one batch (O1) and those of
- * the column constructors of the same kind; claims are validated; contributions never wait on the
- * host; failures join accepted work; and the drop rules (overflow, DECIMAL128 fit, root admission)
- * remove only the affected filter. Also pins `in_list_storage_upper_bound` against the sets it
- * bounds.
+ * the column constructors of the same kind; claims are checked; contributions never wait on the
+ * host; failures join accepted work; and the drop rules (overflow, DECIMAL128 fit, Memory Admission
+ * on the Publishing GPU) remove only the affected filter. Also pins `in_list_storage_upper_bound`
+ * against the sets it bounds.
  */
 
 #include "operator/construction_parity_utils.hpp"
@@ -85,9 +85,10 @@ std::vector<std::vector<cudf::column_view>> split(cudf::column_view const& colum
 }
 
 /**
- * @brief The membership sizing a join is planned with. Construction always reads the device L2, so
- * every sizing uses it; a zero IN-list fraction makes a Bloom key of any build too large for a
- * small IN-list.
+ * @brief The membership sizing a join is planned with.
+ *
+ * Construction always reads the device L2, so every sizing uses it; a zero IN-list fraction makes a
+ * Bloom key of any build too large for a small IN-list.
  */
 struct sizing {
   std::string_view name;
@@ -237,8 +238,8 @@ TEST_CASE("filters from any split equal one batch and the column constructors",
       REQUIRE(single->membership);
       REQUIRE(single->zone_map);
 
-      // The whole build equals the column constructor of the same kind over the whole build, and
-      // its bounds equal one reduction; its one key is judged and kept. The plan builds at the
+      // Construction from one batch equals the column constructor of the same kind over its keys,
+      // and its bounds equal one reduction; its one key is judged and kept. The plan builds at the
       // carrier when it stays in the recorded type's family.
       auto const& built_from =
         whole.plan.keys.front().construction_type == build->type() ? build->view() : oracle->view();

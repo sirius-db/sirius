@@ -172,13 +172,13 @@ class accumulated_bloom_builder final {
   };
 
   /**
-   * @brief Allocates zeroed arrays on every GPU of @p targets without waiting on the host. Each
-   * key's array has its own `key::blocks` and its own transfer chunk
-   * (`accumulated_bloom_chunk_bytes`).
+   * @brief Allocates zeroed arrays on every GPU of `targets` without waiting on the host.
    *
-   * Each GPU's arrays are allocated under their own lease, attached to a new exclusive stream of
-   * that GPU and sized to the exact allocation charge. The calling thread must hold no allocation
-   * tracker for those GPUs; a tracked caller is refused like missing capacity.
+   * Each key's array has its own `key::blocks` and its own transfer chunk
+   * (`accumulated_bloom_chunk_bytes`). Each GPU's arrays are allocated under their own lease,
+   * attached to a new exclusive stream of that GPU and sized to the exact allocation charge. The
+   * calling thread must hold no allocation tracker for those GPUs; a tracked caller is refused like
+   * missing capacity.
    *
    * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
    * overflow

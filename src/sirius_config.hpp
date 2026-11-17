@@ -263,9 +263,12 @@ struct operator_params {
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
-  /// Engine-owned per-GPU cap on the sum of one join's Bloom arrays: the larger of 4x this query's
-  /// scan batch size (saturating) and max_build_hash_table_bytes. YAML and SQL cannot override the
-  /// budget independently.
+  /**
+   * @brief Engine-owned per-GPU cap on the sum of one join's Bloom arrays: the larger of 4x this
+   * query's scan batch size (saturating) and `max_build_hash_table_bytes`.
+   *
+   * YAML and SQL cannot override the budget independently.
+   */
   [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
   {
     return std::max(memory::saturating_mul(4, scan_task_batch_size), max_build_hash_table_bytes);

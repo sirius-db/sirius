@@ -220,7 +220,7 @@ namespace {
 //===--------------------------------------------------------------------===//
 
 /**
- * @brief Whether @p batch is readable without blocking and holds a GPU, host, or disk table with no
+ * @brief Whether `batch` is readable without blocking and holds a GPU, host, or disk table with no
  * rows.
  */
 [[nodiscard]] bool holds_no_rows(cucascade::data_batch& batch) noexcept

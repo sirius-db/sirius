@@ -74,9 +74,8 @@ static_assert(std::is_nothrow_default_constructible_v<sirius::unjoined_gpu_work>
 static_assert(std::is_nothrow_copy_constructible_v<sirius::unjoined_gpu_work>);
 
 /**
- * @brief Bytes one GPU's partials occupy for @p keys keys over @p rows total rows.
+ * @brief The per-GPU lease of `keys` Bloom keys, each sized on `rows` valid rows.
  */
-/// The per-GPU lease of @p keys Bloom keys, each sized on @p rows valid rows.
 std::size_t partial_bytes(std::size_t rows, std::size_t keys)
 {
   return keys * op::detail::tracked_replica_allocation_bytes(
@@ -1390,7 +1389,7 @@ TEST_CASE("declared coverage gates every constructible key type, and only constr
   auto const counters = fixture.stats.snapshot();
   REQUIRE(counters.keys_considered == 1);
   REQUIRE(counters.keys_with_known_domain == 1);
-  // Every key type constructs now; only a key no binding can read is outside the gate.
+  // Every key type constructs now; only a key no binding can read is outside the Domain Gate.
   REQUIRE(counters.keys_skipped_domain_gate == (incompatible_probe ? 0 : 1));
   REQUIRE(counters.bindings_skipped_incompatible_probe == (incompatible_probe ? 1 : 0));
   REQUIRE(counters.accumulations_started == 0);
@@ -2267,7 +2266,7 @@ TEST_CASE("each decline acts only in its own phase", "[dynamic_filter][construct
   fixture.session->decline(op::construction_decline::PIPELINE_BARRIER);
   fixture.contribute(first);
   fixture.contribute(second);
-  // PUBLISHING: neither decline takes the owed publication from the final contributor.
+  // PUBLISHING: neither decline takes the owed publication from the Publishing Task.
   fixture.session->decline(op::construction_decline::INPUT_SHAPE);
   fixture.session->decline_task_input();
   REQUIRE_FALSE(fixture.session->terminal());
@@ -2289,7 +2288,7 @@ TEST_CASE("an attempt budgets task scratch only while it may still publish",
           "[dynamic_filter][construction][memory_estimate]")
 {
   acc::fixture fixture;
-  // Few enough keys for small IN-lists, which the publishing task constructs at the root.
+  // Few enough keys for small IN-lists, which the Publishing Task constructs on the Publishing GPU.
   auto const first  = fixture.make_batch(0, 0, 4);
   auto const second = fixture.make_batch(0, 900, 4);
   REQUIRE(fixture.begin({first, second}));
@@ -2308,7 +2307,7 @@ TEST_CASE("an attempt budgets task scratch only while it may still publish",
   {
     fixture.contribute(first);
     fixture.contribute(second);
-    // The final contributor's task, or its retry, still publishes.
+    // The Publishing Task, or its retry, still publishes.
     REQUIRE(fixture.session->task_scratch_bound() > 0);
     fixture.publish(0, second->get_batch_id());
   }

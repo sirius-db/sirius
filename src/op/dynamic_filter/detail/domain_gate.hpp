@@ -26,15 +26,15 @@
 namespace sirius::op::detail {
 
 /**
- * @brief Counts a bound `key` of a build with `build_rows` rows in `keys_considered`,
- * `keys_with_known_domain` and `keys_build_exceeded_domain`, and logs the domain gate's decision.
+ * @brief Counts an Admitted Key `key` with at least one Key Binding, of a build with `build_rows`
+ * rows in `keys_considered`, `keys_with_known_domain` and `keys_build_exceeded_domain`, and logs
+ * the domain gate's decision.
  *
  * @param counts The counters to update
  * @param key The admitted key
  * @param build_rows The build's row count
  * @param threshold The plan's `dynamic_filter_domain_coverage_threshold`
- * @param path The publication path named in the log
- * @param publishable False when the path has already rejected the key, which the gate then never
+ * @param publishable False when the caller has already rejected the key, which the gate then never
  * skips
  * @return Whether the domain coverage gate skips the key; the caller counts the skip where its own
  * checks order it

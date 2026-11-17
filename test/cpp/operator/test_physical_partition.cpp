@@ -1012,7 +1012,7 @@ TEST_CASE("single-partition and broadcast builds construct at the PARTITION and 
   REQUIRE(input);
   if (broadcast) { REQUIRE(fixture.tree.join->is_build_probe_mode()); }
   REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
-  // The forward path contributes and, as the final contributor, publishes before returning; a retry
+  // The forward path contributes and, as the Publishing Task, publishes before returning; a retry
   // of the same task counts a duplicate and publishes nothing more.
   fixture.contribute(*input);
   REQUIRE(fixture.channel->snapshot().terminal());
@@ -1059,7 +1059,10 @@ TEST_CASE("a single-partition build over the Bloom cap gets no Bloom and ends Te
 
 namespace {
 
-/// A compressed spill that exposes only its row count, as `enable_spill_compression` leaves one.
+/**
+ * @brief A compressed spill that exposes only its row count, as `enable_spill_compression` leaves
+ * one.
+ */
 class compressed_spill final : public sirius::simpatico_compressed_representation {
  public:
   explicit compressed_spill(memory_space& space) : simpatico_compressed_representation(space) {}
@@ -1072,8 +1075,10 @@ class compressed_spill final : public sirius::simpatico_compressed_representatio
   }
 };
 
-/// Converts @p batch to @p Representation in @p space on @p stream (not the default stream, which
-/// batched copies reject), as the downgrade executor would.
+/**
+ * @brief Converts `batch` to `Representation` in `space` on `stream` (not the default stream, which
+ * batched copies reject), as the downgrade executor would.
+ */
 template <class Representation>
 void move_batch(data_batch& batch, memory_space const& space, ::cuda::stream_ref stream)
 {

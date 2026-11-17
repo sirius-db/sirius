@@ -180,7 +180,7 @@ using certified_build_input = std::variant<complete_build_inventory, constructio
  * records `(id, rows)` and each top-level column's carrier and null count (`read_arrival`) from a
  * GPU, host, or disk table. A compressed or unreadable arrival closes the ledger with that reason,
  * and it then cannot certify; a missing or changed column only makes that ordinal unavailable to
- * key admission. Payload child layouts do not affect certification. After such an arrival,
+ * `plan_construction`. Payload child layouts do not affect certification. After such an arrival,
  * `abandon()`, or a failed `certify()`, arrivals are ignored.
  *
  * After `certify()` succeeded, an arrival that could add keys throws `std::logic_error`: a FULL
@@ -199,7 +199,7 @@ class build_arrival_ledger final {
   /**
    * @brief Records one arriving batch without waiting for its data lock or accessing device data.
    *
-   * @throw std::logic_error if the ledger was already certified and @p batch is not a readable
+   * @throw std::logic_error if the ledger was already certified and `batch` is not a readable
    * batch without rows
    */
   void record(cucascade::data_batch& batch);
@@ -253,9 +253,13 @@ class build_arrival_ledger final {
 
 namespace detail {
 
-/// Smallest transfer chunk a Bloom array moves in when it is merged or replicated.
+/**
+ * @brief Smallest transfer chunk a Bloom array moves in when it is merged or replicated.
+ */
 inline constexpr std::size_t k_min_bloom_transfer_chunk_bytes = std::size_t{2} << 20;
-/// Largest transfer chunk a Bloom array moves in when it is merged or replicated.
+/**
+ * @brief Largest transfer chunk a Bloom array moves in when it is merged or replicated.
+ */
 inline constexpr std::size_t k_max_bloom_transfer_chunk_bytes = std::size_t{8} << 20;
 
 /**

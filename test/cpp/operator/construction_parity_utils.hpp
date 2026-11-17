@@ -19,7 +19,7 @@
  * @brief The parity harness for `build_filter_construction`: builds a join's publish plan over
  * chosen key types, constructs its filters from any split of a build (in any order, from any number
  * of threads), and compares the result with the same build as one batch (oracle O1), with the
- * column constructor of the same filter kind over the whole build, and with one reduction for the
+ * column constructor of the same filter kind over every build key, and with one reduction for the
  * zone-map bounds.
  */
 
@@ -86,7 +86,9 @@ struct test_access {
   }
 };
 
-/// The smallest L2 of GPU 0, as construction reads it.
+/**
+ * @brief The smallest L2 of GPU 0, as construction reads it.
+ */
 [[nodiscard]] inline std::size_t l2_bytes()
 {
   int l2 = 0;
@@ -329,8 +331,10 @@ inline void require_same_zone_map(op::sirius_dynamic_filter const* left,
 }
 
 /**
- * @brief The filter the column constructor of @p constructed's kind builds over @p keys, the whole
- * build at the construction type; what construction from any split must equal. Waits on @p stream.
+ * @brief The filter the column constructor of `constructed`'s kind builds over `keys`, every build
+ * key at the construction type: what construction from any split must equal.
+ *
+ * Waits on `stream`.
  */
 [[nodiscard]] inline std::shared_ptr<op::sirius_dynamic_filter const> column_oracle(
   op::sirius_dynamic_filter const& constructed,
@@ -351,7 +355,9 @@ inline void require_same_zone_map(op::sirius_dynamic_filter const* left,
   return oracle;
 }
 
-/// Requires @p zone_map's bounds to be one reduction's minimum and maximum over @p keys.
+/**
+ * @brief Requires `zone_map`'s bounds to be one reduction's minimum and maximum over `keys`.
+ */
 inline void require_zone_map_bounds(op::sirius_dynamic_filter const* zone_map,
                                     cudf::column_view const& keys,
                                     ::cuda::stream_ref stream)

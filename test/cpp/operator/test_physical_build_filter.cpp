@@ -56,7 +56,11 @@ struct build_filter_fixture {
   {
   }
 
-  /// @param plan Makes the session's plan from the fixture's memory
+  /**
+   * @brief Builds the fixture around the plan `plan` makes.
+   *
+   * @param plan Makes the session's plan from the fixture's memory
+   */
   explicit build_filter_fixture(
     std::function<op::dynamic_filter_publish_plan(acc::fixture const&)> const& plan)
   {
@@ -274,7 +278,7 @@ TEST_CASE("a build filter budgets construction only while its attempt may still 
     return fixture.filter->no_history_peak_memory_estimate({1, input_bytes});
   };
   REQUIRE(estimate() == rmm::CUDA_ALLOCATION_ALIGNMENT);
-  // Few enough keys for small IN-lists, which the publishing task constructs at the root.
+  // Few enough keys for small IN-lists, which the Publishing Task constructs on the Publishing GPU.
   auto const first         = fixture.push(0, 4);
   auto const second        = fixture.push(100, 4);
   fixture.source->finished = true;
