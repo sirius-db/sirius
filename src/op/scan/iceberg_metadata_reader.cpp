@@ -17,6 +17,7 @@
 #include "io/path_utils.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_metadata.hpp>
@@ -28,7 +29,6 @@
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
-#include <duckdb/common/enum_util.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
@@ -254,9 +254,7 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // Injection is latched by the planning attempt, after the original scan bound successfully.
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
-  // One query supplies the equality count and the inventory; the equality plan is checked
-  // against the latter. data_sequence_number is the inherited value, which
-  // manifest_sequence_number stops being once a manifest is rewritten.
+  // One query supplies the equality count and the inventory the equality plan is checked against.
   if (counters) ++counters->iceberg_manifest_walks;
   auto meta_result = conn.Submit(
     "SELECT content::VARCHAR, file_path, manifest_sequence_number, file_format, manifest_path, "
@@ -331,7 +329,7 @@ bool charge_equality_deletes(iceberg_equality_plan const& plan,
                              int64_t statement_row_limit)
 {
   for (auto const& file : plan.files) {
-    // Subtractions, not sums: every term comes from a manifest.
+    // Compared by subtraction: the terms come from manifests, and a sum could overflow.
     if (file.record_count < 0 || file.file_size_in_bytes < 0 ||
         file.record_count > kMaxEqualityDeleteRowsPerFile ||
         file.record_count > statement_row_limit - total.rows ||
@@ -530,9 +528,8 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
       }
     } else if (content == kEqualityDeletes) {
       IcebergDeleteFileEntry entry;
-      entry.file_path       = std::move(filepath);
-      entry.content         = 2;
-      entry.sequence_number = row.data_sequence_number;
+      entry.file_path = std::move(filepath);
+      entry.content   = 2;
       result.equality_delete_entries.push_back(std::move(entry));
     } else if (content == kContentDataFile) {
       ++data_files;
@@ -671,21 +668,6 @@ void read_positional_delete_file(duckdb::ClientContext& context,
   }
 }
 
-/// The cuDF type a key column must have for a bound type the gate admitted.
-cudf::type_id bound_key_type(duckdb::LogicalTypeId type)
-{
-  switch (type) {
-    case duckdb::LogicalTypeId::INTEGER: return cudf::type_id::INT32;
-    case duckdb::LogicalTypeId::BIGINT: return cudf::type_id::INT64;
-    case duckdb::LogicalTypeId::VARCHAR: return cudf::type_id::STRING;
-    default:
-      throw std::runtime_error("[iceberg] equality-delete key type " +
-                               duckdb::EnumUtil::ToString(type) +
-                               " reached the loader; the plan gate admits only INTEGER, BIGINT "
-                               "and VARCHAR keys");
-  }
-}
-
 /// Top-level leaf columns of a parquet file by Iceberg field ID. Nested keys are declined by the
 /// gate, so nested leaves are skipped.
 std::unordered_map<int32_t, std::string> top_level_leaves_by_field_id(
@@ -718,8 +700,7 @@ std::unordered_map<int32_t, std::string> top_level_leaves_by_field_id(
 }
 
 /// Reads the key columns of one equality-delete file onto the device, in @p key_field_ids order
-/// and normalized to the bound key types. Other columns are not read: a writer may store the
-/// whole deleted row, and matching on those deletes nothing once a non-key value has changed.
+/// and normalized to the bound key types. No other column is read.
 std::unique_ptr<cudf::table> read_equality_delete_file(
   std::string const& delete_file_path,
   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
@@ -753,7 +734,7 @@ std::unique_ptr<cudf::table> read_equality_delete_file(
                              "' maps two key field ids to one column name");
 
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{sources[0].get()})
-                .columns(names)
+                .column_names(names)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
   if (!result.tbl || result.metadata.schema_info.size() != names.size() ||
@@ -770,19 +751,20 @@ std::unique_ptr<cudf::table> read_equality_delete_file(
     if (found == names.size() || !columns[found])
       throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
                                "' did not return key column '" + names[k] + "'");
-    auto const want = bound_key_type(plan.keys.at(key_field_ids[k]).type);
-    auto const have = columns[found]->type().id();
-    if (have == want) {
+    auto const& bound = plan.keys.at(key_field_ids[k]).type;
+    auto const want   = equality_key_cudf_type(bound);
+    auto const have   = columns[found]->type();
+    if (want && have == *want) {
       keys[k] = std::move(columns[found]);
-    } else if (have == cudf::type_id::INT32 && want == cudf::type_id::INT64) {
+    } else if (want && have.id() == cudf::type_id::INT32 && want->id() == cudf::type_id::INT64) {
       // The one promotion Iceberg allows for an integer key: the delete file predates it.
-      keys[k] = cudf::cast(columns[found]->view(), cudf::data_type{want}, stream);
+      keys[k] = cudf::cast(columns[found]->view(), *want, stream);
     } else {
-      throw std::runtime_error(
-        "[iceberg] equality-delete file '" + delete_file_path + "' stores key field id " +
-        std::to_string(key_field_ids[k]) + " as cuDF type " +
-        std::to_string(static_cast<int>(have)) + ", which cannot be compared with the bound " +
-        duckdb::EnumUtil::ToString(plan.keys.at(key_field_ids[k]).type) + " column");
+      throw std::runtime_error("[iceberg] equality-delete file '" + delete_file_path +
+                               "' stores key field id " + std::to_string(key_field_ids[k]) +
+                               " as cuDF type " + std::to_string(static_cast<int>(have.id())) +
+                               ", which cannot be compared with the bound " + bound.ToString() +
+                               " column");
     }
   }
   stream.sync();
@@ -895,8 +877,7 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
                                   std::shared_ptr<cucascade::io::ioctx> const& ioctx,
                                   IcebergDeleteData& data)
 {
-  // Distinct applicability lists. Data files sharing a list share one group list below, and
-  // that shared pointer is what the batch coalescer compares.
+  // One class per distinct applicability list.
   std::map<std::vector<uint32_t>, uint32_t> class_of_list;
   std::vector<std::vector<uint32_t> const*> classes;
   for (auto const& [data_file, files] : plan.by_data_file) {
@@ -940,16 +921,12 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
       primary.push_back(plan.keys.at(id).primary_index);
     std::vector<std::unique_ptr<cudf::table>> tables;
     std::vector<cudf::table_view> views;
-    std::vector<std::string> paths;
     for (auto file : group_files[group_index]) {
       if (auto counters = iceberg_counters(context)) ++counters->iceberg_delete_payload_loads;
       tables.push_back(read_equality_delete_file(plan.files[file].file_path, ioctx, ids, plan));
       views.push_back(tables.back()->view());
-      paths.push_back(plan.files[file].file_path);
     }
-    auto group                               = build_equality_group(ids, std::move(primary), views);
-    group.delete_files                       = std::move(paths);
-    data.equality_delete_groups[group_index] = std::move(group);
+    data.equality_delete_groups[group_index] = build_equality_group(ids, std::move(primary), views);
   }
 
   std::vector<std::shared_ptr<equality_group_list const>> list_of_class(classes.size());
@@ -966,6 +943,20 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
 }
 
 }  // anonymous namespace
+
+std::optional<cudf::data_type> equality_key_cudf_type(duckdb::LogicalType const& type)
+{
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::DATE:
+    case duckdb::LogicalTypeId::TIMESTAMP:
+    case duckdb::LogicalTypeId::TIMESTAMP_NS:
+    case duckdb::LogicalTypeId::VARCHAR: return sirius::get_cudf_type(type);
+    default: return std::nullopt;
+  }
+}
 
 EqualityDeleteGroup build_equality_group(std::vector<int32_t> key_field_ids,
                                          std::vector<std::size_t> key_primary_indices,
@@ -1076,36 +1067,6 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   iceberg_delete_discovery const& discovery)
 {
   return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);
-}
-
-std::unordered_map<std::string, int32_t> extract_field_id_map(
-  cudf::io::parquet::FileMetaData const& file_meta)
-{
-  std::unordered_map<std::string, int32_t> result;
-
-  // The schema vector is a flattened depth-first representation.
-  // Leaf columns have num_children == 0.  The root element (index 0)
-  // is the message/file-level container and is always skipped.
-  //
-  // Leaf names are not unique -- `a.id` and `b.id` both spell `id` here -- so last-writer-wins
-  // would hand one field's id to the other. An ambiguous name is dropped; the caller already
-  // reads a missing entry as "no field id for this column".
-  std::unordered_set<std::string> ambiguous;
-  for (size_t i = 1; i < file_meta.schema.size(); ++i) {
-    auto const& elem = file_meta.schema[i];
-    if (elem.num_children != 0 || !elem.field_id.has_value()) { continue; }
-    auto const [it, inserted] = result.emplace(elem.name, elem.field_id.value());
-    if (!inserted && it->second != elem.field_id.value()) { ambiguous.insert(elem.name); }
-  }
-  for (auto const& name : ambiguous) {
-    SIRIUS_LOG_DEBUG(
-      "[iceberg] leaf column name '{}' occurs at more than one field id in this parquet schema; "
-      "dropping it rather than guessing which field the delete file means",
-      name);
-    result.erase(name);
-  }
-
-  return result;
 }
 
 }  // namespace sirius::op::scan

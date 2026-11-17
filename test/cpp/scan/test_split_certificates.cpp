@@ -24,6 +24,7 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -1720,9 +1721,10 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
       payload->equality_groups_by_data_file.emplace("/a/other.parquet",
                                                     std::make_shared<equality_group_list const>());
       info->delete_data = std::move(payload);
-      CHECK_THROWS_WITH(
-        make_ingestible(std::move(info)),
-        Catch::Matchers::ContainsSubstring("is absent from the equality-delete plan"));
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        Catch::Matchers::ContainsSubstring(
+                          "iceberg table 'test-table': scanned data file "
+                          "'/a/data.parquet' is absent from the equality-delete plan"));
     }
     SECTION("hive partitions and equality deletes are refused")
     {
@@ -1734,7 +1736,21 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
       info->partition_indices.emplace_back("p", 1);
       CHECK_THROWS_WITH(make_ingestible(std::move(info)),
                         Catch::Matchers::ContainsSubstring(
-                          "combines hive partition columns with equality deletes"));
+                          "iceberg table 'test-table' combines hive partition columns with "
+                          "equality deletes"));
+    }
+    SECTION("an equality key the scan does not read is refused")
+    {
+      auto info    = make_info({"/a/data.parquet"}, {});
+      auto payload = std::make_shared<IcebergDeleteData>();
+      payload->equality_delete_groups.emplace_back().key_primary_indices = {3};
+      payload->equality_groups_by_data_file.emplace(
+        "/a/data.parquet", std::make_shared<equality_group_list const>(equality_group_list{0}));
+      info->delete_data = std::move(payload);
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        Catch::Matchers::ContainsSubstring(
+                          "iceberg table 'test-table': equality-delete key column n_comment is "
+                          "not read by this scan"));
     }
   }
 }
@@ -1797,5 +1813,79 @@ TEST_CASE("Iceberg materialization refuses missing or replaced delete dependenci
   } else {
     CHECK_THROWS_WITH(
       ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr), expected);
+  }
+}
+
+TEST_CASE("Iceberg equality deletes add their probe workspace to the row-group estimate",
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  auto const path  = parquet_info(53)->resolved_file_paths.front();
+  auto const ioctx = sirius::test::make_test_local_ioctx();
+  auto row_groups  = [&](std::shared_ptr<IcebergDeleteData> payload) {
+    auto ingestible = make_ingestible(iceberg_info({path}, std::move(payload)));
+    auto work       = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+    auto metadata = work({});
+    return dynamic_cast<parquet_file_scan_info&>(*metadata).row_groups;
+  };
+  auto with_groups = [&](equality_group_list groups) {
+    auto payload = std::make_shared<IcebergDeleteData>();
+    payload->equality_groups_by_data_file.emplace(
+      path, std::make_shared<equality_group_list const>(std::move(groups)));
+    return row_groups(std::move(payload));
+  };
+  auto const no_deletes = row_groups(std::make_shared<IcebergDeleteData>());
+  auto const unaffected = with_groups({});
+  auto const probed     = with_groups({0});
+  REQUIRE_FALSE(no_deletes.empty());
+  REQUIRE(unaffected.size() == no_deletes.size());
+  REQUIRE(probed.size() == no_deletes.size());
+  for (std::size_t i = 0; i < no_deletes.size(); ++i) {
+    auto const base = no_deletes[i].decode_working_bytes;
+    auto const rows = static_cast<std::size_t>(no_deletes[i].num_rows);
+    // A file no group applies to is sized like a table without equality deletes.
+    CHECK(unaffected[i].decode_working_bytes == base);
+    CHECK(probed[i].decode_working_bytes == 2 * base + 9 * rows);
+  }
+}
+
+TEST_CASE("Equality-delete keys are appended to the scan behind its output",
+          "[scan_preparation][iceberg][delete_set]")
+{
+  auto plan_with_key = [](std::size_t primary) {
+    iceberg_equality_plan plan;
+    plan.files.push_back({"delete.parquet", {1}, 1, 1, 2});
+    plan.keys.emplace(1, iceberg_equality_plan::key{primary, duckdb::LogicalType::VARCHAR});
+    return plan;
+  };
+  auto info = parquet_info(53);  // Binds and emits n_nationkey, with an empty projection.
+  SECTION("a key the query does not read becomes a hidden column")
+  {
+    sirius::planner::widen_scan_for_equality_keys(*info, plan_with_key(3));
+    REQUIRE(info->column_ids.size() == 2);
+    CHECK(info->column_ids[1].GetPrimaryIndex() == 3);
+    CHECK((info->projection_ids == duckdb::vector<duckdb::idx_t>{0, 1}));
+    CHECK(info->projected_output_count == 1);
+    CHECK((info->delete_key_primary_indices == std::vector<std::size_t>{3}));
+  }
+  SECTION("a key the query already reads is not read twice")
+  {
+    sirius::planner::widen_scan_for_equality_keys(*info, plan_with_key(0));
+    CHECK(info->column_ids.size() == 1);
+    CHECK((info->projection_ids == duckdb::vector<duckdb::idx_t>{0}));
+    CHECK((info->delete_key_primary_indices == std::vector<std::size_t>{0}));
+  }
+  SECTION("an empty projection that hides a column is refused")
+  {
+    info->column_ids.push_back(duckdb::ColumnIndex(2));
+    CHECK_THROWS_WITH(sirius::planner::widen_scan_for_equality_keys(*info, plan_with_key(3)),
+                      Catch::Matchers::ContainsSubstring("emits 1 column(s) but binds 2"));
+  }
+  SECTION("a key outside the scan schema is refused")
+  {
+    CHECK_THROWS_WITH(sirius::planner::widen_scan_for_equality_keys(*info, plan_with_key(9)),
+                      Catch::Matchers::ContainsSubstring(
+                        "equality-delete key field id 1 is outside the scan schema"));
   }
 }

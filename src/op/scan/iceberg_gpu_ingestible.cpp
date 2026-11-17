@@ -118,7 +118,7 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
   // The same path also projects the batch to its output there, dropping the equality keys.
   if (!bind.partition_indices.empty() && has_equality) {
     throw duckdb::NotImplementedException(
-      "iceberg table '{}' combines hive partition columns with equality deletes, whose key "
+      "iceberg table '%s' combines hive partition columns with equality deletes, whose key "
       "columns the GPU scan path would project away before matching",
       _table_path);
   }
@@ -132,8 +132,8 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
   }
   if (has_equality) {
     _equality_data = bind.delete_data;
-    // Where each group's keys sit in a decoded batch. The lowering appended every key to the
-    // scan; a key the plan does not read would make its group match nothing, so that is refused.
+    // The lowering appended every key to the scan. A key the plan does not read would make its
+    // group match nothing, so that is refused.
     auto const& plan = _core.plan();
     for (auto const& group : legacy->equality_delete_groups) {
       std::vector<cudf::size_type> positions;
@@ -144,7 +144,7 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
           });
         if (column == plan.data_columns.end()) {
           throw duckdb::NotImplementedException(
-            "iceberg table '{}': equality-delete key column {} is not read by this scan, so "
+            "iceberg table '%s': equality-delete key column %s is not read by this scan, so "
             "its deletes cannot be matched",
             _table_path,
             primary < bind.names.size() ? bind.names[primary] : std::to_string(primary));
@@ -176,7 +176,7 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
     auto const groups = legacy->equality_groups_by_data_file.find(key);
     if (groups == legacy->equality_groups_by_data_file.end()) {
       throw duckdb::NotImplementedException(
-        "iceberg table '{}': scanned data file '{}' is absent from the equality-delete plan, so "
+        "iceberg table '%s': scanned data file '%s' is absent from the equality-delete plan, so "
         "which equality deletes apply to it is unknown",
         _table_path,
         path);
@@ -315,9 +315,20 @@ void attach_delete_set(parquet_file_scan_info& file,
       "[iceberg_gpu_ingestible] parquet file requires one delete-set dependency");
   auto const has_deletes  = !set->positions.empty();
   deps.front().visibility = set;
-  // Files subject to different equality-delete groups must not share a batch: the delete is
-  // applied to a whole batch, and a batch must have one answer.
+  // A batch gets one answer, so files with different equality-delete groups must not share one.
   file.visibility_class = set->equality_groups;
+  if (set->equality_groups) {
+    // Probing holds the join indices and the compaction's gather map (4 B/row each), a BOOL8
+    // mask and the compacted copy beside the batch. Groups run one after another, and virtual
+    // scans already budget a filter copy.
+    for (auto& group : file.row_groups) {
+      auto const copy =
+        plan.has_user_virtual_columns() ? std::size_t{0} : group.decode_working_bytes;
+      group.decode_working_bytes = memory::saturating_add(
+        group.decode_working_bytes,
+        memory::saturating_add(copy, memory::saturating_mul(group.num_rows, std::size_t{9})));
+    }
+  }
   std::vector<std::size_t> selected_deletes;
   if (has_deletes && file.position_filter_eligible) {
     int64_t first  = 0;

@@ -38,6 +38,9 @@
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <catch.hpp>
+#include <duckdb.hpp>
+#include <utils/local_ioctx.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -127,6 +130,16 @@ rmm::device_uvector<cudf::size_type> device_indices(std::vector<cudf::size_type>
   stream.sync();
   return dev;
 }
+
+/// Routes cuDF's default device allocations through @p stats for a scope.
+struct scoped_device_resource {
+  explicit scoped_device_resource(rmm::mr::statistics_resource_adaptor& stats)
+    : previous(cudf::set_current_device_resource(rmm::device_async_resource_ref{stats}))
+  {
+  }
+  ~scoped_device_resource() { cudf::set_current_device_resource(std::move(previous)); }
+  cuda::mr::any_resource<cuda::mr::device_accessible> previous;
+};
 
 }  // namespace
 
@@ -342,15 +355,109 @@ TEST_CASE("iceberg equality delete - a group retains a bounded number of bytes p
 
   rmm::mr::statistics_resource_adaptor stats{
     cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
-  auto previous    = cudf::set_current_device_resource(rmm::device_async_resource_ref{stats});
-  int64_t retained = 0;
-  {
-    auto group = build_equality_group({1}, {0}, {cudf::table_view{{keys->view()}}});
-    retained   = stats.get_bytes_counter().value;
-    REQUIRE(group.delete_table->num_rows() == rows);
-  }
-  cudf::set_current_device_resource(previous);
+  scoped_device_resource restore{stats};
+  auto group          = build_equality_group({1}, {0}, {cudf::table_view{{keys->view()}}});
+  auto const retained = stats.get_bytes_counter().value;
+  REQUIRE(group.delete_table->num_rows() == rows);
   CHECK(retained <= int64_t{32} * rows);
+}
+
+TEST_CASE("iceberg equality delete - probing a batch stays within the row-group estimate",
+          "[iceberg][scan]")
+{
+  // attach_delete_set budgets one copy of the batch plus 9 B/row for a probe. No row matches
+  // here, so the compacted copy is the whole batch: the largest a probe allocates.
+  constexpr cudf::size_type rows = 1 << 20;
+  auto zero                      = cudf::make_fixed_width_scalar<int64_t>(0);
+  auto one                       = cudf::make_fixed_width_scalar<int64_t>(1);
+  auto absent                    = cudf::make_fixed_width_scalar<int64_t>(-1);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::sequence(rows, *zero, *one));  // key
+  columns.push_back(cudf::sequence(rows, *zero, *one));  // payload
+  auto batch             = std::make_unique<cudf::table>(std::move(columns));
+  auto const batch_bytes = std::size_t{2} * rows * sizeof(int64_t);
+
+  auto deleted = cudf::sequence(1, *absent, *one);
+  auto data    = std::make_shared<IcebergDeleteData>();
+  data->equality_delete_groups.push_back(
+    build_equality_group({1}, {0}, {cudf::table_view{{deleted->view()}}}));
+
+  rmm::mr::statistics_resource_adaptor stats{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{cudf::get_current_device_resource_ref()}};
+  scoped_device_resource restore{stats};
+  equality_delete_filter filter{data, 0, {0}};
+  auto out =
+    filter.apply(std::move(batch), {}, test_stream(), rmm::device_async_resource_ref{stats});
+  REQUIRE(out->num_rows() == rows);
+  auto const peak = static_cast<std::size_t>(stats.get_bytes_counter().peak);
+  CAPTURE(peak, batch_bytes);
+  CHECK(peak <= batch_bytes + std::size_t{9} * rows);
+}
+
+TEST_CASE("iceberg equality delete - each ceiling refuses the charge", "[iceberg][scan]")
+{
+  using files  = std::vector<std::pair<int64_t, int64_t>>;  // (record_count, file_size_in_bytes)
+  auto plan_of = [](files const& entries) {
+    iceberg_equality_plan plan;
+    for (auto [rows, bytes] : entries)
+      plan.files.push_back({"delete.parquet", {1}, rows, bytes, 2});
+    return plan;
+  };
+  auto fits = [&](files const& entries, int64_t row_limit = kMaxEqualityDeleteRowsPerStatement) {
+    equality_delete_charge total;
+    return charge_equality_deletes(plan_of(entries), total, row_limit);
+  };
+  CHECK(fits({{kMaxEqualityDeleteRowsPerFile, 1}}));
+  CHECK_FALSE(fits({{kMaxEqualityDeleteRowsPerFile + 1, 1}}));
+  CHECK(fits({{2, 1}, {1, 1}}, 3));
+  CHECK_FALSE(fits({{2, 1}, {2, 1}}, 3));
+  CHECK(fits({{1, kMaxEqualityDeleteBytesPerStatement}}));
+  CHECK_FALSE(fits({{1, kMaxEqualityDeleteBytesPerStatement}, {1, 1}}));
+  // A count the manifest did not supply cannot be charged.
+  CHECK_FALSE(fits({{-1, 1}}));
+  CHECK_FALSE(fits({{1, -1}}));
+
+  // The total carries across the scans of one statement.
+  equality_delete_charge total;
+  CHECK(charge_equality_deletes(plan_of({{2, 1}}), total, 3));
+  CHECK_FALSE(charge_equality_deletes(plan_of({{2, 1}}), total, 3));
+}
+
+TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys is refused",
+          "[iceberg][scan]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  sirius::test::scratch_dir directory("equality_delete_keys");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto written = con.Query("COPY (SELECT 1::INTEGER AS id, 'a' AS name) TO " +
+                           directory.file_literal("delete.parquet") +
+                           " (FORMAT PARQUET, FIELD_IDS {id: 1, name: 2})");
+  REQUIRE(written);
+  REQUIRE_FALSE(written->HasError());
+
+  auto load = [&](int32_t field_id, duckdb::LogicalTypeId bound) {
+    iceberg_delete_discovery discovery;
+    discovery.equality_delete_entries.emplace_back();
+    auto& plan = discovery.equality_plan.emplace();
+    plan.files.push_back({directory.file("delete.parquet"), {field_id}, 1, 1, 2});
+    plan.by_data_file.emplace("data.parquet", std::vector<uint32_t>{0});
+    plan.keys.emplace(field_id, iceberg_equality_plan::key{0, bound});
+    return load_delete_payload(
+      *con.context, "table", sirius::test::make_test_local_ioctx(), discovery);
+  };
+  // The manifest lists a key the delete file does not store.
+  CHECK_THROWS_WITH(load(3, duckdb::LogicalTypeId::INTEGER),
+                    Catch::Matchers::ContainsSubstring("has no top-level column with field id 3"));
+  // A string stored for a BIGINT key: the join would compare unrelated bytes.
+  CHECK_THROWS_WITH(
+    load(2, duckdb::LogicalTypeId::BIGINT),
+    Catch::Matchers::ContainsSubstring("which cannot be compared with the bound BIGINT column"));
+  // INT32 stored for a BIGINT key is the one accepted difference.
+  auto const data = load(1, duckdb::LogicalTypeId::BIGINT);
+  REQUIRE(data->equality_delete_groups.size() == 1);
+  CHECK(data->equality_delete_groups[0].delete_table->view().column(0).type().id() ==
+        cudf::type_id::INT64);
 }
 
 TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",

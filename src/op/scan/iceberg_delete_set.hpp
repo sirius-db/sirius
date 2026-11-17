@@ -72,7 +72,6 @@ struct iceberg_delete_set : prepared_visibility {
   /// Equality-delete groups that apply to this data file, or null when none do. Files with the
   /// same applicability share one list, so the pointer is also the batch-compatibility class.
   std::shared_ptr<std::vector<uint32_t> const> equality_groups;
-  /// Whether applying this set can remove rows, by position or by key.
   [[nodiscard]] bool deletes_rows() const
   {
     return !positions.empty() || (equality_groups && !equality_groups->empty());
