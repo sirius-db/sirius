@@ -10,6 +10,8 @@
 #include <cucascade/io/tls/config.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -175,7 +177,7 @@ TEST_CASE("scan manager values are checked", "[config][config_scan_manager]")
           "epoll, uring)");
   REQUIRE(read_error("      rest:\n        max_retry_attempts: 4294967296\n") ==
           "'sirius.executor.scan_manager.rest.max_retry_attempts': value out of range: "
-          "'4294967296' (must be at most 4294967295)");
+          "'4294967296' (must be between 1 and 4294967295)");
   REQUIRE(read_error("      rest:\n        tls:\n          max_version: tls1.1\n") ==
           "'sirius.executor.scan_manager.rest.tls.max_version': invalid enum value 'tls1.1' "
           "(expected auto, tls1.2, tls1.3)");
@@ -253,4 +255,232 @@ TEST_CASE("scan manager blocks write what they read", "[config][config_scan_mana
   REQUIRE(all.executor.scan_manager.rest.tls.cipher_list.user_defined());
   REQUIRE(all.executor.scan_manager.rest.max_connections.is_unset());  // derived, never written
   REQUIRE(all.executor.scan_manager.memory_prefetcher.drain_quiet.get() == 1000ms);
+}
+
+TEST_CASE("REST ranges are checked when the file is read", "[config][config_scan_manager]")
+{
+  for (auto const* entry : {"request_timeout_s: -1",        "stall_time_s: -1",
+                            "conn_max_age_s: -1s",          "upkeep_interval_ms: -1",
+                            "retry_backoff_base_ms: -1",    "retry_jitter_ms: -1",
+                            "max_retry_attempts: 0",        "max_auth_retry_attempts: 0",
+                            "min_segment_bytes: 0",         "receive_buffer_bytes: 8 KiB",
+                            "receive_buffer_bytes: 8 MiB",  "queue_depth: 0",
+                            "queue_depth: 40000",           "max_connections: 0",
+                            "max_connections: 5000",        "dns_ttl_s: 0",
+                            "dns_max_addresses: 0",         "dns_max_addresses: 5000",
+                            "connect_timeout_ms: 0",        "keepalive_idle_s: 0",
+                            "keepalive_interval_s: 0",      "keepalive_count: -1",
+                            "keepalive_idle_s: 4294967297", "min_mtu: 70000",
+                            "mtu_reject_max_attempts: 0",   "fan_out: 0",
+                            "footer_probe_bytes: 2 GiB",    "list_max_matches: 0",
+                            "list_max_scanned: 0"}) {
+    std::string_view const text = entry;
+    auto const key              = std::string(text.substr(0, text.find(':')));
+    INFO(text);
+    REQUIRE_THAT(read_error(std::string("      rest:\n        ") + entry + "\n"),
+                 Catch::Matchers::StartsWith("'sirius.executor.scan_manager.rest." + key +
+                                             "': value out of range"));
+  }
+  REQUIRE(read("      rest:\n        max_auth_retry_attempts: 4294967295\n")
+            .executor.scan_manager.rest.max_auth_retry_attempts.get() == 4294967295ULL);
+}
+
+TEST_CASE("REST and TLS rules across keys", "[config][config_scan_manager]")
+{
+  REQUIRE(read_error("      rest:\n        max_segment_bytes: 1 MiB\n") ==
+          "'sirius.executor.scan_manager.rest': max_segment_bytes must be at least "
+          "min_segment_bytes");
+  REQUIRE(read_error("      rest:\n        max_connections: 64\n        queue_depth: 100\n") ==
+          "'sirius.executor.scan_manager.rest': queue_depth must be at least 2 * max_connections");
+  // With max_connections derived, queue_depth is checked when the configuration is resolved.
+  REQUIRE(
+    read("      rest:\n        queue_depth: 100\n").executor.scan_manager.rest.queue_depth.get() ==
+    100);
+  REQUIRE(read_error("      rest:\n        tls:\n          min_version: tls1.3\n"
+                     "          max_version: tls1.2\n") ==
+          "'sirius.executor.scan_manager.rest.tls': max_version must not be below min_version");
+  REQUIRE(read_error("      rest:\n        tls:\n          session_cache: true\n"
+                     "          session_cache_per_endpoint: 0\n") ==
+          "'sirius.executor.scan_manager.rest.tls': session_cache_per_endpoint must be greater "
+          "than 0 with the session cache on");
+}
+
+TEST_CASE("explicit zeros count as user-defined, nulls do not", "[config][config_scan_manager]")
+{
+  auto const zeros = read(
+                       "      rest_n_reactors: 0\n      rest:\n        min_mtu: 0\n"
+                       "        n_max_concurrent_scans: 0\n")
+                       .executor.scan_manager;
+  REQUIRE(zeros.rest_n_reactors.user_defined());
+  REQUIRE(zeros.rest.min_mtu.user_defined());
+  REQUIRE(zeros.rest.n_max_concurrent_scans.user_defined());
+  auto const nulls = read(
+                       "      rest_n_reactors: ~\n      rest:\n        min_mtu: ~\n"
+                       "        max_connections: ~\n")
+                       .executor.scan_manager;
+  REQUIRE(nulls.rest_n_reactors.is_unset());
+  REQUIRE(nulls.rest.min_mtu.is_unset());
+  REQUIRE(nulls.rest.max_connections.is_unset());
+}
+
+TEST_CASE("more scan manager rows", "[config][config_scan_manager]")
+{
+  // R7 with the default worker count of 2, and explicit counts.
+  REQUIRE_THAT(
+    read_error("      preparation:\n        max_native_readers: 1\n"),
+    Catch::Matchers::EndsWith("max_native_readers must be at least native_reader_workers"));
+  REQUIRE_THAT(
+    read_error("      preparation:\n        native_reader_workers: 3\n"
+               "        max_native_readers: 2\n"),
+    Catch::Matchers::EndsWith("max_native_readers must be at least native_reader_workers"));
+  // R10 boundaries.
+  (void)read("      rest_n_reactors: 1\n      rest:\n        fan_out: 2\n");  // default, by value
+  (void)read("      rest_n_reactors: 4\n      rest:\n        fan_out: 4\n");
+  (void)read("      rest_n_reactors: ~\n      rest:\n        fan_out: 8\n");
+  // partial_batch.
+  auto const pb = [](std::string_view body) {
+    return read_error(std::string("      preparation:\n        partial_batch:\n          ") +
+                      std::string(body) + "\n");
+  };
+  REQUIRE_THAT(pb("max_residence: 0"),
+               Catch::Matchers::EndsWith("max_residence must be at least min_residence"));
+  REQUIRE_THAT(pb("max_residence: 49ms"),
+               Catch::Matchers::EndsWith("max_residence must be at least min_residence"));
+  REQUIRE_THAT(pb("min_residence: -1ms"),
+               Catch::Matchers::ContainsSubstring("must be greater than 0"));
+  REQUIRE_THAT(pb("min_fill_percent: 101"),
+               Catch::Matchers::ContainsSubstring("must be between 1 and 100"));
+  REQUIRE_THAT(read_error("      preparation:\n        interrupt_check_interval: 0\n"),
+               Catch::Matchers::ContainsSubstring("must be greater than 0"));
+  // Prefetcher, cache, strategy and counts.
+  for (auto const* body : {"memory_prefetcher:\n        num_threads: 0",
+                           "memory_prefetcher:\n        min_free_fraction: 1.5",
+                           "memory_prefetcher:\n        drain_quiet_ms: -1",
+                           "cache:\n        min_prefetching_budget_fraction: .nan",
+                           "num_threads: 0",
+                           "uring_n_reactors: 0"}) {
+    INFO(body);
+    REQUIRE_THAT(read_error(std::string("      ") + body + "\n"),
+                 Catch::Matchers::ContainsSubstring("value out of range"));
+  }
+  REQUIRE_THAT(read_error("      cache:\n        eviction: x\n"),
+               Catch::Matchers::EndsWith("invalid enum value 'x'"));
+  REQUIRE_THAT(read_error("      readahead_strategy: lazy\n"),
+               Catch::Matchers::EndsWith("invalid enum value 'lazy'"));
+  REQUIRE_THAT(read_error("      max_readahead_scans: -1\n"),
+               Catch::Matchers::ContainsSubstring("must be a nonnegative integer"));
+  // Counts cuCascade keeps in an unsigned int.
+  for (auto const* body : {"rest:\n        mtu_reject_max_attempts: 4294967296",
+                           "rest:\n        iowq_max_unbound: 4294967296"}) {
+    INFO(body);
+    REQUIRE_THAT(read_error(std::string("      ") + body + "\n"),
+                 Catch::Matchers::ContainsSubstring("integer out of range"));
+  }
+  REQUIRE_THAT(read_error("      rest:\n        tls:\n          session_cache_per_endpoint: -1\n"),
+               Catch::Matchers::ContainsSubstring("must be a nonnegative integer"));
+}
+
+TEST_CASE("retired scan manager keys fire on null and keep their own advice",
+          "[config][config_scan_manager]")
+{
+  REQUIRE_THAT(read_error("      object_store: ~\n"),
+               Catch::Matchers::ContainsSubstring("no longer"));
+  REQUIRE_THAT(read_error("      kvikio: ~\n"),
+               Catch::Matchers::ContainsSubstring("backend: native"));
+  REQUIRE_THAT(read_error("      rest:\n        tls:\n          verify: ~\n"),
+               Catch::Matchers::ContainsSubstring("VERIFY_SSL on the selected CREATE SECRET"));
+  REQUIRE_THAT(
+    read_error("      rest:\n        tls:\n          ca_file: x\n"),
+    Catch::Matchers::ContainsSubstring("NIX_SSL_CERT_FILE / SSL_CERT_FILE / SSL_CERT_DIR"));
+}
+
+TEST_CASE("deprecated spellings are written canonically", "[config][config_scan_manager]")
+{
+  auto const root    = read("      backend: sirius\n      cache:\n        mode: sirius\n");
+  auto const written = parse_yaml(write_yaml(root, "sirius"));
+  auto const& sm     = *written.find("sirius")->find("executor")->find("scan_manager");
+  REQUIRE(sm.find("backend")->text() == "native");
+  REQUIRE(sm.find("cache")->find("mode")->text() == "cucs");
+}
+
+TEST_CASE("scan manager fallbacks equal the runtime defaults", "[config][config_scan_manager]")
+{
+  scan_root root;
+  read_yaml(root, "sirius: {}\n", "sirius", environment::prod);
+  auto const& sm = root.executor.scan_manager;
+  sirius::scan_manager::scan_manager_config const runtime{};
+  auto const& r = runtime.rest;
+  auto const& o = sm.rest;
+  REQUIRE(o.request_timeout.get().count() == r.request_timeout_s);
+  REQUIRE(o.stall_speed_limit_bytes.get().count() == r.stall_speed_limit_bytes);
+  REQUIRE(o.stall_time.get().count() == r.stall_time_s);
+  REQUIRE(o.merge_max_gap.get().count() == static_cast<std::int64_t>(r.merge_max_gap));
+  REQUIRE(o.min_segment_bytes.get().count() == static_cast<std::int64_t>(r.min_segment_bytes));
+  REQUIRE(o.max_segment_bytes.get().count() == static_cast<std::int64_t>(r.max_segment_bytes));
+  REQUIRE(o.footer_probe_bytes.get().count() == static_cast<std::int64_t>(r.footer_probe_bytes));
+  REQUIRE(o.list_max_matches.get() == r.list_max_matches);
+  REQUIRE(o.list_max_scanned.get() == r.list_max_scanned);
+  REQUIRE(o.retry_backoff_base.get() == r.retry_backoff_base);
+  REQUIRE(o.retry_jitter.get() == r.retry_jitter);
+  REQUIRE(o.max_retry_attempts.get() == r.max_retry_attempts);
+  REQUIRE(o.max_auth_retry_attempts.get() == r.max_auth_retry_attempts);
+  REQUIRE(o.honor_retry_after.get() == r.honor_retry_after);
+  REQUIRE(o.conn_max_age.get() == r.conn_max_age);
+  REQUIRE(o.upkeep_interval.get() == r.upkeep_interval);
+  REQUIRE(o.upkeep_http1.get() == r.upkeep_http1);
+  REQUIRE(o.connect_timeout.get() == r.connect_timeout);
+  REQUIRE(o.dns_ttl.get() == r.dns_ttl);
+  REQUIRE(o.dns_accumulate.get() == r.dns_accumulate);
+  REQUIRE(o.dns_max_addresses.get() == r.dns_max_addresses);
+  REQUIRE(o.keepalive_idle.get().count() == r.keepalive_idle_s);
+  REQUIRE(o.keepalive_interval.get().count() == r.keepalive_interval_s);
+  REQUIRE(o.keepalive_count.get() == r.keepalive_count);
+  REQUIRE(o.mtu_reject_max_attempts.get() == r.mtu_reject_max_attempts);
+  REQUIRE(o.close_with_rst.get() == r.close_with_rst);
+  REQUIRE(o.receive_buffer_bytes.get().count() ==
+          static_cast<std::int64_t>(r.receive_buffer_bytes));
+  REQUIRE(o.queue_depth.get() == r.queue_depth);
+  REQUIRE(o.wait_mode.get() == r.wait_mode);
+  REQUIRE(o.iowq_max_unbound.get() == r.iowq_max_unbound);
+  REQUIRE(o.fan_out.get() == r.fan_out);
+  REQUIRE(o.interface.get() == r.interface);
+  REQUIRE(o.pin_to_irq_cpus.get() == r.pin_to_irq_cpus);
+  REQUIRE(o.raise_reactor_priority.get() == r.raise_reactor_priority);
+
+  auto const& t = r.tls;
+  REQUIRE(o.tls.ktls.get() == t.ktls);
+  REQUIRE(o.tls.user_space_rx.get() == t.fallback_rx);
+  REQUIRE(o.tls.recv_placement.get() == t.placement);
+  REQUIRE(o.tls.min_version.get() == t.min_version);
+  REQUIRE(o.tls.max_version.get() == t.max_version);
+  REQUIRE(o.tls.expect_no_pad.get() == t.expect_no_pad);
+  REQUIRE(o.tls.session_cache.get() == t.session_cache);
+  REQUIRE(o.tls.session_cache_per_endpoint.get() == t.session_cache_per_endpoint);
+  REQUIRE(o.tls.max_connection_bytes.get().count() ==
+          static_cast<std::int64_t>(t.max_connection_bytes));
+  REQUIRE(o.tls.ciphersuites.get() == t.ciphersuites);
+  REQUIRE(o.tls.cipher_list.get() == t.cipher_list);
+  REQUIRE(o.tls.groups.get() == t.groups);
+  REQUIRE(o.tls.sni_override.get() == t.sni_override);
+  REQUIRE(o.tls.allow_tls13_without_rekey.get() == t.allow_tls13_without_rekey);
+
+  REQUIRE(sm.uring.slices_per_pass.get() == runtime.uring.slices_per_pass);
+  REQUIRE(sm.uring.range_batch_slices.get() == runtime.uring.range_batch_slices);
+  REQUIRE(sm.cache.mode.get() == runtime.cache.mode);
+  REQUIRE(sm.cache.eviction.get() == runtime.cache.eviction);
+  REQUIRE(sm.cache.min_prefetching_budget_fraction.get() ==
+          runtime.cache.min_prefetching_budget_fraction);
+  REQUIRE(sm.cache.eviction_threshold_fraction.get() == runtime.cache.eviction_threshold_fraction);
+  REQUIRE(sm.memory_prefetcher.enable.get() == runtime.memory_prefetcher.enable);
+  REQUIRE(sm.memory_prefetcher.num_threads.get() == runtime.memory_prefetcher.num_threads);
+  REQUIRE(sm.memory_prefetcher.min_free_fraction.get() ==
+          runtime.memory_prefetcher.min_free_fraction);
+  REQUIRE(static_cast<std::size_t>(sm.memory_prefetcher.poll_interval.get().count()) ==
+          runtime.memory_prefetcher.poll_interval_ms);
+  REQUIRE(static_cast<std::size_t>(sm.memory_prefetcher.drain_quiet.get().count()) ==
+          runtime.memory_prefetcher.drain_quiet_ms);
+  REQUIRE(sm.preparation.interrupt_check_interval.get() ==
+          runtime.preparation.interrupt_check_interval);
+  REQUIRE(sm.backend.get() == runtime.backend);
+  REQUIRE(sm.reserve_rest_reactor_cpus.get() == runtime.reserve_rest_reactor_cpus);
 }

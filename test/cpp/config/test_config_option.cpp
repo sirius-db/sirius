@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -600,4 +601,42 @@ TEST_CASE("a mandatory option is not required when its block is absent", "[confi
   REQUIRE(cert.is_unset());
   REQUIRE_THROWS_WITH(cert.load(node::mapping(), "tls", environment::prod),
                       "'tls.cert': required but missing");
+}
+
+TEST_CASE("choices read and write a closed set of spellings", "[config][config_option]")
+{
+  enum class mode { epoll, uring, poll };
+  auto choice =
+    option<mode>("wait_mode")
+      .choices({{"epoll", mode::epoll}, {"uring", mode::uring}, {"io_uring", mode::uring}})
+      .build();
+  choice.load(map_of({{"wait_mode", "io_uring"}}), "rest", environment::prod);  // an alias reads
+  REQUIRE(choice.get() == mode::uring);
+  node out = node::mapping();
+  choice.write(out, false);
+  REQUIRE(out == map_of({{"wait_mode", "uring"}}));  // the first spelling writes
+
+  REQUIRE_THROWS_WITH(
+    choice.load(map_of({{"wait_mode", "Epoll"}}), "rest", environment::prod),
+    "'rest.wait_mode': invalid enum value 'Epoll' (expected epoll, uring, io_uring)");
+  REQUIRE_THROWS_WITH(
+    choice.load(map_of({{"wait_mode", " epoll"}}), "rest", environment::prod),
+    "'rest.wait_mode': invalid enum value ' epoll' (expected epoll, uring, io_uring)");
+  node seq = node::mapping();
+  seq.set("wait_mode", node::sequence());
+  REQUIRE_THROWS_WITH(choice.load(seq, "rest", environment::prod),
+                      "'rest.wait_mode': expected a scalar, got a sequence");
+
+  choice.assign(mode::poll);  // a value the table cannot spell
+  node unspellable = node::mapping();
+  REQUIRE_THROWS_AS(choice.write(unspellable, false), std::logic_error);
+
+  auto bound = option<std::optional<int>>("max_version")
+                 .choices({{"auto", std::nullopt}, {"12", 12}, {"13", 13}})
+                 .fallback(std::optional<int>{})
+                 .build();
+  bound.load(map_of({{"max_version", "auto"}}), "", environment::prod);
+  REQUIRE(bound.get() == std::nullopt);
+  bound.load(map_of({{"max_version", "13"}}), "", environment::prod);
+  REQUIRE(bound.get() == 13);
 }
