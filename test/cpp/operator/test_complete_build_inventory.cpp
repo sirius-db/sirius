@@ -15,6 +15,7 @@
  */
 
 #include "dynamic_filter_accumulation_test_utils.hpp"
+#include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -294,4 +295,44 @@ TEST_CASE("accumulated Bloom transfer chunks are aligned and cover non-aligned a
     REQUIRE(shape);
     REQUIRE(shape->chunk_bytes == geometry::k_max_transfer_chunk_bytes);
   }
+}
+
+TEST_CASE(
+  "a scaled Bloom is sized from the build's rows times the scale, in power-of-two blocks",
+  "[dynamic_filter][multi_partition]")
+{
+  using sirius::op::scaled_bloom_keys;
+  constexpr std::size_t min = std::size_t{1} << 16;
+  constexpr std::size_t max = std::size_t{1} << 30;
+  // 16 keys per 256-bit block: the result is 16 times a power of two.
+  auto const power_of_two_blocks = [](std::size_t keys) {
+    return keys % 16 == 0 && (keys / 16 & (keys / 16 - 1)) == 0;
+  };
+  // Small builds take the floor.
+  CHECK(scaled_bloom_keys(0, 4, min, max) == min);
+  CHECK(scaled_bloom_keys(100, 4, min, max) == min);
+  // 300 M rows on each of 4 ranks: 1.2 B keys, more than the cap.
+  CHECK(scaled_bloom_keys(300'000'000, 4, min, max) == max);
+  // 50 M rows on each of 4 ranks: 200 M keys, rounded up to 2^28.
+  CHECK(scaled_bloom_keys(50'000'000, 4, min, max) == std::size_t{1} << 28);
+  CHECK(scaled_bloom_keys(50'000'000, 4, min, max) >= 200'000'000);
+  // Exactly a power of two of blocks stays.
+  CHECK(scaled_bloom_keys(std::size_t{1} << 20, 1, min, max) == std::size_t{1} << 20);
+  CHECK(scaled_bloom_keys((std::size_t{1} << 20) + 1, 1, min, max) == std::size_t{1} << 21);
+  // A scale of 0 counts as 1; the product saturates instead of wrapping.
+  CHECK(scaled_bloom_keys(5000, 0, 1024, max) == 8192);
+  CHECK(scaled_bloom_keys(std::numeric_limits<std::size_t>::max(), 8, min, max) == max);
+  // A cap that is not a power of two of blocks is taken down to one.
+  CHECK(scaled_bloom_keys(std::size_t{1} << 40, 4, min, 3'000'000) == std::size_t{1} << 21);
+  for (std::size_t rows : {1ul, 1000ul, 77'777ul, 123'456'789ul, 999'999'999ul}) {
+    for (std::size_t world : {1ul, 2ul, 3ul, 4ul, 8ul}) {
+      auto const keys = scaled_bloom_keys(rows, world, min, max);
+      CHECK(power_of_two_blocks(keys));
+      CHECK(keys >= std::min(std::max(rows * world, min), max));
+      CHECK(keys <= max);
+    }
+  }
+  // Ranks with nearby row counts agree unless a power of two lies between them.
+  CHECK(scaled_bloom_keys(26'000'000, 4, min, max) ==
+        scaled_bloom_keys(26'010'000, 4, min, max));
 }

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exchange/fabric.hpp"
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
@@ -40,6 +42,17 @@ namespace sirius::exec {
 class query_lifecycle_registry;
 }
 
+namespace duckdb {
+class ClientContext;
+}
+
+namespace sirius::op {
+class sirius_physical_exchange_sink;
+class sirius_physical_hash_join;
+class sirius_physical_sort_sample;
+class sirius_physical_table_scan;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
 class parquet_ingestible_table_info;
 }
@@ -49,6 +62,8 @@ struct operator_params;
 }
 
 namespace sirius::planner {
+
+struct connector;
 
 using parquet_footer_reader =
   std::function<std::shared_ptr<cudf::io::parquet::FileMetaData const>(std::string const& path)>;
@@ -67,6 +82,9 @@ using parquet_footer_reader =
  *
  * Every rank must plan the same query: before returning, this blocks until every rank of
  * @p service has planned it, comparing the plans' shapes in an all-gather.
+ *
+ * Whatever it throws, it first aborts @p query on every rank and retires it on this one: the
+ * query is numbered by then, and the other ranks would wait for this one in the all-gather.
  *
  * @param query This query's number, the same on every rank: its exchanges' stream ids.
  * @param lifecycle Gates the exchange sources' landing into their ports' repositories.
@@ -117,5 +135,38 @@ struct file_byte_range {
 void assign_files_to_rank(op::scan::parquet_ingestible_table_info& info,
                           std::vector<std::string> files,
                           operator_params const& op_params);
+
+/**
+ * @brief Refuses, in distributed mode, a scan that @p source would lower to a read no rank split:
+ * a DuckDB table, `sirius_read_parquet` of one URI, or a Parquet scan whose plan carries its own
+ * byte ranges. Each rank would read all of it, and the query's answer would count it once per rank.
+ *
+ * The plan generator calls it once per scan, before lowering, only when distributed; the other
+ * refusals (`filename`/`file_index`, too few remote files) need the bound files and stay in
+ * assign_files_to_rank.
+ *
+ * @throws sirius::not_implemented_exception naming what cannot be split.
+ */
+void check_distributed_scan(op::sirius_physical_table_scan const& scan,
+                            connector const& source,
+                            duckdb::ClientContext& context);
+
+/// Has @p join merge its dynamic filters across ranks with @p merge, each of the @p ranks ranks
+/// sizing its Blooms from its own build rows (op::merged_bloom_policy), and close its publication
+/// when its build CONCAT (`children[1]`) finalizes:
+/// a peer's merge waits on this rank's part, and that peer's probe may be what this rank's probe
+/// waits on, so the join's own finalize is too late.
+void install_filter_merge(op::sirius_physical_hash_join& join,
+                          std::shared_ptr<op::cross_rank_filter_merge> merge,
+                          std::size_t ranks);
+
+/// Has @p sample take its boundaries from every rank's sample, all-gathered on @p stream, and
+/// give the range exchange's boundaries to @p sink, the EXCHANGE_SINK after it, in whose order
+/// the samples are merged. @p sink must outlive @p sample's boundary task.
+void install_sort_boundaries(op::sirius_physical_sort_sample& sample,
+                             op::sirius_physical_exchange_sink& sink,
+                             std::shared_ptr<exchange::exchange_service> service,
+                             exchange::stream_id stream,
+                             cucascade::memory::memory_space& gpu);
 
 }  // namespace sirius::planner

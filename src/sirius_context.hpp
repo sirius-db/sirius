@@ -79,6 +79,7 @@ class sirius_engine;
 }  // namespace sirius
 
 namespace sirius::exchange {
+class distributed_session;
 class exchange_service;
 }  // namespace sirius::exchange
 
@@ -384,6 +385,8 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
+    uint64_t exists_minmax_rewrites = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
     uint64_t provider_internal_skips          = 0;
     uint64_t hidden_catalog_skips             = 0;
@@ -707,15 +710,11 @@ class SiriusContext : public ClientContextState {
     std::shared_ptr<sirius::pipeline::completion_handler> completion_;
   };
 
-  /// \brief Terminate the Sirius context, releasing all resources.
-  void terminate();
-
   /// \brief Restore the cuDF global pinned memory resource and threshold that
   ///        initialize() installed, before the slab allocator backing them is
-  ///        destroyed. Idempotent and no-op when nothing was installed, so it
-  ///        is safe to call from both terminate() (success path) and the
-  ///        failure/early-return paths. cuDF holds a non-owning reference to
-  ///        small_pinned_allocator_view_, so skipping this leaves it dangling.
+  ///        destroyed. Called by release_resources() during teardown and rollback;
+  ///        idempotent and no-op when nothing was installed. cuDF holds a non-owning
+  ///        reference to small_pinned_allocator_view_, so skipping this leaves it dangling.
   void restore_cudf_pinned_memory_resource() noexcept;
 
   /// \brief Log host and GPU memory pool stats (allocated, peak, and
@@ -825,6 +824,10 @@ class SiriusContext : public ClientContextState {
   /// that numbered it).
   [[nodiscard]] uint64_t next_distributed_query(ClientContext& context, uint64_t assigned = 0);
 
+  /// \brief Shuts the exchange down, freeing its listener port and shared-memory mirrors. For a
+  /// process about to exit; release_resources() does the same on teardown.
+  void shutdown_exchange();
+
   /// \brief @p context is closing: if it runs distributed queries, the next connection to plan
   /// one takes over, and numbering continues where it stopped.
   void release_distributed_connection(ClientContext& context);
@@ -836,6 +839,14 @@ class SiriusContext : public ClientContextState {
   void set_exchange_service_for_testing(
     std::shared_ptr<sirius::exchange::exchange_service> service);
 
+  /// \brief This process's distributed session, or null until its first distributed use (a
+  /// distributed plan, or SET sirius_exchange_rank with the peers set). Once set, it stays until
+  /// this context is destroyed.
+  [[nodiscard]] sirius::exchange::distributed_session* distributed() const noexcept
+  {
+    return distributed_.load(std::memory_order_acquire);
+  }
+
   /// \brief @p context's open execution window runs distributed query @p query, which an earlier
   /// statement planned (a prepared statement's validated plan). No-op for 0 or without a window.
   void adopt_distributed_query(ClientContext& context, uint64_t query);
@@ -843,11 +854,6 @@ class SiriusContext : public ClientContextState {
   /// \brief Window @p window's query failed with @p error: if it is a distributed query, every
   /// peer's run of it fails too, rather than waiting for this rank's batches.
   void abort_distributed_query(sirius::query_id_t window, std::exception_ptr const& error) noexcept;
-
-  /// \brief Window @p window failed to begin with @p error: aborts its distributed query on every
-  /// rank, retires it here, and unties it from the window, whose destructor does not run.
-  void fail_distributed_window_begin(sirius::query_id_t window,
-                                     std::exception_ptr const& error) noexcept;
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -884,6 +890,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Record that a GPU execution failed at runtime and the query completed
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
+
+  /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
+  void record_exists_minmax_rewrites(uint64_t count) noexcept;
 
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
@@ -968,18 +977,19 @@ class SiriusContext : public ClientContextState {
   sirius::exec::query_admission admission_;
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
+  void release_resources() noexcept;
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
   // operator_params.use_hw_decompression is set and every GPU's CUDA driver
   // supports hardware decompression. Emplaced in initialize(), reset in
-  // terminate(); RAII restores the variable's prior state on destruction.
+  // release_resources(); RAII restores the variable's prior state on destruction.
   std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
   // after memory_manager_ so it is destroyed before it: each entry holds a
   // reservation into the manager's GPU spaces, so the manager must outlive the
-  // cache. Also reset explicitly in terminate() before the manager is torn down.
+  // cache. Also reset explicitly in release_resources() before the manager is torn down.
   std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
@@ -995,13 +1005,13 @@ class SiriusContext : public ClientContextState {
   // single-pool path that hardcoded host_spaces[0] and funneled every
   // GPU's cuDF metadata allocation through one NUMA domain.
   // Destroyed before memory_manager_ (declared after it — reverse
-  // destruction order). prev_pinned_mr_ is restored in terminate() before
+  // destruction order). prev_pinned_mr_ is restored in release_resources() before
   // these are torn down to prevent cuDF from holding a dangling ref.
   std::unique_ptr<sirius::memory::numa_small_pinned_mr> small_pinned_allocator_;
   std::optional<sirius::memory::host_device_resource_view<sirius::memory::numa_small_pinned_mr>>
     small_pinned_allocator_view_{};
-  // Previous cuDF pinned resource and threshold — restored in terminate() before the view and
-  // allocator are destroyed to prevent dangling references.
+  // Previous cuDF pinned resource and threshold — restored in release_resources() before the view
+  // and allocator are destroyed to prevent dangling references.
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
@@ -1015,9 +1025,9 @@ class SiriusContext : public ClientContextState {
   /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
   /// before the subsystems that hold a pointer to it so it is destroyed after them.
   sirius::exec::query_lifecycle_registry query_lifecycle_;
-  // The creator and downgrade executors borrow this scheduler. Reverse member destruction
-  // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
-  // throws before terminate() can run; terminate() also stops their threads before reset.
+  // The creator and downgrade executors borrow this scheduler. release_resources()
+  // stops and destroys them before resetting the scheduler. Member declaration order
+  // preserves that lifetime relationship during destruction as well.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
@@ -1030,6 +1040,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
@@ -1063,24 +1074,15 @@ class SiriusContext : public ClientContextState {
   std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
     semantic_decline_counts_{};
 
-  // terminate() shuts the service down before the memory manager: its transport uses its spaces.
-  std::mutex exchange_mutex_;
-  std::vector<std::string> exchange_peers_;
-  uint32_t exchange_rank_{0};
-  std::string exchange_host_staging_;
-  std::string exchange_mnnvl_;
-  uint64_t exchange_frame_bytes_          = 0;
-  uint32_t exchange_send_frames_          = 0;
-  uint32_t exchange_recv_frames_per_peer_ = 0;
-  std::shared_ptr<sirius::exchange::exchange_service> exchange_service_;
-  uint64_t distributed_queries_{0};
-  /// Numbers skipped before the exchange connected (first, last), retired once it does.
-  std::vector<std::pair<uint64_t, uint64_t>> skipped_before_connect_;
-  /// The connection that runs this process's distributed queries.
-  std::optional<connection_t> distributed_connection_;
-  /// Each open execution window's distributed query. A window may retire while another
-  /// connection's window runs, so it names its own.
-  std::unordered_map<uint64_t, uint64_t> distributed_by_window_;
+  /// distributed(), created on first use.
+  sirius::exchange::distributed_session& distributed_session_for_use();
+  std::mutex distributed_create_mutex_;
+  /// The session behind distributed(). It stays until this context is destroyed, so after the
+  /// first distributed use each execution window takes the session's lock twice: when its query
+  /// work retires and when the window ends. terminate() shuts its exchange down before the memory
+  /// manager: its transport uses the memory spaces.
+  std::unique_ptr<sirius::exchange::distributed_session> distributed_owner_;
+  std::atomic<sirius::exchange::distributed_session*> distributed_{nullptr};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

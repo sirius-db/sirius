@@ -2755,8 +2755,9 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
 
   s3_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
-  auto const s3_query = "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn FROM " +
-                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const s3_query =
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr FROM " +
+    s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -2806,7 +2807,7 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
                   ->HasError());
 
   auto result = fixture.con.Query(
-    "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
+    "SELECT n_nationkey, PERCENT_RANK() OVER (ORDER BY n_nationkey) AS pr "
     "FROM v_s3_nation ORDER BY n_nationkey");
   REQUIRE(result);
   REQUIRE(result->HasError());
@@ -2926,7 +2927,7 @@ TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence"
   }
 }
 
-TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
+TEST_CASE("transparent S3 execution rebuild preserves read-view correspondence",
           "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
@@ -2973,18 +2974,11 @@ TEST_CASE("transparent S3 execution rebuild preserves template origin and source
                           : "SELECT sum(n_nationkey) FROM v_s3_rebuild");
         REQUIRE(result);
         INFO((result->HasError() ? result->GetError() : "success"));
-        if (multi) {
-          REQUIRE(result->HasError());
-          CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
-          CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
-          CHECK(result->GetError().find("correspondence=none") != std::string::npos);
-        } else {
-          REQUIRE_FALSE(result->HasError());
-          CHECK(result->Collection().GetValue(0, 0).ToString() == "300");
-        }
+        REQUIRE_FALSE(result->HasError());
+        CHECK(result->Collection().GetValue(0, 0).ToString() == (multi ? "600" : "300"));
         auto const after = sirius::test::get_transparent_execution_stats(con);
         CHECK(after.execution_rebuilds == before.execution_rebuilds + 1);
-        CHECK(after.read_view_mismatches == before.read_view_mismatches + (multi ? 1 : 0));
+        CHECK(after.read_view_mismatches == before.read_view_mismatches);
         sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
       }
     }
@@ -3510,7 +3504,7 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   } reset{*context};
 
   auto const query =
-    "SELECT n_nationkey, row_number() OVER (ORDER BY n_nationkey) "
+    "SELECT n_nationkey, percent_rank() OVER (ORDER BY n_nationkey) "
     "FROM explicit_remote_view";
   SECTION("plan generation fails") {}
   SECTION("window entry fails")

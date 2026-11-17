@@ -45,7 +45,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -77,15 +80,19 @@ struct ranks {
   loopback_hub hub;
   std::vector<one> all;
 
-  ranks(rank_t world, loopback_hub::options opts) : hub(world, opts), all(world)
+  ranks(rank_t world,
+        loopback_hub::options opts,
+        cucascade::memory::memory_space* host               = env().host,
+        sirius::exchange::transport::options transport_opts = {})
+    : hub(world, opts), all(world)
   {
     for (rank_t r = 0; r < world; ++r) {
-      auto& o = all[r];
-      o.send  = std::make_unique<frame_ring>(4, 64 * KiB);
-      o.recv  = std::make_unique<frame_ring>(8, 64 * KiB);
-      o.fab   = hub.attach(r, *o.send, *o.recv);
-      o.service =
-        std::make_shared<exchange_service>(*o.fab, *o.send, *o.recv, *env().gpu, env().host);
+      auto& o   = all[r];
+      o.send    = std::make_unique<frame_ring>(4, 64 * KiB);
+      o.recv    = std::make_unique<frame_ring>(8, 64 * KiB);
+      o.fab     = hub.attach(r, *o.send, *o.recv);
+      o.service = std::make_shared<exchange_service>(
+        *o.fab, *o.send, *o.recv, *env().gpu, host, transport_opts);
     }
   }
   explicit ranks(rank_t world) : ranks(world, loopback_hub::options{}) {}
@@ -531,6 +538,29 @@ TEST_CASE("an aborted query fails its streams on every rank, and only its stream
   CHECK_THROWS(late.get_next_task_input_data());
 }
 
+TEST_CASE("a peer's abort wakes a sender waiting for room, which fails with the abort",
+          "[exchange][operators]")
+{
+  // About 1.2 MB a batch against a 64 KiB cap and a receiver with no room: rank 0's second send
+  // waits for room that the first never frees.
+  ranks c(2, loopback_hub::options{}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto& service          = *c.all[0].service;
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  auto const hold        = hold_gpu();
+  service.send(stream, 1, std::move(first));
+  auto blocked =
+    std::async(std::launch::async, [&] { service.send(stream, 1, std::move(second)); });
+  CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+
+  c.all[1].service->abort(sirius::exchange::query_of(stream), "injected failure");
+
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  CHECK_THROWS_WITH(blocked.get(),
+                    Catch::Matchers::ContainsSubstring("failed on rank 1: injected failure"));
+}
+
 TEST_CASE("a receiver that throws aborts its query on every rank, and the next query runs",
           "[exchange][operators]")
 {
@@ -665,6 +695,41 @@ TEST_CASE("a stream takes a second receiver only once its first has detached",
   CHECK_NOTHROW(service.attach(stream, std::make_shared<ignoring>()));
 }
 
+TEST_CASE("a receiver that throws while its held arrivals are replayed is not left attached",
+          "[exchange][operators]")
+{
+  struct throwing : sirius::exchange::inbound {
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      throw std::runtime_error("replay failed");
+    }
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+  };
+  struct counting : sirius::exchange::inbound {
+    int events{0};
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      ++events;
+    }
+    void on_end(rank_t) override { ++events; }
+    void on_error(std::exception_ptr) override { ++events; }
+  };
+  ranks c(1);
+  auto& service          = *c.all[0].service;
+  stream_id const stream = sirius::exchange::make_stream_id(1, 1);
+  // Held: nobody is attached yet.
+  service.send(stream, 0, key_value_batch(0, 0));
+  CHECK_THROWS_WITH(service.attach(stream, std::make_shared<throwing>()),
+                    Catch::Matchers::ContainsSubstring("replay failed"));
+  // Like a detached stream, it drops what arrives next.
+  service.send(stream, 0, key_value_batch(0, 1));
+  // It takes a receiver again, which gets neither that nor what was held for the failed one.
+  auto second = std::make_shared<counting>();
+  CHECK_NOTHROW(service.attach(stream, second));
+  CHECK(second->events == 0);
+}
+
 TEST_CASE("queries retiring out of order are each forgotten", "[exchange][operators]")
 {
   ranks c(2);
@@ -737,6 +802,61 @@ TEST_CASE("a shut-down exchange service stops its transport and refuses later se
                     Catch::Matchers::ContainsSubstring("shut down"));
   CHECK_THROWS_WITH(service.close(stream + 1, 0), Catch::Matchers::ContainsSubstring("shut down"));
   service.abort(3, "after shutdown");
+}
+
+TEST_CASE("a batch that arrives while the exchange service shuts down is not kept",
+          "[exchange][operators]")
+{
+  /// Counts what it is given; its first batch waits for release().
+  struct gated : sirius::exchange::inbound {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered{false};
+    bool released{false};
+    int batches{0};
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override
+    {
+      std::unique_lock lock{mutex};
+      ++batches;
+      entered = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return released; });
+    }
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override {}
+    void release()
+    {
+      std::lock_guard lock{mutex};
+      released = true;
+      changed.notify_all();
+    }
+  };
+  // Notifications arrive together, so both batches below are copied out before the first is
+  // delivered, and the second is delivered in the same pass of the engine thread.
+  ranks c(2, {.deliver_every = 50});
+  stream_id const attached   = sirius::exchange::make_stream_id(3, 1);
+  stream_id const unattached = sirius::exchange::make_stream_id(3, 2);
+  auto& service              = *c.all[1].service;
+  auto first                 = std::make_shared<gated>();
+  service.attach(attached, first);
+  c.all[0].service->send(attached, 1, key_value_batch(0, 0));
+  c.all[0].service->send(unattached, 1, key_value_batch(0, 1));
+  {
+    std::unique_lock lock{first->mutex};
+    REQUIRE(
+      first->changed.wait_for(lock, std::chrono::seconds{30}, [&] { return first->entered; }));
+  }
+  // The engine thread is inside the first delivery. shutdown() clears what the service holds and
+  // then waits to join it; the second batch is delivered after that clear.
+  std::thread stopping([&] { service.shutdown(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  first->release();
+  stopping.join();
+
+  auto late = std::make_shared<gated>();
+  late->release();
+  service.attach(unattached, late);
+  CHECK(late->batches == 0);
 }
 
 TEST_CASE("a hash exchange with null keys to every rank sends rows with a NULL key to every rank",

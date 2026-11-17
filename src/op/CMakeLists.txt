@@ -5,6 +5,8 @@ target_sources(
           aggregate/group_key_labels.cpp
           aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/aggregate_types.cpp
+          window/cumulative.cpp
           window/ranking.cpp
           window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
@@ -93,6 +95,8 @@ target_sources(
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
+          distributed/sample_all_gather_boundaries.cpp
+          distributed/bloom_all_gather_merge.cpp
           sirius_physical_table_scan.cpp
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
@@ -101,6 +105,7 @@ target_sources(
           aggregate/wide_integer_sum.cu
           partition/crc32_partition_hash.cu
           replicate/gpu_replicate_impl.cu
+          right_join_build_matches.cu
           scan/equality_delete_mask.cu)
 
 add_subdirectory(scan/arrow)

@@ -82,7 +82,8 @@ class exchange_service {
   /// See transport::wait_sent. True once shut down: the transport freed what it held.
   [[nodiscard]] bool wait_sent(distributed_query_id query, std::chrono::milliseconds timeout);
 
-  /// Routes @p stream to @p receiver, replaying what arrived for it before.
+  /// Routes @p stream to @p receiver, replaying what arrived for it before. If a replayed callback
+  /// throws, the stream is left detached and the exception goes on.
   /// @throws sirius::invalid_input_exception when the stream already has a receiver.
   void attach(stream_id stream, std::shared_ptr<inbound> receiver);
   /// Stops routing @p stream; later arrivals for it are dropped.
@@ -115,6 +116,8 @@ class exchange_service {
 
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
   void throw_if_failed();
+  /// The transport, held for the length of a call into it; null once shut down.
+  [[nodiscard]] std::shared_ptr<transport> running_transport();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(distributed_query_id query, std::exception_ptr error);
   [[nodiscard]] bool retired(distributed_query_id query) const;
@@ -141,9 +144,11 @@ class exchange_service {
   std::map<distributed_query_id, distributed_query_id> _retired_above;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
-  // Last: its engine thread calls back into the members above until it is destroyed. Null once
-  // shut down.
-  std::unique_ptr<transport> _transport;
+  /// shutdown() has begun: nothing that arrives from here on is kept.
+  bool _shut_down{false};
+  // Last: its engine thread calls back into the members above until it is stopped. Null once
+  // shut down. Shared, so that a sender still inside it when shutdown() runs keeps it alive.
+  std::shared_ptr<transport> _transport;
 };
 
 }  // namespace sirius::exchange

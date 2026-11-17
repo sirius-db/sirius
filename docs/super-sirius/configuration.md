@@ -28,10 +28,8 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 `sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
 connections to one DatabaseInstance. It bounds initialization through retirement. Additional
-queries wait in a cancellable FIFO queue. The former
-`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
-values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
-maintenance, error and multi-GPU contracts.
+queries wait in a cancellable FIFO queue. See [Concurrent queries](concurrent-queries.md) for
+the maintenance, error and multi-GPU contracts.
 
 ### Distributed launch section (`sirius.distributed`)
 
@@ -372,7 +370,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
+| `backend` | enum: `native`, `kvikio`, `gds` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. `gds` reads local files into GPU memory with cuFile (GPUDirect Storage), see [`scan_manager.gds`](#scan_managergds--gpudirect-storage-backend-srciogds); `s3://` reads then go through kvikIO as under `kvikio`. `kvikio` and `gds` are single-GPU only: a multi-GPU configuration forces `kvikio` back to `native` and rejects `gds`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
@@ -503,6 +501,26 @@ readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
 | `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+
+### `scan_manager.gds` — GPUDirect Storage backend (`src/io/gds/`)
+
+Used when `backend: gds`. Local files are read into GPU memory with cuFile, with no copy through
+host memory. Like `kvikio`, this backend runs without the prefetching cache and the readahead.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `num_threads` | int (**1–64**) | 32 | Threads that issue cuFile reads: the bound on reads in flight per process. On GPFS 32 and 64 were fastest, 128 slower, and at 256 a read stopped returning, so more than 64 is rejected. |
+| `task_size` | bytes (**> 0**) | 16Mi | Bytes per cuFile read. A larger read is cut into pieces of this size. |
+| `require` | bool | true | Refuse to start unless cuFile reports GDS available with its POSIX fallback off, and fail reads once cuFile serves most reads through POSIX (after the first GiB; cuFile reads a few KiB at a time through POSIX even under GDS). With `false` these are logged only. |
+| `max_gb_per_s` | number (**>= 0**) | 0 | Most bytes per second a process starts reading through cuFile, in GB/s; 0 is no cap. With more `num_threads`, data GPFS serves fast (read lately) would otherwise run a storage NIC at the rate that stalled rails; the cap holds that while reads of other data, which GPFS serves at about 1.2 GB/s per thread, gain from the threads. The cap is per process; a NIC carries the sum of the processes that share it. |
+| `slow_read_ms_per_mib` | number (**>= 0**) | 5 | Reads fail with "GDS reads slowed down" once they stay slower than this many milliseconds per MiB for two seconds; 0 turns the check off. Measured on GPFS: 0.8–1.2 ms per MiB when healthy, 10–62 on a path that was going bad. |
+| `read_timeout_s` | int (**> 0**) | 10 | A cuFile read in flight longer than this ends the process with status 70. cuFile reads cannot be cancelled, and failing the query instead would free buffers a stuck read still writes to. `scripts/sirius_rank_node.sh` does not restart a rank that exits with 70. |
+
+cuFile falls back to POSIX reads without an error while its own configuration has
+`allow_compat_mode: true`, so `require: true` needs a cuFile configuration with that turned off.
+`scripts/gds/cufile_json.sh <dir>` writes such a copy of the node's file; `scripts/sirius_rank_node.sh`
+does it for each rank when `SIRIUS_GDS=1` is set. See [Scan](scan.md#gpudirect-storage-backend) for
+the start-up line, the per-query proof line and the first test to run on a new machine.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
@@ -661,8 +679,8 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
-| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and observes only the columns late materialization names. |
-| `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and earlier columns take priority when the cap is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
+| `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -830,6 +848,12 @@ requires startup configuration.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
 
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA
+error reports, and its I/O layer where enabled) go to the same sink, prefixed `[cucascade]`.
+cuCascade's own gate mirrors what the active sink accepts: `sirius_log_level` under `spdlog`,
+nothing under `noop`, and under `duckdb` every record is handed to DuckDB, which applies its own
+level exactly as it does to Sirius's records.
+
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
@@ -858,9 +882,6 @@ rejected. `RESET` restores the registered default. Query initialization captures
 settings in an immutable snapshot, so later changes do not affect an existing query.
 Evaluators retain their own policy values rather than reading mutable global defaults.
 
-`expression_executor_strategy` remains registered as a deprecated compatibility alias for
-`expression_evaluator_strategy`; new configuration should use the evaluator name.
-
 ### Scan
 
 | Variable | Default | Description |
@@ -879,7 +900,10 @@ such as `can_have_nan` change the bounds a footer reads as). They are reused whi
 size, inode and modification time are unchanged, but never while that time is less than 10 seconds
 old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
 unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
-these, so checking costs no request; footers that must be read are read in parallel on DuckDB's
+these, so checking costs no request; a local file listed without them (an explicit file list) costs
+one `stat`. A scan's merged statistics are kept with the per-file statistics they were made from and
+reused until one of those files changes, one entry per set of paths a scan is given (at most 128),
+so a glob that gains files replaces its entry; footers that must be read are read in parallel on DuckDB's
 worker threads. Scans with
 `union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
@@ -927,7 +951,11 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
+| `enable_narrowing_expression_pushdown` | true | Compute a projection's DECIMAL `+`, `-`, `*` expression below the inner join under it when its inputs come from one join side, are used nowhere else, and are wider than the result (TPC-H q9's `amount`). |
+| `enable_build_side_swap` | false | Experimental. For an inner equality join whose build side has no filter and whose probe side has one, build on the probe side instead when DuckDB estimates more rows for the build (TPC-H q9's last join). No gain has been measured. |
 | `enable_complete_group_having` | true | Distributed execution: when the Parquet footers prove a GROUP BY key never spans two row groups (apart from row-group boundary values), apply the HAVING above the merge to each scan batch's partial groups before the exchange (TPC-H Q18). |
+| `enable_scan_reuse_rewrites` | true | Rewrite logical plans that read the same rows twice so they read them once (`src/planner/scan_reuse_rewrites.hpp`): an IN-subquery's aggregate reused by the outer query (TPC-H Q18), a correlated MIN/MAX/AVG subquery over the outer query's own rows (Q17, Q2), a join computed twice (Q11). Standalone and distributed. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -974,7 +1002,7 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A build whose arrays would exceed the cap gets arrays cut to it, which raises the false-positive rate; only a cap too small for one 256-byte array per key records a size refusal. Whole-build publication and distributed Blooms are unaffected. |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication and distributed Blooms are unaffected. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
@@ -987,6 +1015,8 @@ surface.
 
 ### Distributed Execution
 
+Distributed execution is experimental: these settings can change or go away between releases.
+
 See [Distributed Execution](distributed-sirius.md). The exchange belongs to the process, not the
 connection: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank` connects it and
 waits for every peer; set the other way round, the first distributed query connects it. Once it is
@@ -994,13 +1024,14 @@ connected, none of these settings can change, on any connection.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. Needs a build with `-DSIRIUS_WITH_NIXL=ON`. |
+| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
-| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
+| `sirius_exchange_host_staging` | `auto` | How exchange writes reach a peer. `auto`: over the NVLink fabric where it reaches the peer (`sirius_exchange_mnnvl`), else over TCP lanes to ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without peer access. `never`: the fabric where it reaches the peer, else NIXL to every peer, other hosts included. `always`: the mirror for every same-host peer and TCP lanes to other hosts, also where the fabric reaches. `remote`: TCP lanes to every peer (tests). Same on every rank; set it before `sirius_exchange_rank`, which connects. |
 | `sirius_exchange_mnnvl` | `auto` | `auto`, `require` or `off` put the exchange's rings in fabric memory, so that GPUs on other nodes of the NVLink domain write them over NVLink. `auto` falls back to `cudaMalloc` with a warning; `require` fails instead. Same on every rank. |
-| `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames. Same on every rank. |
+| `sirius_exchange_frame_bytes` | 16777216 | The exchange's frame size; a positive multiple of 256 up to 1 GiB. One write covers up to half a peer's receive frames, or one frame over TCP lanes. Same on every rank. |
 | `sirius_exchange_send_frames` | 32 | Send frames, shared by all peers; they bound the bytes in flight. Same on every rank. |
-| `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. Same on every rank. |
+| `sirius_exchange_recv_frames_per_peer` | 16 | Receive frames (credits) each peer may fill; ring memory grows with this times the peers. A TCP lane carries one frame, so fewer frames than lanes leave lanes idle. Same on every rank. |
+| `sirius_exchange_tcp_lanes` | 0 | TCP lanes per rank to ranks on other hosts (at most 64). 0 shares 16 among the ranks on this host, at least 2 each. Set it before `sirius_exchange_rank`. |
 | `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables
@@ -1032,7 +1063,7 @@ retention gates.
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
-| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join). Affects pins and plans made after it is set. |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values retained across all columns for the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
 Both size gates are evaluated on the narrowed table when compressed materialization is active.
@@ -1052,7 +1083,6 @@ still an experimental optimization, not a normal session choice.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
-| `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. Required for a group-by-rowid ride or a rider to be admissible at all. |
 
 Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
@@ -1095,28 +1125,6 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
-
-## Compile-Time Config Flags
-
-### Static flags
-
-**File:** `src/include/config.hpp`
-
-Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
-
-| Flag | Value | Namespace |
-|------|-------|-----------|
-| `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
-| `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
-| `NUM_GPU` | 1 | `sirius::Config` |
-
-These are compile-time defaults. Runtime configuration via `sirius_config` and DuckDB SET variables takes precedence.
-
-### CMake options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `SIRIUS_WITH_NIXL` | OFF | Build the exchange's NIXL fabric for [distributed execution](distributed-sirius.md). It links the NIXL install at `SIRIUS_NIXL_PREFIX`, else at `$NIXL_PREFIX`, else at `scripts/install_nixl.sh --print-prefix` (`~/.sirius/nixl/<commit>`), and caches the resolved prefix in `SIRIUS_NIXL_PREFIX`; see [Settings and build](distributed-sirius.md#settings-and-build). `pixi run build-distributed` installs NIXL and turns this on. |
 
 ## Key Files
 

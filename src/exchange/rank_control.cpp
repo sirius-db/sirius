@@ -84,14 +84,20 @@ unique_ptr<FunctionData> exit_bind(ClientContext&,
                                    vector<LogicalType>& types,
                                    vector<Identifier>& names)
 {
+  // The function exists in every Sirius process. Only one that joined an exchange has a reason
+  // to restart, so no client can end a process that runs alone.
+  if (!exchange_joined.load()) {
+    throw InvalidInputException(
+      "sirius_rank_exit: this process has not joined an exchange, so it does not restart");
+  }
   types = {LogicalType::BIGINT, LogicalType::BOOLEAN};
   names = {"pid", "exiting"};
   return make_uniq<one_row>();
 }
 
-/// Ends the process once the reply has left. terminate() shuts the exchange down, freeing its
-/// listener port and shared-memory mirrors; static destructors are skipped, since other threads
-/// still run. A watchdog ends the process anyway if terminate() hangs.
+/// Ends the process once the reply has left. shutdown_exchange() frees the exchange's listener
+/// port and shared-memory mirrors; static destructors are skipped, since other threads still run.
+/// A watchdog ends the process anyway if the shutdown hangs.
 void exit_soon(shared_ptr<SiriusContext> context)
 {
   std::this_thread::sleep_for(std::chrono::milliseconds{300});
@@ -102,7 +108,7 @@ void exit_soon(shared_ptr<SiriusContext> context)
   SIRIUS_LOG_INFO("sirius_rank_exit: shutting down for a restart");
   if (context && context->is_initialized()) {
     try {
-      context->terminate();
+      context->shutdown_exchange();
     } catch (...) {  // exiting anyway
     }
   }

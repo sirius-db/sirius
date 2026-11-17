@@ -23,13 +23,12 @@
 
 #pragma once
 
-#include <rmm/aligned.hpp>
-
 #include <cuda/cmath>
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
-#include <cstdint>
+#include <limits>
 
 namespace sirius::op {
 
@@ -50,18 +49,27 @@ static_assert(bloom_bits_per_block % bloom_target_bits_per_key == 0,
 }
 
 /**
- * @brief The most keys each of @p key_count Blooms can be sized for when together they must fit in
- * @p cap: the cap split evenly per key, rounded down to the allocation alignment, as whole blocks
- * of bloom_bytes_per_block, each holding bloom_bits_per_block / bloom_target_bits_per_key keys.
+ * @brief The keys a Bloom is sized for when its build holds one part in @p scale of the keys:
+ * @p rows times @p scale, at least @p min_keys, at most @p max_keys, rounded up to a power-of-two
+ * number of blocks.
  *
- * The inverse of detail::accumulated_bloom_geometry::try_create's footprint; change both together.
+ * Builds whose rows straddle a power of two get different sizes. Power-of-two block counts let a
+ * merge fold the larger Blooms onto the smallest (sirius_dynamic_bloom_filter::merge_from).
+ * @p max_keys is taken down to a power-of-two number of blocks, so the result never exceeds it.
  */
-[[nodiscard]] constexpr std::size_t bloom_keys_within_cap(std::uint64_t cap,
-                                                          std::size_t key_count) noexcept
+[[nodiscard]] constexpr std::size_t scaled_bloom_keys(std::size_t rows,
+                                                      std::size_t scale,
+                                                      std::size_t min_keys,
+                                                      std::size_t max_keys) noexcept
 {
-  auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
-  auto const blocks        = cap / key_count / alignment * alignment / bloom_bytes_per_block;
-  return blocks * (bloom_bits_per_block / bloom_target_bits_per_key);
+  constexpr std::size_t keys_per_block = bloom_bits_per_block / bloom_target_bits_per_key;
+  auto const max_blocks = std::bit_floor(std::max<std::size_t>(max_keys / keys_per_block, 1));
+  auto const parts      = std::max<std::size_t>(scale, 1);
+  auto const all_rows   = rows > std::numeric_limits<std::size_t>::max() / parts
+                            ? std::numeric_limits<std::size_t>::max()
+                            : rows * parts;
+  auto const blocks     = bloom_blocks_for(std::max(all_rows, min_keys));
+  return (blocks >= max_blocks ? max_blocks : std::bit_ceil(blocks)) * keys_per_block;
 }
 
 }  // namespace sirius::op

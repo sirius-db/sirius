@@ -92,6 +92,7 @@ extern "C" int cudaProfilerStop();
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
+#include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -1349,19 +1350,17 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       }
     }
 
-    // Uniqueness probe: which pinned columns to observe for whole-table distinctness.
-    // SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS names columns late materialization needs; the
-    // names outlive cache_info, which every insert path moves from.
+    // Uniqueness probe: with pin_table_prove_unique_keys, every column of a parquet pin is
+    // observed for whole-table distinctness, as a join-key candidate and for late materialization.
+    // A native table's scan takes the planner's PRIMARY KEY branch and never reads pin facts for
+    // joins, so its columns are observed only when late materialization is on and could use them;
+    // otherwise it would only cost pin time and GPU memory. The names outlive cache_info, which
+    // every insert path moves from.
     auto const pinned_column_names = cache_info.column_names();
-    auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
-    // With pin_table_prove_unique_keys, every other column of a parquet pin is observed too, as a
-    // join-key candidate. A native table's scan takes the planner's PRIMARY KEY branch and never
-    // reads pin facts, so observing its columns would only cost pin time and GPU memory.
-    auto const probe_unique_automatic = sirius::late_mat::pin_unique_automatic_selection(
-      probe_unique_columns, unique_cfg->prove_unique_keys && data.args.format == "parquet");
-    for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
-      if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
-    }
+    auto const probe_unique_columns =
+      std::vector<bool>(pinned_column_names.size(),
+                        unique_cfg->prove_unique_keys &&
+                          (data.args.format == "parquet" || sirius::late_mat::late_mat_enabled()));
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
@@ -1401,7 +1400,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -1435,7 +1433,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = false,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -1460,7 +1457,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
          .capture_chunk_stats               = capture_chunk_stats,
          .enable_compressed_materialization = compressed_pin,
          .probe_unique_columns              = probe_unique_columns,
-         .probe_unique_automatic            = probe_unique_automatic,
          .unique_exact_max_bytes            = unique_cfg->unique_exact_max_bytes});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
@@ -2610,18 +2606,6 @@ static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scop
   ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
-// Deprecated alias for `expression_evaluator_strategy`. Kept so existing
-// `SET expression_executor_strategy=...` statements keep working; remove in a future release.
-static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
-                                                    SetScope scope,
-                                                    Value& parameter)
-{
-  SIRIUS_LOG_WARN(
-    "The 'expression_executor_strategy' setting is deprecated; use "
-    "'expression_evaluator_strategy' instead.");
-  ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
-}
-
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
                                     Value& /*parameter*/)
@@ -2676,7 +2660,7 @@ static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Val
 {
   auto* params                     = get_operator_params(context, scope);
   params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+  SIRIUS_LOG_DEBUG("Updated config max_sort_partition_bytes to {}",
                    params->max_sort_partition_bytes);
 }
 
@@ -2711,9 +2695,8 @@ static void SetExchangePeers(ClientContext& context, SetScope scope, Value& para
 
 static void SetExchangeHostStaging(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto value = StringValue::Get(parameter);
-  static_cast<void>(sirius::exchange::parse_host_staging(value));
-  get_operator_params(context, scope)->exchange_host_staging = std::move(value);
+  get_operator_params(context, scope)->exchange_host_staging =
+    sirius::exchange::parse_host_staging(StringValue::Get(parameter));
 }
 
 static void SetExchangeMnnvl(ClientContext& context, SetScope scope, Value& parameter)
@@ -2750,6 +2733,17 @@ static void SetExchangeSendFrames(ClientContext& context, SetScope scope, Value&
 {
   get_operator_params(context, scope)->exchange_send_frames =
     ring_frames("sirius_exchange_send_frames", parameter);
+}
+
+static void SetExchangeTcpLanes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > sirius::exchange::max_tcp_lanes) {
+    throw InvalidInputException("sirius_exchange_tcp_lanes must be 0 (automatic) to %u, not %llu",
+                                sirius::exchange::max_tcp_lanes,
+                                lanes);
+  }
+  get_operator_params(context, scope)->exchange_tcp_lanes = static_cast<uint32_t>(lanes);
 }
 
 static void SetExchangeRecvFramesPerPeer(ClientContext& context, SetScope scope, Value& parameter)
@@ -2845,8 +2839,9 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
       level_name);
   }
   Config::LOG_LEVEL = std::move(level_name);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  sirius::log::get_sink()->set_level(*parsed_level);
+  // Only re-targets the current sink and re-mirrors it onto cuCascade's gate; no
+  // rebuild (the duckdb sink ignores the level, and so does the mirror for it).
+  sirius::log::set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
@@ -3026,12 +3021,45 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
 
+static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_exists_minmax_rewrite = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_MINMAX_REWRITE to {}",
+                   params->enable_exists_minmax_rewrite);
+}
+
+static void SetEnableNarrowingExpressionPushdown(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params                                 = get_operator_params(context, scope);
+  params->enable_narrowing_expression_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_NARROWING_EXPRESSION_PUSHDOWN to {}",
+                   params->enable_narrowing_expression_pushdown);
+}
+
+static void SetEnableBuildSideSwap(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                   = get_operator_params(context, scope);
+  params->enable_build_side_swap = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_BUILD_SIDE_SWAP to {}", params->enable_build_side_swap);
+}
+
 static void SetEnableCompleteGroupHaving(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                         = get_operator_params(context, scope);
   params->enable_complete_group_having = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPLETE_GROUP_HAVING to {}",
                    params->enable_complete_group_having);
+}
+
+static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_scan_reuse_rewrites = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SCAN_REUSE_REWRITES to {}",
+                   params->enable_scan_reuse_rewrites);
 }
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
@@ -3223,15 +3251,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
-
-  // Deprecated alias for `expression_evaluator_strategy`; remove in a future release.
-  config.AddExtensionOption(
-    "expression_executor_strategy",
-    "[DEPRECATED - use expression_evaluator_strategy] Strategy for the expression_evaluator: "
-    "'materialize', 'ast_interpret', or 'ast_jit'",
-    LogicalType::VARCHAR,
-    Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
-    SetExpressionExecutorStrategyDeprecated);
 
   add_sirius_option(
     config,
@@ -3518,11 +3537,39 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     SetEnableDenseCountJoin);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_exists_minmax_rewrite",
+                    "runtime override for the correlated EXISTS MIN/MAX rewrite",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_exists_minmax_rewrite),
+                    SetEnableExistsMinmaxRewrite);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_narrowing_expression_pushdown",
+                    "runtime override for computing narrowing expressions below inner joins",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_narrowing_expression_pushdown),
+                    SetEnableNarrowingExpressionPushdown);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_build_side_swap",
+                    "runtime override for building inner joins on their filtered side",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_build_side_swap),
+                    SetEnableBuildSideSwap);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_complete_group_having",
                     "distributed: drop partial groups proven whole that fail the HAVING",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_complete_group_having),
                     SetEnableCompleteGroupHaving);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_scan_reuse_rewrites",
+                    "rewrite plans that read the same rows twice so they read them once",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_scan_reuse_rewrites),
+                    SetEnableScanReuseRewrites);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",
@@ -3626,9 +3673,11 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetExchangeRank);
   config.AddExtensionOption(
     "sirius_exchange_host_staging",
-    "Distributed execution: auto, always or never send the exchange's writes to a peer through "
-    "its pinned host mirror instead of NIXL; auto does so where GPUs lack peer access. Set "
-    "before sirius_exchange_rank, which connects",
+    "Distributed execution: how the exchange's writes reach a peer. auto: over TCP lanes to "
+    "ranks on other hosts, and through a pinned shared-memory mirror to same-host GPUs without "
+    "peer access; always: the mirror for every same-host peer; never: NIXL to every peer; "
+    "remote: TCP lanes to every peer. Same on every rank; set before sirius_exchange_rank, "
+    "which connects",
     LogicalType::VARCHAR,
     Value("auto"),
     SetExchangeHostStaging);
@@ -3644,7 +3693,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "sirius_exchange_frame_bytes",
     "Distributed execution: the exchange's frame size in bytes; one write covers up to half a "
-    "peer's receive frames. Same on every rank; set before sirius_exchange_rank",
+    "peer's receive frames (one frame over TCP lanes). Same on every rank; set before "
+    "sirius_exchange_rank",
     LogicalType::UBIGINT,
     Value::UBIGINT(16ull << 20),
     SetExchangeFrameBytes);
@@ -3656,9 +3706,17 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value::UBIGINT(32),
     SetExchangeSendFrames);
   config.AddExtensionOption(
+    "sirius_exchange_tcp_lanes",
+    "Distributed execution: TCP lanes (connections, each with its own thread) per rank to ranks "
+    "on other hosts; 0 shares 16 among the ranks on this host. Set before sirius_exchange_rank",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(0),
+    SetExchangeTcpLanes);
+  config.AddExtensionOption(
     "sirius_exchange_recv_frames_per_peer",
     "Distributed execution: receive frames (credits) each peer may fill; GPU memory grows with "
-    "it times the peers. Same on every rank; set before sirius_exchange_rank",
+    "it times the peers, and a TCP lane carries one. Same on every rank; set before "
+    "sirius_exchange_rank",
     LogicalType::UBIGINT,
     Value::UBIGINT(16),
     SetExchangeRecvFramesPerPeer);

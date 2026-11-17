@@ -89,7 +89,6 @@ export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'as
 # parity; fused scan-filter engages on the compressed GPU pins.
 export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
 export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 echo "db        : $DB"

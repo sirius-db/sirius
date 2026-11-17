@@ -503,13 +503,16 @@ std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   auto& backend            = target_memory_space->get_io_backend();
 
   spill_file file(*target_memory_space);
-  backend.write(file.path(), header.data(), header.size(), 0);
+  std::vector<cucascade::io_batch_entry> entries;
+  entries.push_back({.ptr = header.data(), .size = header.size(), .file_offset = 0});
   std::size_t written = 0;
   for (std::size_t block = 0; written < payload_bytes; ++block) {
     auto const n = std::min(block_size, payload_bytes - written);
-    backend.write(file.path(), payload.at(block).data(), n, header.size() + written);
+    entries.push_back(
+      {.ptr = payload.at(block).data(), .size = n, .file_offset = header.size() + written});
     written += n;
   }
+  backend.write_host_batch(file.path(), entries);
 
   return std::make_unique<compressed_disk_representation>(
     *const_cast<cucascade::memory::memory_space*>(target_memory_space),

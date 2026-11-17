@@ -505,14 +505,18 @@ TEST_CASE("task_creator creates the boundary task of a distributed SORT_SAMPLE w
                       duckdb::OrderByNullType::NULLS_FIRST,
                       duckdb::make_uniq<duckdb::BoundReferenceExpression>(
                         duckdb::LogicalType::INTEGER, duckdb::idx_t{0}));
+  // A SORT_SAMPLE that takes its boundaries from other processes owes its boundary task.
+  struct one_partition final : sirius::op::cross_rank_sort_boundaries {
+    sirius::op::sort_boundaries make(request const&, ::cuda::stream_ref) override { return {}; }
+  };
   sirius_physical_sort_sample sample(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     std::move(orders),
     /*estimated_cardinality=*/1000,
     /*sort_sample_bytes=*/1 << 20,
     /*max_partition_bytes=*/0);
+  sample.set_cross_rank_boundaries(std::make_shared<one_partition>());
   sample.operator_id = 0;
-  sample.set_distributed({nullptr, 0, nullptr, {}});
 
   // This rank's upstream finished without producing a batch.
   cucascade::shared_data_repository repo;

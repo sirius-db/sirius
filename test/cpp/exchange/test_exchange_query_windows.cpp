@@ -110,6 +110,10 @@ TEST_CASE("sirius_rank_info names this process, one boot id for its life, and wh
   CHECK(boot_id.size() == 32);
   // No unit test connects a real exchange.
   CHECK_FALSE(joined);
+  // So this process, like any that runs alone, cannot be told to exit.
+  auto const refused = conn.Query("CALL sirius_rank_exit()");
+  REQUIRE(refused->HasError());
+  CHECK(refused->GetError().find("has not joined an exchange") != std::string::npos);
   // A gateway reuses a process that never joined; one that has must restart to join again.
   sirius::exchange::note_exchange_joined();
   auto const after = info();

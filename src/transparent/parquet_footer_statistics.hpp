@@ -52,4 +52,11 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths);
 
+namespace detail {
+/// The most sets of scan paths whose merged statistics are kept.
+inline constexpr std::size_t merged_statistics_cache_capacity = 128;
+/// The number of scans whose merged statistics are cached, for tests.
+std::size_t merged_statistics_cache_size();
+}  // namespace detail
+
 }  // namespace sirius::transparent

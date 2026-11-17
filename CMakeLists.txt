@@ -36,16 +36,6 @@ option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
-option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
-
-# The exchange's NIXL fabric (src/exchange/nixl_fabric.cpp) links an out-of-tree
-# NIXL install: SIRIUS_NIXL_PREFIX, else $NIXL_PREFIX, else where
-# scripts/install_nixl.sh installs it. An empty SIRIUS_NIXL_PREFIX is resolved
-# once and cached (cmake/sirius-dependencies.cmake).
-option(SIRIUS_WITH_NIXL "Build the exchange's NIXL fabric" OFF)
-set(SIRIUS_NIXL_PREFIX
-    ""
-    CACHE PATH "NIXL install prefix (empty: $NIXL_PREFIX, else the default)")
 
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")

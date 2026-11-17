@@ -265,9 +265,9 @@ void check_acquisition_failure(site location, bool after_worker, bool monitor_re
 {
   worker_gate gate;
   fixture f;
-  auto failed_batch = f.add_batch(location, location == site::repository ? 2 : 1);
+  auto failed_batch = f.add_batch(location, 1);
   std::shared_ptr<cucascade::data_batch> running_batch;
-  if (after_worker) { running_batch = f.add_batch(location, location == site::repository ? 1 : 2); }
+  if (after_worker) { running_batch = f.add_batch(location, 2); }
   auto const failed_references  = failed_batch.use_count();
   auto const running_references = running_batch.use_count();
   auto error                    = std::make_exception_ptr(acquisition_failure{});

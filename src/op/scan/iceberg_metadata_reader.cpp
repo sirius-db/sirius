@@ -836,7 +836,6 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
   std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
-  std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery)
 {
   return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);

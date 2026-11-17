@@ -7,8 +7,8 @@
 # <gpu> "slurm" keeps the CUDA_VISIBLE_DEVICES the rank inherits. The config file (see
 # sirius_rank_node.conf.example) is sourced and may set every argument, as gpu, quack_port,
 # exchange_port, listen_host, dir; arguments given here win over it. It may also set:
-#   nixl_prefix, ucx_tls, ucx_net_devices  NIXL_PREFIX, UCX_TLS, UCX_NET_DEVICES, unless exported
-#                      (defaults: scripts/nixl_env.sh)
+#   ucx_tls, ucx_net_devices  UCX_TLS, UCX_NET_DEVICES, unless exported
+#                      (defaults: scripts/launcher_env.sh)
 #   priority_networks  CIDRs, e.g. 10.87.140.0/24; this host's first address in them is the listen
 #                      host, and its interface UCX_NET_DEVICES, unless those are set. Default: the
 #                      gateway's networks
@@ -66,11 +66,10 @@ if [ -n "${gateway_conf:-}" ]; then
   reload_gateway_conf
 fi
 
-[ -n "${nixl_prefix:-}" ] && export NIXL_PREFIX=${NIXL_PREFIX:-$nixl_prefix}
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
 # Before priority_networks names an interface: the GPU rail NICs win where the host has them.
-source "$here/nixl_env.sh"
+source "$here/launcher_env.sh"
 priority_networks=${priority_networks:-${networks:-}}
 if [ -n "$priority_networks" ]; then
   source "$here/sirius_net.sh"
@@ -235,11 +234,35 @@ if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
   export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
   mkdir -p "$SIRIUS_LOG_DIR"
 fi
+# SIRIUS_GDS=1 (set it with scan_manager.backend: gds): give the rank a cuFile configuration
+# that cannot fall back to POSIX reads, with its log in the rank's node-local folder.
+if [ "${SIRIUS_GDS:-0}" = 1 ]; then
+  CUFILE_ENV_PATH_JSON=$("$here/gds/cufile_json.sh" "$dir/cufile") || exit 1
+  export CUFILE_ENV_PATH_JSON
+fi
+# SIRIUS_RANK_BIND=gpu keeps the rank's threads on the CPUs of its GPU's socket; it is the default
+# with SIRIUS_GDS=1. Measured on Q6 with one rank: 13.9 s on the GPU's socket, 15.4 s on the other
+# socket or unbound.
+bind=${SIRIUS_RANK_BIND:-$([ "${SIRIUS_GDS:-0}" = 1 ] && echo gpu || echo none)}
+if [ "$bind" = gpu ] && [ -z "${SIRIUS_RANK_WRAPPER:-}" ]; then
+  visible=${CUDA_VISIBLE_DEVICES:-}
+  bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "${visible%%,*}" 2> /dev/null |
+    head -n 1 | tr 'A-F' 'a-f' || true)
+  cpus=$(cat "/sys/bus/pci/devices/${bus#0000}/local_cpulist" 2> /dev/null || true)
+  if [ -n "$cpus" ]; then
+    SIRIUS_RANK_WRAPPER="taskset -c $cpus"
+    echo "rank on GPU $bus bound to CPUs $cpus" >> "$dir/rank.log"
+  else
+    echo "SIRIUS_RANK_BIND=gpu: cannot find the CPUs near GPU '${CUDA_VISIBLE_DEVICES:-}'; not binding" >&2
+  fi
+fi
 trap stop TERM INT
 backoff=1
 first=1
 while :; do
-  "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
+  # SIRIUS_RANK_WRAPPER: a command to start the rank under, for example "taskset -c 0-71".
+  # shellcheck disable=SC2086 # the wrapper is a command line
+  ${SIRIUS_RANK_WRAPPER:-} "$duckdb" -unsigned -init "$dir/init.sql" <> "$dir/stdin" >> "$dir/rank.log" 2>&1 &
   child=$!
   announce "$child" "$first" &
   announcer=$!
@@ -253,6 +276,12 @@ while :; do
   if [ "$rc" -eq 0 ]; then
     backoff=1
     continue
+  fi
+  # 70: the GDS backend gave up on a cuFile read that never returned. A new rank would read from
+  # the same filesystem that just stopped answering, so it stays down.
+  if [ "$rc" -eq 70 ]; then
+    echo "rank exited with 70 (GDS read stalled); not starting it again" >&2
+    exit 70
   fi
   echo "rank exited with $rc; starting it again in ${backoff}s" >&2
   # In the background, so that the TERM trap runs at once, not after the sleep.

@@ -13,29 +13,24 @@ addressable when the far end asks for them, and that is what the pin guarantees.
 ## Turning it on (experimental)
 
 ```bash
-SIRIUS_EXP_LATE_MAT=1                               # the gate; off = nothing below exists
-SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,...   # or `all`
+SIRIUS_EXP_LATE_MAT=1   # the gate; off = nothing below exists
 ```
 
-For the TPC-H SF1000 q10 ride specifically, the column list needs to cover BOTH the group-by-rowid
-key and every rider's key: `c_custkey` (customer, the ride itself) plus `n_name,n_nationkey`
-(nation, riding alongside on the join to customer):
-
-```bash
-SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,n_name,n_nationkey   # needed for q10's full ride
-```
+The group-by-rowid ride and the riders need a key proven distinct over the pinned table. The pin
+proves every integer column, and every column of a small table, automatically (setting
+`pin_table_prove_unique_keys`, on by default;
+see [Proving a column distinct](#proving-a-column-distinct-at-pin-time)), so nothing else has to be
+named: on TPC-H SF1000, q10's ride is admitted through `c_custkey`, and q5's and q9's through
+`nation.n_name`, with no further configuration.
+With `pin_table_prove_unique_keys = false` no column is proven and no ride or rider is admitted.
 
 Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
 every refusal says which refusal it was — a deferral that silently did not happen looks exactly
 like one that did nothing.
 
-The uniqueness probe costs pin-time work, so name the columns a ride actually needs rather than
-using `all`; without a proof there is no group-by-rowid ride and no riders.
-
 | Variable | Default | Effect |
 |---|---|---|
 | `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
-| `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
@@ -141,10 +136,11 @@ ranges leave undecided, by sorting the concatenated chunks and counting runs. Th
 load-bearing rather than a fallback, because chunk ranges usually overlap.
 
 The same facts also serve joins: with `pin_table_prove_unique_keys` (on by default), a pinned
-parquet column proven distinct counts as a unique build key, and the pin observes every integer
-column automatically under a stricter standard (an unsorted chunk is sorted on the spot, so a
-value repeated within a chunk refuses the column at once; a repeat across chunks is caught only by
-the exact stage's final check). That sort is optional: the pin reserves
+parquet column proven distinct counts as a unique build key. The pin observes every integer column
+(and every other column of a table under one million rows, such as `nation.n_name`) of a parquet pin (and of a native table's pin when late materialization is on; a native table's
+join takes its PRIMARY KEY instead). An unsorted chunk is sorted on the spot, so a value repeated
+within a chunk refuses the column at once; a repeat across chunks is caught only by the exact
+stage's final check. That sort is optional: the pin reserves
 GPU memory for it first, and a column whose sort cannot be reserved, or fails, simply gets no proof
 while the pin goes on. See
 [Pin-Proven Unique Join Keys](optimizations.md#pin-proven-unique-join-keys).
@@ -153,10 +149,12 @@ The exact stage is bounded in bytes, across all the columns it retains together,
 `pin_table_unique_exact_max_bytes` (default 10% of the GPU memory space capacity), which replaces
 the former row cap `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS`. Each retained chunk holds a GPU
 reservation. The stage holds the retained chunks, the concatenation of one column and its sorted
-copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap is
-short, earlier columns keep their check and later ones stay UNKNOWN; a copy that fails has the
-same effect, and the pin goes on. Wide columns under `PIN_UNIQUE_COLS=all` are still extra pin-time work, so name
-the columns a ride actually needs.
+copy at once, so its peak is about three times the cap, on top of the pin itself. When the cap,
+the free GPU memory or a reservation is short, integer columns keep their check ahead of the
+others (a non-integer column is a candidate only while its table is small, so it must not crowd
+out an integer key and then be refused itself), then earlier columns ahead of later ones: a copy
+gives up the retained copies of lower priority to make room, and the columns that lose theirs stay
+UNKNOWN. A copy that fails has the same effect, and the pin goes on.
 
 **Absence of a fact means UNKNOWN, never "not unique."** A false positive would collapse
 distinct groups into one — wrong answers, not slow ones. Facts attach to the pinned entry BY

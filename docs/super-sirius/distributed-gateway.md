@@ -26,7 +26,7 @@ For several machines, follow the [distributed quick start](distributed-quickstar
 **One machine.** The gateway can start its ranks itself, rank i on GPU i:
 
 ```bash
-pixi run build-distributed     # Sirius with NIXL, and the gateway
+pixi run build-distributed     # Sirius and the gateway
 pixi run sirius-gateway 4      # 4 ranks on this machine; serves clients on port 9494
 pixi run sirius-client         # in another shell
 ```
@@ -63,9 +63,10 @@ listens on the address of the default route's interface with no ranks of its own
 127.0.0.1 with spawned ranks. On an address other than loopback it serves TLS with a key pair
 kept in `~/.sirius/gateways/<cluster>/tls`. A registered rank listens on its node's first
 address in its `priority_networks`, by default the gateway's subnet from `gateway.conf`, and
-`UCX_NET_DEVICES` defaults to that address's interface. `scripts/nixl_env.sh` defaults
+`UCX_NET_DEVICES` defaults to that address's interface. `scripts/launcher_env.sh` defaults
 `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: left to itself, UCX picks InfiniBand ports that GB200
-hosts cannot connect through.
+hosts cannot connect through. On a host with GPU rail NICs it defaults to those NICs with
+`UCX_TLS=all` instead, which the exchange over the NVLink fabric needs for its notifications.
 
 ## How a statement runs
 
@@ -104,7 +105,7 @@ rank.
 | `sirius_gateway_status()`, `sirius_gateway_log()` | The gateway |
 | `SET` of a setting the gateway sets on each rank (`sirius_distributed_query_id`, `sirius_exchange_*`, `enable_duckdb_fallback`, `gpu_execution`) | Refused |
 | `sirius_gateway_add_rank`, `sirius_gateway_drop_rank`, with `sirius_gateway_allow_join` on (`sirius_gateway.sh` with 0 ranks sets it) | The gateway: a node registers its rank. A client's token already runs any SQL on every rank |
-| Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls at a statement's top level (`CALL f()`, `FROM f()`, `SELECT f()`), and `SET` of such settings | Refused: gateway console only. Calls nested deeper are not checked |
+| Other `sirius_gateway_*`, `quack_*`, `sirius_rank_*` calls anywhere in a statement, and `SET` of such settings | Refused: gateway console only. A `CALL` or `SELECT` is searched as a tree, subqueries and CTEs included. Any other statement (`CREATE TABLE AS`, `INSERT`, `COPY`, a view, a macro) is searched by name: such a name before an opening parenthesis is refused, a table's or a column's too |
 | `PREPARE`, `EXECUTE` | Refused: a prepared plan keeps the query number it was planned with |
 
 ## Ranks
@@ -149,6 +150,8 @@ is. One that has joined is sent `sirius_gateway_rank_exit_sql` (by default
 `CALL sirius_rank_exit()`), and the gateway waits up to 10 minutes for the launcher to start a
 new one. An empty `sirius_gateway_rank_joined_sql` counts every process as joined. So a rank's
 first join uses the process that registered, and each later join restarts it.
+`sirius_rank_exit` is refused in a process that has not joined, so it cannot end a Sirius that
+runs alone.
 `sirius_rank_exit` replies, shuts the exchange down (freeing its port and shared-memory mirrors)
 and exits with code 0; a watchdog ends it with code 1 if that hangs.
 
@@ -214,11 +217,13 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
-| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
+| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings, so it cannot change them |
+| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
+| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
 | `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
 | `sirius_gateway_exchange_frame_bytes` | 16777216 | `sirius_exchange_frame_bytes` for every rank |
 | `sirius_gateway_exchange_send_frames` | 32 | `sirius_exchange_send_frames` for every rank |
-| `sirius_gateway_exchange_recv_frames_per_peer` | 16 | `sirius_exchange_recv_frames_per_peer` for every rank |
+| `sirius_gateway_exchange_recv_frames_per_peer` | 16 | `sirius_exchange_recv_frames_per_peer` for every rank; over TCP lanes, one frame in flight per lane |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |
@@ -238,8 +243,11 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 - **Shared rank sessions:** a client's `SET` reaches every client's statements, and is logged and
   replayed. `CREATE TABLE` and `INSERT` give one copy of the rows per rank. `now()` and `random()`
   evaluate on each rank. A `ROLLBACK` does not undo what ran on the ranks.
-- **The router is a deny-list** over top-level statements: a gateway function nested in a subquery
-  reaches the ranks.
+- **A statement that calls a gateway function** runs in the client's gateway session, so it may
+  read nothing else there: a table, a file or another table function in it is refused.
+- **SQL in a string** is not routed: `query('FROM sirius_rank_exit()')` runs its text on every
+  rank. The refusal of console-only calls guards against mistakes, not against a client, whose
+  token already runs any SQL on every rank.
 - **State across gateway restarts:** with `sirius_gateway_state_dir` set (`sirius_gateway.sh`
   sets it), the DDL log is also written to `<state_dir>/ddl.sql`, mode 600, after each statement
   that adds to it. If that write fails, the statement still succeeds, and the status `error`

@@ -29,8 +29,11 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <format>
+#include <numeric>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -90,17 +93,18 @@ void downgrade_executor::start()
 
   _request_queue.reactivate();
 
-  sirius::exec::invocable<void() noexcept> per_thread_init = nullptr;
+  sirius::exec::invocable<void()> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept {
+    per_thread_init = [device_id]() {
       // Pin each worker to its GPU; silent failure leaks downgrade memcpys
-      // across contexts. Lambda is noexcept, so check inline.
+      // across contexts.
       cudaError_t err = cudaSetDevice(device_id);
       if (err != cudaSuccess) {
-        SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
-                         device_id,
-                         cudaGetErrorString(err));
+        throw std::runtime_error(
+          std::format("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                      device_id,
+                      cudaGetErrorString(err)));
       }
     };
   }
@@ -122,16 +126,16 @@ void downgrade_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
 
-  _pool->interrupt();
+  if (_pool) { _pool->interrupt(); }
   _request_queue.interrupt();
   _monitor_cv.notify_one();
 
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
   if (_processing_thread.joinable()) { _processing_thread.join(); }
 
-  _pool->wait_all();
+  if (_pool) { _pool->wait_all(); }
   cancel_pending_requests();
-  _pool->stop();
+  if (_pool) { _pool->stop(); }
   _pool.reset();
   _stream_pool.reset();
 }
@@ -229,11 +233,9 @@ void downgrade_executor::processing_loop()
       // Resolve the source memory space for filtering candidates
       source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
-      // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK
-      // tier. NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on
-      // the post-#637 architecture): if preferred_numa_node is set, stable_partition the matching
-      // HOST space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space
-      // first.
+      // Build the target list: a GPU-source executor spills to the HOST spaces, then DISK; a
+      // HOST-source executor spills to DISK only. When preferred_numa_node is set, the matching
+      // HOST space(s) are moved to the front so cand->convert() tries the NUMA-local space first.
       if (_space_id.tier == cucascade::memory::Tier::GPU) {
         auto host_span =
           _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -263,10 +265,14 @@ void downgrade_executor::processing_loop()
 
       // === TIER 1: Data repositories ===
       // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
-      // query: outer loop DESCENDING by query id (newest query first), inner loop in
-      // get_repositories() order — ascending {operator_id, port_id} — with early stop once the
+      // query: outer loop DESCENDING by query id (newest query first), inner loop in REVERSE
+      // get_repositories() order — descending {operator_id, port_id} — with early stop once the
       // reservation is satisfied. Operator ids restart at 0 per query, so ordering is
       // (query id, operator id) rather than a single global counter.
+      //
+      // A repository is keyed by its CONSUMER's operator id, and ids follow the topological
+      // pipeline order, so descending order offers the data that is read last first and keeps
+      // the input of the operator about to run resident.
       //
       // Newest-first is the fairness policy: query ids are monotonic, so the newest query is the
       // one that has made the least progress, and spilling it costs the least re-materialization
@@ -287,7 +293,7 @@ void downgrade_executor::processing_loop()
         if (!borrow) { continue; }
         if (req->satisfied.load() || pool_interrupted || target_completed()) break;
         auto repos = manager->get_repositories();
-        for (auto* repo : repos) {
+        for (auto* repo : std::views::reverse(repos)) {
           if (req->satisfied.load() || target_completed()) break;
 
           convertible_data_batch_provider provider(repo);
@@ -296,12 +302,15 @@ void downgrade_executor::processing_loop()
 
           // Snapshot candidate sizes so target-carrying requests can right-size their final pick
           // (spill_policy.hpp) instead of taking the next whole batch in policy order. Requests
-          // without a target keep plain policy-order iteration.
+          // without a target keep plain policy-order iteration. A size of 0 means the batch was
+          // taken exclusively (or moved) since the snapshot; a non-blocking convert would skip
+          // it, so it is dropped here rather than spent as a dispatch.
           std::vector<std::size_t> candidate_sizes(candidates.size());
-          for (std::size_t i = 0; i < candidates.size(); ++i) {
-            candidate_sizes[i] = candidates[i]->bytes_in_space(source_space);
-          }
           std::vector<bool> already_dispatched(candidates.size(), false);
+          for (std::size_t i = 0; i < candidates.size(); ++i) {
+            candidate_sizes[i]    = candidates[i]->bytes_in_space(source_space);
+            already_dispatched[i] = candidate_sizes[i] == 0;
+          }
 
           for (std::size_t n = 0; n < candidates.size(); ++n) {
             if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
@@ -443,10 +452,21 @@ void downgrade_executor::processing_loop()
                   cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
-                  req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  // A task may move only some of its source-space batches (the target filled up,
+                  // a batch was locked); credit what left the source space, not the task total.
+                  auto const moved_bytes =
+                    std::accumulate(result->begin(), result->end(), std::size_t{0});
+                  if (moved_bytes >= candidate_bytes) {
+                    planned_bytes.fetch_add(moved_bytes - candidate_bytes,
+                                            std::memory_order_relaxed);
+                  } else {
+                    planned_bytes.fetch_sub(candidate_bytes - moved_bytes,
+                                            std::memory_order_relaxed);
+                  }
+                  req_ptr->bytes_freed.fetch_add(moved_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                  pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  pipeline_queue_stats.bytes.fetch_add(moved_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {

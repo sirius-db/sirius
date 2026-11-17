@@ -2,12 +2,11 @@
 # Runs the exchange's one-rank-per-process NIXL test: N ranks on this host, rank i on GPU i, or on
 # the i-th GPU of GPUS (e.g. GPUS=0,2). TEST picks the Catch2 tag (default [nixl_multiprocess]).
 #   scripts/distributed_test_nixl.sh [ranks=2] [base port=27000]
-# Needs a build configured with -DSIRIUS_WITH_NIXL=ON; sources scripts/nixl_env.sh.
 set -euo pipefail
 ranks=${1:-2}
 port=${2:-27000}
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/nixl_env.sh"
+source "$here/launcher_env.sh"
 test_bin="$here/../build/release/test/cpp/sirius_unittest"
 
 peers=""

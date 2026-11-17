@@ -34,12 +34,10 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <iterator>
 #include <memory>
 #include <span>
@@ -56,7 +54,6 @@ using sirius::test::s3::env_or;
 using sirius::test::s3::require_env;
 using sirius::test::s3::require_rest_ioctx;
 using sirius::test::s3::single_gpu_index;
-using namespace std::chrono_literals;
 
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
@@ -224,9 +221,7 @@ TEST_CASE("rest datasource fans out host_read_ranges_async against the SeaweedFS
     total += size;
   }
 
-  auto future = datasource->host_read_ranges_async(segments);
-  REQUIRE(future.wait_for(5s) == std::future_status::ready);
-  REQUIRE(future.get() == total);
+  REQUIRE(datasource->host_read_ranges_async(segments).get() == total);
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     auto const [offset, size] = ranges[i];
     require_bytes_equal(buffers[i], std::span<std::uint8_t const>(medium.data() + offset, size));
@@ -297,9 +292,7 @@ TEST_CASE("rest datasource stages device reads through host memory for SeaweedFS
     std::array<cucascade::io::slice, 2> const slices{
       cucascade::io::slice{first_offset, first_size, static_cast<std::uint8_t*>(first.data())},
       cucascade::io::slice{second_offset, second_size, static_cast<std::uint8_t*>(second.data())}};
-    auto future = datasource->device_read_ranges_async(slices, stream);
-    REQUIRE(future.wait_for(10s) == std::future_status::ready);
-    REQUIRE(future.get() == first_size + second_size);
+    REQUIRE(datasource->device_read_ranges_async(slices, stream).get() == first_size + second_size);
     require_bytes_equal(copy_device_to_host(first, first_size, stream),
                         std::span<std::uint8_t const>(medium.data() + first_offset, first_size));
     require_bytes_equal(copy_device_to_host(second, second_size, stream),

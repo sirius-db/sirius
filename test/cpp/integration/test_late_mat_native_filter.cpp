@@ -107,9 +107,8 @@ TEST_CASE_METHOD(NativeFilterFixture,
   // c_custkey rides real as the join and group key, so proving it distinct over the
   // pin is what moves the port past the aggregate. Without it both arms decline for
   // an unrelated reason — the join's fan-out is still uncollapsed at the port — and
-  // the control below could not tell a working plan from a rejected one. Read at pin
-  // time, so it must be set before the pin.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+  // the control below could not tell a working plan from a rejected one. The pin
+  // proves it, because late materialization is on.
   run_ok("CALL pin_table(format='duckdb', name='c', tier='gpu');");
 
   // Control. Without it a decline proves nothing: a query that never had a
@@ -132,6 +131,5 @@ TEST_CASE_METHOD(NativeFilterFixture,
   REQUIRE(rows_of(*gpu_filtered) == expected_filtered);
   REQUIRE(sirius::late_mat::deferrals_installed() == before_filtered);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   run_ok("CALL unpin_table('c');");
 }

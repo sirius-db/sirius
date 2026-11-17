@@ -343,8 +343,7 @@ void run_deferred_query(deferred_query_case const& c)
 
   // c_custkey rides REAL — it is the join key and a group key — so proving it
   // distinct over the pin is what admits the ride past the aggregates. The
-  // probe reads this per pin, so setting it here is enough.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+  // pin proves it, because late materialization is on.
 
   // The plan register is process-wide and keyed by pin name, so the compressed
   // pin gets a name of its own.
@@ -416,7 +415,6 @@ void run_deferred_query(deferred_query_case const& c)
     }
   }
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   auto unpin = con.Query("CALL unpin_table(" + sirius::test::sql_literal(pin_name) + ");");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());
@@ -569,7 +567,6 @@ TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
   REQUIRE(fb);
   REQUIRE_FALSE(fb->HasError());
 
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey,n_name,n_nationkey", 1);
   for (auto const& [path, name] : {std::pair{files.customer, "late_mat_rider_customer"},
                                    std::pair{files.nation, "late_mat_rider_nation"}}) {
     auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(path.string()) +
@@ -590,7 +587,6 @@ TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
   // a rider. If nation claimed the port first, customer's bundle could not install at all.
   CHECK(sirius::late_mat::deferrals_installed() >= before + 2);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   for (auto const* name : {"late_mat_rider_customer", "late_mat_rider_nation"}) {
     auto unpin = con.Query(std::string("CALL unpin_table('") + name + "');");
     REQUIRE(unpin);
@@ -696,7 +692,6 @@ TEST_CASE("a compressed pin under filtered decode and late materialization answe
   run_ok("SET pin_table_compression_max_compressed_fraction = 1000;");
   run_ok("SET pin_table_input_compression_plan_dir = " + sirius::test::sql_literal(tmp.string()) +
          ";");
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
   run_ok("CALL pin_table(" + sirius::test::sql_literal(customer.string()) +
          ", tier='gpu', name='late_mat_compressed_customer');");
   auto const census = sirius::test::census_entry(con, "late_mat_compressed_customer");
@@ -715,7 +710,6 @@ TEST_CASE("a compressed pin under filtered decode and late materialization answe
   // sirius_gpu_scan_operator::decode_consumer() withholding those probes.
   REQUIRE(sirius::late_mat::deferrals_installed() == before);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   run_ok("CALL unpin_table('late_mat_compressed_customer');");
   run_ok("SET pin_table_compression = false;");
 }

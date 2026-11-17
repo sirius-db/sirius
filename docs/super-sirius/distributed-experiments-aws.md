@@ -14,9 +14,10 @@ GPU as on eight, so the numbers compare.
 
 **Tested:** `g7e.24xlarge` only (4 x RTX PRO 6000 Blackwell 96 GB, 96 vCPUs, 999 GiB RAM,
 2 x 3.5 TB instance-store NVMe, x86_64, driver 595.91.07), TPC-H SF3000 with 1, 2 and 4 ranks,
-at commit `e11487d2`. That commit started the gateway and the ranks by hand. The launch script
-and `scripts/compare_answers.py` are newer: steps 5 to 7 were run as written here on a GB200
-machine at SF100, not on an instance. Other `g7e` sizes were not run: check step 1 on yours.
+at commit `e11487d2` of `experimental/distributed-sirius`, a later state of this code. That
+commit started the gateway and the ranks by hand. The launch script and
+`scripts/compare_answers.py` are newer: steps 5 to 7 were run as written here on a GB200 machine
+at SF100, not on an instance. Other `g7e` sizes were not run: check step 1 on yours.
 
 **Also tested:** two `g6.4xlarge` (each 1 x L4 23 GB, 16 vCPUs, 64 GiB RAM, 549 GB of
 instance-store NVMe, no EFA) as one cluster over TCP, one rank per machine, at commit
@@ -91,7 +92,7 @@ driver, or no instance-store NVMe ("Amazon EC2 NVMe Instance Storage" in `lsblk`
 
 On `g7e.24xlarge` the GPUs are two PCIe pairs (0-1 and 2-3). Peer-to-peer copies work inside a
 pair only; data between pairs is staged through host memory. No `g7e` size has NVLink, so skip
-the fabric check and the NIXL pairs test of the other documents.
+the fabric check in step 3 of the other document.
 
 ## 2. Storage
 
@@ -275,19 +276,18 @@ A time without a checked answer is not a result. Run the checks of
 [step 6](distributed-experiments-no-slurm.md#6-check-the-result) of the other document, with two
 differences.
 
-**The exchange path.** There is no NVLink to count. This prints how many rank pairs use each
-path:
+**The exchange path.** Each rank logs a line per peer. The ranks share one log,
+`$CHECKOUT/log/sirius_<date>.log`, which appends, so the last `ranks x (ranks - 1)` such lines
+are this run's. This prints how many rank pairs use each path:
 
 ```bash
-grep -h "exchange: rank .* -> rank" "$OUT"/rank-logs/*/sirius_*.log | sed 's/.*): //' | sort | uniq -c
+grep -ah "exchange: rank .* -> rank" "$CHECKOUT"/log/sirius_*.log | tail -n $((ranks * (ranks - 1))) |
+  sed 's/.*): //' | sort | uniq -c
 ```
 
-Each rank's log has a line per peer, and a warning that is expected without NVLink:
-
 ```text
-exchange: rank 0 has no fabric memory (cuMemCreate: CUDA_ERROR_NOT_PERMITTED (is an IMEX channel open?)); ...
-exchange: rank 0 (GPU 0000:52:00.0) -> rank 1 (GPU 0000:53:00.0, NVLink domain none): NIXL
-exchange: rank 0 (GPU 0000:52:00.0) -> rank 2 (GPU 0000:63:00.0, NVLink domain none): host-staged through pinned shared memory
+exchange: rank 0 (GPU 0000:52:00.0) -> rank 1 (GPU 0000:53:00.0): NIXL
+exchange: rank 0 (GPU 0000:52:00.0) -> rank 2 (GPU 0000:63:00.0): host-staged through pinned shared memory
 ```
 
 `NIXL` is a peer-to-peer pair (UCX `cuda_ipc`); `host-staged through pinned shared memory` is a
@@ -595,4 +595,4 @@ document. On an instance, also:
 The instance type and what step 1 found; the commit and build time; the config and every change
 to it; the dataset path, whether it was found or generated, and its lineitem layout; the storage
 read ceiling and cache mode; cold and warm seconds per query and in total; how each answer was
-checked; the exchange paths the rank logs report; what failed or was not run.
+checked; the exchange paths the log reports; what failed or was not run.

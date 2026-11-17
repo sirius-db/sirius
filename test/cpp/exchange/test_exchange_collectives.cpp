@@ -25,6 +25,8 @@
 #include "exchange/loopback_fabric.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/distributed/bloom_all_gather_merge.hpp"
+#include "op/distributed/sample_all_gather_boundaries.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -32,6 +34,7 @@
 #include "op/sirius_physical_exchange_source.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "operator/partitioned_join_test_utils.hpp"
+#include "planner/distributed_plan.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/null_mask.hpp>
@@ -45,6 +48,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -171,9 +175,18 @@ duckdb::vector<sirius::logical_type> key_types()
   return sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT});
 }
 
-/// SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that a
-/// rank keeps several.
-std::unique_ptr<sirius_physical_sort_sample> make_sample(
+/// What a SORT_SAMPLE's sample_all_gather_boundaries is built from, besides the sort order.
+struct distributed_sampling {
+  std::shared_ptr<exchange_service> service;
+  sirius::exchange::stream_id stream{0};
+  cucascade::memory::memory_space* gpu{nullptr};
+  std::function<void(std::shared_ptr<cudf::table const>)> set_exchange_boundaries;
+  std::chrono::milliseconds timeout = sirius::op::sample_all_gather_boundaries::default_timeout;
+};
+
+/// A SORT_SAMPLE on column 0, ascending unless told otherwise, with partitions small enough that
+/// a rank keeps several.
+std::unique_ptr<sirius_physical_sort_sample> make_local_sample(
   duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
   duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
 {
@@ -187,6 +200,31 @@ std::unique_ptr<sirius_physical_sort_sample> make_sample(
                                                        /*estimated_cardinality=*/60'000,
                                                        /*sort_sample_bytes=*/1 << 20,
                                                        /*max_partition_bytes=*/64 * KiB);
+}
+
+/// make_local_sample(), taking its boundaries from every rank's sample.
+std::unique_ptr<sirius_physical_sort_sample> make_sample(
+  distributed_sampling sampling,
+  duckdb::OrderType order       = duckdb::OrderType::ASCENDING,
+  duckdb::OrderByNullType nulls = duckdb::OrderByNullType::NULLS_FIRST)
+{
+  auto sample = make_local_sample(order, nulls);
+  sample->set_cross_rank_boundaries(std::make_shared<sirius::op::sample_all_gather_boundaries>(
+    std::move(sampling.service),
+    sampling.stream,
+    *sampling.gpu,
+    std::vector<cudf::order>{sirius::op::to_cudf_order(order)},
+    std::vector<cudf::null_order>{sirius::op::to_cudf_null_order(order, nulls)},
+    std::move(sampling.set_exchange_boundaries),
+    sampling.timeout));
+  return sample;
+}
+
+/// The hook make_sample() set on @p sample.
+sirius::op::sample_all_gather_boundaries const& gathering(sirius_physical_sort_sample const& sample)
+{
+  return dynamic_cast<sirius::op::sample_all_gather_boundaries const&>(
+    *sample.cross_rank_boundaries());
 }
 
 using sirius::op::dynamic_filter_publish_plan;
@@ -203,15 +241,28 @@ dynamic_filter_publish_plan filter_plan(
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = cap}};
 }
 
-/// The merge of every rank's filters, the same on every rank.
-dynamic_filter_publish_plan::distributed_merge merge_over(std::shared_ptr<exchange_service> service,
-                                                          std::size_t bloom_keys)
+/// The merge of every rank's filters for @p plan's keys, the same on every rank.
+std::shared_ptr<sirius::op::bloom_all_gather_merge> merge_over(
+  std::shared_ptr<exchange_service> service,
+  dynamic_filter_publish_plan const& plan,
+  std::chrono::milliseconds timeout = std::chrono::seconds{30})
 {
-  return {.service      = std::move(service),
-          .first_stream = 41,
-          .gpu          = env().gpu,
-          .bloom_keys   = bloom_keys,
-          .timeout      = std::chrono::seconds{30}};
+  return std::make_shared<sirius::op::bloom_all_gather_merge>(
+    std::move(service), 41, plan.admitted_keys().size(), *env().gpu, timeout);
+}
+
+/// Merges @p plan's filters across ranks. Each rank sizes its Bloom from its rows times the
+/// ranks, at least @p min_keys and at most @p max_keys.
+void merge_across_ranks(dynamic_filter_publish_plan& plan,
+                        std::shared_ptr<exchange_service> service,
+                        std::size_t min_keys,
+                        std::size_t max_keys              = std::size_t{1} << 30,
+                        std::chrono::milliseconds timeout = std::chrono::seconds{30})
+{
+  auto const ranks = service->world_size();
+  auto merge       = merge_over(std::move(service), plan, timeout);
+  plan.set_cross_rank_merge(
+    std::move(merge), sirius::op::merged_bloom_policy(plan.policy(), ranks, min_keys, max_keys));
 }
 
 /// The Bloom published to @p channel, or null.
@@ -233,11 +284,12 @@ struct accumulating_join {
   std::unique_ptr<sirius::op::dynamic_filter_publication_session> session;
 
   accumulating_join(std::shared_ptr<exchange_service> service,
-                    std::size_t bloom_keys,
-                    std::uint64_t cap)
+                    std::size_t min_keys,
+                    std::uint64_t cap,
+                    std::size_t max_keys = std::size_t{1} << 30)
   {
     auto plan = filter_plan(channel, cap);
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    merge_across_ranks(plan, std::move(service), min_keys, max_keys);
     session =
       std::make_unique<sirius::op::dynamic_filter_publication_session>(std::move(plan), &stats);
   }
@@ -279,11 +331,11 @@ struct whole_build_join {
   dynamic_filter_publish_plan plan;
 
   explicit whole_build_join(std::shared_ptr<exchange_service> service,
-                            std::size_t bloom_keys = 4096,
-                            std::uint64_t cap      = 64 * KiB)
+                            std::size_t min_keys = 4096,
+                            std::uint64_t cap    = 64 * KiB)
     : plan(filter_plan(channel, cap))
   {
-    plan.set_distributed(merge_over(std::move(service), bloom_keys));
+    merge_across_ranks(plan, std::move(service), min_keys);
   }
 
   sirius::op::dynamic_filter_publication_outcome publish(cudf::table_view build)
@@ -419,9 +471,10 @@ TEST_CASE("a rank whose accumulation ends without a filter does not hold up the 
   CHECK(joins[1]->bloom() == nullptr);
 }
 
-TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
+TEST_CASE("ranks whose Blooms differ in size by a power of two fold them onto the smallest",
           "[exchange][collectives][dynamic_filter]")
 {
+  // Floors of 4096 and 8192 keys: 8 KiB and 16 KiB.
   ranks c(2);
   std::vector<std::unique_ptr<accumulating_join>> joins;
   for (rank_t r = 0; r < 2; ++r) {
@@ -429,8 +482,57 @@ TEST_CASE("ranks whose Blooms differ in size publish nothing for that key",
       c.all[r].service, std::size_t{4096} << r, std::uint64_t{64} << 20));
   }
   on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 2000)}); });
-  CHECK(joins[0]->bloom() == nullptr);
-  CHECK(joins[1]->bloom() == nullptr);
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 8 * KiB);
+    CHECK(members(*bloom, sequence(0, 1, 4000)) == 4000);
+  }
+}
+
+TEST_CASE("each rank sizes its merged Bloom from its own build rows, not the plan",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // Rank 0 has 2000 rows (4000 keys over 2 ranks: 256 blocks, 8 KiB), rank 1 has 6000 (12000
+  // keys: 1024 blocks, 32 KiB). They fold to 8 KiB and keep every key.
+  ranks c(2);
+  std::vector<std::unique_ptr<accumulating_join>> joins;
+  for (rank_t r = 0; r < 2; ++r) {
+    joins.push_back(
+      std::make_unique<accumulating_join>(c.all[r].service, 1024, std::uint64_t{64} << 20));
+  }
+  on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, r == 0 ? 2000 : 6000)}); });
+  std::vector<std::int64_t> all_keys = sequence(0, 2, 2000);
+  auto const odd                     = sequence(1, 2, 6000);
+  all_keys.insert(all_keys.end(), odd.begin(), odd.end());
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const* bloom = joins[r]->bloom();
+    REQUIRE(bloom != nullptr);
+    CHECK(bloom->storage_bytes() == 8 * KiB);
+    CHECK(members(*bloom, all_keys) == all_keys.size());
+  }
+}
+
+TEST_CASE("ranks with equal rows size alike, and the cap bounds the size",
+          "[exchange][collectives][dynamic_filter]")
+{
+  // 20000 rows each over 2 ranks: 40000 keys, 2500 blocks, rounded up to 4096 (128 KiB); with a
+  // cap of 16384 keys, 1024 blocks (32 KiB).
+  for (std::size_t max_keys : {std::size_t{1} << 30, std::size_t{16384}}) {
+    ranks c(2);
+    std::vector<std::unique_ptr<accumulating_join>> joins;
+    for (rank_t r = 0; r < 2; ++r) {
+      joins.push_back(std::make_unique<accumulating_join>(
+        c.all[r].service, 1024, std::uint64_t{64} << 20, max_keys));
+    }
+    on_every_rank(2, [&](rank_t r) { joins[r]->build({keys_batch(r, 2, 20000)}); });
+    for (rank_t r = 0; r < 2; ++r) {
+      auto const* bloom = joins[r]->bloom();
+      REQUIRE(bloom != nullptr);
+      CHECK(bloom->storage_bytes() == (max_keys == 16384 ? 32 : 128) * KiB);
+      CHECK(members(*bloom, sequence(0, 1, 40000)) == 40000);
+    }
+  }
 }
 
 TEST_CASE("whole-build ranks merge even when one build is empty and another's targets are drained",
@@ -470,7 +572,8 @@ TEST_CASE("finalizing an empty build CONCAT takes the rank's part in the filter 
   auto rank1         = sirius::test::operator_utils::make_partitioned_join(
     {.side_types  = {duckdb::LogicalType::BIGINT},
              .filter_plan = filter_plan(rank1_channel, 64 * KiB)});
-  rank1.join->set_distributed_dynamic_filters(merge_over(c.all[1].service, 4096));
+  sirius::planner::install_filter_merge(
+    *rank1.join, merge_over(c.all[1].service, rank1.join->dynamic_filter_plan()), 2);
   auto& build_concat = *rank1.join->children[1];
   REQUIRE(build_concat.type == sirius::op::SiriusPhysicalOperatorType::CONCAT);
 
@@ -506,9 +609,7 @@ TEST_CASE("a rank missing from one key's merge costs the others one timeout, not
       {{0, 0, int64}, {1, 1, int64}}}},
     {sirius::op::dynamic_filter_replica_space{*env().gpu, *env().host}},
     {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 64 * KiB}};
-  auto merge    = merge_over(c.all[0].service, 4096);
-  merge.timeout = std::chrono::seconds{1};
-  plan.set_distributed(std::move(merge));
+  merge_across_ranks(plan, c.all[0].service, 4096, std::size_t{1} << 30, std::chrono::seconds{1});
   std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
   producers.push_back(channel->register_producer({0, 1}));
   channel->freeze_registration();
@@ -544,6 +645,48 @@ TEST_CASE("an aborted query wakes an all-gather waiting on its peer", "[exchange
                     Catch::Matchers::ContainsSubstring("injected failure"));
   peer.join();
   CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+}
+
+TEST_CASE("an aborted query wakes a SORT_SAMPLE waiting on its peer's sample",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  auto const stream = sirius::exchange::make_stream_id(9, 1);
+  auto sample       = make_sample({c.all[0].service,
+                                   stream,
+                                   env().gpu,
+                                   [](std::shared_ptr<cudf::table const>) {},
+                                   std::chrono::minutes{2}});
+  // Rank 1 never samples: its query fails instead, as a cancelled or failed statement's does.
+  std::thread peer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    c.all[1].service->abort(sirius::exchange::query_of(stream), "injected failure");
+  });
+  std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  pipelineable_operator_data data{input};
+  auto const start = std::chrono::steady_clock::now();
+  CHECK_THROWS_WITH(sample->execute(data, utils::default_stream()),
+                    Catch::Matchers::ContainsSubstring("injected failure"));
+  peer.join();
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+  CHECK_FALSE(sample->boundaries_computed());
+}
+
+TEST_CASE("a SORT_SAMPLE gives up on a rank that sends no sample within its wait time",
+          "[exchange][collectives]")
+{
+  ranks c(2);
+  auto sample = make_sample({c.all[0].service,
+                             sirius::exchange::make_stream_id(10, 1),
+                             env().gpu,
+                             [](std::shared_ptr<cudf::table const>) {},
+                             std::chrono::milliseconds{200}});
+  std::vector<std::shared_ptr<cucascade::data_batch>> const input{keys_batch(0, 1, 20'000)};
+  pipelineable_operator_data data{input};
+  auto const start = std::chrono::steady_clock::now();
+  CHECK_THROWS_AS(sample->execute(data, utils::default_stream()), sirius::internal_exception);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{30});
+  CHECK_FALSE(sample->boundaries_computed());
 }
 
 TEST_CASE("an all-gather that times out leaves its stream free to attach again",
@@ -655,11 +798,10 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   std::vector<std::unique_ptr<sirius_physical_sort_sample>> samples;
   std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
   for (rank_t r = 0; r < world; ++r) {
-    samples.push_back(make_sample());
-    samples[r]->set_distributed(
+    samples.push_back(make_sample(
       {c.all[r].service, 21, env().gpu, [&boundaries, r](std::shared_ptr<cudf::table const> b) {
          boundaries[r] = std::move(b);
-       }});
+       }}));
   }
   // Skewed inputs: rank 0 holds low keys, rank 1 spread ones, rank 2 none at all.
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
@@ -673,6 +815,8 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   for (rank_t r = 0; r < world; ++r) {
     REQUIRE(samples[r]->boundaries_computed());
     REQUIRE(boundaries[r] != nullptr);
+    // The gathered samples are gone, with the plan still alive; the boundaries are not.
+    CHECK_FALSE(gathering(*samples[r]).holds_gathered_samples());
     CHECK(keys_of(*boundaries[r]) == keys_of(*boundaries[0]));
   }
   auto const eb = keys_of(*boundaries[0]);
@@ -701,18 +845,17 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
   std::vector<std::shared_ptr<cudf::table const>> boundaries(world);
   bool failed_once = false;
   for (rank_t r = 0; r < world; ++r) {
-    samples.push_back(make_sample());
-    samples[r]->set_distributed(
-      {c.all[r].service,
-       22,
-       env().gpu,
-       [&boundaries, &failed_once, r](std::shared_ptr<cudf::table const> b) {
-         // Runs after the all-gather has returned.
-         if (r == 0 && !std::exchange(failed_once, true)) {
-           throw rmm::out_of_memory("injected after the all-gather");
-         }
-         boundaries[r] = std::move(b);
-       }});
+    samples.push_back(
+      make_sample({c.all[r].service,
+                   22,
+                   env().gpu,
+                   [&boundaries, &failed_once, r](std::shared_ptr<cudf::table const> b) {
+                     // Runs after the all-gather has returned.
+                     if (r == 0 && !std::exchange(failed_once, true)) {
+                       throw rmm::out_of_memory("injected after the all-gather");
+                     }
+                     boundaries[r] = std::move(b);
+                   }}));
   }
   std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> inputs(world);
   inputs[0]        = {keys_batch(0, 1, 20'000)};
@@ -723,6 +866,8 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
     if (r == 0) {
       CHECK_THROWS_AS(samples[r]->execute(data, utils::default_stream()), rmm::out_of_memory);
       CHECK_FALSE(samples[r]->boundaries_computed());
+      // Kept for the retry.
+      CHECK(gathering(*samples[r]).holds_gathered_samples());
     }
     static_cast<void>(samples[r]->execute(data, utils::default_stream()));
   });
@@ -730,6 +875,7 @@ TEST_CASE("an OOM after the boundary all-gather retries without gathering again"
   for (rank_t r = 0; r < world; ++r) {
     REQUIRE(samples[r]->boundaries_computed());
     REQUIRE(boundaries[r] != nullptr);
+    CHECK_FALSE(gathering(*samples[r]).holds_gathered_samples());
   }
   CHECK(keys_of(*boundaries[0]) == keys_of(*boundaries[1]));
 }
@@ -768,11 +914,9 @@ TEST_CASE("a DESC NULLS LAST range exchange keeps rank order and puts NULLs on t
 
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 33, spec);
-    auto sample = make_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
-    sample->set_distributed(
-      {c.all[r].service, 34, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-         sink.set_range_boundaries(std::move(b));
-       }});
+    auto sample =
+      make_local_sample(duckdb::OrderType::DESCENDING, duckdb::OrderByNullType::NULLS_LAST);
+    sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 34, *env().gpu);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());
@@ -840,11 +984,8 @@ TEST_CASE("a range exchange on gathered boundaries leaves every rank a sorted ra
   // As in a plan: SORT_SAMPLE's boundaries go to the EXCHANGE_SINK after it.
   on_every_rank(world, [&](rank_t r) {
     sirius::op::sirius_physical_exchange_sink sink(key_types(), 0, c.all[r].service, 31, spec);
-    auto sample = make_sample();
-    sample->set_distributed(
-      {c.all[r].service, 32, env().gpu, [&sink](std::shared_ptr<cudf::table const> b) {
-         sink.set_range_boundaries(std::move(b));
-       }});
+    auto sample = make_local_sample();
+    sirius::planner::install_sort_boundaries(*sample, sink, c.all[r].service, 32, *env().gpu);
     pipelineable_operator_data data{inputs[r]};
     auto out    = sample->execute(data, utils::default_stream());
     auto routed = sink.execute(*out, utils::default_stream());

@@ -23,17 +23,19 @@ sirius_status with_diagnostic(sirius_status status, sirius_error** error, F&& ma
 }
 
 template <typename F>
-sirius_status invoke(sirius_error** error, F&& operation) noexcept
+sirius_status invoke(sirius_error** error,
+                     F&& operation,
+                     sirius_status exception_status = SIRIUS_INTERNAL_ERROR) noexcept
 {
   if (error) { *error = nullptr; }
   try {
     return operation();
-  } catch (const std::bad_alloc&) {
-    return SIRIUS_ALLOCATION_FAILURE;
+  } catch (const std::bad_alloc& e) {
+    return fail(SIRIUS_ALLOCATION_FAILURE, e.what(), error);
   } catch (const std::exception& e) {
-    return fail(SIRIUS_INTERNAL_ERROR, e.what(), error);
+    return fail(exception_status, e.what(), error);
   } catch (...) {
-    return fail(SIRIUS_INTERNAL_ERROR, "Unknown Sirius failure", error);
+    return fail(exception_status, "Unknown Sirius failure", error);
   }
 }
 }  // namespace sirius::c_api

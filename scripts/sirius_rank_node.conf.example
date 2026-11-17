@@ -1,7 +1,6 @@
 # Config for scripts/sirius_rank_node.sh --config <file>: one file per rank, sourced by bash.
 # sirius_node.sh writes these for you, one per GPU; write one yourself only to run a rank alone.
-# Arguments given on the command line win over these; exported NIXL_PREFIX and UCX_* win over the
-# nixl_prefix and ucx_* lines.
+# Arguments given on the command line win over these; exported UCX_* win over the ucx_* lines.
 
 gpu=0                  # or slurm: keep the CUDA_VISIBLE_DEVICES Slurm gives the task
 quack_port=9500
@@ -23,9 +22,6 @@ gateway_conf=$HOME/.sirius/gateways/default/gateway.conf
 # listen_host=10.87.140.52
 # dir=/tmp/sirius_rank_9500
 
-# Only for a build whose RPATH does not find NIXL.
-# nixl_prefix=$HOME/tools/nvda_nixl
-
-# UCX transports and network devices; scripts/nixl_env.sh and priority_networks set defaults.
+# UCX transports and network devices; scripts/launcher_env.sh and priority_networks set defaults.
 # ucx_tls=cuda_copy,cuda_ipc,tcp,self
 # ucx_net_devices=bond0

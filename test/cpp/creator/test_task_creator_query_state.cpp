@@ -120,8 +120,8 @@ TEST_CASE("task_creator reset_all drops every query's state", "[task_creator][qu
   f.creator.set_client_context(kQueryA, *f.con.context);
   f.creator.set_client_context(kQueryB, *f.con.context);
 
-  // Teardown path (SiriusContext::terminate), so that a state a window failed to clean up does
-  // not survive into ~task_creator during database destruction.
+  // Teardown path (SiriusContext::release_resources), so that a state a window failed to clean up
+  // does not survive into ~task_creator during database destruction.
   REQUIRE_NOTHROW(f.creator.reset_all());
   REQUIRE_NOTHROW(f.creator.reset(kQueryA));
 }

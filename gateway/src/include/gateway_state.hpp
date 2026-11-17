@@ -38,10 +38,12 @@ struct start_options {
   /// SQL every rank's session runs after the exchange settings.
   std::string rank_init;
   /// The exchange settings every rank takes before it connects (`sirius_gateway_exchange_*`).
-  std::string mnnvl    = "auto";
-  uint64_t frame_bytes = 16ull << 20;
-  uint32_t send_frames = 32;
-  uint32_t recv_frames = 16;
+  std::string host_staging = "auto";
+  uint32_t tcp_lanes       = 0;
+  std::string mnnvl        = "auto";
+  uint64_t frame_bytes     = 16ull << 20;
+  uint32_t send_frames     = 32;
+  uint32_t recv_frames     = 16;
   std::string log_dir;
   /// How a registered rank names its process, whether that process already joined a set of
   /// ranks, and how it is asked to exit for its launcher to restart it
@@ -178,7 +180,9 @@ class gateway_state {
   /// `sirius_gateway_min_ranks` are registered, for at most `sirius_gateway_join_wait` seconds,
   /// or until the client interrupts. Registering takes the turn, so the wait must not hold it.
   void wait_for_ranks(duckdb::ClientContext& context, std::string const& sql);
-  void start_locked(duckdb::ClientContext& context, start_options options);
+  void start_locked(duckdb::ClientContext& context,
+                    start_options options,
+                    bool discard_log = false);
   /// Attaches to @p r and opens its session, retrying until @p patience runs out or @p give_up
   /// is set. With @p join, a registered rank still running the process the gateway last saw is
   /// asked to exit if that process has joined, and its replacement waited for.
@@ -246,6 +250,9 @@ class gateway_state {
   uint64_t query_id_         = 0;
   uint64_t running_query_id_ = 0;
   std::vector<std::string> ddl_log_;
+  /// ddl_log_ was read from the state directory and no replay of it has finished: its entries
+  /// may fail for reasons outside the log, and are then skipped rather than fatal.
+  bool saved_log_pending_ = false;
 };
 
 /// Fills @p options from the `sirius_gateway_*` settings of @p context.

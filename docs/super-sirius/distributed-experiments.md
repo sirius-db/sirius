@@ -55,7 +55,7 @@ The repository holds no cluster names or paths. Export these first:
 git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
 cd "$CHECKOUT" && git submodule update --init --depth=1 --jobs 5 \
   duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-pixi run build-distributed            # once: NIXL, Sirius with NIXL, the gateway
+pixi run build-distributed            # once: Sirius and the gateway
 mkdir -p "$OUT"
 ```
 

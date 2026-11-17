@@ -97,14 +97,20 @@ exchange_service::exchange_service(fabric& fabric,
                               std::make_exception_ptr(sirius::internal_exception(
                                 "exchange: query {} failed on rank {}: {}", query, from, what)));
                           }};
-  _transport  = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
-  _rank       = _transport->rank();
-  _world_size = _transport->world_size();
+  auto started = std::make_unique<transport>(fabric, send, recv, gpu, host, std::move(cb), opts);
+  _rank        = started->rank();
+  _world_size  = started->world_size();
+  // Under the lock: the engine thread may already be in a callback that reads _transport.
+  std::lock_guard lock{_mutex};
+  _transport = std::move(started);
 }
 
 std::shared_ptr<inbound> exchange_service::receiver_of(stream_id stream, held event)
 {
   std::lock_guard lock{_mutex};
+  // The engine thread delivers until shutdown() has joined it, after _held was cleared: a batch
+  // kept now would outlive the memory space it lives in.
+  if (_shut_down) { return nullptr; }
   if (_aborted.contains(query_of(stream))) { return nullptr; }
   if (auto it = _receivers.find(stream); it != _receivers.end()) { return it->second; }
   if (!retired(query_of(stream)) && !_detached.contains(stream)) {
@@ -119,6 +125,8 @@ bool exchange_service::end_query(distributed_query_id query, std::exception_ptr 
   {
     std::lock_guard lock{_mutex};
     if (retired(query) || !_aborted.emplace(query, error).second) { return false; }
+    // Senders of this query waiting for room in the transport stop waiting: cleanup waits for them.
+    if (_transport) { _transport->cancel(query); }
     for (auto const& [stream, r] : _receivers) {
       if (query_of(stream) == query) { receivers.push_back(r); }
     }
@@ -141,50 +149,58 @@ void exchange_service::abort(distributed_query_id query, std::string const& what
 
 bool exchange_service::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
-  {
-    std::lock_guard lock{_mutex};
-    if (!_transport) { return true; }
-  }
-  return _transport->wait_sent(query, timeout);
+  auto const running = running_transport();
+  return !running || running->wait_sent(query, timeout);
 }
 
 void exchange_service::shutdown()
 {
-  std::unique_ptr<transport> stopped;
+  std::shared_ptr<transport> stopped;
   {
     std::lock_guard lock{_mutex};
     if (!_error) {
       _error = std::make_exception_ptr(
         sirius::internal_exception("exchange: shut down with the Sirius context"));
     }
-    stopped = std::move(_transport);
+    stopped    = std::move(_transport);
+    _shut_down = true;
     _held.clear();
     _receivers.clear();
   }
-  // Outside the lock: the engine thread calls back into this service until it is joined.
-  stopped.reset();
+  // Outside the lock: the engine thread calls back into this service until it is joined. A
+  // sender still inside the transport wakes, and holds it until it returns.
+  if (stopped) { stopped->stop(); }
 }
 
 void exchange_service::attach(stream_id stream, std::shared_ptr<inbound> receiver)
 {
   // Replayed under the lock, so nothing arriving meanwhile overtakes what was held.
   std::lock_guard lock{_mutex};
-  if (!_receivers.emplace(stream, receiver).second) {
+  auto const [slot, inserted] = _receivers.emplace(stream, receiver);
+  if (!inserted) {
     throw sirius::invalid_input_exception("exchange: stream {} already has a receiver", stream);
   }
-  if (auto it = _held.find(stream); it != _held.end()) {
-    for (auto& e : it->second) {
-      if (e.data) {
-        receiver->on_batch(e.from, e.batch, std::move(e.data));
-      } else {
-        receiver->on_end(e.from);
+  try {
+    if (auto it = _held.find(stream); it != _held.end()) {
+      for (auto& e : it->second) {
+        if (e.data) {
+          receiver->on_batch(e.from, e.batch, std::move(e.data));
+        } else {
+          receiver->on_end(e.from);
+        }
       }
+      _held.erase(it);
     }
-    _held.erase(it);
-  }
-  if (_error) { receiver->on_error(_error); }
-  if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
-    receiver->on_error(it->second);
+    if (_error) { receiver->on_error(_error); }
+    if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+      receiver->on_error(it->second);
+    }
+  } catch (...) {
+    // The caller never got a receiver it could detach: leave the stream as detach() would.
+    _receivers.erase(slot);
+    _held.erase(stream);
+    if (!retired(query_of(stream))) { _detached.insert(stream); }
+    throw;
   }
 }
 
@@ -193,6 +209,7 @@ void exchange_service::send(stream_id stream,
                             std::shared_ptr<cucascade::data_batch> batch)
 {
   auto const bytes = to != _rank && batch ? bytes_of(*batch) : 0;
+  std::shared_ptr<transport> running;
   {
     std::lock_guard lock{_mutex};
     if (bytes > 0) {
@@ -206,14 +223,28 @@ void exchange_service::send(stream_id stream,
     if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
       std::rethrow_exception(it->second);
     }
+    running = _transport;
   }
-  _transport->send(stream, to, std::move(batch));
+  running->send(stream, to, std::move(batch));
+  // An abort that arrived meanwhile may have woken this sender without queueing its batch: it
+  // fails like one that started after the abort.
+  std::lock_guard lock{_mutex};
+  if (_error) { std::rethrow_exception(_error); }
+  if (auto it = _aborted.find(query_of(stream)); it != _aborted.end()) {
+    std::rethrow_exception(it->second);
+  }
 }
 
 void exchange_service::close(stream_id stream, rank_t to)
 {
   throw_if_failed();
-  _transport->close(stream, to);
+  if (auto const running = running_transport()) { running->close(stream, to); }
+}
+
+std::shared_ptr<transport> exchange_service::running_transport()
+{
+  std::lock_guard lock{_mutex};
+  return _transport;
 }
 
 void exchange_service::throw_if_failed()
@@ -286,6 +317,7 @@ void exchange_service::forget_range(distributed_query_id first, distributed_quer
       t->second.received_batches);
     t = _traffic.erase(t);
   }
+  if (_transport) { _transport->forget(first, last); }
 }
 
 }  // namespace sirius::exchange

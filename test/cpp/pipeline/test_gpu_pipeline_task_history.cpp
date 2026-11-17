@@ -55,10 +55,12 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -635,6 +637,39 @@ TEST_CASE("materialization peak classifies Simpatico compression by representati
         std::numeric_limits<std::size_t>::max());
   CHECK(sirius::peak_materialization_bytes(&ordinary_smaller) == 400);
   CHECK(sirius::peak_materialization_bytes(&ordinary_expanded) == 400);
+}
+
+TEST_CASE("input size estimate does not wait for a batch that is being converted",
+          "[gpu_pipeline_task][estimation]")
+{
+  pipeline_task_history_fixture fixture;
+  if (!fixture.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  auto batch = fixture.create_compressed_host_data_batch(100, 400);
+  sirius::op::pipelineable_operator_data input(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
+
+  auto const idle = input.estimate_input_sizes(fixture.gpu_space);
+  CHECK(idle.uncompressed_bytes == 400);
+  CHECK(idle.bytes_to_materialize == 500);
+
+  // The estimate runs on another thread, as the executor's manager thread does while a downgrade
+  // thread holds the batch.
+  std::optional<cucascade::mutable_data_batch> converting;
+  converting.emplace(batch->to_mutable());
+  auto busy =
+    std::async(std::launch::async, [&] { return input.estimate_input_sizes(fixture.gpu_space); });
+
+  auto const status = busy.wait_for(std::chrono::seconds(5));
+  converting.reset();
+  REQUIRE(status == std::future_status::ready);
+
+  auto const estimate = busy.get();
+  CHECK(estimate.uncompressed_bytes == 400);
+  CHECK(estimate.bytes_to_materialize == 500);
 }
 
 TEST_CASE("pipeline memory history clamps extrapolated estimates",

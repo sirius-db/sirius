@@ -53,10 +53,12 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
+    test/cpp/exchange/test_distributed_session.cpp
     test/cpp/exchange/test_exchange_batch_io.cpp
     test/cpp/exchange/test_exchange_byte_ranges.cpp
     test/cpp/exchange/test_exchange_collectives.cpp
     test/cpp/exchange/test_exchange_distribute_plan.cpp
+    test/cpp/exchange/test_exchange_nixl.cpp
     test/cpp/exchange/test_exchange_operators.cpp
     test/cpp/exchange/test_exchange_path.cpp
     test/cpp/exchange/test_exchange_plan_reuse.cpp
@@ -116,9 +118,11 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_scalar_subquery.cpp
     test/cpp/integration/test_gpu_execution_cte.cpp
+    test/cpp/integration/test_gpu_execution_scan_reuse.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
+    test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
@@ -196,8 +200,10 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_gds_ioctx.cpp
     test/cpp/io/test_path_utils.cpp
     test/cpp/io/rest/test_rest_datasource_integration.cpp
+    test/cpp/log/test_cucascade_bridge.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
@@ -237,6 +243,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_exchange.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/test_cross_join_slicing.cpp
+    test/cpp/operator/window/test_cumulative.cpp
     test/cpp/operator/window/test_ranking.cpp
     test/cpp/operator/window/test_whole_partition.cpp
     test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
@@ -288,14 +295,19 @@ set(TEST_SOURCES
     test/cpp/planner/test_connector_overrides.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
+    test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
+    test/cpp/planner/test_one_rank_parity.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
+    test/cpp/planner/test_push_narrowing_expressions.cpp
+    test/cpp/planner/test_scan_reuse_rewrites.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_decimal_sum_input_bounds.cpp
     test/cpp/planner/test_scan_column_origin.cpp
+    test/cpp/planner/test_join_implied_filters.cpp
     test/cpp/planner/test_join_key_nullability.cpp
     test/cpp/planner/test_scan_filter_projection.cpp
     test/cpp/planner/test_scan_returned_types.cpp
@@ -315,6 +327,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_window_plan.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
+    test/cpp/pipeline/test_finalize_listeners.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -411,7 +424,3 @@ set(TEST_SOURCES
 # caught by the check-orphan-tests pre-commit hook
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see
 # test/cpp/orphan_test_allowlist.txt.
-
-if(SIRIUS_WITH_NIXL)
-  list(APPEND TEST_SOURCES test/cpp/exchange/test_exchange_nixl.cpp)
-endif()

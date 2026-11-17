@@ -39,6 +39,8 @@ enum class ErrorCode {
   invalid_argument,
   /// An unexpected implementation failure or unknown status was reported.
   internal_error,
+  /// Hardware resolution or engine initialization failed.
+  context_initialization,
 };
 
 /// @brief A failure returned through std::expected by the public API.
@@ -76,6 +78,7 @@ struct Error {
       case SIRIUS_INVALID_CONFIGURATION: code = ErrorCode::invalid_configuration; break;
       case SIRIUS_ALLOCATION_FAILURE: code = ErrorCode::allocation_failure; break;
       case SIRIUS_INVALID_ARGUMENT: code = ErrorCode::invalid_argument; break;
+      case SIRIUS_CONTEXT_INITIALIZATION: code = ErrorCode::context_initialization; break;
       default: break;
     }
     try {
@@ -88,6 +91,7 @@ struct Error {
     }
   }
   friend class ContextConfigBuilder;
+  friend class Context;
 };
 
 }  // namespace sirius

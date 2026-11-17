@@ -50,6 +50,7 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -79,11 +80,14 @@
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
+#include "planner/build_side_choice.hpp"
+#include "planner/scan_reuse_rewrites.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
 #include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/preparation_ledger.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -95,11 +99,9 @@
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -220,63 +222,6 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
-}  // namespace
-
-void assign_files_to_rank(sirius::op::scan::parquet_ingestible_table_info& info,
-                          std::vector<std::string> files,
-                          const sirius::operator_params& op_params)
-{
-  if (!op_params.distributed()) {
-    info.resolved_file_paths = std::move(files);
-    return;
-  }
-  // A rank numbers the files of its own share from 0, so their index and a filter on their name
-  // would mean different files on different ranks.
-  using kind              = sirius::op::scan::scan_plan::parquet_virtual_column_kind;
-  auto const names_a_file = [&](auto const& column) {
-    return column.HasPrimaryIndex() &&
-           std::any_of(
-             info.virtual_columns.begin(), info.virtual_columns.end(), [&](auto const& v) {
-               return v.column_id == column.GetPrimaryIndex() &&
-                      (v.kind == kind::FILENAME || v.kind == kind::FILE_INDEX);
-             });
-  };
-  if (std::any_of(info.column_ids.begin(), info.column_ids.end(), names_a_file)) {
-    throw sirius::not_implemented_exception(
-      "distributed execution: filename or file_index of a table split across ranks");
-  }
-  auto const world  = op_params.exchange_peers.size();
-  auto const rank   = op_params.exchange_rank;
-  auto const remote = std::any_of(
-    files.begin(), files.end(), [](auto const& f) { return f.find("://") != std::string::npos; });
-  if (remote) {
-    // TODO(#2377): split remote files by byte range too, as local ones are.
-    if (files.size() < world) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: a remote table of {} files across {} ranks; each rank needs one. "
-        "Split it into at least {} files, or read it from local files, which split by byte range",
-        files.size(),
-        world,
-        world);
-    }
-    for (std::size_t i = rank; i < files.size(); i += world) {
-      info.resolved_file_paths.push_back(std::move(files[i]));
-    }
-    return;
-  }
-  std::vector<std::uint64_t> bytes;
-  bytes.reserve(files.size());
-  for (auto const& f : files) {
-    bytes.push_back(std::filesystem::file_size(f));
-  }
-  for (auto const& r : sirius::planner::byte_ranges_for_rank(bytes, rank, world)) {
-    info.resolved_file_paths.push_back(std::move(files[r.file]));
-    info.resolved_file_ranges.push_back({{r.start, r.length}});
-  }
-}
-
-namespace {
-
 //! Attach the plan-carried byte ranges to the scan's files, claiming each file's ranges from the
 //! per-plan registry. A file keeps ONE entry holding all its ranges: the bound read view requires
 //! one entry per bound file. If the bind kept repeated occurrences of a ranged path, the first
@@ -393,11 +338,6 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
         "has no URI parameter");
     }
-    // One URI, expanded only when read: nothing splits it, so every rank would read all of it.
-    if (op_params.distributed()) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: read_parquet of one remote URI; every rank would read all of it");
-    }
     info->resolved_file_paths = std::move(resolved_file_paths);
   } else {
     if (resolved_file_paths.empty()) {
@@ -509,19 +449,6 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   info->table_path = scan_op.parameters.front().GetValue<std::string>();
 
-  // Second line of the gate in sirius_plan_get.cpp, which already declines an unpinned scan: a
-  // caller reaching here without an id must fail loudly rather than read "current" a third time.
-  // Deriving one here is not a fallback -- see that gate for why every derivation is unsound.
-  auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) {
-    throw duckdb::NotImplementedException(
-      "iceberg_scan reached GPU physical planning without 'snapshot_from_id': the snapshot its "
-      "delete files must be read from is unknown, and reading them from whatever is current now "
-      "risks pairing one snapshot's data files with another's deletes");
-  }
-  std::optional<uint64_t> const snapshot_id =
-    static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
-
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw duckdb::NotImplementedException(
@@ -547,12 +474,8 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data =
-      sirius::op::scan::load_delete_payload(context,
-                                            info->table_path,
-                                            sirius_ctx->get_scan_manager().shared_io_ctx(),
-                                            snapshot_id,
-                                            discovery);
+    info->delete_data = sirius::op::scan::load_delete_payload(
+      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -804,15 +727,10 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      auto sid =
-        static_cast<uint64_t>(c.scan->named_parameters.at("snapshot_from_id").GetValue<int64_t>());
-      c.info->delete_data = load_delete_payload(context,
-                                                c.info->table_path,
-                                                sirius_ctx->get_scan_manager().shared_io_ctx(),
-                                                sid,
-                                                *c.discovery);
-      auto us             = std::chrono::duration_cast<std::chrono::microseconds>(
+      auto started        = std::chrono::steady_clock::now();
+      c.info->delete_data = load_delete_payload(
+        context, c.info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), *c.discovery);
+      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
       c.scan->read_views->record_delete_preparation(c.scan->contract_id, us);
@@ -1196,6 +1114,7 @@ plan_lineage collect_semantic_lineage(
     if (node.type == type::HASH_JOIN) {
       auto& physical = node.Cast<op::sirius_physical_hash_join>();
       join(physical, physical.lhs_output_columns.col_idxs, physical.rhs_output_columns.col_idxs);
+      if (physical.build_counts()) { result.columns.emplace_back(); }
     } else {
       auto& physical = node.Cast<op::sirius_physical_nested_loop_join>();
       auto left = physical.left_output_col_idxs, right = physical.right_output_col_idxs;
@@ -1437,6 +1356,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                  : nullptr;
   if (state) state->record_scan_lowering(scan.contract_id);
+  if (params.distributed()) { check_distributed_scan(scan, *entry, context); }
   slot = entry->lower(scan, params, context, entry->filter_mode);
 }
 
@@ -1721,14 +1641,11 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 
       if (is_build && join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
         auto& join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-        // Distributed: BUILD_FILTER would publish this rank's build keys before the build is
-        // exchanged, and nothing merges an early publication across ranks, so its filter would
-        // drop probe rows that other ranks' builds match.
         if (!join.is_delim_join_inner() &&
             (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
              join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
             join.publishes_dynamic_filters() &&
-            join.dynamic_filter_plan().multi_partition_enabled() && !op_params.distributed()) {
+            join.dynamic_filter_plan().multi_partition_enabled()) {
           auto publish = duckdb::make_uniq<sirius::op::sirius_physical_build_filter>(
             child_types, est_card, join.dynamic_filter_session());
           if (!child_physical.empty()) { publish->set_physical_types(child_physical); }
@@ -1809,13 +1726,15 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
   if (join_op.children.size() != 2) { throw std::logic_error("partitioned join needs two inputs"); }
   auto& build_concat = join_op.children[1]->Cast<sirius::op::sirius_physical_concat>();
   auto& build        = build_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
-  auto& probe = join_op.children[0]->children[0]->Cast<sirius::op::sirius_physical_partition>();
+  auto& probe_concat = join_op.children[0]->Cast<sirius::op::sirius_physical_concat>();
+  auto& probe        = probe_concat.children[0]->Cast<sirius::op::sirius_physical_partition>();
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
     sirius::op::bind_partition_inputs(join_op.Cast<sirius::op::sirius_physical_hash_join>(),
                                       build,
                                       probe,
                                       &build_concat,
-                                      probe_drives);
+                                      probe_drives,
+                                      &probe_concat);
   } else {
     sirius::op::bind_partition_inputs(
       join_op.Cast<sirius::op::sirius_physical_nested_loop_join>(), build, probe);
@@ -1836,8 +1755,16 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
   bool probe_drives = false;
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
-    auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
+    auto& hash_join         = join_op.Cast<sirius::op::sirius_physical_hash_join>();
+    bool const right_stream = op_params.stream_right_joins &&
+                              hash_join.join_type == duckdb::JoinType::RIGHT &&
+                              !hash_join.is_mixed_join();
+    hash_join.set_right_may_stream(right_stream);
+    if (hash_join.build_counts() && !right_stream) {
+      throw std::logic_error("a hash join counting its build matches must stream its probe");
+    }
+    probe_drives =
+      hash_join.is_right_family() && !hash_join.is_delim_join_inner() && !right_stream;
   }
   bind_wrapped_join(join_op, probe_drives);
 }
@@ -2120,11 +2047,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
   duckdb::ClientContext& context,
   sirius::op::scan::dynamic_filter_apply_mode mode)
 {
-  // Nothing splits a DuckDB table by rank: every rank would scan all of it.
-  if (op_params.distributed()) {
-    throw sirius::not_implemented_exception(
-      "distributed execution: a DuckDB table; read the table from Parquet files instead");
-  }
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
@@ -2154,11 +2076,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // The FFI refuses remote LocalFiles inputs before binding, so its registered ranges are local.
   if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
-    // attach_byte_ranges would replace this rank's share with the plan's ranges.
-    if (op_params.distributed()) {
-      throw sirius::not_implemented_exception(
-        "distributed execution: a plan that carries its own byte ranges");
-    }
     attach_byte_ranges(*table_info, *byte_ranges);
   }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
@@ -2493,6 +2410,23 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   {
+    // Plans that read the same rows twice read them once (Sirius's copy of DuckDB's plan only;
+    // DuckDB's own plan, which a CPU fallback runs, is untouched).
+    auto const sirius_ctx = context.registered_state
+                              ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              : nullptr;
+    if (!sirius_ctx || duckdb::query_operator_options(context)->enable_scan_reuse_rewrites) {
+      sirius::planner::rewrite_repeated_scans(
+        context, op, [&](duckdb::LogicalOperator const& dropped) {
+          read_views->record_skipped_scans(
+            sirius::op::scan::capture_bound_read_views(dropped, context));
+        });
+    }
+    if (!sirius_ctx || duckdb::query_operator_options(context)->enable_build_side_swap) {
+      sirius::planner::swap_unfiltered_builds(context, *op);
+    }
+  }
+  {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
     op->ResolveOperatorTypes();
   }
@@ -2516,8 +2450,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    validate_window_stages(*op);
-    plan = create_plan(*op);
+    plan       = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
@@ -2528,6 +2461,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2568,6 +2504,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2800,10 +2739,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   if (!plan) { throw duckdb::InternalException("Physical plan generator - no plan generated"); }
 
   plan->estimated_cardinality = op.estimated_cardinality;
-#ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
-  auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
-  plan        = std::move(verify);
-#endif
 
   return plan;
 }

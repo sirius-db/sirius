@@ -48,6 +48,7 @@ set(SIRIUS_LINK_LIBRARIES
     cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     roaring::roaring
+    nixl::nixl
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
@@ -56,15 +57,9 @@ set(SIRIUS_LINK_LIBRARIES
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
-    kvikio::kvikio)
-if(BUILD_WITH_CTRACK)
-  list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
-endif()
-if(SIRIUS_WITH_NIXL)
-  # NVML: the NIXL fabric checks peer access between GPUs other processes own.
-  list(APPEND SIRIUS_LINK_LIBRARIES ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY}
-       CUDA::nvml)
-endif()
+    kvikio::kvikio
+    # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+    CUDA::nvml)
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -167,18 +162,6 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-# libsirius finds libnixl without LD_LIBRARY_PATH (and NIXL its plugins next to
-# libnixl).
-if(SIRIUS_WITH_NIXL)
-  set_property(
-    TARGET sirius_shared
-    APPEND
-    PROPERTY BUILD_RPATH "${NIXL_LIBRARY_DIR}")
-  set_property(
-    TARGET sirius_shared
-    APPEND
-    PROPERTY INSTALL_RPATH "${NIXL_LIBRARY_DIR}")
-endif()
 # mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
 if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
   set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)

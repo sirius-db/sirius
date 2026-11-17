@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "creator/config.hpp"
+#include "exchange/host_staging.hpp"
 #include "exec/config.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "op/dynamic_filter/config.hpp"
@@ -119,7 +120,11 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+/// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
+/// table into one scan and a per-key MIN/MAX aggregate.
+constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
+
+/// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
@@ -232,8 +237,9 @@ struct operator_params {
   std::vector<std::string> exchange_peers;
   /// This process's rank among exchange_peers.
   uint32_t exchange_rank = 0;
-  /// Distributed execution: "auto", "always" or "never" host-stage the exchange's writes to peers.
-  std::string exchange_host_staging = "auto";
+  /// Distributed execution: "auto", "always", "never" or "remote" host-stage the exchange's writes
+  /// to peers (sirius::exchange::host_staging).
+  exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
   /// Distributed execution: "auto", "require" or "off" put the exchange's rings in fabric memory,
   /// so that GPUs on other nodes of the NVLink domain write them over NVLink.
   std::string exchange_mnnvl = "auto";
@@ -241,8 +247,12 @@ struct operator_params {
   uint64_t exchange_frame_bytes = 16ull << 20;
   /// Distributed execution: send frames, shared by all peers.
   uint32_t exchange_send_frames = 32;
-  /// Distributed execution: receive frames (credits) each peer may fill.
+  /// Distributed execution: receive frames (credits) each peer may fill; over TCP lanes, one per
+  /// lane in flight.
   uint32_t exchange_recv_frames_per_peer = 16;
+  /// Distributed execution: TCP lanes per rank to ranks on other hosts; 0 shares 16 among the
+  /// ranks on this host.
+  uint32_t exchange_tcp_lanes = 0;
 
   /// Nonzero: the number of the next distributed query, set by a gateway that numbers every
   /// rank's queries. Must increase; zero numbers queries per process.
@@ -296,26 +306,48 @@ struct operator_params {
 
   /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
   /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
-  /// When on, pin_table observes every column it is not already asked to observe; an observed
-  /// column must be an integer column without a repeated value in any chunk to stay a candidate.
-  /// When off, the planner ignores pin-time facts and the pin observes only the columns that
-  /// late materialization asks for.
+  /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
+  /// late materialization is on); an observed column must be an integer column without a repeated
+  /// value in any chunk, or any column of a table under late_mat::small_table_max_rows rows, to
+  /// stay a candidate. When off, the planner ignores pin-time facts and the pin observes nothing,
+  /// so late materialization gets no proof either.
   bool prove_unique_keys{true};
 
   /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
-  /// sorts a whole column when its chunks overlap in range. Earlier columns take priority when the
-  /// cap is short; the check's peak GPU use is about three times the cap. A column that no longer
-  /// fits stays unproven. 0 = a share (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the
-  /// pinning GPU memory space's capacity. Applies to every observed column, whether late
-  /// materialization or join-key proofs asked for it.
+  /// sorts a whole column when its chunks overlap in range. Integer columns take priority over the
+  /// others when the cap is short, and earlier columns over later ones; the check's peak GPU use
+  /// is about three times the cap. A column that no longer fits stays unproven. 0 = a share
+  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
   uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
+  /// Size RIGHT hash joins from their build side so a build that fits runs BUILD_PROBE, streaming
+  /// the probe instead of folding each probe partition whole.
+  bool stream_right_joins = true;
+
+  /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
+  /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
+  /// `rewrite_correlated_inequality_exists`.
+  bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
+
+  /// Compute a projection's expression below the inner join under it when that narrows the rows.
+  /// See `push_narrowing_expressions`.
+  bool enable_narrowing_expression_pushdown = true;
+
+  /// Build an inner join on its filtered side when the unfiltered side is larger. See
+  /// `swap_unfiltered_builds`.
+  bool enable_build_side_swap = false;
+
   /// Distributed execution: apply a HAVING above a grouped aggregate's merge to the partial
   /// groups that the Parquet footers prove already whole (see op::complete_group_having).
   bool enable_complete_group_having = true;
+
+  /// Rewrite plans that read the same rows twice so they read them once
+  /// (planner/scan_reuse_rewrites.hpp): TPC-H Q18's IN-subquery aggregate, Q17's and Q2's
+  /// correlated aggregate over the outer query's own rows, Q11's repeated join.
+  bool enable_scan_reuse_rewrites = true;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
@@ -420,10 +452,7 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
-  [[nodiscard]] int max_concurrent_queries() const noexcept
-  {
-    return _scan_manager_config.max_concurrent_queries;
-  }
+  [[nodiscard]] int max_concurrent_queries() const noexcept { return _max_concurrent_queries; }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -514,6 +543,8 @@ struct sirius_config {
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
+  /// Query admission limit (`sirius.max_concurrent_queries`).
+  int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};

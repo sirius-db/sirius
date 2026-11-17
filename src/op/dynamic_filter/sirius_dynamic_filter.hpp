@@ -510,14 +510,30 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @brief ORs another filter's bit storage into the source replica, which then also holds that
    * filter's keys. Call before replicate_to_devices().
    *
-   * @param words Device storage of a filter of this size and domain, as storage() gives it.
-   * @param bytes The size of @p words; must equal storage_bytes().
+   * The other filter may be larger by a power of two, f = @p bytes / storage_bytes(): each run of
+   * f of its blocks is ORed into one block of this filter. cuco places a key in block
+   * `(upper hash * blocks) >> 32` and sets bits within it from the lower hash, so with
+   * power-of-two block counts a key in block i of the larger filter belongs in block i / f of this
+   * one, with the same bits. Both block counts must be powers of two for that to hold.
+   *
+   * @param words Device storage of a filter of this domain, as storage() gives it.
+   * @param bytes The size of @p words: storage_bytes() times a power of two.
    * @param stream The stream the OR runs on, after whatever wrote @p words.
-   * @throw std::invalid_argument when @p bytes is not this filter's storage_bytes(), or @p words
-   * is on another GPU
+   * @throw std::invalid_argument when @p bytes is not storage_bytes() times a power of two, a
+   * larger @p bytes meets a block count that is not a power of two, or @p words is on another GPU
    * @throw std::logic_error when this filter is on more than one GPU
    */
   void merge_from(void const* words, std::size_t bytes, ::cuda::stream_ref stream);
+
+  /**
+   * @brief An empty filter of @p bytes in this filter's domain, on its GPU, with this filter's keys
+   * merged in (merge_from()): the same filter, folded to a smaller power-of-two size.
+   *
+   * @throw std::invalid_argument when storage_bytes() is not @p bytes times a power of two, or
+   * @p bytes is not a power-of-two number of blocks
+   */
+  [[nodiscard]] std::shared_ptr<sirius_dynamic_bloom_filter> folded_to(
+    std::size_t bytes, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const;
 
  private:
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_impl(

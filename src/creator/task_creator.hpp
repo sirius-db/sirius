@@ -190,7 +190,7 @@ class task_creator {
   /// registered queries; unknown IDs are harmless for partial initialization/repeated cleanup.
   void reset(sirius::query_id_t query_id);
 
-  /// \brief Drop every query's state. Teardown only (SiriusContext::terminate).
+  /// \brief Drop every query's state. Teardown only (SiriusContext::release_resources).
   void reset_all();
 
   /**

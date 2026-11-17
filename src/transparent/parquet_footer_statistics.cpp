@@ -139,8 +139,10 @@ std::shared_ptr<file_statistics const> statistics_of(
 {
   auto version = listed ? version_of(file.path, *listed) : std::nullopt;
   if (!listed) {
-    auto& fs = duckdb::FileSystem::GetFileSystem(context);
-    version = version_of(file.path, fs.OpenFile(file, duckdb::FileFlags::FILE_FLAGS_READ)->Stats());
+    // A local file's metadata is one stat; opening it would cost an open and a close.
+    auto& fs            = duckdb::FileSystem::GetFileSystem(context);
+    auto const metadata = fs.GetStatsIfExists(file);
+    if (metadata) { version = version_of(file.path, *metadata); }
     if (auto hit = cached(key, version)) { return hit; }
   }
   auto result = std::make_shared<file_statistics>();
@@ -183,10 +185,19 @@ std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
   std::vector<std::size_t> unresolved;
   std::vector<std::string> keys(files.size());
   std::vector<std::optional<duckdb::FileMetadata>> listed(files.size());
+  auto& fs = duckdb::FileSystem::GetFileSystem(context);
   for (std::size_t i = 0; i < files.size(); ++i) {
     keys[i]   = cache_key(options_identity, files[i].path);
     listed[i] = listed_metadata(files[i]);
-    if (listed[i]) { result[i] = cached(keys[i], version_of(files[i].path, *listed[i])); }
+    if (listed[i]) {
+      result[i] = cached(keys[i], version_of(files[i].path, *listed[i]));
+    } else if (!duckdb::FileSystem::IsRemoteFile(files[i].path)) {
+      // A local file costs one stat to check, less than scheduling a task for it; only a miss,
+      // which reads a footer, goes to the executor.
+      if (auto const metadata = fs.GetStatsIfExists(files[i])) {
+        result[i] = cached(keys[i], version_of(files[i].path, *metadata));
+      }
+    }
     if (!result[i]) { unresolved.push_back(i); }
   }
   auto read = [&](std::size_t i) {
@@ -267,6 +278,59 @@ duckdb::Value merged_statistics(duckdb::MultiFileBindData const& bind,
     text, duckdb::LogicalType::MAP(text, text), std::move(keys), std::move(values));
 }
 
+/// The merged, verified statistics a scan was last given. An entry holds the very statistics
+/// objects it was merged from, so it matches only while every file's cache entry is unchanged: a
+/// rewritten file is read into a new object, and keeping the old one alive means its address cannot
+/// be reused.
+struct merge_entry {
+  std::vector<std::shared_ptr<file_statistics const>> files;
+  decltype(duckdb::MultiFileBindData::names) names;
+  decltype(duckdb::MultiFileBindData::types) types;
+  duckdb::Value statistics;
+};
+
+std::mutex merge_mutex;
+std::unordered_map<std::string, merge_entry> merges;
+
+/// Keyed by the paths the scan was given, so a glob that gains files replaces its entry instead of
+/// adding one; the entry itself says whether it fits the scan at hand.
+std::string merge_cache_key(duckdb::LogicalGet const& get)
+{
+  std::string key;
+  for (auto const& parameter : get.parameters) {
+    key += parameter.ToString();
+    key += '\0';
+  }
+  return key;
+}
+
+std::optional<duckdb::Value> cached_merge(
+  std::string const& key,
+  std::vector<std::shared_ptr<file_statistics const>> const& files,
+  duckdb::MultiFileBindData const& bind)
+{
+  std::lock_guard guard(merge_mutex);
+  auto const found = merges.find(key);
+  if (found == merges.end() || found->second.files != files || found->second.names != bind.names ||
+      found->second.types != bind.types) {
+    return std::nullopt;
+  }
+  return found->second.statistics;
+}
+
+void remember_merge(std::string const& key,
+                    std::vector<std::shared_ptr<file_statistics const>> const& files,
+                    duckdb::MultiFileBindData const& bind,
+                    duckdb::Value const& statistics)
+{
+  std::lock_guard guard(merge_mutex);
+  // A miss only costs a merge, so any entry may make room for a new set of paths.
+  if (!merges.contains(key) && merges.size() >= detail::merged_statistics_cache_capacity) {
+    merges.erase(merges.begin());
+  }
+  merges[key] = merge_entry{files, bind.names, bind.types, statistics};
+}
+
 bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
 {
   auto const& name = get.function.GetName().GetIdentifierName();
@@ -287,10 +351,16 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
   auto const files            = statistics_of_all(context, all_files, parquet_options);
-  auto statistics             = merged_statistics(*bind, files);
-  if (statistics.IsNull()) { return false; }
-  options.column_statistics = std::move(statistics);
-  options.VerifyColumnStatistics(bind->names, bind->types);
+  auto const merge_key        = merge_cache_key(get);
+  if (auto const hit = cached_merge(merge_key, files, *bind)) {
+    options.column_statistics = *hit;
+  } else {
+    auto statistics = merged_statistics(*bind, files);
+    if (statistics.IsNull()) { return false; }
+    options.column_statistics = std::move(statistics);
+    options.VerifyColumnStatistics(bind->names, bind->types);
+    remember_merge(merge_key, files, *bind, options.column_statistics);
+  }
   return true;
 }
 
@@ -328,6 +398,12 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
   duckdb::ParquetOptions const options(context);
   std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
   return statistics_of_all(context, files, options).size();
+}
+
+std::size_t detail::merged_statistics_cache_size()
+{
+  std::lock_guard guard(merge_mutex);
+  return merges.size();
 }
 
 }  // namespace sirius::transparent

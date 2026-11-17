@@ -443,7 +443,10 @@ void read_settings(ClientContext& context, start_options& options)
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
   options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
   options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
-  options.mnnvl            = setting(context, "sirius_gateway_exchange_mnnvl", "auto");
+  options.host_staging     = setting(context, "sirius_gateway_exchange_host_staging", "auto");
+  options.tcp_lanes =
+    static_cast<uint32_t>(std::stoull(setting(context, "sirius_gateway_exchange_tcp_lanes", "0")));
+  options.mnnvl = setting(context, "sirius_gateway_exchange_mnnvl", "auto");
   options.frame_bytes =
     std::stoull(setting(context, "sirius_gateway_exchange_frame_bytes", "16777216"));
   options.send_frames = static_cast<uint32_t>(
@@ -508,7 +511,6 @@ void gateway_state::start(ClientContext& context, start_options options, bool re
   turn t{*this, context};
   {
     std::lock_guard lock{state_mutex_};
-    if (!replay_saved) { ddl_log_.clear(); }
     auto_start_ = false;
     if (replay_saved) { options_ = options; }
   }
@@ -519,7 +521,7 @@ void gateway_state::start(ClientContext& context, start_options options, bool re
     recover_locked(context);
     return;
   }
-  start_locked(context, std::move(options));
+  start_locked(context, std::move(options), /*discard_log=*/true);
   // Only once the new ranks run: a start that fails keeps the saved log.
   if (auto const file = ddl_file(context); !file.empty()) { std::filesystem::remove(file); }
 }
@@ -580,14 +582,10 @@ void gateway_state::wait_for_ranks(ClientContext& context, std::string const& sq
   }
 }
 
-void gateway_state::start_locked(ClientContext& context, start_options options)
+void gateway_state::start_locked(ClientContext& context, start_options options, bool discard_log)
 {
-  stop_locked();
-  {
-    std::lock_guard lock{state_mutex_};
-    state_ = cluster_state::starting;
-    reason_.clear();
-  }
+  // Everything up to stop_locked() only checks and prepares: a start that is refused there
+  // leaves the running ranks, the state and the DDL log as they were.
   std::vector<rank_spec> registered;
   {
     std::lock_guard lock{state_mutex_};
@@ -663,6 +661,16 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     r.catalog = "sirius_rank_" + std::to_string(r.index);
     peers += (r.index ? "," : "") + r.host + ":" + std::to_string(r.exchange_port);
   }
+  stop_locked();
+  {
+    std::lock_guard lock{state_mutex_};
+    state_ = cluster_state::starting;
+    reason_.clear();
+    if (discard_log) {
+      ddl_log_.clear();
+      saved_log_pending_ = false;
+    }
+  }
   try {
     {
       std::lock_guard lock{state_mutex_};
@@ -707,17 +715,17 @@ void gateway_state::start_locked(ClientContext& context, start_options options)
     if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
-    // on one host, and 'auto' can take a GPU on another host for one here, so ranks on several
-    // hosts never stage.
-    auto const several_hosts = std::any_of(
-      ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.host != ranks_[0].host; });
+    // every peer, so the ranks run it in parallel. The exchange settings come first, the same on
+    // every rank: a rank refuses a peer that reaches it another way. With 'auto', ranks tell other
+    // hosts apart by boot id and reach them over TCP lanes, one frame in flight per lane.
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
       auto& sql = setup[r.index];
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
-        if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
+        sql.push_back("SET sirius_exchange_host_staging = " +
+                      KeywordHelper::WriteQuoted(options_.host_staging));
+        sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options_.tcp_lanes));
         sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options_.mnnvl));
         sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options_.frame_bytes));
         sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options_.send_frames));
@@ -931,17 +939,20 @@ void gateway_state::stop_locked()
 void gateway_state::recover_locked(ClientContext& context)
 {
   std::vector<std::string> log;
+  bool from_file = false;
   {
     std::lock_guard lock{state_mutex_};
     log = ddl_log_;
+    // Still the saved log if an earlier attempt to replay it did not finish.
+    from_file = saved_log_pending_;
   }
   // A gateway that restarted has an empty log: its ranks replay the one it saved.
-  auto const file      = ddl_file(context);
-  bool const from_file = log.empty() && !file.empty() && std::filesystem::exists(file);
-  if (from_file) {
+  auto const file = ddl_file(context);
+  if (log.empty() && !file.empty() && std::filesystem::exists(file)) {
     log = load_ddl_log(file);
     std::lock_guard lock{state_mutex_};
-    ddl_log_ = log;
+    ddl_log_           = log;
+    saved_log_pending_ = from_file = true;
   }
   start_locked(context, options_);
   std::vector<std::string> kept;
@@ -969,11 +980,16 @@ void gateway_state::recover_locked(ClientContext& context)
       throw IOException(reason_);
     }
   }
-  if (skipped.empty()) { return; }
+  if (skipped.empty()) {
+    std::lock_guard lock{state_mutex_};
+    saved_log_pending_ = false;
+    return;
+  }
   std::fprintf(stderr, "sirius_gateway: %s\n", skipped.c_str());
   auto const save_error = try_save_ddl_log(file, kept);
   std::lock_guard lock{state_mutex_};
-  ddl_log_ = std::move(kept);
+  ddl_log_           = std::move(kept);
+  saved_log_pending_ = false;
   // Shown in sirius_gateway_status's error column until the next state change or start.
   reason_ = skipped + (save_error.empty() ? "" : "; " + save_error);
 }
@@ -1019,6 +1035,16 @@ std::shared_ptr<rank_result> gateway_state::run_locked(ClientContext& context,
     return collect(*read);
   }
   if (ranks_.empty() && !replay) { auto_start_locked(context); }
+  if (ranks_.empty() && !replay) {
+    // A recovery that failed leaves no ranks. Spawned ranks are started again here, as
+    // auto_start_locked does for registered ones; a cluster that was stopped stays stopped.
+    bool retry = false;
+    {
+      std::lock_guard lock{state_mutex_};
+      retry = state_ == cluster_state::failed && options_.ranks > 0;
+    }
+    if (retry) { recover_locked(context); }
+  }
   if (ranks_.empty()) {
     std::lock_guard lock{state_mutex_};
     throw IOException(reason_.empty()

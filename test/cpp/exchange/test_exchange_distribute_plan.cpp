@@ -26,6 +26,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "planner/distributed_plan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -39,6 +40,10 @@
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -225,7 +230,8 @@ struct ranks {
 std::vector<std::string> distribute(std::vector<plan>& plans,
                                     ranks& c,
                                     fixture& f,
-                                    sirius::planner::parquet_footer_reader const& footers = {})
+                                    sirius::planner::parquet_footer_reader const& footers = {},
+                                    std::uint64_t query                                   = 7)
 {
   auto const world = static_cast<rank_t>(plans.size());
   std::vector<std::string> errors(world);
@@ -234,11 +240,9 @@ std::vector<std::string> distribute(std::vector<plan>& plans,
     threads.emplace_back([&, r] {
       try {
         sirius::planner::distribute_plan(
-          plans[r], c.all[r].service, f.gpu(), 7, c.lifecycle, footers);
+          plans[r], c.all[r].service, f.gpu(), query, c.lifecycle, footers);
       } catch (std::exception const& e) {
         errors[r] = e.what();
-        // Otherwise a peer waits in distribute_plan's all-gather until it times out.
-        c.all[r].service->abort(7, e.what());
       }
     });
   }
@@ -350,12 +354,120 @@ TEST_CASE("distribute_plan broadcasts a small build and hashes a large one", "[e
   }
 }
 
+TEST_CASE("distribute_plan has a merged join's build CONCAT close its publication",
+          "[exchange][planner]")
+{
+  fixture f;
+  // Filtered builds: a build that covers its whole key domain publishes no filter. Both sides
+  // alike, so on 3 ranks the build is too large to broadcast.
+  auto const hashed =
+    std::string{"SELECT b.v, c.v FROM big b JOIN big2 c ON b.k = c.k WHERE b.v < 5 AND c.v < 5"};
+  auto const broadcast =
+    std::string{"SELECT b.v FROM big b JOIN small s ON b.k = s.k WHERE s.v < 5"};
+  /// Freezes @p join's targets, as execution does, finalizes its build CONCAT, and returns whether
+  /// every target then expects no more filters.
+  auto const closed_by_build_finalize = [](sirius_physical_operator& node) {
+    auto& join          = node.Cast<sirius::op::sirius_physical_hash_join>();
+    auto const& targets = join.dynamic_filter_plan().probe_targets();
+    REQUIRE_FALSE(targets.empty());
+    for (auto const& target : targets) {
+      target.filter_set->freeze_registration();
+      REQUIRE_FALSE(target.filter_set->snapshot().terminal());
+    }
+    join.children.at(1)->finalize_operator();
+    return std::ranges::all_of(
+      targets, [](auto const& target) { return target.filter_set->snapshot().terminal(); });
+  };
+
+  SECTION("a hashed join that merges its filters closes at its build's finalize")
+  {
+    ranks c(3, f.gpu());
+    auto plans = plan_on_every_rank(f, hashed, 3);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(3));
+    for (auto& p : plans) {
+      auto* join = find(*p, T::HASH_JOIN);
+      REQUIRE(join);
+      REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>()
+                .dynamic_filter_plan()
+                .cross_rank_merge());
+      CHECK(closed_by_build_finalize(*join));
+    }
+  }
+
+  SECTION("a broadcast join, and a plan for one process, wait for the join's own finalize")
+  {
+    ranks c(2, f.gpu());
+    auto plans = plan_on_every_rank(f, broadcast, 2);
+    REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
+    auto* broadcast_join = find(*plans[0], T::HASH_JOIN);
+    REQUIRE(broadcast_join);
+    auto [probe, build] = join_sides(*broadcast_join);
+    REQUIRE(sink_below(*build));
+    REQUIRE(sink_below(*build)->spec().routing == exchange_spec::mode::broadcast);
+    CHECK_FALSE(closed_by_build_finalize(*broadcast_join));
+
+    auto local = f.lowered(hashed);
+    auto* join = find(*local, T::HASH_JOIN);
+    REQUIRE(join);
+    CHECK_FALSE(closed_by_build_finalize(*join));
+  }
+}
+
+TEST_CASE("distribute_plan drops a right semi or anti join's early build publication",
+          "[exchange][planner]")
+{
+  fixture f;
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  CAPTURE(join_type);
+  // The filtered side is the smaller, so DuckDB builds on it: a right semi or anti join, which
+  // one process plans with a BUILD_FILTER that publishes before the build is complete.
+  auto const sql =
+    "SELECT b.k FROM big b " + join_type + " JOIN big2 c ON b.k = c.k WHERE b.v <> 0";
+  {
+    auto const local = f.lowered(sql);
+    auto* join       = find(*local, T::HASH_JOIN);
+    REQUIRE(join);
+    REQUIRE(join->Cast<sirius::op::sirius_physical_hash_join>().join_type ==
+            (join_type == "SEMI" ? duckdb::JoinType::RIGHT_SEMI : duckdb::JoinType::RIGHT_ANTI));
+    REQUIRE(find(*local, T::BUILD_FILTER));
+    // At least 2^14 rows, or distribute_plan cancels the publication as too small to merge anyway.
+    REQUIRE(join->children[1]->estimated_cardinality >= std::size_t{1} << 14);
+  }
+  ranks c(2, f.gpu());
+  auto plans = plan_on_every_rank(f, sql, 2);
+  REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
+  for (auto& p : plans) {
+    CHECK_FALSE(find(*p, T::BUILD_FILTER));
+    auto* join = find(*p, T::HASH_JOIN);
+    REQUIRE(join);
+    auto& hash_join = join->Cast<sirius::op::sirius_physical_hash_join>();
+    // Nothing merges this join's filters, and its targets expect none before it runs.
+    CHECK(hash_join.dynamic_filter_plan().cross_rank_merge() == nullptr);
+    auto const& targets = hash_join.dynamic_filter_plan().probe_targets();
+    REQUIRE_FALSE(targets.empty());
+    for (auto const& target : targets) {
+      // As execution does once planning is over; then a snapshot is terminal when every
+      // producer has finished.
+      target.filter_set->freeze_registration();
+      auto const snapshot = target.filter_set->snapshot();
+      CHECK(snapshot.terminal());
+      CHECK(snapshot.empty());
+    }
+    auto [probe, build] = join_sides(*join);
+    for (auto* side : {probe, build}) {
+      REQUIRE(sink_below(*side));
+      CHECK(sink_below(*side)->spec().routing == exchange_spec::mode::hash);
+    }
+  }
+}
+
 TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
           "[exchange][planner]")
 {
   fixture f;
   ranks c(2, f.gpu());
-  auto plans = plan_on_every_rank(f, "SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k", 2);
+  auto const sql = std::string{"SELECT k, v FROM big ORDER BY v DESC NULLS FIRST, k"};
+  auto plans     = plan_on_every_rank(f, sql, 2);
   REQUIRE(distribute(plans, c, f) == std::vector<std::string>(2));
   // The result is gathered to rank 0 in rank order.
   REQUIRE(plans[0]->type == T::EXCHANGE_SOURCE);
@@ -376,6 +488,21 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   auto* sample = find(*plans[0], T::SORT_SAMPLE);
   REQUIRE(sample);
   CHECK(sample->runs_without_input());
+  // The planned sample stays, now taking its boundaries from every rank's sample: SORT_PARTITION
+  // still reads them from it, and its settings are those of the local plan.
+  auto const* distributed = &sample->Cast<sirius::op::sirius_physical_sort_sample>();
+  CHECK(distributed->cross_rank_boundaries() != nullptr);
+  CHECK(partition->Cast<sirius::op::sirius_physical_sort_partition>().get_sample_op() == sample);
+  auto const local = f.lowered(sql);
+  auto const& planned =
+    find(*local, T::SORT_SAMPLE)->Cast<sirius::op::sirius_physical_sort_sample>();
+  CHECK(distributed->sort_sample_bytes() == planned.sort_sample_bytes());
+  CHECK(distributed->max_partition_bytes_override() == planned.max_partition_bytes_override());
+  CHECK(distributed->max_partition_memory_fraction() == planned.max_partition_memory_fraction());
+  CHECK(distributed->orders.size() == planned.orders.size());
+  CHECK(distributed->types == planned.types);
+  CHECK(distributed->estimated_cardinality == planned.estimated_cardinality);
+  CHECK(distributed->children.size() == 1);
 }
 
 TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")
@@ -413,6 +540,46 @@ TEST_CASE("distribute_plan refuses what it cannot place", "[exchange][planner]")
     CHECK_THAT(refused("SELECT k FROM big UNION SELECT k FROM big2"),
                Catch::Matchers::ContainsSubstring("distributed execution does not support"));
   }
+}
+
+TEST_CASE("a rank whose rewrite fails aborts the query on every rank, and the next query plans",
+          "[exchange][planner]")
+{
+  fixture f;
+  ranks c(2, f.gpu());
+  {
+    // Rank 0 refuses its plan; rank 1 plans a supported one and waits for rank 0's shape.
+    std::vector<plan> plans;
+    plans.push_back(f.lowered("SELECT k FROM big UNION SELECT k FROM big2"));
+    plans.push_back(f.lowered("SELECT k FROM big"));
+    auto const start  = std::chrono::steady_clock::now();
+    auto const errors = distribute(plans, c, f);
+    // Not the shape all-gather's own timeout, which is minutes.
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{60});
+    CHECK_THAT(errors[0],
+               Catch::Matchers::ContainsSubstring("distributed execution does not support"));
+    CHECK_THAT(errors[1], Catch::Matchers::ContainsSubstring("failed on rank 0"));
+    CHECK_THAT(errors[1],
+               Catch::Matchers::ContainsSubstring("distributed execution does not support"));
+  }
+  // Both ranks retired the query: their exchanges keep nothing of it, so a receiver attached now
+  // is not failed, as one of a query that was only aborted would be.
+  struct recording : sirius::exchange::inbound {
+    bool failed = false;
+    void on_batch(rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>) override {}
+    void on_end(rank_t) override {}
+    void on_error(std::exception_ptr) override { failed = true; }
+  };
+  auto const late_stream = sirius::exchange::make_stream_id(7, 1000);
+  for (rank_t r = 0; r < 2; ++r) {
+    auto const late = std::make_shared<recording>();
+    c.all[r].service->attach(late_stream, late);
+    CHECK_FALSE(late->failed);
+    c.all[r].service->detach(late_stream);
+  }
+  // The next query plans on both ranks.
+  auto plans = plan_on_every_rank(f, "SELECT k FROM big", 2);
+  CHECK(distribute(plans, c, f, {}, 8) == std::vector<std::string>(2));
 }
 
 TEST_CASE("distribute_plan fails on every rank when the ranks planned differently",

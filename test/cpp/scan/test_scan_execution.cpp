@@ -832,7 +832,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   discovery.positional_delete_files.push_back(directory.file("deletes.parquet"));
   // Exercise the real V2 eager loader with unsorted, duplicate negative and valid
   // positions before either visibility implementation sees the sorted list.
-  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx, {}, discovery);
+  auto payload = load_delete_payload(*con->context, "split-ranges", ioctx, discovery);
   REQUIRE(payload);
   REQUIRE(payload->positional_deletes.at(path) == std::vector<int64_t>{-3, -1, -1, 11, 11});
   auto info                 = std::make_unique<iceberg_ingestible_table_info>();
@@ -1025,7 +1025,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     }
     iceberg_delete_discovery discovery;
     discovery.positional_delete_files.push_back(directory.file(delete_name));
-    auto payload = load_delete_payload(*con->context, delete_name, ioctx, {}, discovery);
+    auto payload = load_delete_payload(*con->context, delete_name, ioctx, discovery);
     REQUIRE(payload);
     REQUIRE(payload->positional_deletes.size() == paths.size());
     for (std::size_t file = 0; file < paths.size(); ++file) {

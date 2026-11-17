@@ -9,8 +9,7 @@ machine up and then uses the script below.
 
 One script starts a gateway and one rank per GPU, on one machine or on several, sends the SQL
 through the client, and stops everything. CPU fallback is off: a query Sirius cannot run on the
-GPU fails. Every step below was run from an empty account on 2026-11-10, on one machine and on
-two (8 ranks).
+GPU fails. Steps 3 to 6 were run on 2026-11-10 at SF100, on one machine and on two (8 ranks).
 
 ## 1. Requirements
 
@@ -27,7 +26,7 @@ export CHECKOUT=<where the checkout goes> DATA=<the dataset> OUT=<a new run fold
 git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
 cd "$CHECKOUT" && git submodule update --init --depth=1 --jobs 5 \
   duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-pixi run build-distributed            # once: NIXL, Sirius with NIXL, the gateway
+pixi run build-distributed            # once: Sirius and the gateway
 ```
 
 The three paths must be absolute. The build takes 35 to 40 minutes on 144 cores. `pixi run` may
@@ -81,8 +80,8 @@ sirius:
 EOF
 ```
 
-This is the SF10000 config of [Config](distributed-experiments.md#config), which also explains
-the keys and has the one for larger scales. It runs SF100 unchanged.
+The config was tuned at SF10000 on GB200 nodes with 4 ranks each, and runs SF100 unchanged;
+[Configuration](configuration.md) explains the keys.
 
 `run.sql` creates a view per table and runs each query twice, here five queries:
 
@@ -106,8 +105,7 @@ q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
 
 Start narrow: the few queries the question is about. "Cold" is a query's first run, "warm" the
 second; the first query of a script is slower still, so keep the query order when comparing
-runs. On a machine other people use, repeat a run before quoting it: the same query took 6.4 to
-9.5 s across runs here.
+runs. On a machine other people use, repeat a run before quoting it.
 
 ## 5. Run
 
@@ -117,8 +115,7 @@ Save this script as `$OUT/run.sh`. One run of it is one arm, with fresh ranks.
 : "${CHECKOUT:?} ${DATA:?} ${OUT:?}"                      # exported, absolute paths
 NODES=""                                                  # other machines, as "node2 node3": see More machines
 export SIRIUS_CLUSTER=bench SIRIUS_GATEWAY_MIN_RANKS=4    # the ranks of all machines together
-export SIRIUS_CONFIG_FILE=$OUT/config.yaml SIRIUS_RANK_LOG_ROOT=$OUT/rank-logs
-export SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1 SIRIUS_GATEWAY_STATEMENT_TIMEOUT=300
+export SIRIUS_CONFIG_FILE=$OUT/config.yaml
 export SIRIUS_GATEWAY_JOIN_WAIT=120                       # seconds the first statement waits for the ranks
 state=$HOME/.sirius/gateways/$SIRIUS_CLUSTER
 if ss -ltn | grep -E ':(9494|950[0-9]|2700[0-9]) '; then   # an old gateway or rank, or another user's
@@ -162,13 +159,13 @@ seconds.
 
 | File in `$OUT` | What |
 |---|---|
-| `client.txt` | For each run: the marker, the answer, then the query's `Run Time` (the second after the marker). Lines end in CR. Large when a query returns many rows: 423 MB with Q11 at SF10000 |
-| `rank-logs/<host>-<port>/` | One Sirius log per rank. They contain the gateway's token: remove it before sharing them |
+| `client.txt` | For each run: the marker, the answer, then the query's `Run Time` (the second after the marker). Lines end in CR. Large when a query returns many rows |
 | `node.out`, `node-<machine>.out`, `gateway.out` | Launch output: `registered with the gateway`, `rank exited` |
 | `env.txt` | The commit |
 
-Launch files also stay in `/tmp/sirius_node_<user>_bench` and `/tmp/sirius_gateway_<user>_bench`
-(each rank's `rank.log`, and the token): delete them when done.
+Each rank's output is in `/tmp/sirius_node_<user>_bench/rank_<port>/rank.log` on its machine.
+That folder and `/tmp/sirius_gateway_<user>_bench` hold the gateway's token: delete them when
+done.
 
 ## 6. Check the result
 
@@ -176,14 +173,9 @@ Launch files also stay in `/tmp/sirius_node_<user>_bench` and `/tmp/sirius_gatew
 grep -c "Error" "$OUT/client.txt"                                   # 0
 grep -c ",up,ready," "$OUT/client.txt"                              # the number of ranks
 nvidia-smi --query-compute-apps=pid --format=csv,noheader           # nothing: every rank is gone
-grep -h "exchange: rank .* -> rank" "$OUT"/rank-logs/*/sirius_*.log |
-  grep -c "NIXL over the NVLink fabric"                             # ranks x (ranks - 1): 12 with 4
 tr -d '\r' < "$OUT/client.txt" |                                    # seconds per run
   awk '/^Q[0-9]+ run [12]$/ { q = $0; n = 0 } /^Run Time/ && q != "" && ++n == 2 { print q, $5; q = "" }'
 ```
-
-Fewer `NIXL over the NVLink fabric` lines than that means a pair of ranks exchanges over the
-network.
 
 Then compare every answer with an independent engine on the same data. The build's shell,
 started without Sirius, is a plain DuckDB on the CPU:
@@ -196,16 +188,24 @@ python3 scripts/compare_answers.py "$OUT/client.txt" --ref-client "$OUT/ref.txt"
 ```
 
 It prints one line per run and exits 1 unless every run is `match` or `match up to a LIMIT
-tie`. Rows compare in any order, numbers within `1e-6` relative or `0.01` absolute; a text
+tie`; a query the reference has and the run does not is `NOT RUN`, and also exits 1. Rows
+compare in any order, numbers within `1e-6` relative or within the rounding of the one printed
+with fewer decimals (at most `0.01`); a text
 `diff` does not work, because float digits and the order of equal rows differ. Q3 and Q18 end
 in `ORDER BY ... LIMIT` and may return different rows that tie at the cut: `--ties` names their
 order columns. At SF10000 the plain DuckDB needs about 15 minutes for 22 queries and 1 TB of
 memory; with answers kept as one CSV file per query, use `--ref-dir DIR --ref-pattern
 "q{n:02d}.csv"` instead of `--ref-client`.
 
-Report the dataset's layout with every number
-([Dataset layout](distributed-experiments.md#check-the-run); run its query in the plain DuckDB),
-and what [Report](distributed-experiments.md#report) lists.
+With every number, report the commit (`env.txt`), the config, the machines, the dataset and its
+lineitem layout, cold and warm seconds per query, and how the answers were checked. Row-group
+size changes scan times by 2x and more; in the plain DuckDB:
+
+```sql
+SELECT count(DISTINCT file_name) AS files, count(*) AS row_groups, median(row_group_num_rows) AS rows
+FROM (SELECT DISTINCT file_name, row_group_id, row_group_num_rows
+      FROM parquet_metadata('<DATA>/lineitem/*.parquet'));
+```
 
 ## Variations
 
@@ -234,10 +234,8 @@ and what [Report](distributed-experiments.md#report) lists.
 | A `FAIL` line from the node check | The line under it names the fix |
 | `client.txt`: `the gateway starts once 4 ranks are registered ...; 3 are` | Fewer ranks than `SIRIUS_GATEWAY_MIN_RANKS` joined within `SIRIUS_GATEWAY_JOIN_WAIT`. `rank exited` in `node.out` means a rank dies at start (usually the config): read `/tmp/sirius_node_<user>_bench/rank_<port>/rank.log` |
 | The script was killed with `kill -9` | Its gateway and ranks still run and hold the GPUs: [stop them](#stop-what-a-killed-run-left) |
-| A statement hangs | The statement timeout (300 s here) cancels it and the next statement restarts the ranks |
-
-Failures of the queries themselves (ranks killed mid-query, Q3 and Q18 ties, Q11's fraction) are
-in [Known failures](distributed-experiments.md#known-failures).
+| Q3 or Q18 differ from the reference | A LIMIT tie: name the query's order columns with `--ties` |
+| Q11 returns no or too few rows | `frac` in step 4 must be `0.0001 / SF` |
 
 ### Stop what a killed run left
 

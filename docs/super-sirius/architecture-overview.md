@@ -58,7 +58,7 @@ SiriusContext
 
 Key lifecycle methods on `SiriusContext`:
 - `initialize()` — initializes all subsystems with config
-- `terminate()` — releases all resources
+- `release_resources()` — releases all resources
 - `QueryBegin()` / `QueryEnd()` — DuckDB query lifecycle hooks
 - `create_query()` — returns an execution-owned query with pipeline metadata
 - `StandaloneQueryScope` — owns admission and query-specific registration/retirement

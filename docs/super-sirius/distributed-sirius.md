@@ -17,7 +17,8 @@ SELECT ...;                               -- the same statement on every rank
 Without `sirius_exchange_peers`, nothing here applies and queries run in one process as before.
 
 To set up the ranks, the [gateway](distributed-gateway.md) and a client on several machines, see
-the [distributed quick start](distributed-quickstart.md).
+the [distributed quick start](distributed-quickstart.md). To have the ranks read Parquet through
+GPUDirect Storage, see the [GDS runbook](gds-runbook.md).
 
 ## Contents
 
@@ -134,9 +135,29 @@ only then passes the write's own notification to the transport. Credits are unch
 frame is reused only after the transport has copied its receive frame out.
 `SET sirius_exchange_host_staging = 'always'` (or `'never'`) overrides the choice (default `auto`). Each rank logs
 its path to every peer at start. Staging maps the peer's mirror from this host's `/dev/shm`, so it
-works only between ranks on one host that share `/dev/shm`; ranks on several hosts, or in separate
-IPC namespaces, need `never` until #2372. A rank that crashes leaves its mirror in `/dev/shm`;
-the launchers in `scripts/` remove mirrors whose process is gone before they start.
+works only between ranks on one host that share `/dev/shm`; ranks in separate IPC namespaces on one
+host need `never`. A rank that crashes leaves its mirror in `/dev/shm`; the launchers in
+`scripts/` remove mirrors whose process is gone before they start.
+
+**TCP lanes.** Between hosts, UCX's TCP transport moves host memory directly but emulates a put of
+GPU memory, at about 0.2 GB/s, and one TCP connection is bound by the core that copies its socket.
+The hello therefore also carries the host's kernel boot id, and with `auto` a rank reaches a peer
+with another boot id, which the NVLink fabric does not reach (below), over *lanes*: extra NIXL agents, each with its own UCX worker, connection and
+thread, pinned to the CPUs NVML places next to the GPU. A lane's metadata travels in a notification
+of the main agent, so lanes need no listener ports. A lane initiates its own writes, into the
+peer's lane of the same number, not through the writer agent. Each lane owns pinned send slots of
+one frame, so the transport sends such a peer one frame per write instead of a run of frames.
+A write copies the frame device-to-host into a free slot (the send frame is then free), and the
+lane thread writes the slot into the peer's receive mirror; the peer lands it as a host-staged
+write. A rank makes its mirror, if it has none yet, when it first chooses this path for a peer.
+`sirius_exchange_tcp_lanes` sets the lanes per rank (default 16 shared by the ranks on the host,
+at least 2), and `sirius_exchange_recv_frames_per_peer` the frames a peer may have in flight (a
+lane carries one). Every rank must use the same `sirius_exchange_host_staging` and
+`sirius_exchange_mnnvl`; a rank offered
+lanes by a peer it reaches another way fails to connect, saying so. On gcn-17/gcn-18 over one
+200 Gb/s port (`[nixl_bandwidth]`, 16 receive frames per peer), 1+1 ranks with 16 lanes moved
+19.0 GB/s each way instead of 0.19, and 4+4 ranks with 4 lanes about 10 GB/s per rank, 23 GB/s
+across the link each way; raw TCP reaches 24.75 there.
 
 ### NVLink between nodes (MNNVL)
 
@@ -153,8 +174,8 @@ fails.
 The hello also carries whether the receive ring is in fabric memory and the GPU's NVLink domain:
 the cluster UUID and clique id from NVML's fabric info (`nvidia-smi -q`, section Fabric). A peer
 whose GPU is in this GPU's domain, both rings in fabric memory, gets the path "NIXL over the
-NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`); every other peer gets the path
-it had before. `require` fails at connect for a peer that cannot be reached that way.
+NVLink fabric" (`choose_path()` in `src/exchange/path_choice.*`), on this host or another; every
+other peer gets the path described above (TCP lanes to another host). `require` fails at connect for a peer that cannot be reached that way.
 
 UCX picks its transport per endpoint and says nothing when `cuda_ipc` cannot map a peer's memory.
 So after connecting, a rank times one write, as large as the transport's largest, to each peer on
@@ -216,7 +237,11 @@ arrived. It is used three ways:
   sorted sample, and every rank merges them all in rank order. From the same global sample each
   rank derives the same world − 1 range boundaries for the exchange after it, and its own
   `SORT_PARTITION` boundaries from inside its range. A rank with no input still runs its boundary
-  task (`runs_without_input()`), since the others wait for it.
+  task (`runs_without_input()`), since the others wait for it. `distribute_plan()` sets a
+  `sample_all_gather_boundaries` on the plan's `SORT_SAMPLE` (`set_cross_rank_boundaries()`),
+  which the operator asks for its boundaries instead of cutting its own sample. It cannot be set
+  again once the boundary task is claimed. It waits up to 10 minutes for the other ranks' samples,
+  keeps what it gathered for a retry of the task, and frees it once the boundaries are made.
 - **The plan-shape check** (below).
 - **The Bloom merge** (below).
 
@@ -281,32 +306,67 @@ Running such an operator on each rank's share would return a wrong answer.
 - **Plan-shape check.** Before running, every rank all-gathers a hash of its plan's shape, and
   every rank fails the query if any differs.
 
+### Adding a distributed behaviour
+
+A distributed plan holds the single-process operators and the two exchange operators, and nothing
+else. Where an operator needs the other ranks in the middle of its work, it asks an interface:
+
+| Operator | Interface (no `exchange/` include) | Across ranks (`src/op/distributed/`) |
+|---|---|---|
+| `SORT_SAMPLE` | `cross_rank_sort_boundaries` | `sample_all_gather_boundaries` |
+| `HASH_JOIN`'s filter publisher | `cross_rank_filter_merge` | `bloom_all_gather_merge` |
+
+- The interface sits beside its operator and speaks of samples, filters and processes, not ranks
+  or streams. With none set, the operator runs as in one process.
+- The implementation holds the `exchange_service` and its stream ids.
+- Only `distribute_plan()` builds one and sets it, through one call per hook
+  (`install_sort_boundaries()`, `install_filter_merge()`), and it adds to the plan shape there.
+- Two hooks on every operator cover the rest: `add_finalize_listener()` (act when an operator's
+  pipeline ends) and `runs_without_input()` (a task owed with no input).
+
+A new behaviour adds an implementation, an interface if its operator has none that fits, and a
+case in `distribute_plan()`: not an operator class.
+
 ## Dynamic filters across ranks
 
 After a join's exchange, a rank's build holds only its share of the keys, so a filter from it
 alone would drop rows another rank's build matches. In distributed mode a publishing join
-carries a `distributed_merge`. Every rank then:
+carries a `cross_rank_filter_merge` (`bloom_all_gather_merge` in `src/op/distributed/`) and a
+publication policy every rank shares (`merged_bloom_policy`). Every rank then:
 
-1. builds a Bloom of one size for each key, from the plan's build estimate clamped to
-   [2^16, 2^30] keys;
+1. builds a Bloom for each key, sized for its own build rows times the number of ranks (a
+   hash-exchanged build holds about one part in that many of the keys), within [2^16, 2^30]
+   keys, as a power-of-two number of blocks;
 2. all-gathers it with a header (key rep, family, scale, size);
-3. ORs the others into its own, and publishes it.
+3. folds its own onto the smallest size any rank sent, ORs the others into it, and publishes it.
 
-A key whose filters cannot all be merged publishes nothing: a rank sent none, a header differs,
-or a rank missed the 2-minute wait. IN-lists and zone maps are not published in distributed mode.
+The plan's build estimate does not size the Bloom: TPC-H Q21 at SF10000 estimated 120 M keys for
+a build of about 1 B, and its merged Bloom kept 98% of `lineitem`. Ranks with nearby row counts
+pick the same size; when a power of two lies between them, each run of blocks of a larger Bloom
+is ORed into one block of the smallest, which gives the smaller Bloom over the same keys.
+
+A key whose filters cannot all be merged publishes nothing: a rank sent none, a header's kind
+differs, a size does not fold onto the smallest, or a rank missed the 2-minute wait. IN-lists and
+zone maps are not published in distributed mode.
 
 A build split into several partitions accumulates its Bloom from every batch instead, and merges
-it the same way, at the same size, so a rank on either path merges with the others.
+it the same way, sized by the same rule, so a rank on either path merges with the others.
 `max_dynamic_filter_bloom_bytes_per_gpu` does not cut a distributed Bloom: the merged filter holds
 every rank's keys, and one cut far below them passes almost every probe row. Right semi and anti joins plan no
-BUILD_FILTER stage in distributed mode, so they publish nothing.
+BUILD_FILTER stage in distributed mode (`distribute_plan()` removes it), so they publish nothing.
 
 A rank with an empty build still merges, contributing an empty Bloom. A rank
 that never saw a whole build joins each key's all-gather without a filter, so the others drop
 that key at once instead of waiting out the timeout. It does so as soon as its build side ends
-(the build `CONCAT` closes the join's publication), before its probe side runs, and without
+(a finalize listener on the build `CONCAT` closes the join's publication), before its probe side runs, and without
 waiting (`leave_all_gather`): a rank holding build rows holds its probe side until the merge
 completes, and that probe side may be what the other rank's probe waits on.
+
+These rules are the publication policy that `merged_bloom_policy()` gives a merged join:
+`bloom_only` (no IN-lists), `bloom_rows_scale` (each rank's Bloom is sized for its rows times the
+ranks, uncapped) and
+`publish_when_empty_or_drained` (an empty build or drained targets still take part). With one
+rank, all three keep their defaults and the publisher behaves as on one GPU.
 
 A join whose build is broadcast publishes from its whole build, as on one GPU, with nothing to
 merge. A join that hashes both sides and whose estimated build is under 2^14 rows publishes no
@@ -323,39 +383,21 @@ connects it. Once it is connected, none of the settings can change, on any conne
 `enable_duckdb_fallback = false` on every rank: one rank falling back to the CPU alone would
 return a wrong answer.
 
-NIXL is an optional build dependency, linked from an out-of-tree install. One command installs
-it when missing and builds Sirius with it, and the [gateway](distributed-gateway.md):
+Every Sirius build includes the NIXL fabric (NIXL with its UCX backend, built with Sirius), so a
+distributed query needs no extra build option or runtime path. One command builds Sirius and the
+[gateway](distributed-gateway.md):
 
 ```bash
 pixi run build-distributed
 ```
 
-It runs `scripts/install_nixl.sh`, which builds NIXL (its core and UCX plugin, at the commit the
-exchange is tested with) against the pixi environment's UCX and installs it in
-`~/.sirius/nixl/<commit>` (`NIXL_PREFIX` sets another prefix), skipping an install whose UCX
-plugin still resolves its libraries. It lists the files it installs in
-`<prefix>/.sirius-install-nixl` and marks a finished install with
-`<prefix>/.sirius-install-nixl-done`. To reinstall, it removes only the listed files, never the
-whole prefix, and it refuses a prefix holding files it did not write. `build-distributed` then
-reconfigures the release build with `-DSIRIUS_WITH_NIXL=ON`, builds it, and builds the gateway.
-
-Configure takes NIXL from `SIRIUS_NIXL_PREFIX`, else `$NIXL_PREFIX`, else
-`scripts/install_nixl.sh --print-prefix`, and fails with a pointer to `install_nixl.sh` when
-there is no NIXL there or its UCX plugin no longer finds UCX. The build directory caches the
-resolved prefix, so a later `NIXL_PREFIX` does not move it: run `pixi run build-distributed`
-again (it passes an empty `-DSIRIUS_NIXL_PREFIX=` so configure resolves it again), or configure
-with `-DSIRIUS_NIXL_PREFIX=<prefix>`. `libsirius` has NIXL's library directory in its RPATH, so
-the ranks need no `LD_LIBRARY_PATH`.
-
-Without NIXL, a distributed query fails with "needs a Sirius built with -DSIRIUS_WITH_NIXL=ON".
-
-`scripts/nixl_env.sh` holds the defaults every launcher sources. A value you export first wins.
+`scripts/launcher_env.sh` holds the defaults every launcher sources. A value you export first wins.
 
 | Variable | Default | Why |
 |---|---|---|
 | `UCX_TLS`, `UCX_NET_DEVICES` | `all` on the GPU rail NICs, if the host has them; else `cuda_copy,cuda_ipc,tcp,self` | Rail NICs (`sirius_rail_devices` in `scripts/sirius_net.sh`: active RDMA ports in no bond, at the highest link speed) carry UCX's notifications over RC, which the exchange over NVLink needs at full speed: 4 GPU pairs both ways moved 5.9 TB/s, against 5.2 with tcp on bond0. `UCX_NET_DEVICES=rails` asks for them. Without rail NICs, the transports tested on one host and on two. Left to itself, UCX also picks the host's InfiniBand ports, and on multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout") |
+| `UCX_RCACHE_ENABLE` | `n` unless `UCX_TLS` is `all` | Without the InfiniBand transports nothing drains the list where UCX 1.21's registration cache queues every freed GPU buffer, and each free walks that list under one lock: the join after TPC-H Q14's exchange took 12 s instead of under 1 s. With a `UCX_TLS` list of your own that has `rc`, `dc` or `ud` in it, export `UCX_RCACHE_ENABLE=y` |
 | `DUCKDB_AGENT_MODE` | 0 | DuckDB changes its output when an AI coding tool runs it; the ranks and the scripts parse that output |
-| `NIXL_PREFIX` | unset | Optional: only for a build whose RPATH does not find NIXL. When set, NIXL's libraries (and `UCX_PREFIX`'s UCX, if set) go ahead of the pixi environment's UCX on `LD_LIBRARY_PATH`, and `NIXL_PLUGIN_DIR` points at NIXL's plugins |
 
 ## Running TPC-H Q12 on 4 GPUs
 
@@ -411,24 +453,36 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
   rank's contribution arrives (#2375).
 - **Failures:** a query that fails on one rank (an error, an exhausted retry) is aborted on every
   rank: the rank tells its peers (`exchange_service::abort`), and each fails that query's sources
-  and all-gathers at once instead of waiting; the next query runs normally. A lost peer or a
-  failed transport is fail-stop: every later distributed query fails, saying the transport failed
-  earlier, and nothing reconnects. To recover, restart every rank: a restarted rank alone cannot
-  reconnect to peers whose transport failed, and its `SET sirius_exchange_rank` fails after the
-  2-minute connect timeout (#2373). The [gateway](distributed-gateway.md) does this restart.
+  and all-gathers at once instead of waiting; the next query runs normally. A query whose
+  execution window fails in `begin_execution_window()` is aborted the same way and retired on
+  that rank (`distributed_session::fail_window_begin`), and so is one whose `distribute_plan()`
+  throws after the query was numbered. A failure before the query is numbered tells no peer.
+  A statement that fails after it was planned and before its window is tied to its query is
+  not aborted either, and its peers wait out their timeouts: one cancelled
+  or refused while it waits for admission, or a prepared statement whose window fails to begin.
+  A lost peer or a failed transport is fail-stop: every later distributed query fails, saying
+  the transport failed earlier, and nothing reconnects. To recover, restart every rank: a
+  restarted rank alone cannot reconnect to peers whose transport failed, and its
+  `SET sirius_exchange_rank` fails after the 2-minute connect timeout (#2373). The
+  [gateway](distributed-gateway.md) does this restart.
 - **Hosts:** two hosts, one GPU each, ran TPC-H Q12 at SF100 through the gateway, with UCX on
   TCP (`UCX_TLS` with `tcp`, `UCX_NET_DEVICES` set to the hosts' shared interface). The launch
-  scripts set both by default: `UCX_TLS` in `nixl_env.sh`, and `UCX_NET_DEVICES` from the
-  rank's address ([quick start](distributed-quickstart.md)).
-  More than two hosts, and RDMA between hosts, are untested (#2372).
-- **Credits:** each peer gets a fixed share of the receive ring (8 frames of 8 MiB by default).
+  scripts set both by default (`launcher_env.sh`, [quick start](distributed-quickstart.md)): the
+  GPU rail NICs with every UCX transport on a host that has them, else `tcp` on the interface of
+  the rank's address.
+  Between nodes of one NVLink domain the data goes over the
+  [NVLink fabric](#nvlink-between-nodes-mnnvl), which two and four GB200 nodes with 4 GPUs each
+  ran for all of TPC-H at SF30000, and between other hosts over TCP lanes (#2372).
+- **Credits:** each peer gets a fixed share of the receive ring (16 frames of 16 MiB by
+  default: `sirius_exchange_recv_frames_per_peer`, `sirius_exchange_frame_bytes`).
   Clusters much larger than 8 ranks would need credits granted on demand (#2371).
-- **Ring memory:** the rings take (16 + 8 x (ranks - 1)) x 8 MiB per GPU (192 MiB at 2 ranks,
-  576 MiB at 8), allocated outside the GPU memory space's budget, which does not shrink for
-  them. Reserving them from the space instead stalls any task whose request is clamped to the
+- **Ring memory:** by default the rings take (32 + 16 x (ranks - 1)) x 16 MiB per GPU (768 MiB
+  at 2 ranks, 2.25 GiB at 8), allocated outside the GPU memory space's budget, which does not
+  shrink for them. A rank on the TCP lanes path also pins, in host memory, a mirror the size of
+  its receive ring and two send slots of one frame per lane. Reserving them from the space instead stalls any task whose request is clamped to the
   space's whole budget, so charging them waits for the budget to shrink with them (#2371).
-- **CI:** no CI job builds with `-DSIRIUS_WITH_NIXL=ON`, so the NIXL fabric and the
-  `[exchange][nixl]` tests run only on developer machines.
+- **CI:** the one-rank-per-process tests (`[nixl_multiprocess]`) need several GPUs and run only on
+  developer machines (#2480).
 
 ## Tests
 
@@ -439,7 +493,11 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `[exchange][operators]` | Hash, range, broadcast, gather, ordered gather, early arrivals, hints, failure; NULL keys to every rank; `VALUES` on rank 0 |
 | `[exchange][byte_range]` | Byte spans tile every file exactly once across ranks; one file split in two; balance by bytes |
 | `[exchange][collectives]` | All-gather; distributed `SORT_SAMPLE` on skewed and empty inputs; `SORT_SAMPLE` feeding a range exchange |
-| `[exchange][nixl]` | Two ranks in one process over NIXL (NIXL builds only; CI does not build NIXL yet) |
+| `[exchange][planner]` | The plan rewrite: where exchanges go, refusals, the plan-shape check, a rank whose planning fails |
+| `[exchange][distributed_session]` | The session: query numbering, windows tied to queries, connecting, a window that fails to begin |
+| `[planner][one_rank_parity]` | One configured peer plans and runs like none |
+| `[pipeline][finalize_listener]` | The callbacks run when an operator's pipeline ends |
+| `[exchange][nixl]` | Two ranks in one process over NIXL |
 | `[nixl_multiprocess]` (hidden) | One rank per process and GPU: `pixi run scripts/distributed_test_nixl.sh 4` |
 | `[exchange][path]` | The path rule (NVLink domain, fabric rings, staging, `require`); a frame ring in fabric memory |
 | `[nixl_bandwidth]` (hidden) | All-to-all bandwidth, one rank per process: `TEST='[nixl_bandwidth]' scripts/distributed_test_nixl.sh 4` |
@@ -454,10 +512,10 @@ which every rank reads from the same shared storage, so 4 GPUs are no faster tha
 | `src/exchange/transport.*`, `messages.*` | Credits, landing, end of stream, failure |
 | `src/exchange/fabric.*`, `nixl_fabric.*` | Rings; the NIXL fabric and its start-up |
 | `src/exchange/exchange_service.*`, `exchange_runtime.*`, `all_gather.*` | A process's exchange; collectives |
+| `src/exchange/distributed_session.*` | A process's distributed state: its exchange, query numbering, each window's query, abort and retire. `SiriusContext` creates it at the first distributed use; a process that runs none has none |
 | `src/op/sirius_physical_exchange_{sink,source}.*` | The operators |
-| `src/op/sirius_physical_sort_sample.*` | Distributed sampling |
-| `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check |
-| `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | Bloom merge across ranks |
+| `src/op/cross_rank_sort_boundaries.hpp`, `src/op/distributed/sample_all_gather_boundaries.*` | `SORT_SAMPLE`'s boundary interface; boundaries from every rank's sample |
+| `src/planner/distributed_plan.*` | The plan rewrite and plan-shape check; each rank's share of a table's files, and the scans no rank can split |
+| `src/op/dynamic_filter/cross_rank_filter_merge.hpp`, `src/op/distributed/bloom_all_gather_merge.*` | The publisher's merge interface; the Bloom merge across ranks |
 | `scripts/distributed_run_sql.sh`, `distributed_test_nixl.sh` | Launchers on one host |
-| `scripts/nixl_env.sh` | Defaults every launcher sources: `UCX_TLS`, `DUCKDB_AGENT_MODE`, and NIXL's paths when `NIXL_PREFIX` is set |
-| `scripts/install_nixl.sh` | Builds and installs NIXL for `-DSIRIUS_WITH_NIXL=ON`; `pixi run build-distributed` runs it |
+| `scripts/launcher_env.sh` | Defaults every launcher sources: `UCX_TLS`, `DUCKDB_AGENT_MODE` |

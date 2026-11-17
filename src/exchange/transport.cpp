@@ -212,6 +212,8 @@ struct transport::engine {
     std::optional<std::uint64_t> expected;
   };
   std::map<std::pair<rank_t, stream_id>, stream_end> ends;
+  /// Ends in `ends` that promised more batches than were delivered so far: work a peer owes.
+  std::size_t owed_ends{0};
   std::vector<bool> recv_in_use;
   std::vector<std::vector<std::uint32_t>> credits_back;
 
@@ -274,7 +276,8 @@ struct transport::engine {
     for (auto const& p : out) {
       if (p.current) { return true; }
     }
-    return false;
+    // A peer that ended a stream sends its batches before the end, so they are in flight or lost.
+    return owed_ends > 0;
   }
 
   // ---- receiving -----------------------------------------------------------------------------
@@ -416,7 +419,9 @@ struct transport::engine {
       } catch (...) {
         fail_query(stream, std::current_exception());
       }
-      ++ends[{from, stream}].delivered;
+      auto& end = ends[{from, stream}];
+      ++end.delivered;
+      if (end.expected && end.delivered == *end.expected) { --owed_ends; }
       check_end(from, stream);
     }
     for (rank_t peer = 0; peer < credits_back.size(); ++peer) {
@@ -454,12 +459,15 @@ struct transport::engine {
         progress = true;
         continue;
       }
-      // Each staged run is up to max_write_frames consecutive send frames; post() writes it in
-      // as few writes as the peer's consecutive credits allow.
+      // Each staged run is up to max_write_frames consecutive send frames, and no more than the
+      // fabric writes to this peer at once (a TCP lane carries one frame); post() writes it in as
+      // few writes as the peer's consecutive credits allow.
+      auto const run_frames = static_cast<std::uint32_t>(
+        std::clamp<std::size_t>(fab.max_write_bytes(peer) / frame_bytes(), 1, max_write_frames));
       while (p.next_k < p.frames && !free_send.empty() && p.unwritten < credits_per_peer) {
         auto const sends = longest_run(free_send);
-        auto const n     = std::min(
-          {p.frames - p.next_k, max_write_frames, sends.length, credits_per_peer - p.unwritten});
+        auto const n =
+          std::min({p.frames - p.next_k, run_frames, sends.length, credits_per_peer - p.unwritten});
         take(free_send, {sends.first, n});
         auto const& batch = p.current->out;
         auto const at     = static_cast<std::size_t>(p.next_k) * frame_bytes();
@@ -560,7 +568,16 @@ struct transport::engine {
         throw sirius::invalid_input_exception(
           "exchange: rank {} ended stream {} twice", from, e->stream);
       }
+      if (end.delivered > e->batches) {
+        throw sirius::invalid_input_exception(
+          "exchange: rank {} ended stream {} after {} batches, having sent {}",
+          from,
+          e->stream,
+          e->batches,
+          end.delivered);
+      }
       end.expected = e->batches;
+      if (end.delivered < e->batches) { ++owed_ends; }
       check_end(from, e->stream);
     } else if (auto* a = std::get_if<abort_message>(&m)) {
       cb.on_abort(a->query, from, std::move(a->what));
@@ -585,14 +602,20 @@ transport::transport(fabric& fabric,
 
 transport::~transport()
 {
+  stop();
+  // The engine still holds unsent batches, whose deleters use the members declared after it.
+  _engine.reset();
+}
+
+void transport::stop()
+{
   {
     std::lock_guard lock{_mutex};
     _stop = true;
   }
   _room.notify_all();
-  _thread.join();
-  // The engine still holds unsent batches, whose deleters use the members declared after it.
-  _engine.reset();
+  _released.notify_all();
+  if (_thread.joinable()) { _thread.join(); }
 }
 
 rank_t transport::rank() const noexcept { return _engine->fab.rank(); }
@@ -643,10 +666,14 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   std::unique_lock lock{_mutex};
   _room.wait(lock, [&] {
     // A batch larger than the cap goes alone, else it would never fit.
-    return _error || _stop || e.queued_bytes == 0 ||
+    return _error || _stop || _cancelled.contains(query) || e.queued_bytes == 0 ||
            e.queued_bytes + bytes <= e.opts.max_queued_bytes;
   });
   if (_error) { std::rethrow_exception(_error); }
+  // Nothing more is queued for a cancelled query, so its senders do not wait for room that only
+  // its own cleanup frees; nor once stopped, when nothing drains the queues. `held` is dropped
+  // after `lock`, as below.
+  if (_stop || _cancelled.contains(query)) { return; }
   // A copy, not a move: if the push throws, `held` stays the last owner and is dropped after `lock`
   // is released, since its deleter takes _mutex.
   auto& next = e.sent[to][stream];
@@ -667,7 +694,7 @@ void transport::released(distributed_query_id query)
 bool transport::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
   std::unique_lock lock{_mutex};
-  _released.wait_for(lock, timeout, [&] { return !_held.contains(query); });
+  _released.wait_for(lock, timeout, [&] { return _stop || !_held.contains(query); });
   return !_held.contains(query);
 }
 
@@ -695,6 +722,21 @@ void transport::abort(distributed_query_id query, std::string what)
   std::lock_guard lock{_mutex};
   if (_error) { return; }
   _aborts.push_back({query, std::move(what)});
+}
+
+void transport::cancel(distributed_query_id query)
+{
+  {
+    std::lock_guard lock{_mutex};
+    _cancelled.insert(query);
+  }
+  _room.notify_all();
+}
+
+void transport::forget(distributed_query_id first, distributed_query_id last)
+{
+  std::lock_guard lock{_mutex};
+  _cancelled.erase(_cancelled.lower_bound(first), _cancelled.upper_bound(last));
 }
 
 void transport::run()
@@ -778,7 +820,8 @@ void transport::run()
       }
     }
     // Freed now, not at ~transport: wait_sent() lets their query release its memory once they
-    // are gone. send() and close() queue nothing once _error is set.
+    // are gone, and a failed transport is kept until the context ends. send() and close() queue
+    // nothing once _error is set.
     std::vector<std::deque<engine::queued>> queued(e.queues.size());
     {
       std::lock_guard lock{_mutex};
@@ -793,6 +836,11 @@ void transport::run()
       p.current.reset();
     }
     e.staged.clear();
+    // A landing owns its whole batch from its first frame, and nothing completes one now. The
+    // copies into it may still run on the receive stream.
+    e.recv_stream.synchronize_no_throw();
+    e.copies.clear();
+    e.landings.clear();
     _room.notify_all();
     _released.notify_all();
     e.cb.on_error(error);

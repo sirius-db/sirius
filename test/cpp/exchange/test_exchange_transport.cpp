@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -96,9 +97,12 @@ struct forged_peer {
   std::unique_ptr<fabric> fab  = hub.attach(0, send, recv);
   std::unique_ptr<fabric> peer = hub.attach(1, peer_send, peer_recv);
   received got;
-  std::unique_ptr<transport> t =
-    std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got));
+  std::unique_ptr<transport> t;
 
+  explicit forged_peer(transport::options opts = {})
+    : t(std::make_unique<transport>(*fab, send, recv, *env().gpu, env().host, recording(got), opts))
+  {
+  }
   ~forged_peer() { t.reset(); }
 
   void forge(sirius::exchange::message const& m) { peer->notify(0, sirius::exchange::encode(m)); }
@@ -173,6 +177,15 @@ TEST_CASE("one write per frame when a peer has one credit", "[exchange][transpor
 {
   cluster c(2, /*send_frames=*/16, /*recv_frames=*/1);
   all_to_all(c, {1}, 2, 30'000);
+  CHECK(c.hub.largest_write() == 64 * KiB);
+}
+
+TEST_CASE("one write per frame to a peer whose fabric takes a frame at a time",
+          "[exchange][transport]")
+{
+  // As over TCP lanes: 8 credits per peer would allow writes of 4 frames.
+  cluster c(2, 16, 8, {.max_write_bytes = 64 * KiB}, env().host);
+  all_to_all(c, {1, 2}, 3, 30'000);
   CHECK(c.hub.largest_write() == 64 * KiB);
 }
 
@@ -254,6 +267,87 @@ TEST_CASE("send blocks while queued bytes exceed the cap, then delivers everythi
   CHECK(got.batches[{0, 5}].size() == 2);
 }
 
+TEST_CASE("a cancelled query's sender stops waiting for room, and the transport carries on",
+          "[exchange][transport]")
+{
+  // About 1.2 MB a batch against a 64 KiB cap and a receiver with no room: the second send waits
+  // for room that the first never frees.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender           = *c.ranks[0].t;
+  auto& got              = *c.ranks[1].got;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto const query       = sirius::exchange::query_of(stream);
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  {
+    auto const hold = hold_gpu();
+    sender.send(stream, 1, std::move(first));
+    auto blocked =
+      std::async(std::launch::async, [&] { sender.send(stream, 1, std::move(second)); });
+    CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    // The receiver still has no room: only the cancellation can wake the sender.
+    sender.cancel(query);
+    REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    CHECK_NOTHROW(blocked.get());
+    // Nothing more is queued for the query, with or without room in the queue.
+    CHECK_NOTHROW(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
+  }
+  // What was queued before the cancellation still goes, and its end counts only that.
+  sender.close(stream, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 1; }));
+  {
+    std::lock_guard lock{got.mutex};
+    REQUIRE_FALSE(got.error);
+    CHECK(got.batches[{0, stream}].size() == 1);
+  }
+  CHECK(sender.wait_sent(query, std::chrono::seconds{30}));
+
+  stream_id const next = sirius::exchange::make_stream_id(6, 1);
+  sender.send(next, 1, gpu_batch(sample_table(5'000)));
+  sender.close(next, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 2; }));
+  {
+    std::lock_guard lock{got.mutex};
+    REQUIRE_FALSE(got.error);
+    CHECK(got.batches[{0, next}].size() == 1);
+  }
+
+  // Once forgotten, the number carries batches again.
+  sender.forget(query, query);
+  stream_id const again = sirius::exchange::make_stream_id(5, 2);
+  sender.send(again, 1, gpu_batch(sample_table(5'000)));
+  sender.close(again, 1);
+  REQUIRE(got.wait_for([&] { return got.error != nullptr || got.ended.size() == 3; }));
+  std::lock_guard lock{got.mutex};
+  REQUIRE_FALSE(got.error);
+  CHECK(got.batches[{0, again}].size() == 1);
+}
+
+TEST_CASE("a stopped transport wakes a sender waiting for room, which drops its batch",
+          "[exchange][transport]")
+{
+  // As above: the second send waits for room that the first never frees.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender           = *c.ranks[0].t;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto const query       = sirius::exchange::query_of(stream);
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  auto const hold        = hold_gpu();
+  sender.send(stream, 1, std::move(first));
+  auto blocked = std::async(std::launch::async, [&] { sender.send(stream, 1, std::move(second)); });
+  CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+  // The owner shuts down while the sender is still inside the transport.
+  sender.stop();
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  CHECK_NOTHROW(blocked.get());
+  CHECK_NOTHROW(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
+  // The first batch is still queued, and nothing will send it: the wait returns at once.
+  auto const before = std::chrono::steady_clock::now();
+  CHECK_FALSE(sender.wait_sent(query, std::chrono::seconds{30}));
+  CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds{5});
+}
+
 TEST_CASE("a batch with no room asks for it once, and lands once it has it",
           "[exchange][transport]")
 {
@@ -293,6 +387,37 @@ TEST_CASE("a transport that makes no progress for the stall timeout fails both r
                     Catch::Matchers::ContainsSubstring("no progress"));
 }
 
+TEST_CASE("an end whose promised batches never arrive fails the receiver at the stall timeout",
+          "[exchange][transport]")
+{
+  using namespace sirius::exchange;
+  transport::options const quick{.stall_timeout = std::chrono::milliseconds{300}};
+  constexpr stream_id stream = 5;
+  SECTION("one batch promised, none sent")
+  {
+    forged_peer c(quick);
+    c.forge(end_message{stream, 1});
+    c.fails_with("no progress");
+  }
+  SECTION("no batch promised: the stream ends, and an idle transport does not stall")
+  {
+    forged_peer c(quick);
+    c.forge(end_message{stream, 0});
+    REQUIRE(c.got.wait_for([&] { return c.got.ended.size() == 1; }, std::chrono::seconds{30}));
+    CHECK_FALSE(c.got.wait_for([&] { return c.got.error != nullptr; }, std::chrono::seconds{1}));
+  }
+  SECTION("ends that overtake their batches are not a stall")
+  {
+    cluster c(3,
+              3,
+              6,
+              {.shuffle = true, .deliver_every = 5},
+              env().host,
+              {.stall_timeout = std::chrono::seconds{2}});
+    all_to_all(c, {1, 2}, 2, 8'000);
+  }
+}
+
 TEST_CASE("a failed write fails both ranks, and frees the batches the sender held",
           "[exchange][transport]")
 {
@@ -309,6 +434,25 @@ TEST_CASE("a failed write fails both ranks, and frees the batches the sender hel
   CHECK(sender.wait_sent(sirius::exchange::query_of(stream), std::chrono::seconds{5}));
   CHECK_THROWS(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
   CHECK_THROWS(c.ranks[1].t->close(stream, 0));
+}
+
+TEST_CASE("a failed transport frees the batches it was still receiving", "[exchange][transport]")
+{
+  using namespace sirius::exchange;
+  forged_peer c;
+  auto const header = many_frame_header();
+  auto const before = env().gpu->get_available_memory();
+  // Frame 0 of about 19: the batch lands, taking its whole size, and stays incomplete.
+  c.forge(frame_message{5, 0, 0, 0, 64 * KiB, header});
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (env().gpu->get_available_memory() >= before) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  c.forge(error_message{"forged failure"});
+  c.fails_with("forged failure");
+  // The transport is still alive: its failure freed the landing, not its destructor.
+  CHECK(env().gpu->get_available_memory() == before);
 }
 
 TEST_CASE("a transport destroyed right after close and abort still sends them",
@@ -478,13 +622,15 @@ TEST_CASE("a malformed notification from a peer fails the receiver", "[exchange]
   }
 }
 
-TEST_CASE("sirius_exchange_host_staging takes auto, always or never", "[exchange][transport]")
+TEST_CASE("sirius_exchange_host_staging takes auto, always, never or remote",
+          "[exchange][transport]")
 {
   using sirius::exchange::host_staging;
   using sirius::exchange::parse_host_staging;
   CHECK(parse_host_staging("auto") == host_staging::automatic);
   CHECK(parse_host_staging("always") == host_staging::always);
   CHECK(parse_host_staging("never") == host_staging::never);
+  CHECK(parse_host_staging("remote") == host_staging::remote);
   CHECK_THROWS_AS(parse_host_staging(""), sirius::invalid_input_exception);
   CHECK_THROWS_AS(parse_host_staging("Always"), sirius::invalid_input_exception);
 }

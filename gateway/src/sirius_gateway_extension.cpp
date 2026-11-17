@@ -24,6 +24,25 @@ struct gateway_info : TableFunctionInfo {
 };
 
 /// Refuses a value no rank takes, at SET rather than when the ranks start.
+void check_host_staging(ClientContext&, SetScope, Value& parameter)
+{
+  auto const value = StringValue::Get(parameter);
+  if (value != "auto" && value != "always" && value != "never" && value != "remote") {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_host_staging must be auto, always, never or remote, not '%s'",
+      value);
+  }
+}
+
+void check_tcp_lanes(ClientContext&, SetScope, Value& parameter)
+{
+  auto const lanes = UBigIntValue::Get(parameter);
+  if (lanes > 64) {
+    throw InvalidInputException(
+      "sirius_gateway_exchange_tcp_lanes must be 0 (automatic) to 64, not %llu", lanes);
+  }
+}
+
 void check_mnnvl(ClientContext&, SetScope, Value& parameter)
 {
   auto const value = StringValue::Get(parameter);
@@ -411,6 +430,18 @@ void LoadInternal(ExtensionLoader& loader)
                             "SQL each rank's session runs after the exchange settings",
                             LogicalType::VARCHAR,
                             Value(""));
+  config.AddExtensionOption("sirius_gateway_exchange_host_staging",
+                            "sirius_exchange_host_staging for every rank: auto (TCP lanes to "
+                            "other hosts), always, never or remote",
+                            LogicalType::VARCHAR,
+                            Value("auto"),
+                            check_host_staging);
+  config.AddExtensionOption("sirius_gateway_exchange_tcp_lanes",
+                            "sirius_exchange_tcp_lanes for every rank: TCP lanes per rank to "
+                            "other hosts; 0 shares 16 among the ranks of a host",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(0),
+                            check_tcp_lanes);
   config.AddExtensionOption("sirius_gateway_exchange_mnnvl",
                             "sirius_exchange_mnnvl for every rank: auto, require or off put the "
                             "exchange's rings in fabric memory, for NVLink between nodes",
@@ -428,7 +459,8 @@ void LoadInternal(ExtensionLoader& loader)
                             Value::UBIGINT(32),
                             check_frames);
   config.AddExtensionOption("sirius_gateway_exchange_recv_frames_per_peer",
-                            "sirius_exchange_recv_frames_per_peer for every rank",
+                            "sirius_exchange_recv_frames_per_peer for every rank; over TCP lanes, "
+                            "one frame in flight per lane",
                             LogicalType::UBIGINT,
                             Value::UBIGINT(16),
                             check_frames);

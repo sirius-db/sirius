@@ -93,7 +93,7 @@ if [ -n "$gateway" ] && ! [[ $gateway =~ ^[A-Za-z0-9.:-]+:[0-9]+$ && $token =~ ^
 fi
 
 here=$(cd "$(dirname "$0")" && pwd)
-source "$here/nixl_env.sh"
+source "$here/launcher_env.sh"
 source "$here/sirius_net.sh"
 build="$here/../sirius-duckdb/build/release"
 extension="$build/extension/sirius/sirius.duckdb_extension"
@@ -123,22 +123,11 @@ fail()
 
 check_build()
 {
-  local nixl
   if [ ! -f "$extension" ] || [ ! -x "$build/duckdb" ]; then
     fail "no Sirius build at $build" "pixi run build-distributed"
     return
   fi
-  # The rank loads libsirius through the extension; NIXL must resolve in this environment.
-  nixl=$(ldd "$extension" 2>&1 | grep 'libnixl\.so' || true)
-  if [ -z "$nixl" ]; then
-    fail "Sirius is built without NIXL" "pixi run build-distributed"
-  elif [[ $nixl == *"not found"* ]]; then
-    fail "the Sirius build does not find libnixl" \
-      "scripts/install_nixl.sh, then pixi run build-distributed (or export NIXL_PREFIX)"
-  else
-    nixl=${nixl#*=> }
-    pass "Sirius built with NIXL: ${nixl% (*}"
-  fi
+  pass "Sirius build: $build"
 }
 
 check_gpus()

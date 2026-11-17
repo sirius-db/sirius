@@ -29,6 +29,7 @@
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <planner/substrait_scan_ranges.hpp>
 #include <sirius/exception.hpp>
+#include <sirius_context.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -101,13 +102,16 @@ class physical_planner : public sirius::planner::sirius_physical_plan_generator 
   }
 };
 
-/// Plans @p sql as rank 1 of 2 and lowers its scans; returns what lowering threw, or "".
-std::string lowering_error(duckdb::Connection& con, std::string const& sql)
+/// Plans @p sql, as rank 1 of 2 when @p distributed, and lowers its scans; returns what lowering
+/// threw, or "".
+std::string lowering_error(duckdb::Connection& con, std::string const& sql, bool distributed = true)
 {
   REQUIRE_FALSE(con.Query("SET gpu_execution = false")->HasError());
-  // Rank first: with the peers already set, SET sirius_exchange_rank would connect.
-  REQUIRE_FALSE(con.Query("SET sirius_exchange_rank = 1")->HasError());
-  REQUIRE_FALSE(con.Query("SET sirius_exchange_peers = '127.0.0.1:1,127.0.0.1:2'")->HasError());
+  if (distributed) {
+    // Rank first: with the peers already set, SET sirius_exchange_rank would connect.
+    REQUIRE_FALSE(con.Query("SET sirius_exchange_rank = 1")->HasError());
+    REQUIRE_FALSE(con.Query("SET sirius_exchange_peers = '127.0.0.1:1,127.0.0.1:2'")->HasError());
+  }
   REQUIRE_FALSE(con.Query("BEGIN TRANSACTION READ ONLY")->HasError());
   physical_planner planner(*con.context);
   auto plan = planner.plan(con.ExtractPlan(sql));
@@ -177,6 +181,41 @@ TEST_CASE("a distributed plan refuses scans it cannot split", "[planner][distrib
                                 sirius::test::sql_literal(parquet.string()) + ")"),
                Catch::Matchers::ContainsSubstring("a plan that carries its own byte ranges"));
     con.context->registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+  }
+
+  SECTION("without sirius_exchange_peers, the same scans lower as on one process")
+  {
+    REQUIRE_FALSE(
+      con
+        .Query("ATTACH " + sirius::test::sql_literal((scratch.path() / "t.db").string()) + " AS f")
+        ->HasError());
+    REQUIRE_FALSE(con.Query("CREATE TABLE f.t AS SELECT range AS a FROM range(10)")->HasError());
+    CHECK(lowering_error(con, "SELECT sum(a) FROM f.t", false).empty());
+    CHECK(lowering_error(con,
+                         "SELECT sum(k) FROM sirius_read_parquet(" +
+                           sirius::test::sql_literal(parquet.string()) + ")",
+                         false)
+            .empty());
+    CHECK(lowering_error(con,
+                         "SELECT file_index, count(*) FROM read_parquet(" +
+                           sirius::test::sql_literal(parquet.string()) + ") GROUP BY 1",
+                         false)
+            .empty());
+    std::map<std::string, std::vector<sirius::planner::scan_byte_range>> ranges;
+    ranges[parquet.string()] = {{0, 100}};
+    con.context->registered_state->Insert(
+      sirius::planner::scan_byte_ranges_state::kStateKey,
+      duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+    CHECK(lowering_error(
+            con,
+            "SELECT sum(k) FROM read_parquet(" + sirius::test::sql_literal(parquet.string()) + ")",
+            false)
+            .empty());
+    con.context->registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+    // Nothing distributed ran, so this process has no distributed session to pay for.
+    auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(ctx);
+    CHECK(ctx->distributed() == nullptr);
   }
 }
 

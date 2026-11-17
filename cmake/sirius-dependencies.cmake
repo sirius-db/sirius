@@ -19,6 +19,11 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+if(VCPKG_BUILD)
+  find_package(nixl 1.5.2 EXACT CONFIG REQUIRED)
+else()
+  include(${CMAKE_CURRENT_LIST_DIR}/sirius-nixl-build.cmake)
+endif()
 
 # The static vcpkg build only exports cuvs::cuvs_static; shared cuvs packages
 # already provide cuvs::cuvs. Provide the canonical name when it is missing so
@@ -75,25 +80,6 @@ else()
     set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
                                                 "${cuco_SOURCE_DIR}/include")
   endif()
-endif()
-
-# CTrack is retained as an opt-in profiling dependency.
-if(BUILD_WITH_CTRACK)
-  # --- ctrack (profiling instrumentation) --- #
-  include(FetchContent)
-  FetchContent_Declare(
-    ctrack
-    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
-    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
-    SOURCE_SUBDIR do-not-build)
-  FetchContent_MakeAvailable(ctrack)
-  if(NOT TARGET ctrack::ctrack)
-    add_library(ctrack::ctrack INTERFACE IMPORTED)
-    set_target_properties(
-      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                "${ctrack_SOURCE_DIR}/include")
-  endif()
-
 endif()
 
 if(VCPKG_BUILD)
@@ -188,74 +174,3 @@ endif()
 add_subdirectory(rust/crates/telemetry/bridge)
 
 find_package(kvikio REQUIRED CONFIG)
-
-if(SIRIUS_WITH_NIXL)
-  if(NOT SIRIUS_NIXL_PREFIX)
-    # $NIXL_PREFIX, else the script's default prefix (it names the pinned NIXL
-    # commit). Cached, so that a later automatic reconfigure (ninja, or make
-    # after a CMake file changed) keeps this NIXL whatever the shell's
-    # NIXL_PREFIX is then; -DSIRIUS_NIXL_PREFIX= resolves it again.
-    execute_process(
-      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_nixl.sh"
-              --print-prefix
-      OUTPUT_VARIABLE _nixl_prefix
-      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-    set(SIRIUS_NIXL_PREFIX
-        "${_nixl_prefix}"
-        CACHE PATH
-              "NIXL install prefix (empty: $NIXL_PREFIX, else the default)"
-              FORCE)
-  endif()
-  string(
-    CONCAT
-      _nixl_hint
-      "Install it with: pixi run scripts/install_nixl.sh, or choose an install "
-      "with -DSIRIUS_NIXL_PREFIX=<prefix> (an empty value takes $NIXL_PREFIX, "
-      "else the default, again; pixi run build-distributed passes it empty)")
-  # The found paths are cached: look again when the prefix changes.
-  if(NOT "${SIRIUS_NIXL_PREFIX}" STREQUAL "${_SIRIUS_NIXL_FOUND_IN}")
-    unset(NIXL_INCLUDE_DIR CACHE)
-    unset(NIXL_LIBRARY CACHE)
-    unset(NIXL_BUILD_LIBRARY CACHE)
-    set(_SIRIUS_NIXL_FOUND_IN
-        "${SIRIUS_NIXL_PREFIX}"
-        CACHE INTERNAL "")
-  endif()
-  find_path(
-    NIXL_INCLUDE_DIR nixl.h
-    PATHS ${SIRIUS_NIXL_PREFIX}/include
-    NO_DEFAULT_PATH)
-  find_library(
-    NIXL_LIBRARY nixl
-    PATHS ${SIRIUS_NIXL_PREFIX}/lib
-    PATH_SUFFIXES aarch64-linux-gnu x86_64-linux-gnu
-    NO_DEFAULT_PATH)
-  # The descriptor lists live in libnixl_build.
-  find_library(
-    NIXL_BUILD_LIBRARY nixl_build
-    PATHS ${SIRIUS_NIXL_PREFIX}/lib
-    PATH_SUFFIXES aarch64-linux-gnu x86_64-linux-gnu
-    NO_DEFAULT_PATH)
-  if(NOT NIXL_INCLUDE_DIR
-     OR NOT NIXL_LIBRARY
-     OR NOT NIXL_BUILD_LIBRARY)
-    message(FATAL_ERROR "SIRIUS_WITH_NIXL: no NIXL in ${SIRIUS_NIXL_PREFIX}. "
-                        "${_nixl_hint}")
-  endif()
-  # NIXL dlopens its UCX plugin from plugins/ next to libnixl; only the plugin's
-  # own RPATH finds libucp there.
-  get_filename_component(NIXL_LIBRARY_DIR "${NIXL_LIBRARY}" DIRECTORY)
-  execute_process(
-    COMMAND ldd "${NIXL_LIBRARY_DIR}/plugins/libplugin_UCX.so"
-    OUTPUT_VARIABLE _nixl_ucx_ldd
-    ERROR_VARIABLE _nixl_ucx_ldd
-    RESULT_VARIABLE _nixl_ucx_ldd_result)
-  if(NOT _nixl_ucx_ldd_result EQUAL 0 OR _nixl_ucx_ldd MATCHES "not found")
-    message(
-      FATAL_ERROR
-        "SIRIUS_WITH_NIXL: ${NIXL_LIBRARY_DIR}/plugins/libplugin_UCX.so "
-        "does not resolve its libraries (was the UCX it was built against "
-        "removed?):\n${_nixl_ucx_ldd}${_nixl_hint}")
-  endif()
-  message(STATUS "Exchange NIXL fabric: ${NIXL_LIBRARY}")
-endif()

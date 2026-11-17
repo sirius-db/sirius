@@ -37,11 +37,8 @@ pixi run sirius-client            # a DuckDB shell whose statements go to the ga
 | A shared `$HOME`, or `pixi run sirius-node --gateway HOST:PORT --token-file FILE` on a node without it (or export `SIRIUS_GATEWAY_TOKEN` instead of `--token-file`) | Nodes and clients read the gateway's address, token and TLS fingerprint from `~/.sirius/gateways/<cluster>/gateway.conf` |
 | Free TCP ports, open between the machines | The gateway listens on 9494. The rank on a node's i-th GPU listens on 9500 + i (Quack) and 27000 + i (exchange) |
 
-`pixi run build-distributed` runs `scripts/install_nixl.sh`, which builds NIXL into
-`~/.sirius/nixl/<commit>` unless a working install is there (`NIXL_PREFIX` sets another prefix).
-It then reconfigures Sirius with `-DSIRIUS_WITH_NIXL=ON`, builds it, and builds the gateway
-(`make -C gateway release`). The build directory keeps the NIXL prefix it found: after changing
-`NIXL_PREFIX`, run `pixi run build-distributed` again. See [Settings and build](distributed-sirius.md#settings-and-build).
+`pixi run build-distributed` builds Sirius, which includes NIXL, and the gateway
+(`make -C gateway release`). See [Settings and build](distributed-sirius.md#settings-and-build).
 
 ## Configure
 
@@ -66,10 +63,12 @@ sirius:
       quack_port: 9500          # rank i: 9500 + i
       exchange_port: 27000      # rank i: 27000 + i
     exchange:                   # the gateway gives every rank these
+      host_staging: auto        # auto: TCP lanes to ranks on other hosts
+      tcp_lanes: 0              # 0: 16 shared by the ranks of a host
       mnnvl: auto               # auto | require | off: NVLink between nodes (fabric memory)
       frame_bytes: 16777216
       send_frames: 32
-      recv_frames_per_peer: 16
+      recv_frames_per_peer: 16  # over TCP lanes, one frame in flight per lane
     ucx:                        # default: every transport on the GPU rail NICs, if any
       # tls: cuda_copy,cuda_ipc,tcp,self
       # net_devices: bond0      # without rail NICs: the interface that holds the rank's address
@@ -93,11 +92,13 @@ number or list, stops the scripts before they apply any of it. `gateway.min_rank
 | `node.networks` | `SIRIUS_NODE_NETWORKS` | the gateway's subnet | Each rank listens on this node's first address in these CIDRs, and UCX uses that address's interface |
 | `node.quack_port` | `SIRIUS_NODE_QUACK_PORT` | 9500 | First rank's Quack port |
 | `node.exchange_port` | `SIRIUS_NODE_EXCHANGE_PORT` | 27000 | First rank's exchange port |
+| `exchange.host_staging` | `SIRIUS_GATEWAY_EXCHANGE_HOST_STAGING` | `auto` | `sirius_gateway_exchange_host_staging`, which the gateway sets as `sirius_exchange_host_staging` on every rank. `auto` reaches ranks on other hosts over TCP lanes |
+| `exchange.tcp_lanes` | `SIRIUS_GATEWAY_EXCHANGE_TCP_LANES` | 0 | `sirius_gateway_exchange_tcp_lanes`: TCP lanes per rank, at most 64. 0 shares 16 among the ranks of a host, at least 2 each |
 | `exchange.mnnvl` | `SIRIUS_GATEWAY_EXCHANGE_MNNVL` | `auto` | `sirius_gateway_exchange_mnnvl`, which the gateway sets as `sirius_exchange_mnnvl` on every rank: ranks on other nodes of the NVLink domain exchange over NVLink |
 | `exchange.frame_bytes` | `SIRIUS_GATEWAY_EXCHANGE_FRAME_BYTES` | 16777216 | `sirius_gateway_exchange_frame_bytes`: the exchange's frame size |
 | `exchange.send_frames` | `SIRIUS_GATEWAY_EXCHANGE_SEND_FRAMES` | 32 | `sirius_gateway_exchange_send_frames`: send frames shared by a rank's peers |
-| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 16 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill |
-| `ucx.tls` | `UCX_TLS` | `all` on a host with GPU rail NICs, else `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/nixl_env.sh`'s |
+| `exchange.recv_frames_per_peer` | `SIRIUS_GATEWAY_EXCHANGE_RECV_FRAMES_PER_PEER` | 16 | `sirius_gateway_exchange_recv_frames_per_peer`: receive frames each peer may fill; over TCP lanes, one frame in flight per lane |
+| `ucx.tls` | `UCX_TLS` | `all` on a host with GPU rail NICs, else `cuda_copy,cuda_ipc,tcp,self` | UCX transports; the default is `scripts/launcher_env.sh`'s |
 | `ucx.net_devices` | `UCX_NET_DEVICES` | the GPU rail NICs, else the interface of the rank's address | UCX devices, for example `mlx5_0:1`; `rails` asks for the rail NICs. The rail NICs are the active RDMA ports in no bond at the highest link speed (on GB200 nodes `mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1`). Notifications over RC on them let the exchange over NVLink reach full speed. Never list bond0 with them: UCX then hangs reaching a peer's bond0 address from a rail NIC |
 
 A gateway on an address other than loopback serves TLS. It writes the subnet of its address to
@@ -216,12 +217,7 @@ and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with
 
 | Message | Cause and fix |
 |---|---|
-| `FAIL no Sirius build at ...`, `FAIL Sirius is built without NIXL` | Run `pixi run build-distributed` on that machine |
-| `FAIL the Sirius build does not find libnixl` | The NIXL install moved or is gone: `pixi run scripts/install_nixl.sh`, then `pixi run build-distributed` (or export `NIXL_PREFIX`) |
-| `SIRIUS_WITH_NIXL: no NIXL in <prefix>` (CMake) | `pixi run scripts/install_nixl.sh`, or set `NIXL_PREFIX` to an install |
-| `.../libplugin_UCX.so does not resolve its libraries` (CMake) | The NIXL install was built against a pixi environment that is gone. Run `pixi run scripts/install_nixl.sh` again: it removes the files it installed there (listed in `.sirius-install-nixl`), never the whole prefix, and installs again |
-| `<prefix> holds something other than a working NIXL` | `install_nixl.sh` does not install over files it did not write: give an empty or new prefix |
-| The build still uses the old NIXL after `NIXL_PREFIX` changed | The build directory keeps the prefix it found. Run `pixi run build-distributed`, which looks again, or configure with `-DSIRIUS_NIXL_PREFIX=<prefix>` |
+| `FAIL no Sirius build at ...` | Run `pixi run build-distributed` on that machine |
 | `FAIL no GPU visible to nvidia-smi -L`, `FAIL no GPU N: this node has M` | Run on a GPU machine, and give `--gpus` (or `node.gpus`) GPUs that exist |
 | `FAIL --gpus slurm, but Slurm gave this task no GPU` | Ask Slurm for `--gpus-per-task=1` |
 | `FAIL no ~/.sirius/gateways/<cluster>/gateway.conf`, `no ... gateway.conf: start the gateway first` | Start the gateway on a host that shares `$HOME`, with the same cluster name; or pass `--gateway` and `--token-file` to `sirius-node` |

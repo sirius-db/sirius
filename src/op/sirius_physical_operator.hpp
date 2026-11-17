@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -357,14 +358,26 @@ class pipelineable_operator_data : public operator_data {
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
-    std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches();
-    for (auto const& ro : ro_batches) {
-      if (!ro.get_data()) { continue; }
-      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
-    }
-    return total;
+    return estimate_input_sizes(nullptr).uncompressed_bytes;
   }
+
+  /// Sizes of the batches as a reservation estimate needs them.
+  struct input_size_estimate {
+    std::size_t uncompressed_bytes   = 0;  ///< Decoded size of every batch
+    std::size_t bytes_to_materialize = 0;  ///< Peak device bytes to bring the batches to the GPU
+  };
+
+  /**
+   * @brief Size the batches without waiting for one that another thread holds exclusively.
+   *
+   * A batch counts toward `bytes_to_materialize` when it is off the GPU or, with a
+   * @p target_space, in another memory space. A batch that is being converted (a spill holds its
+   * exclusive lock for the whole write) is sized from the sizes the batch last published and
+   * counted as if it had to be materialized, so the result can exceed the true need but never
+   * falls below it.
+   */
+  [[nodiscard]] input_size_estimate estimate_input_sizes(
+    const ::cucascade::memory::memory_space* target_space) const;
 
   [[nodiscard]] std::string get_origin_tiers() const override
   {
@@ -576,13 +589,6 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
-
-  //! Schema of the rows this operator's parent receives; defaults to `types`. The materialized CTE
-  //! delegates to its consumer subtree.
-  [[nodiscard]] virtual const duckdb::vector<sirius::logical_type>& get_output_types() const
-  {
-    return types;
-  }
 
   //! Whether `get_types()` describes the batches returned directly by execute(). Most operators
   //! materialize their declared logical schema. Structural pass-through stages may instead carry
@@ -812,11 +818,22 @@ class sirius_physical_operator {
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
   //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
-  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  //! dispatches to on_finalize_operator(), then to each finalize listener. Do not override this;
+  //! override on_finalize_operator().
   void finalize_operator()
   {
     finalized.store(true);
     on_finalize_operator();
+    for (auto const& listener : _finalize_listeners) {
+      listener();
+    }
+  }
+
+  //! Adds @p listener, which finalize_operator() calls after on_finalize_operator(). Register it
+  //! while planning; it runs under the pipeline's status lock, so it must not block or throw.
+  void add_finalize_listener(std::function<void()> listener)
+  {
+    _finalize_listeners.push_back(std::move(listener));
   }
 
   //! True after finalize_operator() has been called on this operator.
@@ -994,6 +1011,9 @@ class sirius_physical_operator {
   //! the two halves cannot be installed apart.
   late_mat::deferred_scan_output _deferred_output;
   late_mat::port_materialize_directive _port_directive;
+
+  //! See add_finalize_listener().
+  std::vector<std::function<void()>> _finalize_listeners;
 
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }

@@ -57,7 +57,8 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe,
                            sirius_physical_concat* build_concat,
-                           bool probe_drives)
+                           bool probe_drives,
+                           sirius_physical_concat* probe_concat)
 {
   build.set_input_barrier(MemoryBarrierType::FULL);
   probe.set_input_barrier(probe_drives ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
@@ -67,7 +68,7 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
     {&build, &probe},
     probe_drives ? 1 : 0,
     false,
-    [&join, build_concat, probe_drives](auto const& stats, bool empty) {
+    [&join, build_concat, probe_concat, probe_drives](auto const& stats, bool empty) {
       auto const& sizing = stats[probe_drives ? 1 : 0];
       partition_sizing_input in{sizing.bytes,
                                 !probe_drives,
@@ -83,6 +84,10 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
         if (!build_concat) { throw std::logic_error("BUILD_PROBE requires a bound build CONCAT"); }
         build_concat->set_concat_all(true);
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
+        // A streamed RIGHT join probes each batch as it arrives instead of a folded partition.
+        if (probe_concat && join.join_type == duckdb::JoinType::RIGHT) {
+          probe_concat->set_concat_all(false);
+        }
       } else if (!empty && in.is_build_side && strategy.num_partitions == 1 &&
                  join.publishes_dynamic_filters() &&
                  in.resident_bytes.value_or(in.total_bytes) < join.max_build_probe_resident_bytes &&
