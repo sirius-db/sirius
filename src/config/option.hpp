@@ -589,8 +589,10 @@ class option_builder {
   }
 
   /// Read and write the last alternative as one of @p table's spellings, for a type without
-  /// string_to_enum / enum_to_string (e.g. a third-party enum, or std::optional of one). The first
-  /// spelling of a value is the one written; anything else is rejected with the list.
+  /// string_to_enum / enum_to_string (e.g. a third-party enum, or std::optional of one). Matching
+  /// is exact (case-sensitive, untrimmed); anything else is rejected with the list. The first
+  /// spelling of a value is the one written; writing a value the table lacks throws
+  /// std::logic_error.
   option_builder& choices(
     std::initializer_list<
       std::pair<std::string_view, std::tuple_element_t<sizeof...(Ts) - 1, std::tuple<Ts...>>>>

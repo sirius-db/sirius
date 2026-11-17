@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
@@ -37,17 +38,14 @@ inline const scan_manager::partial_batch_options& partial_batch_defaults()
   return value;
 }
 
-/// Accepts counts that fit in an unsigned int (the type cuCascade keeps them in).
-struct fits_unsigned {
-  [[nodiscard]] bool operator()(std::size_t value) const noexcept
-  {
-    return value <= std::numeric_limits<unsigned>::max();
-  }
-  [[nodiscard]] static std::string description()
-  {
-    return "must be at most " + std::to_string(std::numeric_limits<unsigned>::max());
-  }
-};
+/// The largest MTU an IPv4 TCP packet can declare (65535 + IP and TCP options).
+inline constexpr std::int64_t max_min_mtu = 65535 + 60 + 12;
+
+/// keepalive seconds: positive, and within the int cuCascade keeps them in.
+inline between<std::chrono::seconds> keepalive_seconds()
+{
+  return {std::chrono::seconds{1}, std::chrono::seconds{std::numeric_limits<int>::max()}};
+}
 
 }  // namespace detail
 
@@ -174,11 +172,22 @@ struct tls_options : block_base<tls_options> {
       sni_override,
       allow_tls13_without_rekey);
   }
+
+  void validate(std::string_view path) const
+  {
+    if (auto const& max = max_version.get(); max && *max < min_version.get()) {
+      throw config_error(detail::framed(path, "max_version must not be below min_version"));
+    }
+    if (session_cache.get() && session_cache_per_endpoint.get() == 0) {
+      throw config_error(detail::framed(
+        path, "session_cache_per_endpoint must be greater than 0 with the session cache on"));
+    }
+  }
 };
 
-/// `sirius.executor.scan_manager.rest`: the object-store (REST) IO reactors. cuCascade checks the
-/// ranges and cross-field rules (rest::config::validate()) once derived defaults are in place,
-/// when the configuration is resolved.
+/// `sirius.executor.scan_manager.rest`: the object-store (REST) IO reactors. Each key's range is
+/// cuCascade's (rest::config::validate()); resolving the configuration runs that check again with
+/// the derived values in place.
 struct rest_options : block_base<rest_options> {
   static const cucascade::io::rest::config& defaults()
   {
@@ -191,44 +200,60 @@ struct rest_options : block_base<rest_options> {
     option<std::size_t>("n_max_concurrent_scans").build();
   config_option<std::chrono::seconds> request_timeout =
     option<std::chrono::seconds>("request_timeout_s")
+      .validate(non_negative<std::chrono::seconds>{})
       .fallback(std::chrono::seconds(defaults().request_timeout_s))
       .build();
-  /// A transfer slower than this for stall_time_s is abandoned.
+  /// Bytes per second; a transfer slower than this for stall_time_s is abandoned.
   config_option<bytes> stall_speed_limit_bytes =
     option<bytes>("stall_speed_limit_bytes")
       .fallback(bytes(defaults().stall_speed_limit_bytes))
       .build();
   config_option<std::chrono::seconds> stall_time =
     option<std::chrono::seconds>("stall_time_s")
+      .validate(non_negative<std::chrono::seconds>{})
       .fallback(std::chrono::seconds(defaults().stall_time_s))
       .build();
   config_option<bytes> merge_max_gap =
     option<bytes>("merge_max_gap").fallback(to_bytes(defaults().merge_max_gap)).build();
-  config_option<bytes> min_segment_bytes =
-    option<bytes>("min_segment_bytes").fallback(to_bytes(defaults().min_segment_bytes)).build();
+  config_option<bytes> min_segment_bytes = option<bytes>("min_segment_bytes")
+                                             .validate(positive<bytes>{})
+                                             .fallback(to_bytes(defaults().min_segment_bytes))
+                                             .build();
   config_option<bytes> max_segment_bytes =
     option<bytes>("max_segment_bytes").fallback(to_bytes(defaults().max_segment_bytes)).build();
   config_option<bytes> footer_probe_bytes =
-    option<bytes>("footer_probe_bytes").fallback(to_bytes(defaults().footer_probe_bytes)).build();
-  config_option<std::size_t> list_max_matches =
-    option<std::size_t>("list_max_matches").fallback(defaults().list_max_matches).build();
-  config_option<std::size_t> list_max_scanned =
-    option<std::size_t>("list_max_scanned").fallback(defaults().list_max_scanned).build();
+    option<bytes>("footer_probe_bytes")
+      .validate(between<bytes>{bytes{}, bytes(gibibytes(1))})
+      .fallback(to_bytes(defaults().footer_probe_bytes))
+      .build();
+  config_option<std::size_t> list_max_matches = option<std::size_t>("list_max_matches")
+                                                  .validate(positive<std::size_t>{})
+                                                  .fallback(defaults().list_max_matches)
+                                                  .build();
+  config_option<std::size_t> list_max_scanned = option<std::size_t>("list_max_scanned")
+                                                  .validate(positive<std::size_t>{})
+                                                  .fallback(defaults().list_max_scanned)
+                                                  .build();
 
   // -- retry policy
   config_option<std::chrono::milliseconds> retry_backoff_base =
     option<std::chrono::milliseconds>("retry_backoff_base_ms")
+      .validate(non_negative<std::chrono::milliseconds>{})
       .fallback(defaults().retry_backoff_base)
       .build();
   config_option<std::chrono::milliseconds> retry_jitter =
-    option<std::chrono::milliseconds>("retry_jitter_ms").fallback(defaults().retry_jitter).build();
-  config_option<std::size_t> max_retry_attempts = option<std::size_t>("max_retry_attempts")
-                                                    .validate(detail::fits_unsigned{})
-                                                    .fallback(defaults().max_retry_attempts)
-                                                    .build();
+    option<std::chrono::milliseconds>("retry_jitter_ms")
+      .validate(non_negative<std::chrono::milliseconds>{})
+      .fallback(defaults().retry_jitter)
+      .build();
+  config_option<std::size_t> max_retry_attempts =
+    option<std::size_t>("max_retry_attempts")
+      .validate(between<std::size_t>{1, std::size_t{std::numeric_limits<unsigned>::max()}})
+      .fallback(defaults().max_retry_attempts)
+      .build();
   config_option<std::size_t> max_auth_retry_attempts =
     option<std::size_t>("max_auth_retry_attempts")
-      .validate(detail::fits_unsigned{})
+      .validate(between<std::size_t>{1, std::size_t{std::numeric_limits<unsigned>::max()}})
       .fallback(defaults().max_auth_retry_attempts)
       .build();
   config_option<bool> honor_retry_after =
@@ -237,51 +262,71 @@ struct rest_options : block_base<rest_options> {
   // -- connection pool
   /// Unset: half the queue depth, up to 128 with kernel TLS or 64 without, derived when the
   /// configuration is resolved.
-  config_option<std::size_t> max_connections = option<std::size_t>("max_connections").build();
+  config_option<std::size_t> max_connections =
+    option<std::size_t>("max_connections").validate(between<std::size_t>{1, 4096}).build();
   config_option<std::chrono::seconds> conn_max_age =
-    option<std::chrono::seconds>("conn_max_age_s").fallback(defaults().conn_max_age).build();
+    option<std::chrono::seconds>("conn_max_age_s")
+      .validate(non_negative<std::chrono::seconds>{})
+      .fallback(defaults().conn_max_age)
+      .build();
   config_option<std::chrono::milliseconds> upkeep_interval =
     option<std::chrono::milliseconds>("upkeep_interval_ms")
+      .validate(non_negative<std::chrono::milliseconds>{})
       .fallback(defaults().upkeep_interval)
       .build();
   config_option<bool> upkeep_http1 =
     option<bool>("upkeep_http1").fallback(defaults().upkeep_http1).build();
   config_option<std::chrono::milliseconds> connect_timeout =
     option<std::chrono::milliseconds>("connect_timeout_ms")
+      .validate(positive<std::chrono::milliseconds>{})
       .fallback(defaults().connect_timeout)
       .build();
-  config_option<std::chrono::seconds> dns_ttl =
-    option<std::chrono::seconds>("dns_ttl_s").fallback(defaults().dns_ttl).build();
+  config_option<std::chrono::seconds> dns_ttl = option<std::chrono::seconds>("dns_ttl_s")
+                                                  .validate(positive<std::chrono::seconds>{})
+                                                  .fallback(defaults().dns_ttl)
+                                                  .build();
   config_option<bool> dns_accumulate =
     option<bool>("dns_accumulate").fallback(defaults().dns_accumulate).build();
-  config_option<std::size_t> dns_max_addresses =
-    option<std::size_t>("dns_max_addresses").fallback(defaults().dns_max_addresses).build();
+  config_option<std::size_t> dns_max_addresses = option<std::size_t>("dns_max_addresses")
+                                                   .validate(between<std::size_t>{1, 4096})
+                                                   .fallback(defaults().dns_max_addresses)
+                                                   .build();
   config_option<std::chrono::seconds> keepalive_idle =
     option<std::chrono::seconds>("keepalive_idle_s")
+      .validate(detail::keepalive_seconds())
       .fallback(std::chrono::seconds(defaults().keepalive_idle_s))
       .build();
   config_option<std::chrono::seconds> keepalive_interval =
     option<std::chrono::seconds>("keepalive_interval_s")
+      .validate(detail::keepalive_seconds())
       .fallback(std::chrono::seconds(defaults().keepalive_interval_s))
       .build();
   /// 0 = the kernel's default.
-  config_option<int> keepalive_count =
-    option<int>("keepalive_count").fallback(defaults().keepalive_count).build();
+  config_option<int> keepalive_count = option<int>("keepalive_count")
+                                         .validate(non_negative<int>{})
+                                         .fallback(defaults().keepalive_count)
+                                         .build();
   /// Unset: the egress NIC's MTU when it uses jumbo frames, else 0 (no check), derived when the
   /// configuration is resolved.
-  config_option<bytes> min_mtu                    = option<bytes>("min_mtu").build();
+  config_option<bytes> min_mtu =
+    option<bytes>("min_mtu").validate(between<bytes>{bytes{}, bytes(detail::max_min_mtu)}).build();
   config_option<unsigned> mtu_reject_max_attempts = option<unsigned>("mtu_reject_max_attempts")
+                                                      .validate(positive<unsigned>{})
                                                       .fallback(defaults().mtu_reject_max_attempts)
                                                       .build();
   config_option<bool> close_with_rst =
     option<bool>("close_with_rst").fallback(defaults().close_with_rst).build();
 
   // -- transport
-  config_option<bytes> receive_buffer_bytes = option<bytes>("receive_buffer_bytes")
-                                                .fallback(to_bytes(defaults().receive_buffer_bytes))
-                                                .build();
-  config_option<std::size_t> queue_depth =
-    option<std::size_t>("queue_depth").fallback(defaults().queue_depth).build();
+  config_option<bytes> receive_buffer_bytes =
+    option<bytes>("receive_buffer_bytes")
+      .validate(between<bytes>{bytes(kibibytes(16)), bytes(mebibytes(4))})
+      .fallback(to_bytes(defaults().receive_buffer_bytes))
+      .build();
+  config_option<std::size_t> queue_depth = option<std::size_t>("queue_depth")
+                                             .validate(between<std::size_t>{2, 32768})
+                                             .fallback(defaults().queue_depth)
+                                             .build();
   config_option<cucascade::io::rest::reactor_wait_mode> wait_mode =
     option<cucascade::io::rest::reactor_wait_mode>("wait_mode")
       .choices({{"epoll", cucascade::io::rest::reactor_wait_mode::epoll},
@@ -293,8 +338,10 @@ struct rest_options : block_base<rest_options> {
     option<unsigned>("iowq_max_unbound").fallback(defaults().iowq_max_unbound).build();
 
   // -- placement
-  config_option<std::size_t> fan_out =
-    option<std::size_t>("fan_out").fallback(defaults().fan_out).build();
+  config_option<std::size_t> fan_out = option<std::size_t>("fan_out")
+                                         .validate(positive<std::size_t>{})
+                                         .fallback(defaults().fan_out)
+                                         .build();
   /// Empty: the default route's interface.
   config_option<std::string> interface =
     option<std::string>("interface").fallback(defaults().interface).build();
@@ -348,6 +395,20 @@ struct rest_options : block_base<rest_options> {
                       pin_to_irq_cpus,
                       raise_reactor_priority,
                       sub("tls", tls));
+  }
+
+  /// The rules that do not need derived values; with an unset max_connections, queue_depth is
+  /// checked against the derived one when the configuration is resolved.
+  void validate(std::string_view path) const
+  {
+    if (max_segment_bytes.get() < min_segment_bytes.get()) {
+      throw config_error(
+        detail::framed(path, "max_segment_bytes must be at least min_segment_bytes"));
+    }
+    if (auto const* connections = max_connections.get_if();
+        connections != nullptr && queue_depth.get() < 2 * *connections) {
+      throw config_error(detail::framed(path, "queue_depth must be at least 2 * max_connections"));
+    }
   }
 };
 
@@ -582,7 +643,7 @@ struct scan_manager_options : block_base<scan_manager_options> {
     auto const fan_out   = rest.fan_out.get();
     if (reactors != nullptr && *reactors > 0 && fan_out > *reactors &&
         fan_out != rest_options::defaults().fan_out) {
-      throw config_error("'" + join_path(join_path(path, "rest"), "fan_out") +
+      throw config_error("'" + join_path(join_path(path, "rest"), rest.fan_out.key()) +
                          "': must be at most rest_n_reactors (" + std::to_string(*reactors) + ")");
     }
   }
