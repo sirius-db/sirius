@@ -1,11 +1,14 @@
 # Distributed experiments on NVL4 and NVL72 nodes
 
-How to run a distributed Sirius benchmark on GB200 NVLink nodes under Slurm and get numbers
-that can be trusted. Without Slurm, follow
-[Distributed experiments without Slurm](distributed-experiments-no-slurm.md) instead, and on an
-AWS instance [Distributed experiments on AWS g7e instances](distributed-experiments-aws.md). Read
-[Distributed Quick Start](distributed-quickstart.md) first for the commands and the
-`sirius.distributed` settings.
+How to reproduce a TPC-H benchmark of distributed Sirius and get numbers that can be trusted.
+Start here, then follow the document for your hardware:
+
+| Read | For |
+|---|---|
+| [Distributed Quick Start](distributed-quickstart.md), first | What the gateway, node and client commands do, the `sirius.distributed` launch settings, and the launch errors. This document does not repeat them |
+| This document | GB200 NVLink nodes that Slurm schedules (NVL4, NVL72) |
+| [Distributed experiments without Slurm](distributed-experiments-no-slurm.md) | A machine Slurm does not schedule, such as a standalone NVL4 node: the same config, `run.sql` and checks, with one script that starts and stops the gateway and the ranks |
+| [Distributed experiments on AWS g7e instances](distributed-experiments-aws.md) | An AWS instance (no Slurm, no NVLink, data on local NVMe): launch, storage, build, dataset generation, and a config for 96 GB GPUs |
 
 | System | What it is | Ranks |
 |---|---|---|
@@ -13,9 +16,8 @@ AWS instance [Distributed experiments on AWS g7e instances](distributed-experime
 | NVL72 | One rack: 18 such nodes in one NVLink domain | 4 per node |
 
 Every run goes through the gateway, on one node as on several, so the numbers compare: a
-gateway, one rank per GPU, and `sirius-client` for the SQL. `scripts/sirius_slurm.sbatch` starts
-the gateway and the ranks ([Run](#run)). Ranks on different nodes exchange over NVLink (MNNVL).
-CPU fallback is off: a query Sirius cannot run on the GPU fails. Tested with 4, 8 and 16 ranks.
+gateway, one rank per GPU, and `sirius-client` for the SQL. Ranks on different nodes exchange
+over NVLink (MNNVL). Tested with 4, 8 and 16 ranks.
 Last followed from an empty account on 2026-11-10: clone, build, and SF10000 on one node.
 
 ## Rules
@@ -34,9 +36,10 @@ Last followed from an empty account on 2026-11-10: clone, build, and SF10000 on 
 
 ## Setup
 
-Needs Git and [Pixi](https://pixi.sh/latest/installation/) 0.78 or newer on `PATH`, and under
-Slurm its client commands (export `SLURM_CONF` if `sinfo` finds no configuration). What the
-machine needs is in [docs/README.md](../README.md#requirements).
+Needs Git, [Pixi](https://pixi.sh/latest/installation/) 0.78 or newer and the Slurm client
+commands on `PATH` (export `SLURM_CONF` if `sinfo` finds no configuration), and the quick
+start's [prerequisites](distributed-quickstart.md#prerequisites). What the machine needs is in
+[docs/README.md](../README.md#requirements).
 
 The repository holds no cluster names or paths. Export these first:
 
@@ -47,9 +50,8 @@ The repository holds no cluster names or paths. Export these first:
 | `DATA` | The Parquet dataset, one folder per table, same path on every node |
 | `OUT` | A new run folder, for `config.yaml`, `run.sql` and the output |
 
-`$HOME` must be shared by the nodes and have free space: the build puts about 8 GB there
-(Pixi's package cache; `PIXI_CACHE_DIR` moves it) and the gateway writes
-`~/.sirius/gateways/<job id>/`. With `$HOME` at its quota, jobs fail within seconds.
+`$HOME` needs free space: the build puts about 8 GB there (Pixi's package cache;
+`PIXI_CACHE_DIR` moves it). With `$HOME` at its quota, jobs fail within seconds.
 
 ```bash
 git clone --branch experimental/distributed-sirius https://github.com/sirius-db/sirius.git "$CHECKOUT"
@@ -81,8 +83,11 @@ GPU pair should move about 700 GB/s; under 150 GB/s, UCX is not using NVLink.
 
 ## Config
 
-`$OUT/config.yaml` configures every rank. The SF10000 config, tuned on 1 node and used
-unchanged on 2, and for a first check at SF100:
+`$OUT/config.yaml` holds the engine settings of every rank ([Configuration](configuration.md)
+explains the keys). The launch settings, the quick start's
+[`sirius.distributed`](distributed-quickstart.md#configure) section, stay at their defaults: the
+Slurm script names the gateway and counts the ranks itself. The SF10000 config, tuned on 1 node
+and used unchanged on 2, and for a first check at SF100:
 
 ```yaml
 sirius:
@@ -136,8 +141,9 @@ sirius:
 
 ## Run
 
-One arm is one Slurm job with fresh ranks: start the gateway, send the SQL, cancel the job. As a
-script:
+One arm is one Slurm job with fresh ranks: start the gateway, send the SQL, cancel the job.
+What `scripts/sirius_slurm.sbatch` starts is in the quick start's
+[Slurm](distributed-quickstart.md#slurm) section. As a script:
 
 ```bash
 export SIRIUS_CONFIG_FILE=$OUT/config.yaml
@@ -184,18 +190,6 @@ q=$CHECKOUT/test/tpch_performance/tpch_queries/orig
   third), so keep the query order when comparing runs.
 - At SF100000, footer statistics are per query: Q3 needs
   `SET parquet_footer_statistics = false`, Q9 needs the default (`true`).
-
-## Run without Slurm
-
-On a machine Slurm does not schedule, such as a standalone NVL4 node, follow
-[Distributed experiments without Slurm](distributed-experiments-no-slurm.md): the same config,
-`run.sql` and checks, from an empty account, with one script that starts the gateway and the
-ranks, and stops them.
-
-On an AWS `g7e` instance (no Slurm, no NVLink, data on local NVMe), follow
-[Distributed experiments on AWS g7e instances](distributed-experiments-aws.md): launch, storage,
-build and dataset from scratch, a config for 96 GB GPUs, and why scans there are bound by the
-disks.
 
 ## Check the run
 
@@ -260,10 +254,12 @@ rack, `exchange.recv_frames_per_peer: 8` halves that for about 10% less throughp
 
 ## Known failures
 
+A `FAIL` line or a `rank N ...` message from the launch is in the quick start's
+[Troubleshooting](distributed-quickstart.md#troubleshooting).
+
 | Symptom | Cause and fix |
 |---|---|
 | Job fails in seconds, no output | `$HOME` at quota, or a stale mount on the node: run the `ls` check |
-| `gateway <cluster> already runs (lock ...)` | Another gateway has that name: set another `SIRIUS_CLUSTER` |
 | Job fails its prolog, node drained | A user process outside Slurm, or `/` nearly full. An administrator resumes the node |
 | Ranks killed mid-query | Host tier too large: use 200Gi |
 | A peer is not on `NIXL over the NVLink fabric` | No IMEX channel, different NVLink domains, or `UCX_TLS` without `cuda_ipc`: keep the default `ucx` settings |

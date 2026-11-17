@@ -18,6 +18,11 @@ pixi run sirius-node              # on each GPU machine
 pixi run sirius-client            # a DuckDB shell whose statements go to the gateway
 ```
 
+This document explains those commands. To reproduce a TPC-H benchmark with them (build, engine
+config, queries, checked answers), follow
+[Distributed experiments](distributed-experiments.md), which names the document for your
+hardware.
+
 ## Contents
 
 - [Prerequisites](#prerequisites)
@@ -209,6 +214,9 @@ exchange port 27000 + `SLURM_LOCALID`. The script asks for 4 tasks per node;
 serves until the job ends. If either the gateway's step or the ranks' step exits, the job stops
 the other and ends with exit code 1. At exit the script removes `~/.sirius/gateways/<job id>/`,
 so the job's token, keys and DDL log go with it. It needs a shared `$HOME`.
+
+A benchmark arm under Slurm, from `sbatch` to `scancel`, is in
+[Distributed experiments](distributed-experiments.md#run).
 
 Tested on two GB200 nodes with 2 GPUs each (`sbatch -N2 --ntasks-per-node=2`): a count at SF100
 and TPC-H Q12 were correct, and cancelling the gateway's step ended the job with exit code 1.
