@@ -1,10 +1,10 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "config/chrono.hpp"
+#include "config/chrono.hpp"  // IWYU pragma: keep (parser<> / formatter<> for durations)
 #include "config/node.hpp"
 #include "config/parser.hpp"
-#include "config/size.hpp"
+#include "config/size.hpp"  // IWYU pragma: keep (parser<> / formatter<> for sizes)
 
 #include <concepts>
 #include <cstddef>
@@ -24,7 +24,7 @@ namespace sirius::config {
 /// Where an option's current value came from.
 enum class value_source {
   unset,     ///< not loaded, absent without a fallback, or skipped (for_prod outside prod)
-  file,      ///< read from the configuration (or assigned as if it were)
+  user,      ///< defined by the user: read from the configuration, or assigned
   fallback,  ///< absent, so the declared fallback applies
 };
 
@@ -39,7 +39,7 @@ enum class option_scope { session, query };
 {
   switch (source) {
     case value_source::unset: return "unset";
-    case value_source::file: return "file";
+    case value_source::user: return "user";
     case value_source::fallback: return "fallback";
   }
   return "unknown";
@@ -145,73 +145,154 @@ struct between {
 
 namespace detail {
 
-template <class T, class... Ts>
-struct first_convertible {
-  using type = void;
-};
-template <class T, class U, class... Rest>
-struct first_convertible<T, U, Rest...> {
-  using type = std::
-    conditional_t<std::is_convertible_v<T, U>, U, typename first_convertible<T, Rest...>::type>;
-};
-
-/// A value of T initializes exactly one alternative: its own type, else the only one T
-/// implicitly converts to (1_MiB -> bytes, 42 -> std::size_t).
-template <class T, class... Ts>
-concept selects_one_of = (std::is_same_v<std::decay_t<T>, Ts> || ...) ||
-                         ((static_cast<std::size_t>(std::is_convertible_v<T, Ts>) + ... + 0) == 1);
-
-template <class T, class... Ts>
-using selected_alternative_t = std::conditional_t<(std::is_same_v<std::decay_t<T>, Ts> || ...),
-                                                  std::decay_t<T>,
-                                                  typename first_convertible<T, Ts...>::type>;
-
 template <class F>
 concept described = requires(const F& f) {
   { f.description() } -> std::convertible_to<std::string>;
 };
 
-/// Wrap a validator into the stored form. A bool validator rejects with "value out of range",
-/// plus its description() when it has one; a parse_status validator words its own rejection.
+/// A validator wording its own rejection.
+template <class F, class T>
+concept status_validator = requires(const F& f, const T& value) {
+  { std::invoke(f, value) } -> std::convertible_to<parse_status>;
+};
+
+/// A validator answering yes or no (exactly bool: a type that merely converts to bool, such as
+/// std::error_code, may mean the opposite).
+template <class F, class T>
+concept bool_validator = requires(const F& f, const T& value) {
+  { std::invoke(f, value) } -> std::same_as<bool>;
+};
+
 template <class T, class F>
 std::function<parse_status(const T&)> make_validator(F fn, std::string description)
 {
-  if constexpr (std::is_invocable_r_v<parse_status, const F&, const T&> &&
-                std::same_as<std::invoke_result_t<const F&, const T&>, parse_status>) {
-    return [fn = std::move(fn)](const T& value) { return std::invoke(fn, value); };
+  static_assert(status_validator<F, T> || bool_validator<F, T>,
+                "a validator is callable as const F& with const T& and returns bool or "
+                "parse_status");
+  if constexpr (!bool_validator<F, T>) {
+    // Rejected with its own reason, plus the description when one was given.
+    return [fn = std::move(fn), description = std::move(description)](const T& value) {
+      parse_status status = std::invoke(fn, value);
+      if (status || description.empty()) { return status; }
+      return parse_status::failure(status.error() + " (" + description + ")");
+    };
   } else {
-    static_assert(std::is_invocable_r_v<bool, const F&, const T&>,
-                  "a validator takes const T& and returns bool or parse_status");
+    // Rejected as "value out of range: '<value>' (<description>)"; an explicit description wins
+    // over the callable's description().
     if (description.empty()) {
       if constexpr (described<F>) { description = std::string(fn.description()); }
     }
     return [fn = std::move(fn), description = std::move(description)](const T& value) {
       if (std::invoke(fn, value)) { return parse_status{}; }
       std::string text = "value out of range";
-      if constexpr (config_value<T> && !is_vector<T>::value) {
-        text += ": " + config::detail::quoted(formatter<T>{}(value));
-      }
+      if constexpr (parsable<T>) { text += ": " + config::detail::quoted(formatter<T>{}(value)); }
       if (!description.empty()) { text += " (" + description + ")"; }
       return parse_status::failure(std::move(text));
     };
   }
 }
 
+/// A text parser: called with the scalar's text as written (const std::string&, so callables
+/// taking std::string_view work too).
+template <class F, class T>
+concept text_status_parser = requires(const F& f, const std::string& text, T& out) {
+  { std::invoke(f, text, out) } -> std::convertible_to<parse_status>;
+};
+template <class F, class T>
+concept text_bool_parser = requires(const F& f, const std::string& text, T& out) {
+  { std::invoke(f, text, out) } -> std::same_as<bool>;
+};
+template <class F, class T>
+concept node_parser = requires(const F& f, const node& n, T& out) {
+  { std::invoke(f, n, out) } -> std::convertible_to<parse_status>;
+};
+
+template <class F, class T>
+concept node_writer = requires(const F& f, const T& value) {
+  { std::invoke(f, value) } -> std::convertible_to<node>;
+};
+template <class F, class T>
+concept text_writer = requires(const F& f, const T& value) {
+  { std::invoke(f, value) } -> std::convertible_to<std::string>;
+};
+
+/// From converts to To without losing information or meaning: the same type; a class type
+/// conversion the class allows implicitly (mebibytes -> bytes, a string literal -> std::string);
+/// or an arithmetic widening that keeps the kind (integral or floating) and, for integers, the
+/// signedness. Nothing but bool converts to bool, and bool converts to nothing else.
+template <class From, class To>
+concept lossless_to =
+  std::same_as<std::decay_t<From>, To> ||
+  ((std::is_class_v<std::decay_t<From>> || std::is_class_v<To>) &&
+   std::is_convertible_v<From, To>) ||
+  (std::is_arithmetic_v<std::decay_t<From>> && std::is_arithmetic_v<To> &&
+   !std::same_as<std::decay_t<From>, bool> && !std::same_as<To, bool> &&
+   ((std::is_integral_v<std::decay_t<From>> && std::is_integral_v<To> &&
+     std::is_signed_v<std::decay_t<From>> == std::is_signed_v<To>) ||
+    (std::is_floating_point_v<std::decay_t<From>> && std::is_floating_point_v<To>)) &&
+   sizeof(To) >= sizeof(std::decay_t<From>));
+
+template <class T, class... Ts>
+struct first_lossless {
+  using type = void;
+};
+template <class T, class U, class... Rest>
+struct first_lossless<T, U, Rest...> {
+  using type = std::conditional_t<lossless_to<T, U>, U, typename first_lossless<T, Rest...>::type>;
+};
+
+/// A value of T initializes exactly one alternative: its own type, else the only one it converts
+/// to losslessly (1_MiB -> bytes, 1.0f -> double; not 1 -> double, -1 -> std::size_t).
+template <class T, class... Ts>
+concept selects_one_of = (std::same_as<std::decay_t<T>, Ts> || ...) ||
+                         ((static_cast<std::size_t>(lossless_to<T, Ts>) + ... + 0) == 1);
+
+template <class T, class... Ts>
+using selected_alternative_t = std::conditional_t<(std::same_as<std::decay_t<T>, Ts> || ...),
+                                                  std::decay_t<T>,
+                                                  typename first_lossless<T, Ts...>::type>;
+
+/// `'<path>': <message>`, or the bare message at the root.
+[[nodiscard]] inline std::string framed(std::string_view path, const std::string& message)
+{
+  return path.empty() ? message : "'" + std::string(path) + "': " + message;
+}
+
 }  // namespace detail
 
 // ---- options ------------------------------------------------------------------------------
 
-/// One spelling of an option: its key and how its value is read, validated and written.
+template <class... Ts>
+class option_builder;
+
+/// One spelling of an option: its key and how its value is read, validated and written. A type
+/// without parser<T> / formatter<T> starts with neither and must be given both.
 template <class T>
 struct option_alternative {
   using value_type = T;
 
   std::string key;
-  std::function<parse_status(const node&, T&)> parser = [](const node& n, T& out) {
-    return read_value(n, out);
-  };
-  std::function<node(const T&)> writer = [](const T& value) { return write_value(value); };
+  std::function<parse_status(const node&, T&)> parser = default_parser();
+  std::function<node(const T&)> writer                = default_writer();
   std::function<parse_status(const T&)> validator;  ///< empty: every value is accepted
+
+ private:
+  static std::function<parse_status(const node&, T&)> default_parser()
+  {
+    if constexpr (config_value<T>) {
+      return [](const node& n, T& out) { return read_value(n, out); };
+    } else {
+      return {};
+    }
+  }
+  static std::function<node(const T&)> default_writer()
+  {
+    if constexpr (config_value<T>) {
+      return [](const T& value) { return write_value(value); };
+    } else {
+      return {};
+    }
+  }
 };
 
 /**
@@ -223,47 +304,51 @@ struct option_alternative {
  * - a present value that does not parse or validate is an error, never a fallback;
  * - a required option must be present: a fallback does not satisfy it;
  * - absent and optional: the fallback (value_source::fallback) or nothing (value_source::unset);
- * - for_prod() options are left unset outside environment::prod;
+ * - for_prod() options are left unset outside environment::prod, without looking at the file:
+ *   a value there is neither checked nor kept, so writing the configuration back drops it;
  * - a failed load leaves the option unset.
  *
- * Declare options with option<T>(key)...build().
+ * Declare options with option<T>(key)...build(). Not synchronized: load, assign and reset must
+ * not race with readers.
  */
 template <class... Ts>
-struct config_option {
+class config_option {
+ public:
   static_assert(sizeof...(Ts) >= 1, "an option has at least one alternative");
 
   using value_type = std::variant<Ts...>;
   using first_type = std::tuple_element_t<0, std::tuple<Ts...>>;
 
-  std::tuple<option_alternative<Ts>...> alternatives;
-  std::optional<value_type> fallback;
-  std::optional<value_type> value;
-  bool required      = false;
-  bool prod_only     = false;
-  option_scope scope = option_scope::session;
-  std::string description;
-
   [[nodiscard]] value_source source() const noexcept { return _source; }
-  [[nodiscard]] bool is_from_file() const noexcept { return _source == value_source::file; }
+  [[nodiscard]] bool user_defined() const noexcept { return _source == value_source::user; }
   [[nodiscard]] bool is_fallback() const noexcept { return _source == value_source::fallback; }
   [[nodiscard]] bool is_unset() const noexcept { return _source == value_source::unset; }
-  [[nodiscard]] bool has_value() const noexcept { return value.has_value(); }
+  [[nodiscard]] bool has_value() const noexcept { return _value.has_value(); }
+
+  /// The current value (user-defined or the fallback), if any.
+  [[nodiscard]] const std::optional<value_type>& value() const noexcept { return _value; }
+  /// The declared fallback, if any.
+  [[nodiscard]] const std::optional<value_type>& fallback() const noexcept { return _fallback; }
+  [[nodiscard]] bool is_required() const noexcept { return _required; }
+  [[nodiscard]] bool is_prod_only() const noexcept { return _prod_only; }
+  [[nodiscard]] option_scope scope() const noexcept { return _scope; }
+  [[nodiscard]] const std::string& description() const noexcept { return _description; }
 
   /// The first alternative's key, which names the option.
-  [[nodiscard]] const std::string& key() const { return std::get<0>(alternatives).key; }
+  [[nodiscard]] const std::string& key() const { return std::get<0>(_alternatives).key; }
 
-  /// Every alternative's key, in declaration order.
+  /// Every alternative's key, in declaration order (views into this option).
   [[nodiscard]] std::vector<std::string_view> keys() const
   {
     return std::apply([](const auto&... alt) { return std::vector<std::string_view>{alt.key...}; },
-                      alternatives);
+                      _alternatives);
   }
 
   /// The value when it holds alternative @p T, else nullptr.
   template <class T = first_type>
   [[nodiscard]] const T* get_if() const noexcept
   {
-    return value ? std::get_if<T>(&*value) : nullptr;
+    return _value ? std::get_if<T>(&*_value) : nullptr;
   }
 
   /// The value as alternative @p T. @throws std::logic_error when unset or holding another one.
@@ -272,103 +357,149 @@ struct config_option {
   {
     if (auto const* v = get_if<T>()) { return *v; }
     throw std::logic_error("config option '" + key() +
-                           "': " + (value ? "holds another alternative" : "has no value"));
+                           "': " + (_value ? "holds another alternative" : "has no value"));
   }
 
-  /// Set the value as if it had been read from the configuration.
+  /**
+   * @brief Set the value as if it had been read from the configuration: @p v initializes its own
+   * alternative, or the only one it converts to losslessly, and must pass that alternative's
+   * validator.
+   * @throws config_error (`'<key>': <reason>`) when the validator rejects it; the option is then
+   * unchanged.
+   */
   template <class T>
     requires detail::selects_one_of<T, Ts...>
   void assign(T&& v)
   {
-    value.emplace(std::in_place_type<detail::selected_alternative_t<T, Ts...>>, std::forward<T>(v));
-    _source = value_source::file;
+    using A = detail::selected_alternative_t<T, Ts...>;
+    A candidate(std::forward<T>(v));
+    auto const& alt = std::get<option_alternative<A>>(_alternatives);
+    if (alt.validator) {
+      if (auto status = alt.validator(candidate); !status) {
+        throw config_error("'" + alt.key + "': " + status.error());
+      }
+    }
+    reset();  // a throwing emplace then leaves the option unset, not half-assigned
+    _value.emplace(std::in_place_type<A>, std::move(candidate));
+    _source = value_source::user;
   }
 
   /// Forget the value (value_source::unset).
   void reset() noexcept
   {
-    value.reset();
+    _value.reset();
     _source = value_source::unset;
   }
 
   /**
    * @brief Load from the mapping @p block, whose dotted path is @p path ("" at the root).
-   * @throws config_error naming the offending key.
+   * @throws config_error naming the offending key; an exception from a custom parser or
+   * validator is reported the same way. std::bad_alloc passes through.
    */
   void load(const node& block, std::string_view path, environment env)
   {
     reset();
-    if (prod_only && env != environment::prod) { return; }
+    if (_prod_only && env != environment::prod) { return; }
 
-    std::size_t matches = 0;
-    std::string present;
+    std::vector<std::string_view> present;
     std::apply(
       [&](const auto&... alt) {
-        auto count = [&](const auto& a) {
-          if (!block.has_value(a.key)) { return; }
-          present += (matches++ == 0 ? "'" : " and '") + a.key + "'";
-        };
-        (count(alt), ...);
+        ((block.has_value(alt.key) ? present.push_back(alt.key) : void()), ...);
       },
-      alternatives);
-    if (matches > 1) {
-      throw config_error("'" + std::string(path) + "': " + present + " are mutually exclusive");
+      _alternatives);
+    if (present.size() > 1) {
+      throw config_error(
+        detail::framed(path, quote_list(present, " and ") + " are mutually exclusive"));
+    }
+    if (present.empty() && _required) {
+      if constexpr (sizeof...(Ts) == 1) {
+        throw config_error("'" + join_path(path, key()) + "': required but missing");
+      } else {
+        throw config_error(
+          detail::framed(path, "one of " + quote_list(keys(), " or ") + " is required"));
+      }
     }
 
     std::optional<value_type> candidate;
-    std::apply(
-      [&](const auto&... alt) {
-        auto read = [&](const auto& a) {
-          auto const* n = block.find(a.key);
-          if (n == nullptr || n->is_null()) { return; }
-          using T = typename std::decay_t<decltype(a)>::value_type;
-          T parsed{};
-          auto status = a.parser(*n, parsed);
-          if (status && a.validator) { status = a.validator(parsed); }
-          if (!status) {
-            throw config_error("'" + join_path(path, a.key) + "': " + status.error());
-          }
-          candidate.emplace(std::in_place_type<T>, std::move(parsed));
-        };
-        (read(alt), ...);
-      },
-      alternatives);
-
-    if (matches == 0 && required) {
-      throw config_error("'" + join_path(path, key()) + "': required but missing");
-    }
+    std::apply([&](const auto&... alt) { (read(alt, block, path, candidate), ...); },
+               _alternatives);
     if (candidate) {
-      value   = std::move(candidate);
-      _source = value_source::file;
-    } else if (fallback) {
-      value   = fallback;
+      _value  = std::move(candidate);
+      _source = value_source::user;
+    } else if (_fallback) {
+      _value  = _fallback;
       _source = value_source::fallback;
     }
   }
 
-  /// Add this option to the mapping @p block: the key of the alternative it holds and its value.
-  /// Writes a fallback only when @p include_fallbacks; writes nothing when unset.
+  /// Put this option into the mapping @p block: the key of the alternative it holds, with its
+  /// value, replacing any alternative already there. A fallback is written only when
+  /// @p include_fallbacks; an unset option writes nothing (and removes nothing).
   void write(node& block, bool include_fallbacks) const
   {
-    if (!value || (_source == value_source::fallback && !include_fallbacks)) { return; }
+    if (!_value || (_source == value_source::fallback && !include_fallbacks)) { return; }
     std::apply(
       [&](const auto&... alt) {
+        (block.erase(alt.key), ...);
         auto emit = [&](const auto& a) {
           using T = typename std::decay_t<decltype(a)>::value_type;
-          if (auto const* v = std::get_if<T>(&*value)) { block.set(a.key, a.writer(*v)); }
+          if (auto const* v = std::get_if<T>(&*_value)) { block.set(a.key, a.writer(*v)); }
         };
         (emit(alt), ...);
       },
-      alternatives);
+      _alternatives);
   }
 
  private:
+  template <class...>
+  friend class option_builder;
+
+  static std::string quote_list(const std::vector<std::string_view>& keys, std::string_view sep)
+  {
+    std::string text;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (i > 0) { text += i + 1 == keys.size() ? std::string(sep) : ", "; }
+      text += "'" + std::string(keys[i]) + "'";
+    }
+    return text;
+  }
+
+  template <class T>
+  static void read(const option_alternative<T>& alt,
+                   const node& block,
+                   std::string_view path,
+                   std::optional<value_type>& candidate)
+  {
+    auto const* n = block.find(alt.key);
+    if (n == nullptr || n->is_null()) { return; }
+    T parsed{};
+    parse_status status;
+    try {
+      status = alt.parser(*n, parsed);
+      if (status && alt.validator) { status = alt.validator(parsed); }
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (const std::exception& e) {
+      status = parse_status::failure(e.what());
+    }
+    if (!status) { throw config_error("'" + join_path(path, alt.key) + "': " + status.error()); }
+    candidate.emplace(std::in_place_type<T>, std::move(parsed));
+  }
+
+  std::tuple<option_alternative<Ts>...> _alternatives;
+  std::optional<value_type> _fallback;
+  std::optional<value_type> _value;
+  bool _required      = false;
+  bool _prod_only     = false;
+  option_scope _scope = option_scope::session;
+  std::string _description;
   value_source _source = value_source::unset;
 };
 
 /**
- * @brief Fluent declaration of a config_option. validate() and parser() apply to the most
- * recently added alternative; the rest applies to the whole option.
+ * @brief Fluent declaration of a config_option. validate(), parser() and writer() apply to the
+ * most recently added alternative; the rest applies to the whole option. Use it in one
+ * expression ending in build(): the setters return a reference to the builder.
  *
  *     config_option<bytes, double> capacity =
  *       option<bytes>("capacity_bytes")
@@ -382,10 +513,16 @@ class option_builder {
  public:
   using option_type = config_option<Ts...>;
 
-  explicit option_builder(option_type spec) : _spec(std::move(spec)) {}
+  /// An option read from @p key as the single alternative type; see option<T>().
+  explicit option_builder(std::string key)
+    requires(sizeof...(Ts) == 1)
+  {
+    std::get<0>(_spec._alternatives).key = std::move(key);
+  }
 
   /// Validate the last alternative with a callable taking const T& and returning bool (rejected
-  /// as "value out of range", plus the callable's description() when it has one) or parse_status.
+  /// as "value out of range", with @p description or the callable's description()) or
+  /// parse_status (its own reason, followed by @p description when given).
   template <class F>
   option_builder& validate(F fn, std::string description = {})
   {
@@ -395,27 +532,32 @@ class option_builder {
     return *this;
   }
 
-  /// Replace the last alternative's parser. Accepts
-  /// `bool|parse_status (std::string_view, T&)` for a scalar or `parse_status (const node&, T&)`.
+  /// Replace the last alternative's parser with a callable taking (const node&, T&) and returning
+  /// parse_status, or taking the scalar's text as written (std::string_view or
+  /// const std::string&) and T&, and returning parse_status or bool. Leave @p out untouched on
+  /// failure.
   template <class F>
   option_builder& parser(F fn)
   {
     auto& alt = last();
     using T   = typename std::decay_t<decltype(alt)>::value_type;
-    if constexpr (std::is_invocable_v<const F&, const node&, T&>) {
-      alt.parser = std::move(fn);
+    if constexpr (detail::node_parser<F, T>) {
+      alt.parser = [fn = std::move(fn)](const node& n, T& out) -> parse_status {
+        return std::invoke(fn, n, out);
+      };
     } else {
-      static_assert(std::is_invocable_v<const F&, std::string_view, T&>,
-                    "a parser takes (std::string_view, T&) or (const node&, T&)");
+      static_assert(detail::text_status_parser<F, T> || detail::text_bool_parser<F, T>,
+                    "a parser takes (const node&, T&) and returns parse_status, or takes the "
+                    "text (std::string_view or const std::string&) and T& and returns "
+                    "parse_status or bool");
       alt.parser = [fn = std::move(fn)](const node& n, T& out) -> parse_status {
         if (!n.is_scalar()) {
           return parse_status::failure("expected a scalar, got " + std::string(n.kind_name()));
         }
-        if constexpr (std::same_as<std::invoke_result_t<const F&, std::string_view, T&>,
-                                   parse_status>) {
-          return std::invoke(fn, std::string_view(n.text()), out);
+        if constexpr (detail::text_status_parser<F, T>) {
+          return std::invoke(fn, n.text(), out);
         } else {
-          if (std::invoke(fn, std::string_view(n.text()), out)) { return {}; }
+          if (std::invoke(fn, n.text(), out)) { return {}; }
           return parse_status::failure("cannot parse " + detail::quoted(n.text()));
         }
       };
@@ -423,16 +565,19 @@ class option_builder {
     return *this;
   }
 
-  /// Replace the last alternative's writer: `std::string (const T&)` for a scalar, or
-  /// `node (const T&)`. Pair it with parser() when the custom spelling differs from formatter<T>.
+  /// Replace the last alternative's writer with a callable taking const T& and returning a node,
+  /// or the scalar's text. Pair it with parser() when the custom spelling differs from
+  /// formatter<T>.
   template <class F>
   option_builder& writer(F fn)
   {
     auto& alt = last();
     using T   = typename std::decay_t<decltype(alt)>::value_type;
-    if constexpr (std::same_as<std::invoke_result_t<const F&, const T&>, node>) {
-      alt.writer = std::move(fn);
+    if constexpr (detail::node_writer<F, T>) {
+      alt.writer = [fn = std::move(fn)](const T& value) { return node(std::invoke(fn, value)); };
     } else {
+      static_assert(detail::text_writer<F, T>,
+                    "a writer takes const T& and returns a node or a string");
       alt.writer = [fn = std::move(fn)](const T& value) {
         return node::scalar(std::string(std::invoke(fn, value)));
       };
@@ -441,89 +586,122 @@ class option_builder {
   }
 
   /// Add a mutually exclusive alternative: the same setting spelled as another key and type.
+  /// Option-wide settings made so far carry over.
   template <class U>
-  [[nodiscard]] option_builder<Ts..., U> or_type(std::string key) const
+  [[nodiscard]] option_builder<Ts..., U> or_type(std::string key) const&
+  {
+    return option_builder(*this).template or_type<U>(std::move(key));
+  }
+  template <class U>
+  [[nodiscard]] option_builder<Ts..., U> or_type(std::string key) &&
   {
     static_assert((!std::is_same_v<U, Ts> && ...),
                   "each alternative of an option needs a distinct value type");
     option_alternative<U> added;
     added.key = std::move(key);
     config_option<Ts..., U> next;
-    next.alternatives = std::tuple_cat(_spec.alternatives, std::make_tuple(std::move(added)));
-    if (_spec.fallback) {
-      next.fallback =
-        std::visit([](const auto& v) { return typename config_option<Ts..., U>::value_type(v); },
-                   *_spec.fallback);
+    next._alternatives =
+      std::tuple_cat(std::move(_spec._alternatives), std::make_tuple(std::move(added)));
+    if (_spec._fallback) {
+      next._fallback = std::visit(
+        [](auto&& v) {
+          using V = std::decay_t<decltype(v)>;
+          return typename config_option<Ts..., U>::value_type(std::in_place_type<V>,
+                                                              std::forward<decltype(v)>(v));
+        },
+        std::move(*_spec._fallback));
     }
-    next.required    = _spec.required;
-    next.prod_only   = _spec.prod_only;
-    next.scope       = _spec.scope;
-    next.description = _spec.description;
+    next._required    = _spec._required;
+    next._prod_only   = _spec._prod_only;
+    next._scope       = _spec._scope;
+    next._description = std::move(_spec._description);
     return option_builder<Ts..., U>(std::move(next));
   }
 
   /// The value used when no alternative is present (for an optional option). It initializes its
-  /// own alternative type, else the only one it converts to.
+  /// own alternative type, else the only one it converts to losslessly.
   template <class T>
     requires detail::selects_one_of<T, Ts...>
   option_builder& fallback(T&& v)
   {
-    _spec.fallback.emplace(std::in_place_type<detail::selected_alternative_t<T, Ts...>>,
-                           std::forward<T>(v));
+    _spec._fallback.emplace(std::in_place_type<detail::selected_alternative_t<T, Ts...>>,
+                            std::forward<T>(v));
     return *this;
   }
 
-  option_builder& as_mandatory()
+  option_builder& mark_mandatory()
   {
-    _spec.required = true;
+    _spec._required = true;
     return *this;
   }
-  option_builder& as_optional()
+  option_builder& mark_optional()
   {
-    _spec.required = false;
+    _spec._required = false;
     return *this;
   }
   option_builder& for_prod()
   {
-    _spec.prod_only = true;
+    _spec._prod_only = true;
     return *this;
   }
   option_builder& scope(option_scope s)
   {
-    _spec.scope = s;
+    _spec._scope = s;
     return *this;
   }
   option_builder& describe(std::string text)
   {
-    _spec.description = std::move(text);
+    _spec._description = std::move(text);
     return *this;
   }
 
-  /// The declared option. @throws std::logic_error when the fallback fails its alternative's
-  /// validator (a declaration bug).
-  [[nodiscard]] option_type build() const
+  /**
+   * @brief The declared option.
+   * @throws std::logic_error for a declaration bug: an empty or repeated key, an alternative
+   * without a parser or writer (a type with no parser<T> / formatter<T> needs both), or a
+   * fallback its alternative's validator rejects.
+   */
+  [[nodiscard]] option_type build() const& { return option_builder(*this).build(); }
+  [[nodiscard]] option_type build() &&
   {
-    if (_spec.fallback) {
-      std::apply(
-        [&](const auto&... alt) {
-          auto check = [&](const auto& a) {
-            using T       = typename std::decay_t<decltype(a)>::value_type;
-            auto const* v = std::get_if<T>(&*_spec.fallback);
-            if (v == nullptr || !a.validator) { return; }
-            if (auto status = a.validator(*v); !status) {
-              throw std::logic_error("config option '" + a.key +
-                                     "': invalid fallback: " + status.error());
-            }
-          };
-          (check(alt), ...);
-        },
-        _spec.alternatives);
+    auto const names = _spec.keys();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (names[i].empty()) { throw std::logic_error("config option: empty key"); }
+      for (std::size_t j = 0; j < i; ++j) {
+        if (names[i] == names[j]) {
+          throw std::logic_error("config option '" + std::string(names[i]) + "': repeated key");
+        }
+      }
     }
-    return _spec;
+    std::apply(
+      [&](const auto&... alt) {
+        auto check = [&](const auto& a) {
+          if (!a.parser || !a.writer) {
+            throw std::logic_error("config option '" + a.key +
+                                   "': no parser or writer (give both for a type without "
+                                   "parser<T> / formatter<T>)");
+          }
+          using T       = typename std::decay_t<decltype(a)>::value_type;
+          auto const* v = _spec._fallback ? std::get_if<T>(&*_spec._fallback) : nullptr;
+          if (v == nullptr || !a.validator) { return; }
+          if (auto status = a.validator(*v); !status) {
+            throw std::logic_error("config option '" + a.key +
+                                   "': invalid fallback: " + status.error());
+          }
+        };
+        (check(alt), ...);
+      },
+      _spec._alternatives);
+    return std::move(_spec);
   }
 
  private:
-  auto& last() { return std::get<sizeof...(Ts) - 1>(_spec.alternatives); }
+  template <class...>
+  friend class option_builder;
+
+  explicit option_builder(option_type spec) : _spec(std::move(spec)) {}
+
+  auto& last() { return std::get<sizeof...(Ts) - 1>(_spec._alternatives); }
 
   option_type _spec;
 };
@@ -532,9 +710,7 @@ class option_builder {
 template <class T>
 [[nodiscard]] option_builder<T> option(std::string key)
 {
-  config_option<T> spec;
-  std::get<0>(spec.alternatives).key = std::move(key);
-  return option_builder<T>(std::move(spec));
+  return option_builder<T>(std::move(key));
 }
 
 }  // namespace sirius::config

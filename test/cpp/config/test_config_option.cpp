@@ -4,6 +4,7 @@
 #include "config/option.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -35,14 +36,14 @@ struct memory_options {
                                             .or_type<double>("capacity_fraction")
                                             .validate(between<double>{0.0, 1.0})
                                             .fallback(0.95)
-                                            .as_optional()
+                                            .mark_optional()
                                             .for_prod()
                                             .build();
 
   config_option<milliseconds> timeout = option<milliseconds>("timeout")
                                           .validate([](milliseconds v) { return v > 0ms; })
                                           .fallback(1500ms)
-                                          .as_optional()
+                                          .mark_optional()
                                           .scope(option_scope::query)
                                           .build();
 
@@ -68,7 +69,7 @@ std::string load_error(memory_options& options, const node& block)
 
 TEST_CASE("an optional option without a fallback stays unset", "[config][config_option]")
 {
-  auto limit = option<int>("limit").as_optional().build();
+  auto limit = option<int>("limit").mark_optional().build();
   REQUIRE(limit.is_unset());
   limit.load(node::mapping(), "", environment::prod);
   REQUIRE(limit.is_unset());
@@ -77,7 +78,7 @@ TEST_CASE("an optional option without a fallback stays unset", "[config][config_
 
 TEST_CASE("value_source tracks file vs fallback", "[config][config_option]")
 {
-  auto limit = option<int>("limit").fallback(42).as_optional().build();
+  auto limit = option<int>("limit").fallback(42).mark_optional().build();
   REQUIRE(limit.is_unset());  // declaring a fallback does not load the option
 
   limit.load(node::mapping(), "", environment::prod);
@@ -85,7 +86,7 @@ TEST_CASE("value_source tracks file vs fallback", "[config][config_option]")
   REQUIRE(limit.get() == 42);
 
   limit.load(map_of({{"limit", "42"}}), "", environment::prod);
-  REQUIRE(limit.is_from_file());  // same value as the fallback, different source
+  REQUIRE(limit.user_defined());  // same value as the fallback, different source
 
   limit.load(node::mapping(), "", environment::prod);
   REQUIRE(limit.source() == value_source::fallback);
@@ -118,7 +119,7 @@ TEST_CASE("alternatives hold the type of the key that was present", "[config][co
 {
   memory_options options;
   options.load(map_of({{"capacity", "1 GiB"}}));
-  REQUIRE(options.capacity.is_from_file());
+  REQUIRE(options.capacity.user_defined());
   REQUIRE(options.capacity.get<bytes>() == 1_GiB);
   REQUIRE(options.capacity.get_if<double>() == nullptr);
   REQUIRE_THROWS_AS(options.capacity.get<double>(), std::logic_error);
@@ -133,13 +134,13 @@ TEST_CASE("alternatives hold the type of the key that was present", "[config][co
 
 TEST_CASE("a fallback does not satisfy a mandatory option", "[config][config_option]")
 {
-  auto limit = option<int>("limit").fallback(42).as_mandatory().build();
+  auto limit = option<int>("limit").fallback(42).mark_mandatory().build();
   REQUIRE_THROWS_WITH(limit.load(node::mapping(), "sirius.limits", environment::prod),
                       "'sirius.limits.limit': required but missing");
   REQUIRE(limit.is_unset());
   limit.load(map_of({{"limit", "7"}}), "sirius.limits", environment::prod);
   REQUIRE(limit.get() == 7);
-  REQUIRE(limit.is_from_file());
+  REQUIRE(limit.user_defined());
 }
 
 TEST_CASE("present but invalid values never fall back", "[config][config_option]")
@@ -166,12 +167,12 @@ TEST_CASE("present but invalid values never fall back", "[config][config_option]
 TEST_CASE("scope and description are declared per option", "[config][config_option]")
 {
   memory_options options;
-  REQUIRE(options.capacity.scope == option_scope::session);
-  REQUIRE(options.timeout.scope == option_scope::query);
+  REQUIRE(options.capacity.scope() == option_scope::session);
+  REQUIRE(options.timeout.scope() == option_scope::query);
   REQUIRE(to_string(option_scope::query) == "query");
 
   auto described = option<bool>("enable").describe("Turn it on.").build();
-  REQUIRE(described.description == "Turn it on.");
+  REQUIRE(described.description() == "Turn it on.");
 }
 
 TEST_CASE("or_type keeps the option-wide policy declared before it", "[config][config_option]")
@@ -181,7 +182,7 @@ TEST_CASE("or_type keeps the option-wide policy declared before it", "[config][c
                  .scope(option_scope::query)
                  .or_type<double>("limit_fraction")
                  .build();
-  REQUIRE(limit.scope == option_scope::query);
+  REQUIRE(limit.scope() == option_scope::query);
   limit.load(node::mapping(), "", environment::prod);
   REQUIRE(limit.get<bytes>() == 1_MiB);
 }
@@ -271,15 +272,323 @@ TEST_CASE("write emits file values, and fallbacks only on request", "[config][co
   reread.load(everything);
   REQUIRE(reread.capacity.get<double>() == 0.5);
   REQUIRE(reread.timeout.get() == 1500ms);
-  REQUIRE(reread.timeout.is_from_file());
+  REQUIRE(reread.timeout.user_defined());
 }
 
 TEST_CASE("assign sets a value as if read from the file", "[config][config_option]")
 {
   memory_options options;
   options.capacity.assign(2_GiB);
-  REQUIRE(options.capacity.is_from_file());
+  REQUIRE(options.capacity.user_defined());
   REQUIRE(options.capacity.get<bytes>() == 2_GiB);
   options.capacity.reset();
   REQUIRE(options.capacity.is_unset());
+}
+
+// ---- node ----------------------------------------------------------------------------------
+
+TEST_CASE("node mappings keep order and replace in place", "[config][config_option]")
+{
+  node block;
+  block.set("b", node::scalar("1"));  // a null node becomes a mapping
+  block.set("a", node::scalar("2"));
+  block.set("b", node::scalar("3"));
+  REQUIRE(block.entries().size() == 2);
+  REQUIRE(block.entries()[0].first == "b");
+  REQUIRE(block.find("b")->text() == "3");
+  REQUIRE(block != map_of({{"a", "2"}, {"b", "3"}}));  // order matters
+  REQUIRE(block == map_of({{"b", "3"}, {"a", "2"}}));
+
+  block.erase("b");
+  block.erase("missing");
+  REQUIRE(block == map_of({{"a", "2"}}));
+
+  node copy = block;
+  copy.set("a", node::scalar("changed"));
+  REQUIRE(block.find("a")->text() == "2");  // copies are independent
+
+  block.set("null", node{});
+  REQUIRE(block.find("null") != nullptr);
+  REQUIRE_FALSE(block.has_value("null"));
+  REQUIRE_FALSE(block.has_value("missing"));
+}
+
+TEST_CASE("node accessors check the kind", "[config][config_option]")
+{
+  node scalar = node::scalar("x");
+  REQUIRE(scalar.find("x") == nullptr);
+  REQUIRE_FALSE(scalar.has_value("x"));
+  REQUIRE_THROWS_WITH(scalar.entries(), "config::node: expected a mapping, got a scalar");
+  REQUIRE_THROWS_AS(scalar.set("k", node{}), std::logic_error);
+  REQUIRE_THROWS_WITH(node{}.text(), "config::node: expected a scalar, got null");
+  REQUIRE(node::sequence().kind_name() == "a sequence");
+}
+
+// ---- loading -------------------------------------------------------------------------------
+
+TEST_CASE("a null alternative does not conflict with a present one", "[config][config_option]")
+{
+  memory_options options;
+  node block = map_of({{"capacity_fraction", "0.5"}});
+  block.set("capacity", node{});
+  options.load(block);
+  REQUIRE(options.capacity.get<double>() == 0.5);
+
+  // Only nulls: absent, so a mandatory option is missing.
+  auto pair  = option<int>("a").or_type<double>("b").mark_mandatory().build();
+  node nulls = node::mapping();
+  nulls.set("a", node{});
+  nulls.set("b", node{});
+  REQUIRE_THROWS_WITH(pair.load(nulls, "p", environment::prod),
+                      "'p': one of 'a' or 'b' is required");
+}
+
+TEST_CASE("messages at the root have no path prefix", "[config][config_option]")
+{
+  auto pair = option<int>("a").or_type<double>("b").build();
+  REQUIRE_THROWS_WITH(pair.load(map_of({{"a", "1"}, {"b", "2"}}), "", environment::prod),
+                      "'a' and 'b' are mutually exclusive");
+  auto triple = option<int>("a").or_type<double>("b").or_type<bool>("c").mark_mandatory().build();
+  REQUIRE_THROWS_WITH(
+    triple.load(map_of({{"a", "1"}, {"b", "2"}, {"c", "y"}}), "", environment::prod),
+    "'a', 'b' and 'c' are mutually exclusive");
+  REQUIRE_THROWS_WITH(triple.load(node::mapping(), "", environment::prod),
+                      "one of 'a', 'b' or 'c' is required");
+  auto single = option<int>("a").mark_mandatory().build();
+  REQUIRE_THROWS_WITH(single.load(node::mapping(), "", environment::prod),
+                      "'a': required but missing");
+}
+
+TEST_CASE("every failed load leaves the option unset", "[config][config_option]")
+{
+  memory_options options;
+  auto failing = [&](const node& block) {
+    options.load(map_of({{"capacity", "1 GiB"}}));  // populated first
+    REQUIRE_THROWS_AS(options.capacity.load(block, "memory", environment::prod), config_error);
+    REQUIRE(options.capacity.is_unset());
+    REQUIRE_FALSE(options.capacity.has_value());
+  };
+  failing(map_of({{"capacity", "1 GiB"}, {"capacity_fraction", "0.5"}}));  // exclusive
+  failing(map_of({{"capacity_fraction", "2"}}));                           // validator
+  failing(map_of({{"capacity", "x"}}));                                    // parser
+
+  auto required = option<int>("limit").mark_mandatory().build();
+  required.assign(3);
+  REQUIRE_THROWS_AS(required.load(node::mapping(), "", environment::prod), config_error);
+  REQUIRE(required.is_unset());
+}
+
+TEST_CASE("for_prod options ignore the file outside prod", "[config][config_option]")
+{
+  // Even a mandatory option with an invalid value: it is not looked at in dev.
+  auto prod = option<int>("limit").mark_mandatory().for_prod().build();
+  prod.load(map_of({{"limit", "bad"}}), "", environment::dev);
+  REQUIRE(prod.is_unset());
+  REQUIRE_THROWS_AS(prod.load(map_of({{"limit", "bad"}}), "", environment::prod), config_error);
+}
+
+TEST_CASE("exceptions from custom parsers and validators are framed", "[config][config_option]")
+{
+  auto throwing = option<int>("n")
+                    .parser([](std::string_view text, int& out) -> parse_status {
+                      out = std::stoi(std::string(text));  // throws std::invalid_argument
+                      return {};
+                    })
+                    .build();
+  throwing.assign(1);
+  REQUIRE_THROWS_AS(throwing.load(map_of({{"n", "x"}}), "p", environment::prod), config_error);
+  REQUIRE(throwing.is_unset());
+
+  auto node_misuse = option<int>("n")
+                       .parser([](const node& n, int&) -> parse_status {
+                         (void)n.entries();  // a scalar: throws std::logic_error
+                         return {};
+                       })
+                       .build();
+  REQUIRE_THROWS_WITH(node_misuse.load(map_of({{"n", "1"}}), "p", environment::prod),
+                      "'p.n': config::node: expected a mapping, got a scalar");
+}
+
+// ---- assign and fallback conversions --------------------------------------------------------
+
+static_assert(detail::selects_one_of<mebibytes, bytes, double>);  // lossless class conversion
+static_assert(detail::selects_one_of<float, bytes, double>);      // widening
+static_assert(!detail::selects_one_of<int, bytes, double>);       // 1 is not 1.0 of a fraction
+static_assert(!detail::selects_one_of<const char (&)[6], bool>);  // no pointer to bool
+static_assert(!detail::selects_one_of<double, int>);              // no truncation
+static_assert(!detail::selects_one_of<int, std::size_t>);         // no sign change
+static_assert(detail::selects_one_of<int, std::int64_t>);         // widening, same sign
+static_assert(!detail::selects_one_of<bool, int>);                // bool stays bool
+static_assert(detail::selects_one_of<const char (&)[4], std::string>);  // string literal
+static_assert(detail::selects_one_of<int, bool, int>);                  // exact match wins
+
+TEST_CASE("assign converts losslessly and validates", "[config][config_option]")
+{
+  auto size = option<bytes>("size").validate([](bytes v) { return v > 0_B; }).build();
+  size.assign(1_MiB);
+  REQUIRE(size.get() == 1_MiB);
+
+  size.assign(2_MiB);
+  REQUIRE_THROWS_WITH(size.assign(0_B), "'size': value out of range: '0 B'");
+  REQUIRE(size.get() == 2_MiB);  // unchanged after a rejected assign
+  REQUIRE(size.user_defined());
+
+  auto name = option<std::string>("name").fallback("telemetry_data").build();
+  name.load(node::mapping(), "", environment::prod);
+  REQUIRE(name.get() == "telemetry_data");
+}
+
+// ---- custom parsers and writers -------------------------------------------------------------
+
+namespace {
+struct point {
+  int x = 0, y = 0;
+  bool operator==(const point&) const = default;
+};
+}  // namespace
+
+static_assert(!config_value<point>);
+
+TEST_CASE("a type without parser<T> works with a custom parser and writer",
+          "[config][config_option]")
+{
+  auto origin = option<point>("origin")
+                  .parser([](const node& n, point& out) -> parse_status {
+                    if (!n.is_sequence() || n.elements().size() != 2) {
+                      return parse_status::failure("expected [x, y]");
+                    }
+                    point p;
+                    if (!parser<int>{}(n.elements()[0].text(), p.x) ||
+                        !parser<int>{}(n.elements()[1].text(), p.y)) {
+                      return parse_status::failure("expected integers");
+                    }
+                    out = p;
+                    return {};
+                  })
+                  .writer([](const point& p) {
+                    return node::sequence(
+                      {node::scalar(std::to_string(p.x)), node::scalar(std::to_string(p.y))});
+                  })
+                  .build();
+  node block = node::mapping();
+  block.set("origin", node::sequence({node::scalar("3"), node::scalar("4")}));
+  origin.load(block, "", environment::prod);
+  REQUIRE(origin.get() == point{3, 4});
+  node out = node::mapping();
+  origin.write(out, false);
+  REQUIRE(out == block);
+
+  // Without both, the declaration is rejected.
+  REQUIRE_THROWS_AS(option<point>("origin").build(), std::logic_error);
+}
+
+TEST_CASE("text parsers may take std::string and return parse_status", "[config][config_option]")
+{
+  auto upper = option<std::string>("name")
+                 .parser([](const std::string& text, std::string& out) -> parse_status {
+                   if (text.empty()) { return parse_status::failure("must not be empty"); }
+                   out = text;
+                   return {};
+                 })
+                 .build();
+  REQUIRE_THROWS_WITH(upper.load(map_of({{"name", ""}}), "t", environment::prod),
+                      "'t.name': must not be empty");
+}
+
+TEST_CASE("validator descriptions", "[config][config_option]")
+{
+  // An explicit description wins over the callable's description().
+  auto fraction = option<double>("f").validate(between<double>{0.0, 1.0}, "a fraction").build();
+  REQUIRE_THROWS_WITH(fraction.load(map_of({{"f", "2"}}), "", environment::prod),
+                      "'f': value out of range: '2.0' (a fraction)");
+
+  // A parse_status validator keeps its reason and gains the description.
+  auto even =
+    option<int>("n")
+      .validate([](int v) { return v % 2 == 0 ? parse_status{} : parse_status::failure("odd"); },
+                "must be even")
+      .build();
+  REQUIRE_THROWS_WITH(even.load(map_of({{"n", "3"}}), "", environment::prod),
+                      "'n': odd (must be even)");
+
+  // A vector value is not echoed.
+  auto list = option<std::vector<int>>("ids")
+                .validate([](const std::vector<int>& v) { return !v.empty(); }, "must not be empty")
+                .build();
+  node block = node::mapping();
+  block.set("ids", node::sequence());
+  REQUIRE_THROWS_WITH(list.load(block, "", environment::prod),
+                      "'ids': value out of range (must not be empty)");
+}
+
+TEST_CASE("declaration mistakes are logic errors", "[config][config_option]")
+{
+  REQUIRE_THROWS_WITH(option<int>("k").or_type<double>("k").build(),
+                      "config option 'k': repeated key");
+  REQUIRE_THROWS_WITH(option<int>("").build(), "config option: empty key");
+  REQUIRE_THROWS_WITH(
+    option<int>("a").or_type<double>("b").validate(between<double>{0.0, 1.0}).fallback(2.0).build(),
+    "config option 'b': invalid fallback: value out of range: '2.0' (must be between 0.0 and 1.0)");
+}
+
+TEST_CASE("or_type carries every option-wide setting", "[config][config_option]")
+{
+  auto pair = option<bool>("on")
+                .fallback(true)
+                .mark_mandatory()
+                .for_prod()
+                .describe("text")
+                .or_type<int>("level")
+                .build();
+  REQUIRE(pair.is_required());
+  REQUIRE(pair.is_prod_only());
+  REQUIRE(pair.description() == "text");
+  REQUIRE(*pair.fallback() == decltype(pair)::value_type(true));
+}
+
+TEST_CASE("vector values", "[config][config_option]")
+{
+  auto names = option<std::vector<std::string>>("names").build();
+  node block = node::mapping();
+  block.set("names", node::sequence());
+  names.load(block, "", environment::prod);
+  REQUIRE(names.get().empty());
+
+  block.set("names", node::sequence({node::scalar("a"), node::mapping()}));
+  REQUIRE_THROWS_WITH(names.load(block, "", environment::prod),
+                      "'names': element 1: expected a scalar, got a mapping");
+
+  names.assign(std::vector<std::string>{"x", "y"});
+  node out = node::mapping();
+  names.write(out, false);
+  names.load(out, "", environment::prod);
+  REQUIRE(names.get() == std::vector<std::string>{"x", "y"});
+}
+
+TEST_CASE("write replaces a sibling alternative and skips unset options", "[config][config_option]")
+{
+  memory_options options;
+  node block = map_of({{"capacity", "1 GiB"}});
+  options.load(block);
+  options.capacity.assign(0.5);
+  options.capacity.write(block, false);
+  REQUIRE(block == map_of({{"capacity_fraction", "0.5"}}));
+
+  auto unset = option<int>("n").build();
+  unset.load(node::mapping(), "", environment::prod);
+  node out = map_of({{"n", "7"}});
+  unset.write(out, true);
+  REQUIRE(out == map_of({{"n", "7"}}));
+}
+
+TEST_CASE("accessors report what they hold", "[config][config_option]")
+{
+  auto triple = option<int>("a").or_type<double>("b").or_type<bool>("c").build();
+  REQUIRE(triple.keys() == std::vector<std::string_view>{"a", "b", "c"});
+  REQUIRE(triple.get_if<int>() == nullptr);
+  REQUIRE_THROWS_WITH(triple.get<int>(), "config option 'a': has no value");
+  triple.assign(true);
+  REQUIRE_THROWS_WITH(triple.get<int>(), "config option 'a': holds another alternative");
+  REQUIRE(to_string(value_source::fallback) == "fallback");
+  REQUIRE(to_string(option_scope::session) == "session");
 }
