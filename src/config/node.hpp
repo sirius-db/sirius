@@ -78,18 +78,27 @@ class node {
   }
 
   /// Add @p key to a mapping (a null node becomes an empty mapping first), replacing an existing
-  /// entry in place. @return the stored value.
-  node& set(std::string key, node value)
+  /// entry in place. References and pointers into this mapping (e.g. from find()) are invalidated.
+  /// @throws std::logic_error when this is a scalar or a sequence.
+  void set(std::string key, node value)
   {
     if (is_null()) { _value = mapping_type{}; }
     auto& map = entries();
     for (auto& [name, existing] : map) {
       if (name == key) {
         existing = std::move(value);
-        return existing;
+        return;
       }
     }
-    return map.emplace_back(std::move(key), std::move(value)).second;
+    map.emplace_back(std::move(key), std::move(value));
+  }
+
+  /// Remove @p key from a mapping; a no-op when absent or when this is not a mapping.
+  void erase(std::string_view key)
+  {
+    auto* map = std::get_if<mapping_type>(&_value);
+    if (map == nullptr) { return; }
+    std::erase_if(*map, [key](const auto& entry) { return entry.first == key; });
   }
 
   /// "null", "a scalar", "a sequence" or "a mapping", for messages.
