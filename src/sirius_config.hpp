@@ -138,6 +138,13 @@ constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
 /// and combine the partial results above it.
 constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
 
+/// Restrict every table a delim subquery ties to its correlation column by an equality, before
+/// DuckDB orders the joins.
+constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = true;
+
+/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows.
+constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = true;
+
 /// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
@@ -352,6 +359,15 @@ struct operator_params {
   /// variable-width group-by columns, so the join repeats them once per key instead of once per
   /// row. See `push_partial_aggregates_below_joins`.
   bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
+
+  /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also
+  /// gets them on every column of another table an equality ties to it. See
+  /// `carry_subquery_keys_across_equalities`.
+  bool enable_subquery_key_carry = config::DEFAULT_ENABLE_SUBQUERY_KEY_CARRY;
+
+  /// Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also
+  /// reads, and keep the outer rows that have a group. See `answer_exists_from_aggregate`.
+  bool enable_exists_from_aggregate = config::DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.

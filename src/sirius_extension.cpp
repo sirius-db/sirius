@@ -3060,6 +3060,22 @@ static void SetEnablePartialAggregateBelowJoin(ClientContext& context,
                    params->enable_partial_aggregate_below_join);
 }
 
+static void SetEnableSubqueryKeyCarry(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->enable_subquery_key_carry = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SUBQUERY_KEY_CARRY to {}",
+                   params->enable_subquery_key_carry);
+}
+
+static void SetEnableExistsFromAggregate(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                         = get_operator_params(context, scope);
+  params->enable_exists_from_aggregate = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EXISTS_FROM_AGGREGATE to {}",
+                   params->enable_exists_from_aggregate);
+}
+
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
@@ -3686,6 +3702,21 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_partial_aggregate_below_join),
                     SetEnablePartialAggregateBelowJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_subquery_key_carry",
+                    "carry a correlated subquery's keys to the tables an equality ties to them",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_subquery_key_carry),
+                    SetEnableSubqueryKeyCarry);
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_exists_from_aggregate",
+    "answer a correlated EXISTS from a scalar aggregate subquery over the same rows",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_exists_from_aggregate),
+    SetEnableExistsFromAggregate);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

@@ -42,6 +42,7 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/aggregate_binding.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_flat_tree.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
@@ -617,30 +618,6 @@ std::optional<peeled_scan> peel_scan(unique_ptr<LogicalOperator>& root)
   return scan;
 }
 
-/// Whether two scans read the same view of the same source. This is the identity the transparent
-/// execution path itself compares between plans (`capture_bound_read_view`), which a table
-/// function's own bind-data equality does not reliably provide (parquet's does not, even for a
-/// scan against itself). Reads of the same files can still select different rows, such as two
-/// Iceberg snapshots with different deletes, so their selector evidence must match too.
-bool same_source(duckdb::ClientContext& context,
-                 duckdb::LogicalGet const& a,
-                 duckdb::LogicalGet const& b)
-{
-  if (a.function.GetName() != b.function.GetName() || a.returned_types != b.returned_types ||
-      a.names != b.names) {
-    return false;
-  }
-  try {
-    auto const view_a = sirius::op::scan::capture_bound_read_view(a, context);
-    auto const view_b = sirius::op::scan::capture_bound_read_view(b, context);
-    return view_a.identity && view_b.identity &&
-           view_a.identity->fingerprint == view_b.identity->fingerprint &&
-           sirius::op::scan::same_selector(view_a, view_b);
-  } catch (std::exception const&) {
-    return false;
-  }
-}
-
 /// The slot of @p get that outputs base column @p base, reading it if the scan does not already.
 duckdb::idx_t widen(duckdb::LogicalGet& get, duckdb::idx_t base)
 {
@@ -749,7 +726,7 @@ unique_ptr<LogicalOperator> rewrite_merged(duckdb::ClientContext& context,
   auto const outer_names = outer->GetColumnBindings();
   for (std::size_t i = 0; i < chain.size(); ++i) {
     auto const& get = *scans[i].get;
-    if (!same_source(context, shared, get) || chain[i].key_type != innermost.key_type ||
+    if (!flat::same_source(context, shared, get) || chain[i].key_type != innermost.key_type ||
         !(chain[i].outer_key == innermost.outer_key) ||
         !reads_only(*column(chain[i].key_type, t_keys[i]), get) ||
         base_column(get, t_keys[i].column_index) != key_base ||
