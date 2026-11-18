@@ -83,13 +83,10 @@ fi
 # Overridable from the environment (diagnosis runs append e.g. a log-level SET).
 export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'ast_jit'}"
 
-# Fused decode-time filtering and late materialization, same gates and defaults
-# as run.sh (see docs/super-sirius/late-materialization.md). Late-mat is inert on
+# Fused decode-time filtering and late materialization default on, as in run.sh
+# (see docs/super-sirius/late-materialization.md). Late-mat is inert on
 # duckdb pins (the defer policy refuses non-parquet sources) but stays on for
 # parity; fused scan-filter engages on the compressed GPU pins.
-export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
-export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 echo "db        : $DB"
 echo "refresh   : $REFRESH"

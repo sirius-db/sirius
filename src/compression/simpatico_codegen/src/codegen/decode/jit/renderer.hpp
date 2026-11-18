@@ -57,7 +57,7 @@
 namespace codegen::decode::jit {
 
 // Kernels that evaluate a scan's filter while decoding (experimental; the
-// engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator, not
+// query policy enable_fused_scan_filter lives in the wave orchestrator, not
 // here).
 //
 // A decode kernel is a point in a two-axis product, not a flat variant list.

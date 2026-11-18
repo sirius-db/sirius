@@ -761,9 +761,12 @@ def open_benchmark_db(
     log(f"Loading Sirius extension from {EXTENSION_PATH}")
     sql(con, f"LOAD '{EXTENSION_PATH}'")
     sql(con, "CHECKPOINT")
+    sql(
+        con,
+        f"SET pin_table_compression = {'true' if compression_plan_dir else 'false'}",
+    )
     if compression_plan_dir:
         log(f"Enabling Simpatico pin compression (plans: {compression_plan_dir})")
-        sql(con, "SET pin_table_compression = true")
         sql(
             con,
             f"SET pin_table_input_compression_plan_dir = '{compression_plan_dir}'",

@@ -28,7 +28,6 @@ mod defaults {
 mod env {
     pub(crate) const QUENT_COLLECTOR_ADDRESS: &str = "QUENT_COLLECTOR_ADDRESS";
     pub(crate) const QUENT_COLLECTOR_OUTPUT_DIR: &str = "QUENT_COLLECTOR_OUTPUT_DIR";
-    pub(crate) const QUENT_COLLECTOR_EXPORTER: &str = "QUENT_COLLECTOR_EXPORTER";
     pub(crate) const QUENT_ANALYZER_ADDRESS: &str = "QUENT_ANALYZER_ADDRESS";
     pub(crate) const QUENT_ANALYZER_CORS_ADDRESS: &str = "QUENT_ANALYZER_CORS_ADDRESS";
 }
@@ -40,9 +39,6 @@ struct Args {
 
     #[arg(long, default_value = defaults::QUENT_COLLECTOR_ADDRESS, env = env::QUENT_COLLECTOR_ADDRESS)]
     collector_address: String,
-
-    #[arg(long, default_value = "ndjson", value_parser = ["ndjson"], env = env::QUENT_COLLECTOR_EXPORTER)]
-    exporter: String,
 
     #[arg(long, default_value = "data", env = env::QUENT_COLLECTOR_OUTPUT_DIR)]
     output_dir: PathBuf,
@@ -60,7 +56,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level,
         cors_address,
         collector_address,
-        exporter: _,
         output_dir,
         analyzer_address,
     } = Args::parse();

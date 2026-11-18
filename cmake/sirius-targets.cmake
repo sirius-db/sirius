@@ -1,5 +1,9 @@
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
+if(SIRIUS_DISTRIBUTION_DEFAULTS)
+  target_compile_definitions(sirius_objects
+                             PRIVATE SIRIUS_DISTRIBUTION_DEFAULTS)
+endif()
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
 set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

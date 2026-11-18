@@ -58,7 +58,8 @@ downgrade_trigger_fraction = 0.9;
 downgrade_stop_fraction = 0.8;
 block_size = 1MiB;              // cuCascade block size
 pool_size = 128;                // blocks per pool
-initial_number_pools = 4;       // pools allocated at startup
+initial_number_pools;           // auto: 10% of NUMA RAM, capped by host capacity,
+                              // rounded down to whole pools; explicit count overrides
 ```
 
 **Disk Memory Space:**
@@ -230,7 +231,8 @@ On allocation failure:
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
-- Fixed-size block pools: 1 MiB blocks, 128 blocks per pool, with four pools initially
+- Obtains blocks on demand from shared fixed-size HOST pools (default: 1 MiB blocks, 128 blocks per pool).
+- With high-level configuration and an omitted `initial_number_pools`, initial HOST pools target 10% of each backing NUMA node's RAM, capped by host capacity and rounded down to whole pools. Set `initial_number_pools: 4` to retain four initial pools explicitly.
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))

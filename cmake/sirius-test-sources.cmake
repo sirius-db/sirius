@@ -80,6 +80,9 @@ set(TEST_SOURCES
     test/cpp/exec/test_sirius_ffi_embedder.cpp
     test/cpp/exec/test_sirius_ffi_byte_ranges.cpp
     test/cpp/exec/test_sirius_ffi_object_store.cpp
+    test/cpp/object_store_scope/test_registry.cpp
+    test/cpp/object_store_scope/test_scope.cpp
+    test/cpp/object_store_scope/test_validation.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -123,7 +126,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_decimal_integer_cast.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_delim_aggregate_reuse.cpp
+    test/cpp/integration/test_gpu_execution_delim_cte_rewrites.cpp
     test/cpp/integration/test_gpu_execution_exists_minmax_rewrite.cpp
+    test/cpp/integration/test_gpu_execution_partial_aggregate_pushdown.cpp
     test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_domain_evidence.cpp
@@ -156,6 +161,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_round.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
+    test/cpp/integration/test_gpu_execution_table_function.cpp
     test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_required_null_scan.cpp
@@ -299,9 +305,11 @@ set(TEST_SOURCES
     test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_delim_aggregate_reuse.cpp
+    test/cpp/planner/test_delim_cte_rewrites.cpp
     test/cpp/planner/test_exists_minmax_rewrite.cpp
     test/cpp/planner/test_distributed_scan_refusals.cpp
     test/cpp/planner/test_one_rank_parity.cpp
+    test/cpp/planner/test_partial_aggregate_pushdown.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
