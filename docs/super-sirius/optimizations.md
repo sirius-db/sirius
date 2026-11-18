@@ -311,6 +311,21 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 
 **Config:** `mark_join_build_switch_ratio` (default: 8.0; `0` disables), settable via YAML and the `mark_join_build_switch_ratio` SET option
 
+### Join Side for a Large Unfiltered Scan
+
+**Motivation:** A hash join collects its build side whole before the probe side starts, and holds it until the probe arrives. DuckDB chooses the build side from estimated sizes, and its estimate for a filter it cannot rate is a fifth of the table. TPC-H Q9 at SF100000 then builds its last join on all of `orders` (1.8 TB, read and partitioned before the `lineitem` side starts) and probes with the 0.9 TB that survive the `part` filter.
+
+**Mechanism:** No estimate of the filtered side is used.
+- At plan time, an INNER equality join whose build side is a scan with no filter and whose probe side has one is built on the probe side instead, when the scan's estimated rows times the bytes of its columns reach the smallest GPU's downgrade threshold. A scan that fits in one GPU keeps the side DuckDB chose.
+- The distributed planner reads the row count of a join's plain probe scan from its Parquet footers and gives the join's `partition_exchange` the bytes this rank will receive from it.
+- While the join runs, a build that has received that many bytes and is still arriving is the larger side. The layout is then sized from the scan, the scan starts, the build is partitioned as it arrives instead of being collected whole, and the join reads the scan before more of the build. A build that ends smaller is held as before, and the scan streams.
+
+The switch is late: the build has already delivered the scan's size by then, and reading the scan next to it is slow when the two do not fit in memory.
+
+**Code path:** `src/planner/build_side_choice.cpp` — `swap_unfiltered_builds()`; `src/planner/distributed_plan.cpp` — `defer_probe_scan()`; `src/op/partition/partition_exchange.cpp` — `defer_scan()` and the test in `prepare_impl()`; `src/op/sirius_physical_partition.cpp` and `src/op/sirius_physical_hash_join.cpp` — the task hints after the switch
+
+**Config:** none. It applies to distributed execution with a configured GPU capacity.
+
 ### Projection Folding (PR #909)
 
 **Motivation:** Building a Sirius physical plan from DuckDB's logical plan inserts PROJECTION operators that DuckDB's optimizer never sees — for filter `projection_map` reordering, hoisted aggregate child/filter expressions, table-scan filter columns, and the user's SELECT list. Each PROJECTION is a full GPU pipeline stage that runs `expression_evaluator` over every batch and materializes an intermediate batch, so stacked projections evaluate expressions more than once.

@@ -2401,7 +2401,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
             return scans.parquet_footer(path);
           }}
         : planner::parquet_footer_reader{},
-      op_params.enable_build_side_swap
+      // With the GPU memory unknown, no scan is deferred.
+      sirius_ctx->get_config().smallest_gpu_downgrade_threshold() > 0
         ? planner::deferred_scan_policy{[&scans = sirius_ctx->get_scan_manager()](
                                           std::string const& path) {
                                           return scans.parquet_footer(path);
@@ -2429,7 +2430,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
             sirius::op::scan::capture_bound_read_views(dropped, context));
         });
     }
-    if (sirius_ctx && duckdb::query_operator_options(context)->enable_build_side_swap) {
+    if (sirius_ctx) {
       // With the GPU memory unknown, nothing is swapped.
       if (auto const budget = sirius_ctx->get_config().smallest_gpu_downgrade_threshold();
           budget > 0) {
