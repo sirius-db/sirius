@@ -61,6 +61,19 @@ class PinCompressionTests(unittest.TestCase):
                 )
                 self.assertLess(statements.index(intended), first_pin)
 
+    def test_power_runner_compresses_with_automatic_plans_without_a_plan_dir(self):
+        con = Mock()
+        with (
+            patch.object(power.duckdb, "connect", return_value=con),
+            patch.dict(os.environ, {"SIRIUS_PRE_SQL": ""}),
+        ):
+            power.open_benchmark_db("/tpch.duckdb", "gpu", pin_compression=True)
+        statements = [call.args[0] for call in con.execute.call_args_list]
+        self.assertIn("SET pin_table_compression = true", statements)
+        self.assertFalse(
+            any("pin_table_input_compression_plan_dir" in s for s in statements)
+        )
+
     def test_external_runner_script_sets_compression_before_pinning(self):
         for plan_dir in (None, "/plans"):
             with self.subTest(

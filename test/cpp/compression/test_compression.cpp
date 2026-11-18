@@ -134,7 +134,9 @@ void write_compression_yaml(const fs::path& yaml_path, std::size_t scan_batch_by
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 100000000\n"
        "    concat_batch_bytes: 100000000\n"
-       "    max_build_hash_table_bytes: 90000000\n";
+       "    max_build_hash_table_bytes: 90000000\n"
+       "  compression:\n"
+       "    min_table_device_fraction: 0\n";
 }
 
 bool has_gpu()
@@ -1207,6 +1209,62 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
 
   run_ok(con, "CALL unpin_table('t_ratio');", "unpin");
 
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - GPU pins small next to GPU memory stay uncompressed",
+          "[compression][pin_table][automatic_pin][isolated_context]")
+{
+  if (no_gpu()) { return; }
+  auto [tmp, yaml_path] = make_comp_env("min-table");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(4000000)", 1);
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con       = env.make_connection();
+  auto glob      = sirius::test::mgpu::parquet_glob(tmp);
+  auto const pin = [&](char const* name, char const* tier) {
+    run_ok(
+      con, "CALL pin_table('" + glob + "', tier => '" + tier + "', name => '" + name + "')", "pin");
+    return sirius::test::census_entry(con, name);
+  };
+
+  run_ok(con, "SET pin_table_compression_min_table_device_fraction = 0.5", "size gate");
+  CHECK(pin("t_small", "gpu").compressed_chunks == 0);
+
+  // Host pins are not gated by GPU memory.
+  auto const host = pin("t_host", "host");
+  CHECK(host.compressed_chunks == host.chunks);
+
+  // An explicit table plan is not gated.
+  auto const plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_planned", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  run_ok(con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "'", "plan dir");
+  auto const planned = pin("t_planned", "gpu");
+  CHECK(planned.compressed_chunks == planned.chunks);
+  run_ok(con, "SET pin_table_input_compression_plan_dir = ''", "no plan dir");
+
+  run_ok(con, "SET pin_table_compression_min_table_device_fraction = 0", "no size gate");
+  auto const ungated = pin("t_ungated", "gpu");
+  CHECK(ungated.compressed_chunks == ungated.chunks);
+
+  require_cached_gpu_matches_cpu(con, "SELECT sum(k), count(*) FROM read_parquet('" + glob + "')");
+  for (auto const* name : {"t_small", "t_host", "t_planned", "t_ungated"}) {
+    run_ok(con, std::string{"CALL unpin_table('"} + name + "')", "unpin");
+  }
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - the table size gate rejects non-finite or negative fractions",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+  auto [tmp, yaml_path] = make_comp_env("min-table-settings");
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con = env.make_connection();
+  CHECK(con.Query("SET pin_table_compression_min_table_device_fraction = -0.5")->HasError());
+  CHECK(con.Query("SET pin_table_compression_min_table_device_fraction = 'inf'")->HasError());
+  run_ok(con, "SET pin_table_compression_min_table_device_fraction = 0.5", "size gate");
   fs::remove_all(tmp);
 }
 

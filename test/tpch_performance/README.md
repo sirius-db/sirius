@@ -440,17 +440,15 @@ Each query runs as its own `READ ONLY` transaction. q15 is a CTE in the 3.0.1 te
 query creates a view and nothing is shared between concurrent streams.
 
 `--pin-compression` pins the tables Simpatico-compressed (either tier): the runner sets
-`pin_table_compression` and points `pin_table_input_compression_plan_dir` at
-`--compression-plan-dir`, which defaults to the explore-generated TPC-H plans shipped under
-`src/compression/simpatico_codegen/plans/tpch_sf1000` (2 of 8 tables active — `lineitem`, `orders`;
-`part`, `partsupp`, `supplier`, `customer` are present but named `*_disabled.txt` pending
-performance/correctness validation of a whole-table plan against the SF1000 repro, and `nation`/
-`region` have no plans at all — all six pin uncompressed). Compression happens at pin time, so the
-flag requires a pinned tier.
-A table whose plan is missing or does not cover the pinned columns degrades to uncompressed with
-a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` INFO markers after
-pinning and aborts if nothing compressed, so a misconfigured run cannot silently measure
-uncompressed data. Refreshed rows live in the uncompressed insert delta / delete mask on top of
+`pin_table_compression`, and each table's plans are selected automatically (see
+[Compressed Pinning](../../docs/super-sirius/compressed-pinning.md)). `--compression-plan-dir`
+points `pin_table_input_compression_plan_dir` at a directory of per-table plan overrides, such as
+the explore-generated TPC-H plans under `src/compression/simpatico_codegen/plans/tpch_sf1000`.
+Compression happens at pin time, so the flag requires a pinned tier.
+A table whose plan file does not cover the pinned columns degrades to uncompressed with
+a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` and
+`automatically selecting compression plans` INFO markers after pinning and aborts if nothing
+compressed, so a misconfigured run cannot silently measure uncompressed data. Refreshed rows live in the uncompressed insert delta / delete mask on top of
 the compressed base, which is exactly the recurring cost the post-RF passes measure.
 
 Power@Size is a geometric mean, so one very fast query would otherwise pull it up without bound;

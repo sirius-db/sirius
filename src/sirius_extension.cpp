@@ -1210,6 +1210,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // duckdb-native has no standalone reader, so both formats go through their
     // gpu_ingestible — one read path.
     std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+    // Rows of the pinned table, which the automatic-plan size check extrapolates the first
+    // chunk to; 0 when unknown.
+    std::size_t table_rows = 0;
     // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
     // order — the zone-map capture keys its type allowlist on these exact types.
     vector<LogicalType> pinned_column_types;
@@ -1221,6 +1224,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     if (data.args.format == "duckdb") {
       auto info = build_duckdb_pin_info(
         context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
+      table_rows = static_cast<std::size_t>(info->storage->GetTotalRows());
       // After the catalog resolution (so a bad table name fails without side
       // effects) but before make_ingestible snapshots the on-disk row groups.
       suppress_auto_checkpoint_for_pin(context);
@@ -1269,6 +1273,13 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
       });
       warm_parquet_footer_statistics(context, file_paths);
+      if (data.args.tier != "parquet") {
+        try {
+          table_rows = sirius::transparent::parquet_files_row_count(context, file_paths);
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_DEBUG("[pin_table] '{}': no row count: {}", data.args.name, e.what());
+        }
+      }
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1403,6 +1414,15 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
           data.args.name,
           data.args.tier,
           pin_comp.column_names.size());
+        if (data.args.tier == "gpu") {
+          std::size_t gpu_capacity = 0;
+          for (auto const* space : gpu_spaces_mut) {
+            gpu_capacity += space->get_max_memory();
+          }
+          pin_comp.min_pin_bytes = static_cast<std::size_t>(comp_cfg.min_table_device_fraction *
+                                                            static_cast<double>(gpu_capacity));
+          pin_comp.table_rows    = table_rows;
+        }
       }
     }
 
@@ -3015,6 +3035,24 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetPinTableCompressionMinTableDeviceFraction(ClientContext& context,
+                                                         SetScope scope,
+                                                         Value& parameter)
+{
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
+  const double fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0) {
+    throw InvalidInputException(
+      "pin_table_compression_min_table_device_fraction must be finite and non-negative, got %f",
+      fraction);
+  }
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  duckdb::session_compression_config(context).min_table_device_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_table_device_fraction");
+}
+
 static void SetPinTableProveUniqueKeys(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params              = get_operator_params(context, scope);
@@ -3926,6 +3964,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "pin_table_compression_min_table_device_fraction",
+    "Select compression plans automatically for a GPU-tier pin only when its uncompressed size "
+    "is at least this finite, non-negative fraction of its GPUs' memory, and pin a smaller one "
+    "uncompressed; host pins are not gated; 0 disables the gate",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(compression_defaults.min_table_device_fraction),
+    SetPinTableCompressionMinTableDeviceFraction);
 
   config.AddExtensionOption(
     "pin_table_prove_unique_keys",
