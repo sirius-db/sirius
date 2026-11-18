@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Distributed Sirius — onboarding slides</title>
+<style>
+*{box-sizing:border-box} :root{--ink:#111;--muted:#878787;--body:#333;--line:#e4e4e4;--green:#76b900;--green-ink:#4c7800;--tint:#f5fae9}
+html{scroll-behavior:smooth;scroll-padding:24px}
+body{margin:0;background:#f2f2f2;color:var(--ink);font-family:"Geist",system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:1440px;margin:28px auto;padding:0 24px}
+.frame{position:relative;width:100%;aspect-ratio:16/9;background:#fff;margin-bottom:28px;overflow:hidden}
+.slide{position:absolute;left:0;top:0;width:1280px;height:720px;padding:56px 72px 48px;transform:scale(var(--scale,1));transform-origin:top left;background:#fff;display:flex;flex-direction:column}
+h1,h2,h3,p,ul,ol{margin:0}
+h1{font-size:64px;line-height:1.08;font-weight:600;letter-spacing:-2px}
+h2{font-size:40px;line-height:1.13;font-weight:600;letter-spacing:-1px;color:#000}
+h3{font-size:20px;line-height:1.25;font-weight:600}
+.subtitle{font-size:18px;line-height:1.45;color:var(--muted);margin-top:12px}
+.content{flex:1;min-height:0;margin-top:24px;display:flex;flex-direction:column;justify-content:center}
+.foot{display:flex;justify-content:space-between;gap:24px;padding-top:13px;margin-top:20px;font-size:12px;color:var(--muted);line-height:1.4}
+.number{white-space:nowrap}
+p,li{font-size:18px;line-height:1.42;color:var(--body)}
+ul{padding-left:22px}
+li{margin-bottom:9px}
+li:last-child{margin-bottom:0}
+strong,b{color:#111;font-weight:600}
+code{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:.92em}
+pre{margin:0;background:#f6f6f6;border:1px solid var(--line);padding:12px 14px;font:14.5px/1.5 "Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;color:#111;white-space:pre;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-bottom:1px solid var(--line);font-size:17px;line-height:1.38;color:var(--body)}
+th{font-size:13px;font-weight:400;letter-spacing:.5px;color:var(--muted);text-transform:uppercase}
+td.num,th.num{text-align:right;white-space:nowrap}
+td.acc{color:var(--green-ink);font-weight:600}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:start}
+.cols.wide-left{grid-template-columns:1.75fr 1fr;gap:36px;align-items:center}
+.cols.wide-right{grid-template-columns:1fr 1.35fr;gap:36px}
+.cards{display:grid;grid-template-columns:1.1fr 1fr .9fr;gap:22px}
+.cards.four{grid-template-columns:1.1fr 1fr 1fr .9fr;gap:18px}
+.card{border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+.card h3{margin-bottom:8px}
+.card p{font-size:17px;line-height:1.4}
+.card .n{font-size:30px;line-height:1;font-weight:600;color:var(--green-ink);margin-bottom:10px}
+.terms{display:grid;grid-template-columns:1fr 1fr;gap:16px 44px}
+.terms p{font-size:16.5px;line-height:1.4}
+.terms b{font-size:18.5px}
+.note{font-size:17px;line-height:1.42;color:var(--body);margin-top:18px}
+.rule{border-left:3px solid var(--green);padding:2px 0 2px 16px;margin-top:18px}
+.rule p{font-size:17px}
+.small{font-size:15px;line-height:1.4;color:#555}
+.label{font:13px "Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;letter-spacing:1px;color:var(--green-ink);text-transform:uppercase;margin-bottom:8px}
+svg{display:block;width:100%;height:auto}
+svg text{font-family:"Geist",system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+svg text.mono{font-family:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+svg .sub{fill:#555}
+svg .box{fill:#fff;stroke:#8a8a8a;stroke-width:1.3}
+svg .gbox{fill:#f5fae9;stroke:#4c7800;stroke-width:1.5}
+svg .ctl{stroke:#8a8a8a;stroke-width:1.5;fill:none}
+svg .xch{stroke:#4c7800;stroke-width:2;fill:none}
+svg .dash{stroke:#8a8a8a;stroke-width:1.3;stroke-dasharray:5 4;fill:none}
+.cover{justify-content:center}
+.cover .kicker{font:14px "Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;letter-spacing:2px;text-transform:uppercase;color:var(--green-ink);margin-bottom:22px}
+.cover .lead{font-size:26px;line-height:1.35;color:#555;margin-top:22px;max-width:900px}
+.cover .meta{font:15px/1.5 "Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;color:var(--muted);margin-top:38px}
+.agenda{display:grid;grid-template-columns:1fr 1fr;gap:56px}
+.agenda ol{padding-left:26px}
+.agenda li{font-size:20px;margin-bottom:10px}
+nav{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:16px;background:#111;color:#fff;padding:10px 16px;z-index:10;font-size:12px;border-radius:3px}
+nav button{border:0;background:transparent;color:inherit;cursor:pointer;padding:3px 6px}
+nav span{min-width:50px;text-align:center}
+@media print{body{background:#fff}main{max-width:none;margin:0;padding:0}.frame{margin:0;page-break-after:always}nav{display:none}.slide{print-color-adjust:exact;-webkit-print-color-adjust:exact}}
+</style></head><body><main>
+
+<section class="frame" id="slide-1"><article class="slide cover">
+<p class="kicker">Onboarding</p>
+<h1>Distributed Sirius</h1>
+<p class="lead">How one SQL query runs across many GPUs, and how to start using it.</p>
+<p class="meta">Branch experimental/distributed-sirius · commit d9d973a · 18 November 2026<br>Experimental: settings can change between releases.</p>
+</article></section>
+
+<section class="frame" id="slide-2"><article class="slide">
+<header><h2>What you will learn</h2><p class="subtitle">First how it works, then how to use it. The onboarding web page has the full detail.</p></header>
+<div class="content"><div class="agenda">
+<div><p class="label">Understand</p><ol>
+<li>What Distributed Sirius is</li>
+<li>The gateway and the ranks</li>
+<li>How a statement and a query run</li>
+<li>How rows move between GPUs</li>
+<li>Filters across ranks</li>
+<li>What happens when something fails</li>
+</ol></div>
+<div><p class="label">Use</p><ol start="7">
+<li>Start a cluster in three commands</li>
+<li>Run SQL and configure</li>
+<li>Run a first benchmark</li>
+<li>Read through GDS</li>
+<li>What to expect, and the limits</li>
+<li>Troubleshooting and further reading</li>
+</ol></div>
+</div></div>
+<footer class="foot"><span>Distributed Sirius onboarding</span><span class="number">2 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-3"><article class="slide">
+<header><h2>One SQL query across many GPUs</h2><p class="subtitle">Sirius is a GPU SQL engine inside DuckDB. Distributed Sirius runs one query on several Sirius processes, one per GPU.</p></header>
+<div class="content">
+<div class="cards">
+<div class="card"><h3>One endpoint</h3><p>You connect a DuckDB shell to a gateway and type plain SQL. The gateway sends each statement to every GPU process.</p></div>
+<div class="card"><h3>Same SQL everywhere</h3><p>Every process, called a rank, plans and runs the same statement on its own share of each table. Rank 0 returns the result.</p></div>
+<div class="card"><h3>Rows move between GPUs</h3><p>Where a join, a group-by or a sort needs rows from other ranks, the plan has an exchange: GPU to GPU, over NVLink where the hardware has it.</p></div>
+</div>
+<div class="rule"><p><strong>Experimental.</strong> Through the gateway, CPU fallback is off: a query Sirius cannot run on the GPU fails instead of running on the CPU. Run so far with 4, 8 and 16 ranks on one, two and four GB200 nodes.</p></div>
+</div>
+<footer class="foot"><span>Source: distributed-sirius.md · distributed-quickstart.md</span><span class="number">3 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-4"><article class="slide">
+<header><h2>Eight words you will meet</h2><p class="subtitle">The documents, the commands and the logs use them.</p></header>
+<div class="content"><div class="terms">
+<p><b>Rank</b><br>One Sirius process on one GPU. Numbered from 0; rank 0 returns every result.</p>
+<p><b>Gateway</b><br>A CPU-only DuckDB that is the one SQL endpoint. It orders, numbers and sends statements, and restarts ranks.</p>
+<p><b>Node</b><br>A GPU machine. <code>sirius-node</code> starts one rank per GPU on it.</p>
+<p><b>Exchange</b><br>The plan operators that move rows between ranks: hash, range, broadcast or gather.</p>
+<p><b>NIXL</b><br>The transfer library under the exchange. It writes one rank's GPU memory into another's.</p>
+<p><b>Fail-stop</b><br>The failure rule: nothing is repaired in place. Every rank restarts.</p>
+<p><b>DDL log</b><br>The statements (views, <code>SET</code>, <code>INSERT</code> …) the gateway keeps and runs again on restarted ranks.</p>
+<p><b>GDS</b><br>GPUDirect Storage: an optional way to read Parquet straight into GPU memory.</p>
+</div></div>
+<footer class="foot"><span>Source: distributed-gateway.md · distributed-sirius.md · gds-runbook.md</span><span class="number">4 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-5"><article class="slide">
+<header><h2>One gateway, one rank per GPU</h2><p class="subtitle">SQL and results go through the gateway. Rows go directly between ranks.</p></header>
+<div class="content"><div class="cols wide-left">
+<svg viewBox="0 0 700 392" role="img" aria-labelledby="s-arch-title s-arch-desc"><title id="s-arch-title">Gateway, ranks and storage</title><desc id="s-arch-desc">Clients send SQL to one gateway, which sends each statement to every rank. Ranks exchange rows with each other and each reads its own share of the Parquet files.</desc><defs><marker id="s-arch-a-std" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#5b5b5b"/></marker><marker id="s-arch-s-std" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#5b5b5b"/></marker><marker id="s-arch-a-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4c7800"/></marker><marker id="s-arch-s-acc" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#4c7800"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="380" y="32" width="184" height="296" rx="8" fill="#fafafa" stroke="#dcdcdc" stroke-width="1"/><rect x="392" y="24" width="142" height="16" rx="2" fill="#ffffff"/><text class="mono" x="463.0" y="35.5" font-size="9.5" fill="#6f6f6f" text-anchor="middle" letter-spacing=".14em">RANKS · ONE PER GPU</text>
+<path d="M104,164 L148,164" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-arch-a-std)"/>
+<path d="M148,196 L104,196" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#s-arch-a-std)"/>
+<path d="M316,156 H340 Q348,156 348,148 V96 Q348,88 356,88 H396" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-arch-a-std)"/>
+<path d="M316,180 L396,180" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-arch-a-std)"/>
+<path d="M316,204 H356 Q364,204 364,212 V264 Q364,272 372,272 H396" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-arch-a-std)"/>
+<path d="M472,120 L472,148" fill="none" stroke="#4c7800" stroke-width="1.8" marker-end="url(#s-arch-a-acc)" marker-start="url(#s-arch-s-acc)"/>
+<path d="M472,212 L472,240" fill="none" stroke="#4c7800" stroke-width="1.8" marker-end="url(#s-arch-a-acc)" marker-start="url(#s-arch-s-acc)"/>
+<path d="M548,88 L604,88" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#s-arch-a-std)"/>
+<path d="M548,180 L604,180" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#s-arch-a-std)"/>
+<path d="M548,272 L604,272" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#s-arch-a-std)"/>
+<rect x="0" y="148" width="104" height="64" rx="6" fill="#ffffff"/><rect x="0" y="148" width="104" height="64" rx="6" fill="#ececec" stroke="#6f6f6f" stroke-width="1.2"/><text x="52.0" y="176.6" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Client</text><text class="mono" x="52.0" y="193.6" font-size="12" fill="#6f6f6f" text-anchor="middle">SQL</text>
+<rect x="148" y="124" width="168" height="112" rx="6" fill="#ffffff"/><rect x="148" y="124" width="168" height="112" rx="6" fill="#f1f8e2" stroke="#4c7800" stroke-width="1.6"/><rect x="156" y="131" width="61" height="16" rx="2" fill="none" stroke="#4c7800" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="186.5" y="142.0" font-size="9.5" fill="#4c7800" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">CPU ONLY</text><text x="232.0" y="177.9" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Gateway</text><text class="mono" x="232.0" y="194.9" font-size="12" fill="#6f6f6f" text-anchor="middle">orders statements</text><text class="mono" x="232.0" y="211.9" font-size="12" fill="#6f6f6f" text-anchor="middle">restarts ranks</text>
+<rect x="396" y="56" width="152" height="64" rx="6" fill="#ffffff"/><rect x="396" y="56" width="152" height="64" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="472.0" y="84.6" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Rank 0</text><text class="mono" x="472.0" y="101.6" font-size="12" fill="#6f6f6f" text-anchor="middle">returns result</text>
+<rect x="396" y="148" width="152" height="64" rx="6" fill="#ffffff"/><rect x="396" y="148" width="152" height="64" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="472.0" y="176.6" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Rank 1</text><text class="mono" x="472.0" y="193.6" font-size="12" fill="#6f6f6f" text-anchor="middle">plans and runs</text>
+<rect x="396" y="240" width="152" height="64" rx="6" fill="#ffffff"/><rect x="396" y="240" width="152" height="64" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="472.0" y="268.6" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Rank N−1</text><text class="mono" x="472.0" y="285.6" font-size="12" fill="#6f6f6f" text-anchor="middle">any node</text>
+<rect x="604" y="56" width="96" height="248" rx="6" fill="#ffffff"/><rect x="604" y="56" width="96" height="248" rx="6" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/><text x="652.0" y="168.1" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Parquet</text><text class="mono" x="652.0" y="185.1" font-size="12" fill="#6f6f6f" text-anchor="middle">same path</text><text class="mono" x="652.0" y="202.1" font-size="12" fill="#6f6f6f" text-anchor="middle">everywhere</text>
+<line x1="32" y1="346" x2="668" y2="346" stroke="#e2e2e2" stroke-width="1"/><text class="mono" x="32" y="366" font-size="9.5" fill="#6f6f6f" letter-spacing=".14em">LEGEND</text><path d="M118,362.5 H144" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-arch-a-std)"/><text x="152" y="367" font-size="12.5" fill="#5b5b5b">statement</text><path d="M256,362.5 H282" fill="none" stroke="#4c7800" stroke-width="1.8" marker-end="url(#s-arch-a-acc)"/><text x="290" y="367" font-size="12.5" fill="#5b5b5b">rows between ranks</text><path d="M461,362.5 H487" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#s-arch-a-std)"/><text x="495" y="367" font-size="12.5" fill="#5b5b5b">own scan</text>
+</svg>
+<div>
+<p><strong>Gateway.</strong> Orders statements, numbers queries, sends them to every rank, returns rank 0's result. It does not plan or execute: the ranks do.</p>
+<p class="note"><strong>Rank.</strong> Plans the statement, scans its share, exchanges rows, runs every operator on its GPU.</p>
+<div class="rule"><p><strong>The rule behind it all:</strong> every rank runs the same statements, in the same order, with the same query numbers.</p></div>
+</div>
+</div></div>
+<footer class="foot"><span>Source: distributed-gateway.md</span><span class="number">5 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-6"><article class="slide">
+<header><h2>Life of a statement</h2><p class="subtitle">What the gateway does with every statement a client sends.</p></header>
+<div class="content">
+<div class="cards four">
+<div class="card"><p class="n">1</p><h3>Route</h3><p>Most statements go to every rank. Status calls stay on the gateway. A few are refused.</p></div>
+<div class="card"><p class="n">2</p><h3>Wait for the turn</h3><p>One statement runs at a time, in arrival order across all clients.</p></div>
+<div class="card"><p class="n">3</p><h3>Number and send</h3><p>The gateway sets the query number on every rank, then sends the statement to all in parallel.</p></div>
+<div class="card"><p class="n">4</p><h3>Return and record</h3><p>Rank 0's result goes back. Statements that change state are added to the DDL log.</p></div>
+</div>
+<ul style="margin-top:22px">
+<li><strong>Refused through the gateway:</strong> <code>PREPARE</code> and <code>EXECUTE</code>, and <code>SET</code> of the exchange settings.</li>
+<li><strong>One copy per rank:</strong> <code>CREATE TABLE</code> and <code>INSERT</code> give every rank its own copy of the rows. Use views over <code>read_parquet</code> for data that must be split.</li>
+<li><strong>Shared sessions:</strong> one client's <code>SET</code> reaches every client's later statements.</li>
+</ul>
+</div>
+<footer class="foot"><span>Source: distributed-gateway.md, "How a statement runs", "Routing", "Limits"</span><span class="number">6 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-7"><article class="slide">
+<header><h2>Distribution is a plan rewrite</h2><p class="subtitle">Each rank builds the single-GPU plan, then <code>distribute_plan()</code> inserts exchanges where that plan already partitions.</p></header>
+<div class="content">
+<table>
+<thead><tr><th style="width:150px">Exchange</th><th style="width:400px">Where each row goes</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><code>hash</code></td><td>To the rank chosen by a hash of the key</td><td>Joins, on the join key; grouped aggregation, on the group key</td></tr>
+<tr><td><code>broadcast</code></td><td>To every rank</td><td>A join input that is small against the other one (at most 1 GiB); nested-loop joins</td></tr>
+<tr><td><code>range</code></td><td>To the rank that owns the key's range</td><td>A global <code>ORDER BY</code>, with boundaries from a sample all ranks share</td></tr>
+<tr><td><code>gather</code></td><td>To rank 0</td><td>Ungrouped aggregates, top-N, and the final result</td></tr>
+</tbody></table>
+<ul style="margin-top:20px">
+<li>Scans, filters and projections stay on the rank where their input is.</li>
+<li>Before running, the ranks compare a hash of their plan's shape. If any differs, the query fails on every rank.</li>
+<li>A plan shape the rewrite does not know is refused, because running it per rank would return a wrong answer.</li>
+</ul>
+</div>
+<footer class="foot"><span>Source: distributed-sirius.md, "The plan rewrite"</span><span class="number">7 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-8"><article class="slide">
+<header><h2>Example: TPC-H Q12 on four ranks</h2><p class="subtitle">A join of <code>orders</code> and <code>lineitem</code>, a group-by and an <code>ORDER BY</code>. Every rank runs this same plan.</p></header>
+<div class="content">
+<svg viewBox="0 0 1136 332" role="img" aria-labelledby="s-q12-title s-q12-desc"><title id="s-q12-title">TPC-H Q12 as a distributed plan</title><desc id="s-q12-desc">Each rank scans its share, joins and groups, merges the groups, sorts and returns rows; between those steps four exchanges move rows between ranks: by hash of the join key, by hash of the group key, by key range, and a gather to rank 0.</desc><defs><marker id="s-q12-a-std" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#5b5b5b"/></marker><marker id="s-q12-s-std" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#5b5b5b"/></marker><marker id="s-q12-a-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4c7800"/></marker><marker id="s-q12-s-acc" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#4c7800"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="0" y="24" width="1136" height="132" rx="8" fill="#fafafa" stroke="#dcdcdc" stroke-width="1"/><rect x="12" y="16" width="135" height="16" rx="2" fill="#ffffff"/><text class="mono" x="79.5" y="27.5" font-size="9.5" fill="#6f6f6f" text-anchor="middle" letter-spacing=".14em">ON EACH RANK'S GPU</text>
+<rect x="0" y="184" width="1136" height="132" rx="8" fill="#fafafa" stroke="#dcdcdc" stroke-width="1"/><rect x="12" y="176" width="175" height="16" rx="2" fill="#ffffff"/><text class="mono" x="99.5" y="187.5" font-size="9.5" fill="#6f6f6f" text-anchor="middle" letter-spacing=".14em">BETWEEN RANKS · EXCHANGE</text>
+<path d="M192,96 H212 Q220,96 220,104 V220" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M300,256 H328 Q336,256 336,248 V132" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M424,96 H444 Q452,96 452,104 V220" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M532,256 H560 Q568,256 568,248 V132" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M656,96 H676 Q684,96 684,104 V220" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M764,256 H792 Q800,256 800,248 V132" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M888,96 H908 Q916,96 916,104 V220" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<path d="M996,256 H1024 Q1032,256 1032,248 V132" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#s-q12-a-std)"/>
+<rect x="140" y="220" width="160" height="72" rx="6" fill="#ffffff"/><rect x="140" y="220" width="160" height="72" rx="6" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/><rect x="148" y="227" width="61" height="16" rx="2" fill="none" stroke="#5b5b5b" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="178.5" y="238.0" font-size="9.5" fill="#5b5b5b" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">EXCHANGE</text><text x="220.0" y="262.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">hash</text><text class="mono" x="220.0" y="279.4" font-size="12" fill="#6f6f6f" text-anchor="middle">by order key</text>
+<rect x="372" y="220" width="160" height="72" rx="6" fill="#ffffff"/><rect x="372" y="220" width="160" height="72" rx="6" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/><rect x="380" y="227" width="61" height="16" rx="2" fill="none" stroke="#5b5b5b" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="410.5" y="238.0" font-size="9.5" fill="#5b5b5b" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">EXCHANGE</text><text x="452.0" y="262.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">hash</text><text class="mono" x="452.0" y="279.4" font-size="12" fill="#6f6f6f" text-anchor="middle">by l_shipmode</text>
+<rect x="604" y="220" width="160" height="72" rx="6" fill="#ffffff"/><rect x="604" y="220" width="160" height="72" rx="6" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/><rect x="612" y="227" width="61" height="16" rx="2" fill="none" stroke="#5b5b5b" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="642.5" y="238.0" font-size="9.5" fill="#5b5b5b" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">EXCHANGE</text><text x="684.0" y="262.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">range</text><text class="mono" x="684.0" y="279.4" font-size="12" fill="#6f6f6f" text-anchor="middle">same boundaries</text>
+<rect x="836" y="220" width="160" height="72" rx="6" fill="#ffffff"/><rect x="836" y="220" width="160" height="72" rx="6" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/><rect x="844" y="227" width="61" height="16" rx="2" fill="none" stroke="#5b5b5b" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="874.5" y="238.0" font-size="9.5" fill="#5b5b5b" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">EXCHANGE</text><text x="916.0" y="262.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">gather</text><text class="mono" x="916.0" y="279.4" font-size="12" fill="#6f6f6f" text-anchor="middle">to rank 0</text>
+<rect x="16" y="60" width="176" height="72" rx="6" fill="#ffffff"/><rect x="16" y="60" width="176" height="72" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><rect x="24" y="67" width="35" height="16" rx="2" fill="none" stroke="#161616" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="41.5" y="78.0" font-size="9.5" fill="#161616" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">SCAN</text><text x="104.0" y="102.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Scan own share</text><text class="mono" x="104.0" y="119.4" font-size="12" fill="#6f6f6f" text-anchor="middle">lineitem, orders</text>
+<rect x="248" y="60" width="176" height="72" rx="6" fill="#ffffff"/><rect x="248" y="60" width="176" height="72" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><rect x="256" y="67" width="35" height="16" rx="2" fill="none" stroke="#161616" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="273.5" y="78.0" font-size="9.5" fill="#161616" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">JOIN</text><text x="336.0" y="102.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Join, group-by</text><text class="mono" x="336.0" y="119.4" font-size="12" fill="#6f6f6f" text-anchor="middle">partial groups</text>
+<rect x="480" y="60" width="176" height="72" rx="6" fill="#ffffff"/><rect x="480" y="60" width="176" height="72" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><rect x="488" y="67" width="42" height="16" rx="2" fill="none" stroke="#161616" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="509.0" y="78.0" font-size="9.5" fill="#161616" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">MERGE</text><text x="568.0" y="102.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Merge groups</text><text class="mono" x="568.0" y="119.4" font-size="12" fill="#6f6f6f" text-anchor="middle">then sort sample</text>
+<rect x="712" y="60" width="176" height="72" rx="6" fill="#ffffff"/><rect x="712" y="60" width="176" height="72" rx="6" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><rect x="720" y="67" width="35" height="16" rx="2" fill="none" stroke="#161616" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="737.5" y="78.0" font-size="9.5" fill="#161616" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">SORT</text><text x="800.0" y="102.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Sort</text><text class="mono" x="800.0" y="119.4" font-size="12" fill="#6f6f6f" text-anchor="middle">its own key range</text>
+<rect x="944" y="60" width="176" height="72" rx="6" fill="#ffffff"/><rect x="944" y="60" width="176" height="72" rx="6" fill="#f1f8e2" stroke="#4c7800" stroke-width="1.6"/><rect x="952" y="67" width="48" height="16" rx="2" fill="none" stroke="#4c7800" stroke-opacity=".45" stroke-width=".9"/><text class="mono" x="976.0" y="78.0" font-size="9.5" fill="#4c7800" fill-opacity=".85" text-anchor="middle" letter-spacing=".08em">RESULT</text><text x="1032.0" y="102.4" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">Result</text><text class="mono" x="1032.0" y="119.4" font-size="12" fill="#6f6f6f" text-anchor="middle">on rank 0</text>
+</svg>
+<p class="note"><strong>Top lane:</strong> work each rank does on its own GPU, with the same operators as on one GPU. <strong>Bottom lane:</strong> the four exchanges, the only places where rows move between ranks.</p>
+</div>
+<footer class="foot"><span>Source: distributed-sirius.md, "How a query runs"</span><span class="number">8 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-9"><article class="slide">
+<header><h2>Every rank reads its own share</h2><p class="subtitle">No rank reads a table for the others, and no row group is read twice.</p></header>
+<div class="content"><div class="cols wide-right">
+<div>
+<svg viewBox="0 0 468 212" role="img" aria-labelledby="s-scan-title s-scan-desc"><title id="s-scan-title">A table's files cut into one byte span per rank</title><desc id="s-scan-desc">A table's Parquet files are laid end to end and cut into equal byte spans, one per rank; a rank reads the row groups that start inside its span.</desc><defs><marker id="s-scan-a-std" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#5b5b5b"/></marker><marker id="s-scan-s-std" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#5b5b5b"/></marker><marker id="s-scan-a-acc" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4c7800"/></marker><marker id="s-scan-s-acc" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto"><polygon points="8 0, 0 3, 8 6" fill="#4c7800"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text class="mono" x="8" y="18" font-size="9.5" fill="#6f6f6f" letter-spacing=".14em">THE TABLE'S PARQUET FILES, END TO END</text>
+<rect x="8" y="28" width="154" height="44" rx="4" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/>
+<line x1="42" y1="34" x2="42" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="76" y1="34" x2="76" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="110" y1="34" x2="110" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="144" y1="34" x2="144" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<text x="85.0" y="56" font-size="13.5" fill="#161616" text-anchor="middle" font-weight="600" stroke="#f1f1f1" stroke-width="5" paint-order="stroke">file 1</text>
+<rect x="162" y="28" width="118" height="44" rx="4" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/>
+<line x1="196" y1="34" x2="196" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="230" y1="34" x2="230" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="264" y1="34" x2="264" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<text x="221.0" y="56" font-size="13.5" fill="#161616" text-anchor="middle" font-weight="600" stroke="#f1f1f1" stroke-width="5" paint-order="stroke">file 2</text>
+<rect x="280" y="28" width="181" height="44" rx="4" fill="#f1f1f1" stroke="#5b5b5b" stroke-width="1.2"/>
+<line x1="314" y1="34" x2="314" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="348" y1="34" x2="348" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="382" y1="34" x2="382" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="416" y1="34" x2="416" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<line x1="450" y1="34" x2="450" y2="66" stroke="#c9c9c9" stroke-width="1"/>
+<text x="370.5" y="56" font-size="13.5" fill="#161616" text-anchor="middle" font-weight="600" stroke="#f1f1f1" stroke-width="5" paint-order="stroke">file 3</text>
+<text class="mono" x="8" y="108" font-size="9.5" fill="#6f6f6f" letter-spacing=".14em">EQUAL BYTE SPANS, ONE PER RANK</text>
+<rect x="8.0" y="118" width="113.0" height="44" rx="4" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="64.5" y="146" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">rank 0</text>
+<rect x="121.0" y="118" width="113.0" height="44" rx="4" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="177.5" y="146" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">rank 1</text>
+<line x1="121.0" y1="72" x2="121.0" y2="118" stroke="#4c7800" stroke-width="1.4" stroke-dasharray="4,3"/>
+<rect x="234.0" y="118" width="113.0" height="44" rx="4" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="290.5" y="146" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">rank 2</text>
+<line x1="234.0" y1="72" x2="234.0" y2="118" stroke="#4c7800" stroke-width="1.4" stroke-dasharray="4,3"/>
+<rect x="347.0" y="118" width="113.0" height="44" rx="4" fill="#ffffff" stroke="#161616" stroke-width="1.2"/><text x="403.5" y="146" font-size="16" font-weight="600" fill="#161616" text-anchor="middle">rank 3</text>
+<line x1="347.0" y1="72" x2="347.0" y2="118" stroke="#4c7800" stroke-width="1.4" stroke-dasharray="4,3"/>
+<text x="8" y="186" font-size="13" fill="#5b5b5b">Thin marks are row groups: a rank reads</text><text x="8" y="204" font-size="13" fill="#5b5b5b">those that start inside its span.</text>
+</svg>
+</div>
+<ul>
+<li><strong>Local files</strong> are cut by bytes, as in the picture. A table of one row group lands on one rank.</li>
+<li><strong>Remote files</strong> (S3) are dealt out whole, file by file, so a remote table needs at least as many files as ranks.</li>
+<li><strong>Every rank binds every file,</strong> so every rank plans from the same statistics and reaches the same plan.</li>
+<li><strong>Only Parquet through <code>read_parquet</code> is split.</strong> A DuckDB table is refused.</li>
+<li><strong>Row-group size matters:</strong> it changes scan times by 2× and more, so report it with every number.</li>
+</ul>
+</div></div>
+<footer class="foot"><span>Source: distributed-sirius.md, "Scan shares" · distributed-experiments.md, "Dataset layout"</span><span class="number">9 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-10"><article class="slide">
+<header><h2>Moving rows: rings, credits and four paths</h2><p class="subtitle">A sender can only fill memory the receiver has set aside for it, so a slow receiver slows its senders.</p></header>
+<div class="content"><div class="cols wide-right">
+<ul>
+<li><strong>Rings.</strong> Each rank has a send ring and a receive ring of 16 MiB frames. They are the only memory registered for transfers.</li>
+<li><strong>Credits.</strong> The receive ring is split among the peers. A sender gets a frame back once the receiver has copied it out.</li>
+<li><strong>Landing.</strong> A batch lands on the GPU if there is room, else in host memory, else it waits in the ring and the sender stops.</li>
+<li><strong>Cost.</strong> Ring memory per GPU: 2.25 GiB with 8 ranks, 4.25 GiB with 16.</li>
+</ul>
+<table>
+<thead><tr><th style="width:215px">The peer is</th><th>Path</th><th style="width:150px">Measured</th></tr></thead>
+<tbody>
+<tr><td>On this host</td><td>Direct GPU to GPU (<code>cuda_ipc</code>)</td><td></td></tr>
+<tr><td>On this host, GPUs without peer access</td><td>Through a shared-memory mirror on the host</td><td></td></tr>
+<tr><td>On another node of the NVLink domain</td><td>NVLink between nodes</td><td>up to 780 GB/s per GPU pair</td></tr>
+<tr><td>On another host, no NVLink</td><td>TCP lanes</td><td>19 GB/s on one 200 Gb/s port</td></tr>
+</tbody></table>
+</div>
+<p class="note">Each rank writes its path to every peer in the engine log. On GB200 NVL every line should end in <code>NIXL over the NVLink fabric</code>.</p>
+</div>
+<footer class="foot"><span>Source: distributed-sirius.md, "Layers" · distributed-experiments.md, "Check the run"</span><span class="number">10 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-11"><article class="slide">
+<header><h2>Filters must include every rank</h2><p class="subtitle">A join builds a filter that lets the other table's scan skip rows. Built from one rank's share alone, it would drop rows another rank needs.</p></header>
+<div class="content">
+<div class="cards">
+<div class="card"><p class="n">1</p><h3>Build</h3><p>Each rank builds a Bloom filter per join key, sized for its own rows times the number of ranks.</p></div>
+<div class="card"><p class="n">2</p><h3>Share</h3><p>Every rank sends its filter to every other rank and waits for theirs.</p></div>
+<div class="card"><p class="n">3</p><h3>Merge, then publish</h3><p>Each rank ORs the others into its own. Only the merged filter reaches the scan.</p></div>
+</div>
+<ul style="margin-top:22px">
+<li><strong>A missing filter costs speed, never correctness.</strong> If any rank's part is missing or does not fit, that key publishes no filter and the join does the work.</li>
+<li>A broadcast build side already holds every key, so it publishes as on one GPU.</li>
+<li>In TPC-H Q12 at SF1000 the merged filter keeps 2.0% of <code>orders</code> before its exchange.</li>
+</ul>
+</div>
+<footer class="foot"><span>Source: distributed-sirius.md, "Dynamic filters across ranks"</span><span class="number">11 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-12"><article class="slide">
+<header><h2>When something fails, every rank restarts</h2><p class="subtitle">A rank's peers are fixed once it connects, so nothing is repaired in place. The gateway restarts the ranks and replays the DDL log.</p></header>
+<div class="content">
+<table>
+<thead><tr><th style="width:330px">Event</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>A query fails with an error</td><td>It is aborted on every rank. The ranks keep serving and the next query runs normally.</td></tr>
+<tr><td>A rank dies during a statement</td><td>The statement fails. The next statement restarts every rank and replays the DDL log.</td></tr>
+<tr><td>A rank dies between statements</td><td>Its node starts it again. The gateway probes each rank before a statement and restarts all if one is still down.</td></tr>
+<tr><td>A statement runs too long</td><td>The gateway cancels it on every rank after <code>statement_timeout</code> (3600 s by default).</td></tr>
+<tr><td>The gateway restarts</td><td>Nodes register again within 10 s. The first statement restarts the ranks and replays the saved log.</td></tr>
+</tbody></table>
+<p class="note"><strong>Lost when the gateway itself restarts:</strong> statements that carry credentials, such as <code>CREATE SECRET</code>. Run them again then.</p>
+</div>
+<footer class="foot"><span>Source: distributed-gateway.md, "Failures and cancellation" · distributed-quickstart.md, "Recovery"</span><span class="number">12 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-13"><article class="slide">
+<header><h2>Start a cluster in three commands</h2><p class="subtitle">Build, then start a gateway, a node per GPU machine, and a client.</p></header>
+<div class="content"><div class="cols">
+<div>
+<p class="label">You need</p>
+<ul>
+<li>The same checkout and the same data path on every machine.</li>
+<li>A shared <code>$HOME</code>: nodes and clients find the gateway through a file there.</li>
+<li>Free ports: 9494 for the gateway; 9500 + i and 27000 + i for the rank on GPU i.</li>
+<li>Pixi 0.78 or newer, and 35 to 40 minutes for the build on 144 cores.</li>
+</ul>
+<div class="rule"><p><strong>Under Slurm, use Slurm for everything.</strong> Never start a process on a scheduled node over <code>ssh</code>.</p></div>
+</div>
+<div>
+<p class="label">Several machines</p>
+<pre>pixi run build-distributed   # once on a shared checkout
+pixi run sirius-gateway      # needs no GPU
+pixi run sirius-node --check # on each GPU machine
+pixi run sirius-node         # one rank per GPU
+pixi run sirius-client       # a DuckDB shell</pre>
+<p class="label" style="margin-top:16px">One machine</p>
+<pre>pixi run sirius-gateway 4    # starts 4 ranks itself
+pixi run sirius-client</pre>
+<p class="label" style="margin-top:16px">Slurm</p>
+<pre>sbatch -N2 scripts/sirius_slurm.sbatch
+SIRIUS_CLUSTER=&lt;job id&gt; pixi run sirius-client</pre>
+</div>
+</div></div>
+<footer class="foot"><span>Source: distributed-quickstart.md · distributed-gateway.md, "Quick path"</span><span class="number">13 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-14"><article class="slide">
+<header><h2>Run SQL and look at the cluster</h2><p class="subtitle">The client is a DuckDB shell. Tables are views over Parquet files.</p></header>
+<div class="content">
+<pre>CREATE VIEW lineitem AS FROM read_parquet('/data/tpch/lineitem/*.parquet');
+SELECT l_shipmode, count(*) FROM lineitem GROUP BY ALL;   -- every rank runs it; rank 0 answers
+FROM sirius_gateway_status();                             -- one row per rank, on the gateway</pre>
+<div class="cols" style="margin-top:22px">
+<ul>
+<li><strong>The first statement waits</strong> until <code>min_ranks</code> ranks have registered, then starts them. Set it to the number of ranks you expect.</li>
+<li><strong><code>sirius_gateway_status()</code></strong> shows each rank's state, the cluster's state and the last error. Look here first.</li>
+</ul>
+<ul>
+<li><strong>Logs:</strong> each rank's output is in <code>/tmp/sirius_node_&lt;user&gt;_&lt;cluster&gt;/</code> on its node. The engine log is in <code>&lt;checkout&gt;/log/</code>, or under <code>$SIRIUS_RANK_LOG_ROOT</code>.</li>
+<li><strong>Gateway state:</strong> <code>~/.sirius/gateways/&lt;cluster&gt;/</code> holds its address, token and DDL log.</li>
+</ul>
+</div>
+</div>
+<footer class="foot"><span>Source: distributed-quickstart.md, "Run", "What the gateway keeps"</span><span class="number">14 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-15"><article class="slide">
+<header><h2>Configure with one file</h2><p class="subtitle"><code>sirius.yaml</code>: the <code>distributed</code> section is for the launch scripts, the rest for the engine on each rank. Every key is optional.</p></header>
+<div class="content"><div class="cols">
+<pre>sirius:
+  distributed:
+    cluster: tpch
+    gateway:
+      min_ranks: 8
+      statement_timeout: 3600
+    node:
+      gpus: all
+    exchange:
+      mnnvl: auto
+  memory:
+    host: { capacity_bytes: 200Gi }</pre>
+<table>
+<thead><tr><th style="width:205px">Key</th><th>What</th></tr></thead>
+<tbody>
+<tr><td><code>gateway.min_ranks</code></td><td>Ranks the first statement waits for. Default 1</td></tr>
+<tr><td><code>statement_timeout</code></td><td>Seconds before a statement is cancelled</td></tr>
+<tr><td><code>node.gpus</code></td><td><code>all</code>, a list, or <code>slurm</code></td></tr>
+<tr><td><code>exchange.mnnvl</code></td><td><code>require</code> fails instead of using the network</td></tr>
+<tr><td><code>host.capacity_bytes</code></td><td>Host memory per rank. 200Gi works on GB200; 250Gi got ranks killed</td></tr>
+</tbody></table>
+</div>
+<p class="note">Found at <code>$SIRIUS_CONFIG_FILE</code>, then <code>./sirius.yaml</code>, then <code>~/.sirius/sirius.yaml</code>. Each <code>distributed</code> key also has an environment variable, which wins.</p>
+</div>
+<footer class="foot"><span>Source: distributed-quickstart.md, "Configure" · distributed-experiments.md, "Config"</span><span class="number">15 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-16"><article class="slide">
+<header><h2>Your first benchmark</h2><p class="subtitle">One run is one job with fresh ranks. A number counts only with a checked answer.</p></header>
+<div class="content">
+<div class="cards">
+<div class="card"><p class="n">1</p><h3>Check the nodes</h3><p>Every node sees the build and the data. On GB200 NVL: fabric <code>Completed</code>, same clique and cluster id everywhere.</p></div>
+<div class="card"><p class="n">2</p><h3>Config and <code>run.sql</code></h3><p>Views, then each query twice in a row after a marker (cold, then warm). End with the gateway status.</p></div>
+<div class="card"><p class="n">3</p><h3>Run</h3><p>Start gateway and ranks, send the SQL with <code>sirius-client -bail</code>, stop everything.</p></div>
+<div class="card"><p class="n">4</p><h3>Check the answers</h3><p>Against plain DuckDB on the same data, with <code>scripts/compare_answers.py</code>.</p></div>
+<div class="card"><p class="n">5</p><h3>Check the logs</h3><p>Every peer on the expected path, no error, every rank <code>up,ready</code>.</p></div>
+<div class="card"><p class="n">6</p><h3>Report</h3><p>Commit, config, nodes, dataset layout, cold and warm seconds, what failed.</p></div>
+</div>
+<p class="note"><strong>In Claude Code,</strong> <code>/sirius-tpch-bench</code> walks through these steps, with a smoke test before the benchmark. <strong>Start narrow:</strong> a few queries before all 22.</p>
+</div>
+<footer class="foot"><span>Source: distributed-experiments.md · distributed-experiments-no-slurm.md</span><span class="number">16 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-17"><article class="slide">
+<header><h2>Optional: read through GDS</h2><p class="subtitle">GPUDirect Storage moves Parquet bytes from storage straight into GPU memory. Its integration is not finished.</p></header>
+<div class="content"><div class="cols">
+<div>
+<p class="label">Config: two lines</p>
+<pre>sirius:
+  executor:
+    scan_manager:
+      backend: gds
+      gds: { num_threads: 8, read_timeout_s: 30 }</pre>
+<p class="label" style="margin-top:16px">Environment</p>
+<pre>export SIRIUS_GDS=1
+export UCX_MODULES=^ib,rdmacm   # UCX off the storage NICs
+export UCX_NET_DEVICES=&lt;iface&gt;  # the ranks' interface</pre>
+<p class="note"><strong>About 2 to 2.5 times faster</strong> than io_uring, the default, on one, two and four GB200 nodes.</p>
+</div>
+<ul>
+<li><strong>Before the first run on a node:</strong> build and run the probe (<code>gds_probe</code>, in the runbook), and tell the storage admins first.</li>
+<li><strong>Check each query:</strong> the engine log says <code>held_reads=0 verdict=gds</code>.</li>
+<li><strong>If the log says <code>[gds] held:</code></strong> a storage NIC stopped delivering. Stop the session at the first such line and check the node before using it again.</li>
+<li><strong>Do not report times from a session with held reads.</strong> The runbook places the cause below Sirius.</li>
+</ul>
+</div></div>
+<footer class="foot"><span>Source: gds-runbook.md · distributed-experiments.md, "Reference numbers"</span><span class="number">17 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-18"><article class="slide">
+<header><h2>What to expect</h2><p class="subtitle">GB200, 4 ranks per node. Sum of the 22 TPC-H query times, in seconds. Reference numbers published with the branch.</p></header>
+<div class="content">
+<table>
+<thead><tr><th>Scale</th><th>Scans</th><th class="num">1 node · 4 GPUs</th><th class="num">2 nodes · 8 GPUs</th><th class="num">4 nodes · 16 GPUs</th></tr></thead>
+<tbody>
+<tr><td>SF10000 (nominal 10 TB)</td><td>GDS</td><td class="num acc">94.7</td><td class="num acc">54.4</td><td class="num acc">36.3</td></tr>
+<tr><td>SF30000 (nominal 30 TB)</td><td>GDS</td><td class="num acc">321.7</td><td class="num acc">184.8</td><td class="num acc">109.2</td></tr>
+<tr><td>SF100000 (nominal 100 TB)</td><td>GDS</td><td class="num acc">1,641.1</td><td class="num acc">747.7</td><td class="num acc">336.8</td></tr>
+<tr><td>SF10000</td><td>io_uring</td><td class="num">237.1</td><td class="num">128.0</td><td class="num">72.2</td></tr>
+<tr><td>SF30000</td><td>io_uring</td><td class="num">720.4</td><td class="num">384.7</td><td class="num">208.7</td></tr>
+<tr><td>SF100000</td><td>io_uring</td><td class="num">3,263.0</td><td class="num">1,508.9</td><td class="num">725.8</td></tr>
+</tbody></table>
+<ul style="margin-top:20px">
+<li><strong>io_uring is the default scan backend.</strong> GDS is about 2 to 2.5 times faster at every scale and node count; its integration is not finished.</li>
+<li><strong>More GPUs do not help a query that waits for storage.</strong> Q12 at SF1000 took 6.38 s on four GPUs and 6.4 s on one. Measure the storage first.</li>
+</ul>
+</div>
+<footer class="foot"><span>Source: distributed-experiments.md, "Reference numbers" · distributed-sirius.md, "Running TPC-H Q12 on 4 GPUs"</span><span class="number">18 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-19"><article class="slide">
+<header><h2>Limits to know</h2><p class="subtitle">What is refused today, and how the system behaves under load.</p></header>
+<div class="content"><div class="cols">
+<div>
+<p class="label">Queries that are refused</p>
+<ul>
+<li>DuckDB tables: only Parquet through <code>read_parquet</code> is split.</li>
+<li><code>ORDER BY</code> on an expression.</li>
+<li><code>COUNT(DISTINCT)</code> with grouping sets, or without a group-by; grouped <code>STDDEV_SAMP</code>.</li>
+<li>Nested-loop joins that emit unmatched build rows.</li>
+<li><code>PREPARE</code> and <code>EXECUTE</code> through the gateway.</li>
+</ul>
+</div>
+<div>
+<p class="label">How it runs</p>
+<ul>
+<li>One statement at a time for the whole gateway.</li>
+<li>Recovery restarts every rank; nothing reconnects.</li>
+<li>Some exchange buffers cannot spill to host or disk.</li>
+<li>Ring memory grows with the number of ranks. More than 16 ranks has not been run.</li>
+<li>Nothing builds or tests the gateway in CI.</li>
+</ul>
+</div>
+</div></div>
+<footer class="foot"><span>Source: distributed-sirius.md, "Limits" · distributed-gateway.md, "Limits" · distributed-experiments.md, "Past 16 ranks"</span><span class="number">19 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-20"><article class="slide">
+<header><h2>When it does not work</h2><p class="subtitle">Look at <code>FROM sirius_gateway_status();</code> first, then at the rank's <code>rank.log</code>.</p></header>
+<div class="content">
+<table>
+<thead><tr><th style="width:470px">Symptom</th><th>Cause and fix</th></tr></thead>
+<tbody>
+<tr><td><code>the gateway starts once N ranks are registered</code></td><td>Too few ranks joined in time. A rank that dies at start, usually from the config, shows as <code>rank exited</code>.</td></tr>
+<tr><td><code>rank N failed its session setup</code></td><td>The ranks could not connect to each other. Check the exchange ports and the UCX settings.</td></tr>
+<tr><td><code>Endpoint timeout</code> in a rank's log</td><td>UCX picked a port the ranks cannot connect through. Keep the default UCX settings.</td></tr>
+<tr><td>A peer is not on <code>NIXL over the NVLink fabric</code></td><td>No IMEX channel between the nodes, or different NVLink domains.</td></tr>
+<tr><td>Ranks killed in the middle of a query</td><td>The host memory tier is too large. Lower it (200Gi works on GB200).</td></tr>
+<tr><td>A job fails in seconds with no output</td><td><code>$HOME</code> at its quota, or a stale mount on the node.</td></tr>
+</tbody></table>
+</div>
+<footer class="foot"><span>Source: distributed-quickstart.md, "Troubleshooting" · distributed-experiments.md, "Known failures"</span><span class="number">20 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-21"><article class="slide">
+<header><h2>What the branch adds to main</h2><p class="subtitle">251 commits up to 17 November 2026; counts are approximate. Since then: two documentation commits and the benchmark skill.</p></header>
+<div class="content">
+<table>
+<thead><tr><th style="width:500px">Theme</th><th class="num" style="width:100px">Commits</th><th>Where in the code</th></tr></thead>
+<tbody>
+<tr><td>Exchange transport: wire format, credits, NIXL, NVLink</td><td class="num">59</td><td><code>src/exchange/</code></td></tr>
+<tr><td>Plan rewrite and the exchange operators</td><td class="num">28</td><td><code>src/planner/distributed_plan.*</code>, <code>src/op/</code></td></tr>
+<tr><td>Bloom filters and sort boundaries across ranks</td><td class="num">30</td><td><code>src/op/distributed/</code>, <code>src/exchange/all_gather.*</code></td></tr>
+<tr><td>Gateway, launch scripts, session and rank control</td><td class="num">44</td><td><code>gateway/</code>, <code>scripts/</code>, <code>src/exchange/rank_control.*</code></td></tr>
+<tr><td>GDS scan backend</td><td class="num">4</td><td><code>src/io/gds/</code>, <code>scripts/gds/</code></td></tr>
+<tr><td>Planner rewrites for TPC-H, spill, scheduler</td><td class="num">12</td><td><code>src/planner/</code>, <code>src/downgrade/</code>, <code>src/creator/</code></td></tr>
+<tr><td>Tests and documents</td><td class="num">66</td><td><code>test/cpp/exchange/</code>, <code>gateway/test/sql/</code>, <code>docs/</code></td></tr>
+</tbody></table>
+<p class="note"><strong>The documents match the code</strong> on every port, default, setting name and script. One difference to know: a rank is not restarted after exit code 70, a GDS read that never returned.</p>
+</div>
+<footer class="foot"><span>Source: commit history of the branch against main · code review of 18 November 2026</span><span class="number">21 / 22</span></footer>
+</article></section>
+
+<section class="frame" id="slide-22"><article class="slide">
+<header><h2>Where to read next</h2><p class="subtitle">All in <code>docs/super-sirius/</code> on the branch. The onboarding web page summarizes them.</p></header>
+<div class="content">
+<table>
+<thead><tr><th style="width:60px">Order</th><th style="width:400px">Document</th><th>Read it for</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>distributed-quickstart.md</code></td><td>The commands, every launch setting, recovery, Slurm</td></tr>
+<tr><td>2</td><td><code>distributed-gateway.md</code></td><td>How the gateway routes, numbers and restarts</td></tr>
+<tr><td>3</td><td><code>distributed-sirius.md</code></td><td>How a query runs across ranks; limits; tests; files</td></tr>
+<tr><td>4</td><td><code>distributed-experiments.md</code></td><td>Benchmarks on GB200 under Slurm, and the reference numbers</td></tr>
+<tr><td></td><td><code>distributed-experiments-no-slurm.md</code>, <code>-aws.md</code></td><td>The same without Slurm, and on an AWS instance</td></tr>
+<tr><td></td><td><code>gds-runbook.md</code></td><td>Reading through GDS; what to do when storage stalls</td></tr>
+<tr><td></td><td><code>.claude/skills/sirius-tpch-bench/</code></td><td>The skill that runs a smoke test and a benchmark</td></tr>
+</tbody></table>
+<p class="note"><strong>In the code:</strong> <code>src/planner/distributed_plan.cpp</code>, <code>src/exchange/</code>, <code>gateway/src/</code>, <code>scripts/sirius_*.sh</code>.</p>
+</div>
+<footer class="foot"><span>github.com/sirius-db/sirius · branch experimental/distributed-sirius</span><span class="number">22 / 22</span></footer>
+</article></section>
+
+</main>
+<nav aria-label="Slide navigation"><button id="prev" aria-label="Previous slide">←</button><span id="counter" aria-live="polite">1 / 22</span><button id="next" aria-label="Next slide">→</button></nav>
+<script>const frames=[...document.querySelectorAll('.frame')];const resize=new ResizeObserver(es=>es.forEach(({target,contentRect})=>target.style.setProperty('--scale',contentRect.width/1280)));frames.forEach(f=>resize.observe(f));let active=0;const counter=document.getElementById('counter');function sync(){let best=Infinity;frames.forEach((f,i)=>{const r=f.getBoundingClientRect(),d=Math.abs(r.top+r.height/2-innerHeight/2);if(d<best){best=d;active=i}});counter.textContent=`${active+1} / ${frames.length}`;}let pending=false;addEventListener('scroll',()=>{if(!pending){pending=true;requestAnimationFrame(()=>{sync();pending=false})}},{passive:true});sync();function go(i){active=Math.max(0,Math.min(frames.length-1,i));frames[active].scrollIntoView({behavior:'instant',block:'center'});counter.textContent=`${active+1} / ${frames.length}`;}document.getElementById('prev').onclick=()=>go(active-1);document.getElementById('next').onclick=()=>go(active+1);addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(['ArrowRight','PageDown',' '].includes(e.key)){e.preventDefault();go(active+1)}if(['ArrowLeft','PageUp'].includes(e.key)){e.preventDefault();go(active-1)}});</script>
+</body></html>
