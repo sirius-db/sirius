@@ -257,18 +257,32 @@ GB200, 4 ranks per node, the sum of the 22 TPC-H query times in seconds.
   0.6 TB), so that run has spill compression on.
 - The build of these runs carries the planner rewrites for Q2, Q11, Q13, Q17 and Q18.
 
-The one-node runs are on [accel-etl](https://accel-etl.nvidia.com/runs). A run there holds every
-pass, so its totals are per pass and differ from the faster-run totals above; the SF10000 GDS run
-there is a separate session with the standard query parameters.
+These runs are on [accel-etl](https://accel-etl.nvidia.com/runs). A run there holds every pass,
+so its totals are per pass and differ from the faster-run totals above. The SF10000 GDS run on
+one node is a separate session with the standard query parameters. In the SF30000 io_uring runs
+on two and four nodes each pass has one statement that paused for more than 90 s; the faster-run
+totals leave those out.
 
 | Scale | Scans | Nodes | Run | First pass (s) |
 |---|---|---|---|---|
 | SF10000 | GDS | 1 | [11807](https://accel-etl.nvidia.com/runs/11807/) | 99.4 |
+| SF10000 | GDS | 2 | [11899](https://accel-etl.nvidia.com/runs/11899/) | 58.3 |
+| SF10000 | GDS | 4 | [11900](https://accel-etl.nvidia.com/runs/11900/) | 39.5 |
 | SF10000 | io_uring | 1 | [11808](https://accel-etl.nvidia.com/runs/11808/) | 245.3 |
+| SF10000 | io_uring | 2 | [11901](https://accel-etl.nvidia.com/runs/11901/) | 136.0 |
+| SF10000 | io_uring | 4 | [11902](https://accel-etl.nvidia.com/runs/11902/) | 78.1 |
 | SF30000 | GDS | 1 | [11805](https://accel-etl.nvidia.com/runs/11805/) | 325.4 |
+| SF30000 | GDS | 2 | [11903](https://accel-etl.nvidia.com/runs/11903/) | 198.1 |
+| SF30000 | GDS | 4 | [11904](https://accel-etl.nvidia.com/runs/11904/) | 112.0 |
 | SF30000 | io_uring | 1 | [11806](https://accel-etl.nvidia.com/runs/11806/) | 738.8 |
+| SF30000 | io_uring | 2 | [11905](https://accel-etl.nvidia.com/runs/11905/) | 484.5 |
+| SF30000 | io_uring | 4 | [11906](https://accel-etl.nvidia.com/runs/11906/) | 322.2 |
 | SF100000 | GDS | 1 | [11810](https://accel-etl.nvidia.com/runs/11810/) | 1,641.1 |
+| SF100000 | GDS | 2 | [11907](https://accel-etl.nvidia.com/runs/11907/) | 747.7 |
+| SF100000 | GDS | 4 | [11908](https://accel-etl.nvidia.com/runs/11908/) | 336.8 |
 | SF100000 | io_uring | 1 | [11809](https://accel-etl.nvidia.com/runs/11809/) | 3,263.0 |
+| SF100000 | io_uring | 2 | [11909](https://accel-etl.nvidia.com/runs/11909/) | 1,508.9 |
+| SF100000 | io_uring | 4 | [11910](https://accel-etl.nvidia.com/runs/11910/) | 725.8 |
 
 ## Past 16 ranks
 
