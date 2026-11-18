@@ -122,6 +122,7 @@ extern "C" int cudaProfilerStop();
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1211,8 +1212,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // gpu_ingestible — one read path.
     std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
     // Rows of the pinned table, which the automatic-plan size check extrapolates the first
-    // chunk to; 0 when unknown.
-    std::size_t table_rows = 0;
+    // chunk to; 0 when unknown. Called only when that check applies, since a parquet pin reads
+    // every file's footer for it.
+    std::function<std::size_t()> count_table_rows = [] { return std::size_t{0}; };
     // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
     // order — the zone-map capture keys its type allowlist on these exact types.
     vector<LogicalType> pinned_column_types;
@@ -1224,7 +1226,9 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     if (data.args.format == "duckdb") {
       auto info = build_duckdb_pin_info(
         context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
-      table_rows = static_cast<std::size_t>(info->storage->GetTotalRows());
+      count_table_rows = [rows = static_cast<std::size_t>(info->storage->GetTotalRows())] {
+        return rows;
+      };
       // After the catalog resolution (so a bad table name fails without side
       // effects) but before make_ingestible snapshots the on-disk row groups.
       suppress_auto_checkpoint_for_pin(context);
@@ -1273,13 +1277,14 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         return strverscmp(lhs.c_str(), rhs.c_str()) < 0;
       });
       warm_parquet_footer_statistics(context, file_paths);
-      if (data.args.tier != "parquet") {
+      count_table_rows = [&context, file_paths, name = data.args.name]() -> std::size_t {
         try {
-          table_rows = sirius::transparent::parquet_files_row_count(context, file_paths);
+          return sirius::transparent::parquet_files_row_count(context, file_paths);
         } catch (std::exception const& e) {
-          SIRIUS_LOG_DEBUG("[pin_table] '{}': no row count: {}", data.args.name, e.what());
+          SIRIUS_LOG_DEBUG("[pin_table] '{}': no row count: {}", name, e.what());
+          return 0;
         }
-      }
+      };
 
       // tier='parquet' pins the undecoded bytes and stops there: there is no
       // decode, no GPU materialisation and no pinned_entry, because the residency
@@ -1414,14 +1419,20 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
           data.args.name,
           data.args.tier,
           pin_comp.column_names.size());
-        if (data.args.tier == "gpu") {
+        if (data.args.tier == "gpu" && comp_cfg.min_table_device_fraction > 0) {
           std::size_t gpu_capacity = 0;
           for (auto const* space : gpu_spaces_mut) {
             gpu_capacity += space->get_max_memory();
           }
-          pin_comp.min_pin_bytes = static_cast<std::size_t>(comp_cfg.min_table_device_fraction *
-                                                            static_cast<double>(gpu_capacity));
-          pin_comp.table_rows    = table_rows;
+          // Any finite fraction is accepted; one whose threshold exceeds size_t saturates, which
+          // leaves every pin uncompressed.
+          auto const min_pin_bytes =
+            comp_cfg.min_table_device_fraction * static_cast<double>(gpu_capacity);
+          auto constexpr max_bytes = std::numeric_limits<std::size_t>::max();
+          pin_comp.min_pin_bytes   = min_pin_bytes >= static_cast<double>(max_bytes)
+                                       ? max_bytes
+                                       : static_cast<std::size_t>(min_pin_bytes);
+          pin_comp.table_rows      = count_table_rows();
         }
       }
     }

@@ -1231,6 +1231,9 @@ TEST_CASE("pin_table compression - GPU pins small next to GPU memory stay uncomp
   run_ok(con, "SET pin_table_compression_min_table_device_fraction = 0.5", "size gate");
   CHECK(pin("t_small", "gpu").compressed_chunks == 0);
 
+  run_ok(con, "SET pin_table_compression_min_table_device_fraction = 1e300", "huge size gate");
+  CHECK(pin("t_huge_gate", "gpu").compressed_chunks == 0);
+
   // Host pins are not gated by GPU memory.
   auto const host = pin("t_host", "host");
   CHECK(host.compressed_chunks == host.chunks);
@@ -1249,7 +1252,7 @@ TEST_CASE("pin_table compression - GPU pins small next to GPU memory stay uncomp
   CHECK(ungated.compressed_chunks == ungated.chunks);
 
   require_cached_gpu_matches_cpu(con, "SELECT sum(k), count(*) FROM read_parquet('" + glob + "')");
-  for (auto const* name : {"t_small", "t_host", "t_planned", "t_ungated"}) {
+  for (auto const* name : {"t_small", "t_huge_gate", "t_host", "t_planned", "t_ungated"}) {
     run_ok(con, std::string{"CALL unpin_table('"} + name + "')", "unpin");
   }
   fs::remove_all(tmp);

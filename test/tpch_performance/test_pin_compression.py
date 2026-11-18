@@ -74,6 +74,22 @@ class PinCompressionTests(unittest.TestCase):
             any("pin_table_input_compression_plan_dir" in s for s in statements)
         )
 
+    def test_compressed_pin_count_counts_only_pins_with_compressed_chunks(self):
+        with tempfile.TemporaryDirectory() as log_dir:
+            Path(log_dir, "sirius.log").write_text(
+                "[info] [pin_table] 'part' tier=gpu: automatically selecting "
+                "compression plans for 4 column(s)\n"
+                "[info] [materialize_all_batches_compressed] pin '/d/part.parquet': "
+                "0/1 chunk(s) compressed\n"
+            )
+            self.assertEqual(power.compressed_pin_count(log_dir, timeout_s=0), 0)
+            with Path(log_dir, "sirius.log").open("a") as log:
+                log.write(
+                    "[info] [materialize_pin_to_host] pin '/d/lineitem.parquet': "
+                    "3/13 chunk(s) compressed — remainder pinned UNCOMPRESSED\n"
+                )
+            self.assertEqual(power.compressed_pin_count(log_dir, timeout_s=0), 1)
+
     def test_external_runner_script_sets_compression_before_pinning(self):
         for plan_dir in (None, "/plans"):
             with self.subTest(

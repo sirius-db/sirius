@@ -72,6 +72,7 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -902,11 +903,14 @@ def close_benchmark_db(con, pin_tier, pin_layout=None, close=True):
             con.close()
 
 
-def compressed_pin_count(log_dir, timeout_s=10.0):
-    """Count pins the engine compressed, via the pin_table INFO log marker.
+_PIN_COVERAGE = re.compile(r"\] pin '.*': (\d+)/\d+ chunk\(s\) compressed")
 
-    The marker is written during CALL pin_table, well before the pins finish,
-    but the log sink may flush late; poll briefly before concluding zero.
+
+def compressed_pin_count(log_dir, timeout_s=10.0):
+    """Count pins with at least one compressed chunk, via pin_table's INFO coverage records.
+
+    Each record is written when its CALL pin_table finishes materializing, but the
+    log sink may flush late; poll briefly before concluding zero.
     """
 
     def scan():
@@ -915,11 +919,9 @@ def compressed_pin_count(log_dir, timeout_s=10.0):
             if not name.endswith(".log"):
                 continue
             with open(os.path.join(log_dir, name), errors="replace") as f:
-                found += sum(
-                    "compressing with plan" in line
-                    or "automatically selecting compression plans" in line
-                    for line in f
-                )
+                for line in f:
+                    match = _PIN_COVERAGE.search(line)
+                    found += bool(match and int(match.group(1)) > 0)
         return found
 
     deadline = time.time() + timeout_s
