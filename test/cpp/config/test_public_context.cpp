@@ -126,8 +126,12 @@ TEST_CASE("public context rolls back late initialization failures before retry",
   // Exercise telemetry as well as the pinned/device resources.
   root["sirius"]["telemetry"]["enable_quent"] = true;
   root["sirius"]["telemetry"]["enable_nvtx"]  = false;
-  auto const threshold                        = cudf::get_allocate_host_as_pinned_threshold();
-  auto failed                                 = sirius::Context::create(from_yaml(root));
+  // The file's fixed output directory can belong to another user of the machine.
+  auto const telemetry_dir = std::filesystem::temp_directory_path() /
+                             ("sirius_public_context_telemetry_" + std::to_string(getpid()));
+  root["sirius"]["telemetry"]["output_directory"] = telemetry_dir.string();
+  auto const threshold                            = cudf::get_allocate_host_as_pinned_threshold();
+  auto failed                                     = sirius::Context::create(from_yaml(root));
   REQUIRE_FALSE(failed.has_value());
   CHECK(failed.error().code == sirius::ErrorCode::context_initialization);
   CHECK(cudf::get_allocate_host_as_pinned_threshold() == threshold);
@@ -142,4 +146,6 @@ TEST_CASE("public context rolls back late initialization failures before retry",
     REQUIRE(retry.has_value());
   }
   check_default_allocators();
+  std::error_code ignored;
+  std::filesystem::remove_all(telemetry_dir, ignored);
 }
