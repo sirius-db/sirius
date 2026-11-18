@@ -149,6 +149,7 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
                                      [](auto const& c) { return c.range.has_value(); });
   if (!any_range && !has_external_selection) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      request.fused_scan.diagnostics,
       "[decompression-pushdown] config: {} column entr(ies), no ranges, no in-place/membership "
       "sources — plain decode",
       request.columns.size());
@@ -176,6 +177,7 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
     auto const capability = probe_column(table, selected_columns[i]);
     auto const physical   = selected_columns[i];
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      request.fused_scan.diagnostics,
       "[decompression-pushdown] config col[{}] physical={} dtype={} route={} comparable_lane={} "
       "range_requested={} range=[{}, {}]",
       i,
@@ -199,6 +201,7 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
       // it here keeps the rest of the plan on the fast path and leaves the
       // scan's own residual filter to correctly return no rows.
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        request.fused_scan.diagnostics,
         "[decompression-pushdown] config: DROPPING provably empty range conjunct on selected pos "
         "{} (physical {}): [{}, {}]",
         i,
@@ -211,6 +214,7 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
     }
     if (!capability.can_select_rows()) {
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        request.fused_scan.diagnostics,
         "[decompression-pushdown] config: DROPPING range conjunct on selected pos {} (physical {}) "
         "— the "
         "column cannot evaluate it while decoding (route={} comparable_lane={})",
@@ -228,6 +232,7 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
 
   if (selecting_columns == 0 && !has_external_selection) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      request.fused_scan.diagnostics,
       "[decompression-pushdown] config: no row-selecting source survived — plain decode");
     return {};
   }
@@ -241,10 +246,11 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
   // Join filters do not bear on coverage either way: coverage is a claim about the scan's own
   // filter, which every surviving row satisfies whether or not a join filter ran. One that ran
   // removed only rows the join rejects; one that declined on this batch or was dropped by the probe
-  // cap (decompression_pushdown_max_membership_sources) left such rows for the join to reject.
+  // cap (fused_scan_max_membership_sources) left such rows for the join to reject.
   config.covers_whole_filter =
     request.ranges_cover_whole_filter && !dropped_conjunct && selecting_columns > 0;
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    request.fused_scan.diagnostics,
     "[decompression-pushdown] config ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
     selecting_columns,
@@ -368,6 +374,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   if (sources.size() > kMaxSelectionSources ||
       chunk.num_rows() > std::numeric_limits<std::int32_t>::max()) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      request.fused_scan.diagnostics,
       "[decompression-pushdown] declined on shape ({} row-selecting sources, {} rows) — plain "
       "decode",
       sources.size(),
@@ -382,6 +389,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   });
 
   sirius::codegen::scan_filter_request wave_request;
+  wave_request.enable_fused_scan_filter = request.enable_fused_scan_filter;
+  wave_request.fused_scan               = request.fused_scan;
   wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     wave_request.routes.push_back(config.routes[i]);
@@ -417,7 +426,9 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
     }
   }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-    "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
+    request.fused_scan.diagnostics,
+    "[decompression-pushdown] wave-1 sources, ascending expected keep:{}",
+    order_echo);
   wave_request.source_generation  = request.membership_generation;
   wave_request.measure_membership = request.membership_measurement.measure;
   wave_request.output_types.assign(
@@ -482,6 +493,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
          .rows_after  = static_cast<std::size_t>(rows.rows_out)});
     }
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      request.fused_scan.diagnostics,
       "[decompression-pushdown] join filters kept {}/{} rows ({} of {} probe(s) ran, complete={})",
       outcome.membership_keep->rows_after,
       outcome.membership_keep->rows_before,
@@ -490,6 +502,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
       outcome.membership_keep->complete);
   }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    request.fused_scan.diagnostics,
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
     "selection_unprofitable={} filter_only_columns_dropped={}",
@@ -519,11 +532,15 @@ std::shared_ptr<const decompression_pushdown_scan>
 decompression_pushdown_scan::without_row_selection() const
 {
   pushdown_request narrowed;
+  narrowed.enable_fused_scan_filter = _request.enable_fused_scan_filter;
+  narrowed.fused_scan               = _request.fused_scan;
   narrowed.columns.reserve(_request.columns.size());
   for (auto const& column : _request.columns) {
     narrowed.columns.push_back({column.equals_any, std::nullopt, {}});
   }
-  if (narrowed.empty()) { return nullptr; }
+  if (narrowed.empty() && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics) {
+    return nullptr;
+  }
   narrowed.row_selection_disabled = true;
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
@@ -568,7 +585,9 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
     }
     any_asked = any_asked || !column.empty();
   }
-  if (!any_asked) { return nullptr; }
+  if (!any_asked && narrowed.enable_fused_scan_filter && !narrowed.fused_scan.diagnostics) {
+    return nullptr;
+  }
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
@@ -576,7 +595,7 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
   compaction_forecast forecast{};
-  if (!decompression_pushdown_enabled()) { return forecast; }
+  if (!_request.enable_fused_scan_filter) { return forecast; }
   if (_request.row_selection_disabled) { return forecast; }
   if (!_request.ranges_cover_whole_filter) { return forecast; }
 
@@ -633,6 +652,8 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
   if (!any_mask_producer) { return forecast; }
   forecast.compacts          = true;
   forecast.survivors_bounded = !any_unbounded;
+  forecast.max_surviving_fraction =
+    any_unbounded ? 1.0 : std::min(1.0, _request.fused_scan.max_selectivity);
   return forecast;
 }
 
@@ -656,6 +677,7 @@ decompress_result decompress_chunk(
 
   auto const predicates = to_decode_predicates(request, selected.size());
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    request.fused_scan.diagnostics,
     "[decompression-pushdown] chunk: columns={} equalities={} request_empty={}",
     selected.size(),
     predicates.size(),

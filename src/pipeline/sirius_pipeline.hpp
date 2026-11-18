@@ -29,6 +29,7 @@
 #include "query_id.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -235,7 +236,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
   [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
   {
-    return _task_creator;
+    return _task_creator.load(std::memory_order_acquire);
   }
 
   // Serializes input claims without blocking task completion while a source waits.
@@ -317,8 +318,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
 
   bool schedule_parallel(std::shared_ptr<duckdb::Event>& event);
 
-  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
-  sirius::creator::task_creator* _task_creator{nullptr};
+  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes. Set
+  //! last by prepare_for_query, so a caller on another thread that sees it sees the query's state.
+  std::atomic<sirius::creator::task_creator*> _task_creator{nullptr};
 
   //! Per-query completion reference for terminal pipelines. Guarded by _status_mutex.
   std::weak_ptr<completion_handler> _completion_handler;

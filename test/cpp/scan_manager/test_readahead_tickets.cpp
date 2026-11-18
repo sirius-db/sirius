@@ -277,6 +277,8 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
   ::cuda::stream_ref const stream_ref{stream};
   rmm::device_buffer device_destination(device_read ? read_size : 0, stream_ref);
   std::future<std::size_t> read;
+  // Waits on read; declared before the held requests so their failure settles it on unwinding.
+  std::future<std::size_t> reading;
   std::atomic<bool> first{true};
   readahead_query query(budget, 1);
   readahead_query peer(budget, 2);
@@ -313,7 +315,8 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
   complete_success(*prefetch_io);
   CHECK(await_condition(
     [&] { return query.outcomes(readahead_query::outcome::wait_for_prefetch) == 1; }));
-  CHECK(read.wait_for(0ms) == std::future_status::timeout);
+  reading = std::async(std::launch::async, [&read] { return read.get(); });
+  CHECK(reading.wait_for(50ms) == std::future_status::timeout);
   CHECK(budget->active(backend) == 1);
   auto peer_split = peer.add_split(fixture.context, "controlled://coverage-peer");
   peer.manager->start();
@@ -321,8 +324,8 @@ TEST_CASE("prefetch completing a subset retains the ticket for a demand-owned ch
   CHECK(fixture.reactor().pending() == 0);
 
   complete_success(*demand_io);
-  REQUIRE(read.wait_for(2s) == std::future_status::ready);
-  CHECK(read.get() == read_size);
+  REQUIRE(reading.wait_for(2s) == std::future_status::ready);
+  CHECK(reading.get() == read_size);
   if (device_read) {
     std::vector<std::uint8_t> copied(read_size);
     REQUIRE(

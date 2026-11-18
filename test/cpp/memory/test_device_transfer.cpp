@@ -173,7 +173,8 @@ TEST_CASE("device staging refuses unavailable capacity without consuming source 
                                staging,
                                device_transfer_policy::force_host_staging);
   };
-  REQUIRE_THROWS_AS(copy(&host), rmm::out_of_memory);
+  // The shortage is of HOST staging, so a task can retry it without growing its GPU reservation.
+  REQUIRE_THROWS_AS(copy(&host), sirius::memory::host_staging_out_of_memory);
   REQUIRE_THROWS_AS(copy(nullptr), std::runtime_error);
   REQUIRE_THROWS_AS(copy(&gpu), std::invalid_argument);
   REQUIRE(resource->get_total_allocated_bytes() == 0);

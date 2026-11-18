@@ -157,9 +157,14 @@ TEST_CASE("sirius_config accepts object_store_config through its setter",
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
-             "        request_timeout_s: 8\n");
+             "        request_timeout_s: 8\n"
+             "        tls:\n"
+             "          ktls: disable\n"
+             "          groups: X25519\n");
   REQUIRE_NOTHROW(cfg.load_from_file(path));
   CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 8);
+  CHECK(cfg.get_scan_manager_config().rest.tls.ktls == cucascade::io::tls::ktls_mode::disable);
+  CHECK(cfg.get_scan_manager_config().rest.tls.groups == "X25519");
 
   auto const& retained = cfg.get_scan_manager_config().object_store;
   CHECK(retained.endpoint == input.endpoint);
@@ -261,7 +266,7 @@ TEST_CASE("sirius_config still loads unrelated REST YAML fields", "[config][s3][
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][config][rest]")
+TEST_CASE("sirius_config exposes REST connection count", "[scan_manager][config][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_max_connections.yaml";
   write_yaml(path,
@@ -272,10 +277,9 @@ TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][
              "        max_connections: 7\n");
 
   sirius::sirius_config cfg;
-  REQUIRE_THROWS_WITH(
-    cfg.load_from_file(path),
-    Catch::Matchers::ContainsSubstring("unknown config key: 'max_connections' in rest"));
-  CHECK(cfg.get_scan_manager_config().rest.max_connections == 64);
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.max_connections == 7);
+  CHECK(cfg.get_scan_manager_config().to_io_config().rest.max_connections == 7);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

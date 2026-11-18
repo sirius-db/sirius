@@ -16,7 +16,7 @@
 
 #pragma once
 
-// How long a scanned column's VALUES are needed (env gate: SIRIUS_EXP_LATE_MAT).
+// How long a scanned column's VALUES are needed (query setting: enable_late_materialization).
 //
 // A column can be deferred for as long as nobody looks at what is in it.
 // Operators between the scan and its first real reader only move it — a filter

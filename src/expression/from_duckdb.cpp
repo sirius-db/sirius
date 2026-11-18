@@ -177,6 +177,11 @@ std::unique_ptr<node> translate_cast(duckdb::BoundFunctionExpression const& expr
   // then applies the configured fallback policy. Planner-generated restores bypass translation.
   auto const& source_type = duckdb::BoundCastExpression::Child(expr).GetReturnType();
   auto const& target_type = expr.GetReturnType();
+  // cuDF's cast does not parse strings as numbers. DuckDB must handle CAST errors and
+  // TRY_CAST's null-on-invalid semantics until a compatible GPU parser exists.
+  if (source_type.id() == duckdb::LogicalTypeId::VARCHAR && target_type.IsNumeric()) {
+    return nullptr;
+  }
   if ((source_type.IsTemporal() && target_type.IsNumeric()) ||
       (source_type.IsNumeric() && target_type.IsTemporal())) {
     return nullptr;

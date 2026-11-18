@@ -90,10 +90,14 @@ class convertible_data {
   /**
    * @brief Get the size in bytes of this data unit in the specified memory space.
    *
-   * Returns 0 if the data does not currently reside in the given space.
+   * A non-blocking probe: implementations never wait on a batch lock, and a batch another
+   * thread holds exclusively is counted as 0, since a non-blocking convert() could not move it
+   * either. The result is therefore a lower bound on what resides in the space, and 0 does
+   * not establish that nothing does. Callers size spill candidates from it; the request is
+   * credited with what convert() actually moves.
    *
    * @param space The memory space to query.
-   * @return The size in bytes, or 0 if not in that space.
+   * @return A lower bound on the bytes residing in the space; 0 when none could be seen there.
    */
   virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
 };

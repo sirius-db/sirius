@@ -31,7 +31,8 @@ class owned_arrow_scan_info final : public scan_info {
                         std::shared_ptr<physical_profile_table>,
                         std::size_t admitted_host_bytes,
                         std::shared_ptr<void const> read_identity = {},
-                        std::shared_ptr<void> input_lifetime      = {});
+                        std::shared_ptr<void> input_lifetime      = {},
+                        std::size_t admitted_batch_bytes          = 0);
   owned_arrow_scan_info(materialization_program const&,
                         uint64_t sequence,
                         std::shared_ptr<physical_profile_table>,
@@ -43,6 +44,12 @@ class owned_arrow_scan_info final : public scan_info {
   uint64_t generation() const noexcept { return generation_; }
   uint64_t sequence() const noexcept { return sequence_; }
   std::size_t estimated_bytes() const noexcept override { return bytes_; }
+  std::optional<int> required_device_id() const noexcept override
+  {
+    auto const* profile = batch_ ? batch_->source_profile() : nullptr;
+    if (profile && profile->memory == arrow_source_memory::device) return profile->device;
+    return {};
+  }
   std::size_t preparation_bytes() const noexcept override { return host_bytes_; }
   std::unique_ptr<owned_arrow_scan_info> coalesced_copy() const;
 
