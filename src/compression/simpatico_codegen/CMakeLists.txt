@@ -115,7 +115,17 @@ add_library(
   src/bridge/codegen_runtime.cpp
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
-  src/explore/compression_explorer.cpp)
+  src/explore/compression_explorer.cpp
+  # Chunk-span decode: cursor and per-encoding chunk decoders. The header
+  # description is in src/api/compressed_table_io.cpp.
+  src/api/chunk_decode.cpp
+  src/decode/chunk/validity_chunks.cu
+  src/decode/chunk/bitpack_chunks.cu
+  src/decode/chunk/stored_chunks.cu
+  src/decode/chunk/ans_blocks.cu
+  src/decode/chunk/delta_chunks.cu
+  src/decode/chunk/dictionary_chunks.cu
+  src/decode/chunk/str_split_chunks.cu)
 # Keep libcudf's CCCL includes ahead of the toolkit's implicit headers. Imported
 # -isystem paths would otherwise be searched after ordinary -I paths.
 set_target_properties(
@@ -222,7 +232,18 @@ add_codegen_host_test(test_chunk_row_set_build)
 add_codegen_host_test(test_row_id_space)
 add_codegen_host_test(test_chunk_row_set_convert)
 add_codegen_host_test(test_decompress_column_rows)
+add_codegen_host_test(test_hpln_describe)
+add_codegen_host_test(test_chunk_cursor)
+add_codegen_host_test(test_chunk_validity)
+add_codegen_host_test(test_chunk_bitpack)
+add_codegen_host_test(test_chunk_stored)
+add_codegen_host_test(test_chunk_ans_blocks)
+add_codegen_host_test(test_chunk_delta)
+add_codegen_host_test(test_chunk_dictionary)
+add_codegen_host_test(test_chunk_str_split)
+add_codegen_host_test(test_chunk_decode_equivalence)
 add_codegen_host_test(test_render_signature_contract)
+add_codegen_host_test(test_chunk_test_utils)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -256,4 +277,15 @@ add_test(NAME chunk_row_set_build COMMAND test_chunk_row_set_build)
 add_test(NAME row_id_space COMMAND test_row_id_space)
 add_test(NAME chunk_row_set_convert COMMAND test_chunk_row_set_convert)
 add_test(NAME decompress_column_rows COMMAND test_decompress_column_rows)
+add_test(NAME hpln_describe COMMAND test_hpln_describe)
+add_test(NAME chunk_cursor COMMAND test_chunk_cursor)
+add_test(NAME chunk_validity COMMAND test_chunk_validity)
+add_test(NAME chunk_bitpack COMMAND test_chunk_bitpack)
+add_test(NAME chunk_stored COMMAND test_chunk_stored)
+add_test(NAME chunk_ans_blocks COMMAND test_chunk_ans_blocks)
+add_test(NAME chunk_delta COMMAND test_chunk_delta)
+add_test(NAME chunk_dictionary COMMAND test_chunk_dictionary)
+add_test(NAME chunk_str_split COMMAND test_chunk_str_split)
+add_test(NAME chunk_decode_equivalence COMMAND test_chunk_decode_equivalence)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
+add_test(NAME chunk_test_utils COMMAND test_chunk_test_utils)

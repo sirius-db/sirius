@@ -125,8 +125,10 @@ struct sirius_physical_exchange_source::receiver : exchange::inbound {
         s->error = std::make_exception_ptr(
           sirius::internal_exception("exchange source: an unexpected batch from rank {}", from));
       } else if (s->ordered) {
-        s->held.emplace(std::make_pair(from, batch), std::move(data));
-        return;  // released once every sender has ended
+        // Released once every sender has ended. A number seen twice would drop a batch.
+        if (s->held.emplace(std::make_pair(from, batch), std::move(data)).second) { return; }
+        s->error = std::make_exception_ptr(sirius::internal_exception(
+          "exchange source: rank {} sent two batches numbered {}", from, batch));
       } else if (s->repo != nullptr) {
         auto const lease = s->lifecycle->try_acquire_work(s->query_id);
         if (!lease) { return; }  // the query is ending, and nothing will take this batch
@@ -202,6 +204,11 @@ void sirius_physical_exchange_source::set_memory_space(cucascade::memory::memory
   _state->gpu = &gpu;
 }
 
+void sirius_physical_exchange_source::hold_until(std::function<bool()> ready)
+{
+  _ready = std::move(ready);
+}
+
 void sirius_physical_exchange_source::set_pipeline(
   std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
@@ -254,12 +261,17 @@ void sirius_physical_exchange_source::bind_repository()
 std::optional<task_creation_hint> sirius_physical_exchange_source::get_next_task_hint()
 {
   bool finished = false;
+  // Not under the mutex: it is the planner's callback.
+  bool const released = !_ready || _ready();
   {
     std::lock_guard lock{_state->mutex};
     bind_repository();
-    bool const ready = _state->error || !_state->unordered_empty() ||
-                       (_state->all_ended() && !_state->held.empty()) || _state->owes_empty_batch();
-    if (ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
+    bool const has_batch = !_state->unordered_empty() ||
+                           (_state->all_ended() && !_state->held.empty()) ||
+                           _state->owes_empty_batch();
+    if (_state->error || (released && has_batch)) {
+      return task_creation_hint{TaskCreationHint::READY, this};
+    }
     finished = _state->all_ended();
   }
   // Walk on to this rank's producer, so its scans are scheduled while this source waits.
@@ -285,9 +297,11 @@ std::unique_ptr<operator_data> sirius_physical_exchange_source::get_next_task_in
 {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   cucascade::memory::memory_space* empty_on = nullptr;
+  bool const released                       = !_ready || _ready();
   {
     std::lock_guard lock{_state->mutex};
     if (_state->error) { std::rethrow_exception(_state->error); }
+    if (!released) { return nullptr; }
     bind_repository();
     if (!_state->queue.empty()) {
       batches.push_back(std::move(_state->queue.front()));

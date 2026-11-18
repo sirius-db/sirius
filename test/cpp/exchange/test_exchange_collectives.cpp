@@ -164,11 +164,13 @@ std::vector<std::int64_t> keys_of(cucascade::data_batch& batch)
   return utils::copy_column_to_host<std::int64_t>(sirius::get_cudf_table_view(ro).column(0));
 }
 
-std::vector<std::int64_t> keys_of(cudf::table const& table)
+std::vector<std::int64_t> keys_of(cudf::table_view table)
 {
   cudaDeviceSynchronize();
-  return utils::copy_column_to_host<std::int64_t>(table.view().column(0));
+  return utils::copy_column_to_host<std::int64_t>(table.column(0));
 }
+
+std::vector<std::int64_t> keys_of(cudf::table const& table) { return keys_of(table.view()); }
 
 duckdb::vector<sirius::logical_type> key_types()
 {
@@ -772,7 +774,10 @@ TEST_CASE("distributed SORT_SAMPLE sets the same exchange boundaries on every ra
   // one partition.
   for (rank_t r = 0; r < world; ++r) {
     if (samples[r]->get_num_partitions() <= 1) { continue; }
-    for (auto const k : keys_of(samples[r]->get_partition_boundaries())) {
+    // The sample keeps its boundaries on the host; this is the copy for the test's GPU.
+    auto const own = samples[r]->get_partition_boundaries(*env().gpu, utils::default_stream());
+    CHECK(samples[r]->num_boundary_rows() == samples[r]->get_num_partitions() - 1);
+    for (auto const k : keys_of(own)) {
       if (r > 0) { CHECK(k >= eb[r - 1]); }
       if (r + 1 < world) { CHECK(k < eb[r]); }
     }

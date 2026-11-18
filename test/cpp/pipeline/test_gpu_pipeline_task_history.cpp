@@ -1088,6 +1088,68 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// Test: an input whose port opted out of GPU materialization runs through the task where it is.
+//
+// The task's bookkeeping around execute() (the per-operator data log, the output schema check)
+// must not assume a GPU table.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task runs an operator over a host batch left in its tier",
+          "[gpu_pipeline_task][history][residency_policy_e2e]")
+{
+  constexpr std::size_t kNumRows = 1000;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+  rmm::cuda_stream stream, stream_data_init;
+  auto input_batch = f.create_host_data_batch(kNumRows, stream_data_init);
+
+  for (bool forward_input : {false, true}) {
+    INFO("operator forwards its input: " << forward_input);
+    auto ctx = create_pipeline_context();
+    std::optional<std::size_t> rows_seen;
+    ctx.stub_op->on_execute = [&](const sirius::op::operator_data& input, ::cuda::stream_ref) {
+      auto& pipelineable = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
+      auto const batches = pipelineable.get_read_only_batches();
+      REQUIRE(batches.size() == 1);
+      CHECK(batches[0].get_current_tier() == cucascade::memory::Tier::HOST);
+      rows_seen = sirius::representation_num_rows(batches[0].get_data());
+      std::vector<std::shared_ptr<cucascade::data_batch>> output;
+      if (forward_input) { output = pipelineable.get_data_batches(); }
+      return std::make_unique<sirius::op::pipelineable_operator_data>(std::move(output));
+    };
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+    auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{input_batch});
+    op_data->set_materialize_on_gpu(false);
+    auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      /*task_id=*/1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
+      global_state);
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
+    auto reservation = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, 1ULL << 20);
+    REQUIRE(reservation != nullptr);
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
+    advance_to_reserving(*task);
+
+    REQUIRE_NOTHROW(task->execute(stream));
+    CHECK(rows_seen == std::optional<std::size_t>{kNumRows});
+    task.reset();
+    CHECK(input_batch->to_read_only().get_current_tier() == cucascade::memory::Tier::HOST);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Test: a prepare OOM resumes at the attempt's current start index.
 //
 // prepare_for_processing runs before any operator in this attempt, so the input
@@ -2163,4 +2225,83 @@ TEST_CASE(
   }
   retry.reset();
   REQUIRE(source_lifetime.expired());
+}
+
+TEST_CASE("bytes_to_materialize_input skips inputs that do not materialize on GPU",
+          "[gpu_pipeline_task][history][residency_policy]")
+{
+  constexpr std::size_t kInputNumRows = 1024;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream;
+  auto make_local_state = [](std::shared_ptr<cucascade::data_batch> batch, bool materialize) {
+    auto input = std::make_unique<sirius::op::pipelineable_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
+    input->set_materialize_on_gpu(materialize);
+    return std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input));
+  };
+
+  SECTION("HOST input that materializes counts its upload size")
+  {
+    auto batch = f.create_host_data_batch(kInputNumRows, stream);
+    std::size_t materialization_bytes;
+    {
+      auto ro               = batch->to_read_only();
+      materialization_bytes = sirius::peak_materialization_bytes(ro.get_data());
+    }
+    REQUIRE(materialization_bytes > 0);
+
+    auto local_state = make_local_state(batch, true);
+    CHECK(local_state->get_estimated_bytes_to_materialize_input(nullptr) == materialization_bytes);
+    CHECK(local_state->get_estimated_bytes_to_materialize_input(f.gpu_space) ==
+          materialization_bytes);
+  }
+
+  SECTION("HOST input left in place counts nothing")
+  {
+    auto local_state = make_local_state(f.create_host_data_batch(kInputNumRows, stream), false);
+    CHECK(local_state->get_estimated_bytes_to_materialize_input(nullptr) == 0);
+    CHECK(local_state->get_estimated_bytes_to_materialize_input(f.gpu_space) == 0);
+  }
+
+  SECTION("GPU input in another memory space left in place counts nothing")
+  {
+    // The fixture has one GPU space, so the host space stands in for the other target: the
+    // estimator only compares memory space ids.
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream);
+    REQUIRE(f.host_space->get_id() != f.gpu_space->get_id());
+    CHECK(make_local_state(batch, true)->get_estimated_bytes_to_materialize_input(f.host_space) >
+          0);
+    CHECK(make_local_state(batch, false)->get_estimated_bytes_to_materialize_input(f.host_space) ==
+          0);
+  }
+
+  SECTION("reservation size info carries no materialization bytes")
+  {
+    auto ctx          = create_pipeline_context();
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    auto batch       = f.create_host_data_batch(kInputNumRows, stream);
+    auto create_task = [&](bool materialize, int task_id) {
+      return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+        task_id,
+        std::vector<cucascade::shared_data_repository*>{},
+        make_local_state(batch, materialize),
+        global_state);
+    };
+
+    auto const materialized = create_task(true, 1)->get_estimated_reservation_size_info(nullptr);
+    auto const in_place     = create_task(false, 2)->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(materialized.bytes_to_materialize_input > 0);
+    CHECK(in_place.bytes_to_materialize_input == 0);
+    CHECK(in_place.input_basis == materialized.input_basis);
+    CHECK(in_place.peak_memory_estimate == materialized.peak_memory_estimate);
+    CHECK(in_place.reservation_size ==
+          materialized.reservation_size - materialized.bytes_to_materialize_input);
+  }
 }

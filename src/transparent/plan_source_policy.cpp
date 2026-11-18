@@ -202,8 +202,8 @@ void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string con
       discovery = duckdb::ErrorData(duckdb::ExceptionType::INVALID, "non-standard exception");
     }
     auto message =
-      "CPU fallback is not supported: source discovery failed: " + discovery.RawMessage() +
-      ". Underlying GPU error: " + gpu_error;
+      "Underlying GPU error: " + gpu_error +
+      ". CPU fallback is not supported: source discovery failed: " + discovery.RawMessage();
     auto type = discovery.Type();
     // A failed replay check must not invalidate the database instance.
     if (type == duckdb::ExceptionType::INTERNAL || type == duckdb::ExceptionType::FATAL) {
@@ -215,8 +215,10 @@ void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string con
     throw std::runtime_error(message);
   }
   if (!policy.cpu_replay_permitted()) {
-    throw std::runtime_error("CPU fallback is not supported: " + policy.reason() +
-                             ". Underlying GPU error: " + gpu_error);
+    // The GPU error is the cause; that the query cannot be replayed on the CPU only explains
+    // why it is reported instead of being retried there.
+    throw std::runtime_error("Underlying GPU error: " + gpu_error +
+                             ". CPU fallback is not supported: " + policy.reason());
   }
 }
 }  // namespace sirius::transparent

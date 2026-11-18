@@ -22,6 +22,9 @@
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
 
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
@@ -29,6 +32,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <format>
 #include <limits>
@@ -247,10 +251,38 @@ void downgrade_executor::set_fs_cache(cucascade::io::cache::fs_cache* cache)
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
-    auto request = _request_queue.pop();
-    if (!request) break;  // interrupted
+    auto popped = _request_queue.pop();
+    if (!popped) break;  // interrupted
 
-    auto& req = request;
+    // A waiting reservation is completed the moment its memory is there (see
+    // serve_ready_reserve_requests()), whatever request is being processed. The evicting itself
+    // is left to the monitor's request when one is queued: it frees memory in bulk, down to the
+    // stop threshold, and the waiting tasks are served as it goes; processing each of their
+    // requests first would evict one small piece per task and keep the space at its limit.
+    // A reserve-path request is processed on its own when no monitor request is pending, and
+    // after every other request for whatever that left unsatisfied.
+    // The check is repeated before each one: tasks that are served queue their next request
+    // at once, and a monitor request must not wait behind an endless run of them.
+    auto const drain_reserve_requests = [this] {
+      while (!_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+        auto request = pop_reserve_request();
+        if (!request) { break; }
+        process_request(*request);
+      }
+    };
+    if (popped->is_wakeup) {
+      drain_reserve_requests();
+      continue;
+    }
+    process_request(*popped);
+    drain_reserve_requests();
+  }
+}
+
+void downgrade_executor::process_request(downgrade_request& request)
+{
+  {
+    auto* const req = &request;
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -300,6 +332,36 @@ void downgrade_executor::processing_loop()
       return false;
     };
 
+    // Conversions of this request that failed for a reason other than memory. A run of them
+    // with no success in between means the target tier is broken (unwritable spill directory,
+    // I/O error): the request stops dispatching instead of failing on every candidate.
+    std::atomic<std::size_t> convert_failures{0};
+    std::atomic<std::size_t> consecutive_convert_failures{0};
+    auto const failure_limit = _config.max_consecutive_convert_failures;
+    auto spill_broken        = [&consecutive_convert_failures, failure_limit]() {
+      return failure_limit > 0 &&
+             consecutive_convert_failures.load(std::memory_order_relaxed) >= failure_limit;
+    };
+    auto on_convert_failure = [this, &convert_failures, &consecutive_convert_failures](
+                                std::string_view source, std::string_view what) noexcept {
+      consecutive_convert_failures.fetch_add(1, std::memory_order_relaxed);
+      auto const first = convert_failures.fetch_add(1, std::memory_order_relaxed) == 0;
+      record_convert_failure(what);
+      log::log_noexcept([&] {
+        // One ERROR per request; the rest are counted in the request's summary line.
+        if (first) {
+          SIRIUS_LOG_ERROR("[downgrade] convert failed from {}: {}", source, what);
+        } else {
+          SIRIUS_LOG_DEBUG("[downgrade] convert failed from {}: {}", source, what);
+        }
+      });
+    };
+    auto on_convert_success = [this, &consecutive_convert_failures]() noexcept {
+      consecutive_convert_failures.store(0, std::memory_order_relaxed);
+      record_convert_success();
+      serve_ready_reserve_requests();
+    };
+
     // Bytes freed or still in flight toward the request's byte target. Failed conversions remove
     // their contribution so another candidate can be attempted.
     std::atomic<std::size_t> planned_bytes{0};
@@ -315,7 +377,7 @@ void downgrade_executor::processing_loop()
       [this, &req, &predicate_satisfied, &target_reached, &target_completed]() {
         if (!target_reached()) { return false; }
         _pool->wait_all();
-        return predicate_satisfied(req.get()) || target_completed();
+        return predicate_satisfied(req) || target_completed();
       };
 
     try {
@@ -360,7 +422,7 @@ void downgrade_executor::processing_loop()
       // Return unused staging buffers before spilling repository data. Credit both the
       // completed and planned totals so byte-target requests do not over-dispatch batches.
       if (_space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
-          !predicate_satisfied(req.get()) && !target_completed()) {
+          !predicate_satisfied(req) && !target_completed()) {
         auto const target =
           req->target_bytes.has_value()
             ? *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed)
@@ -368,7 +430,7 @@ void downgrade_executor::processing_loop()
         auto const freed = reclaim_fs_cache(cucascade::io::cache::reclaim_mode::idle, target);
         req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
         planned_bytes.fetch_add(freed, std::memory_order_relaxed);
-        predicate_satisfied(req.get());
+        predicate_satisfied(req);
       }
 
       // === TIER 1: Data repositories ===
@@ -386,6 +448,12 @@ void downgrade_executor::processing_loop()
       // allocating. This makes the pressure response FIFO: earliest queries keep execution
       // priority, latest queries pay for the memory.
       //
+      // Within a query, repositories are visited by downgrade priority, highest first. The
+      // priority is a per-repository hint for how cheap its batches are to spill; it comes from
+      // port_residency_policy::downgrade_priority and is copied onto the repository at wiring.
+      // The sort is stable, so equal priorities (0 by default) keep get_repositories() order.
+      // Priority never reorders repositories across queries.
+      //
       // get_all() returns ascending by query id, so this iterates the snapshot in reverse.
       // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
       // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
@@ -396,10 +464,19 @@ void downgrade_executor::processing_loop()
       for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
         auto borrow = _query_lifecycle.try_acquire_work(victim_id);
         if (!borrow) { continue; }
-        if (req->satisfied.load() || pool_interrupted || target_completed()) break;
-        auto repos = manager->get_repositories();
-        for (auto* repo : repos) {
-          if (req->satisfied.load() || target_completed()) break;
+        if (req->satisfied.load() || pool_interrupted || target_completed() || spill_broken()) {
+          break;
+        }
+        // Read each priority once: it is an atomic that wiring may still be setting, and a key
+        // that changes mid-sort would break the comparator's ordering.
+        std::vector<std::pair<int32_t, cucascade::shared_data_repository*>> repos;
+        for (auto* repo : manager->get_repositories()) {
+          repos.emplace_back(repo->get_downgrade_priority(), repo);
+        }
+        std::ranges::stable_sort(
+          repos, std::ranges::greater{}, [](auto const& entry) { return entry.first; });
+        for (auto* repo : repos | std::views::values) {
+          if (req->satisfied.load() || target_completed() || spill_broken()) break;
 
           convertible_data_batch_provider provider(repo);
           auto candidates = provider.get_all_convertible(
@@ -418,7 +495,8 @@ void downgrade_executor::processing_loop()
           }
 
           for (std::size_t n = 0; n < candidates.size(); ++n) {
-            if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
+            if (predicate_satisfied(req) || wait_if_target_reached() || spill_broken()) break;
+            serve_ready_reserve_requests();
 
             std::optional<std::size_t> remaining;
             if (req->target_bytes.has_value()) {
@@ -455,7 +533,7 @@ void downgrade_executor::processing_loop()
             _pool->dispatch(
               std::move(slot),
               [cand       = std::move(candidate),
-               req_ptr    = req.get(),
+               req_ptr    = req,
                &res_mgr   = _reservation_manager,
                &targets   = target_spaces,
                exc_stream = std::move(exc_stream),
@@ -465,6 +543,8 @@ void downgrade_executor::processing_loop()
                &repo_stats,
                &host_target_stats,
                &disk_target_stats,
+               &on_convert_failure,
+               &on_convert_success,
                predicate_satisfied]() mutable {
                 absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
                   planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -490,11 +570,15 @@ void downgrade_executor::processing_loop()
                       }
                     }
                     predicate_satisfied(req_ptr);
+                    on_convert_success();
                   }
-                } catch (const std::exception& e) {
+                } catch (const std::bad_alloc& e) {
+                  // Out of memory in the target tier: the next candidate may be smaller.
                   SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
+                } catch (const std::exception& e) {
+                  on_convert_failure("data repository", e.what());
                 } catch (...) {
-                  SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository");
+                  on_convert_failure("data repository", "unknown error");
                 }
               });
           }
@@ -503,7 +587,8 @@ void downgrade_executor::processing_loop()
       }
 
       // === TIER 2: task_scheduler task queue ===
-      if (can_convert && !req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
+      if (can_convert && !req->satisfied.load() && !target_completed() && !spill_broken() &&
+          _pipeline_task_queue) {
         size_t max_tasks_to_convert = _pipeline_task_queue->size();
         size_t tasks_converted      = 0;
         failed_pipeline_candidates.reserve(max_tasks_to_convert);
@@ -512,7 +597,8 @@ void downgrade_executor::processing_loop()
         convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue,
                                                                  _query_lifecycle);
         while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
-          if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
+          if (predicate_satisfied(req) || wait_if_target_reached() || spill_broken()) break;
+          serve_ready_reserve_requests();
           auto candidate =
             pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
           if (!candidate) break;
@@ -533,7 +619,7 @@ void downgrade_executor::processing_loop()
           _pool->dispatch(
             std::move(slot),
             [cand       = std::move(candidate),
-             req_ptr    = req.get(),
+             req_ptr    = req,
              &res_mgr   = _reservation_manager,
              &targets   = target_spaces,
              exc_stream = std::move(exc_stream),
@@ -545,6 +631,8 @@ void downgrade_executor::processing_loop()
              &pipeline_queue_stats,
              &host_target_stats,
              &disk_target_stats,
+             &on_convert_failure,
+             &on_convert_success,
              predicate_satisfied]() mutable {
               absl::Cleanup rollback = [&]() {
                 planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
@@ -583,11 +671,14 @@ void downgrade_executor::processing_loop()
                     }
                   }
                   predicate_satisfied(req_ptr);
+                  on_convert_success();
                 }
-              } catch (const std::exception& e) {
+              } catch (const std::bad_alloc& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
+              } catch (const std::exception& e) {
+                on_convert_failure("task queue", e.what());
               } catch (...) {
-                SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue");
+                on_convert_failure("task queue", "unknown error");
               }
             });
         }
@@ -606,14 +697,14 @@ void downgrade_executor::processing_loop()
     // Only a known, still-unmet byte target justifies dropping subscribed cache warmth.
     // All workers have settled, so the deficit reflects actual rather than planned releases.
     if (!dispatch_error && _space_id.tier == cucascade::memory::Tier::HOST && _fs_cache &&
-        req->target_bytes.has_value() && !predicate_satisfied(req.get()) && !target_completed()) {
+        req->target_bytes.has_value() && !predicate_satisfied(req) && !target_completed()) {
       try {
         auto const remaining =
           *req->target_bytes - req->bytes_freed.load(std::memory_order_relaxed);
         auto const freed = reclaim_fs_cache(cucascade::io::cache::reclaim_mode::forced, remaining);
         req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
         planned_bytes.fetch_add(freed, std::memory_order_relaxed);
-        predicate_satisfied(req.get());
+        predicate_satisfied(req);
       } catch (...) {
         dispatch_error = std::current_exception();
       }
@@ -711,13 +802,125 @@ void downgrade_executor::processing_loop()
       });
     }
 
+    // Conversions that failed for a non-memory reason: one summary line per request, a
+    // back-off for the monitor when nothing at all was freed, and an error for a waiting task
+    // when the tier is broken (it would otherwise proceed and retry its OOM for minutes).
+    auto const failures     = convert_failures.load(std::memory_order_relaxed);
+    auto const freed_bytes  = req->bytes_freed.load(std::memory_order_relaxed);
+    auto const no_progress  = failures > 0 && freed_bytes == 0 && !req->satisfied.load();
+    auto const first_error  = failures > 0 ? spill_failure() : std::nullopt;
+    auto const error_string = first_error.value_or("unknown error");
+    if (failures > 0) {
+      log::log_noexcept([&] {
+        SIRIUS_LOG_WARN(
+          "[downgrade] [{}] {} conversion(s) failed in this request ({} bytes freed{}); first "
+          "error: {}",
+          _source_label,
+          failures,
+          freed_bytes,
+          spill_broken() ? ", request stopped early" : "",
+          error_string);
+      });
+    }
+    if (req->is_monitor_request) {
+      if (no_progress) {
+        _failure_backoff = _failure_backoff.count() == 0
+                             ? _config.failure_backoff_initial
+                             : std::min(_failure_backoff * 2, _config.failure_backoff_max);
+        _monitor_not_before_ns.store(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() + _failure_backoff).time_since_epoch())
+            .count(),
+          std::memory_order_relaxed);
+      } else if (freed_bytes > 0) {
+        _failure_backoff = std::chrono::milliseconds{0};
+      }
+    }
+
     // Fulfill the promise
     if (dispatch_error) {
       req->result.set_exception(dispatch_error);
+    } else if (req->is_reserve_request && no_progress && spill_broken()) {
+      req->result.set_exception(std::make_exception_ptr(std::runtime_error(
+        "spilling from " + _source_label + " is failing (" + std::to_string(failures) +
+        " conversions failed, none succeeded): " + error_string)));
     } else {
-      req->result.set_value(req->bytes_freed.load(std::memory_order_relaxed));
+      req->result.set_value(freed_bytes);
     }
   }
+}
+
+std::unique_ptr<downgrade_request> downgrade_executor::pop_reserve_request()
+{
+  std::lock_guard lock(_reserve_requests_mutex);
+  if (_reserve_requests.empty()) { return nullptr; }
+  auto request = std::move(_reserve_requests.front());
+  _reserve_requests.pop_front();
+  return request;
+}
+
+void downgrade_executor::serve_ready_reserve_requests() noexcept
+{
+  std::vector<std::unique_ptr<downgrade_request>> ready;
+  try {
+    std::lock_guard lock(_reserve_requests_mutex);
+    if (_reserve_requests.empty()) { return; }
+    for (auto it = _reserve_requests.begin(); it != _reserve_requests.end();) {
+      bool holds = false;
+      try {
+        holds = (*it)->predicate && (*it)->predicate();
+      } catch (...) {
+        // Left in the queue: the processing loop reports predicate failures when it gets there.
+      }
+      if (holds) {
+        (*it)->satisfied.store(true, std::memory_order_release);
+        ready.push_back(std::move(*it));
+        it = _reserve_requests.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  } catch (...) {
+    return;
+  }
+  for (auto& request : ready) {
+    try {
+      request->result.set_value(0);
+    } catch (...) {
+    }
+  }
+}
+
+std::size_t downgrade_executor::pending_reserve_requests_for_testing() const
+{
+  std::lock_guard lock(_reserve_requests_mutex);
+  return _reserve_requests.size();
+}
+
+void downgrade_executor::record_convert_failure(std::string_view what) noexcept
+{
+  try {
+    _convert_failures_since_success.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(_spill_failure_mutex);
+    if (!_spill_failure.has_value()) { _spill_failure = std::string(what); }
+  } catch (...) {
+  }
+}
+
+void downgrade_executor::record_convert_success() noexcept
+{
+  if (_convert_failures_since_success.exchange(0, std::memory_order_relaxed) == 0) { return; }
+  try {
+    std::lock_guard lock(_spill_failure_mutex);
+    _spill_failure.reset();
+  } catch (...) {
+  }
+}
+
+std::optional<std::string> downgrade_executor::spill_failure() const
+{
+  std::lock_guard lock(_spill_failure_mutex);
+  return _spill_failure;
 }
 
 void downgrade_executor::maybe_fail_stream_acquisition(stream_acquisition_site site)
@@ -817,6 +1020,10 @@ void downgrade_executor::monitor_loop()
   bool stalled           = false;  // throttles the no-progress warning to once per episode
 
   while (_running.load() && !_paused.load()) {
+    // A waiting reservation is completed as soon as its memory is there, whatever the
+    // processing loop is busy with.
+    serve_ready_reserve_requests();
+    log_device_accounting();
     auto const enqueued = _monitor_request_enqueued.load(std::memory_order_acquire);
     if (awaiting_outcome && !enqueued) {
       awaiting_outcome = false;
@@ -839,7 +1046,13 @@ void downgrade_executor::monitor_loop()
       }
     }
 
-    if (_memory_space && _memory_space->should_downgrade_memory() && !enqueued &&
+    // After a request whose conversions all failed, wait out the back-off instead of issuing
+    // the same failing request every period.
+    auto const now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+    if (now_ns >= _monitor_not_before_ns.load(std::memory_order_relaxed) && _memory_space &&
+        _memory_space->should_downgrade_memory() && !enqueued &&
         std::chrono::steady_clock::now() >= next_request) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
@@ -902,8 +1115,63 @@ void downgrade_executor::monitor_loop()
   }
 }
 
+void downgrade_executor::log_device_accounting() noexcept
+{
+  using namespace std::chrono_literals;
+  if (_space_id.tier != cucascade::memory::Tier::GPU || _memory_space == nullptr) { return; }
+  // Every five seconds while the space is above its downgrade stop threshold: that is when
+  // what the device holds beyond the tracked bytes decides whether allocations fail.
+  auto const now = std::chrono::steady_clock::now();
+  if (now - _last_accounting_log < 5s || _memory_space->should_stop_downgrading_memory()) {
+    return;
+  }
+  _last_accounting_log = now;
+  try {
+    auto const* adaptor = _memory_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (adaptor == nullptr) { return; }
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_memory_space->get_device_id()}};
+    std::size_t device_free  = 0;
+    std::size_t device_total = 0;
+    if (cudaMemGetInfo(&device_free, &device_total) != cudaSuccess) { return; }
+    std::uint64_t pool_used = 0, pool_reserved = 0, pool_used_high = 0, pool_reserved_high = 0;
+    if (auto pool = adaptor->pool_handle(); pool != nullptr) {
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &pool_used);
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &pool_used_high);
+      cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &pool_reserved_high);
+    }
+    // tracked = allocations plus the unused part of reservations; allocated = tracked less
+    // the reservations' unused part cannot be told apart here, so both figures are logged.
+    auto const tracked  = adaptor->get_total_allocated_bytes();
+    auto const reserved = adaptor->get_total_reserved_bytes();
+    SIRIUS_LOG_INFO(
+      "[memory][accounting] [{}] limit={} tracked={} reserved={} pool_used={} pool_reserved={} "
+      "pool_used_high={} pool_reserved_high={} device_used={} device_total={}",
+      _source_label,
+      _memory_space->get_max_memory(),
+      tracked,
+      reserved,
+      pool_used,
+      pool_reserved,
+      pool_used_high,
+      pool_reserved_high,
+      device_total - device_free,
+      device_total);
+  } catch (...) {
+  }
+}
+
 void downgrade_executor::cancel_pending_requests()
 {
+  for (;;) {
+    auto req = pop_reserve_request();
+    if (!req) { break; }
+    try {
+      req->result.set_exception(
+        std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
+    } catch (...) {
+    }
+  }
   while (auto req = _request_queue.try_pop()) {
     try {
       req->result.set_exception(
@@ -947,12 +1215,31 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
-  auto req       = std::make_unique<downgrade_request>();
-  req->predicate = std::move(predicate);
-  auto future    = req->result.get_future();
-  if (!_request_queue.push(std::move(req))) {
-    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
+  auto req                = std::make_unique<downgrade_request>();
+  req->predicate          = std::move(predicate);
+  req->is_reserve_request = true;
+  auto future             = req->result.get_future();
+  if (!_config.prioritize_reserve_requests) {
+    if (!_request_queue.push(std::move(req))) {
+      SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
+    }
     return future;
+  }
+  auto* const raw = req.get();
+  {
+    std::lock_guard lock(_reserve_requests_mutex);
+    _reserve_requests.push_back(std::move(req));
+  }
+  auto wakeup       = std::make_unique<downgrade_request>();
+  wakeup->is_wakeup = true;
+  if (!_request_queue.push(std::move(wakeup))) {
+    // Nobody will come for it: drop it (the future reports a broken promise), as a push to the
+    // inactive queue does.
+    std::lock_guard lock(_reserve_requests_mutex);
+    auto it = std::ranges::find_if(_reserve_requests,
+                                   [raw](auto const& queued) { return queued.get() == raw; });
+    if (it != _reserve_requests.end()) { _reserve_requests.erase(it); }
+    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
   }
   return future;
 }

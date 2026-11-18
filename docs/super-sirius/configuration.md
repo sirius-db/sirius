@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -109,7 +109,8 @@ sirius:
     task_creator: { num_threads: 1 }
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
-    max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
+    max_sort_partition_bytes:   0           # 0 = auto (see sort_partition_auto_sizing)
+    sort_merge_mode:            auto        # auto | windowed | one_shot (see Sort Merge)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
@@ -150,8 +151,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
-| `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.95 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. What is evicted between the two fractions is usually read back, so a wide band costs traffic: a sort of twice the GPU limit took 33 s at 0.8/0.6 and 21 s at 0.95/0.9. |
+| `downgrade_stop_fraction` | double (0,1] | 0.9 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+
+**Keep the limit well below the device size.** The limit bounds the bytes Sirius allocates; the device's CUDA memory pool reserves more than that. Under a sort of twice the limit it has been measured to hold 1.16 to 1.41 times the limit (100-121 GB for an 85.9 GB limit; 45-75 GB of it reserved but unused at the peak) and it does not give the excess back (trimming the pool released under 1.2 GB of 18 GB). When the device cannot supply that, allocations fail although the tracked usage is below the limit, and tasks retry: a 160 GiB sort under an 80 GiB limit took 39-70 s with 274-803 OOM retries instead of 33 s with none when only 96 and 88 GiB of the device were available, and 263 s with a 176 GiB limit on a 184 GiB device. Sirius warns at startup when the device has less than 1.4 times the limit available. The default `usage_limit_fraction` of 0.95 is above that bound: set `usage_limit_fraction: 0.7` (or the equivalent bytes) for workloads that spill.
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level
@@ -159,11 +162,13 @@ diagnostic control remains available only through the explicit low-level
 
 ### Host Memory (`sirius.memory.host`)
 
-Controls pinned host memory pools. One pool group is created per NUMA node (auto-detected from hardware topology).
+Controls pinned host memory pools. One pool group is created per NUMA node that carries a configured GPU (auto-detected from hardware topology); CPU-less NUMA nodes (GPU memory exposed as NUMA nodes) are never used. The pools are allocated with `numa_alloc_onnode`, whose policy is a strict bind to the node.
+
+When neither capacity key is set, each host space gets **one third of its NUMA node's RAM per configured GPU on that node, for at most two GPUs**: a node carrying one GPU gives one third to the host tier, a node carrying two or more gives two thirds, and one third always stays free for everything else (including the page cache that buffered spill files use).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
+| `capacity_fraction` | double (0,1] | — (see above) | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
@@ -172,6 +177,7 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | auto | When omitted, pre-allocate 10% of each backing NUMA node's total RAM, capped by host capacity and rounded down to whole pools (possibly zero). Requires discovered host RAM capacity. An explicit count overrides automatic sizing. Additional pools are created on demand. Initial host footprint = aligned `block_size × pool_size × initial_number_pools`. |
+| `prepin_fraction` | double [0,1] | 0 | Share of the host capacity to pin at startup: raises `initial_number_pools` above its automatic or explicit value to cover it. Pools created on demand are pinned on the spill path at about 20 GB/s, against 60 GB/s and more into pools that already exist, so a sort that spills tens of GB finishes sooner with the pools pinned up front (measured: 14.5-16.8 s to 7.9-9.7 s for 160 GiB under an 80 GiB limit); pinning costs about 25 ms per GiB at load and commits the memory. |
 
 ### Disk Memory (`sirius.memory.disk`)
 
@@ -180,8 +186,56 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
-| `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+| `capacity_bytes` | bytes | 1Ti | Capacity bound for reservations / in-flight conversions, not a quota on stored spill files. The filesystem must have enough free space. |
+| `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). The directory is checked at startup: a missing one is created, and Sirius refuses to start when it cannot be created, is not a directory or is not writable (it used to start and fail every spill to disk). |
+
+Raw and compressed `.hpln` spills use the DISK space's `cucascade::io::ioctx`, built at
+startup from the space's `io` block (below). The context owns its reactor
+teardown and its staging (a cuFile context borrows its pinned host scratch from the HOST
+space per transfer); see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+Disk spaces with equal `io` settings share one context.
+
+#### Spill-file I/O (`sirius.memory.disk.io`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `backend` | string | `cufile` (see below) | `cufile`: cuCascade's cuFile reactors. `uring`: its io_uring reactors. `automatic`: cuCascade chooses, cuFile when GPUDirect Storage really works on the host, else io_uring, else the cuFile reactors if io_uring is forbidden in the process. |
+| `direct_io` | bool | false | `false`: buffered reads and writes through the page cache. `true`: O_DIRECT; with the cuFile reactors, device data then goes through GPUDirect Storage where the driver and the file system support it. |
+| `reactors` | int | 8 | Reactor threads that serve the space's transfers. `0` keeps cuCascade's own count: 4 io_uring reactors, or a group of cuFile reactors per GPU pinned to that GPU's CPUs. A cuFile reactor borrows up to 16 MiB of pinned staging from the HOST space while a transfer runs; each io_uring reactor pins 64 MiB of its own at startup. |
+
+With the defaults, spill files are written and read with POSIX calls on eight reactor threads,
+device data staged through pinned memory, exactly as on a host without GPUDirect Storage. This
+needs neither `libcufile` nor the `nvidia-fs` driver at run time: with `direct_io: false` no
+spill file is opened with O_DIRECT, no transfer goes through cuFile and no device staging slots
+are registered. The cuFile reactors still probe the platform once, when the context is built at
+startup: where `libcufile` can be loaded they open the cuFile driver and log the mode it reports
+(`cufile: cuFile ... reports GPUDirect Storage`, or compatibility mode), and where it cannot
+they log that cuFile is unavailable and serve the same POSIX path.
+`io: { backend: automatic, direct_io: true, reactors: 0 }` is cuCascade's own default. In a build without `cufile.h` (no cuFile reactors compiled in)
+the default `backend` is `automatic` instead, which there means io_uring.
+
+Choosing a setting:
+
+- Keep the default on network and parallel file systems. Their direct writes are usually far
+  slower than their buffered writes.
+- `direct_io: true` with `backend: cufile` is worth measuring on a local NVMe device with a
+  working GPUDirect Storage stack.
+- `backend: uring` fails at startup where the process may not use io_uring (some container
+  seccomp profiles). An invalid combination is reported when Sirius starts, not at the first
+  spill.
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: /mnt/nvme/sirius_spill
+      io: { direct_io: true, reactors: 4 }   # backend stays cufile
+```
+
+The `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and the spill-file layouts
+are unchanged. `sirius.executor.scan_manager.backend`, its reactor counts and cache settings
+configure independent scan contexts, not spilling. The removed kvikIO backend is not
+available for reads or writes.
 
 ### Input-table compression (`sirius.compression`)
 
@@ -208,7 +262,9 @@ With spill compression on, a GPU batch the downgrade executor moves to the host 
 stored Simpatico-compressed and decoded on its way back to the GPU. Plans are chosen per column
 from its type (see [Memory Management](memory-management.md#spill-compression)); no plan files are
 involved. A batch that does not qualify, saves too little, or fails to encode spills
-uncompressed.
+uncompressed. Compressed DISK spills use the same per-space ioctx as raw spills, with
+unchanged `.hpln` layout. This I/O transport change does not change the settings below or
+the process-wide SQL `spill_compression` semantics.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
@@ -286,7 +342,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `mount_path` | string | "" | Spill directory. |
-| `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
+| `memory_capacity` | bytes | space default | Reservation / in-flight conversion bound, not a stored-file quota. |
+| `io` | map | defaults | Spill-file I/O of this space: `backend`, `direct_io`, `reactors`, as in [`sirius.memory.disk.io`](#spill-file-io-siriusmemorydiskio). |
 
 ```yaml
 sirius:
@@ -331,7 +388,12 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: clamp(floor(3T/(8G)), 4, 8)` per GPU). No extra keys.
+Thread pool (default `num_threads: clamp(floor(3T/(8G)), 4, 8)` per GPU) plus:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wait_for_memory_on_worker` | bool | false | `true`: a task whose memory reservation cannot be granted at once waits for it on its own worker thread, so the executor keeps dispatching the tasks that fit. A waiting task is overtaken by at most 16 later tasks and for at most 1 s; after that nothing new is dispatched until it is served. `false` waits on the executor's manager loop: one waiting task holds back every other task of the device. Off by default: with `prioritize_reserve_requests` it removed most of the time in which no task computed, but not wall time (the runs are bound by spill I/O), and it needs MERGE_SORT windows that do not depend on the memory free when a partition is armed. |
+| `fail_fast_on_full_gpu_oom` | bool | true | Fail a task the second time it runs out of memory while its reservation already covers the whole GPU memory limit and its input cannot shrink (for example a one-shot merge of a partition that is too large): a retry gets the same memory. `false` retries up to the retry limit (100). |
 
 ### `sirius.executor.downgrade`
 
@@ -340,9 +402,12 @@ Thread pool (default `num_threads: clamp(floor(T/(8G)), 1, 4)`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+| `prioritize_reserve_requests` | bool | false | `true`: complete the eviction request of a task waiting for a reservation as soon as its memory is available, also while another request (the monitor's bulk eviction) is being processed, and process the ones still unsatisfied before the next queued request. `false` processes requests strictly in arrival order: a waiting task then waits for every request ahead of its own to finish. |
 
-HOST downgrade executors synchronously reclaim idle staging chunks from the default local
-ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+A request stops after 8 conversions in a row fail for a reason other than memory (an I/O error, a spill directory that went away) with none succeeding; a waiting task then fails with that error, and the monitor backs off (100 ms, doubling to 5 s) instead of re-issuing the failing request every period. While the GPU tier is above its downgrade stop threshold the monitor logs one `[memory][accounting]` line every five seconds: the bytes Sirius tracks against what the device's memory pool and the device hold.
+
+HOST downgrade executors synchronously reclaim idle staging chunks from the scan manager's
+default local ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
 is still short after those workers finish, a forced pass reclaims additional unpinned,
 non-loading chunks up to the remaining deficit, even if a future scan subscribes to them. That
 includes the chunks of a `pin_table(..., tier => 'parquet')` pin, whatever the eviction settings:
@@ -359,12 +424,12 @@ reservation, it backs off like any other non-viable executor. If the cache holds
 monitor request frees nothing (every chunk above the reservation is pinned by a reader or still
 loading), the monitor waits before its next request: the wait starts at `monitor_period` and
 doubles up to `max(monitor_period, 1 s)`. It resets as soon as a request frees memory or the
-pressure clears. GPU executors and routed remote ioctx caches do not participate. This adds no
-configuration keys.
+pressure clears. GPU executors, independent DISK spill contexts and routed remote ioctx caches
+do not participate. This adds no configuration keys.
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `cufile/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
@@ -372,15 +437,20 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | 18 | Metadata-producer worker threads; fixed default. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
+| `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. With several GPUs, cuFile runs one reactor group and one set of staging slots per GPU. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
+| `cufile_n_reactors` | int (**>= 0**) | 0 | cuFile reactors for local reads, each one worker thread keeping one read in flight. `0` plans a pinned group of `cufile.reactors_per_device` reactors for each GPU in `cufile.devices` (default: the GPU Sirius reads into). A positive count runs one flat, unpinned pool of that many reactors instead. See [`scan_manager.cufile`](#scan_managercufile--local-cufile-reads-iocufileconfighpp). |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
-sub-config below.
+sub-config below. cuFile cannot use `fs_cache` for scan readahead.
+Neither `cache.mode: cucs` nor an explicit positive `max_readahead_scans`
+creates a readahead manager without an eligible advertised backend. This also
+excludes empty queries, cuFile-only queries and requested pinned caches that failed to build.
+The readahead policies below apply only to eligible backends; routed REST reads retain their own policy.
 
 `max_readahead_scans` has three states:
 
@@ -388,7 +458,7 @@ sub-config below.
 |-------|--------|
 | unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
-| `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
+| `n > 0` | An eligible advertised backend runs readahead with a budget of `n`, whatever the cache mode. |
 
 `readahead_strategy` works the same way, deferring to the backend rather than to the cache:
 
@@ -408,7 +478,7 @@ A runtime budget additionally accounts for every backend touched by each split a
 queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
 routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
-Five optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
+Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
 ### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
@@ -608,6 +678,136 @@ sirius:
           recv_placement: automatic
 ```
 
+### `scan_manager.cufile` — local cuFile reads (`io/cufile/config.hpp`)
+
+Select cuFile with the existing `backend` key. The default remains `native`.
+This backend reads local and network-filesystem regular files (for example IBM Storage
+Scale / GPFS) into GPU memory through cuFile (GPUDirect Storage). `s3://` reads, listing
+and globs still use native REST. With several GPUs, the planned pool has one group of
+reactors and one set of staging slots per GPU, and each read is routed by its destination.
+
+The example below is for a GPFS deployment. Point `storage_hint_path` at a file on the
+data filesystem so the pool is sized for network storage:
+
+```yaml
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    scan_manager:
+      backend: cufile
+      cufile_n_reactors: 0            # plan a pinned pool per GPU
+      cache: { mode: none }
+      cufile:
+        storage_hint_path: /gpfs/fs1/warehouse/lineitem/part-0.parquet
+        reactors_per_device: 0        # auto: 32 on GPFS/NFS/Lustre, 8 on local NVMe, 16 unknown
+        staging_mode: automatic
+        staging_piece_bytes: 8MiB
+        staging_slots_per_reactor: 2
+        max_staging_bytes_per_device: 1GiB
+        pin_to_device_cpus: true
+        max_inflight: 32
+        max_op_bytes: 64MiB
+        gds_threshold: 256KiB
+        use_odirect: true
+        compat_mode: auto
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `reactors_per_device` | int (**>= 0**) | 0 | Reactors per GPU in a planned pool (`cufile_n_reactors: 0`). Each reactor keeps one synchronous `cuFileRead` in flight, so this is the GPU's queue depth (Little's law: depth ≈ throughput × latency / read size). `0` sizes it from `storage_hint_path`: 32 on a network filesystem (GPFS, NFS, Lustre, ...), 8 on local block storage, 16 when unknown. |
+| `devices` | list of CUDA ordinals | empty | GPUs the planned pool serves, a group of reactors and reserved staging each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and GPUs Sirius reads into; startup fails otherwise. |
+| `storage_hint_path` | string | empty | A file (not a directory) on the storage Sirius mostly reads, used only to size the pool. Empty = unknown storage. |
+| `pin_to_device_cpus` | bool | true | Pin each GPU's reactors to the CPUs local to that GPU (NVML affinity intersected with the process affinity). |
+| `staging_mode` | enum: `automatic`, `always`, `never` | `automatic` | Stage device reads of a cuFile-registered file through registered, aligned GPU slots, then scatter the wanted bytes with a device-to-device copy. `automatic` stages only when cuFile reports a real GDS mode; `always` forces it (tests, diagnostics); `never` reads straight into the destination through cuFile's bounce buffers. |
+| `staging_piece_bytes` | bytes (**> 0, multiple of 4KiB**) | 8MiB | File bytes one staged `cuFileRead` covers. Larger device reads are split into pieces of this size so several reactors read them at once. Capped at cuFile's `max_direct_io_size`. |
+| `staging_slots_per_reactor` | int (**> 0**) | 2 | Staging slots each reactor holds per GPU. With 2, a read can complete into one slot while its caller's stream is still busy; 1 disables those early reads. |
+| `max_staging_bytes_per_device` | bytes | 1GiB | Cap on registered staging per GPU. `0` = no cap beyond the device limits (half the free BAR1, cuFile's pinned-memory limit). |
+| `max_inflight` | int (**> 0**) | 32 | Per-reactor bound on asynchronous items holding copy resources (staged scatter copies waiting for their stream, H2D copies of fallback reads), not concurrent `cuFileRead` calls. |
+| `max_op_bytes` | bytes (**>= 4KiB**) | 64MiB | Largest direct (unstaged) `cuFileRead` issued by a worker; larger device reads are chunked. |
+| `gds_threshold` | bytes | 256KiB | Device reads below this size use POSIX reads and pinned H2D staging rather than cuFile. `0` is legal. |
+| `use_odirect` | bool | true | Open the direct-I/O descriptor needed for cuFile. `false` skips cuFile registration and uses buffered POSIX reads; it conflicts with `compat_mode: off`. Independent of `cache.mode`. |
+| `compat_mode` | enum: `auto`, `on`, `off` | `auto` | Per-file policy: `auto` tries cuFile and permits POSIX fallback, `on` forces POSIX, `off` requires a usable cuFile handle and fails the open rather than falling back if it cannot be registered. Values are lowercase. |
+| `poll_interval_us` | int (**>= 0**, µs) | 50 | Idle polling interval while copies await completion; not a delay before dispatching ready work. |
+| `low_service_interval` | int (**>= 0**) | 4 | High-priority requests started while low work is waiting before granting the low tier a turn. `0` restores strict priority. |
+
+cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
+or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor
+`readahead_strategy` enables it. These are read-only settings; no write or
+per-transfer buffer-registration controls are exposed.
+`cufile.n_max_concurrent_scans` is intentionally not a YAML setting: cuFile cannot
+publish a usable cache/readahead budget. Tune read concurrency with
+`cufile.reactors_per_device` (or `cufile_n_reactors` for a flat pool) and
+`cufile.max_inflight` instead.
+
+**Staging memory.** Staging slots are `cudaMalloc`ed outside RMM, registered with cuFile
+once, and kept for the life of the process. With the defaults on GPFS that is about
+32 reactors × 2 slots × (8 MiB + 128 KiB of alignment) ≈ 520 MiB per GPU, capped by
+`max_staging_bytes_per_device`. For a planned pool, Sirius reserves the slots at startup
+**before** the GPU memory pools are created, so they come on top of
+`sirius.memory.gpu.usage_limit_*`; on a small GPU, lower the usage limit or
+`max_staging_bytes_per_device`. A flat pool (`cufile_n_reactors > 0`) allocates its
+slots as its reactors first stage a read, from whatever the pools left free. The POSIX
+fallback (small and host reads, and staged writes) stages through pinned host memory
+borrowed per transfer from the HOST space of the reactor's GPU's NUMA node: up to two
+8 MiB slots, counted against that space only while the transfer runs. If a slot
+cannot be allocated or registered, reads fall back to direct cuFile reads and a WARN says
+so. With `staging_mode: automatic` on a host without GDS, nothing is allocated.
+
+**Plan and counters.** At startup the pool plan (`cufile pool: ...`, with each GPU
+group's reactors, CPUs and staging) is logged at INFO, and each GDS setup problem
+the planner can see (Storage Scale without GDS or without `rdma_dev_addr_list`, no peer
+memory, poll mode, a small `max_direct_io_size`) at WARN. At shutdown the scan manager
+logs which path the reads took (`cufile reads: staged ..., direct ..., posix device ...,
+host ..., cufile failures ...`). On a GDS host, Parquet device reads should land in
+`staged`; growing `posix device` bytes or `cufile failures` mean GPUDirect Storage is not
+serving them.
+
+**IBM Storage Scale checklist.** cuCascade's
+[cuFile / GPUDirect Storage guide](../../cucascade/docs/io/cufile-gds.md) has the full
+list and the tuning sweep that measures `reactors_per_device`, `staging_piece_bytes` and
+`max_staging_bytes_per_device` on the deployment host. In short:
+
+1. `gdscheck -p` lists IBM Storage Scale with a GDS mode (dmabuf / peermem), not only
+   `compat`.
+2. Cluster: `mmchconfig verbsRdma=enable,verbsRdmaSend=yes,verbsGPUDirectStorage=yes`
+   and `verbsPorts` naming the client's RDMA ports.
+3. `cufile.json`: a non-empty `rdma_dev_addr_list`, `use_poll_mode: false`, and
+   `max_direct_io_size_kb` at least `staging_piece_bytes`; otherwise the planner shrinks
+   the pieces to it. 16384 (16 MiB) is its maximum and default.
+4. `nvidia_peermem` is loaded, or DMA-BUF is enabled.
+5. **CPU architecture:** IBM documents Storage Scale GDS clients as x86 only. On an
+   aarch64 node (Grace / GB200), confirm support first. Otherwise every GPFS read runs
+   in cuFile compatibility mode (a host bounce) and automatic staging stays off.
+
+**Capability and fallback.** cuFile availability depends on the runtime library, GPU,
+filesystem/mount, storage stack, alignment and cuFile configuration. A per-path
+capability report combines that evidence with direct-open/handle-registration results;
+`direct_candidate` is advisory, **not proof of direct DMA**. Unknown evidence is not
+proof of unsupported storage. Successful registration (including `compat_mode: off`)
+does not prove that cuFile itself avoided compatibility mode. With `auto`, reads can
+remain correct through host/POSIX fallback on a compatibility-only host, including a
+host without `nvidia-fs`; conversely, absence of `nvidia-fs` alone does not rule out
+supported P2PDMA. Small reads and unaligned tails can use host staging. An explicit
+cuFile context initialization failure is reported, not silently rerouted to another backend.
+
+**cuFile logging.** `libcufile` can create `cufile.log` in the working directory.
+Configure its `logging.level` and `logging.dir` in a cuFile JSON file, selected with
+`CUFILE_ENV_PATH_JSON` **before starting the process / first cuFile initialization**
+(otherwise cuFile uses `/etc/cufile.json` and its defaults). For example, save this as
+`/absolute/path/to/cufile.json`:
+
+```json
+{"logging": {"level": "ERROR", "dir": "/tmp"}}
+```
+
+```bash
+export CUFILE_ENV_PATH_JSON=/absolute/path/to/cufile.json
+```
+
+Use a more verbose level such as `TRACE` only when diagnosing transfer mode; verbose
+logging can affect performance. This is cuFile configuration, not a Sirius YAML setting.
+
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
 Everything about read-path caching lives in this one block — rather than a mode on the
@@ -629,9 +829,12 @@ sirius:
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
-`mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
-through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
-pinned prefetching cache (`fs_cache`).
+For the native local backend, `mode: none` bypasses every cache (`O_DIRECT`, no
+prefetching cache), `mode: os` reads through the kernel page cache, and `mode: cucs`
+reads `O_DIRECT` into cuCascade's pinned prefetching cache (`fs_cache`). REST can also
+use `fs_cache` under `cucs`. cuFile never attaches `fs_cache` or runs scan
+readahead, regardless of this mode; cuFile's direct-open policy is set by
+`cufile.use_odirect`, not derived from the cache mode.
 
 Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
 file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
@@ -649,7 +852,7 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | Derived setting | Derived from |
 |-----------------|--------------|
 | `uring.use_odirect` | `mode` — true for everything but `os` |
-| whether the prefetching cache is armed | `mode` — only under `cucs` |
+| whether the prefetching cache is armed | `mode` — only under `cucs`, and only for a backend that supports `fs_cache` (not cuFile) |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
@@ -743,7 +946,7 @@ S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` 
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -769,7 +972,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
-| `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
+| `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. 0 = chosen automatically, see `sort_partition_auto_sizing`. A non-zero value fixes the count at data bytes / this value. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT and REPLICATE (`EXCEPT ALL` / `INTERSECT ALL`). REPLICATE may exceed the byte target by one row. A small value splits REPLICATE output into many small batches and slows those queries. 0 disables ordinary CONCAT coalescing and REPLICATE's byte target; CONCAT's `concat_all` mode still combines the whole partition |
 | `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
@@ -777,7 +980,18 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows x 16 B; unavailable row counts decline admission). 0 disables BUILD_PROBE. |
 | `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU decoded folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
-| `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_memory_fraction` | 0.33 | Largest sort partition as a fraction of one GPU's memory limit when `max_sort_partition_bytes` is 0 |
+| `sort_partition_auto_sizing` | true | How the number of ORDER BY range partitions is chosen when `max_sort_partition_bytes` is 0. true: enough partitions to keep each one under `max_sort_partition_memory_fraction` of a GPU's memory limit, or under a tenth of the limit when the data and its sorted copy do not fit the GPUs; where the one-shot merge is used, also under the cuDF row limit and its GPU memory need; in `auto` mode, never several partitions that fall under the one-shot threshold without fitting the GPU together; and, with `sort_merge_mode = 'windowed'` on several GPUs, one partition per executor thread of a GPU (at most 4, no partition under 2 GiB). false: the previous rule, data bytes over the fraction of the GPU memory free at the moment the sort is sampled. |
+| `sort_key_encoding` | true | Per-batch sort of ORDER BY: order string keys and multi-column keys by radix sorts over an encoding of the keys instead of cuDF's comparison sort. `false` is for A/B comparison. |
+| `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each, so a range partition receives few large sorted runs instead of one per input batch. See [Sort Run Coalescing](#sort-run-coalescing). |
+| `sort_coalesce_memory_fraction` | 0.25 | Share of one GPU's memory for the inputs of the local sorts running at the same time: one run is at most this fraction of the GPU divided by the GPU executor thread count. In (0, 1]. |
+| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
+| `sort_merge_mode` | `auto` | Merge path of MERGE_SORT: `auto`, `windowed` or `one_shot`. See [Sort Merge](#sort-merge). |
+| `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge |
+| `sort_merge_output_bytes` | 0 (derive) | Output chunk target per windowed merge task; accepts byte suffixes |
+| `sort_merge_one_shot_max_fraction` | 0 (derive) | In `auto` mode, the fraction of GPU memory above which a partition takes the windowed path |
+| `sort_merge_max_fan_in` | 8 | Most sorted runs one merge task reads |
+| `sort_merge_disabled_rules` | 64 | Bit set of merge sizing and planning rules to switch off. See [Sort Merge](#sort-merge). |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
@@ -813,6 +1027,129 @@ Runtime distinct-build probing is an internal join policy, not a user configurat
 temporarily disabled while the cuCollections defect tracked in #1600 remains unresolved. The
 engine retains the guarded single-pass `cudf::distinct_hash_join` path for policy-controlled use
 after that dependency is fixed.
+
+### Sort Run Coalescing
+
+**Files:** `src/op/sirius_physical_order.hpp`, `src/op/sirius_physical_order.cpp`,
+`src/planner/sirius_physical_plan_generator.cpp` (`order_by_run_limits`, `wrap_order_by`)
+
+Three settings control which input batches the local sort of ORDER BY sorts together (see
+[Operators](operators.md#sirius_physical_order--order_by)). Each is a key under
+`sirius.operator_params` and a session `SET` variable of the same name.
+
+| Setting | Type | Default | Meaning |
+|---------|------|---------|---------|
+| `sort_coalesce_runs` | BOOLEAN | true | On: the local sort concatenates groups of input batches and sorts each group as one run. Off: every input batch is sorted on its own (one run per batch), in the pipeline that produced it. |
+| `sort_coalesce_memory_fraction` | DOUBLE | 0.25 | Size of one run: `fraction × GPU memory limit / GPU executor threads` bytes of input (the smallest GPU when there are several). In (0, 1]. |
+| `sort_coalesce_string_keys` | BOOLEAN | true | On: a sort with a string key is coalesced like any other, provided `sort_key_encoding` is on. Off, or with `sort_key_encoding` off: it keeps the per-batch sort. |
+
+Why it matters: every sorted run is cut by range, so each range partition holds as many runs as
+the local sort produced, and MERGE_SORT needs one extra pass over a partition's rows for every
+factor of `sort_merge_max_fan_in` in that count. A sort over fixed-width keys costs the same per
+row whatever the run size, so sorting larger runs removes merge passes for free. The run size is
+a memory bound, not a target derived from the data size: a sort task holds its input batches,
+their concatenation, the sort's scratch and the sorted copy. A run is also kept below 2^31 rows
+and, when the schema has a string column, below 2^31 bytes. A sort with a string key is
+coalesced only while `sort_key_encoding` is on: the encoded sort costs the same per row at any
+run size, while cuDF's comparison sort of string keys gets slower per row as a run grows, by
+more than the saved merge passes give back for keys with many distinct values.
+
+Why 0.25: for a 32 GiB sort under an 80 GiB limit it gives 7 runs per partition, which the
+default `sort_merge_max_fan_in` merges in one pass; 0.125 gives 14 runs and an extra pass, and
+0.5 and 1.0 make the sorts themselves spill.
+
+Coalescing is not applied (the plan and the behaviour are those of `sort_coalesce_runs = false`)
+when a column of the sort's input is nested, when a sort key is not a plain column, and, when
+`sort_coalesce_string_keys` or `sort_key_encoding` is off, when a sort key is a string.
+
+### Sort Merge
+
+**Files:** `src/sirius_config.hpp`, `src/sirius_config.cpp`, `src/sirius_extension.cpp`, `src/op/merge/merge_config.cpp`
+
+Six settings control how MERGE_SORT merges the sorted runs of a partition (see
+[Operators](operators.md#sirius_physical_merge_sort--merge_sort)). Each is a key under
+`sirius.operator_params` and a session `SET` variable of the same name.
+
+| Setting | Type | Default | Meaning |
+|---------|------|---------|---------|
+| `sort_merge_mode` | VARCHAR | `auto` | `auto`: windowed merge for a partition that has a batch off the GPU tier, or whose bytes plus output exceed `sort_merge_one_shot_max_fraction` of the GPU, or whose one-shot merge does not fit the GPU beside the rest of the sort; otherwise one-shot. `windowed`: always the windowed k-way merge. `one_shot`: always the concat-then-merge path. Case-insensitive. |
+| `sort_merge_window_rows` | UBIGINT | 0 | `n`: maximum rows per window of a run read through a window buffer. An explicit value also bounds the rows one merge round emits; a derived one does not (see `round rows` below). 0 derives it. |
+| `sort_merge_output_bytes` | UBIGINT | 0 | Output chunk target per merge task. 0 derives it. |
+| `sort_merge_one_shot_max_fraction` | DOUBLE | 0 | The `auto` threshold, as a fraction of the device's total GPU memory. 0 derives it. |
+| `sort_merge_max_fan_in` | UBIGINT | 8 | Most runs one merge task reads. A partition with more runs is merged in passes. |
+| `sort_merge_disabled_rules` | UBIGINT | 64 | Bit set of the rules below to switch off; 0 puts all of them in force. Meant for measuring each rule. |
+
+The rules of `sort_merge_disabled_rules` (`merge::merge_rule`); a set bit restores the behaviour
+from before the rule:
+
+| Bit | Rule | Default |
+|-----|------|---------|
+| 1 | Pass plan: a short first merge, so every later merge and the final pass read `fan_in` runs | on |
+| 2 | Budget floor: `G` is at least a quarter of the device's GPU memory | on |
+| 4 | Budget per open partition: `T = clamp(partitions, 1, executor threads)`, also the open-partition cap | on |
+| 8 | In-place reservation: no window buffers reserved for runs sliced in place, but one spare | on |
+| 16 | Output-sized rounds: `round rows` below, and an output target of `B / 8` instead of `B / 16` | on |
+| 32 | Row-count guard: in `auto` mode a partition of 2^31 - 1 rows or more is windowed | on |
+| 64 | One-shot cold-start estimate of 2.5 × the input instead of 2 × | off |
+| 128 | In `auto` mode a partition whose only run is on the GPU is forwarded without a merge | on |
+| 256 | STRING slot estimate from the STRING columns' own width | on |
+| 512 | One-shot fit: in `auto` mode a partition under the threshold is still windowed when the one-shot merges that run at once do not fit the GPU together with the runs of the whole sort | on |
+
+`one_shot` is kept for A/B testing against the windowed path and is slated for removal once the
+windowed path is proven (measurements and the conditions for the removal:
+[`test/sort_performance/RESULTS.md`](../../test/sort_performance/RESULTS.md)). Partitions with nested columns or late materialization still take the
+one-shot route in every mode.
+
+**Derivation.** A value left at 0 is derived for each partition when its first merge task is
+created (`merge::derive_merge_config()`), from:
+
+- `G`: GPU memory available on the device (free plus reserved by tasks in flight), at least a
+  quarter of the device's total GPU memory;
+- `T`: windowed partitions that can be open at once on the device: the partitions the operator
+  has, at most `executor.pipeline.num_threads`;
+- `w`: estimated row width in bytes (fixed widths, plus an equal share of the rest of the average
+  row for each variable-width column);
+- `k`: the fan-in, `min(runs in the partition, fan-in cap)`.
+
+The per-task budget is `B = 0.5 × G / T`.
+
+| Value | Heuristic |
+|-------|-----------|
+| Fan-in cap | `clamp(B / (3 × 65536 × w), 2, sort_merge_max_fan_in)`: the most runs whose windows fit `B` with `n` at its floor |
+| `sort_merge_window_rows` | `n = min(max(B / (3 × k × w), 65536), G / (16 × k × w))`, at least 1. The ceiling is applied last, so it wins when it is below the 65,536-row floor. |
+| `sort_merge_output_bytes` | `clamp(B / 8, 64 MiB, 1 GiB)` |
+| round rows | `max(n, output target / w)`, at most 2^30 - 1: the most rows one round emits, and the rows a run sliced in place offers a round. Equal to `n` when `sort_merge_window_rows` is set. |
+| `sort_merge_one_shot_max_fraction` | 0.20 below 16 GiB of total GPU memory, 0.25 below 64 GiB, otherwise 0.33 |
+
+For a planned query, `G` comes from the GPU memory space that holds most of the partition's bytes
+(the smallest GPU space when no run is on a GPU) and `T` is bounded by the configured
+`executor.pipeline.num_threads`. A MERGE_SORT built without the plan generator has no budget
+provider: it uses the default executor width, and a partition with no batch on the GPU reuses the
+last GPU space the
+operator saw, or sizes for 8 GiB and logs a warning when it has seen none. The derived values are
+logged at DEBUG level (`sort merge config: ...`).
+
+**Validation.** `SET` throws an invalid-input error and keeps the previous value; the config file
+fails to load with the same rule, prefixed with `'operator_params.<key>'`.
+
+| Setting | Accepted |
+|---------|----------|
+| `sort_merge_mode` | `auto`, `windowed`, `one_shot` |
+| `sort_merge_window_rows` | 0, or at least 1024 |
+| `sort_merge_output_bytes` | 0, or at least 1 MiB |
+| `sort_merge_one_shot_max_fraction` | 0, or in (0, 1]; NaN and infinity are rejected |
+| `sort_merge_max_fan_in` | at least 2 (values above 4096, the merge kernel's limit, are treated as 4096) |
+
+The variables are session settings: `SET GLOBAL` is rejected and `RESET` restores the config-file
+value. After an OOM a windowed task may run with a smaller window and output target than these
+values; see [Shrink Before Retry](memory-management.md#shrink-before-retry).
+
+```sql
+SET sort_merge_mode = 'one_shot';        -- concat-then-merge, for A/B comparison
+SET sort_merge_mode = 'windowed';        -- force the windowed merge
+SET sort_merge_window_rows = 1048576;    -- pin n
+SET sort_merge_window_rows = 0;          -- back to the derived n
+```
 
 ## Telemetry
 
@@ -1068,7 +1405,17 @@ SET enable_compressed_materialization = false;
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
-| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
+| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction (of a GPU's memory limit) when `max_sort_partition_bytes` is 0 |
+| `sort_partition_auto_sizing` | true | Automatic sort partition count from the GPU memory limit, the merge route, the number of GPUs and the cuDF row limit; false = previous rule (free GPU memory at sampling time) |
+| `sort_key_encoding` | true | Per-batch sort of ORDER BY uses radix sorts over an encoding of string and multi-column keys; `false` uses cuDF's comparison sort (A/B comparison) |
+| `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each; see [Sort Run Coalescing](#sort-run-coalescing) |
+| `sort_coalesce_memory_fraction` | 0.25 | One coalesced run is at most this fraction of the GPU memory limit divided by the GPU executor thread count; in (0, 1] |
+| `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
+| `sort_merge_mode` | `auto` | MERGE_SORT merge path: `auto`, `windowed` or `one_shot` (kept for A/B testing, slated for removal); see [Sort Merge](#sort-merge) |
+| `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge; 0 or at least 1024 |
+| `sort_merge_output_bytes` | 0 (derive) | Output chunk target per merge task; 0 or at least 1 MiB |
+| `sort_merge_one_shot_max_fraction` | 0 (derive) | Fraction of GPU memory above which `auto` takes the windowed path; 0 or in (0, 1] |
+| `sort_merge_max_fan_in` | 8 | Most sorted runs one merge task reads; at least 2 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 8× startup-resolved `hash_partition_bytes` | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |

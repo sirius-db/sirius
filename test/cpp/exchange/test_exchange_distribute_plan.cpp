@@ -18,6 +18,7 @@
 // rewritten on its own thread over a loopback exchange: where the exchanges go, what they route
 // on, what it refuses, and a shape mismatch between ranks.
 
+#include "data/data_batch_utils.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exchange/loopback_fabric.hpp"
 #include "exec/query_lifecycle_registry.hpp"
@@ -31,6 +32,10 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -444,9 +449,14 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   // The result is gathered to rank 0 in rank order.
   REQUIRE(plans[0]->type == T::EXCHANGE_SOURCE);
   CHECK(plans[0]->Cast<sirius::op::sirius_physical_exchange_source>().ordered());
-  CHECK(
-    plans[0]->children.at(0)->Cast<sirius::op::sirius_physical_exchange_sink>().spec().routing ==
-    exchange_spec::mode::gather);
+  for (auto const& plan : plans) {
+    // Every rank's sink numbers its batches by MERGE_SORT's positions.
+    auto const& gather =
+      plan->children.at(0)->Cast<sirius::op::sirius_physical_exchange_sink>().spec();
+    CHECK(gather.routing == exchange_spec::mode::gather);
+    CHECK(gather.ordered);
+    CHECK(plan->children.at(0)->children.at(0)->type == T::MERGE_SORT);
+  }
   auto* partition = find(*plans[0], T::SORT_PARTITION);
   REQUIRE(partition);
   REQUIRE(sink_below(*partition));
@@ -465,6 +475,25 @@ TEST_CASE("distribute_plan range-exchanges an ORDER BY on the sample's order",
   auto const* distributed = &sample->Cast<sirius::op::sirius_physical_sort_sample>();
   CHECK(distributed->cross_rank_boundaries() != nullptr);
   CHECK(partition->Cast<sirius::op::sirius_physical_sort_partition>().get_sample_op() == sample);
+  // A peer whose boundaries are stored may send before this rank's are: the range exchange's
+  // source holds what arrives until then, since SORT_PARTITION could not split it.
+  auto& range_source =
+    partition->children.at(0)->Cast<sirius::op::sirius_physical_exchange_source>();
+  REQUIRE_FALSE(distributed->boundaries_computed());
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                              1,
+                                              cudf::mask_state::ALL_NULL,
+                                              cudf::get_default_stream(),
+                                              f.gpu().get_default_allocator()));
+  c.all[0].service->send(range_source.stream(),
+                         0,
+                         sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                                 f.gpu(),
+                                                 cudf::get_default_stream(),
+                                                 sirius::telemetry::batch_telemetry_info{}));
+  CHECK(range_source.get_next_task_input_data() == nullptr);
+  CHECK_FALSE(range_source.all_ports_empty());
   auto const local = f.lowered(sql);
   auto const& planned =
     find(*local, T::SORT_SAMPLE)->Cast<sirius::op::sirius_physical_sort_sample>();

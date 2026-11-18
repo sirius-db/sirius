@@ -14,7 +14,7 @@ Super Sirius uses cuCascade for tiered memory management across three tiers:
 │  Host Pinned (Tier 1)    │  Medium speed, larger (>100GB)
 │  Pinned pools per NUMA   │  Used for caching, GPU↔CPU transfer
 ├──────────────────────────┤
-│  Disk (Tier 2)           │  Slow, unlimited (~1TB default)
+│  Disk (Tier 2)           │  Slow, limited by filesystem space
 │  Spill files on mount    │  Last resort for extreme pressure
 └──────────────────────────┘
 ```
@@ -66,8 +66,44 @@ initial_number_pools;           // auto: 10% of NUMA RAM, capped by host capacit
 ```cpp
 disk_id;
 mount_paths;                    // directories for spill files
-memory_capacity = 1TB;          // total spill capacity
+memory_capacity = 1TB;          // reservation / in-flight conversion bound, not a stored-file quota
 ```
+
+### DISK I/O and ownership
+
+Raw spills and compressed `.hpln` spills use the same per-space
+`std::shared_ptr<cucascade::io::ioctx>`. `SiriusContext` builds it at startup with
+`cucascade::make_disk_io_context()` from the space's `io` settings
+([configuration](configuration.md#spill-file-io-siriusmemorydiskio)) and hands it to the
+space; spaces with equal settings share one context. The default is the cuFile reactors with
+buffered I/O and eight reactor threads, which start with the context and stay idle until the
+first spill. A DISK space built through the C++ API without a context still adopts
+`cucascade::default_disk_io_context()` on its first conversion.
+
+The cuCascade DISK factory supports `automatic`, `uring`, and `cufile`. Its `automatic`
+prefers **cuFile with real GDS**, then **usable io_uring**, then the **cuFile POSIX/staging
+path** when io_uring is unavailable or forbidden; cuFile compatibility mode alone is not real
+GDS. These DISK contexts are independent of the scan backend; the removed kvikIO backend is
+not supported for reads or writes.
+
+A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
+(64 MiB of portable pinned staging per reactor). A cuFile one borrows its pinned host
+scratch from the HOST space of the GPU's NUMA node for each transfer and gives it back
+before the transfer settles; device-write bodies on a real GDS host go through the same
+registered GPU staging slots as scan reads. Destruction stops/drains reactor
+workers before releasing their staging. The memory spaces own their contexts;
+spill representations and contexts must still be released before CUDA/RMM global
+teardown, including in debug builds. Each conversion retains its context, file object and
+source/destination owners until all submitted work completes, draining futures on errors
+before buffers or partial-file guards can unwind.
+
+The raw HOST/GPU↔DISK converters use one file object and one vectored request per table,
+and remain synchronous to their callers. The raw file layout, mount paths, file-removal
+ownership and downgrade/reservation policy are unchanged. Spill reads use cache-unaware
+I/O; factory DISK contexts do not arm `fs_cache`. The scan manager's contexts, backend,
+reactor counts and cache configuration are independent and are not shared with DISK by
+default. No new YAML settings or backend registration are needed; see
+[Disk Memory](configuration.md#disk-memory-siriusmemorydisk).
 
 ## Parquet scan working sets
 
@@ -117,6 +153,34 @@ Wraps RMM device memory resource. On each allocation:
 ### Caller reservations for HOST conversions
 
 Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+
+### Shrink Before Retry
+
+**Files:** `src/op/sirius_physical_operator.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`, `src/pipeline/gpu_pipeline_task.hpp`
+
+A task that runs out of GPU memory is rescheduled with the same input object and a raised
+**retry reservation floor**: the larger of twice the reservation it had and its live allocations
+plus the failed request. The next attempt reserves at least the floor.
+
+`operator_data::shrink_for_retry()` lets a task input reduce its own working set instead. The GPU
+pipeline executor's reschedule path calls it, on OOM only, on the input that will be retried:
+
+- A pipelineable input's read-only locks are released before the call, so an override may lock,
+  spill or drop its batches.
+- When it returns `true`, the rescheduled task inherits the floor as it was before this OOM
+  (`inherit_retry_reservation_floor_before_last_oom()`), so the retry asks for the smaller
+  estimate the input now reports.
+- When it returns `false` (the default), the raised floor is inherited as usual.
+- The retry count increments either way, so the retry limit bounds a run of shrinks.
+
+`merge::windowed_merge_input` is the one override. A task that left window buffers out of its
+estimate for runs sliced in place answers its first OOM by charging them (same sizes, a larger
+estimate; see [Window reservations](#window-reservations)) and returns `true`. Otherwise each
+call halves `window_rows` down to 1024
+rows and `output_target_bytes` down to 16 MiB, and returns `false` once both are at their floors.
+From then on a further OOM raises the floor like any other task's. The shrunk sizes hold for the
+later tasks of the same pass of the partition, which continue the task's merger; the next pass
+starts from the derived sizes again.
 
 ## Downgrade Executor
 
@@ -169,9 +233,18 @@ With `compression.enable_spill_compression` on, `convertible_data_batch::convert
 | From | To | Converter |
 |------|----|-----------|
 | `gpu_table_representation` | `compressed_host_representation` | encode on the device, stage the payload in pinned host blocks |
-| `gpu_table_representation` | `compressed_disk_representation` | encode on the device, write an `.hpln` file under the disk space's mount path through its I/O backend |
-| `compressed_host_representation` | `compressed_disk_representation` | write the pinned header and payload as an `.hpln` file through the I/O backend (no decode) |
-| `compressed_disk_representation` | `gpu_table_representation` | read the header, then each compressed buffer straight into device memory, through the I/O backend; decode |
+| `gpu_table_representation` | `compressed_disk_representation` | encode on the device; one `mixed_writev_async` writes the host header and device payloads to `.hpln` through the target DISK space's ioctx |
+| `compressed_host_representation` | `compressed_disk_representation` | one `host_writev_async` writes the header and pinned payload blocks through the same per-space ioctx (no decode or device work) |
+| `compressed_disk_representation` | `gpu_table_representation` | open once through the source DISK space's ioctx; read the header with cache-unaware host I/O, then read each payload into device memory on the destination stream and decode |
+
+The `.hpln` header/payload byte layout is unchanged, including unaligned boundaries; no
+padding or relocation is introduced. Writers prepare all slices before submitting, await
+completion and validate the exact byte total. Readers validate header and payload read
+counts before decoding; device I/O honors the caller's stream and GPU binding. The
+context, file object and encoded/pinned/device buffers stay alive until submitted work
+drains, including on failure. Clones still share one immutable `.hpln` file, removed only
+after the last owner is destroyed. Compression gates, uncompressed fallback and retryable
+OOM decoding are unchanged.
 
 The compressed host representation decodes with the converter `pin_table` already uses. Each column's plan follows from its type and a prefix sample: fixed-width columns up to 8 GiB are bitpacked (bitpack's encode scratch holds a column at full width as 2^31 32-bit words at most; larger ones are stored as is). Integer-valued columns up to 64 bits (integers, decimals, chrono types) copy a 64K-row prefix to the host and estimate the size of bitpack, delta → bitpack and delta → rle → bitpack from per-1024-value-chunk bit widths; a delta plan is used when it is estimated at least 10% smaller, which is the case for sorted join and group keys, especially those with repeats. The choice is made per batch, not cached: it costs about a millisecond per column. Strings are dictionary-encoded when a sample has few distinct values and otherwise split into ans-coded chars and delta → bitpack offsets, anything else is stored as is. The encode allocates from the GPU pool the batch is being evicted from, so it runs under a reservation of `spill_encode_reserve_fraction` of the batch's size, attached to the allocation tracker for the encode's duration. Under per-thread tracking the reservation covers the column-parallel encode on the stream pool; under per-stream tracking it covers only the downgrade stream, so the encode runs on that stream alone. The batch spills uncompressed when the reservation is not grantable, when every column's plan stores it as is (the encode would only copy the batch), or when the compressed form exceeds `spill_max_compressed_fraction` of the batch. A spilled compressed batch reports its compressed size from `get_size_in_bytes()`, so code that sizes GPU work from waiting batches (the PARTITION operator's partition count, CONCAT's `concat_batch_bytes` grouping) uses `get_uncompressed_data_size_in_bytes()`, the size the task will decode to. Decoding back to the GPU reserves the batch's uncompressed size, and a decode that runs out of device memory or streams throws `rmm::out_of_memory`, which the executor reschedules like any other OOM.
 
@@ -179,10 +252,161 @@ The compressed host representation decodes with the converter `pin_table` alread
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
+1. **Data repositories** are iterated query by query, newest query first. Within one query they are visited by downgrade priority, highest first, and in repository manager order among equal priorities (see [Input Residency and Downgrade Priority](#input-residency-and-downgrade-priority)). Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
 2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. A queued task can hold inputs in several spaces (inputs that were only partly spilled, a build batch shared from another GPU); only the batches still in the source space are converted, and the request is credited with the bytes that actually moved. Tasks are returned to the queue via RAII on all code paths.
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically per batch. A task is not a unit of rollback: its batches convert one at a time, and if a later batch throws, the ones already moved stay at the target but the request is credited nothing for the task, since the exception discards the running totals. Credited bytes are the batches' sizes in the source space, not what they occupy at the target (a batch spilled compressed is credited at its uncompressed GPU size).
+
+## Input Residency and Downgrade Priority
+
+**Files:** `src/op/sirius_physical_operator.hpp`, `src/pipeline/repository_wiring_materializer.cpp`, `src/downgrade/downgrade_executor.cpp`
+
+An operator declares how the task machinery treats the batches waiting on one of its input ports
+by overriding `input_residency_policy(port_id)`, which returns a `port_residency_policy`:
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `materialize_inputs_on_gpu` | `true` | `false`: a task input built from this port is not converted to the GPU in `prepare_for_processing()`. Each batch is read-locked in its current tier and memory space, and the input adds nothing to `bytes_to_materialize_input`. The operator reads the batches itself. |
+| `downgrade_priority` | 0 | Order of the port's repository in the downgrade sweep within one query: a higher value is spilled earlier. |
+
+The policy is read once per port, when `materialize_repository_wiring()` creates the port's
+repository. It is stored in `port::residency`, and the priority is copied onto the repository with
+`set_downgrade_priority()`. No code in the task, the task creator or the downgrade executor names
+an operator type.
+
+- **Default task input.** The base `get_next_task_input_data()` sets
+  `set_materialize_on_gpu()` from the ports that contributed a batch. The input skips GPU
+  materialization only when every contributing port opted out. An operator that builds its own
+  input can set the flag per task.
+- **Downgrade sweep.** Tier-1 candidates are still drawn query by query, newest query first.
+  Within one query the executor reads each repository's priority once and stable-sorts the
+  repositories by it, highest first. Equal priorities keep repository manager order, so a query
+  whose repositories are all at 0 is swept as before. Priority never reorders repositories across
+  queries.
+
+MERGE_SORT returns `{.materialize_inputs_on_gpu = false, .downgrade_priority = 100}` unless
+`sort_merge_mode` is `one_shot`: its sorted runs wait for a whole merge and are read back by row
+range, so they are the cheapest batches of the query to spill. A partition that takes the one-shot
+route in `auto` or `windowed` mode sets `set_materialize_on_gpu(true)` on its own input.
+
+DISCARD_SINK returns `{.materialize_inputs_on_gpu = false, .downgrade_priority = -100}` (the
+order check turns materialization back on): it only counts its input, so a spilled batch is not
+read back, and batches about to be dropped are the last ones worth spilling.
+
+## Windowed Merge Memory
+
+**Files:** `src/op/merge/merge_config.cpp`, `src/op/merge/windowed_merge_input.cpp`, `src/op/merge/windowed_merge.cu`, `src/data/sirius_row_range_reader_registry.hpp`
+
+The windowed route of MERGE_SORT (see
+[Operators](operators.md#sirius_physical_merge_sort--merge_sort)) bounds a merge task's GPU
+memory by its windows, not by the partition.
+
+### Window reservations
+
+`windowed_merge_input` is not a `pipelineable_operator_data`: nothing is uploaded for it and its
+`bytes_to_materialize_input` is 0. Its `get_estimated_size_in_bytes()` is
+`merge::estimate_task_bytes()` plus `merge::estimate_reader_state_bytes()`, and
+`sirius_physical_merge_sort::no_history_peak_memory_estimate()` returns that same value for a
+`WINDOWED_MERGE` input, so the reservation and the memory-history basis are the task's window
+working set:
+
+```
+slot = n × (w − ws) + cols × (n / 8 + 64)     // fixed-width rows of one window + a validity mask per column
+     + 1.25 × n × (ws + str_cols)             // STRING chars: each column's width + 1, plus 25% slack
+     + str_cols × (4 × (n + 1) + 64)          // per STRING column: int32 offsets and the chars minimum
+
+estimate_task_bytes = 2 × (k − g) × slot                // two slots per run read through a window buffer
+                    + 2 × (output_target_bytes + r × w) // accumulated rounds + the concatenated chunk
+                    + 8 × r + (r / 2048 + 2) × (4 + 12 × k)  // gather map and tile co-ranks of one merge
+                    + fallback bytes                    // runs with a batch that has no row-range reader
+
+estimate_reader_state_bytes = c × (cols × 16 × (n + 2048)  // decode scratch per fetched column
+                                   + str_cols × 2 MiB)     // offsets scratch per STRING column
+```
+
+`k` is the number of runs the task reads and `g` how many of them need no new window buffer: runs
+whose remaining batches are all uncompressed GPU tables on the task's device (they are windowed in
+place; a compressed batch on the GPU is read into a window buffer like a host or disk batch), less
+one, and runs whose buffers the partition's kept merger already holds. `n` is `window_rows`, `r`
+the rows of one round (`round_rows`), `w` the estimated row width of the fetched columns, `ws` the
+part of it that belongs to STRING columns (offsets go to 8 bytes when the chars could pass 2 GiB),
+`cols` the number of fetched columns and `str_cols` how many of them are STRING.
+
+**Runs sliced in place.** A run on the GPU when its task is planned stays in the repository, which
+is spilled first, so it can be on another tier by the time the task locks it. The estimate
+therefore keeps the window buffers of one such run as a spare. If more of them moved, the task
+allocates their buffers beyond its reservation, which succeeds while the device has room. If it
+runs out of memory instead, its first retry keeps its sizes and reserves for every run
+(`windowed_merge_input::shrink_for_retry()` resets the in-place count; counted as a *recharge*,
+not a shrink); only a further OOM halves the sizes. A batch is read-locked for as long as a task
+reads it, so it cannot move during a round.
+
+**Rounds and output.** A round emits at most `r = max(n, output_target_bytes / w)` rows, so one
+round can fill the task's chunk; a round that a batch boundary of a run cuts short is followed by
+another, so a task's output stays below `output_target_bytes + r × w`, and concatenating the
+rounds doubles that for a moment. With rounds sized from the output this is up to twice the
+output target (measured: 2.0 GiB of output and a 4.0 GiB task peak for a 1 GiB target). `c` is the number of
+runs that hold a Simpatico-compressed batch: a compressed run is read through one decode cursor
+per fetched column, which keeps its scratch between refills. The dictionary keys a cursor also
+keeps depend on the data and are not estimated. The fallback term adds, per run, its largest batch
+whose representation has no registered reader or whose compressed header cannot be read. A
+compressed batch that its reader refuses only at read time (see
+[Row-Range Readers](#row-range-readers)) is converted too, but is not in the estimate. The
+arithmetic saturates. `n` and `output_target_bytes` are the task's current values, so the estimate
+drops after a [shrink](#shrink-before-retry). See [Sort Merge](configuration.md#sort-merge) for
+how `n` and the output target are derived.
+
+**Window buffers outlive a task.** The partition keeps its merger between tasks, so the window
+buffers of its non-GPU runs (up to about one window per such run) stay allocated on the GPU while
+no task of the partition is in flight, outside any task reservation. The next task's estimate
+does not count the buffers the kept merger already holds. They are freed when the partition
+finishes, when a task fails (an OOM retry starts from empty windows), when the merger is rebuilt,
+and with the operator.
+
+### Runs stay spillable
+
+The runs of a windowed partition stay in the operator's input repository for the whole merge:
+
+- The task input carries batch ids and cursors. A `gpu_pipeline_task` subscribes the batches of
+  a pipelineable input, and the repository sweep skips subscribed batches; a windowed task
+  subscribes none, so its runs remain tier-1 downgrade candidates, ahead of the query's other
+  repositories, while tasks are queued and running.
+- A batch is popped, and so freed, only when a task that read it to the end commits. The kept
+  merger drops its reference to such a batch first (`rebase_consumed()`); it holds references to
+  the unread batches between tasks, which does not stop them from being spilled.
+- Intermediate runs written by a fan-in pass are added to the same repository and spill like the
+  original runs.
+- Final-pass output chunks wait in the downstream repository until the merge pipeline finishes,
+  where they can be spilled too.
+
+### Row-Range Readers
+
+`sirius::row_range_reader_registry` is the process-wide accessor of cuCascade's
+`row_range_reader_registry`, initialized with cuCascade's builtin readers and the Simpatico
+compressed readers when the extension is loaded. A reader appends rows
+`[row_begin, row_begin + k)` of the requested columns of a batch to caller-owned device buffers,
+without materializing the batch on the GPU. The reader contract is in
+`cucascade/include/cucascade/data/row_range_read.hpp`.
+
+| Representation | Reader |
+|----------------|--------|
+| `gpu_table_representation` | yes (the source must be on the device of the stream) |
+| `host_data_representation` | yes |
+| `disk_data_representation` | yes, through the source memory space's I/O backend |
+| `host_data_packed_representation` | no |
+| `compressed_device_representation`, `compressed_host_representation`, `compressed_disk_representation` (Simpatico) | yes, by chunk-span decode (`src/compression/compressed_row_range_readers.hpp`); a projection or filtered view, a device batch without a table, or a column plan that is not chunk-decodable throws `row_range_unsupported_error` |
+
+Readers serve fixed-width and STRING columns. LIST, STRUCT and DICTIONARY32 columns throw
+`row_range_unsupported_error`. A batch with no reader, or whose reader throws that error, is
+converted once to the GPU by the merge (the convert-once fallback).
+
+**Per-refill locking.** The merger takes a read lock on a non-GPU batch only for the duration of
+one refill (`cucascade::read_rows_into`, which orders the stream after the batch's writer and
+records the reader event). Between refills the batch is idle and can be downgraded. Whatever tier
+the next refill's lock observes is the tier it reads: a different representation resets the
+reader state, and a batch that has arrived on the GPU in the task's memory space is windowed in
+place from then on. A GPU batch windowed in place stays read-locked until the task has finished
+it or returns, so it becomes spillable again at the task boundary at the latest.
 
 ## Memory Consumption History
 
@@ -277,3 +501,7 @@ SF1-sized pressure config.
 | `src/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
 | `src/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |
+| `src/op/sirius_physical_operator.hpp` | `port_residency_policy`, `operator_data::shrink_for_retry()` |
+| `src/pipeline/repository_wiring_materializer.cpp` | Copies the residency policy onto ports and repositories |
+| `src/op/merge/merge_config.cpp` | Windowed merge sizing, `estimate_task_bytes()` |
+| `src/data/sirius_row_range_reader_registry.hpp` | Row-range reader registry accessor |

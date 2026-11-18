@@ -20,6 +20,7 @@
 #include "exec/thread_defaults.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/merge/merge_config.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -32,18 +33,24 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -176,12 +183,40 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
     "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
-static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
+static void from_yaml(const YAML::Node& node, disk_io_config& opt)
+{
+  yaml::reader r(node, "disk io");
+  std::optional<std::string> backend;
+  r.optional("backend", backend);
+  if (backend) {
+    opt.backend = parse_disk_io_backend(*backend);
+    if (!opt.backend) {
+      throw std::runtime_error("'io.backend': invalid value '" + *backend +
+                               "'; valid values: automatic, uring, cufile");
+    }
+  }
+  r.optional("direct_io", opt.direct_io);
+  {
+    auto reactors = static_cast<std::int64_t>(opt.reactors);
+    r.optional("reactors", reactors, yaml::greater_than<std::int64_t>{-1});
+    opt.reactors = static_cast<std::size_t>(reactors);
+  }
+  r.reject_unknown();
+}
+
+/// A `sirius.space.disk[]` entry: the cuCascade space and its `io` block.
+struct disk_space_entry {
+  cucascade::memory::disk_memory_space_config space;
+  std::optional<disk_io_config> io;
+};
+
+static void from_yaml(const YAML::Node& node, disk_space_entry& opt)
 {
   yaml::reader r(node, "disk_memory_space");
-  r.optional("disk_id", opt.disk_id);
-  r.optional("mount_path", opt.mount_paths);
-  r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
+  r.optional("disk_id", opt.space.disk_id);
+  r.optional("mount_path", opt.space.mount_paths);
+  r.optional("memory_capacity", yaml::bytes(opt.space.memory_capacity));
+  if (auto n = r.optional_node("io")) { from_yaml(*n, opt.io.emplace()); }
   r.reject_unknown();
 }
 
@@ -476,6 +511,89 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, cucascade::io::cufile::config& opt)
+{
+  yaml::reader r(node, "cufile");
+  auto count = [&](char const* key, std::size_t& out, bool positive = false) {
+    std::optional<std::int64_t> value;
+    r.optional(key, value);
+    if (!value) { return; }
+    if (*value < 0 || (positive && *value == 0)) {
+      throw std::runtime_error("'cufile." + std::string(key) + "': must be " +
+                               (positive ? "positive" : "nonnegative"));
+    }
+    out = static_cast<std::size_t>(*value);
+  };
+  if (r.has("n_max_concurrent_scans")) {
+    throw std::runtime_error(
+      "'cufile.n_max_concurrent_scans': not configurable; cuFile cannot "
+      "use fs_cache or scan readahead (use cufile.reactors_per_device or "
+      "cufile_n_reactors, and cufile.max_inflight, for read concurrency)");
+  }
+  count("max_inflight", opt.max_inflight, true);
+  count("poll_interval_us", opt.poll_interval_us);
+  count("low_service_interval", opt.low_service_interval);
+  r.optional("max_op_bytes", yaml::bytes(opt.max_op_bytes));
+  if (opt.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
+    throw std::runtime_error("'cufile.max_op_bytes': must be at least 4 KiB");
+  }
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("use_odirect", opt.use_odirect);
+  std::optional<std::string> compat;
+  r.optional("compat_mode", compat);
+  if (compat) {
+    if (*compat == "auto") {
+      opt.compat_mode = cucascade::io::cufile::compat::automatic;
+    } else if (*compat == "on") {
+      opt.compat_mode = cucascade::io::cufile::compat::on;
+    } else if (*compat == "off") {
+      opt.compat_mode = cucascade::io::cufile::compat::off;
+    } else {
+      throw std::runtime_error("'cufile.compat_mode': invalid enum value '" + *compat +
+                               "' (expected auto, on or off)");
+    }
+  }
+  if (!opt.use_odirect && opt.compat_mode == cucascade::io::cufile::compat::off) {
+    throw std::runtime_error("'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
+  }
+  read_choice(r,
+              "staging_mode",
+              opt.staging_mode,
+              {{"automatic", cucascade::io::cufile::staging::automatic},
+               {"always", cucascade::io::cufile::staging::always},
+               {"never", cucascade::io::cufile::staging::never}});
+  r.optional("staging_piece_bytes", yaml::bytes(opt.staging_piece_bytes));
+  if (opt.staging_piece_bytes == 0 || opt.staging_piece_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::runtime_error("'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
+  }
+  count("staging_slots_per_reactor", opt.staging_slots_per_reactor, true);
+  r.optional("fuse_gap_bytes", yaml::bytes(opt.fuse_gap_bytes));
+  // 0 = no cap beyond the device limits.
+  r.optional("max_staging_bytes_per_device", yaml::bytes(opt.max_staging_bytes_per_device));
+  // 0 = sized from storage_hint_path (see the cuFile backend's planner).
+  count("reactors_per_device", opt.reactors_per_device);
+  r.optional("pin_to_device_cpus", opt.pin_to_device_cpus);
+  r.optional("devices", opt.devices);
+  if (std::ranges::any_of(opt.devices, [](int id) { return id < 0; })) {
+    throw std::runtime_error("'cufile.devices': must contain only non-negative device ids");
+  }
+  {
+    auto sorted = opt.devices;
+    std::ranges::sort(sorted);
+    if (std::ranges::adjacent_find(sorted) != sorted.end()) {
+      throw std::runtime_error("'cufile.devices': must not contain duplicate device ids");
+    }
+  }
+  r.optional("storage_hint_path", opt.storage_hint_path);
+  // The planner sizes the pool from the storage of a regular file; a directory would
+  // silently read as unknown storage.
+  if (std::error_code ec; std::filesystem::is_directory(opt.storage_hint_path, ec)) {
+    throw std::runtime_error(
+      "'cufile.storage_hint_path': must name a file on the data filesystem, not a directory");
+  }
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
@@ -598,6 +716,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   // Per routed REST context, shared by all GPUs; 0 sizes each pool from the egress NIC's IRQs.
   read_count(r, "rest_n_reactors", opt.rest_n_reactors);
   r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
+  // 0 plans a pinned pool per GPU; a positive count is one flat pool.
+  read_count(r, "cufile_n_reactors", opt.cufile_n_reactors);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
@@ -605,6 +725,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
   // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
   if (r.has_value("rest_n_reactors")) { validate_rest_fan_out(opt); }
+  if (auto n = r.optional_node("cufile")) sirius::from_yaml(*n, opt.cufile);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -652,6 +773,58 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
              yaml::fraction<double>{});
+  r.optional("sort_partition_auto_sizing", opt.sort_partition_auto_sizing);
+  if (std::string mode; r.optional("sort_merge_mode", mode), !mode.empty()) {
+    auto const parsed = parse_sort_merge_mode(mode);
+    if (!parsed) {
+      throw std::runtime_error("'operator_params.sort_merge_mode': invalid value '" + mode +
+                               "'; valid values: auto, windowed, one_shot");
+    }
+    opt.sort_merge_mode_setting = *parsed;
+  }
+  // Counts are read signed: the reader's unsigned conversion would wrap a negative value.
+  auto const read_count = [&r](const char* key, uint64_t& out) {
+    auto value = static_cast<int64_t>(out);
+    r.optional(key, value);
+    if (value < 0) {
+      throw std::runtime_error(std::string("'operator_params.") + key + "': must be non-negative");
+    }
+    out = static_cast<uint64_t>(value);
+  };
+  read_count("sort_merge_window_rows", opt.sort_merge_window_rows);
+  if (opt.sort_merge_window_rows != 0 &&
+      opt.sort_merge_window_rows < op::merge::kMinExplicitWindowRows) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_window_rows': must be 0 (derive) or at least " +
+      std::to_string(op::merge::kMinExplicitWindowRows));
+  }
+  r.optional("sort_merge_output_bytes", yaml::bytes(opt.sort_merge_output_bytes));
+  if (opt.sort_merge_output_bytes != 0 && opt.sort_merge_output_bytes < (1ULL << 20)) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_output_bytes': must be 0 (derive) or at least 1 MiB");
+  }
+  r.optional("sort_merge_one_shot_max_fraction",
+             opt.sort_merge_one_shot_max_fraction,
+             yaml::fraction<double>{});
+  read_count("sort_merge_max_fan_in", opt.sort_merge_max_fan_in);
+  if (opt.sort_merge_max_fan_in < 2) {
+    throw std::runtime_error("'operator_params.sort_merge_max_fan_in': must be at least 2");
+  }
+  read_count("sort_merge_disabled_rules", opt.sort_merge_disabled_rules);
+  if ((opt.sort_merge_disabled_rules & ~config::sort_merge_rule::ALL) != 0) {
+    throw std::runtime_error(
+      "'operator_params.sort_merge_disabled_rules': unknown rule bit (the "
+      "valid bits are " +
+      std::to_string(config::sort_merge_rule::ALL) + ")");
+  }
+  r.optional("sort_key_encoding", opt.sort_key_encoding);
+  r.optional("sort_coalesce_runs", opt.sort_coalesce_runs);
+  r.optional("sort_coalesce_memory_fraction", opt.sort_coalesce_memory_fraction);
+  // Written so that NaN is rejected too.
+  if (!(opt.sort_coalesce_memory_fraction > 0.0 && opt.sort_coalesce_memory_fraction <= 1.0)) {
+    throw std::runtime_error("'operator_params.sort_coalesce_memory_fraction': must be in (0, 1]");
+  }
+  r.optional("sort_coalesce_string_keys", opt.sort_coalesce_string_keys);
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   if (opt.hash_partition_bytes == 0) {
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
@@ -763,6 +936,19 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
   r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
+  r.optional("prioritize_reserve_requests", opt.prioritize_reserve_requests);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node,
+                      exec::thread_pool_config& pool,
+                      exec::reservation_wait_policy& policy)
+{
+  // Named like the plain thread pool reader: the pipeline pool's keys are a superset of it.
+  yaml::reader r(node, "thread_pool");
+  r.optional("num_threads", pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("wait_for_memory_on_worker", policy.wait_on_worker);
+  r.optional("fail_fast_on_full_gpu_oom", policy.fail_fast_on_full_space_oom);
   r.reject_unknown();
 }
 
@@ -819,8 +1005,11 @@ size_t resolve_num_gpus(size_t requested, const cucascade::memory::system_topolo
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit{0.95};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
-  double downgrade_trigger_fraction{0.8};
-  double downgrade_stop_fraction{0.6};
+  // A narrow band close to the limit: what is evicted between trigger and stop is read back
+  // later, so a wide band (0.8 / 0.6) moves a fifth of the GPU per request and makes a sort
+  // of twice the GPU limit about a third slower, with no difference for inputs that fit.
+  double downgrade_trigger_fraction{0.95};
+  double downgrade_stop_fraction{0.9};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -845,6 +1034,14 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
+    // A configuration that names only a trigger at or below the default stop (the former
+    // default trigger was 0.8) keeps working: the stop follows it at the default ratio.
+    if (!r.has_value("downgrade_stop_fraction") && r.has_value("downgrade_trigger_fraction") &&
+        opt.downgrade_trigger_fraction <= opt.downgrade_stop_fraction) {
+      opt.downgrade_stop_fraction =
+        opt.downgrade_trigger_fraction *
+        (gpu_mem_config{}.downgrade_stop_fraction / gpu_mem_config{}.downgrade_trigger_fraction);
+    }
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -875,9 +1072,21 @@ struct gpu_mem_config {
   }
 };
 
+/// Default host tier size: this share of a GPU's CPU NUMA node per selected GPU on that node,
+/// for at most this many GPUs, so a node carrying two GPUs gives two thirds to the host tier and
+/// keeps one third for everything else (the page cache of the spill files included).
+constexpr double default_host_capacity_fraction_per_gpu   = 1.0 / 3.0;
+constexpr std::size_t default_host_capacity_gpus_per_node = 2;
+
 struct host_mem_config {
-  // Default to 90% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
-  std::variant<double, std::uint64_t> capacity{0.9};
+  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node. Unless
+  // one of the capacity keys is set, the fraction is per selected GPU on the node (see
+  // apply_default_capacity()).
+  std::variant<double, std::uint64_t> capacity{default_host_capacity_fraction_per_gpu};
+  bool capacity_is_default{true};
+  /// Share of the capacity to pin when the host space is created (raises
+  /// initial_number_pools to cover it). 0 keeps initial_number_pools as given.
+  double prepin_fraction{0.0};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
   // needs a configured downgrade_root_dirs; without one the executor warns and skips.
@@ -902,10 +1111,15 @@ struct host_mem_config {
                                std::to_string(*cap_frac));
     }
     if (cap_bytes) {
-      opt.capacity = *cap_bytes;
+      opt.capacity            = *cap_bytes;
+      opt.capacity_is_default = false;
     } else if (cap_frac) {
-      opt.capacity = *cap_frac;
+      opt.capacity            = *cap_frac;
+      opt.capacity_is_default = false;
     }
+    r.optional("prepin_fraction", opt.prepin_fraction, [](double value) {
+      return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+    });
     std::optional<std::uint64_t> res_bytes;
     double res_frac = 1.0;
     reject_mutually_exclusive(
@@ -950,12 +1164,75 @@ struct host_mem_config {
     // build() only creates configs; resolve() replaces this temporary count before allocation.
     builder.set_host_pool_features(block_size, pool_size, 1);
   }
+
+  /// Scale the default capacity of the host spaces the configurator built by the number of
+  /// selected GPUs on each space's NUMA node.
+  void apply_default_capacity(std::vector<cucascade::memory::memory_space_config>& spaces,
+                              const cucascade::memory::system_topology_info& hw) const
+  {
+    std::vector<int> gpu_numa_nodes;
+    for (auto const& space : spaces) {
+      if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+        auto const it = std::ranges::find_if(
+          hw.gpus, [&](auto const& info) { return static_cast<int>(info.id) == gpu->device_id; });
+        gpu_numa_nodes.push_back(it != hw.gpus.end() ? it->numa_node : -1);
+      }
+    }
+    for (auto& space : spaces) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (host == nullptr) { continue; }
+      if (capacity_is_default) {
+        auto const gpus_on_node =
+          static_cast<std::size_t>(std::ranges::count(gpu_numa_nodes, host->numa_id));
+        auto const counted =
+          std::clamp<std::size_t>(gpus_on_node, 1, default_host_capacity_gpus_per_node);
+        if (counted > 1 && host->memory_capacity > 0) {
+          auto const one_gpu = host->memory_capacity;
+          host->memory_capacity =
+            sirius::memory::saturating_mul(one_gpu, static_cast<std::uint64_t>(counted));
+          if (std::holds_alternative<std::uint64_t>(reservation_limit)) {
+            // The byte limit was turned into a fraction of the one-GPU capacity.
+            host->reservation_limit_fraction *=
+              static_cast<double>(one_gpu) / static_cast<double>(host->memory_capacity);
+          }
+        }
+        SIRIUS_LOG_INFO(
+          "sirius_config: host memory capacity defaulted to {} bytes on NUMA node {} ({} "
+          "selected GPU(s) on the node, one third of the node per GPU for at most {} GPUs); set "
+          "sirius.memory.host.capacity_bytes or capacity_fraction to override",
+          host->memory_capacity,
+          host->numa_id,
+          gpus_on_node,
+          default_host_capacity_gpus_per_node);
+      }
+    }
+  }
+
+  /// Raise initial_number_pools to cover prepin_fraction of the capacity. Runs after the
+  /// default initial pool count is derived, so it only ever adds to it.
+  void apply_prepin(std::vector<cucascade::memory::memory_space_config>& spaces) const
+  {
+    for (auto& space : spaces) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (host == nullptr) { continue; }
+      if (prepin_fraction > 0.0) {
+        auto const pool_bytes = sirius::memory::saturating_mul(host->block_size, host->pool_size);
+        if (pool_bytes > 0) {
+          auto const pools = static_cast<std::size_t>(
+            std::ceil(prepin_fraction * static_cast<double>(host->memory_capacity) /
+                      static_cast<double>(pool_bytes)));
+          host->initial_number_pools = std::max(host->initial_number_pools, pools);
+        }
+      }
+    }
+  }
 };
 
 struct disk_mem_config {
   int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
+  std::optional<disk_io_config> io;
 
   static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
   {
@@ -963,6 +1240,7 @@ struct disk_mem_config {
     r.optional("disk_id", opt.id);
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
+    if (auto n = r.optional_node("io")) { sirius::from_yaml(*n, opt.io.emplace()); }
     r.reject_unknown();
   }
 
@@ -1116,7 +1394,7 @@ try {
   std::optional<YAML::Node> operator_node;
   std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
   std::vector<cucascade::memory::host_memory_space_config> host_space_configs;
-  std::vector<cucascade::memory::disk_memory_space_config> disk_space_configs;
+  std::vector<disk_space_entry> disk_space_configs;
 
   yaml::reader top(root);
   auto sirius_node = top.optional_node("sirius");
@@ -1147,6 +1425,7 @@ try {
     if (auto n = mr.optional_node("disk")) {
       high_level_memory_configured = true;
       disk_mem_config::from_yaml(*n, disk_cfg);
+      if (disk_cfg.io) { settings._disk_io_configs[disk_cfg.id] = *disk_cfg.io; }
     }
     mr.reject_unknown();
   }
@@ -1174,7 +1453,7 @@ try {
     }
     if (auto n = er.optional_node("pipeline")) {
       impl->explicit_threads.pipeline = yaml::reader(*n).has_value("num_threads");
-      from_yaml(*n, settings._gpu_pipeline_executor_config);
+      from_yaml(*n, settings._gpu_pipeline_executor_config, settings._reservation_wait_policy);
     }
     if (auto n = er.optional_node("downgrade")) {
       impl->explicit_threads.downgrade = yaml::reader(*n).has_value("num_threads");
@@ -1220,9 +1499,10 @@ try {
   std::copy(host_space_configs.begin(),
             host_space_configs.end(),
             std::back_inserter(settings._memory_space_configs));
-  std::copy(disk_space_configs.begin(),
-            disk_space_configs.end(),
-            std::back_inserter(settings._memory_space_configs));
+  for (auto const& disk : disk_space_configs) {
+    settings._memory_space_configs.emplace_back(disk.space);
+    if (disk.io) { settings._disk_io_configs[disk.space.disk_id] = *disk.io; }
+  }
 
   bool const explicit_low_level_gpu_capacity =
     !gpu_space_configs.empty() &&
@@ -1320,13 +1600,17 @@ try {
       for (auto const& space : capacity_builder.build(hw_topology)) {
         if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
             gpu && *bytes > gpu->memory_capacity) {
+          // The capacity is what the device reports as usable, which is below the total that
+          // nvidia-smi shows: name both numbers so the largest accepted limit is not a guess.
           throw configuration_input_error(
             "sirius.memory.gpu.usage_limit_bytes exceeds the capacity of GPU " +
-            std::to_string(gpu->device_id));
+            std::to_string(gpu->device_id) + ": requested " + std::to_string(*bytes) +
+            " bytes, capacity " + std::to_string(gpu->memory_capacity) + " bytes");
         }
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    host_cfg.apply_default_capacity(settings._memory_space_configs, hw_topology);
     for (auto& space : settings._memory_space_configs) {
       auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
       if (!host) { continue; }
@@ -1355,6 +1639,7 @@ try {
       host->initial_number_pools = std::min(node->memory_capacity / 10, host->memory_capacity) /
                                    (aligned_block_size * host->pool_size);
     }
+    host_cfg.apply_prepin(settings._memory_space_configs);
   }
 
   const auto defaults =
@@ -1432,7 +1717,6 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   derive_uring_scan_budget();
-  enforce_native_backend_for_multi_gpu();
   reserve_rest_reactor_cpus();
 }
 
@@ -1564,25 +1848,95 @@ void sirius_config::derive_uring_scan_budget()
   _scan_manager_config.uring.n_max_concurrent_scans = derived;
 }
 
-void sirius_config::enforce_native_backend_for_multi_gpu()
+void validate_spill_directory(const std::string& directory)
 {
-  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
-    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
-  });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'native' but {} GPUs are configured; "
-      "the native backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'native'.",
-      num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::native;
+  if (directory.empty()) { return; }
+  auto const fail = [&](const std::string& why) {
+    throw std::runtime_error(
+      "sirius.memory.disk.downgrade_root_dirs: spill directory '" + directory + "' " + why +
+      ". Spilling to disk cannot work with it; create the directory, make it writable, or "
+      "remove the setting to run without a disk tier.");
+  };
+  std::error_code ec;
+  auto status = std::filesystem::status(directory, ec);
+  if (status.type() == std::filesystem::file_type::not_found) {
+    ec.clear();
+    // A missing directory is created (configurations name directories under /tmp that nothing
+    // else creates); one that cannot be created is the error.
+    std::filesystem::create_directories(directory, ec);
+    if (ec) { fail("does not exist and cannot be created (" + ec.message() + ")"); }
+    SIRIUS_LOG_INFO("sirius_config: created spill directory '{}'", directory);
+    status = std::filesystem::status(directory, ec);
   }
+  if (ec) { fail("cannot be accessed (" + ec.message() + ")"); }
+  if (!std::filesystem::is_directory(status)) { fail("is not a directory"); }
+  // The spill files are created with mkstemps in this directory; do the same once.
+  std::string probe = (std::filesystem::path(directory) / "sirius_probe_XXXXXX.tmp").string();
+  int const fd      = ::mkstemps(probe.data(), 4);
+  if (fd < 0) { fail(std::string("is not writable (") + std::strerror(errno) + ")"); }
+  ::close(fd);
+  ::unlink(probe.c_str());
 }
 
 const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_memory_space_configs()
   const noexcept
 {
   return _memory_space_configs;
+}
+
+disk_io_config sirius_config::get_disk_io_config(int disk_id) const
+{
+  auto const it = _disk_io_configs.find(disk_id);
+  return it != _disk_io_configs.end() ? it->second : disk_io_config{};
+}
+
+std::optional<disk_io_backend> parse_disk_io_backend(std::string_view name) noexcept
+{
+  if (name == "automatic") { return disk_io_backend::AUTOMATIC; }
+  if (name == "uring") { return disk_io_backend::URING; }
+  if (name == "cufile") { return disk_io_backend::CUFILE; }
+  return std::nullopt;
+}
+
+std::string_view to_string(disk_io_backend backend) noexcept
+{
+  switch (backend) {
+    case disk_io_backend::AUTOMATIC: return "automatic";
+    case disk_io_backend::URING: return "uring";
+    case disk_io_backend::CUFILE: return "cufile";
+  }
+  return "unknown";
+}
+
+disk_io_backend effective_disk_io_backend(const disk_io_config& config) noexcept
+{
+  if (config.backend) { return *config.backend; }
+#ifdef CUCASCADE_HAS_CUFILE
+  return disk_io_backend::CUFILE;
+#else
+  return disk_io_backend::AUTOMATIC;
+#endif
+}
+
+cucascade::disk_io_context_options to_disk_io_context_options(const disk_io_config& config)
+{
+  cucascade::disk_io_context_options options;
+  switch (effective_disk_io_backend(config)) {
+    case disk_io_backend::AUTOMATIC: options.backend = cucascade::disk_io_backend::automatic; break;
+    case disk_io_backend::URING: options.backend = cucascade::disk_io_backend::uring; break;
+    case disk_io_backend::CUFILE: options.backend = cucascade::disk_io_backend::cufile; break;
+  }
+  // AUTOMATIC may resolve to either stack, so both get the settings. 0 reactors keeps
+  // cuCascade's own counts.
+  options.io.uring.use_odirect = config.direct_io;
+  if (config.reactors > 0) { options.io.uring_n_reactors = config.reactors; }
+#ifdef CUCASCADE_HAS_CUFILE
+  options.io.cufile.use_odirect = config.direct_io;
+  if (config.reactors > 0) { options.io.cufile_n_reactors = config.reactors; }
+  // Buffered transfers never reach cuFile, so they need no registered device staging slots.
+  if (!config.direct_io) { options.io.cufile.staging_mode = cucascade::io::cufile::staging::never; }
+#endif
+  return options;
 }
 
 const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config() const noexcept

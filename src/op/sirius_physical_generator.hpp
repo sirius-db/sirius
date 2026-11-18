@@ -1,0 +1,112 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "op/scan/generator/generator_spec.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
+#include "op/sirius_physical_operator.hpp"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace sirius::op {
+
+/**
+ * @brief GPU source operator behind the `sirius_generate` table function.
+ *
+ * Produces `spec.num_batches` batches of `spec.rows_per_batch` synthetic rows directly on the
+ * GPU. Only the spec columns named by `output_columns` are generated; each keeps the values it
+ * has in the full spec. Like GPU_VALUES it is an input-free source driven by the normal task
+ * creator loop, but it hands out one task per batch: each task input carries its batch index as
+ * the input_free_operator_data sequence number, so an OOM retry regenerates the same batch.
+ */
+class sirius_physical_generator : public sirius_physical_operator {
+ public:
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GENERATOR;
+
+  /// Produces every column of the spec, in spec order.
+  sirius_physical_generator(duckdb::vector<sirius::logical_type> types,
+                            scan::generator::generator_spec spec,
+                            duckdb::idx_t estimated_cardinality);
+
+  /// Produces only `output_columns` (indices into `spec.columns`, at least one), in that
+  /// order; `types` describes those columns. `read_views` and `contract_id` name the scan
+  /// contract the planner allocated for this source, if any.
+  sirius_physical_generator(
+    duckdb::vector<sirius::logical_type> types,
+    scan::generator::generator_spec spec,
+    std::vector<std::size_t> output_columns,
+    duckdb::idx_t estimated_cardinality,
+    std::shared_ptr<sirius::transparent::read_view_registry> read_views = nullptr,
+    scan::scan_contract_id contract_id                                  = 0);
+
+  // -----------------------------
+  // Source interface
+  // -----------------------------
+  bool is_source() const override { return true; }
+
+  std::optional<task_creation_hint> get_next_task_hint() override;
+  [[nodiscard]] bool all_ports_empty() override;
+  /// input_free_operator_data(estimated_batch_bytes(spec, output_columns), batch_index), or
+  /// nullptr once every batch has been handed out.
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  // -----------------------------
+  // Execution
+  // -----------------------------
+  /// Generates the batch named by the input's sequence number in the task's GPU memory space.
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         ::cuda::stream_ref stream) override;
+
+  /// estimated_peak_batch_bytes(spec, output_columns), whatever the stats say.
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const input_stats& stats) const override;
+
+  /// Estimated whole-query input basis, known at plan time: num_batches * estimated_batch_bytes.
+  [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
+
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override;
+
+  /// The whole bound spec, including columns this operator does not produce.
+  [[nodiscard]] const scan::generator::generator_spec& spec() const noexcept { return _spec; }
+
+  /// Indices into `spec().columns` of the columns produced, in output order.
+  [[nodiscard]] const std::vector<std::size_t>& output_columns() const noexcept
+  {
+    return _output_columns;
+  }
+
+  [[nodiscard]] scan::scan_contract_id contract_id() const noexcept { return _contract_id; }
+  [[nodiscard]] std::shared_ptr<sirius::transparent::read_view_registry> const& read_views()
+    const noexcept
+  {
+    return _read_views;
+  }
+
+ private:
+  scan::generator::generator_spec _spec;
+  std::vector<std::size_t> _output_columns;
+  std::shared_ptr<sirius::transparent::read_view_registry> _read_views;
+  scan::scan_contract_id _contract_id = 0;
+  //! Index of the next batch to hand out; batches are claimed with fetch_add.
+  std::atomic<std::uint64_t> _next_batch{0};
+};
+
+}  // namespace sirius::op

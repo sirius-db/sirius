@@ -101,8 +101,9 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
                                                 std::size_t live_allocated_bytes,
                                                 std::optional<std::size_t> requested_bytes) noexcept
   {
-    auto const request_bytes = requested_bytes.value_or(kDefaultRetryRequestBytes);
-    auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
+    _retry_reservation_floor_before_last_oom = _retry_reservation_floor;
+    auto const request_bytes                 = requested_bytes.value_or(kDefaultRetryRequestBytes);
+    auto next_floor                          = memory::saturating_mul(current_reservation_bytes, 2);
     next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
     next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
     _retry_reservation_floor = std::max(_retry_reservation_floor, next_floor);
@@ -112,6 +113,17 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   {
     _retry_reservation_floor =
       std::max(_retry_reservation_floor, previous._retry_reservation_floor);
+    _retry_reservation_floor_before_last_oom = _retry_reservation_floor;
+  }
+
+  /// Inherit `previous`'s floor as it was before its most recent OOM raised it. Used when the
+  /// retried input shrank its own working set instead (operator_data::shrink_for_retry()).
+  void inherit_retry_reservation_floor_before_last_oom(
+    const gpu_pipeline_task_local_state& previous) noexcept
+  {
+    _retry_reservation_floor =
+      std::max(_retry_reservation_floor, previous._retry_reservation_floor_before_last_oom);
+    _retry_reservation_floor_before_last_oom = _retry_reservation_floor;
   }
 
   [[nodiscard]] std::size_t get_retry_reservation_floor() const noexcept
@@ -142,6 +154,8 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
   std::size_t _retry_reservation_floor = 0;
+  /// `_retry_reservation_floor` as it was before the most recent OOM raised it.
+  std::size_t _retry_reservation_floor_before_last_oom = 0;
 };
 
 /**

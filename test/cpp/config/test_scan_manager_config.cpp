@@ -18,6 +18,7 @@
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/config.hpp>
@@ -39,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using cucascade::io::cache::cache_mode;
@@ -896,6 +898,9 @@ TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][confi
   REQUIRE(string_to_enum("native", b));
   CHECK(b == io_backend::native);
 
+  REQUIRE(string_to_enum("cufile", b));
+  CHECK(b == io_backend::cufile);
+
   // Deprecated spelling of `native`, still accepted.
   REQUIRE(string_to_enum("sirius", b));
   CHECK(b == io_backend::native);
@@ -920,6 +925,8 @@ TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][conf
 
   REQUIRE(enum_to_string(io_backend::native, out));
   CHECK(out == "native");
+  REQUIRE(enum_to_string(io_backend::cufile, out));
+  CHECK(out == "cufile");
 }
 
 TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][config][backend]")
@@ -927,6 +934,53 @@ TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][
   scan_manager_config cfg{};
 
   CHECK(cfg.backend == io_backend::native);
+  CHECK(cfg.cufile_n_reactors == 0);  // planned per GPU
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK_FALSE(cfg.cufile.compat_mode.has_value());
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::automatic);
+  CHECK(cfg.cufile.staging_piece_bytes == (8UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 2);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == (1UL << 30));
+  CHECK(cfg.cufile.reactors_per_device == 0);
+  CHECK(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices.empty());
+  CHECK(cfg.cufile.storage_hint_path.empty());
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
+}
+
+TEST_CASE("the default cuFile pool serves the GPUs Sirius reads into",
+          "[scan_manager][config][backend][cufile]")
+{
+  scan_manager_config cfg{};
+  std::vector<int> const sirius_gpus{0, 1};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == sirius_gpus);
+  // An explicit list is kept as configured when Sirius reads into those GPUs...
+  cfg.cufile.devices = {1};
+  CHECK(cfg.resolved_cufile(sirius_gpus).devices == std::vector<int>{1});
+  // ...and refused when it names another one.
+  cfg.cufile.devices = {1, 2};
+  CHECK_THROWS_WITH(cfg.resolved_cufile(sirius_gpus),
+                    Catch::Matchers::ContainsSubstring("'cufile.devices': GPU 2"));
+}
+
+TEST_CASE("cuFile C++ config is validated before starting the scan manager",
+          "[scan_manager][config][backend][cufile]")
+{
+  scan_manager_config cfg{};
+  SECTION("inflight window") { cfg.cufile.max_inflight = 0; }
+  SECTION("operation bytes") { cfg.cufile.max_op_bytes = 4095; }
+  SECTION("zero staging piece") { cfg.cufile.staging_piece_bytes = 0; }
+  SECTION("unaligned staging piece") { cfg.cufile.staging_piece_bytes = (8UL << 20) + 512; }
+  SECTION("staging slots") { cfg.cufile.staging_slots_per_reactor = 0; }
+  SECTION("direct policy")
+  {
+    cfg.cufile.use_odirect = false;
+    cfg.cufile.compat_mode = cucascade::io::cufile::compat::off;
+  }
+  CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(cfg), std::invalid_argument);
 }
 
 TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_config",
@@ -960,6 +1014,8 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
   // 0 (size the REST pool from the NIC) is handed to cuCascade as is.
   cfg.rest_n_reactors = 0;
   CHECK(cfg.to_io_config().rest_n_reactors == 0);
+  cfg.backend = io_backend::cufile;
+  CHECK(cfg.to_io_config().backend == cucascade::io::io_backend::cufile);
 }
 
 TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][backend]")
@@ -986,6 +1042,184 @@ TEST_CASE("sirius_config rejects the removed kvikio backend and block",
                        "'scan_manager.kvikio': removed; remove this block and use "
                        "backend: native instead");
   }
+}
+
+TEST_CASE("sirius_config reads cuFile read tuning", "[scan_manager][config][backend][cufile]")
+{
+  auto const cfg =
+    load_scan_manager("sirius_backend_cufile.yaml",
+                      single_gpu_scan_manager_yaml(
+                        "      backend: cufile\n"
+                        "      cufile_n_reactors: 3\n"
+                        "      cache:\n"
+                        "        mode: cucs\n"
+                        "      cufile:\n"
+                        "        max_inflight: 7\n"
+                        "        max_op_bytes: 8 MiB\n"
+                        "        gds_threshold: 128 KiB\n"
+                        "        use_odirect: false\n"
+                        "        compat_mode: on\n"
+                        "        poll_interval_us: 75\n"
+                        "        low_service_interval: 0\n"
+                        "        staging_mode: always\n"
+                        "        staging_piece_bytes: 4 MiB\n"
+                        "        staging_slots_per_reactor: 1\n"
+                        "        max_staging_bytes_per_device: 0\n"
+                        "        reactors_per_device: 24\n"
+                        "        pin_to_device_cpus: false\n"
+                        "        devices: [1]\n"
+                        "        storage_hint_path: /nonexistent/sirius/lineitem.parquet\n"));
+  CHECK(cfg.backend == io_backend::cufile);
+  auto const io = cfg.to_io_config();
+  CHECK(io.backend == cucascade::io::io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 3);
+  CHECK(cfg.cufile.max_inflight == 7);
+  CHECK(cfg.cufile.max_op_bytes == (8UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (128UL << 10));
+  CHECK_FALSE(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::on);
+  CHECK(cfg.cufile.poll_interval_us == 75);
+  CHECK(cfg.cufile.low_service_interval == 0);
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::always);
+  CHECK(cfg.cufile.staging_piece_bytes == (4UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 1);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == 0);
+  CHECK(cfg.cufile.reactors_per_device == 24);
+  CHECK_FALSE(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices == std::vector<int>{1});
+  CHECK(cfg.cufile.storage_hint_path == "/nonexistent/sirius/lineitem.parquet");
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(io.cufile_n_reactors == cfg.cufile_n_reactors);
+  CHECK(io.cufile.max_inflight == cfg.cufile.max_inflight);
+  CHECK(io.cufile.max_op_bytes == cfg.cufile.max_op_bytes);
+  CHECK(io.cufile.gds_threshold == cfg.cufile.gds_threshold);
+  CHECK(io.cufile.use_odirect == cfg.cufile.use_odirect);
+  CHECK(io.cufile.compat_mode == cfg.cufile.compat_mode);
+  CHECK(io.cufile.poll_interval_us == cfg.cufile.poll_interval_us);
+  CHECK(io.cufile.low_service_interval == cfg.cufile.low_service_interval);
+  CHECK(io.cufile.staging_mode == cfg.cufile.staging_mode);
+  CHECK(io.cufile.staging_piece_bytes == cfg.cufile.staging_piece_bytes);
+  CHECK(io.cufile.reactors_per_device == cfg.cufile.reactors_per_device);
+  CHECK(io.cufile.devices == cfg.cufile.devices);
+  CHECK(io.cufile.storage_hint_path == cfg.cufile.storage_hint_path);
+#endif
+
+  for (auto const& [spelling, expected] :
+       {std::pair{"auto", cucascade::io::cufile::compat::automatic},
+        std::pair{"on", cucascade::io::cufile::compat::on},
+        std::pair{"off", cucascade::io::cufile::compat::off}}) {
+    auto const parsed =
+      load_scan_manager("sirius_cufile_compat.yaml",
+                        single_gpu_scan_manager_yaml(
+                          std::string{"      cufile:\n        compat_mode: "} + spelling + "\n"));
+    CHECK(parsed.cufile.compat_mode == expected);
+  }
+  for (auto const& [spelling, expected] :
+       {std::pair{"automatic", cucascade::io::cufile::staging::automatic},
+        std::pair{"always", cucascade::io::cufile::staging::always},
+        std::pair{"never", cucascade::io::cufile::staging::never}}) {
+    auto const parsed =
+      load_scan_manager("sirius_cufile_staging.yaml",
+                        single_gpu_scan_manager_yaml(
+                          std::string{"      cufile:\n        staging_mode: "} + spelling + "\n"));
+    CHECK(parsed.cufile.staging_mode == expected);
+  }
+  // 0 plans the pool per GPU.
+  CHECK(load_scan_manager("sirius_cufile_planned.yaml",
+                          single_gpu_scan_manager_yaml("      cufile_n_reactors: 0\n"))
+          .cufile_n_reactors == 0);
+}
+
+TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
+          "[scan_manager][config][backend][cufile]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"      cufile_n_reactors: -1\n", "scan_manager.cufile_n_reactors"},
+        std::pair{"      cufile:\n        max_inflight: 0\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_inflight: -1\n", "cufile.max_inflight"},
+        std::pair{"      cufile:\n        max_op_bytes: 4095\n", "cufile.max_op_bytes"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: -1\n",
+                  "cufile.n_max_concurrent_scans"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 0\n", "not configurable"},
+        std::pair{"      cufile:\n        n_max_concurrent_scans: 4\n", "not configurable"},
+        std::pair{"      cufile:\n        gds_threshold: -1\n", "cufile.gds_threshold"},
+        std::pair{"      cufile:\n        poll_interval_us: -1\n", "cufile.poll_interval_us"},
+        std::pair{"      cufile:\n        low_service_interval: -1\n",
+                  "cufile.low_service_interval"},
+        std::pair{"      cufile:\n        compat_mode: ON\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        compat_mode: ''\n", "cufile.compat_mode"},
+        std::pair{"      cufile:\n        staging_mode: auto\n", "cufile.staging_mode"},
+        std::pair{"      cufile:\n        staging_piece_bytes: 0\n", "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_piece_bytes: 6000\n",
+                  "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_piece_bytes: -4096\n",
+                  "cufile.staging_piece_bytes"},
+        std::pair{"      cufile:\n        staging_slots_per_reactor: 0\n",
+                  "cufile.staging_slots_per_reactor"},
+        std::pair{"      cufile:\n        max_staging_bytes_per_device: -1\n",
+                  "cufile.max_staging_bytes_per_device"},
+        std::pair{"      cufile:\n        reactors_per_device: -1\n", "cufile.reactors_per_device"},
+        std::pair{"      cufile:\n        pin_to_device_cpus: maybe\n",
+                  "cufile.pin_to_device_cpus"},
+        std::pair{"      cufile:\n        devices: [-1]\n", "cufile.devices"},
+        std::pair{"      cufile:\n        devices: [0, 0]\n", "cufile.devices"},
+        std::pair{"      cufile:\n        devices: 0\n", "cufile.devices"},
+        std::pair{"      cufile:\n        storage_hint_path: /\n", "cufile.storage_hint_path"},
+        std::pair{"      cufile:\n        use_odirect: false\n        compat_mode: off\n",
+                  "cufile.use_odirect"},
+        std::pair{"      cufile:\n        write_split_bytes: 4096\n", "write_split_bytes"},
+        std::pair{"      cufile:\n        register_min_bytes: 4096\n", "register_min_bytes"},
+        std::pair{"      io_backend: cufile\n", "io_backend"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_cufile_invalid.yaml", single_gpu_scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::ContainsSubstring(key));
+  }
+}
+
+TEST_CASE("the documented cuFile configuration example loads",
+          "[scan_manager][config][backend][cufile]")
+{
+  std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
+  REQUIRE(doc.is_open());
+  bool in_yaml = false;
+  std::string block;
+  std::string example;
+  size_t examples = 0;
+  for (std::string line; std::getline(doc, line);) {
+    if (!in_yaml) {
+      if (line == "```yaml") {
+        in_yaml = true;
+        block.clear();
+      }
+    } else if (line == "```") {
+      if (block.find("backend: cufile") != std::string::npos) {
+        ++examples;
+        example = block;
+      }
+      in_yaml = false;
+    } else {
+      block += line + '\n';
+    }
+  }
+  REQUIRE(examples == 1);
+  scan_manager_config cfg;
+  REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
+  CHECK(cfg.backend == io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 0);
+  CHECK(cfg.cufile.storage_hint_path == "/gpfs/fs1/warehouse/lineitem/part-0.parquet");
+  CHECK(cfg.cufile.reactors_per_device == 0);
+  CHECK(cfg.cufile.staging_mode == cucascade::io::cufile::staging::automatic);
+  CHECK(cfg.cufile.staging_piece_bytes == (8UL << 20));
+  CHECK(cfg.cufile.staging_slots_per_reactor == 2);
+  CHECK(cfg.cufile.max_staging_bytes_per_device == (1UL << 30));
+  CHECK(cfg.cufile.pin_to_device_cpus);
+  CHECK(cfg.cufile.devices.empty());
+  CHECK(cfg.cufile.max_inflight == 32);
+  CHECK(cfg.cufile.max_op_bytes == (64UL << 20));
+  CHECK(cfg.cufile.gds_threshold == (256UL << 10));
+  CHECK(cfg.cufile.use_odirect);
+  CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
@@ -1550,6 +1784,17 @@ TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config
       }
     }
   }
+}
+
+TEST_CASE("sirius_config keeps the cuFile backend for multi-GPU",
+          "[scan_manager][config][backend][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  auto const cufile = load_scan_manager("sirius_cufile_multi_gpu.yaml",
+                                        "sirius:\n  topology:\n    num_gpus: 2\n  executor:\n    "
+                                        "scan_manager:\n      backend: cufile\n");
+  CHECK(cufile.backend == io_backend::cufile);
 }
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")

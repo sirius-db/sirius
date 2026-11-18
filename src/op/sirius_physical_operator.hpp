@@ -102,6 +102,23 @@ struct task_creation_hint {
   sirius_physical_operator* producer{nullptr};
 };
 
+/// How the task machinery treats batches arriving on one input port of an operator.
+/// Defaults keep a port's batches materialized on the GPU and its repository in the normal
+/// downgrade order.
+struct port_residency_policy {
+  /// false: task inputs built from this port are NOT converted to the GPU by
+  /// pipelineable_operator_data::prepare_for_processing (each batch is read-locked in its current
+  /// tier and memory space) and are NOT counted by
+  /// gpu_pipeline_task::get_estimated_bytes_to_materialize_input. The operator reads them itself
+  /// (e.g. through the cuCascade row-range readers).
+  bool materialize_inputs_on_gpu{true};
+  /// Downgrade sweep order within one query: repositories with a higher value are spilled
+  /// earlier. 0 = no preference. Copied to the port's repository at wiring time.
+  int32_t downgrade_priority{0};
+
+  friend bool operator==(const port_residency_policy&, const port_residency_policy&) = default;
+};
+
 /**
  * @brief Tag identifying the concrete operator_data subclass.
  *
@@ -115,6 +132,7 @@ enum class operator_data_type : uint8_t {
   PARTITIONED,
   GPU_SCAN,
   INPUT_FREE,
+  WINDOWED_MERGE,
 };
 
 /**
@@ -233,6 +251,14 @@ class operator_data {
    *        locality heuristics).
    */
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
+
+  /// Lets a task input shrink its own working set before an OOM retry. Called by the GPU
+  /// pipeline executor's reschedule path on the input object that will be retried. Returns true
+  /// if it shrank; the retry then keeps the reservation floor it had before this OOM instead of
+  /// raising it. A pipelineable input's read-only locks from prepare_for_processing() are
+  /// released before the call, so an override may lock, spill or drop its batches; other holders
+  /// of a batch may still have it locked. Default: false (the input never shrinks).
+  virtual bool shrink_for_retry() { return false; }
 
  private:
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
@@ -376,6 +402,12 @@ class pipelineable_operator_data : public operator_data {
     return result.empty() ? "UNKNOWN" : result;
   }
 
+  /// Default true. When false, prepare_for_processing locks each batch in its current tier
+  /// (no conversion, no cross-GPU clone) and the task's
+  /// get_estimated_bytes_to_materialize_input skips it.
+  void set_materialize_on_gpu(bool v) noexcept { _materialize_on_gpu = v; }
+  [[nodiscard]] bool materializes_on_gpu() const noexcept { return _materialize_on_gpu; }
+
  protected:
   /**
    * @brief Takes the row identity of @p source, whose batches this payload's batches replace
@@ -400,14 +432,18 @@ class pipelineable_operator_data : public operator_data {
   /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  /// See set_materialize_on_gpu().
+  bool _materialize_on_gpu{true};
 };
 
 /// Output of a row router. Each batch has its own destination; omitted empty slices retain IDs.
 class routed_operator_data : public pipelineable_operator_data {
  public:
   routed_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-                       std::vector<std::size_t> destinations)
-    : pipelineable_operator_data(std::move(batches)), _destinations(std::move(destinations))
+                       std::vector<std::size_t> destinations,
+                       std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(batches), position),
+      _destinations(std::move(destinations))
   {
     if (get_data_batches().size() != _destinations.size()) {
       throw std::invalid_argument("routed_operator_data: destination/batch count mismatch");
@@ -702,6 +738,13 @@ class sirius_physical_operator {
   [[nodiscard]] virtual MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const;
 
+  /// Override to opt an input port into on-demand residency and/or downgrade-first. Read once
+  /// per port, at materialize_repository_wiring. Default: {} (materialize on the GPU, priority 0).
+  [[nodiscard]] virtual port_residency_policy input_residency_policy(std::string_view port_id) const
+  {
+    return {};
+  }
+
  public:
   // Operator interface
 
@@ -857,6 +900,8 @@ class sirius_physical_operator {
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
     quent::Uuid source_port_uuid{quent::now_v7()};
+    /// Copied from input_residency_policy(port_id) at wiring time. Default {}.
+    port_residency_policy residency{};
   };
 
   /// Describes a downstream operator's port to which data is pushed

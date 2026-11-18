@@ -33,7 +33,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 **Mechanism:** ORDER_BY is split into 3 pipeline phases:
 1. **ORDER_BY**: Local sort of each batch
 2. **SORT_SAMPLE + SORT_PARTITION**: Sample N batches to compute boundaries, then range-partition — both run back-to-back in the same `gpu_pipeline_task`
-3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions via `cudf::merge_order_by()`
+3. **MERGE_SORT**: Multi-way merge of pre-sorted partitions — one `cudf::merge_order_by()` over a whole partition (one-shot route), or a chain of windowed k-way merge tasks that keep the runs on their tier (windowed route); see [MERGE_SORT](operators.md#sirius_physical_merge_sort--merge_sort)
 
 **Code path:**
 - `src/planner/sirius_physical_plan_generator.cpp` — `wrap_order_by()` (plan-time sort chain insertion)
@@ -41,7 +41,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_sort_partition.cpp` — range partitioning
 - `src/op/sirius_physical_merge_sort.cpp` — multi-way merge
 
-**Config:** `max_sort_partition_bytes` (default: auto, 33% of GPU memory)
+**Config:** `max_sort_partition_bytes` (default: auto), `max_sort_partition_memory_fraction`, `sort_partition_auto_sizing`; the automatic partition count is described under [SORT_SAMPLE](operators.md#sirius_physical_sort_sample--sort_sample)
 
 ### SORT_SAMPLE Byte-Based Merge Sampling (PRs #876, #886)
 

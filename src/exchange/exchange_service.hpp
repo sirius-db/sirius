@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -34,7 +35,8 @@ namespace sirius::exchange {
 class inbound {
  public:
   virtual ~inbound() = default;
-  /// Batch @p batch (numbered per sender, from 0) of the stream, from rank @p from.
+  /// Batch @p batch of the stream from rank @p from: numbered per sender, from 0 in send order
+  /// unless the sender numbered its batches itself.
   virtual void on_batch(rank_t from,
                         std::uint64_t batch,
                         std::shared_ptr<cucascade::data_batch> data) = 0;
@@ -74,8 +76,12 @@ class exchange_service {
   [[nodiscard]] rank_t rank() const noexcept { return _rank; }
   [[nodiscard]] rank_t world_size() const noexcept { return _world_size; }
 
+  /// See transport::send for @p number.
   /// @throws the exchange's error once it has failed, or the query's once it was aborted.
-  void send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch);
+  void send(stream_id stream,
+            rank_t to,
+            std::shared_ptr<cucascade::data_batch> batch,
+            std::optional<std::uint64_t> number = std::nullopt);
   /// @throws the exchange's error once it has failed.
   void close(stream_id stream, rank_t to);
 

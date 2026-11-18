@@ -90,15 +90,19 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "exec/thread_util.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"  // sirius::io::s3::sirius_httpfs
 #include "late_mat/column_origin.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "op/discard_copy_function.hpp"
+#include "op/merge/merge_config.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
@@ -2513,6 +2517,10 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
   // on the transparent path too.
   sirius::exec::register_stream_source_function(instance);
+  // sirius_generate(...): synthetic data produced on the GPU by the GENERATOR source.
+  sirius::op::scan::generator::register_generate_function(instance);
+  // COPY ... (FORMAT sirius_discard): runs a query and drops its rows.
+  sirius::op::register_discard_copy_function(instance);
 
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
@@ -2762,6 +2770,130 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
   params->max_sort_partition_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
                    params->max_sort_partition_memory_fraction);
+}
+
+static void SetSortPartitionAutoSizing(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->sort_partition_auto_sizing = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_partition_auto_sizing to {}",
+                   params->sort_partition_auto_sizing);
+}
+
+static void SetSortMergeMode(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const value  = StringValue::Get(parameter);
+  auto const parsed = sirius::parse_sort_merge_mode(value);
+  if (!parsed) {
+    throw InvalidInputException(
+      "Invalid sort_merge_mode '%s'. Valid values: auto, windowed, one_shot", value);
+  }
+  auto* params                    = get_operator_params(context, scope);
+  params->sort_merge_mode_setting = *parsed;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_mode to {}", sirius::to_string(*parsed));
+}
+
+static void SetSortMergeWindowRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rows = UBigIntValue::Get(parameter);
+  if (rows != 0 && rows < sirius::op::merge::kMinExplicitWindowRows) {
+    throw InvalidInputException("sort_merge_window_rows must be 0 (derive) or at least %s, got %s",
+                                std::to_string(sirius::op::merge::kMinExplicitWindowRows),
+                                std::to_string(rows));
+  }
+  auto* params                   = get_operator_params(context, scope);
+  params->sort_merge_window_rows = rows;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_window_rows to {}", params->sort_merge_window_rows);
+}
+
+static void SetSortMergeOutputBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes != 0 && bytes < (1ULL << 20)) {
+    throw InvalidInputException(
+      "sort_merge_output_bytes must be 0 (derive) or at least 1 MiB (1048576), got %s",
+      std::to_string(bytes));
+  }
+  auto* params                    = get_operator_params(context, scope);
+  params->sort_merge_output_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_output_bytes to {}", params->sort_merge_output_bytes);
+}
+
+static void SetSortMergeOneShotMaxFraction(ClientContext& context, SetScope scope, Value& parameter)
+{
+  const double fraction = parameter.GetValue<double>();
+  // Written so that NaN is rejected too.
+  if (!(fraction >= 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException(
+      "sort_merge_one_shot_max_fraction must be 0 (derive) or in (0, 1], got %f", fraction);
+  }
+  auto* params                             = get_operator_params(context, scope);
+  params->sort_merge_one_shot_max_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_one_shot_max_fraction to {}",
+                   params->sort_merge_one_shot_max_fraction);
+}
+
+static void SetSortMergeMaxFanIn(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const fan_in = UBigIntValue::Get(parameter);
+  if (fan_in < 2) {
+    throw InvalidInputException("sort_merge_max_fan_in must be at least 2, got %s",
+                                std::to_string(fan_in));
+  }
+  auto* params                  = get_operator_params(context, scope);
+  params->sort_merge_max_fan_in = fan_in;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_max_fan_in to {}", params->sort_merge_max_fan_in);
+}
+
+static void SetSortMergeDisabledRules(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rules = UBigIntValue::Get(parameter);
+  if ((rules & ~sirius::config::sort_merge_rule::ALL) != 0) {
+    throw InvalidInputException(
+      "sort_merge_disabled_rules has an unknown rule bit: got %s, the valid bits are %s",
+      std::to_string(rules),
+      std::to_string(sirius::config::sort_merge_rule::ALL));
+  }
+  auto* params                      = get_operator_params(context, scope);
+  params->sort_merge_disabled_rules = rules;
+  SIRIUS_LOG_DEBUG("Updated config sort_merge_disabled_rules to {}",
+                   params->sort_merge_disabled_rules);
+}
+
+static void SetSortKeyEncoding(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params              = get_operator_params(context, scope);
+  params->sort_key_encoding = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_key_encoding to {}", params->sort_key_encoding);
+}
+
+static void SetSortCoalesceRuns(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params               = get_operator_params(context, scope);
+  params->sort_coalesce_runs = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_runs to {}", params->sort_coalesce_runs);
+}
+
+static void SetSortCoalesceMemoryFraction(ClientContext& context, SetScope scope, Value& parameter)
+{
+  const double fraction = parameter.GetValue<double>();
+  // Written so that NaN is rejected too.
+  if (!(fraction > 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException("sort_coalesce_memory_fraction must be in (0, 1], got %f",
+                                fraction);
+  }
+  auto* params                          = get_operator_params(context, scope);
+  params->sort_coalesce_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_memory_fraction to {}",
+                   params->sort_coalesce_memory_fraction);
+}
+
+static void SetSortCoalesceStringKeys(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                      = get_operator_params(context, scope);
+  params->sort_coalesce_string_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_string_keys to {}",
+                   params->sort_coalesce_string_keys);
 }
 
 static void SetExchangePeers(ClientContext& context, SetScope scope, Value& parameter)
@@ -3783,10 +3915,92 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                             SetMaxSortPartitionBytes);
   config.AddExtensionOption(
     "max_sort_partition_memory_fraction",
-    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
+    "Fraction of a GPU's memory limit per sort partition when max_sort_partition_bytes is 0",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
+  config.AddExtensionOption(
+    "sort_partition_auto_sizing",
+    "Choose the number of sort partitions from the GPU memory limit, the merge tasks that can run "
+    "at once and the cuDF row limit (false = from the GPU memory free when the sort is sampled)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_partition_auto_sizing),
+    SetSortPartitionAutoSizing);
+
+  // Add in config options for the MERGE_SORT merge path
+  config.AddExtensionOption(
+    "sort_merge_mode",
+    "Merge path for sorted runs: 'auto' (windowed under memory pressure or when any input is not "
+    "on the GPU), 'windowed' (always the windowed k-way merge), or 'one_shot' (the "
+    "concat-then-merge path)",
+    LogicalType::VARCHAR,
+    Value(std::string(sirius::to_string(operator_defaults.sort_merge_mode_setting))),
+    SetSortMergeMode);
+  config.AddExtensionOption(
+    "sort_merge_window_rows",
+    "Maximum rows per input window of the windowed merge (0 = derive from available GPU memory; "
+    "otherwise at least 1024)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_window_rows),
+    SetSortMergeWindowRows);
+  config.AddExtensionOption(
+    "sort_merge_output_bytes",
+    "Output chunk target in bytes per merge task (0 = derive from available GPU memory; "
+    "otherwise at least 1 MiB)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_output_bytes),
+    SetSortMergeOutputBytes);
+  config.AddExtensionOption(
+    "sort_merge_one_shot_max_fraction",
+    "Fraction of GPU memory above which sort_merge_mode = 'auto' takes the windowed path (0 = "
+    "derive from the device's GPU memory size; otherwise in (0, 1])",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.sort_merge_one_shot_max_fraction),
+    SetSortMergeOneShotMaxFraction);
+  config.AddExtensionOption(
+    "sort_merge_max_fan_in",
+    "Most sorted runs one merge task reads; a partition with more runs is merged in passes (at "
+    "least 2)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_max_fan_in),
+    SetSortMergeMaxFanIn);
+  config.AddExtensionOption(
+    "sort_merge_disabled_rules",
+    "Bit set of merge sizing and planning rules to switch off, for measuring each one (0 = all in "
+    "force; default 64): 1 Huffman pass plan, 2 budget floor, 4 budget per open partition, 8 "
+    "in-place reservation, 16 output-sized rounds, 32 row-count guard, 64 one-shot cold-start "
+    "estimate, 128 single-run passthrough, 256 STRING slot estimate",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_merge_disabled_rules),
+    SetSortMergeDisabledRules);
+  config.AddExtensionOption(
+    "sort_key_encoding",
+    "Whether the per-batch sort of ORDER BY orders string keys and multi-column keys by radix "
+    "sorts over an encoding of the keys instead of cuDF's comparison sort (false: for A/B "
+    "comparison)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_key_encoding),
+    SetSortKeyEncoding);
+  config.AddExtensionOption(
+    "sort_coalesce_runs",
+    "Sort groups of input batches as one run each in ORDER BY, so each range partition receives "
+    "few large sorted runs instead of one per input batch",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_coalesce_runs),
+    SetSortCoalesceRuns);
+  config.AddExtensionOption(
+    "sort_coalesce_memory_fraction",
+    "Share of one GPU's memory for the inputs of concurrently running local sorts: one coalesced "
+    "run is at most this fraction of the GPU divided by the GPU executor thread count (in (0, 1])",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.sort_coalesce_memory_fraction),
+    SetSortCoalesceMemoryFraction);
+  config.AddExtensionOption("sort_coalesce_string_keys",
+                            "Coalesce ORDER BY runs also when a sort key is a string (applies "
+                            "only while sort_key_encoding is on)",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(operator_defaults.sort_coalesce_string_keys),
+                            SetSortCoalesceStringKeys);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",
@@ -4082,6 +4296,11 @@ static void LoadInternal(ExtensionLoader& loader)
 
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
+
+  // DuckDB may run LOAD on a worker it pinned to one core. The configuration plans CPU
+  // placement from the calling thread's mask and every Sirius thread inherits it, so read the
+  // configuration and start the runtime with the process's affinity instead.
+  sirius::exec::scoped_process_affinity const process_affinity;
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).

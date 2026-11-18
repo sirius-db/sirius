@@ -107,7 +107,8 @@ struct transport::engine {
 
   // ---- shared with senders, under transport::_mutex -----------------------------------------
 
-  /// A batch to send, or (no batch) the end of its stream after `batch` batches.
+  /// A batch to send under the number `batch`, or (no batch) the end of its stream after `batch`
+  /// batches.
   struct queued {
     stream_id stream;
     std::uint64_t batch;
@@ -519,7 +520,10 @@ transport::~transport()
 rank_t transport::rank() const noexcept { return _engine->fab.rank(); }
 rank_t transport::world_size() const noexcept { return _engine->fab.world_size(); }
 
-void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::data_batch> batch)
+void transport::send(stream_id stream,
+                     rank_t to,
+                     std::shared_ptr<cucascade::data_batch> batch,
+                     std::optional<std::uint64_t> number)
 {
   auto& e = *_engine;
   if (to >= world_size()) {
@@ -533,7 +537,9 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
     std::uint64_t index = 0;
     {
       std::lock_guard lock{_mutex};
-      index = e.sent[to][stream]++;
+      // The count goes with the stream's end, whatever the batches are numbered.
+      index = number.value_or(e.sent[to][stream]);
+      ++e.sent[to][stream];
     }
     e.cb.on_batch(stream, to, index, std::move(batch));
     return;
@@ -574,7 +580,7 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   // A copy, not a move: if the push throws, `held` stays the last owner and is dropped after `lock`
   // is released, since its deleter takes _mutex.
   auto& next = e.sent[to][stream];
-  e.queues[to].push_back({stream, next, held});
+  e.queues[to].push_back({stream, number.value_or(next), held});
   ++next;
   e.queued_bytes += bytes;
 }

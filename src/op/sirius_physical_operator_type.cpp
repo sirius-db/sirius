@@ -107,6 +107,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::PARTITION: return "PARTITION";
     case SiriusPhysicalOperatorType::CONCAT: return "CONCAT";
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK: return "PASSTHROUGH_SINK";
+    case SiriusPhysicalOperatorType::DISCARD_SINK: return "DISCARD_SINK";
     case SiriusPhysicalOperatorType::MERGE_SORT: return "MERGE_SORT";
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: return "MERGE_GROUP_BY";
     case SiriusPhysicalOperatorType::MERGE_TOP_N: return "MERGE_TOP_N";
@@ -114,6 +115,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::SORT_PARTITION: return "SORT_PARTITION";
     case SiriusPhysicalOperatorType::SORT_SAMPLE: return "SORT_SAMPLE";
     case SiriusPhysicalOperatorType::GPU_VALUES: return "GPU_VALUES";
+    case SiriusPhysicalOperatorType::GENERATOR: return "GENERATOR";
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";

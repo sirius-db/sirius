@@ -35,7 +35,11 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -110,6 +114,92 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   sirius::converter_registry::initialize();
   return manager;
 }
+
+/**
+ * @brief A memory manager of 256 MiB GPU spaces with per-thread reservation tracking, its spaces,
+ * and builders for batches resident in a chosen tier.
+ *
+ * The destructor shuts the manager down and then the converter registry, so declare the fixture
+ * before anything that holds batches or streams of its spaces.
+ */
+struct tiered_memory_fixture {
+  static constexpr std::size_t default_num_rows = 4096;
+
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  cucascade::memory::memory_space* gpu0  = nullptr;
+  cucascade::memory::memory_space* gpu1  = nullptr;  ///< Null unless set up with two GPUs.
+  cucascade::memory::memory_space* host0 = nullptr;
+
+  /// Builds the manager; false if the memory spaces could not be created. A CUDA error is rethrown
+  /// rather than reported as false, so a broken device fails the test instead of being skipped.
+  bool setup(std::size_t n_gpus = 1)
+  {
+    try {
+      manager = initialize_memory_manager(n_gpus,
+                                          {.gpu_bytes                = std::size_t{256} << 20,
+                                           .gpu_reservation_fraction = 0.75,
+                                           .divide_among_gpus        = false,
+                                           .per_stream_tracking      = false});
+    } catch (cucascade::cuda_error const&) {
+      throw;
+    } catch (std::exception const&) {
+      return false;
+    }
+
+    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpu_spaces.size() < n_gpus) { return false; }
+    gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+    if (n_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
+    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (host_spaces.empty()) { return false; }
+    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+    return true;
+  }
+
+  ~tiered_memory_fixture()
+  {
+    // initialize_memory_manager initializes the registry right after building the manager, so
+    // both exist or neither.
+    if (manager) {
+      manager->shutdown();
+      sirius::converter_registry::shutdown();
+    }
+  }
+
+  /// Single INT64 column of random data, resident on @p space; @p stream must be on its device.
+  std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_space& space,
+                                                        ::cuda::stream_ref stream,
+                                                        std::size_t num_rows = default_num_rows)
+  {
+    auto table = sirius::create_cudf_table_with_random_data(num_rows,
+                                                            {cudf::data_type{cudf::type_id::INT64}},
+                                                            {std::make_pair(0, 1000000)},
+                                                            stream,
+                                                            space.get_default_allocator());
+    stream.sync();
+    return sirius::make_data_batch(
+      std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
+  }
+
+  /// Single INT64 column of random data, resident on the first GPU space.
+  std::shared_ptr<cucascade::data_batch> make_gpu_batch(::cuda::stream_ref stream)
+  {
+    return make_gpu_batch(*gpu0, stream);
+  }
+
+  /// GPU batch converted in place to the host representation (spilled-batch shape).
+  std::shared_ptr<cucascade::data_batch> make_host_batch(::cuda::stream_ref stream)
+  {
+    auto batch = make_gpu_batch(stream);
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(
+        sirius::converter_registry::get(), host0, stream);
+    }
+    stream.sync();
+    return batch;
+  }
+};
 
 /// Initializes the process-global converter registry unless it is already initialized. Tests that
 /// cache a memory manager across test cases call this on every access, since other tests may shut

@@ -26,7 +26,11 @@
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <algorithm>
 
@@ -64,7 +68,120 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
   return false;
 }
 
+std::size_t ceil_div(std::size_t numerator, std::size_t denominator)
+{
+  return denominator == 0 ? 1 : (numerator + denominator - 1) / denominator;
+}
+
 }  // namespace
+
+sort_partition_sizing compute_sort_partition_sizing(const sort_partition_sizing_input& input)
+{
+  sort_partition_sizing result;
+  auto const bytes = input.data_bytes;
+  auto raise       = [&result](std::size_t partitions, const char* rule) {
+    if (partitions > result.num_partitions) {
+      result.num_partitions = partitions;
+      result.rule           = rule;
+    }
+  };
+
+  // An explicit partition size decides alone.
+  if (input.max_partition_bytes_override > 0) {
+    result.max_partition_bytes = input.max_partition_bytes_override;
+    raise(ceil_div(bytes, result.max_partition_bytes), "max_sort_partition_bytes");
+    return result;
+  }
+
+  if (!input.policy.auto_sizing) {
+    // Previous rule: a fraction of the GPU memory free at this moment.
+    result.max_partition_bytes = static_cast<std::size_t>(
+      static_cast<double>(input.gpu_available_bytes) * input.memory_fraction);
+    if (result.max_partition_bytes > 0) {
+      raise(ceil_div(bytes, result.max_partition_bytes), "fraction_of_free");
+    }
+    return result;
+  }
+
+  // Memory: a fraction of the GPU's limit. Without a known limit, fall back to the free memory.
+  auto const capacity =
+    input.gpu_capacity_bytes > 0 ? input.gpu_capacity_bytes : input.gpu_available_bytes;
+  auto const gpus = std::max<std::size_t>(input.policy.num_gpus, 1);
+  result.max_partition_bytes =
+    static_cast<std::size_t>(static_cast<double>(capacity) * input.memory_fraction);
+  const char* memory_rule = "fraction_of_limit";
+  // The sort holds the data and its sorted copy. When they do not fit the GPUs, runs are spilled
+  // before the merge starts, and smaller partitions keep more of each merge on the GPU.
+  if (capacity > 0 && bytes > (capacity / 2) * gpus) {
+    auto const spill_bytes =
+      static_cast<std::size_t>(static_cast<double>(capacity) * kSortPartitionSpillFraction);
+    if (spill_bytes > 0 && spill_bytes < result.max_partition_bytes) {
+      result.max_partition_bytes = spill_bytes;
+      memory_rule                = "larger_than_gpu";
+    }
+  }
+  if (result.max_partition_bytes > 0) {
+    raise(ceil_div(bytes, result.max_partition_bytes), memory_rule);
+  }
+
+  // One-shot merges hold the partition, the merge temporaries and the output on one GPU:
+  // 3 x bytes + 8 bytes per row, for kSortPartitionOneShotConcurrentMerges merges at once.
+  if (input.policy.one_shot_only && capacity > 0 && input.data_rows > 0 && bytes > 0) {
+    auto const row_width      = static_cast<double>(bytes) / static_cast<double>(input.data_rows);
+    auto const one_shot_bytes = static_cast<std::size_t>(
+      static_cast<double>(capacity) /
+      ((3.0 + 8.0 / row_width) * static_cast<double>(kSortPartitionOneShotConcurrentMerges)));
+    if (one_shot_bytes > 0 && one_shot_bytes < result.max_partition_bytes) {
+      result.max_partition_bytes = one_shot_bytes;
+    }
+    if (one_shot_bytes > 0) { raise(ceil_div(bytes, one_shot_bytes), "one_shot_memory"); }
+  }
+
+  // Rows: a one-shot merge makes one cuDF table of its partition. Windowed merges are not
+  // limited.
+  auto const auto_route = !input.policy.one_shot_only && !input.policy.windowed_only &&
+                          input.policy.auto_one_shot_partition_bytes > 0;
+  auto const takes_one_shot = [&](std::size_t partitions) {
+    return bytes / partitions <= input.policy.auto_one_shot_partition_bytes;
+  };
+  if ((input.policy.one_shot_only || (auto_route && takes_one_shot(result.num_partitions))) &&
+      input.data_rows > kSortPartitionMaxRows * result.num_partitions) {
+    raise(ceil_div(input.data_rows, kSortPartitionMaxRows), "row_limit");
+  }
+
+  // Concurrency: on several GPUs, one partition per merge task a GPU runs at once, while
+  // partitions and the pieces each input batch is cut into stay large enough for that to pay.
+  if (input.policy.windowed_only && gpus > 1 && input.policy.merge_concurrency > 1) {
+    auto wanted = std::min(input.policy.merge_concurrency, kSortPartitionMaxConcurrency);
+    wanted      = std::min(wanted, bytes / kSortPartitionMinConcurrencyBytes);
+    if (input.avg_batch_bytes > 0) {
+      wanted = std::min(wanted, input.avg_batch_bytes / kSortPartitionMinPieceBytes);
+    }
+    raise(wanted, "merge_concurrency");
+  }
+
+  // Auto mode: partitions at or below the one-shot threshold are merged whole, as many at once
+  // as there are executor threads. When those merges do not fit the GPU together, keep the
+  // partitions large enough to be merged in windows instead.
+  if (auto_route && result.num_partitions > 1 && takes_one_shot(result.num_partitions)) {
+    auto const partition_bytes = bytes / result.num_partitions;
+    auto const row_bytes =
+      input.data_rows > 0 ? 8 * (input.data_rows / result.num_partitions) : std::size_t{0};
+    auto const concurrent =
+      std::min(result.num_partitions, std::max<std::size_t>(input.policy.merge_concurrency, 1));
+    if (concurrent * (3 * partition_bytes + row_bytes) > capacity) {
+      // The largest count whose partitions stay clear of the threshold.
+      auto const windowed_bytes =
+        static_cast<std::size_t>(static_cast<double>(input.policy.auto_one_shot_partition_bytes) *
+                                 kSortPartitionWindowedRouteMargin);
+      result.num_partitions = std::max<std::size_t>(bytes / windowed_bytes, 1);
+      result.rule           = "windowed_route";
+    }
+  }
+  return result;
+}
+
+sirius_physical_sort_sample::~sirius_physical_sort_sample() { clear_partition_boundaries(); }
 
 std::unique_ptr<cudf::column> sirius_physical_sort_sample::index_column(
   std::vector<int32_t> const& indices, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
@@ -110,6 +227,50 @@ sort_boundaries sirius_physical_sort_sample::local_boundaries(
   if (num_parts <= 1 || rows == 0) { return {}; }
   return {num_parts,
           evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator())};
+}
+
+void sirius_physical_sort_sample::store_boundaries(const sort_boundaries& made,
+                                                   ::cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  if (made.num_partitions <= 1 || !made.table || made.table->num_rows() == 0) {
+    // Single partition — no boundaries needed
+    _num_partitions = 1;
+    clear_partition_boundaries();
+    return;
+  }
+  // SORT_PARTITION cuts every batch at each boundary row and numbers the pieces up to the
+  // partition count: the two must agree, whoever made the boundaries.
+  if (static_cast<size_t>(made.table->num_rows()) + 1 != made.num_partitions) {
+    throw internal_exception("Sort sample: {} boundary rows for {} partitions",
+                             made.table->num_rows(),
+                             made.num_partitions);
+  }
+
+  // Bring the boundary rows to host memory. SORT_PARTITION tasks run on every GPU and on streams
+  // other than this one as soon as DONE is published, so they must not read a device table that
+  // this stream may still be writing (cudf::gather of fixed-width columns returns before its
+  // kernel has run) or that lives on another GPU. The host copy is complete once this stream is
+  // synchronised; each GPU uploads its own copy from it on first use.
+  auto packed    = cudf::pack(made.table->view(), stream, mr);
+  auto host      = std::make_unique<host_boundaries>();
+  host->num_rows = static_cast<size_t>(made.table->num_rows());
+  if (packed.metadata) { host->metadata = *packed.metadata; }
+  if (packed.gpu_data && packed.gpu_data->size() > 0) {
+    host->data.resize(packed.gpu_data->size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host->data.data(),
+                                  packed.gpu_data->data(),
+                                  host->data.size(),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+  }
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  {
+    std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+    _device_boundaries.clear();
+    _host_boundaries = std::move(host);
+  }
+  _num_partitions = made.num_partitions;
 }
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
@@ -243,12 +404,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   }
 
   if (valid_batches.empty() || !space) {
-    auto made =
-      _cross_rank_boundaries
-        ? _cross_rank_boundaries->make({{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream)
-        : sort_boundaries{};
-    _num_partitions       = made.num_partitions;
-    _partition_boundaries = std::move(made.table);
+    if (_cross_rank_boundaries && !_pending_cross_rank_boundaries) {
+      _pending_cross_rank_boundaries =
+        _cross_rank_boundaries->make({{}, 0, _sort_sample_bytes, 1, batch_telemetry()}, stream);
+    }
+    // No input batch names a memory space here: a table the hook still returns is packed with
+    // the current device resource.
+    sort_boundaries const single_partition;
+    store_boundaries(
+      _pending_cross_rank_boundaries ? *_pending_cross_rank_boundaries : single_partition,
+      stream,
+      cudf::get_current_device_resource_ref());
+    _pending_cross_rank_boundaries.reset();
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -325,32 +492,36 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
         bytes_for_sizing  = avg_batch_bytes * total_batch_count;
       }
-      size_t available_memory    = space->get_available_memory(stream);
-      size_t max_partition_bytes = _max_partition_bytes_override > 0
-                                     ? _max_partition_bytes_override
-                                     : static_cast<size_t>(static_cast<double>(available_memory) *
-                                                           _max_partition_memory_fraction);
+      sort_partition_sizing_input sizing_input;
+      sizing_input.data_bytes          = bytes_for_sizing;
+      sizing_input.data_rows           = complete_input ? total_rows : estimated_cardinality;
+      sizing_input.avg_batch_bytes     = avg_batch_bytes;
+      sizing_input.gpu_capacity_bytes  = space->get_max_memory();
+      sizing_input.gpu_available_bytes = space->get_available_memory(stream);
+      sizing_input.max_partition_bytes_override = _max_partition_bytes_override;
+      sizing_input.memory_fraction              = _max_partition_memory_fraction;
+      sizing_input.policy                       = _partition_policy;
+      auto const sizing                         = compute_sort_partition_sizing(sizing_input);
+      // One boundary row is needed per partition after the first.
+      num_parts = std::min(sizing.num_partitions, std::max<size_t>(1, total_rows));
 
-      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
-        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
-      }
-      num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
-
-      SIRIUS_LOG_DEBUG(
-        "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
-        "avg_rows_per_batch={}, "
-        "avg_batch_bytes={}, total_batch_count={}, "
-        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
-        complete_input,
-        estimated_cardinality,
-        total_rows,
-        avg_rows_per_batch,
-        avg_batch_bytes,
-        total_batch_count,
-        bytes_for_sizing,
-        available_memory,
-        max_partition_bytes,
-        num_parts);
+      SIRIUS_LOG_INFO(
+        "[sort_sample][sizing] partitions={} rule={} max_partition_bytes={} data_bytes={} "
+        "data_rows={} avg_batch_bytes={} gpu_limit_bytes={} gpu_free_bytes={} "
+        "merge_concurrency={} merge_mode={} auto_sizing={} complete_input={}",
+        num_parts,
+        sizing.rule,
+        sizing.max_partition_bytes,
+        sizing_input.data_bytes,
+        sizing_input.data_rows,
+        sizing_input.avg_batch_bytes,
+        sizing_input.gpu_capacity_bytes,
+        sizing_input.gpu_available_bytes,
+        _partition_policy.merge_concurrency,
+        _partition_policy.one_shot_only ? "one_shot"
+                                        : (_partition_policy.windowed_only ? "windowed" : "auto"),
+        _partition_policy.auto_sizing ? 1 : 0,
+        complete_input ? 1 : 0);
     }
 
     // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
@@ -359,17 +530,24 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       sort_key_cols.push_back(merged_sample_view.column(idx));
     }
     cudf::table_view const sort_keys_view(sort_key_cols);
-    auto made =
-      _cross_rank_boundaries
-        ? _cross_rank_boundaries->make(
-            {sort_keys_view, total_sample_bytes, _sort_sample_bytes, num_parts, batch_telemetry()},
-            stream)
-        : local_boundaries(sort_keys_view, num_parts, space, stream);
-    _num_partitions       = made.num_partitions;
-    _partition_boundaries = std::move(made.table);
+    // Either way the boundaries arrive as a table on this task's GPU; keep them on the host.
+    if (_cross_rank_boundaries) {
+      if (!_pending_cross_rank_boundaries) {
+        _pending_cross_rank_boundaries = _cross_rank_boundaries->make(
+          {sort_keys_view, total_sample_bytes, _sort_sample_bytes, num_parts, batch_telemetry()},
+          stream);
+      }
+      store_boundaries(*_pending_cross_rank_boundaries, stream, space->get_default_allocator());
+      _pending_cross_rank_boundaries.reset();
+    } else {
+      store_boundaries(local_boundaries(sort_keys_view, num_parts, space, stream),
+                       stream,
+                       space->get_default_allocator());
+    }
 
-    // sort_partition runs in the same gpu_pipeline_task immediately after this
-    // execute() returns, so _partition_boundaries is visible before partition runs.
+    // SORT_PARTITION runs in this task right after execute() returns (or, in a distributed plan,
+    // in the pipeline after the range exchange), and in tasks on every other executor thread and
+    // GPU as soon as DONE is visible: the host copy of the boundaries is complete at this point.
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
 
   } catch (...) {
@@ -382,10 +560,53 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Sort sample: computed {} partitions with {} boundaries in {:.2f} ms",
                    _num_partitions,
-                   _partition_boundaries ? _partition_boundaries->num_rows() : 0,
+                   num_boundary_rows(),
                    duration.count() / 1000.0);
 
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+}
+
+cudf::table_view sirius_physical_sort_sample::get_partition_boundaries(
+  cucascade::memory::memory_space& space, ::cuda::stream_ref stream)
+{
+  const int device_id = space.get_device_id();
+  std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+  if (!_host_boundaries) {
+    throw internal_exception("Sort sample: partition boundaries requested but not available");
+  }
+  auto it = _device_boundaries.find(device_id);
+  if (it == _device_boundaries.end()) {
+    auto copy = std::make_unique<device_boundaries>();
+    copy->data =
+      rmm::device_buffer(_host_boundaries->data.size(), stream, space.get_default_allocator());
+    if (!_host_boundaries->data.empty()) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(copy->data.data(),
+                                    _host_boundaries->data.data(),
+                                    _host_boundaries->data.size(),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+    }
+    // Other tasks on this GPU read the copy from their own streams: finish the upload first.
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    // The buffer outlives the task's stream; it is freed on the device's default stream.
+    copy->data.set_stream(rmm::cuda_stream_default);
+    copy->view = cudf::unpack(_host_boundaries->metadata.data(),
+                              static_cast<const uint8_t*>(copy->data.data()));
+    it         = _device_boundaries.emplace(device_id, std::move(copy)).first;
+  }
+  return it->second->view;
+}
+
+void sirius_physical_sort_sample::clear_partition_boundaries()
+{
+  std::lock_guard<std::mutex> lock(_device_boundaries_mutex);
+  for (auto& [device_id, copy] : _device_boundaries) {
+    // Free each copy with its own GPU current; this may run on a thread bound to another GPU.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+    copy.reset();
+  }
+  _device_boundaries.clear();
+  _host_boundaries.reset();
 }
 
 }  // namespace op

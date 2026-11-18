@@ -17,6 +17,7 @@
 #include "exec/stream_bind_catalog.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/scan/generator/generate_function.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
@@ -118,6 +119,8 @@ duckdb::unique_ptr<duckdb::FunctionData> replacement_bind(
     return duckdb::make_uniq<duckdb::SiriusReadParquetBindData>("s3://bucket/a.parquet", 1);
   if (name == "sirius_stream_source")
     return duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1);
+  if (name == "sirius_generate")
+    return duckdb::make_uniq<sirius::op::scan::generator::GenerateFunctionData>();
   return duckdb::make_uniq<duckdb::MultiFileBindData>();
 }
 
@@ -448,7 +451,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("ROLLBACK");
 }
 
-TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts][shared_context]")
+TEST_CASE("Scan registry verifies all seven catalog functions", "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
   auto con = sirius::test::g_shared_env->make_connection();
@@ -463,7 +466,7 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   std::set<std::string> names;
   for (auto const& entry : sirius::planner::registered_connectors()) {
     names.insert(entry.function_name);
-    if (entry.function_name == "sirius_stream_source") {
+    if (entry.function_name == "sirius_stream_source" || entry.function_name == "sirius_generate") {
       CHECK(entry.certify == nullptr);
     } else {
       CHECK(entry.certify != nullptr);
@@ -474,7 +477,8 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
                                          "read_parquet",
                                          "sirius_read_parquet",
                                          "iceberg_scan",
-                                         "sirius_stream_source"});
+                                         "sirius_stream_source",
+                                         "sirius_generate"});
   for (auto const& name : names) {
     auto& catalog_entry = duckdb::Catalog::GetSystemCatalog(*con.context)
                             .GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -488,6 +492,8 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
         bind = duckdb::make_uniq<duckdb::SiriusReadParquetBindData>("s3://bucket/a.parquet", 1);
       } else if (name == "sirius_stream_source") {
         bind = duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1);
+      } else if (name == "sirius_generate") {
+        bind = duckdb::make_uniq<sirius::op::scan::generator::GenerateFunctionData>();
       } else {
         bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
       }
@@ -1241,6 +1247,8 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       bind = duckdb::make_uniq<duckdb::SiriusReadParquetBindData>("s3://bucket/a.parquet", 1);
     else if (source.function_name == "sirius_stream_source")
       bind = duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1);
+    else if (source.function_name == "sirius_generate")
+      bind = duckdb::make_uniq<sirius::op::scan::generator::GenerateFunctionData>();
     else
       bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
     bool const nested = std::string_view(phase).find("nested_") != std::string_view::npos;

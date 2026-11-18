@@ -53,6 +53,48 @@ struct downgrade_executor_config {
   /// reservation manager's order (single-GPU default behavior).
   /// Populated by SiriusContext from config_.get_hw_topology().gpus[device_id].numa_node.
   std::optional<int> preferred_numa_node;
+
+  /// Complete a reserve-path request (request_downgrade(): a task is waiting for its
+  /// reservation) as soon as its predicate holds, also while another request is being
+  /// processed, and process the ones still unsatisfied before the next queued request. false
+  /// (the default) keeps strict FIFO order. Off by default: on sorts larger than the GPU it
+  /// removes most of the time in which no task computes without shortening the run, which is
+  /// bound by spill I/O, and tasks that start while the GPU is still full can make MERGE_SORT
+  /// derive much smaller windows from the bytes free at arming.
+  bool prioritize_reserve_requests{false};
+
+  /// A request stops dispatching candidates after this many conversions in a row failed for a
+  /// reason other than memory (an unwritable spill directory, an I/O error), with none
+  /// succeeding. 0 disables the limit.
+  std::size_t max_consecutive_convert_failures{8};
+
+  /// After a monitor request that freed nothing because its conversions failed, the monitor
+  /// waits this long before issuing the next one, doubling up to the maximum. A request that
+  /// frees anything resets it.
+  std::chrono::milliseconds failure_backoff_initial{std::chrono::milliseconds{100}};
+  std::chrono::milliseconds failure_backoff_max{std::chrono::milliseconds{5000}};
+};
+
+/// How the GPU pipeline executor behaves when a task's memory reservation cannot be granted at
+/// once. Process-wide; see gpu_pipeline_executor::set_reservation_policy().
+struct reservation_wait_policy {
+  /// Wait for the reservation on the task's worker thread, so the manager loop keeps
+  /// dispatching other ready tasks. false (the default) waits on the manager loop: one waiting
+  /// task stalls the executor. Off by default: it gives no wall-time gain on spilling sorts (see
+  /// downgrade_executor_config::prioritize_reserve_requests), and a task waiting on a worker
+  /// is no longer in the scheduler's queue, where the downgrade executor could evict its
+  /// inputs.
+  bool wait_on_worker{false};
+  /// A waiting task may be overtaken by at most this many later tasks, and for at most
+  /// max_bypass_time; after that the manager dispatches nothing new until it is served.
+  std::size_t max_bypass_tasks{16};
+  std::chrono::milliseconds max_bypass_time{std::chrono::milliseconds{1000}};
+  /// How long a waiting task lets running tasks release memory before it asks the downgrade
+  /// executor to evict. It asks at once when no other reservation is active.
+  std::chrono::milliseconds patience{std::chrono::milliseconds{20}};
+  /// Fail a task at once when it runs out of memory while its reservation already covers the
+  /// whole memory space and its input cannot shrink: a retry cannot succeed.
+  bool fail_fast_on_full_space_oom{true};
 };
 
 }  // namespace sirius::exec

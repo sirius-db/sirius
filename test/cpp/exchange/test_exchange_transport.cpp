@@ -29,14 +29,20 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -153,6 +159,89 @@ TEST_CASE("every rank sends to every rank, then the same streams again once they
     r.got->ended.clear();
   }
   all_to_all(c, {7, 9}, 2, 5'000);
+}
+
+TEST_CASE("a sender's own batch numbers reach the receiver, and its end still counts batches",
+          "[exchange][transport]")
+{
+  // What an ordered gather sends: numbers that are neither dense nor in send order.
+  struct numbered {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::map<std::pair<rank_t, std::uint64_t>, table_digest> batches;
+    std::set<rank_t> ended;
+    std::exception_ptr error;
+  };
+  loopback_hub hub{2, {.shuffle = true, .deliver_every = 3}};
+  std::vector<std::unique_ptr<frame_ring>> rings;
+  std::vector<std::unique_ptr<fabric>> fabrics;
+  std::vector<std::unique_ptr<numbered>> got;
+  std::vector<std::unique_ptr<transport>> transports;
+  for (rank_t r = 0; r < 2; ++r) {
+    auto& send = *rings.emplace_back(std::make_unique<frame_ring>(4, 64 * KiB));
+    auto& recv = *rings.emplace_back(std::make_unique<frame_ring>(4, 64 * KiB));
+    fabrics.push_back(hub.attach(r, send, recv));
+    auto* g = got.emplace_back(std::make_unique<numbered>()).get();
+    transports.push_back(std::make_unique<transport>(
+      *fabrics.back(),
+      send,
+      recv,
+      *env().gpu,
+      env().host,
+      transport::callbacks{
+        [g](stream_id, rank_t from, std::uint64_t batch, std::shared_ptr<cucascade::data_batch> b) {
+          auto d = digest(b);
+          std::lock_guard lock{g->mutex};
+          if (!g->batches.emplace(std::make_pair(from, batch), std::move(d)).second) {
+            g->error = std::make_exception_ptr(std::runtime_error("a batch number came twice"));
+          }
+          g->changed.notify_all();
+        },
+        [g](stream_id, rank_t from) {
+          std::lock_guard lock{g->mutex};
+          g->ended.insert(from);
+          g->changed.notify_all();
+        },
+        [g](std::exception_ptr error) {
+          std::lock_guard lock{g->mutex};
+          g->error = error;
+          g->changed.notify_all();
+        },
+        [g](std::uint64_t, rank_t, std::string what) {
+          std::lock_guard lock{g->mutex};
+          g->error = std::make_exception_ptr(std::runtime_error(what));
+          g->changed.notify_all();
+        }}));
+  }
+  stream_id const stream = 3;
+  std::vector<std::uint64_t> const numbers{
+    (std::uint64_t{3} << 32) | 1, 7, 0, std::uint64_t{1} << 32};
+  // Rank 1 sends to rank 0 and to itself; about 400 KB a batch, several frames each.
+  for (rank_t to = 0; to < 2; ++to) {
+    for (std::size_t i = 0; i < numbers.size(); ++i) {
+      transports[1]->send(
+        stream, to, exchange_batch(1, to, stream, static_cast<int>(i), 10'000), numbers[i]);
+    }
+    transports[1]->close(stream, to);
+  }
+  for (rank_t to = 0; to < 2; ++to) {
+    auto& g = *got[to];
+    std::unique_lock lock{g.mutex};
+    // The end waits for as many batches as were sent, whatever their numbers.
+    REQUIRE(g.changed.wait_for(
+      lock, std::chrono::seconds{60}, [&] { return g.error || g.ended.contains(1); }));
+    REQUIRE_FALSE(g.error);
+    REQUIRE(g.batches.size() == numbers.size());
+    for (std::size_t i = 0; i < numbers.size(); ++i) {
+      INFO("to rank " << to << ", number " << numbers[i]);
+      REQUIRE(g.batches.contains({1, numbers[i]}));
+      CHECK(g.batches.at({1, numbers[i]}) ==
+            digest(exchange_batch(1, to, stream, static_cast<int>(i), 10'000)));
+    }
+  }
+  for (auto& t : transports) {
+    t.reset();
+  }
 }
 
 TEST_CASE("one credit per peer and one send frame still deliver many-frame batches",

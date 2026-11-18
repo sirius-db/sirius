@@ -57,6 +57,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
+  // After a range exchange the sample runs in another pipeline. Passing rows through to
+  // partition 0 before it has stored this process's boundaries would mix every range into one
+  // partition: the exchange's source holds its batches until then.
+  if (_sample_op && _sample_op->cross_rank_boundaries() != nullptr &&
+      !_sample_op->boundaries_computed()) {
+    throw internal_exception("Sort partition: a batch arrived before the sort boundaries");
+  }
+
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
@@ -66,10 +74,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       input.get_data_batches(), std::vector<std::size_t>(input.get_data_batches().size(), 0));
   }
 
-  auto start           = std::chrono::high_resolution_clock::now();
-  size_t num_parts     = _sample_op->get_num_partitions();
-  auto& boundaries     = _sample_op->get_partition_boundaries();
-  auto boundaries_view = boundaries.view();
+  auto start       = std::chrono::high_resolution_clock::now();
+  size_t num_parts = _sample_op->get_num_partitions();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -106,6 +112,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
       sort_key_cols.push_back(input_table.column(idx));
     }
     cudf::table_view batch_sort_keys(sort_key_cols);
+
+    // The boundaries as a table on this batch's GPU (the sample operator keeps one copy per GPU)
+    auto boundaries_view = _sample_op->get_partition_boundaries(*space, stream);
 
     // Use lower_bound: haystack=batch (sorted), needles=boundaries
     // Returns P-1 split positions in the batch

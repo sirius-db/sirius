@@ -48,6 +48,38 @@ struct lock_to_new_batch {
 
 using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_to_new_batch>;
 
+namespace detail {
+
+/**
+ * @brief Opportunistic stream rebind (best-effort, non-blocking).
+ *
+ * If the batch already resides in the target GPU memory space, rebind its deallocation stream to
+ * this task's stream so that when the task later frees the data the free lands on the active
+ * stream's free list rather than on the stream the data was produced on. We use try_to_mutable()
+ * so we never block -- if another reader holds the batch (e.g. a probe task on another GPU
+ * sharing a build batch) or it is otherwise busy, we simply skip the rebind; correctness is
+ * unaffected. Gating on a space match guarantees the stream and the data live on the same device
+ * (important for multi-GPU).
+ *
+ * @param target_space  Space `stream` belongs to; nullptr means the batch's current space.
+ */
+inline void try_rebind_stream(const std::shared_ptr<cucascade::data_batch>& batch,
+                              const cucascade::memory::memory_space* target_space,
+                              ::cuda::stream_ref stream)
+{
+  if (std::optional<cucascade::mutable_data_batch> mut = batch->try_to_mutable()) {
+    const auto* current_space = mut->get_memory_space();
+    const auto* rebind_target = target_space != nullptr ? target_space : current_space;
+    if (current_space != nullptr && rebind_target != nullptr &&
+        current_space->get_id() == rebind_target->get_id() &&
+        rebind_target->get_tier() == cucascade::memory::Tier::GPU) {
+      mut->rebind_stream(stream);
+    }
+  }
+}
+
+}  // namespace detail
+
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
  *
@@ -85,25 +117,9 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
 {
   if (!batch) { return std::nullopt; }
 
-  // Opportunistic stream rebind (best-effort, non-blocking): if the batch already resides in
-  // the target GPU memory space, rebind its deallocation stream to this task's stream so that
-  // when the task later frees the data the free lands on the active stream's free list rather
-  // than on the stream the data was produced on. We use try_to_mutable() so we never block --
-  // if another reader holds the batch (e.g. a probe task on another GPU sharing a build batch)
-  // or it is otherwise busy, we simply skip the rebind; correctness is unaffected. Gating on a
-  // space match guarantees the stream and the data live on the same device (important for
-  // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
-  // table on it, so no rebind is needed there.
-  if (std::optional<cucascade::mutable_data_batch> mut = batch->try_to_mutable()) {
-    const auto* current_space = mut->get_memory_space();
-    const auto* rebind_target =
-      requested_memory_space != nullptr ? requested_memory_space : current_space;
-    if (current_space != nullptr && rebind_target != nullptr &&
-        current_space->get_id() == rebind_target->get_id() &&
-        rebind_target->get_tier() == cucascade::memory::Tier::GPU) {
-      mut->rebind_stream(stream);
-    }
-  }
+  // A batch outside the requested space is converted on `stream` below, which allocates the new
+  // table on it: no rebind needed there.
+  detail::try_rebind_stream(batch, requested_memory_space, stream);
 
   // Acquire a read-only lock
   cucascade::read_only_data_batch read_accessor = batch->to_read_only();
@@ -221,6 +237,34 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
                        read_accessor.get_batch_id());
       return std::nullopt;
   }
+}
+
+/**
+ * @brief Read-lock a batch where it is, in whatever tier and memory space it currently has.
+ *
+ * For inputs the consumer reads itself (pipelineable_operator_data::materializes_on_gpu() ==
+ * false): no conversion and no cross-GPU clone. This is lock_and_prepare_batch's "already in the
+ * requested space" path applied to any batch, so the batch-state handling is the same. The
+ * deallocation stream is rebound only when the batch already sits in @p stream_memory_space; a
+ * batch on another GPU must not be bound to a stream of this one.
+ *
+ * @param batch                The batch to lock.
+ * @param stream_memory_space  Memory space @p stream belongs to; may be nullptr (no rebind).
+ * @param stream               The task's CUDA stream.
+ * @return The shared lock on @p batch, or std::nullopt on failure.
+ */
+inline std::optional<lock_and_prepare_batch_result> lock_batch_in_place(
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  const cucascade::memory::memory_space* stream_memory_space,
+  ::cuda::stream_ref stream)
+{
+  if (!batch) { return std::nullopt; }
+  if (stream_memory_space != nullptr) {
+    detail::try_rebind_stream(batch, stream_memory_space, stream);
+  }
+  cucascade::read_only_data_batch read_accessor = batch->to_read_only();
+  if (read_accessor.get_memory_space() == nullptr) { return std::nullopt; }
+  return lock_to_existing_batch{.ro_lock = std::move(read_accessor)};
 }
 
 }  // namespace pipeline

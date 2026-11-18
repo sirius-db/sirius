@@ -553,6 +553,10 @@ op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
     kind = op::scan::materializer_kind::duckdb_native;
   } else if (connector.kind == op::scan::source_kind::stream_source) {
     kind = op::scan::materializer_kind::stream;
+  } else if (connector.kind == op::scan::source_kind::generator) {
+    // A generator leaf has no scan metadata either; it reuses the stream materializer kind so
+    // no materializer_kind switch needs a new case.
+    kind = op::scan::materializer_kind::stream;
   } else if (connector.function_name == "iceberg_scan") {
     kind = op::scan::materializer_kind::iceberg;
   }
