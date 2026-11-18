@@ -51,8 +51,6 @@ inline between<std::chrono::seconds> keepalive_seconds()
 
 /// `sirius.executor.scan_manager.uring`: the local-disk IO reactors.
 struct uring_options : block_base<uring_options> {
-  static constexpr bool developer_block = true;
-
   /// Unset: one scan per pipeline thread, derived when the configuration is resolved; an explicit
   /// 0 keeps local readahead off.
   config_option<std::size_t> n_max_concurrent_scans =
@@ -80,8 +78,6 @@ struct uring_options : block_base<uring_options> {
 /// `sirius.executor.scan_manager.rest.tls`: TLS for object-store connections. Trust settings belong
 /// to the object store configuration, not to this file.
 struct tls_options : block_base<tls_options> {
-  static constexpr bool developer_block = true;
-
   using ktls_mode     = cucascade::io::tls::ktls_mode;
   using rx_mode       = cucascade::io::tls::user_space_rx;
   using placement     = cucascade::io::tls::recv_placement;
@@ -194,8 +190,6 @@ struct tls_options : block_base<tls_options> {
 /// cuCascade's (rest::config::validate()); resolving the configuration runs that check again with
 /// the derived values in place.
 struct rest_options : block_base<rest_options> {
-  static constexpr bool developer_block = true;
-
   static const cucascade::io::rest::config& defaults()
   {
     return detail::scan_manager_defaults().rest;
@@ -270,12 +264,15 @@ struct rest_options : block_base<rest_options> {
   // -- connection pool
   /// Unset: half the queue depth, up to 128 with kernel TLS or 64 without, derived when the
   /// configuration is resolved.
-  config_option<std::size_t> max_connections =
-    option<std::size_t>("max_connections").validate(between<std::size_t>{1, 4096}).build();
+  config_option<std::size_t> max_connections = option<std::size_t>("max_connections")
+                                                 .validate(between<std::size_t>{1, 4096})
+                                                 .mark_production()
+                                                 .build();
   config_option<std::chrono::seconds> conn_max_age =
     option<std::chrono::seconds>("conn_max_age_s")
       .validate(non_negative<std::chrono::seconds>{})
       .fallback(defaults().conn_max_age)
+      .mark_production()
       .build();
   config_option<std::chrono::milliseconds> upkeep_interval =
     option<std::chrono::milliseconds>("upkeep_interval_ms")
@@ -319,6 +316,7 @@ struct rest_options : block_base<rest_options> {
   config_option<ubytes> min_mtu =
     option<ubytes>("min_mtu")
       .validate(between<ubytes>{ubytes{}, ubytes(detail::max_min_mtu)})
+      .mark_production()
       .build();
   config_option<unsigned> mtu_reject_max_attempts = option<unsigned>("mtu_reject_max_attempts")
                                                       .validate(positive<unsigned>{})
@@ -356,7 +354,7 @@ struct rest_options : block_base<rest_options> {
   config_option<std::string> interface =
     option<std::string>("interface").fallback(defaults().interface).build();
   config_option<bool> pin_to_irq_cpus =
-    option<bool>("pin_to_irq_cpus").fallback(defaults().pin_to_irq_cpus).build();
+    option<bool>("pin_to_irq_cpus").fallback(defaults().pin_to_irq_cpus).mark_production().build();
   config_option<bool> raise_reactor_priority =
     option<bool>("raise_reactor_priority").fallback(defaults().raise_reactor_priority).build();
 
@@ -439,20 +437,24 @@ struct cache_options : block_base<cache_options> {
         return parser<cache_mode>{}(text, out);
       })
       .fallback(detail::scan_manager_defaults().cache.mode)
+      .mark_production()
       .build();
   config_option<eviction_policy> eviction =
     option<eviction_policy>("eviction")
       .fallback(detail::scan_manager_defaults().cache.eviction)
+      .mark_production()
       .build();
   config_option<double> min_prefetching_budget_fraction =
     option<double>("min_prefetching_budget_fraction")
       .validate(fraction{})
       .fallback(detail::scan_manager_defaults().cache.min_prefetching_budget_fraction)
+      .mark_production()
       .build();
   config_option<double> eviction_threshold_fraction =
     option<double>("eviction_threshold_fraction")
       .validate(fraction{})
       .fallback(detail::scan_manager_defaults().cache.eviction_threshold_fraction)
+      .mark_production()
       .build();
 
   auto fields()
@@ -469,7 +471,8 @@ struct memory_prefetcher_options : block_base<memory_prefetcher_options> {
     return detail::scan_manager_defaults().memory_prefetcher;
   }
 
-  config_option<bool> enable = option<bool>("enable").fallback(defaults().enable).build();
+  config_option<bool> enable =
+    option<bool>("enable").fallback(defaults().enable).mark_production().build();
   config_option<std::size_t> num_threads = option<std::size_t>("num_threads")
                                              .validate(positive<std::size_t>{})
                                              .fallback(defaults().num_threads)
@@ -498,8 +501,6 @@ struct memory_prefetcher_options : block_base<memory_prefetcher_options> {
 /// `sirius.executor.scan_manager.preparation.partial_batch`: when a partly filled batch is
 /// published anyway. Always on.
 struct partial_batch_options : block_base<partial_batch_options> {
-  static constexpr bool developer_block = true;
-
   config_option<std::size_t> min_fill_percent =
     option<std::size_t>("min_fill_percent")
       .validate(between<std::size_t>{1, 100})
@@ -529,8 +530,6 @@ struct partial_batch_options : block_base<partial_batch_options> {
 /// `sirius.executor.scan_manager.preparation`: how scans prepare their inputs. Unset limits are
 /// resolved from the scan worker count when the scan manager starts.
 struct preparation_options : block_base<preparation_options> {
-  static constexpr bool developer_block = true;
-
   /// 0 = unlimited.
   config_option<std::size_t> max_inflight_metadata_jobs =
     option<std::size_t>("max_inflight_metadata_jobs").build();
@@ -591,7 +590,8 @@ struct preparation_options : block_base<preparation_options> {
 /// `sirius.executor.scan_manager`: the scan workers and the IO backends behind them.
 struct scan_manager_options : block_base<scan_manager_options> {
   /// Unset: the fixed scan-worker default, derived when the configuration is resolved.
-  config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
+  config_option<int> num_threads =
+    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
   config_option<std::vector<int>> cpu_affinity =
     option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
   /// `sirius` is the deprecated spelling of `native`.
@@ -605,20 +605,22 @@ struct scan_manager_options : block_base<scan_manager_options> {
         return parser<scan_manager::io_backend>{}(text, out);
       })
       .fallback(detail::scan_manager_defaults().backend)
+      .mark_production()
       .build();
   /// Unset: derived from the CPU count when the configuration is resolved.
   config_option<std::size_t> uring_n_reactors =
     option<std::size_t>("uring_n_reactors").validate(positive<std::size_t>{}).build();
   /// Unset: derived from the egress NIC and the CPU count when the configuration is resolved;
   /// 0 lets cuCascade size each pool from the NIC.
-  config_option<std::size_t> rest_n_reactors = option<std::size_t>("rest_n_reactors").build();
+  config_option<std::size_t> rest_n_reactors =
+    option<std::size_t>("rest_n_reactors").mark_production().build();
   config_option<bool> reserve_rest_reactor_cpus =
     option<bool>("reserve_rest_reactor_cpus")
       .fallback(detail::scan_manager_defaults().reserve_rest_reactor_cpus)
       .build();
   /// Unset: the cache and the backend decide; 0 turns readahead off.
   config_option<std::size_t> max_readahead_scans =
-    option<std::size_t>("max_readahead_scans").build();
+    option<std::size_t>("max_readahead_scans").mark_production().build();
   /// Unset: the backend's preference.
   config_option<scan_manager::prefetch_strategy> readahead_strategy =
     option<scan_manager::prefetch_strategy>("readahead_strategy").build();

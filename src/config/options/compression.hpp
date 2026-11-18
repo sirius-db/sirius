@@ -46,8 +46,10 @@ struct compression_options : block_base<compression_options> {
                                                 .scope(option_scope::query)
                                                 .build();
   /// SET spill_compression changes it for the whole process, so it is session-scoped.
-  config_option<bool> enable_spill_compression =
-    option<bool>("enable_spill_compression").fallback(defaults().enable_spill_compression).build();
+  config_option<bool> enable_spill_compression = option<bool>("enable_spill_compression")
+                                                   .fallback(defaults().enable_spill_compression)
+                                                   .mark_production()
+                                                   .build();
   config_option<ubytes> spill_min_batch_bytes =
     option<ubytes>("spill_min_batch_bytes")
       .fallback(ubytes(defaults().spill_min_batch_bytes))

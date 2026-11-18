@@ -24,7 +24,8 @@ inline const exec::downgrade_executor_config& downgrade_defaults()
 /// `sirius.executor.task_creator`: the threads that turn ready inputs into GPU tasks.
 struct task_creator_options : block_base<task_creator_options> {
   /// Unset: the resolver's fixed default.
-  config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
+  config_option<int> num_threads =
+    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
   config_option<std::vector<int>> cpu_affinity =
     option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
 
@@ -45,7 +46,8 @@ struct task_creator_options : block_base<task_creator_options> {
 /// `sirius.executor.pipeline`: the GPU pipeline threads.
 struct pipeline_options : block_base<pipeline_options> {
   /// Unset: derived from the machine and the GPU count when the configuration is resolved.
-  config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
+  config_option<int> num_threads =
+    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
 
   auto fields() { return field_list(num_threads); }
 };
@@ -53,7 +55,8 @@ struct pipeline_options : block_base<pipeline_options> {
 /// `sirius.executor.downgrade`: the threads that spill batches to lower memory tiers.
 struct downgrade_options : block_base<downgrade_options> {
   /// Unset: derived from the machine and the GPU count when the configuration is resolved.
-  config_option<int> num_threads = option<int>("num_threads").validate(positive<int>{}).build();
+  config_option<int> num_threads =
+    option<int>("num_threads").validate(positive<int>{}).mark_production().build();
   config_option<std::vector<int>> cpu_affinity =
     option<std::vector<int>>("cpu_affinity").fallback(std::vector<int>{}).build();
   /// Period of the memory pressure monitor; 0 turns the monitor off.

@@ -333,7 +333,8 @@ class config_option {
   [[nodiscard]] const std::optional<value_type>& fallback() const noexcept { return _fallback; }
   [[nodiscard]] bool is_required() const noexcept { return _required; }
   [[nodiscard]] bool is_prod_only() const noexcept { return _prod_only; }
-  /// A developer-only option: a configuration dump outside developer mode leaves it out.
+  /// A developer-only option, as every option not marked production is: a configuration dump
+  /// outside developer mode leaves it out.
   [[nodiscard]] bool is_developer() const noexcept { return _developer; }
   [[nodiscard]] option_scope scope() const noexcept { return _scope; }
   [[nodiscard]] const std::string& description() const noexcept { return _description; }
@@ -496,7 +497,7 @@ class config_option {
   std::optional<value_type> _value;
   bool _required      = false;
   bool _prod_only     = false;
-  bool _developer     = false;
+  bool _developer     = true;
   option_scope _scope = option_scope::session;
   std::string _description;
   value_source _source = value_source::unset;
@@ -686,10 +687,11 @@ class option_builder {
     _spec._required = false;
     return *this;
   }
-  /// Developer-only: kept out of a configuration dump unless Sirius runs in developer mode.
-  option_builder& for_developers()
+  /// A production setting: written to every configuration dump. Options left unmarked are
+  /// developer-only, kept out of a dump unless Sirius runs in developer mode.
+  option_builder& mark_production()
   {
-    _spec._developer = true;
+    _spec._developer = false;
     return *this;
   }
   option_builder& for_prod()

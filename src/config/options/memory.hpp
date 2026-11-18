@@ -21,6 +21,7 @@ struct gpu_memory_options : block_base<gpu_memory_options> {
                                                 .or_type<double>("usage_limit_fraction")
                                                 .validate(fraction{})
                                                 .fallback(0.95)
+                                                .mark_production()
                                                 .build();
 
   /// How much of the capacity reservations may take: bytes or a fraction of it.
@@ -28,12 +29,19 @@ struct gpu_memory_options : block_base<gpu_memory_options> {
                                                       .or_type<double>("reservation_limit_fraction")
                                                       .validate(positive_fraction{})
                                                       .fallback(1.0)
+                                                      .mark_production()
                                                       .build();
 
-  config_option<double> downgrade_trigger_fraction =
-    option<double>("downgrade_trigger_fraction").validate(fraction{}).fallback(0.8).build();
-  config_option<double> downgrade_stop_fraction =
-    option<double>("downgrade_stop_fraction").validate(fraction{}).fallback(0.6).build();
+  config_option<double> downgrade_trigger_fraction = option<double>("downgrade_trigger_fraction")
+                                                       .validate(fraction{})
+                                                       .fallback(0.8)
+                                                       .mark_production()
+                                                       .build();
+  config_option<double> downgrade_stop_fraction = option<double>("downgrade_stop_fraction")
+                                                    .validate(fraction{})
+                                                    .fallback(0.6)
+                                                    .mark_production()
+                                                    .build();
 
   auto fields()
   {
@@ -56,30 +64,40 @@ struct host_memory_options : block_base<host_memory_options> {
                                              .or_type<double>("capacity_fraction")
                                              .validate(positive_fraction{})
                                              .fallback(0.9)
+                                             .mark_production()
                                              .build();
 
   config_option<ubytes, double> reservation_limit = option<ubytes>("reservation_limit_bytes")
                                                       .or_type<double>("reservation_limit_fraction")
                                                       .validate(positive_fraction{})
                                                       .fallback(1.0)
+                                                      .mark_production()
                                                       .build();
 
-  config_option<double> downgrade_trigger_fraction =
-    option<double>("downgrade_trigger_fraction").validate(fraction{}).fallback(0.9).build();
-  config_option<double> downgrade_stop_fraction =
-    option<double>("downgrade_stop_fraction").validate(fraction{}).fallback(0.8).build();
+  config_option<double> downgrade_trigger_fraction = option<double>("downgrade_trigger_fraction")
+                                                       .validate(fraction{})
+                                                       .fallback(0.9)
+                                                       .mark_production()
+                                                       .build();
+  config_option<double> downgrade_stop_fraction = option<double>("downgrade_stop_fraction")
+                                                    .validate(fraction{})
+                                                    .fallback(0.8)
+                                                    .mark_production()
+                                                    .build();
 
   config_option<ubytes> block_size = option<ubytes>("block_size")
                                        .validate(positive<ubytes>{})
                                        .fallback(ubytes(cucascade::memory::default_block_size))
+                                       .mark_production()
                                        .build();
   config_option<std::size_t> pool_size = option<std::size_t>("pool_size")
                                            .validate(positive<std::size_t>{})
                                            .fallback(cucascade::memory::default_pool_size)
+                                           .mark_production()
                                            .build();
   /// Unset: sized from the NUMA node's memory when the configuration is resolved.
   config_option<std::size_t> initial_number_pools =
-    option<std::size_t>("initial_number_pools").build();
+    option<std::size_t>("initial_number_pools").mark_production().build();
 
   auto fields()
   {
@@ -102,12 +120,12 @@ struct host_memory_options : block_base<host_memory_options> {
 /// `sirius.memory.disk`: the disk tier batches spill to. Off unless downgrade_root_dirs is set and
 /// capacity_bytes is nonzero.
 struct disk_memory_options : block_base<disk_memory_options> {
-  config_option<int> disk_id = option<int>("disk_id").fallback(0).build();
+  config_option<int> disk_id = option<int>("disk_id").fallback(0).mark_production().build();
   config_option<ubytes> capacity_bytes =
-    option<ubytes>("capacity_bytes").fallback(tebibytes(1)).build();
+    option<ubytes>("capacity_bytes").fallback(tebibytes(1)).mark_production().build();
   /// The spill directory; empty turns the disk tier off.
   config_option<std::string> downgrade_root_dirs =
-    option<std::string>("downgrade_root_dirs").fallback(std::string{}).build();
+    option<std::string>("downgrade_root_dirs").fallback(std::string{}).mark_production().build();
 
   auto fields() { return field_list(disk_id, capacity_bytes, downgrade_root_dirs); }
 };

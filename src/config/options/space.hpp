@@ -146,8 +146,6 @@ struct disk_space_options : block_base<disk_space_options> {
 /// `sirius.space`: memory spaces listed one by one (the low-level alternative to sirius.memory).
 /// Any non-empty list replaces the per-tier description and the topology's GPU selection.
 struct space_options : block_base<space_options> {
-  static constexpr bool developer_block = true;
-
   std::vector<gpu_space_options> gpu;
   std::vector<host_space_options> host;
   std::vector<disk_space_options> disk;
