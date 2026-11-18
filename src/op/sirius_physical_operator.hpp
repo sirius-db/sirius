@@ -745,6 +745,17 @@ class sirius_physical_operator {
     return {};
   }
 
+  /// Whether so much input is waiting on @p port_id that its producer should be given no further
+  /// task for now. The task creator asks before every task it creates for the producing
+  /// pipeline. An operator that answers true must call `task_creator::schedule(this)` whenever a
+  /// task of its own finishes: that request is what restarts the producer. Default: never.
+  [[nodiscard]] virtual bool input_backlogged(std::string_view /*port_id*/) { return false; }
+
+  /// Whether the pipeline this operator starts is scheduled ahead of the pipeline producing its
+  /// input, against plan order, so its input is consumed as it arrives instead of after the
+  /// producer's queued tasks (`task_creator::compute_pipeline_priorities`). Default: plan order.
+  [[nodiscard]] virtual bool runs_ahead_of_producer() const noexcept { return false; }
+
  public:
   // Operator interface
 

@@ -2888,6 +2888,21 @@ static void SetSortCoalesceMemoryFraction(ClientContext& context, SetScope scope
                    params->sort_coalesce_memory_fraction);
 }
 
+static void SetSortCoalesceConcurrentRuns(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                          = get_operator_params(context, scope);
+  params->sort_coalesce_concurrent_runs = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_coalesce_concurrent_runs to {}",
+                   params->sort_coalesce_concurrent_runs);
+}
+
+static void SetSortInputBackpressure(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                    = get_operator_params(context, scope);
+  params->sort_input_backpressure = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config sort_input_backpressure to {}", params->sort_input_backpressure);
+}
+
 static void SetSortCoalesceStringKeys(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                      = get_operator_params(context, scope);
@@ -3991,10 +4006,24 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   config.AddExtensionOption(
     "sort_coalesce_memory_fraction",
     "Share of one GPU's memory for the inputs of concurrently running local sorts: one coalesced "
-    "run is at most this fraction of the GPU divided by the GPU executor thread count (in (0, 1])",
+    "run is at most this fraction of the GPU divided by sort_coalesce_concurrent_runs (in (0, 1])",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.sort_coalesce_memory_fraction),
     SetSortCoalesceMemoryFraction);
+  config.AddExtensionOption(
+    "sort_coalesce_concurrent_runs",
+    "Full ORDER BY runs one GPU sorts at the same time (0 = one per GPU executor thread, with no "
+    "bound on the sorts running at once)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sort_coalesce_concurrent_runs),
+    SetSortCoalesceConcurrentRuns);
+  config.AddExtensionOption(
+    "sort_input_backpressure",
+    "Schedule the local sort and the range partitioning of ORDER BY ahead of the tasks producing "
+    "their input, and hold the producer of a coalescing sort back while unsorted input waits",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.sort_input_backpressure),
+    SetSortInputBackpressure);
   config.AddExtensionOption("sort_coalesce_string_keys",
                             "Coalesce ORDER BY runs also when a sort key is a string (applies "
                             "only while sort_key_encoding is on)",

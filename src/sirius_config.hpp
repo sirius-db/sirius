@@ -99,14 +99,23 @@ constexpr bool DEFAULT_SORT_PARTITION_AUTO_SIZING = true;
 
 /// Default for sort_coalesce_memory_fraction: the share of one GPU's memory that the inputs of the
 /// local sorts running at the same time may add up to. One sorted run is at most this fraction
-/// of the GPU's memory divided by the number of GPU executor threads.
+/// of the GPU's memory divided by sort_coalesce_concurrent_runs.
 ///
 /// Why 0.25: a coalesced sort task holds its input batches, their concatenation, the sort's
-/// scratch and the sorted copy, about 3.3 times the run. With four executor threads a run is
-/// 1/16 of the GPU and the four sorts together stay near 80% of it at their peak only while every
-/// thread sorts a full run; runs of 5% of the GPU limit sorted without an out-of-memory retry
-/// and runs of 10% did not.
+/// scratch and the sorted copy, about 3.3 times the run, so the sorts running at once stay near
+/// 80% of the GPU at their peak only while each of them sorts a full run.
 inline constexpr double DEFAULT_SORT_COALESCE_MEMORY_FRACTION = 0.25;
+
+/// Default for sort_coalesce_concurrent_runs: how many full runs one GPU sorts at the same time.
+/// One run is sort_coalesce_memory_fraction of the GPU divided by this, and a GPU starts another
+/// sort only while the inputs of its running sorts stay within the fraction. 0 restores the
+/// previous rule: a run is the fraction divided by the GPU executor thread count and every
+/// thread may sort one.
+///
+/// Why 2: the sort is a small part of the work on the batches it reads, so two at a time keep up
+/// with the scan, and a run of an eighth of the GPU covers several scan batches, which is what
+/// lowers the number of runs per range partition and so the merge passes.
+inline constexpr uint64_t DEFAULT_SORT_COALESCE_CONCURRENT_RUNS = 2;
 
 /// Default for sort_merge_max_fan_in: the most runs one MERGE_SORT task reads. A partition with
 /// more runs is merged in passes.
@@ -336,8 +345,18 @@ struct operator_params {
   bool sort_coalesce_runs = true;
 
   /// Share of one GPU's memory for the inputs of concurrently running local sorts; one run is at
-  /// most this fraction of the GPU divided by the GPU executor thread count.
+  /// most this fraction of the GPU divided by sort_coalesce_concurrent_runs.
   double sort_coalesce_memory_fraction = config::DEFAULT_SORT_COALESCE_MEMORY_FRACTION;
+
+  /// Full runs one GPU sorts at the same time (SET sort_coalesce_concurrent_runs). 0: one per GPU
+  /// executor thread, with no bound on how many sorts run at once.
+  uint64_t sort_coalesce_concurrent_runs = config::DEFAULT_SORT_COALESCE_CONCURRENT_RUNS;
+
+  /// Whether the local sort and the range partitioning of ORDER BY are scheduled ahead of the
+  /// tasks that produce their input, and the producer of a coalescing sort is held back while
+  /// twice sort_coalesce_memory_fraction of every GPU is waiting unsorted (SET
+  /// sort_input_backpressure). Off: plan order, and the producer is never held back.
+  bool sort_input_backpressure = true;
 
   /// Whether runs are also coalesced when a sort key is a string. It applies only while
   /// sort_key_encoding is on: the encoded sort costs the same per row at any run size, while

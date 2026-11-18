@@ -16,9 +16,11 @@
 
 #include "op/sirius_physical_sort_sample.hpp"
 
+#include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
@@ -386,6 +388,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
+    schedule_next_task();
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -563,7 +566,54 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    num_boundary_rows(),
                    duration.count() / 1000.0);
 
+  schedule_next_task();
   return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+}
+
+void sirius_physical_sort_sample::schedule_next_task()
+{
+  if (!runs_ahead_of_producer()) { return; }
+  if (auto pipeline = get_pipeline()) {
+    if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
+  }
+}
+
+bool sirius_physical_sort_sample::input_backlogged(std::string_view /*port_id*/)
+{
+  if (!runs_ahead_of_producer() ||
+      _boundary_state.load(std::memory_order_acquire) != BoundaryState::DONE) {
+    return false;
+  }
+  auto port_ids = get_port_ids();
+  if (port_ids.empty()) { return false; }
+  auto* p = get_port(port_ids[0]);
+  if (!p || !p->repo || !p->src_pipeline || p->src_pipeline->is_pipeline_finished()) {
+    return false;
+  }
+  std::size_t waiting = 0;
+  std::size_t runs    = 0;
+  for (size_t part = 0; part < p->repo->num_partitions(); ++part) {
+    for (auto batch_id : p->repo->get_batch_ids(part)) {
+      auto batch = p->repo->get_data_batch_by_id(batch_id, part);
+      if (!batch) { continue; }
+      // A run that is being moved between tiers is exclusively locked: do not wait for it.
+      auto const read_only = batch->try_to_read_only();
+      if (!read_only || !read_only->get_data()) { continue; }
+      waiting = memory::saturating_add(waiting,
+                                       read_only->get_data()->get_uncompressed_data_size_in_bytes());
+      ++runs;
+    }
+  }
+  // A producer task counts as finished before this operator is scheduled for its output, so the
+  // request that follows the last of them sees only the parked runs, and every parked run gets
+  // a task, each of which schedules this operator again.
+  if (runs != 0) {
+    auto const created    = p->src_pipeline->get_tasks_created();
+    auto const completed  = p->src_pipeline->get_tasks_completed();
+    auto const unfinished = created - std::min(created, completed);
+    waiting = memory::saturating_add(waiting, memory::saturating_mul(unfinished, waiting / runs));
+  }
+  return waiting >= _input_backlog_bytes;
 }
 
 cudf::table_view sirius_physical_sort_sample::get_partition_boundaries(

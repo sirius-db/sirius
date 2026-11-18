@@ -1512,6 +1512,31 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
   });
 }
 
+//! The limits of a coalesced ORDER_BY run for this engine and these settings
+//! (`sirius::op::make_sort_run_limits`), or nullopt without an engine context to size a run from.
+std::optional<sirius::op::sort_run_limits> engine_sort_run_limits(
+  const sirius::operator_params& op_params, duckdb::SiriusContext* sirius_ctx)
+{
+  if (sirius_ctx == nullptr || !sirius_ctx->is_initialized()) { return std::nullopt; }
+  // A task may land on any GPU: size a run for the smallest one.
+  std::size_t gpu_bytes = 0;
+  auto const gpu_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  for (auto const* space : gpu_spaces) {
+    if (gpu_bytes == 0 || space->get_max_memory() < gpu_bytes) {
+      gpu_bytes = space->get_max_memory();
+    }
+  }
+  auto const threads = static_cast<std::size_t>(
+    std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
+  return sirius::op::make_sort_run_limits(gpu_bytes,
+                                          gpu_spaces.size(),
+                                          threads,
+                                          op_params.sort_coalesce_memory_fraction,
+                                          op_params.sort_coalesce_concurrent_runs,
+                                          op_params.sort_input_backpressure);
+}
+
 //! The limits of one coalesced ORDER_BY run, or nullopt when the local sort should stay per batch:
 //! the setting is off, there is no engine context to size a run from, a column is nested (only
 //! fixed-width and string columns are concatenated), a sort key is not a plain column, or a sort
@@ -1541,23 +1566,7 @@ std::optional<sirius::op::sort_run_limits> order_by_run_limits(
       return std::nullopt;
     }
   }
-  // A task may land on any GPU: size a run for the smallest one.
-  std::size_t gpu_bytes = 0;
-  for (auto const* space :
-       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (gpu_bytes == 0 || space->get_max_memory() < gpu_bytes) {
-      gpu_bytes = space->get_max_memory();
-    }
-  }
-  auto const threads = static_cast<std::size_t>(
-    std::max(1, sirius_ctx->get_config().get_gpu_pipeline_executor_config().num_threads));
-  auto const run_bytes = static_cast<std::size_t>(static_cast<double>(gpu_bytes) *
-                                                  op_params.sort_coalesce_memory_fraction) /
-                         threads;
-  if (run_bytes == 0) { return std::nullopt; }
-  sirius::op::sort_run_limits limits;
-  limits.max_run_bytes = run_bytes;
-  return limits;
+  return engine_sort_run_limits(op_params, sirius_ctx);
 }
 
 //! Replace an ORDER_BY slot with `MERGE_SORT → SORT_PARTITION → SORT_SAMPLE → ORDER_BY →
@@ -1592,7 +1601,7 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     order_ptr->types       = child_types;
 
     if (auto const limits = order_by_run_limits(*order_ptr, child_types, op_params, sirius_ctx)) {
-      order_ptr->enable_run_coalescing(*limits);
+      order_ptr->enable_run_coalescing(*limits, order_ptr->children[0]->get_physical_types());
       wrap_child(*order_ptr, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
         auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
           child->types, child->estimated_cardinality, "default");
@@ -1638,6 +1647,11 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
         }
       }
       sample->set_partition_policy(policy);
+    }
+    // Sorted runs waiting to be partitioned are bounded like the unsorted input of a coalescing
+    // sort, whichever mode the local sort is in.
+    if (auto const limits = engine_sort_run_limits(op_params, sirius_ctx)) {
+      sample->set_input_backlog_bytes(limits->max_backlog_bytes);
     }
     sample->children.push_back(std::move(order_op));
 

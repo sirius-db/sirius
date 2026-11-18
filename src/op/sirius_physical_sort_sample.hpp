@@ -264,6 +264,24 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   [[nodiscard]] bool all_ports_empty() override;
   //! With a hook the boundary task runs with no input, since the other processes wait for it.
   //! get_next_task_input_data() has already claimed it (SCHEDULED) when the task creator asks.
+  //! Bytes of sorted runs waiting to be partitioned at which the local sort producing them is
+  //! given no further task (`input_backlogged()`); the range partitioning is then also scheduled
+  //! ahead of that sort, so a run is cut as soon as it exists instead of waiting behind the sorts
+  //! still queued. 0 (the default): plan order, and the producer is never held back.
+  void set_input_backlog_bytes(std::size_t bytes) noexcept { _input_backlog_bytes = bytes; }
+  [[nodiscard]] std::size_t input_backlog_bytes() const noexcept { return _input_backlog_bytes; }
+  [[nodiscard]] bool runs_ahead_of_producer() const noexcept override
+  {
+    // Not where the boundaries come from every rank: there the runs wait for the other ranks.
+    return _input_backlog_bytes != 0 && !_cross_rank_boundaries;
+  }
+
+  //! Whether `input_backlog_bytes()` of runs are waiting while the producer is still running:
+  //! the parked runs plus, at their average size, the producer's unfinished tasks. Never before
+  //! the boundaries exist, when the runs wait for the sample and not for a task, and never with
+  //! cross-rank boundaries.
+  [[nodiscard]] bool input_backlogged(std::string_view port_id) override;
+
   [[nodiscard]] bool runs_without_input() const override
   {
     return _cross_rank_boundaries != nullptr && boundary_state() != BoundaryState::DONE;
@@ -353,6 +371,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! See set_cross_rank_boundaries().
   std::shared_ptr<cross_rank_sort_boundaries> _cross_rank_boundaries;
+  std::size_t _input_backlog_bytes = 0;
+
+  //! With a backlog limit, asks the task creator for this operator's next task: the request
+  //! that restarts a producer held back by `input_backlogged()`.
+  void schedule_next_task();
 
   //! What the hook returned, until the host copy is made: the hook takes part only once, so a
   //! boundary task retried after that (an OOM while copying) must not ask it again. Only one

@@ -39,6 +39,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sirius::creator {
@@ -270,6 +271,47 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   for (auto& [pipeline, priority] : priorities) {
     const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
     priority        = query_bits | static_cast<exec::queue_priority>(rank);
+  }
+
+  // A pipeline whose source asks to run ahead of its producer (runs_ahead_of_producer()) trades
+  // places with it. Such pipelines form chains, consumer above producer; the priorities a chain
+  // holds are handed out again from its last consumer down to its first producer, so the chain
+  // keeps its place among the other pipelines and only its internal order is reversed.
+  std::unordered_map<const pipeline::sirius_pipeline*, const pipeline::sirius_pipeline*> producer;
+  std::unordered_set<const pipeline::sirius_pipeline*> is_producer;
+  for (const auto& entry : priorities) {
+    const auto* pipeline = entry.first;
+    auto source          = pipeline->get_source();
+    if (!source || !source->runs_ahead_of_producer()) { continue; }
+    const pipeline::sirius_pipeline* only = nullptr;
+    bool single                           = true;
+    for (auto const port_id : source->get_port_ids()) {
+      auto* port = source->get_port(port_id);
+      if (port == nullptr || port->repo == nullptr || !port->src_pipeline) { continue; }
+      single = single && (only == nullptr || only == port->src_pipeline.get());
+      only   = port->src_pipeline.get();
+    }
+    if (!single || only == nullptr || only == pipeline || !priorities.contains(only)) { continue; }
+    producer.emplace(pipeline, only);
+    is_producer.insert(only);
+  }
+  for (const auto& link : producer) {
+    const auto* consumer = link.first;
+    if (is_producer.contains(consumer)) { continue; }  // not the last consumer of its chain
+    std::vector<const pipeline::sirius_pipeline*> chain{consumer};
+    for (auto it = producer.find(consumer); it != producer.end(); it = producer.find(it->second)) {
+      if (std::find(chain.begin(), chain.end(), it->second) != chain.end()) { break; }
+      chain.push_back(it->second);
+    }
+    std::vector<exec::queue_priority> held;
+    held.reserve(chain.size());
+    for (const auto* pipeline : chain) {
+      held.push_back(priorities.at(pipeline));
+    }
+    std::sort(held.begin(), held.end());
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+      priorities[chain[i]] = held[i];
+    }
   }
   return priorities;
 }
@@ -711,6 +753,17 @@ void task_creator::manager_loop()
               // Serialize this check with task registration and pipeline completion. A claim
               // may race this check, but any extra task is counted and safely claims zero rows.
               if (pipeline->is_pipeline_finished() || pipeline->is_limit_exhausted()) { break; }
+              // A consumer with enough input waiting holds its producer back; it schedules itself
+              // when one of its tasks finishes, and that request leads back here.
+              auto const consumer_ports = pipeline->get_next_ports_after_sink();
+              if (std::any_of(
+                    consumer_ports.begin(), consumer_ports.end(), [](const auto& port_info) {
+                      return port_info.next_operator != nullptr &&
+                             port_info.next_operator->input_backlogged(
+                               port_info.next_operator_port_name);
+                    })) {
+                break;
+              }
               auto input_data = node->get_next_task_input_data();
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());

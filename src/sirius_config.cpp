@@ -824,6 +824,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (!(opt.sort_coalesce_memory_fraction > 0.0 && opt.sort_coalesce_memory_fraction <= 1.0)) {
     throw std::runtime_error("'operator_params.sort_coalesce_memory_fraction': must be in (0, 1]");
   }
+  r.optional("sort_coalesce_concurrent_runs", opt.sort_coalesce_concurrent_runs);
+  r.optional("sort_input_backpressure", opt.sort_input_backpressure);
   r.optional("sort_coalesce_string_keys", opt.sort_coalesce_string_keys);
   r.optional("hash_partition_bytes", yaml::bytes(opt.hash_partition_bytes));
   if (opt.hash_partition_bytes == 0) {

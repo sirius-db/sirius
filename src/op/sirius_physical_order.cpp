@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_order.hpp"
 
+#include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
@@ -31,6 +32,8 @@
 
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -82,6 +85,26 @@ process_counter_storage& process_storage()
 }
 
 }  // namespace
+
+std::optional<sort_run_limits> make_sort_run_limits(std::size_t gpu_bytes,
+                                                    std::size_t num_gpus,
+                                                    std::size_t executor_threads,
+                                                    double fraction,
+                                                    std::size_t concurrent_runs,
+                                                    bool backpressure)
+{
+  auto const total = static_cast<std::size_t>(static_cast<double>(gpu_bytes) * fraction);
+  auto const runs  = concurrent_runs != 0 ? concurrent_runs : std::max<std::size_t>(1, executor_threads);
+  sort_run_limits limits;
+  limits.max_run_bytes = total / runs;
+  if (limits.max_run_bytes == 0) { return std::nullopt; }
+  if (concurrent_runs != 0) { limits.max_concurrent_bytes = total; }
+  if (backpressure) {
+    limits.max_backlog_bytes =
+      memory::saturating_mul(memory::saturating_mul(total, 2), std::max<std::size_t>(1, num_gpus));
+  }
+  return limits;
+}
 
 sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type> types,
                                              duckdb::vector<duckdb::BoundOrderByNode> orders,
@@ -227,10 +250,14 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
   record();
 
   SIRIUS_LOG_DEBUG("ORDER_BY: sorted {} input batches as {} runs", sorted_batches, runs);
+  if (auto const& claimed = input.get_data_batches(); !claimed.empty() && claimed.front()) {
+    finish_claim(claimed.front()->get_batch_id());
+  }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }
 
-void sirius_physical_order::enable_run_coalescing(sort_run_limits limits)
+void sirius_physical_order::enable_run_coalescing(sort_run_limits limits,
+                                                  const std::vector<cudf::data_type>& physical_types)
 {
   if (limits.max_run_bytes == 0) {
     throw std::invalid_argument("sirius_physical_order: max_run_bytes must be positive");
@@ -239,6 +266,34 @@ void sirius_physical_order::enable_run_coalescing(sort_run_limits limits)
   _coalesce          = true;
   _has_string_column = std::any_of(
     types.begin(), types.end(), [](sirius::logical_type const& type) { return type.is_varchar(); });
+  _non_character_row_bytes = non_character_row_bytes(types, physical_types);
+}
+
+std::size_t sirius_physical_order::non_character_row_bytes(
+  const duckdb::vector<sirius::logical_type>& types,
+  const std::vector<cudf::data_type>& physical_types)
+{
+  std::size_t bytes = 0;
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    if (types[i].is_varchar()) {
+      bytes += sizeof(int32_t);
+      continue;
+    }
+    if (!types[i].is_fixed_width()) { continue; }
+    auto width = types[i].fixed_width_byte_size();
+    if (i < physical_types.size() && cudf::is_fixed_width(physical_types[i])) {
+      width = std::min(width, cudf::size_of(physical_types[i]));
+    }
+    bytes += width;
+  }
+  return bytes;
+}
+
+port_residency_policy sirius_physical_order::input_residency_policy(std::string_view port_id) const
+{
+  auto policy = sirius_physical_operator::input_residency_policy(port_id);
+  if (_coalesce && _limits.max_backlog_bytes != 0) { policy.downgrade_priority = -50; }
+  return policy;
 }
 
 MemoryBarrierType sirius_physical_order::input_barrier_for(
@@ -250,36 +305,72 @@ MemoryBarrierType sirius_physical_order::input_barrier_for(
   return sirius_physical_operator::input_barrier_for(producer);
 }
 
+int sirius_physical_order::run_device(const std::vector<parked_batch>& parked,
+                                      const std::vector<std::size_t>& members)
+{
+  std::unordered_map<int, std::size_t> bytes;
+  for (auto const index : members) {
+    if (parked[index].device >= 0) { bytes[parked[index].device] += parked[index].bytes; }
+  }
+  int device       = -1;
+  std::size_t most = 0;
+  for (auto const& [candidate, held] : bytes) {
+    if (device < 0 || held > most || (held == most && candidate < device)) {
+      device = candidate;
+      most   = held;
+    }
+  }
+  return device;
+}
+
 std::vector<std::size_t> sirius_physical_order::plan_next_run(
   const std::vector<parked_batch>& parked,
   const sort_run_limits& limits,
   bool has_string_column,
-  bool producer_finished)
+  bool producer_finished,
+  const sorting_bytes_by_device& sorting)
 {
-  // Decoded bytes bound every string column's character bytes, so one byte limit covers both.
-  auto max_bytes = limits.max_run_bytes == 0 ? std::numeric_limits<std::size_t>::max()
-                                             : limits.max_run_bytes;
-  if (has_string_column && limits.max_string_column_bytes != 0) {
-    max_bytes = std::min(max_bytes, limits.max_string_column_bytes);
-  }
-  auto const max_rows =
-    limits.max_run_rows == 0 ? std::numeric_limits<std::size_t>::max() : limits.max_run_rows;
+  auto const unlimited = std::numeric_limits<std::size_t>::max();
+  auto const max_bytes = limits.max_run_bytes == 0 ? unlimited : limits.max_run_bytes;
+  auto const max_rows  = limits.max_run_rows == 0 ? unlimited : limits.max_run_rows;
+  auto const max_string_bytes =
+    has_string_column && limits.max_string_column_bytes != 0 ? limits.max_string_column_bytes
+                                                             : unlimited;
 
   struct group {
     int device = -1;
     std::vector<std::size_t> members;
-    std::size_t bytes = 0;
-    std::size_t rows  = 0;
+    std::size_t bytes        = 0;
+    std::size_t rows         = 0;
+    std::size_t string_bytes = 0;
+    bool held_back           = false;  ///< complete, but its device may not sort another run yet
+  };
+  // A batch without a bound of its own may be all characters of one string column.
+  auto const string_bytes_of = [](parked_batch const& batch) {
+    return batch.string_bytes.value_or(batch.bytes);
   };
   auto const takes = [&](group const& g, parked_batch const& batch) {
     if (g.members.empty()) { return true; }
     return batch.bytes <= max_bytes - std::min(g.bytes, max_bytes) &&
-           batch.rows.value_or(0) <= max_rows - std::min(g.rows, max_rows);
+           batch.rows.value_or(0) <= max_rows - std::min(g.rows, max_rows) &&
+           string_bytes_of(batch) <= max_string_bytes - std::min(g.string_bytes, max_string_bytes);
   };
-  auto const add = [](group& g, std::size_t index, parked_batch const& batch) {
+  auto const add = [&](group& g, std::size_t index, parked_batch const& batch) {
     g.members.push_back(index);
-    g.bytes = memory::saturating_add(g.bytes, batch.bytes);
-    g.rows  = memory::saturating_add(g.rows, batch.rows.value_or(0));
+    g.bytes        = memory::saturating_add(g.bytes, batch.bytes);
+    g.rows         = memory::saturating_add(g.rows, batch.rows.value_or(0));
+    g.string_bytes = memory::saturating_add(g.string_bytes, string_bytes_of(batch));
+  };
+  auto const full = [&](group const& g) {
+    return g.bytes >= max_bytes || g.rows >= max_rows || g.string_bytes >= max_string_bytes;
+  };
+  // A device with nothing being sorted takes any group, or a run larger than the limit would
+  // never be sorted.
+  auto const admitted = [&](int device, std::size_t bytes) {
+    if (limits.max_concurrent_bytes == 0) { return true; }
+    auto const it = sorting.find(device);
+    if (it == sorting.end() || it->second == 0) { return true; }
+    return bytes <= limits.max_concurrent_bytes - std::min(it->second, limits.max_concurrent_bytes);
   };
 
   // One open group per location, in order of first appearance.
@@ -292,9 +383,13 @@ std::vector<std::size_t> sirius_physical_order::plan_next_run(
       groups.push_back(group{.device = batch.device});
       it = std::prev(groups.end());
     }
-    if (!takes(*it, batch)) { return it->members; }
-    add(*it, i, batch);
-    if (it->bytes >= max_bytes || it->rows >= max_rows) { return it->members; }
+    if (it->held_back) { continue; }
+    if (takes(*it, batch)) {
+      add(*it, i, batch);
+      if (!full(*it)) { continue; }
+    }
+    if (admitted(it->device, it->bytes)) { return it->members; }
+    it->held_back = true;
   }
   if (!producer_finished || parked.empty()) { return {}; }
 
@@ -304,6 +399,7 @@ std::vector<std::size_t> sirius_physical_order::plan_next_run(
     if (!takes(tail, parked[i])) { break; }
     add(tail, i, parked[i]);
   }
+  if (!admitted(run_device(parked, tail.members), tail.bytes)) { return {}; }
   return tail.members;
 }
 
@@ -338,9 +434,17 @@ std::vector<sirius_physical_order::parked_batch> sirius_physical_order::snapshot
         stats.bytes         = measured.bytes;
       }
       cached = _stats_cache.emplace(id, stats).first;
+      ++_seen_batches;
+      _seen_bytes = memory::saturating_add(_seen_bytes, stats.bytes);
     }
     entry.bytes = cached->second.bytes;
     entry.rows  = cached->second.rows;
+    if (_has_string_column && entry.rows) {
+      // What the batch holds beyond its fixed-width values and string offsets is at most the
+      // characters of its string columns.
+      auto const other   = memory::saturating_mul(*entry.rows, _non_character_row_bytes);
+      entry.string_bytes = entry.bytes - std::min(entry.bytes, other);
+    }
     parked.push_back(entry);
   }
   return parked;
@@ -355,15 +459,62 @@ std::optional<task_creation_hint> sirius_physical_order::get_next_task_hint()
   }
   auto* const port             = ports.begin()->second;
   bool const producer_finished = is_source_pipeline_finished();
-  if (producer_finished) {
-    if (port->repo->total_size() > 0) { return task_creation_hint{TaskCreationHint::READY, this}; }
-    return std::nullopt;
-  }
-  if (!plan_next_run(snapshot_parked(*port->repo), _limits, _has_string_column, false).empty()) {
+  if (!plan_next_run(snapshot_parked(*port->repo),
+                     _limits,
+                     _has_string_column,
+                     producer_finished,
+                     _sorting_bytes)
+         .empty()) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
+  // Batches may remain after the producer finished only while their device is sorting as much as
+  // it may; the task that finishes there schedules this operator again.
+  if (producer_finished) { return std::nullopt; }
   return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
                             &(port->src_pipeline->get_operators()[0].get())};
+}
+
+bool sirius_physical_order::input_backlogged(std::string_view /*port_id*/)
+{
+  if (!_coalesce || _limits.max_backlog_bytes == 0) { return false; }
+  std::lock_guard<std::mutex> lg(lock);
+  if (ports.size() != 1 || ports.begin()->second->repo == nullptr) { return false; }
+  auto* const port = ports.begin()->second;
+  if (is_source_pipeline_finished()) { return false; }
+  std::size_t waiting = 0;
+  for (auto const& batch : snapshot_parked(*port->repo)) {
+    waiting = memory::saturating_add(waiting, batch.bytes);
+  }
+  // The producer's unfinished tasks deliver about one average batch each. A task counts as
+  // finished before its consumers are scheduled, so the request that follows the last of them
+  // sees only the parked batches: at the limit one group is complete, and either it is claimed
+  // or a run is being sorted, whose task schedules this operator when it finishes.
+  if (port->src_pipeline != nullptr && _seen_batches != 0) {
+    auto const created   = port->src_pipeline->get_tasks_created();
+    auto const completed = port->src_pipeline->get_tasks_completed();
+    auto const unfinished = created - std::min(created, completed);
+    waiting = memory::saturating_add(
+      waiting, memory::saturating_mul(unfinished, _seen_bytes / _seen_batches));
+  }
+  return waiting >= _limits.max_backlog_bytes;
+}
+
+void sirius_physical_order::finish_claim(uint64_t first_batch_id)
+{
+  {
+    std::lock_guard<std::mutex> lg(lock);
+    auto const it = _claims.find(first_batch_id);
+    if (it == _claims.end()) { return; }
+    auto& sorting = _sorting_bytes[it->second.device];
+    sorting      -= std::min(sorting, it->second.bytes);
+    _claims.erase(it);
+  }
+  // No producer task schedules this operator for a group that was held back, or for the
+  // producer it stopped: ask for the next task here.
+  if (_limits.max_concurrent_bytes == 0 && _limits.max_backlog_bytes == 0) { return; }
+  if (auto pipeline = get_pipeline()) {
+    if (auto* creator = pipeline->get_task_creator()) { creator->schedule(this); }
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_order::get_next_task_input_data()
@@ -378,17 +529,25 @@ std::unique_ptr<operator_data> sirius_physical_order::get_next_task_input_data()
   // the snapshot below is the complete remainder.
   bool const producer_finished = is_source_pipeline_finished();
   auto const parked            = snapshot_parked(*port->repo);
-  auto const members = plan_next_run(parked, _limits, _has_string_column, producer_finished);
+  auto const members =
+    plan_next_run(parked, _limits, _has_string_column, producer_finished, _sorting_bytes);
   if (members.empty()) { return nullptr; }
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> input_batches;
   input_batches.reserve(members.size());
+  std::size_t claimed_bytes = 0;
   for (auto const index : members) {
     auto batch = port->repo->pop_data_batch_by_id(parked[index].id, 0);
     _stats_cache.erase(parked[index].id);
-    if (batch) { input_batches.push_back(std::move(batch)); }
+    if (batch) {
+      claimed_bytes = memory::saturating_add(claimed_bytes, parked[index].bytes);
+      input_batches.push_back(std::move(batch));
+    }
   }
   if (input_batches.empty()) { return nullptr; }
+  auto const device = run_device(parked, members);
+  _claims[input_batches.front()->get_batch_id()] = claim{.device = device, .bytes = claimed_bytes};
+  _sorting_bytes[device] = memory::saturating_add(_sorting_bytes[device], claimed_bytes);
   auto input = std::make_unique<pipelineable_operator_data>(std::move(input_batches));
   input->set_materialize_on_gpu(port->residency.materialize_inputs_on_gpu);
   return input;
@@ -424,11 +583,13 @@ void sirius_physical_order::on_finalize_operator()
 {
   auto const stats = counters();
   SIRIUS_LOG_INFO(
-    "[order_by][stats] op={} coalesce={} max_run_bytes={} tasks={} batches_in={} runs_out={} "
-    "concat_bytes={}",
+    "[order_by][stats] op={} coalesce={} max_run_bytes={} max_concurrent_bytes={} "
+    "max_backlog_bytes={} tasks={} batches_in={} runs_out={} concat_bytes={}",
     has_operator_id() ? std::to_string(get_operator_id()) : std::string("-"),
     _coalesce ? 1 : 0,
     _coalesce ? _limits.max_run_bytes : 0,
+    _coalesce ? _limits.max_concurrent_bytes : 0,
+    _coalesce ? _limits.max_backlog_bytes : 0,
     stats.tasks,
     stats.input_batches,
     stats.runs,
