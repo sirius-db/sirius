@@ -43,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -136,7 +137,6 @@ struct merge_entry {
   duckdb::Value statistics;
 };
 
-// One lock for the three caches: what each may keep is bounded together with the others.
 std::mutex cache_mutex;
 detail::cache_capacities capacities = detail::default_cache_capacities;
 // Keyed by the reader options as well as the path: options such as can_have_nan change the
@@ -149,26 +149,21 @@ std::list<std::string const*> cache_order;
 std::unordered_map<std::string, merge_entry> merges;
 /// The file ids the merged entries hold together.
 std::size_t merge_references = 0;
-/// The footer row total of one scan of one planning. The plan and the copies made of it share it.
-struct row_total {
-  std::size_t rows;
-  std::uint64_t sequence;
-  std::size_t members = 0;
-  bool withdrawn      = false;
-};
-
+/// The footer row total of one scan, kept for the plan that holds the scan's file list.
 struct row_count_entry {
   duckdb::weak_ptr<duckdb::MultiFileList> owner;
-  std::shared_ptr<row_total> total;
+  std::size_t rows;
+  /// Groups copied counts for the test accessor.
+  std::uint64_t serial;
 };
 
 /// Keyed by the file list of a scan's bind data, which a plan owns and each plan copy has anew, so
 /// a total answers only for the plan it was published or copied for. The weak owner tells a list
 /// that is gone from a new one at its address.
 std::unordered_map<duckdb::MultiFileList const*, row_count_entry> row_counts;
-std::uint64_t next_row_total_sequence = 0;
-/// The totals some live entry still answers with; bounded like the merged statistics.
-std::size_t live_row_totals = 0;
+std::uint64_t next_row_count_serial             = 0;
+constexpr std::size_t row_count_sweep_allowance = 64;
+std::size_t row_count_sweep_at                  = row_count_sweep_allowance;
 
 void evict_statistics_locked()
 {
@@ -193,41 +188,22 @@ void evict_merges_locked()
   }
 }
 
-void erase_row_count_locked(
-  std::unordered_map<duckdb::MultiFileList const*, row_count_entry>::iterator entry)
+/// Drops the entries whose file list is gone. Nothing tells the table when a list goes, so it is
+/// swept when it reaches twice its size after the last sweep plus the allowance: the insertions
+/// since then pay for the sweep.
+void sweep_row_counts_locked()
 {
-  auto& total = *entry->second.total;
-  if (--total.members == 0 && !total.withdrawn) { --live_row_totals; }
-  row_counts.erase(entry);
+  std::erase_if(row_counts, [](auto const& entry) { return entry.second.owner.expired(); });
+  row_count_sweep_at = 2 * row_counts.size() + row_count_sweep_allowance;
 }
 
-/// Drops the entries whose plan is gone or whose total was withdrawn.
-void purge_row_counts_locked()
+void keep_row_count_locked(duckdb::shared_ptr<duckdb::MultiFileList> const& list,
+                           std::size_t rows,
+                           std::uint64_t serial)
 {
-  for (auto entry = row_counts.begin(); entry != row_counts.end();) {
-    auto const stale = entry++;
-    if (stale->second.total->withdrawn || stale->second.owner.expired()) {
-      erase_row_count_locked(stale);
-    }
-  }
-}
-
-/// Withdraws the oldest totals until at most \p limit remain; their plans then have no row count.
-void withdraw_row_totals_locked(std::size_t limit)
-{
-  while (live_row_totals > limit) {
-    row_total* oldest = nullptr;
-    for (auto const& [list, entry] : row_counts) {
-      auto& total = *entry.total;
-      if (!total.withdrawn && (!oldest || total.sequence < oldest->sequence)) { oldest = &total; }
-    }
-    if (!oldest) {
-      live_row_totals = 0;
-      return;
-    }
-    oldest->withdrawn = true;
-    --live_row_totals;
-  }
+  if (row_counts.size() >= row_count_sweep_at) { sweep_row_counts_locked(); }
+  row_counts.insert_or_assign(
+    list.get(), row_count_entry{duckdb::weak_ptr<duckdb::MultiFileList>(list), rows, serial});
 }
 
 std::string cache_key(std::string const& options_identity, std::string const& path)
@@ -521,34 +497,19 @@ duckdb::shared_ptr<duckdb::MultiFileList> const* file_list_of(duckdb::LogicalGet
 
 bool answers(row_count_entry const& entry, duckdb::MultiFileList const* list)
 {
-  return !entry.total->withdrawn && entry.owner.lock().get() == list;
+  return entry.owner.lock().get() == list;
 }
 
 void forget_row_count(duckdb::MultiFileList const* list)
 {
   std::lock_guard guard(cache_mutex);
-  if (auto const found = row_counts.find(list); found != row_counts.end()) {
-    erase_row_count_locked(found);
-  }
+  row_counts.erase(list);
 }
 
 void remember_row_count(duckdb::shared_ptr<duckdb::MultiFileList> const& list, std::size_t rows)
 {
   std::lock_guard guard(cache_mutex);
-  if (auto const found = row_counts.find(list.get()); found != row_counts.end()) {
-    erase_row_count_locked(found);
-  }
-  purge_row_counts_locked();
-  if (capacities.merges == 0) { return; }
-  withdraw_row_totals_locked(capacities.merges - 1);
-  auto total       = std::make_shared<row_total>(row_total{rows, next_row_total_sequence});
-  auto const entry = row_counts.try_emplace(list.get()).first;
-  // Nothing below throws: the entry and the counters change together.
-  entry->second.owner          = duckdb::weak_ptr<duckdb::MultiFileList>(list);
-  entry->second.total          = std::move(total);
-  entry->second.total->members = 1;
-  ++next_row_total_sequence;
-  ++live_row_totals;
+  keep_row_count_locked(list, rows, next_row_count_serial++);
 }
 
 bool add_statistics(duckdb::ClientContext& context,
@@ -582,8 +543,8 @@ bool add_statistics(duckdb::ClientContext& context,
   // optimizer takes what it is given as fact.
   if (!within(limits.remote, scan.remote_reads) || !within(limits.local, scan.local_reads)) {
     SIRIUS_LOG_DEBUG(
-      "No footer statistics for a Parquet scan of {} files: {} remote and {} local footers to "
-      "read, limits {} and {}",
+      "No footer statistics or row count for a Parquet scan of {} files: {} remote and {} local "
+      "footers to read, limits {} and {}",
       all_files.size(),
       scan.remote_reads,
       scan.local_reads,
@@ -626,7 +587,7 @@ void visit(duckdb::ClientContext& context,
       // Withdraw what this call installed; statistics the caller supplied stay.
       if (bind && !supplied) { bind->file_options.column_statistics = duckdb::Value(); }
       if (bind && bind->file_list) { forget_row_count(bind->file_list.get()); }
-      SIRIUS_LOG_DEBUG("No footer statistics for a Parquet scan: {}", e.what());
+      SIRIUS_LOG_DEBUG("No footer statistics or row count for a Parquet scan: {}", e.what());
     }
   }
   for (auto& child : op.children) {
@@ -648,10 +609,16 @@ std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
 {
   auto const* list = file_list_of(get);
   if (!list) { return std::nullopt; }
-  std::lock_guard guard(cache_mutex);
-  auto const found = row_counts.find(list->get());
-  if (found == row_counts.end() || !answers(found->second, list->get())) { return std::nullopt; }
-  return found->second.total->rows;
+  {
+    std::lock_guard guard(cache_mutex);
+    auto const found = row_counts.find(list->get());
+    if (found != row_counts.end() && answers(found->second, list->get())) {
+      return found->second.rows;
+    }
+  }
+  SIRIUS_LOG_DEBUG("No footer row count for the Parquet scan at table index {}",
+                   get.table_index.index);
+  return std::nullopt;
 }
 
 void forget_parquet_scan_row_counts(duckdb::LogicalOperator const& plan)
@@ -675,17 +642,9 @@ void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::Logical
     std::lock_guard guard(cache_mutex);
     auto const found = row_counts.find(source->get());
     if (found == row_counts.end() || !answers(found->second, source->get())) { return; }
-    auto total = found->second.total;
-    if (auto const old = row_counts.find(target->get()); old != row_counts.end()) {
-      erase_row_count_locked(old);
-    }
-    // Copies are made per execution; entries of plans that are gone leave here, not only at the
-    // next planning.
-    if (row_counts.size() > 4 * capacities.merges + 16) { purge_row_counts_locked(); }
-    auto const entry    = row_counts.try_emplace(target->get()).first;
-    entry->second.owner = duckdb::weak_ptr<duckdb::MultiFileList>(*target);
-    entry->second.total = std::move(total);
-    ++entry->second.total->members;
+    auto const rows   = found->second.rows;
+    auto const serial = found->second.serial;
+    keep_row_count_locked(*target, rows, serial);
   } catch (std::bad_alloc const&) {
     // The copy plans without the count.
   }
@@ -710,8 +669,18 @@ std::size_t detail::merged_statistics_cache_size()
 std::size_t detail::row_count_cache_size()
 {
   std::lock_guard guard(cache_mutex);
-  purge_row_counts_locked();
-  return live_row_totals;
+  sweep_row_counts_locked();
+  std::unordered_set<std::uint64_t> totals;
+  for (auto const& [list, entry] : row_counts) {
+    totals.insert(entry.serial);
+  }
+  return totals.size();
+}
+
+std::size_t detail::row_count_association_count()
+{
+  std::lock_guard guard(cache_mutex);
+  return row_counts.size();
 }
 
 std::size_t detail::statistics_cache_size()
@@ -740,8 +709,6 @@ detail::cache_capacities detail::set_cache_capacities_for_testing(cache_capaciti
   capacities          = replacement;
   evict_statistics_locked();
   evict_merges_locked();
-  purge_row_counts_locked();
-  withdraw_row_totals_locked(capacities.merges);
   return previous;
 }
 
@@ -753,7 +720,7 @@ void detail::clear_caches_for_testing()
   merges.clear();
   merge_references = 0;
   row_counts.clear();
-  live_row_totals = 0;
+  row_count_sweep_at = row_count_sweep_allowance;
 }
 
 }  // namespace sirius::transparent

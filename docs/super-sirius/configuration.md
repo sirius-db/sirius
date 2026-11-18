@@ -1064,7 +1064,10 @@ need repeated reads and merging. A scan's footer row count belongs to the plan w
 covered the scan, and to the copies Sirius makes of that plan; another statement over the same
 paths does not supply it. It is unknown when `parquet_footer_statistics` is off, when a limit is
 exceeded, when a footer cannot be read, and when DuckDB replaces the scan's file list while
-optimizing, as partition pruning does. The counts of at most 128 scans of live plans are kept.
+optimizing, as partition pruning does. A successfully collected count is retained for its owning
+scan and propagated Sirius copies without capacity eviction, while their file-list bindings remain
+valid. The documented opt-out, failure and optimizer replacement/copy cases still yield an unknown
+count; expired association metadata is reclaimed lazily.
 
 ```sql
 SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');

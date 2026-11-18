@@ -42,6 +42,7 @@
 #include <duckdb/storage/external_file_cache/external_file_cache.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -50,8 +51,11 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <map>
+#include <memory>
 #include <new>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -314,7 +318,6 @@ TEST_CASE_METHOD(ParquetFilesFixture,
 {
   using sirius::transparent::detail::merged_statistics_cache_capacity;
   using sirius::transparent::detail::merged_statistics_cache_size;
-  using sirius::transparent::detail::row_count_cache_size;
   // Pairs of 17 files give 136 distinct lists, more than the cache keeps.
   constexpr int files = 17;
   for (int file = 2; file < files; ++file) {
@@ -331,7 +334,6 @@ TEST_CASE_METHOD(ParquetFilesFixture,
     }
   }
   CHECK(merged_statistics_cache_size() <= merged_statistics_cache_capacity);
-  CHECK(row_count_cache_size() <= merged_statistics_cache_capacity);
 }
 
 namespace {
@@ -657,7 +659,6 @@ void check_footer_retention(footer_detail::cache_capacities capacities)
 {
   CHECK(footer_detail::statistics_cache_size() <= capacities.statistics);
   CHECK(footer_detail::merged_statistics_cache_size() <= capacities.merges);
-  CHECK(footer_detail::row_count_cache_size() <= capacities.merges);
   CHECK(footer_detail::merged_reference_count() <= capacities.merge_references);
   CHECK(footer_detail::live_statistics_records() <= capacities.statistics);
 }
@@ -1080,10 +1081,10 @@ TEST_CASE_METHOD(
   check_footer_retention(capacities);
 }
 
-TEST_CASE_METHOD(
-  FooterAdmissionFixture,
-  "Footer admission uses oversized merges now and recomputes evicted facts",
-  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]")
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer admission uses oversized merges now and recomputes evicted facts",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]"
+                 "[footer_row_count]")
 {
   add_files(3);
   auto first          = plan();
@@ -1102,13 +1103,14 @@ TEST_CASE_METHOD(
   CHECK(footer_detail::footer_read_count() > before);
   CHECK(footer_scan_bind(*again).file_options.column_statistics == expected);
   check_footer_scan(*again, 3, 300);
+  check_footer_scan(*oversized, 3, 300);
   check_footer_retention(capacities);
 }
 
-TEST_CASE_METHOD(
-  FooterAdmissionFixture,
-  "Footer admission keeps an active reader valid while its cached hits are evicted",
-  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]")
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer admission keeps an active reader valid while its cached hits are evicted",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]"
+                 "[footer_row_count]")
 {
   warm({0, 1});
   write_file("f2", 200, 300);
@@ -1154,6 +1156,8 @@ TEST_CASE_METHOD(
   auto again = plan();
   CHECK(footer_scan_bind(*again).file_options.column_statistics ==
         footer_scan_bind(*result).file_options.column_statistics);
+  check_footer_scan(*result, 3, 300);
+  check_footer_scan(*again, 3, 300);
   check_footer_retention(capacities);
 }
 
@@ -1396,10 +1400,10 @@ TEST_CASE_METHOD(
   CHECK(footer_detail::row_count_cache_size() == 0);
 }
 
-TEST_CASE_METHOD(
-  FooterAdmissionFixture,
-  "Footer fix bounds shared live totals and withdraws the oldest total across copies",
-  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]")
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer row counts outlive merged-cache eviction with their plans and copies",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+                 "[footer_row_count]")
 {
   (void)footer_detail::set_cache_capacities_for_testing({8, 2, 8});
   auto oldest = plan();
@@ -1410,20 +1414,176 @@ TEST_CASE_METHOD(
   CHECK(footer_fix_rows(*copy) == std::optional<std::size_t>{200});
   CHECK(footer_detail::row_count_cache_size() == 2);
   auto third = plan();
-  CHECK_FALSE(footer_fix_rows(*copy));
+  CHECK(footer_fix_rows(*copy) == std::optional<std::size_t>{200});
   CHECK(footer_fix_rows(*second) == std::optional<std::size_t>{200});
   CHECK(footer_fix_rows(*third) == std::optional<std::size_t>{200});
-  CHECK(footer_detail::row_count_cache_size() == 2);
+  CHECK(footer_detail::row_count_cache_size() == 3);
   auto third_copy = footer_fix_copy(*con, *third);
   (void)footer_detail::set_cache_capacities_for_testing({8, 0, 8});
-  CHECK_FALSE(footer_fix_rows(*second));
-  CHECK_FALSE(footer_fix_rows(*third));
-  CHECK_FALSE(footer_fix_rows(*third_copy));
-  CHECK(footer_detail::row_count_cache_size() == 0);
+  CHECK(footer_fix_rows(*second) == std::optional<std::size_t>{200});
+  CHECK(footer_fix_rows(*third) == std::optional<std::size_t>{200});
+  CHECK(footer_fix_rows(*third_copy) == std::optional<std::size_t>{200});
+  CHECK(footer_detail::row_count_cache_size() == 3);
   auto unretained = plan();
-  CHECK_FALSE(footer_fix_rows(*unretained));
+  CHECK(footer_fix_rows(*unretained) == std::optional<std::size_t>{200});
   CHECK_FALSE(footer_scan_bind(*unretained).file_options.column_statistics.IsNull());
+  CHECK(footer_detail::row_count_cache_size() == 4);
+}
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer row counts remain available to 200 live plans and their surviving copy",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+                 "[footer_row_count]")
+{
+  (void)footer_detail::set_cache_capacities_for_testing(footer_detail::default_cache_capacities);
+  auto connection = std::make_unique<duckdb::Connection>(*con->context->db);
+  footer_query_ok(*connection, "USE " + attach_alias);
+  footer_query_ok(*connection, "SET parquet_footer_statistics=true");
+  footer_query_ok(*connection, "SET parquet_footer_statistics_max_local_reads=-1");
+  std::vector<duckdb::unique_ptr<duckdb::LogicalOperator>> plans;
+  for (int i = 0; i < 200; ++i) {
+    plans.push_back(connection->ExtractPlan("SELECT x FROM v"));
+    REQUIRE(plans.back());
+  }
+  for (auto const& root : plans) {
+    CHECK(footer_fix_rows(*root) == std::optional<std::size_t>{200});
+  }
+  CHECK(footer_detail::row_count_cache_size() == 200);
+  auto copy = footer_fix_copy(*connection, *plans.front());
+  plans.clear();
+  connection.reset();
+  CHECK(footer_fix_rows(*copy) == std::optional<std::size_t>{200});
+  CHECK(footer_detail::row_count_cache_size() == 1);
+  copy.reset();
   CHECK(footer_detail::row_count_cache_size() == 0);
+}
+
+TEST_CASE_METHOD(
+  FooterAdmissionFixture,
+  "Footer row-count sweeping bounds expired associations through planning and copying",
+  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+  "[footer_row_count]")
+{
+  run_ok("SET parquet_footer_statistics=false");
+  auto anchor = plan();
+  REQUIRE(footer_fix_collect(*con, *anchor) == 1);
+  auto const files = footer_scan_bind(*anchor).file_list->GetAllFiles();
+  std::vector<std::weak_ptr<duckdb::SimpleMultiFileList>> owners;
+  auto target = [&] {
+    auto root = plan();
+    auto list = std::make_shared<duckdb::SimpleMultiFileList>(files);
+    // Keep the allocation address distinct after destruction, without keeping the list alive.
+    owners.emplace_back(list);
+    footer_fix_bind(*root).file_list = duckdb::shared_ptr<duckdb::MultiFileList>(std::move(list));
+    return root;
+  };
+  auto copy_count = [&](duckdb::LogicalOperator const& root) {
+    sirius::transparent::copy_parquet_scan_row_count(*footer_parquet_get(*anchor),
+                                                     *footer_parquet_get(root));
+  };
+  constexpr std::size_t small_bound = 2 * 2 + 64;
+  for (bool copying : {false, true}) {
+    std::size_t sweeps = 0;
+    for (int i = 0; i < 1000; ++i) {
+      CAPTURE(copying, i);
+      auto root         = target();
+      auto const before = footer_detail::row_count_association_count();
+      if (copying) {
+        copy_count(*root);
+      } else {
+        REQUIRE(footer_fix_collect(*con, *root) == 1);
+      }
+      auto const after = footer_detail::row_count_association_count();
+      if (after < before) { ++sweeps; }
+      CHECK(after <= small_bound);
+      CHECK(footer_fix_rows(*root) == std::optional<std::size_t>{200});
+      CHECK(footer_fix_rows(*anchor) == std::optional<std::size_t>{200});
+      root.reset();
+      CHECK(owners.back().expired());
+    }
+    CHECK(sweeps > 0);
+  }
+  std::vector<duckdb::unique_ptr<duckdb::LogicalOperator>> burst;
+  constexpr std::size_t burst_bound = 2 * 201 + 64;
+  for (int i = 0; i < 200; ++i) {
+    auto root = target();
+    copy_count(*root);
+    CHECK(footer_fix_rows(*root) == std::optional<std::size_t>{200});
+    burst.push_back(std::move(root));
+    CHECK(footer_detail::row_count_association_count() <= burst_bound);
+  }
+  burst.clear();
+  CHECK(std::ranges::all_of(owners, [](auto const& owner) { return owner.expired(); }));
+  auto const after_release = footer_detail::row_count_association_count();
+  CAPTURE(after_release);
+  CHECK(after_release > small_bound);
+  CHECK(after_release <= burst_bound);
+  for (int i = 0; i < 1000; ++i) {
+    auto root = target();
+    copy_count(*root);
+    CHECK(footer_detail::row_count_association_count() <= burst_bound);
+    CHECK(footer_fix_rows(*root) == std::optional<std::size_t>{200});
+    CHECK(footer_fix_rows(*anchor) == std::optional<std::size_t>{200});
+  }
+  CHECK(footer_detail::row_count_association_count() <= small_bound);
+  // This final explicit cleanup is outside the automatic-sweep observation interval.
+  CHECK(footer_detail::row_count_cache_size() == 1);
+  CHECK(footer_detail::row_count_association_count() == 1);
+  anchor.reset();
+  CHECK(footer_detail::row_count_cache_size() == 0);
+}
+
+TEST_CASE_METHOD(
+  FooterAdmissionFixture,
+  "Footer row-count copying ignores missing sources and aliases and forgets only its owner",
+  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+  "[footer_row_count]")
+{
+  run_ok("SET parquet_footer_statistics=false");
+  auto source      = plan();
+  auto target      = plan();
+  auto const& from = *footer_parquet_get(*source);
+  auto const& to   = *footer_parquet_get(*target);
+  sirius::transparent::copy_parquet_scan_row_count(from, from);
+  sirius::transparent::copy_parquet_scan_row_count(from, to);
+  CHECK(footer_detail::row_count_association_count() == 0);
+  CHECK_FALSE(footer_fix_rows(*target));
+  REQUIRE(footer_fix_collect(*con, *source) == 1);
+  auto const entries                 = footer_detail::row_count_association_count();
+  footer_fix_bind(*target).file_list = footer_scan_bind(*source).file_list;
+  sirius::transparent::copy_parquet_scan_row_count(from, from);
+  sirius::transparent::copy_parquet_scan_row_count(from, to);
+  CHECK(footer_detail::row_count_association_count() == entries);
+  CHECK(footer_fix_rows(*target) == std::optional<std::size_t>{200});
+  auto copied = footer_fix_copy(*con, *source);
+  sirius::transparent::forget_parquet_scan_row_counts(*source);
+  CHECK_FALSE(footer_fix_rows(*source));
+  CHECK_FALSE(footer_fix_rows(*target));
+  CHECK(footer_fix_rows(*copied) == std::optional<std::size_t>{200});
+  auto unknown = footer_fix_copy(*con, *source);
+  CHECK_FALSE(footer_fix_rows(*unknown));
+  CHECK(footer_fix_rows(*copied) == std::optional<std::size_t>{200});
+}
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer row counts preserve a known zero across a copy",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+                 "[footer_row_count]")
+{
+  run_ok("SET parquet_footer_statistics=false");
+  auto empty = plan();
+  write_file("empty", 0, 0);
+  duckdb::vector<duckdb::OpenFileInfo> files;
+  files.emplace_back((dir / "empty.parquet").string());
+  footer_fix_bind(*empty).file_list =
+    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(std::move(files));
+  REQUIRE(footer_fix_collect(*con, *empty) == 0);
+  CHECK(footer_fix_rows(*empty) == std::optional<std::size_t>{0});
+  auto copy = footer_fix_copy(*con, *empty);
+  CHECK(footer_fix_rows(*copy) == std::optional<std::size_t>{0});
+  sirius::transparent::forget_parquet_scan_row_counts(*empty);
+  CHECK_FALSE(footer_fix_rows(*empty));
+  CHECK(footer_fix_rows(*copy) == std::optional<std::size_t>{0});
 }
 
 TEST_CASE_METHOD(
@@ -1598,12 +1758,78 @@ TEST_CASE_METHOD(FooterAdmissionFixture,
 
 TEST_CASE_METHOD(
   FooterAdmissionFixture,
+  "Footer row-count publication and copying recover from a failed association allocation",
+  "[.][integration][footer_host_allocation_fault][footer_fix_row_count]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  auto const copying = GENERATE(false, true);
+  CAPTURE(copying);
+  run_ok("SET threads=1");
+  run_ok("SET parquet_footer_statistics=false");
+  auto source = plan();
+  REQUIRE(footer_fix_collect(*con, *source) == 1);
+  auto attempt = [&](duckdb::LogicalOperator& target) {
+    if (copying) {
+      sirius::transparent::copy_parquet_scan_row_count(*footer_parquet_get(*source),
+                                                       *footer_parquet_get(target));
+    } else {
+      (void)footer_fix_collect(*con, target);
+    }
+  };
+  auto calibration     = plan();
+  std::size_t observed = 0;
+  {
+    fault counting(fault::filter_shell_scope, 0);
+    attempt(*calibration);
+    observed = counting.stop();
+  }
+  REQUIRE(observed == 1);
+  REQUIRE(footer_fix_rows(*calibration) == std::optional<std::size_t>{200});
+  calibration.reset();
+  REQUIRE(footer_detail::row_count_cache_size() == 1);
+  auto target        = plan();
+  auto const entries = footer_detail::row_count_association_count();
+  bool fired         = false;
+  {
+    fault injection(fault::filter_shell_scope, 1);
+    attempt(*target);
+    observed = injection.stop();
+    fired    = injection.fired();
+  }
+  REQUIRE(fired);
+  REQUIRE(observed == 1);
+  CHECK_FALSE(footer_fix_rows(*target));
+  CHECK(footer_scan_bind(*target).file_options.column_statistics.IsNull());
+  CHECK(footer_fix_rows(*source) == std::optional<std::size_t>{200});
+  CHECK(footer_detail::row_count_association_count() == entries);
+  CHECK(footer_detail::row_count_cache_size() == 1);
+  attempt(*target);
+  CHECK(footer_fix_rows(*target) == std::optional<std::size_t>{200});
+  CHECK(footer_fix_rows(*source) == std::optional<std::size_t>{200});
+  CHECK(footer_detail::row_count_cache_size() == (copying ? 1 : 2));
+  {
+    fault injection(fault::filter_shell_scope, 1);
+    sirius::transparent::copy_parquet_scan_row_count(*footer_parquet_get(*source),
+                                                     *footer_parquet_get(*target));
+    observed = injection.stop();
+    fired    = injection.fired();
+  }
+  CHECK(observed == 0);
+  CHECK_FALSE(fired);
+  CHECK(footer_fix_rows(*target) == std::optional<std::size_t>{200});
+}
+
+TEST_CASE_METHOD(
+  FooterAdmissionFixture,
   "Footer fix keeps row totals in optimized TPC-H Q2 and Q20 and their Sirius copies",
-  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]")
+  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]"
+  "[footer_row_count]")
 {
   auto const number     = GENERATE(2, 20);
   auto const statistics = GENERATE(false, true);
-  CAPTURE(number, statistics);
+  auto const file_count = GENERATE(1, 3);
+  CAPTURE(number, statistics, file_count);
   auto const data = fs::path(__FILE__).parent_path().parent_path() / "integration/data/parquet";
   auto setup      = [&](std::string const& sql) {
     INFO("TPC-H setup: " << sql);
@@ -1611,17 +1837,62 @@ TEST_CASE_METHOD(
   };
   setup("SET gpu_execution=false");
   setup("SET parquet_footer_statistics=false");
-  std::unordered_map<std::string, std::size_t> rows;
+  auto count_query = [&](std::string const& sql) {
+    auto result      = footer_query_ok(*con, sql);
+    auto const count = result->Collection().GetValue(0, 0).GetValue<std::int64_t>();
+    REQUIRE(count >= 0);
+    return static_cast<std::size_t>(count);
+  };
+  std::map<std::vector<std::string>, std::size_t> manifests;
   for (auto const* table : {"part", "partsupp", "supplier", "nation", "region", "lineitem"}) {
     auto const path = (data / (std::string(table) + ".parquet")).string();
     REQUIRE(fs::exists(path));
+    auto const original = "read_parquet(" + sirius::test::sql_literal(path) + ")";
+    auto const count    = count_query("SELECT count(*) FROM " + original);
+    REQUIRE(count >= 3);
+    std::vector<std::string> paths;
+    std::string pattern = path;
+    if (file_count == 3) {
+      auto const folder = dir / table;
+      REQUIRE(fs::create_directory(folder));
+      auto const temporary = "footer_split_" + std::string(table);
+      setup("CREATE TEMP TABLE " + temporary +
+            " AS SELECT *, row_number() OVER () AS footer_split_ordinal FROM " + original);
+      for (int part = 0; part < 3; ++part) {
+        auto const output = (folder / ("part" + std::to_string(part) + ".parquet")).string();
+        setup("COPY (SELECT * EXCLUDE (footer_split_ordinal) FROM " + temporary +
+              " WHERE (footer_split_ordinal - 1) % 3 = " + std::to_string(part) + ") TO " +
+              sirius::test::sql_literal(output));
+        paths.push_back(output);
+      }
+      setup("DROP TABLE " + temporary);
+      pattern = (folder / "*.parquet").string();
+    } else {
+      paths.push_back(path);
+    }
     setup("CREATE VIEW " + std::string(table) + " AS SELECT * FROM read_parquet(" +
-          sirius::test::sql_literal(path) + ")");
-    auto result      = footer_query_ok(*con, "SELECT count(*) FROM " + std::string(table));
-    auto const count = result->Collection().GetValue(0, 0).GetValue<std::int64_t>();
-    REQUIRE(count > 0);
-    rows.emplace(path, static_cast<std::size_t>(count));
+          sirius::test::sql_literal(pattern) + ")");
+    auto expected_schema = footer_query_ok(*con, "DESCRIBE SELECT * FROM " + original);
+    auto actual_schema   = footer_query_ok(*con, "DESCRIBE SELECT * FROM " + std::string(table));
+    CHECK(collect_rows(*actual_schema, false) == collect_rows(*expected_schema, false));
+    CHECK(count_query("SELECT count(*) FROM ((SELECT * FROM " + std::string(table) +
+                      " EXCEPT ALL SELECT * FROM " + original + ") UNION ALL (SELECT * FROM " +
+                      original + " EXCEPT ALL SELECT * FROM " + std::string(table) +
+                      ")) AS difference") == 0);
+    std::size_t sum = 0;
+    for (auto const& part : paths) {
+      auto const part_rows =
+        count_query("SELECT count(*) FROM read_parquet(" + sirius::test::sql_literal(part) + ")");
+      REQUIRE(part_rows > 0);
+      sum += part_rows;
+    }
+    CHECK(sum == count);
+    std::ranges::sort(paths);
+    manifests.emplace(std::move(paths), sum);
   }
+  auto const* query        = number == 2 ? sirius::test::kTpchQ2 : sirius::test::kTpchQ20;
+  auto reference           = footer_query_ok(*con, query);
+  auto const expected_rows = collect_rows(*reference);
   setup("SET gpu_execution=true");
   setup(std::string("SET parquet_footer_statistics=") + (statistics ? "true" : "false"));
 
@@ -1629,6 +1900,8 @@ TEST_CASE_METHOD(
   struct observer_info : duckdb::OptimizerExtensionInfo {
     std::atomic<duckdb::ClientContext*> target{nullptr};
     std::function<void(duckdb::ClientContext&, duckdb::LogicalOperator const&)> inspect;
+    std::function<std::string(duckdb::LogicalOperator const&)> describe;
+    std::string before;
     unsigned visits = 0;
   };
   auto observed = duckdb::make_shared_ptr<observer_info>();
@@ -1636,12 +1909,38 @@ TEST_CASE_METHOD(
     duckdb::shared_ptr<observer_info> info;
     ~disable_observer()
     {
-      info->target  = nullptr;
-      info->inspect = {};
+      info->target   = nullptr;
+      info->inspect  = {};
+      info->describe = {};
     }
   } reset{observed};
+  observed->describe = [](duckdb::LogicalOperator const& root) {
+    std::ostringstream text;
+    auto visit = [&](auto const& self, duckdb::LogicalOperator const& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        auto const& get  = op.Cast<duckdb::LogicalGet>();
+        auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+        if (bind && bind->file_list) {
+          auto const rows = sirius::transparent::parquet_scan_row_count(get);
+          text << "scan " << get.table_index.index << " list " << bind->file_list.get() << " rows "
+               << (rows ? std::to_string(*rows) : "unknown") << '\n';
+          for (auto const& file : bind->file_list->GetAllFiles()) {
+            text << file.path << '\n';
+          }
+        }
+      }
+      for (auto const& child : op.children) {
+        self(self, *child);
+      }
+    };
+    visit(visit, root);
+    return text.str();
+  };
   observed->inspect = [&](duckdb::ClientContext& context,
                           duckdb::LogicalOperator const& optimized) {
+    INFO("Before optimization:\n" << observed->before);
+    INFO("After optimization:\n" << observed->describe(optimized));
+    INFO(optimized.ToString());
     auto inspect = [&](duckdb::LogicalOperator const& root) {
       std::size_t scans = 0;
       auto visit        = [&](auto const& self, duckdb::LogicalOperator const& op) -> void {
@@ -1652,12 +1951,20 @@ TEST_CASE_METHOD(
             auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
             REQUIRE(bind);
             auto const files = bind->file_list->GetAllFiles();
-            REQUIRE(files.size() == 1);
-            CAPTURE(files[0].path);
-            REQUIRE(rows.contains(files[0].path));
+            REQUIRE(files.size() == static_cast<std::size_t>(file_count));
+            std::vector<std::string> paths;
+            for (auto const& file : files) {
+              paths.push_back(file.path);
+            }
+            std::ranges::sort(paths);
+            CAPTURE(paths);
+            REQUIRE(manifests.contains(paths));
             auto const expected =
-              statistics ? std::optional<std::size_t>{rows.at(files[0].path)} : std::nullopt;
+              statistics ? std::optional<std::size_t>{manifests.at(paths)} : std::nullopt;
             CHECK(sirius::transparent::parquet_scan_row_count(get) == expected);
+            if (file_count == 3) {
+              CHECK(bind->file_options.column_statistics.IsNull() == !statistics);
+            }
             ++scans;
           }
         }
@@ -1676,7 +1983,15 @@ TEST_CASE_METHOD(
     CHECK(inspect(*copy) == scans);
   };
   duckdb::OptimizerExtension observer;
-  observer.optimizer_info    = observed;
+  observer.optimizer_info        = observed;
+  observer.pre_optimize_function = [](duckdb::OptimizerExtensionInput& input,
+                                      duckdb::unique_ptr<duckdb::LogicalOperator>& plan) {
+    auto& info = static_cast<observer_info&>(*input.info);
+    if (info.target.load() != &input.context) { return; }
+    auto state = duckdb::get_sirius_connection_state(input.context);
+    if (!state || state->is_internal_query_active()) { return; }
+    info.before = info.describe(*plan);
+  };
   observer.optimize_function = [](duckdb::OptimizerExtensionInput& input,
                                   duckdb::unique_ptr<duckdb::LogicalOperator>& plan) {
     auto& info = static_cast<observer_info&>(*input.info);
@@ -1690,7 +2005,6 @@ TEST_CASE_METHOD(
                                        std::move(observer));
   auto const before = sirius::test::get_transparent_execution_stats(*con);
   observed->target  = con->context.get();
-  auto const* query = number == 2 ? sirius::test::kTpchQ2 : sirius::test::kTpchQ20;
   INFO(query);
   duckdb::unique_ptr<duckdb::QueryResult> result;
   REQUIRE_NOTHROW(result = con->Query(query));
@@ -1698,6 +2012,7 @@ TEST_CASE_METHOD(
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : "query succeeded"));
   REQUIRE_FALSE(result->HasError());
+  CHECK(collect_rows(*result) == expected_rows);
   CHECK(observed->visits == 1);
   sirius::test::require_transparent_execution_delta(
     before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);

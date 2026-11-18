@@ -5,9 +5,9 @@
 # See the LICENSE file at the repo root for the full text.
 """Run hidden footer-cache allocation tests with the existing opt-in new helper.
 
-The x86 GCC build inlines the two insertions. Select the return PC of the
-allocation before the LRU hook, and of the merged-map node before its rehash
-check. Require the named containers at those sites; fail on missing or ambiguous
+The x86 GCC build inlines the insertions. Select the return PC of the allocation
+before the LRU hook, and of the merged-map and row-count nodes before their rehash
+checks. Require the named containers at those sites; fail on missing or ambiguous
 matches. No node sizes, private layouts, or fixed binary addresses are assumed.
 """
 
@@ -96,6 +96,7 @@ def main():
     for label, function, callee, container in (
         ("lru", "statistics_of", "_List_node_base::_M_hook", "::cache_order"),
         ("merge", "visit", "_M_need_rehash", "::merges"),
+        ("row_count", "keep_row_count_locked", "_M_need_rehash", "::row_counts"),
     ):
         assembly, code = instructions(binary, symbols, function)
         (args.output / f"{label}.asm").write_text(assembly)

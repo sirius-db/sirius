@@ -75,6 +75,11 @@ struct footer_read_limits {
 /// list of the scan's bind data. Another plan over the same paths does not have it, and neither
 /// does a scan whose file list DuckDB replaced while optimizing. A copy of the plan has it only
 /// through copy_parquet_scan_row_count.
+///
+/// A successfully collected count is retained for its owning scan and propagated Sirius copies
+/// without capacity eviction, while their file-list bindings remain valid. The documented opt-out,
+/// failure and optimizer replacement/copy cases still yield an unknown count; expired association
+/// metadata is reclaimed lazily.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
 
 /// \brief Make the row count of every Parquet scan in \p plan unknown.
@@ -99,7 +104,7 @@ namespace detail {
 /// What the caches keep once no planning is running.
 struct cache_capacities {
   std::size_t statistics;  ///< Files whose statistics are kept, each reader-options set apart.
-  std::size_t merges;      ///< Merged statistics kept; also row counts of live plans kept.
+  std::size_t merges;      ///< Merged statistics kept.
   std::size_t merge_references;  ///< Files all kept merged statistics were merged from, together.
 };
 inline constexpr cache_capacities default_cache_capacities{16'384, 128, 16'384};
@@ -107,8 +112,11 @@ inline constexpr cache_capacities default_cache_capacities{16'384, 128, 16'384};
 inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;
 /// The number of scans whose merged statistics are cached, for tests.
 std::size_t merged_statistics_cache_size();
-/// The number of scans whose row counts are cached, for tests. Bounded like the merged statistics.
+/// The number of scans of live plans that have a row count, a plan's copies counted once; for
+/// tests. Drops what is kept for file lists that are gone.
 std::size_t row_count_cache_size();
+/// The row counts kept, those of file lists that are gone and not yet dropped included; for tests.
+std::size_t row_count_association_count();
 /// The number of files whose statistics are cached, for tests.
 std::size_t statistics_cache_size();
 /// The number of files the cached merged statistics were merged from, for tests.
