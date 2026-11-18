@@ -32,41 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace duckdb {
-
-struct PinTableArgs {
-  std::string path;
-  std::string tier;
-  std::string name;
-  std::optional<std::vector<std::string>> cols;
-  /// Optional per-call request for Simpatico pin compression. When omitted,
-  /// the legacy session/config setting remains the default.
-  std::optional<bool> compression;
-  /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
-  /// `format` named parameter, else inferred from the path extension
-  /// (.parquet -> parquet, .db/.duckdb -> duckdb).
-  std::string format;
-  /// duckdb-native only: schema that contains the table named by `name`. Defaults
-  /// to "main"; the catalog search path (current/USE'd database) still applies.
-  std::string schema = "main";
-};
-
-void pin_table_to(const PinTableArgs& args);
-
-void unpin_table_to(const std::string& name);
-
-// Test-only helpers used by unit tests to verify pin_table forwards the
-// correct parameters to pin_table_to. Not part of the stable public API.
-namespace pin_table_testing {
-const std::vector<PinTableArgs>& recorded_calls();
-void clear_recorded_calls();
-
-const std::vector<std::string>& recorded_unpin_calls();
-void clear_recorded_unpin_calls();
-}  // namespace pin_table_testing
-
-}  // namespace duckdb
-
 namespace cudf {
 class table;
 class column;
@@ -240,6 +205,8 @@ struct host_pin_result {
 /// and @ref materialize_all_batches_compressed.
 struct compression_pin_config {
   bool enabled{false};
+  /// Empty selects the spill policy automatically for each materialized chunk.
+  /// Nonempty is an explicit, already column-selected table plan.
   std::string plan_dsl;
   std::size_t min_batch_size_bytes{0};
   /// Keep the compressed form only if header+payload <= this fraction of the
@@ -248,6 +215,33 @@ struct compression_pin_config {
   double max_compressed_fraction{0.95};
   std::vector<std::string> column_names;
 };
+
+#ifdef SIRIUS_TEST_PIN_STAGING_OVERRIDES
+namespace testing {
+/// Fail the calling thread's Nth final compressed-GPU payload allocation (one-based).
+/// Zero only counts attempts. Decode, plan selection and encoding are not intercepted.
+/// Available only in the unit-test variant of pin_table.cpp.
+class scoped_pin_staging_failure {
+ public:
+  explicit scoped_pin_staging_failure(std::size_t fail_at);
+  ~scoped_pin_staging_failure();
+  scoped_pin_staging_failure(scoped_pin_staging_failure const&)            = delete;
+  scoped_pin_staging_failure& operator=(scoped_pin_staging_failure const&) = delete;
+
+  [[nodiscard]] std::size_t attempts() const noexcept { return attempts_; }
+  [[nodiscard]] bool failed() const noexcept { return failed_; }
+
+ private:
+  friend void before_pin_staging_allocation();
+  scoped_pin_staging_failure* previous_;
+  std::size_t fail_at_;
+  std::size_t attempts_{0};
+  bool failed_{false};
+};
+
+void before_pin_staging_allocation();
+}  // namespace testing
+#endif
 
 /// One GPU-tier chunk of a compression-enabled pin, in emission order. Exactly
 /// one form is populated: a batch that qualified for compression carries
@@ -268,6 +262,8 @@ struct device_pin_chunk {
 /// chunks may be interleaved within a single pin.
 struct device_pin_result {
   std::vector<device_pin_chunk> chunks;
+  /// Optional native statistics captured before encoding, parallel to chunks.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
   /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
   /// compressed or split into device columns. Parallel to @c chunks and their columns.
   pinned_column_storage_matrix column_storage;
@@ -316,16 +312,15 @@ host_pin_result materialize_pin_to_host(
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
 /// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host.
-/// Zone-map capture is forced off:
-/// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
-/// none, so device pins keep the statless-pin serving behavior.
+/// When requested, zone maps are captured before narrowing and compression, carried
+/// in @c device_pin_result, and retained by @c insert_pinned_entry_device.
 ///
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
-///                            (column_ids) order — drives the carrier narrowing. Empty is
-///                            valid only when narrowing is off.
+///                            (column_ids) order — drives narrowing and zone-map capture.
+///                            Empty is valid only when narrowing is off and yields no stats.
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
-/// \param options             Per-pin materialization behavior (carrier narrowing).
+/// \param options             Per-pin materialization behavior (narrowing and statistics).
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,

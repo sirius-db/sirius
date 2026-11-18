@@ -82,6 +82,10 @@ struct unit_split final : scan::scan_info {
   }
   scan::scan_contract_id contract_id() const override { return owner->contract; }
   size_t estimated_bytes() const noexcept override { return input ? input->estimated_bytes() : 0; }
+  std::optional<int> required_device_id() const noexcept override
+  {
+    return input ? input->required_device_id() : std::nullopt;
+  }
   size_t estimated_working_set_bytes() const noexcept override
   {
     return input ? input->estimated_working_set_bytes() : 0;

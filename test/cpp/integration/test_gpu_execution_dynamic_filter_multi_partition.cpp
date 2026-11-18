@@ -215,8 +215,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
   sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
   sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
-  sirius::test::scoped_setting bloom_cap(
-    *con, "max_dynamic_filter_bloom_bytes_per_gpu", 256ULL * 1024 * 1024);
 
   // Disjoint matching keys expose a partial union if consumed; deterministic membership tests
   // cover completeness independently of whether this scan reaches its final checkpoint first.

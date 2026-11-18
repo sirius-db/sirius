@@ -15,6 +15,7 @@ target_sources(
           sirius_like_multiliteral.cu
           sirius_round_floating_point.cu
           scan/gpu_decode_alp.cu
+          scan/arrow_import.cu
           scan/gpu_decode_bitpacking.cu
           scan/gpu_decode_rle.cu
           scan/gpu_decode_strings.cu

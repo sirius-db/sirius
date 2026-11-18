@@ -58,7 +58,8 @@ downgrade_trigger_fraction = 0.9;
 downgrade_stop_fraction = 0.8;
 block_size = 1MiB;              // cuCascade block size
 pool_size = 128;                // blocks per pool
-initial_number_pools = 4;       // pools allocated at startup
+initial_number_pools;           // auto: 10% of NUMA RAM, capped by host capacity,
+                              // rounded down to whole pools; explicit count overrides
 ```
 
 **Disk Memory Space:**
@@ -84,6 +85,14 @@ usable reader predicate, the execution estimate excludes the internal position w
 decode retains interval deletion; filters published later cannot enable positions for that split.
 User-requested virtual columns retain their own workspace. Pipeline memory history and retry
 floors still apply independently; this removes the position estimate, not other measured peaks.
+
+Canonical lineage is opt-in: identity and interval selections use host metadata;
+a device selection retains an INT64 ordinal column (8 B/row), with additional
+copy/sort scratch during validation. `lineage_conversion_workspace_bytes()` and
+`shared_materialization_workspace_bytes()` estimate extra working space; they do
+not reserve memory and currently have no production callers. An adapter using them
+must account for its complete working set according to the API contract. Default
+Parquet/Iceberg scans do not reserve canonical-lineage scratch.
 
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
@@ -222,7 +231,8 @@ On allocation failure:
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
-- Fixed-size block pools: 1 MiB blocks, 128 blocks per pool, with four pools initially
+- Obtains blocks on demand from shared fixed-size HOST pools (default: 1 MiB blocks, 128 blocks per pool).
+- With high-level configuration and an omitted `initial_number_pools`, initial HOST pools target 10% of each backing NUMA node's RAM, capped by host capacity and rounded down to whole pools. Set `initial_number_pools: 4` to retain four initial pools explicitly.
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))

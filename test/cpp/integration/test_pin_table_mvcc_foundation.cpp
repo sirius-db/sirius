@@ -25,6 +25,7 @@
  *        asserts query-time visibility.
  */
 
+#include "compression/compressed_representation.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -84,12 +85,23 @@ entry_probe probe_entry(duckdb::Connection& con, const std::string& name)
       out.num_rows    = entry.num_rows;
       out.gpu_chunks  = entry.chunk_memory_spaces.size();
       out.host_chunks = entry.host_chunks.size();
-      if (!entry.data_batches_by_column.empty()) {
+      if (!entry.device_chunks.empty()) {
+        out.gpu_chunks = entry.device_chunks.size();
+        for (auto const& chunk : entry.device_chunks) {
+          out.actual_chunk_rows.push_back(static_cast<std::size_t>(
+            chunk.compressed ? chunk.compressed->num_rows() : chunk.columns.front()->size()));
+        }
+      } else if (!entry.data_batches_by_column.empty()) {
         for (auto const& chunk : entry.data_batches_by_column.begin()->second) {
           out.actual_chunk_rows.push_back(static_cast<std::size_t>(chunk->size()));
         }
       } else {
         for (auto const& chunk : entry.host_chunks) {
+          if (auto const* compressed =
+                dynamic_cast<sirius::compressed_host_representation const*>(chunk.get())) {
+            out.actual_chunk_rows.push_back(static_cast<std::size_t>(compressed->num_rows()));
+            continue;
+          }
           auto const& host_table =
             chunk->cast<cucascade::host_data_representation>().get_host_table();
           out.actual_chunk_rows.push_back(
