@@ -21,6 +21,7 @@
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "data/sirius_row_range_reader_registry.hpp"
+#include "downgrade/spill_io_stats.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -611,6 +612,10 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   auto const keys_released = release_query_state(query_id, inject_failure);
   try {
     log_pool_stats(end_tag);
+    // What the query's spills stored and read back, in stored bytes (see spill::io_stats).
+    SIRIUS_LOG_INFO("[spill_io] {} {}",
+                    end_tag,
+                    sirius::spill::format_io_totals(sirius::spill::io_stats::get().take()));
   } catch (...) {
   }
   return keys_released;

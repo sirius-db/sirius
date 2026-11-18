@@ -1253,6 +1253,63 @@ TEST_CASE("compressed readers keep, rebuild or do without the reader state",
   }
 }
 
+TEST_CASE("compressed readers copy a small host or disk payload to the device once",
+          "[compressed_row_range_readers]")
+{
+  if (!has_gpu()) { return; }
+  auto const& main            = main_batch();
+  const std::size_t columns[] = {kSplitNulls, kSorted, kDict, kRandomNulls, kRuns};
+  auto& stats                 = sirius::spill::io_stats::get();
+  struct restore_settings {
+    ~restore_settings() { sirius::compression::set_spill_compression_settings({}); }
+  } const restore;
+
+  // The limit decides: at 0 nothing is copied, at the default the test batch is.
+  for (std::size_t limit : {std::size_t{0}, std::size_t{16} << 20}) {
+    sirius::compression::spill_compression_settings settings;
+    settings.read_cache_max_bytes = limit;
+    sirius::compression::set_spill_compression_settings(settings);
+    for (auto const& t : main.tiers) {
+      INFO(t.name << ", limit " << limit);
+      auto const before = stats.snapshot();
+      {
+        reader_state state;
+        for (std::size_t row_begin : {0, 1500, 3000, 100, 19000}) {
+          auto dsts = roomy_dsts(main.data, columns, 1500, 2, 1);
+          read_and_check(main, t, columns, dsts, row_begin, 1500, &state);
+        }
+      }
+      auto const after      = stats.snapshot();
+      auto const host_loads = after.payload_host_loads - before.payload_host_loads;
+      auto const disk_loads = after.payload_disk_loads - before.payload_disk_loads;
+      // One copy per reader state, whatever the number of reads; none of a device batch.
+      CHECK(host_loads == (limit != 0 && t.name == "host" ? 1 : 0));
+      CHECK(disk_loads == (limit != 0 && t.name == "disk" ? 1 : 0));
+      if (disk_loads == 1) {
+        auto ro          = t.batch->to_read_only();
+        auto const& disk = ro.get_data()->cast<sirius::compressed_disk_representation>();
+        CHECK(after.payload_disk_bytes - before.payload_disk_bytes ==
+              disk.get_size_in_bytes() - disk.header_bytes());
+      }
+    }
+  }
+
+  SECTION("a payload above the limit is read by ranges")
+  {
+    sirius::compression::spill_compression_settings settings;
+    settings.read_cache_max_bytes = 1024;
+    sirius::compression::set_spill_compression_settings(settings);
+    auto const before = stats.snapshot();
+    for (auto const& t : main.tiers) {
+      INFO(t.name);
+      read_whole_batch(main, t, all_columns(main.data), 2600, 3000);
+    }
+    auto const after = stats.snapshot();
+    CHECK(after.payload_host_loads == before.payload_host_loads);
+    CHECK(after.payload_disk_loads == before.payload_disk_loads);
+  }
+}
+
 TEST_CASE("compressed readers follow the caller from one stream to another",
           "[compressed_row_range_readers]")
 {

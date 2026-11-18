@@ -16,13 +16,17 @@
 
 #pragma once
 
+#include "downgrade/spill_io_stats.hpp"
+
 #include <cudf/column/column_view.hpp>
 
 #include <cuda/stream>
 
 #include <cucascade/data/representation_converter.hpp>
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -56,6 +60,16 @@ struct spill_compression_settings {
   /// memory space -- the headroom the encoder needs. Not grantable means the batch
   /// spills uncompressed. 0 skips the check (compression.spill_encode_reserve_fraction).
   double encode_reserve_fraction{0.5};
+  /// Largest compressed payload a row-range reader copies whole to the device before it
+  /// decodes row ranges of it; 0 disables the copy (compression.spill_read_cache_max_bytes).
+  std::size_t read_cache_max_bytes{16ULL * 1024 * 1024};
+  /// Largest decoded size of a compressed batch the windowed merge decodes whole when its rows
+  /// fit one window; 0 always reads by row range (compression.spill_whole_decode_max_bytes).
+  std::size_t whole_decode_max_bytes{64ULL * 1024 * 1024};
+  /// Longest an encode whose headroom is not grantable waits for another encode on the same
+  /// GPU to give its headroom back before the batch spills uncompressed, in milliseconds;
+  /// 0 never waits (compression.spill_encode_wait_ms).
+  std::uint64_t encode_wait_ms{1000};
 };
 
 /// Install the process-wide settings. The converters run on downgrade threads with no
@@ -86,11 +100,35 @@ void apply_spill_compression_config(compression_config const& config);
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              ::cuda::stream_ref stream);
 
+namespace detail {
+
+/// Mark the start and the end of a spill encode on GPU @p device that holds a headroom
+/// reservation. An encode whose headroom is not grantable waits for the end of one (see
+/// spill_compression_settings::encode_wait_ms). Called by the encoder; exposed for tests.
+void note_encode_started(int device);
+void note_encode_finished(int device) noexcept;
+
+/// Blocks until an encode on GPU @p device ends. Returns false, without waiting, when none is
+/// in flight there, and false at @p deadline.
+bool wait_for_encode_end(int device, std::chrono::steady_clock::time_point deadline);
+
+}  // namespace detail
+
 /// Thrown by a spill converter that chose not to compress (too small a saving, no
 /// encode headroom). The caller spills the batch uncompressed instead.
 class spill_compression_declined : public std::runtime_error {
  public:
-  using std::runtime_error::runtime_error;
+  explicit spill_compression_declined(
+    std::string const& what, spill::encode_outcome outcome = spill::encode_outcome::small_saving)
+    : std::runtime_error(what), _outcome(outcome)
+  {
+  }
+
+  /// Why the batch was not compressed, for the spill counters.
+  [[nodiscard]] spill::encode_outcome outcome() const noexcept { return _outcome; }
+
+ private:
+  spill::encode_outcome _outcome;
 };
 
 }  // namespace sirius::compression

@@ -15,6 +15,7 @@
  */
 
 #include "compression/simpatico_compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
 #include "log/logging.hpp"
 #include "op/merge/detail/run_fallback.hpp"
 #include "op/merge/detail/window_buffer.hpp"
@@ -259,6 +260,25 @@ struct windowed_merger::impl {
     return std::min(cfg.window_rows, largest);
   }
 
+  /// True for a compressed host or disk batch that is decoded whole instead of window by window:
+  /// one whose rows all fit one window and whose decoded size is within
+  /// compression.spill_whole_decode_max_bytes. Its first refill would decode every row into the
+  /// window buffer anyway. Decoded whole it goes through the batch decode, which fetches the
+  /// payload once and decodes each column in one pass, where the row-range reader builds a decode
+  /// cursor per column and waits for the device several times per cursor; and the run is then
+  /// windowed by zero-copy slices, so it needs no window buffer (the decoded batch is no larger
+  /// than one of the buffer's two slots).
+  [[nodiscard]] bool decoded_whole(const cucascade::idata_representation& data,
+                                   std::size_t batch_rows) const
+  {
+    if (data.get_current_tier() == cucascade::memory::Tier::GPU ||
+        !is_simpatico_compressed_representation(&data) || batch_rows > cfg.window_rows) {
+      return false;
+    }
+    return data.get_uncompressed_data_size_in_bytes() <=
+           compression::get_spill_compression_settings().whole_decode_max_bytes;
+  }
+
   /// True when @p lock holds an uncompressed table in the task's GPU space, which is windowed by
   /// zero-copy slices. Any other GPU-tier batch (another space, a compressed device
   /// representation) goes through its reader or the whole-batch conversion.
@@ -356,7 +376,9 @@ struct windowed_merger::impl {
           slice_gpu_window(run);
           return;
         }
-        if (readers->has_reader(*data)) {
+        // Only on the first attempt: after a downgrade that won the race against the conversion
+        // the batch is read through its reader, which needs no exclusive lock.
+        if (!(attempt == 0 && decoded_whole(*data, batch_rows)) && readers->has_reader(*data)) {
           const std::type_index type{typeid(*data)};
           if (held.reader_type != type) {
             held.reader_state.reset();

@@ -46,6 +46,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -53,6 +55,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -81,6 +84,9 @@ void apply_spill_compression_config(compression_config const& config)
     .min_batch_bytes         = config.spill_min_batch_bytes,
     .max_compressed_fraction = config.spill_max_compressed_fraction,
     .encode_reserve_fraction = config.spill_encode_reserve_fraction,
+    .read_cache_max_bytes    = config.spill_read_cache_max_bytes,
+    .whole_decode_max_bytes  = config.spill_whole_decode_max_bytes,
+    .encode_wait_ms          = config.spill_encode_wait_ms,
   });
 }
 
@@ -120,19 +126,30 @@ constexpr char const* kStoredPlan = "input -> identity\n";
 
 /// Rows a string column needs before a dictionary can pay for its key table.
 constexpr cudf::size_type kMinDictionaryRows = 4096;
-/// Rows sampled to estimate a string column's cardinality.
+/// Most rows sampled to estimate a string column's cardinality (see plan_sample_rows).
 constexpr cudf::size_type kDictionarySampleRows = 64 * 1024;
 /// Dictionary-encode when at most this fraction of the sampled values are distinct.
 constexpr double kMaxDictionaryDistinctFraction = 0.1;
 /// Largest fixed-width column bitpack accepts. Its encode scratch holds the column at
 /// full width as 32-bit words in a cudf column, which caps it at 2^31 words.
 constexpr std::size_t kMaxBitpackColumnBytes = std::size_t{1} << 33;  // 8 GiB
-/// Rows sampled to choose an integer column's plan.
+/// Most rows sampled to choose an integer column's plan (see plan_sample_rows).
 constexpr cudf::size_type kIntegerSampleRows = 64 * 1024;
 /// Values per bitpack chunk; each chunk is packed at the bit width of its own range.
 constexpr std::size_t kBitpackChunk = 1024;
 /// A delta plan replaces plain bitpack only when it is estimated this much smaller.
 constexpr double kMinDeltaSaving = 0.9;
+
+/// Rows of a column sampled to choose its plan: the whole column up to @p cap rows, and for a
+/// longer one 1/64 of it, between cap / 16 and cap. The sample is read back to the host (or
+/// counted on the device) once per column of every spilled batch, so for a batch of a few
+/// megabytes a full-size sample costs more than the encode it chooses a plan for; a batch of
+/// 4 million rows or more is sampled at @p cap as before.
+cudf::size_type plan_sample_rows(cudf::size_type rows, cudf::size_type cap)
+{
+  if (rows <= cap) { return rows; }
+  return std::clamp(rows / 64, cap / 16, cap);
+}
 
 /// Estimated bitpack size of a stream of values pushed one at a time: each chunk at the
 /// bit width of its range, plus its min/count/width header.
@@ -180,7 +197,7 @@ class bitpack_size_estimate {
 std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
 {
   auto const width = cudf::size_of(column.type());
-  auto const rows  = static_cast<std::size_t>(std::min(column.size(), kIntegerSampleRows));
+  auto const rows  = static_cast<std::size_t>(plan_sample_rows(column.size(), kIntegerSampleRows));
   std::vector<std::uint8_t> raw(rows * width);
   CUDF_CUDA_TRY(cudaMemcpyAsync(raw.data(),
                                 column.head<std::uint8_t>() + column.offset() * width,
@@ -239,7 +256,7 @@ std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_r
     if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
     // A prefix is a cheap and, for batches built from scans and joins, representative
     // sample; a wrong guess costs ratio, never correctness.
-    auto const sample_rows = std::min(column.size(), kDictionarySampleRows);
+    auto const sample_rows = plan_sample_rows(column.size(), kDictionarySampleRows);
     auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
     auto const distinct    = cudf::distinct_count(
       sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
@@ -257,6 +274,43 @@ std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_r
     return integer_spill_plan(column, stream);
   }
   return kBitpackPlan;
+}
+
+namespace {
+
+// Encodes that hold a headroom reservation right now, per GPU. A downgrade request hands
+// several batches to the downgrade threads at once, and each encode reserves a share of its
+// batch's size from a device that is being relieved because it is full: the first ones get
+// their headroom and the next ones do not, although it comes back within the time of one
+// encode. Those wait for an encode of their GPU to end instead of spilling uncompressed.
+std::mutex g_encode_mutex;
+std::condition_variable g_encode_finished;
+std::unordered_map<int, std::size_t> g_encodes_in_flight;
+
+}  // namespace
+
+void detail::note_encode_started(int device)
+{
+  std::lock_guard lock(g_encode_mutex);
+  ++g_encodes_in_flight[device];
+}
+
+void detail::note_encode_finished(int device) noexcept
+{
+  {
+    std::lock_guard lock(g_encode_mutex);
+    auto const it = g_encodes_in_flight.find(device);
+    if (it != g_encodes_in_flight.end() && it->second > 0) { --it->second; }
+  }
+  g_encode_finished.notify_all();
+}
+
+bool detail::wait_for_encode_end(int device, std::chrono::steady_clock::time_point deadline)
+{
+  std::unique_lock lock(g_encode_mutex);
+  auto const it = g_encodes_in_flight.find(device);
+  if (it == g_encodes_in_flight.end() || it->second == 0) { return false; }
+  return g_encode_finished.wait_until(lock, deadline) != std::cv_status::timeout;
 }
 
 }  // namespace sirius::compression
@@ -291,6 +345,30 @@ std::vector<std::string> column_names(std::size_t num_columns)
   return names;
 }
 
+/// Retries the headroom reservation of @p bytes each time an encode on the GPU of @p space
+/// ends, for @p wait_ms at most. Gives up at once when no encode is in flight there: nothing
+/// is then about to give headroom back. Returns the reservation, or null.
+std::unique_ptr<cucascade::memory::reservation> wait_for_encode_headroom(
+  cucascade::memory::memory_space& space, std::size_t bytes, std::uint64_t wait_ms)
+{
+  auto const started  = std::chrono::steady_clock::now();
+  auto const deadline = started + std::chrono::milliseconds{wait_ms};
+  auto const device   = space.get_device_id();
+  std::unique_ptr<cucascade::memory::reservation> reservation;
+  bool waited = false;
+  while (!reservation) {
+    // False with no encode in flight on the GPU, or at the deadline.
+    auto const encode_ended = compression::detail::wait_for_encode_end(device, deadline);
+    waited = waited || encode_ended || std::chrono::steady_clock::now() >= deadline;
+    if (!encode_ended) { break; }
+    reservation = space.make_reservation_or_null(bytes);
+  }
+  if (waited) {
+    spill::io_stats::get().record_encode_wait(spill::micros_since(started), reservation != nullptr);
+  }
+  return reservation;
+}
+
 /// Encode @p source with its default plans. Throws spill_compression_declined when the
 /// encode cannot get its headroom or does not save enough; any other exception is a
 /// failure the caller treats the same way.
@@ -320,22 +398,34 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
   // The encoder allocates from the same GPU pool the batch is being evicted from, so
   // it runs only under a reservation of its headroom, which keeps it from taking
   // memory that other tasks are about to reserve.
-  bool reserved = false;
+  bool reserved              = false;
+  std::size_t reserved_bytes = 0;
   if (settings.encode_reserve_fraction > 0.0) {
     auto const bytes = static_cast<std::size_t>(settings.encode_reserve_fraction *
                                                 static_cast<double>(out.uncompressed_bytes));
     auto reservation = space.make_reservation_or_null(bytes);
+    if (!reservation && settings.encode_wait_ms > 0) {
+      reservation = wait_for_encode_headroom(space, bytes, settings.encode_wait_ms);
+    }
     if (!reservation) {
-      throw spill_compression_declined("no GPU headroom for a " + std::to_string(bytes) +
-                                       " byte encode");
+      throw spill_compression_declined(
+        "no GPU headroom for a " + std::to_string(bytes) + " byte encode",
+        spill::encode_outcome::no_headroom);
     }
     if (!gpu_mr->attach_reservation_to_tracker(stream, std::move(reservation))) {
-      throw spill_compression_declined("the allocation tracker already holds a reservation");
+      throw spill_compression_declined("the allocation tracker already holds a reservation",
+                                       spill::encode_outcome::no_headroom);
     }
-    reserved = true;
+    reserved       = true;
+    reserved_bytes = bytes;
+    compression::detail::note_encode_started(space.get_device_id());
   }
   absl::Cleanup detach = [&] {
-    if (reserved) { gpu_mr->reset_stream_reservation(stream); }
+    if (!reserved) { return; }
+    // What the encode allocated at most under its reservation, also when it failed.
+    spill::io_stats::get().record_encode(reserved_bytes, gpu_mr->get_peak_allocated_bytes(stream));
+    gpu_mr->reset_stream_reservation(stream);
+    compression::detail::note_encode_finished(space.get_device_id());
   };
 
   std::string plan;

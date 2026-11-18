@@ -542,12 +542,17 @@ struct tiers_fixture {
 struct scoped_spill_compression {
   /// @param max_compressed_fraction Largest compressed size, as a fraction of the batch, that
   ///        is kept; the default keeps every encode, also of columns that do not compress.
-  explicit scoped_spill_compression(double max_compressed_fraction = 2.0)
+  /// @param whole_decode_max_bytes Largest decoded size of a batch the windowed merge decodes
+  ///        whole when its rows fit one window; the default always reads through the row-range
+  ///        readers, which is what most tests are about.
+  explicit scoped_spill_compression(double max_compressed_fraction     = 2.0,
+                                    std::size_t whole_decode_max_bytes = 0)
   {
     sirius::compression::spill_compression_settings settings;
     settings.enabled                 = true;
     settings.min_batch_bytes         = 0;
     settings.max_compressed_fraction = max_compressed_fraction;
+    settings.whole_decode_max_bytes  = whole_decode_max_bytes;
     sirius::compression::set_spill_compression_settings(settings);
   }
   ~scoped_spill_compression() { sirius::compression::set_spill_compression_settings({}); }

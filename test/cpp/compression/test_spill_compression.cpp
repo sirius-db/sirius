@@ -61,6 +61,7 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -368,6 +369,19 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
                       .front();
   CHECK(contains(plan(tail), "rle"));
 
+  // The sample is the whole column up to 64K rows and 1/64 of a longer one (4K rows at least):
+  // a sorted prefix of 8,192 rows decides for a 400,000-row column, not for a 60,000-row one.
+  auto const prefix_sorted = [&](std::size_t rows) {
+    std::vector<std::int64_t> values(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+      values[i] = i < 8192 ? static_cast<std::int64_t>(i * 1000 + rng() % 7)
+                           : static_cast<std::int64_t>(rng() % 1'000'000'000);
+    }
+    return numeric_column(int64, values, stream);
+  };
+  CHECK(contains(plan(prefix_sorted(400'000)->view()), "delta"));
+  CHECK_FALSE(contains(plan(prefix_sorted(60'000)->view()), "delta"));
+
   // Other fixed-width types are bitpacked as they are.
   auto const doubles = numeric_column(
     cudf::data_type{cudf::type_id::FLOAT64}, std::vector<double>(10'000, 1.5), stream);
@@ -531,6 +545,154 @@ TEST_CASE("spill compression: a compressed host batch moves to disk without a de
   CHECK(digest(*batch) == expected);
   CHECK(env().disk->get_io_context() == context);
   CHECK_FALSE(fs::exists(path));
+}
+
+TEST_CASE("spill compression: the spill counters report stored bytes and reloads",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  scoped_settings settings(enabled_settings());
+  auto& stats             = sirius::spill::io_stats::get();
+  auto batch              = gpu_batch(compressible_table());
+  auto const device_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+
+  auto before = stats.snapshot();
+  move_to(batch, env().host);
+  auto const host_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+  auto after            = stats.snapshot();
+  CHECK(after.to_host_batches - before.to_host_batches == 1);
+  CHECK(after.to_host_source_bytes - before.to_host_source_bytes == device_bytes);
+  CHECK(after.to_host_stored_bytes - before.to_host_stored_bytes == host_bytes);
+  CHECK(after.compressed_batches - before.compressed_batches == 1);
+  CHECK(after.compressed_input_bytes - before.compressed_input_bytes == device_bytes);
+  CHECK(after.compressed_output_bytes - before.compressed_output_bytes == host_bytes);
+  // The encode ran under its reservation and reported what it allocated.
+  CHECK(after.encodes - before.encodes == 1);
+  CHECK(after.encode_reserved_bytes > before.encode_reserved_bytes);
+  CHECK(after.encode_peak_bytes > before.encode_peak_bytes);
+
+  // Already compressed: written out as is, which is not another compressed batch.
+  before = after;
+  move_to(batch, env().disk);
+  auto const file_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+  after                 = stats.snapshot();
+  CHECK(file_bytes > host_bytes);  // the header travels with the payload
+  CHECK(after.to_disk_batches - before.to_disk_batches == 1);
+  CHECK(after.to_disk_source_bytes - before.to_disk_source_bytes == host_bytes);
+  CHECK(after.to_disk_stored_bytes - before.to_disk_stored_bytes == file_bytes);
+  CHECK(after.compressed_batches == before.compressed_batches);
+
+  before = after;
+  move_to(batch, env().gpu);
+  after = stats.snapshot();
+  CHECK(after.from_disk_batches - before.from_disk_batches == 1);
+  CHECK(after.from_disk_stored_bytes - before.from_disk_stored_bytes == file_bytes);
+  CHECK(after.from_disk_device_bytes - before.from_disk_device_bytes == device_bytes);
+  CHECK(after.from_disk_compressed_batches - before.from_disk_compressed_batches == 1);
+  CHECK(after.from_disk_compressed_stored_bytes - before.from_disk_compressed_stored_bytes ==
+        file_bytes);
+  CHECK(after.from_host_batches == before.from_host_batches);
+
+  // A GPU batch written straight to disk compressed counts the file, not its device size.
+  before = after;
+  move_to(batch, env().disk);
+  after                   = stats.snapshot();
+  auto const direct_bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+  CHECK(direct_bytes < device_bytes);
+  CHECK(after.to_disk_source_bytes - before.to_disk_source_bytes == device_bytes);
+  CHECK(after.to_disk_stored_bytes - before.to_disk_stored_bytes == direct_bytes);
+  CHECK(after.compressed_batches - before.compressed_batches == 1);
+
+  SECTION("a batch that saves too little is counted as a fallback")
+  {
+    std::mt19937_64 rng{7};
+    std::vector<std::int64_t> noise(1 << 18);
+    for (auto& v : noise) {
+      v = static_cast<std::int64_t>(rng());
+    }
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+      numeric_column(cudf::data_type{cudf::type_id::INT64}, noise, utils::default_stream()));
+    auto raw             = gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+    auto const raw_bytes = raw->to_read_only().get_data()->get_size_in_bytes();
+    before               = stats.snapshot();
+    move_to(raw, env().host);
+    after = stats.snapshot();
+    CHECK(holds<cucascade::host_data_representation>(*raw));
+    CHECK(after.declined_small_saving - before.declined_small_saving == 1);
+    CHECK(after.uncompressed_fallback_bytes - before.uncompressed_fallback_bytes == raw_bytes);
+    CHECK(after.compressed_batches == before.compressed_batches);
+    CHECK(after.to_host_stored_bytes - before.to_host_stored_bytes ==
+          raw->to_read_only().get_data()->get_size_in_bytes());
+  }
+}
+
+TEST_CASE("spill compression: an encode without headroom waits only for another encode",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  auto& stats = sirius::spill::io_stats::get();
+  auto s      = enabled_settings();
+  // Generous enough to tell a wait from a refusal, short enough for a test.
+  s.encode_wait_ms = 400;
+  scoped_settings settings(s);
+  auto batch          = gpu_batch(compressible_table());
+  auto const expected = digest(*batch);
+
+  // Everything the space still has, so the encode's headroom is not grantable.
+  auto hold = env().gpu->make_reservation_upto(env().gpu->get_available_memory());
+  REQUIRE(hold != nullptr);
+  REQUIRE(env().gpu->make_reservation_or_null(1 << 20) == nullptr);
+
+  SECTION("no encode in flight: the batch spills uncompressed at once")
+  {
+    auto const before  = stats.snapshot();
+    auto const started = std::chrono::steady_clock::now();
+    move_to(batch, env().host);
+    auto const elapsed = std::chrono::steady_clock::now() - started;
+    auto const after   = stats.snapshot();
+    CHECK(holds<cucascade::host_data_representation>(*batch));
+    CHECK(after.declined_no_headroom - before.declined_no_headroom == 1);
+    CHECK(after.encode_waits == before.encode_waits);
+    CHECK(elapsed < std::chrono::milliseconds{300});
+  }
+  SECTION("headroom given back while the encode waits is used")
+  {
+    // An encode is in flight on this GPU; when it ends its headroom is free.
+    auto const device = env().gpu->get_device_id();
+    auto const before = stats.snapshot();
+    sirius::compression::detail::note_encode_started(device);
+    std::thread other([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+      hold.reset();
+      sirius::compression::detail::note_encode_finished(device);
+    });
+    move_to(batch, env().host);
+    other.join();
+    auto const after = stats.snapshot();
+    CHECK(holds<sirius::compressed_host_representation>(*batch));
+    CHECK(after.encode_waits - before.encode_waits == 1);
+    CHECK(after.encode_waits_granted - before.encode_waits_granted == 1);
+    CHECK(after.declined_no_headroom == before.declined_no_headroom);
+  }
+  SECTION("the wait ends at its deadline")
+  {
+    sirius::compression::detail::note_encode_started(env().gpu->get_device_id());
+    auto const before  = stats.snapshot();
+    auto const started = std::chrono::steady_clock::now();
+    move_to(batch, env().host);
+    auto const elapsed = std::chrono::steady_clock::now() - started;
+    sirius::compression::detail::note_encode_finished(env().gpu->get_device_id());
+    auto const after = stats.snapshot();
+    CHECK(holds<cucascade::host_data_representation>(*batch));
+    CHECK(after.encode_waits - before.encode_waits == 1);
+    CHECK(after.encode_waits_granted == before.encode_waits_granted);
+    CHECK(after.declined_no_headroom - before.declined_no_headroom == 1);
+    CHECK(elapsed >= std::chrono::milliseconds{400});
+  }
+  hold.reset();
+  move_to(batch, env().gpu);
+  CHECK(digest(*batch) == expected);
 }
 
 TEST_CASE("spill compression: batches spill uncompressed when it does not apply",

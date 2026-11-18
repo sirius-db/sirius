@@ -19,6 +19,9 @@
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_payload_sources.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
+#include "downgrade/spill_io_stats.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -37,6 +40,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -67,6 +71,13 @@ using cucascade::row_range_unsupported_error;
 /// Every read therefore records an event on its stream, and the destructor waits for the last one
 /// before it lets go of the wrapped source. The cursors of a state hold this source too, so it is
 /// destroyed after them.
+///
+/// A small host or disk payload is read once, whole, into a device buffer (make_resident), and
+/// every read of the state is then served from that copy in place: a window refill of such a
+/// batch costs no transfer and no staging, where the wrapped source would copy (host) or read
+/// from the file and wait (disk) once per leaf buffer of every column. The copy follows the rules
+/// of the cursors: it is allocated on the stream and from the resource they are built with, and
+/// dropped with them when either changes.
 class tagged_payload_source final : public simpatico::payload_source {
  public:
   tagged_payload_source(std::shared_ptr<simpatico::payload_source> source,
@@ -93,12 +104,46 @@ class tagged_payload_source final : public simpatico::payload_source {
                       void* dst,
                       rmm::cuda_stream_view stream) override
   {
-    _source->read_to_device(offset, size, dst, stream);
+    current().read_to_device(offset, size, dst, stream);
   }
 
   [[nodiscard]] const std::byte* device_base() const noexcept override
   {
-    return _source->device_base();
+    return current().device_base();
+  }
+
+  /// Copies the payload of @p representation to the device when it is at most @p max_bytes and
+  /// not there already. Called once the cursors of any other stream or resource are gone and
+  /// before a cursor is built, so no cursor ever sees the source change under it. A copy that
+  /// cannot be allocated is not retried until the cursors are dropped: the reads then stage what
+  /// they need, as they do for a larger payload.
+  void make_resident(const simpatico_compressed_representation& representation,
+                     std::size_t max_bytes,
+                     ::cuda::stream_ref stream,
+                     rmm::device_async_resource_ref mr)
+  {
+    if (_resident != nullptr || _resident_tried) { return; }
+    _resident_tried  = true;
+    auto const bytes = resident_payload_bytes(representation);
+    if (bytes == 0 || bytes > max_bytes || _source->device_base() != nullptr) { return; }
+    try {
+      _resident = load_resident_payload(representation, stream, mr);
+    } catch (const std::bad_alloc& e) {
+      SIRIUS_LOG_DEBUG(
+        "[compressed_row_range_readers] no device memory for a {} byte payload copy ({}); "
+        "reading it by ranges",
+        bytes,
+        e.what());
+      return;
+    }
+    spill::io_stats::get().record_payload_load(representation.get_current_tier(), bytes);
+  }
+
+  /// Frees the device copy of the payload. Only after wait_for_reads() and with no cursor left.
+  void drop_resident() noexcept
+  {
+    _resident.reset();
+    _resident_tried = false;
   }
 
   [[nodiscard]] bool reads(std::type_index type, const void* storage) const noexcept
@@ -176,9 +221,18 @@ class tagged_payload_source final : public simpatico::payload_source {
   cudaEvent_t _event{nullptr};
   cudaStream_t _stream{nullptr};
   int _device{0};
+  [[nodiscard]] simpatico::payload_source& current() const noexcept
+  {
+    return _resident != nullptr ? *_resident : *_source;
+  }
+
   /// The resource the state's cursors were built with; compared, never allocated from.
   std::optional<rmm::device_async_resource_ref> _resource;
   std::shared_ptr<simpatico::payload_source> _source;
+  /// The payload on the device, when it was small enough to copy whole. Declared after _source:
+  /// it is released first.
+  std::shared_ptr<simpatico::payload_source> _resident;
+  bool _resident_tried{false};
   std::type_index _type;
   const void* _storage;
 };
@@ -354,9 +408,12 @@ cucascade::row_range_result read_rows_compressed(
     for (auto& cursor : state.cursors) {
       cursor.reset();
     }
+    tagged.drop_resident();
   }
   tagged.set_cursor_resource(mr);
   read_recorder const recorder{tagged, stream.get()};
+  tagged.make_resident(
+    *representation, get_spill_compression_settings().read_cache_max_bytes, stream, mr);
 
   // ---- validate every requested column and bound k by the slot capacities (rule 1) ----
   constexpr auto max_size = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());

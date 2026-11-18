@@ -21,6 +21,7 @@
 #include "compression/spill_compression.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "downgrade/spill_io_stats.hpp"
 #include "log/logging.hpp"
 
 #include <cuda/stream>
@@ -38,6 +39,7 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -163,10 +165,23 @@ class convertible_data_batch : public convertible_data {
 
       auto& converter_registry = sirius::converter_registry::get();
 
+      // What the batch holds where it is, for the spill counters.
+      auto const source_tier  = mut.get_data()->get_current_tier();
+      auto const source_bytes = mut.get_data()->get_size_in_bytes();
+      auto const from_gpu_table =
+        dynamic_cast<cucascade::gpu_table_representation const*>(mut.get_data()) != nullptr;
+      auto const from_compressed = is_simpatico_compressed_representation(mut.get_data());
+      auto const started         = std::chrono::steady_clock::now();
+
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
           mut.convert_to<cucascade::gpu_table_representation>(
             converter_registry, *reservation, stream);
+          spill::io_stats::get().record_reload(source_tier,
+                                               source_bytes,
+                                               mut.get_data()->get_size_in_bytes(),
+                                               spill::micros_since(started),
+                                               from_compressed);
           break;
         case cucascade::memory::Tier::HOST:
           if (try_spill_compressed<compressed_host_representation>(mut, *reservation, stream)) {
@@ -192,6 +207,15 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         default: continue;
+      }
+
+      if (space->get_tier() != cucascade::memory::Tier::GPU) {
+        spill::io_stats::get().record_store(
+          space->get_tier(),
+          source_bytes,
+          mut.get_data()->get_size_in_bytes(),
+          from_gpu_table && is_simpatico_compressed_representation(mut.get_data()),
+          spill::micros_since(started));
       }
 
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle
@@ -241,13 +265,19 @@ class convertible_data_batch : public convertible_data {
         !compression::spill_compression_applies(data->get_size_in_bytes())) {
       return false;
     }
+    auto const bytes   = data->get_size_in_bytes();
+    auto const started = std::chrono::steady_clock::now();
     try {
       mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
       return true;
     } catch (compression::spill_compression_declined const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] spilling uncompressed: {}", e.what());
+      spill::io_stats::get().record_uncompressed_fallback(
+        e.outcome(), bytes, spill::micros_since(started));
     } catch (std::exception const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] encode failed, spilling uncompressed: {}", e.what());
+      spill::io_stats::get().record_uncompressed_fallback(
+        spill::encode_outcome::failed, bytes, spill::micros_since(started));
     }
     return false;
   }

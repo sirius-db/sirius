@@ -22,10 +22,14 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/resource_ref.hpp>
+
 #include <cuda/stream>
 
 #include <api/chunk_decode.hpp>
+#include <cucascade/io/io_context.hpp>
 
+#include <cstddef>
 #include <memory>
 
 namespace sirius::compression {
@@ -123,5 +127,42 @@ struct compressed_payload {
  */
 compressed_payload open_compressed_payload(
   const simpatico_compressed_representation& representation, ::cuda::stream_ref stream);
+
+/**
+ * @brief Read the whole compressed payload of a host or disk batch into one device buffer.
+ *
+ * The returned source is device resident (device_base() is not null), so a decode cursor reads
+ * the payload in place and a whole-batch decode copies its buffers device to device: the batch is
+ * fetched once, whatever the number of buffers or of row ranges read from it afterwards. Its
+ * payload offsets are the dense offsets of the batch's header (describe() of the same batch).
+ *
+ * A disk batch is read with one vectored request over the payload, cut into slices so that it
+ * spreads over the I/O reactors; the read has completed when the call returns. A host batch is
+ * copied on @p stream: the pinned blocks must not be released before the stream has run the
+ * copies, as for make_payload_source (the returned source holds no share of them).
+ *
+ * The buffer holds resident_payload_bytes() of @p representation, allocated on @p stream from
+ * @p mr, and is freed with the source.
+ *
+ * @throws std::invalid_argument if @p representation is not a compressed host or disk batch.
+ * @throws std::bad_alloc if the buffer cannot be allocated; the batch is unchanged.
+ */
+std::shared_ptr<simpatico::payload_source> load_resident_payload(
+  const simpatico_compressed_representation& representation,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
+/// load_resident_payload() of a disk batch through a context and a file the caller has open.
+std::shared_ptr<simpatico::payload_source> load_resident_payload(
+  const compressed_disk_representation& representation,
+  cucascade::io::ioctx& ctx,
+  const cucascade::io::io_object& object,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
+/// Bytes load_resident_payload() would stage on the device for @p representation: the payload
+/// of a host or disk batch; 0 for any other representation.
+[[nodiscard]] std::size_t resident_payload_bytes(
+  const simpatico_compressed_representation& representation) noexcept;
 
 }  // namespace sirius::compression

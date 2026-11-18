@@ -1035,6 +1035,12 @@ TEST_CASE("Sirius configuration loads spill compression settings", "[sirius][con
   REQUIRE(compression.max_compressed_fraction ==
           Approx(sirius::compression_config{}.max_compressed_fraction));
   REQUIRE(compression.spill_encode_reserve_fraction == Approx(0.25));
+  REQUIRE(compression.spill_read_cache_max_bytes == 4ULL * 1024 * 1024);
+  REQUIRE(sirius::compression_config{}.spill_read_cache_max_bytes == 16ULL * 1024 * 1024);
+  REQUIRE(compression.spill_whole_decode_max_bytes == 8ULL * 1024 * 1024);
+  REQUIRE(sirius::compression_config{}.spill_whole_decode_max_bytes == 64ULL * 1024 * 1024);
+  REQUIRE(compression.spill_encode_wait_ms == 250);
+  REQUIRE(sirius::compression_config{}.spill_encode_wait_ms == 1000);
 
   sirius::sirius_config negative_fraction;
   REQUIRE_THROWS_WITH(negative_fraction.load_from_file(

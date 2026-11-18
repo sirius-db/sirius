@@ -16,7 +16,9 @@
 
 #include "op/merge/detail/run_fallback.hpp"
 
+#include "compression/simpatico_compressed_representation.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "downgrade/spill_io_stats.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -26,6 +28,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 
+#include <chrono>
 #include <stdexcept>
 
 namespace sirius::op::merge::detail {
@@ -65,8 +68,17 @@ bool convert_run_batch_to_gpu(cucascade::data_batch& batch,
   // The target-space overload allocates from `gpu_space`'s allocator, so the bytes are charged
   // to the reservation the merge task has attached; an OOM propagates and leaves the batch as
   // it was. convert_to() synchronizes `stream` before it destroys the source representation.
+  auto const source_tier  = mut.get_data()->get_current_tier();
+  auto const source_bytes = mut.get_data()->get_size_in_bytes();
+  auto const compressed   = is_simpatico_compressed_representation(mut.get_data());
+  auto const started      = std::chrono::steady_clock::now();
   mut.convert_to<cucascade::gpu_table_representation>(
     sirius::converter_registry::get(), &gpu_space, stream_ref);
+  spill::io_stats::get().record_reload(source_tier,
+                                       source_bytes,
+                                       mut.get_data()->get_size_in_bytes(),
+                                       spill::micros_since(started),
+                                       compressed);
   return true;
 }
 

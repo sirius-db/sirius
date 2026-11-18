@@ -594,6 +594,77 @@ TEST_CASE("windowed_merger merges compressed runs of every spill plan in the thr
   CHECK(runs.representations() == representations);
 }
 
+TEST_CASE("windowed_merger decodes whole a compressed batch that fits one window",
+          "[windowed_merge_compressed]")
+{
+  if (!has_gpu()) { SKIP("No GPU available"); }
+  tiers_fixture fx;
+  // Batches of at most 5,000 rows and of 9,000 and more, in the three tiers.
+  const std::vector<run_shape> shapes{{.batch_rows = {20500}, .null_keys = 300},
+                                      {.batch_rows = {4500, 4500}, .null_keys = 0},
+                                      {.batch_rows = {3000}, .null_keys = 40},
+                                      {.batch_rows = {4000, 4000, 4000}, .null_keys = 5000},
+                                      {.batch_rows = {5000}, .null_keys = 0},
+                                      {.batch_rows = {9000, 7000}, .null_keys = 1}};
+  constexpr std::size_t window_rows = 5000;
+  auto const keys                   = ascending_key();
+
+  auto const merge_all = [&](std::size_t whole_decode_max_bytes) {
+    scoped_spill_compression compression{2.0, whole_decode_max_bytes};
+    compressed_runs runs(fx, shapes, 1);
+    // Host and disk batches of at most one window, which is what is decoded whole.
+    std::size_t small_spilled = 0;
+    std::size_t small_rows    = 0;
+    for (auto const& run : runs.runs) {
+      for (auto const& batch : run.batches) {
+        auto ro           = batch->to_read_only();
+        auto const rows   = sirius::representation_num_rows(*ro.get_data()).value();
+        auto const on_gpu = ro.get_current_tier() == Tier::GPU;
+        if (!on_gpu && rows <= window_rows) {
+          ++small_spilled;
+          small_rows += rows;
+        }
+      }
+    }
+    REQUIRE(small_spilled > 0);
+    auto const expected = expected_full_sort(runs.runs, keys);
+    auto merger =
+      runs.make_merger(keys, {.window_rows = window_rows, .output_target_bytes = 512 * 1024});
+    merge::merge_round_stats stats;
+    auto const collected =
+      collect_full_sort(merger, runs.cursors, fx.stream_view(), fx.mr(), &stats);
+    REQUIRE(collected.table->num_rows() == expected->num_rows());
+    CHECK(tables_equal(collected.table->view(), expected->view()));
+    CHECK(all_exhausted(runs.cursors));
+    CHECK(stats.rows_out == runs.total_rows);
+    struct outcome {
+      std::size_t conversions;
+      std::size_t refill_rows;
+      std::size_t small_spilled;
+      std::size_t small_rows;
+      std::size_t total_rows;
+    };
+    return outcome{
+      stats.fallback_conversions, stats.refill_rows, small_spilled, small_rows, runs.total_rows};
+  };
+
+  // Off: every row comes through a window buffer.
+  auto const by_range = merge_all(0);
+  CHECK(by_range.conversions == 0);
+  CHECK(by_range.refill_rows == by_range.total_rows);
+
+  // On: the small host and disk batches are converted once each and sliced in place; the larger
+  // ones, and the device batches, are still read window by window.
+  auto const whole = merge_all(std::size_t{64} << 20);
+  CHECK(whole.conversions == whole.small_spilled);
+  CHECK(whole.refill_rows == whole.total_rows - whole.small_rows);
+
+  // A size limit below the batches leaves them to the readers.
+  auto const limited = merge_all(1024);
+  CHECK(limited.conversions == 0);
+  CHECK(limited.refill_rows == limited.total_rows);
+}
+
 // ---------------------------------------------------------------------------
 // 2. A plan the readers refuse: whole-batch fallback
 // ---------------------------------------------------------------------------

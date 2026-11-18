@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "compression/simpatico_compressed_representation.hpp"
+#include "downgrade/spill_io_stats.hpp"
 #include "log/logging.hpp"
 
 #include <cuda/stream>
@@ -27,6 +29,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -192,8 +195,17 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           };
           // mut_accessor to the original batch dropped.
         }
+        auto const source_tier  = mut_accessor.get_current_tier();
+        auto const source_bytes = mut_accessor.get_data()->get_size_in_bytes();
+        auto const compressed   = is_simpatico_compressed_representation(mut_accessor.get_data());
+        auto const started      = std::chrono::steady_clock::now();
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
+        spill::io_stats::get().record_reload(source_tier,
+                                             source_bytes,
+                                             mut_accessor.get_data()->get_size_in_bytes(),
+                                             spill::micros_since(started),
+                                             compressed);
 
         // exclusive mutable access dropped.
       }

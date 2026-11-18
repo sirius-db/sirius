@@ -258,7 +258,20 @@ class spill_io_test_context final : public cucascade::io::ioctx {
     ::cuda::stream_ref stream,
     cucascade::io::io_priority priority = cucascade::io::io_priority::automatic) noexcept override
   {
-    return _inner->device_readv_async_io(obj, slices, stream, priority);
+    try {
+      {
+        std::lock_guard lock(_mutex);
+        ++_observed.device_read_calls;
+      }
+      return _inner->device_readv_async_io(obj, slices, stream, priority)
+        .defer_value([this](std::size_t bytes) {
+          std::lock_guard lock(_mutex);
+          _observed.device_read_bytes += bytes;
+          return bytes;
+        });
+    } catch (...) {
+      return cucascade::exec::make_semi_future<std::size_t>(std::current_exception());
+    }
   }
   cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
     const cucascade::io::io_object& obj,

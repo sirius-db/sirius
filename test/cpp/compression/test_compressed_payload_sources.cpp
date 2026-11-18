@@ -60,8 +60,10 @@ namespace {
 
 namespace utils = sirius::test::operator_utils;
 using sirius::compression::describe;
+using sirius::compression::load_resident_payload;
 using sirius::compression::make_payload_source;
 using sirius::compression::open_compressed_payload;
+using sirius::compression::resident_payload_bytes;
 
 using sirius::test::compression_utils::has_gpu;
 using sirius::test::compression_utils::make_compressed_device;
@@ -488,6 +490,60 @@ TEST_CASE("compressed payload sources: every buffer reads the same from the thre
     }
     CHECK(in_place == expected);
   }
+}
+
+TEST_CASE("compressed payload sources: a host or disk payload is copied whole to the device",
+          "[compressed_payload_sources]")
+{
+  if (!has_gpu()) { return; }
+  const sirius::simpatico_compressed_representation* const batches[] = {&tiers().host(),
+                                                                        &tiers().disk()};
+  auto stream                                                        = utils::default_stream();
+  auto const mr  = utils::get_resource_ref(*env().gpu);
+  auto const all = tiers().payload.size();
+  for (auto const* batch : batches) {
+    CAPTURE(typeid(*batch).name());
+    // The payload only: a disk batch's header is not part of the copy.
+    CHECK(resident_payload_bytes(*batch) == all);
+    auto const source = load_resident_payload(*batch, stream, mr);
+    REQUIRE(source != nullptr);
+    auto const* base = source->device_base();
+    REQUIRE(base != nullptr);
+
+    // In place, the copy is the payload byte for byte, at the header's dense offsets.
+    std::vector<std::byte> in_place(all);
+    REQUIRE(cudaMemcpyAsync(in_place.data(), base, all, cudaMemcpyDeviceToHost, stream.get()) ==
+            cudaSuccess);
+    stream.sync();
+    CHECK(in_place == tiers().payload);
+
+    for (auto const& [offset, size] : buffer_ranges(*describe(*batch))) {
+      CAPTURE(offset, size);
+      CHECK(read_range(*source, offset, size) == expected_range(offset, size));
+    }
+  }
+  CHECK(resident_payload_bytes(*tiers().device) == 0);
+  CHECK_THROWS_AS(load_resident_payload(*tiers().device, stream, mr), std::invalid_argument);
+}
+
+TEST_CASE("compressed payload sources: a device copy outlives the batch it was read from",
+          "[compressed_payload_sources]")
+{
+  if (!has_gpu()) { return; }
+  auto local     = make_tiers(source_table(40'000));
+  auto stream    = utils::default_stream();
+  auto const mr  = utils::get_resource_ref(*env().gpu);
+  auto const all = local.payload;
+  auto host      = load_resident_payload(local.host(), stream, mr);
+  auto disk      = load_resident_payload(local.disk(), stream, mr);
+  // The host copy is enqueued on the stream; the pinned blocks may go once it has run.
+  stream.sync();
+  auto const path = local.disk().path();
+  local.host_owner.reset();
+  local.disk_owner.reset();
+  CHECK_FALSE(std::filesystem::exists(path));
+  CHECK(read_range(*host, 0, all.size()) == all);
+  CHECK(read_range(*disk, 0, all.size()) == all);
 }
 
 TEST_CASE("compressed payload sources: a device batch without a table is rejected",

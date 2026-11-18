@@ -22,6 +22,8 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime.h>
 
 #include <api/compressed_table_io.hpp>
@@ -301,7 +303,119 @@ std::shared_ptr<const simpatico::hpln_description> describe_disk(
   return parse_header(header);
 }
 
+// ── Resident copy ────────────────────────────────────────────────────────────
+
+/// Largest slice of the one vectored read of a spill file. A read slice is one queue entry of
+/// one I/O reactor, so a file read as a single slice would not spread over the reactors.
+constexpr std::size_t kResidentReadSliceBytes = std::size_t{32} << 20;
+
+/// A compressed payload copied whole into one device buffer; the payload starts @c skip bytes
+/// into it.
+class resident_payload_source final : public simpatico::payload_source {
+ public:
+  resident_payload_source(rmm::device_buffer bytes, std::size_t skip)
+    : _bytes(std::move(bytes)), _skip(skip)
+  {
+  }
+
+  void read_to_device(std::uint64_t offset,
+                      std::uint64_t size,
+                      void* dst,
+                      rmm::cuda_stream_view stream) override
+  {
+    if (size == 0) { return; }
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(dst,
+                                       device_base() + offset,
+                                       static_cast<std::size_t>(size),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream.value()));
+  }
+
+  [[nodiscard]] const std::byte* device_base() const noexcept override
+  {
+    return static_cast<const std::byte*>(_bytes.data()) + _skip;
+  }
+
+ private:
+  rmm::device_buffer _bytes;
+  std::size_t _skip;
+};
+
+std::shared_ptr<simpatico::payload_source> load_resident(
+  const compressed_host_representation& representation,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const bytes = representation.get_size_in_bytes();
+  rmm::device_buffer staged{bytes, stream, mr};
+  copy_pinned_blocks_to_device(representation.payload(), 0, staged.data(), bytes, stream);
+  return std::make_shared<resident_payload_source>(std::move(staged), 0);
+}
+
 }  // namespace
+
+std::shared_ptr<simpatico::payload_source> load_resident_payload(
+  const compressed_disk_representation& representation,
+  cucascade::io::ioctx& ctx,
+  const cucascade::io::io_object& object,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (!ctx.supports_device_read()) {
+    throw std::logic_error("compressed spill: DISK context cannot read device memory");
+  }
+  auto const header = representation.header_bytes();
+  auto const bytes  = representation.get_size_in_bytes() - header;
+  rmm::device_buffer staged{bytes, stream, mr};
+  if (bytes == 0) { return std::make_shared<resident_payload_source>(std::move(staged), 0); }
+  // Slices end at multiples of the slice size in the file, so every slice but the first starts
+  // at a block-aligned offset, which a backend reading with O_DIRECT wants; the payload itself
+  // starts wherever the header ends.
+  auto* const base = static_cast<std::uint8_t*>(staged.data());
+  auto const end   = header + bytes;
+  std::vector<cucascade::io::slice> slices;
+  slices.reserve(bytes / kResidentReadSliceBytes + 2);
+  for (auto offset = header; offset < end;) {
+    auto const stop =
+      std::min(end, (offset / kResidentReadSliceBytes + 1) * kResidentReadSliceBytes);
+    slices.emplace_back(offset, stop - offset, base + (offset - header));
+    offset = stop;
+  }
+  // Cache-unaware, like every read of a spill file. Declared after the buffer: the read drains
+  // before it is released, also when the wait throws.
+  detail::spill_request request{ctx.device_readv_async_io(object, slices, stream)};
+  detail::check_spill_bytes(request.get(), bytes);
+  return std::make_shared<resident_payload_source>(std::move(staged), 0);
+}
+
+std::size_t resident_payload_bytes(
+  const simpatico_compressed_representation& representation) noexcept
+{
+  if (dynamic_cast<const compressed_host_representation*>(&representation) != nullptr) {
+    return representation.get_size_in_bytes();
+  }
+  if (auto const* disk = dynamic_cast<const compressed_disk_representation*>(&representation)) {
+    return disk->get_size_in_bytes() - disk->header_bytes();
+  }
+  return 0;
+}
+
+std::shared_ptr<simpatico::payload_source> load_resident_payload(
+  const simpatico_compressed_representation& representation,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (auto const* host = dynamic_cast<const compressed_host_representation*>(&representation)) {
+    return load_resident(*host, stream, mr);
+  }
+  if (auto const* disk = dynamic_cast<const compressed_disk_representation*>(&representation)) {
+    auto const ctx    = detail::spill_context(disk->get_memory_space());
+    auto const object = ctx->open_io_object(disk->path());
+    return load_resident_payload(*disk, *ctx, *object, stream, mr);
+  }
+  throw std::invalid_argument(
+    "[compressed_payload_sources] load_resident_payload: not a compressed host or disk batch");
+}
 
 std::shared_ptr<simpatico::payload_source> make_payload_source(
   const compressed_device_representation& representation, ::cuda::stream_ref stream)
