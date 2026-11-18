@@ -299,8 +299,8 @@ One node, GDS, the datasets, config and method of the table above, in seconds:
 | SF30000 | 321.7 | 319.7 | 28.5 | 27.1 |
 | SF100000 | 1,641.1 | 1,494.6 | 328.8 | 179.3 |
 
-- **SF100000 Q9** has two modes: 179.3 s in the 22-query pass and 122.0 s alone an hour earlier on
-  the same node, against 338.8 s for the earlier build run next to it. It now writes 44 to 436 GB
+- **SF100000 Q9** has two modes: 179.3 s in the 22-query pass and 122.0 s alone 50 minutes earlier
+  on the same node, against 338.8 s for the earlier build run next to it. It now writes 44 to 436 GB
   to disk where it wrote about 2.5 TB. Q13 is unchanged and still writes about 0.6 TB.
 - **The other 21 queries at SF100000** sum to 1,315.3 s against 1,312.4 s.
 - **Answers** match the expected results for all 22 queries at both scales.
