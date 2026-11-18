@@ -276,6 +276,9 @@ struct gather_read_back {
  * Waits on the stream once to read back the null counts and STRING chars sizes of all columns,
  * and once more when there is a STRING column, whatever the number of columns and windows, plus
  * once per STRING column whose chars reach the large-strings threshold (its offsets are rebuilt).
+ * A STRING column of short strings is copied one thread per string; when one of its strings is
+ * too long for that, the column's chars are gathered again by the batched copy, with one more
+ * wait for the call.
  * Everything queued on @p stream has run when it returns.
  *
  * @param windows The k windows; all share one schema.

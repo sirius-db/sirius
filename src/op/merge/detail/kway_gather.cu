@@ -42,6 +42,7 @@
 
 #include <cuda/iterator>
 #include <cuda_runtime_api.h>
+#include <thrust/for_each.h>
 #include <thrust/scan.h>
 #include <thrust/transform.h>
 
@@ -125,6 +126,36 @@ struct pair_size_fn {
   __device__ cudf::size_type operator()(cudf::strings::detail::string_index_pair const& pair) const
   {
     return pair.second;
+  }
+};
+
+/// A STRING column whose strings average at most this many bytes is gathered by
+/// copy_short_strings_fn, one thread per string.
+constexpr std::int64_t kShortStringAverageBytes = 32;
+/// The longest string copy_short_strings_fn copies; a longer one sends the column to the batched
+/// copy, whose cost does not depend on the longest string.
+constexpr cudf::size_type kShortStringCopyLimit = 256;
+
+/// Copies the string of output row j to its place in the output chars, or raises the flag when
+/// the string is longer than kShortStringCopyLimit.
+template <typename PairIterator>
+struct copy_short_strings_fn {
+  PairIterator pairs;
+  std::int32_t const* offsets;  ///< Output offsets, rows + 1 values.
+  char* chars;                  ///< Output chars.
+  std::int32_t* too_long;       ///< Set to 1 when some string was not copied.
+
+  __device__ void operator()(cudf::size_type j) const
+  {
+    cudf::strings::detail::string_index_pair const pair = pairs[j];
+    if (pair.second > kShortStringCopyLimit) {
+      *too_long = 1;
+      return;
+    }
+    char* const out = chars + offsets[j];
+    for (cudf::size_type b = 0; b < pair.second; ++b) {
+      out[b] = pair.first[b];
+    }
   }
 };
 
@@ -298,14 +329,30 @@ pending_column start_strings(std::span<const cudf::table_view> windows,
   return pending;
 }
 
-/// Gathers the chars of a STRING column once its chars size is on the host.
-std::unique_ptr<cudf::column> finish_strings(pending_column&& pending,
-                                             gather_map map,
-                                             cudf::size_type rows,
-                                             cudf::size_type null_count,
-                                             std::int64_t chars_bytes,
-                                             rmm::cuda_stream_view stream,
-                                             rmm::device_async_resource_ref mr)
+/// The chars of a STRING column through cudf's batched copy.
+template <typename PairIterator>
+rmm::device_uvector<char> gather_chars_batched(cudf::column_view const& offsets,
+                                               std::int64_t chars_bytes,
+                                               PairIterator pairs,
+                                               cudf::size_type rows,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  return cudf::strings::detail::make_chars_buffer(offsets, chars_bytes, pairs, rows, stream, mr);
+}
+
+/// Gathers the chars of a STRING column once its chars size is on the host. A column of short
+/// strings is copied one thread per string; @p too_long, a zeroed device flag, is then set when
+/// a string was too long for that and the chars must be gathered again (regather_strings).
+/// Returns the column and whether the flag has to be checked.
+std::pair<std::unique_ptr<cudf::column>, bool> finish_strings(pending_column&& pending,
+                                                              gather_map map,
+                                                              cudf::size_type rows,
+                                                              cudf::size_type null_count,
+                                                              std::int64_t chars_bytes,
+                                                              std::int32_t* too_long,
+                                                              rmm::cuda_stream_view stream,
+                                                              rmm::device_async_resource_ref mr)
 {
   auto const pairs     = string_pairs(pending, map);
   auto const threshold = cudf::strings::get_offset64_threshold();
@@ -319,13 +366,52 @@ std::unique_ptr<cudf::column> finish_strings(pending_column&& pending,
     std::tie(pending.offsets, chars_bytes) =
       cudf::strings::detail::make_offsets_child_column(sizes, sizes + rows, stream, mr);
   }
-  auto chars = cudf::strings::detail::make_chars_buffer(
-    pending.offsets->view(), chars_bytes, pairs, rows, stream, mr);
+  auto const short_strings =
+    chars_bytes < threshold && chars_bytes <= kShortStringAverageBytes * rows &&
+    pending.offsets->type().id() == cudf::type_id::INT32;
+  rmm::device_uvector<char> chars(0, stream, mr);
+  if (short_strings) {
+    chars = rmm::device_uvector<char>(static_cast<std::size_t>(chars_bytes), stream, mr);
+    auto const begin = cuda::counting_iterator<cudf::size_type>{0};
+    thrust::for_each(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                     begin,
+                     begin + rows,
+                     copy_short_strings_fn<decltype(pairs)>{
+                       pairs,
+                       pending.offsets->view().data<std::int32_t>(),
+                       chars.data(),
+                       too_long});
+  } else {
+    chars = gather_chars_batched(pending.offsets->view(), chars_bytes, pairs, rows, stream, mr);
+  }
+  return {cudf::make_strings_column(rows,
+                                    std::move(pending.offsets),
+                                    chars.release(),
+                                    null_count,
+                                    std::move(pending.validity.mask)),
+          short_strings};
+}
+
+/// Gathers the chars of a finished STRING column again, through the batched copy. @p pending is
+/// what finish_strings left of the column's state: the device arrays its string pairs read.
+std::unique_ptr<cudf::column> regather_strings(std::unique_ptr<cudf::column> column,
+                                               pending_column const& pending,
+                                               gather_map map,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  auto const rows       = column->size();
+  auto const null_count = column->null_count();
+  auto const chars_bytes =
+    static_cast<std::int64_t>(cudf::strings_column_view{column->view()}.chars_size(stream));
+  auto contents = column->release();
+  auto chars    = gather_chars_batched(
+    contents.children.front()->view(), chars_bytes, string_pairs(pending, map), rows, stream, mr);
   return cudf::make_strings_column(rows,
-                                   std::move(pending.offsets),
+                                   std::move(contents.children.front()),
                                    chars.release(),
                                    null_count,
-                                   std::move(pending.validity.mask));
+                                   std::move(*contents.null_mask));
 }
 
 /// Copies @p read_back.source to the host and waits for it.
@@ -450,14 +536,31 @@ std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windo
                 read_back.source.size() * sizeof(cudf::size_type));
   }
 
+  // One flag per STRING column: a string was too long for the short-string copy.
+  rmm::device_uvector<std::int32_t> too_long(num_strings, stream, temp_mr);
+  if (num_strings > 0) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+      too_long.data(), 0, too_long.size() * sizeof(std::int32_t), stream.value()));
+  }
+  bool check_too_long = false;
+
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(num_columns);
   for (std::size_t c = 0, s = 0; c < num_columns; ++c) {
     auto& column          = pending[c];
     auto const null_count = column.validity.nullable ? rows - counts[c] : 0;
     if (is_string(c)) {
-      columns.push_back(
-        finish_strings(std::move(column), map, rows, null_count, host_totals[s++], stream, mr));
+      auto finished = finish_strings(std::move(column),
+                                     map,
+                                     rows,
+                                     null_count,
+                                     host_totals[s],
+                                     too_long.data() + s,
+                                     stream,
+                                     mr);
+      ++s;
+      columns.push_back(std::move(finished.first));
+      check_too_long = check_too_long || finished.second;
     } else {
       columns.push_back(std::make_unique<cudf::column>(
         windows.front().column(static_cast<cudf::size_type>(c)).type(),
@@ -467,8 +570,25 @@ std::unique_ptr<cudf::table> gather_kway(std::span<const cudf::table_view> windo
         null_count));
     }
   }
-  // The chars of the STRING columns are gathered after the read-back.
-  if (num_strings > 0) { stream.synchronize(); }
+  // The chars of the STRING columns are gathered after the read-back. The flags of the
+  // short-string copies come back in the same wait.
+  if (num_strings > 0) {
+    if (!check_too_long) {
+      stream.synchronize();
+    } else {
+      auto const host_too_long = cudf::detail::make_pinned_vector_async(too_long, stream);
+      stream.synchronize();
+      bool regathered = false;
+      for (std::size_t c = 0, s = 0; c < num_columns; ++c) {
+        if (!is_string(c)) { continue; }
+        if (host_too_long[s++] != 0) {
+          columns[c] = regather_strings(std::move(columns[c]), pending[c], map, stream, mr);
+          regathered = true;
+        }
+      }
+      if (regathered) { stream.synchronize(); }
+    }
+  }
   return std::make_unique<cudf::table>(std::move(columns));
 }
 

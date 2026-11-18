@@ -497,6 +497,40 @@ TEST_CASE("gather_kway matches concatenate + gather on a mixed schema", "[kway_g
   }
 }
 
+TEST_CASE("gather_kway copies short strings, with and without a long one among them",
+          "[kway_gather]")
+{
+  std::mt19937 rng{31};
+  // Columns: a nullable STRING and a STRING without a null mask. The strings average a few
+  // bytes, so both columns take the short-string copy; with long_rows a few strings are past
+  // what it copies and the column is gathered again.
+  for (const std::size_t long_rows : {std::size_t{0}, std::size_t{3}}) {
+    INFO("long_rows=" << long_rows);
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    for (std::size_t i = 0; i < 4; ++i) {
+      const std::size_t rows = 700 + 50 * i;
+      std::vector<std::vector<std::string>> values(2, std::vector<std::string>(rows));
+      for (auto& column : values) {
+        for (auto& value : column) {
+          value.resize(rng() % 9);
+          for (auto& ch : value) {
+            ch = static_cast<char>('a' + rng() % 26);
+          }
+        }
+        for (std::size_t l = 0; l < long_rows; ++l) {
+          column[rng() % rows] = std::string(257 + rng() % 3000, static_cast<char>('A' + l));
+        }
+      }
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(make_strings(values[0], random_validity(rows, rng)));
+      columns.push_back(make_strings(values[1], {}));
+      tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+    }
+    auto const windows = views_of(tables);
+    check_gather(windows, random_map(windows, 2500, rng));
+  }
+}
+
 TEST_CASE("gather_kway reads sliced window views", "[kway_gather]")
 {
   std::mt19937 rng{7};

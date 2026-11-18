@@ -918,7 +918,9 @@ With `n` = `window_rows`, each round does the following:
    accepts at most `kMaxKwayMergeInputs` (4096) windows; the configured fan-in is clamped to that.
 5. **Gather.** `detail::gather_kway()` copies the selected rows of all fetched columns, with null
    masks and STRING data, into the round's output table. The null counts, the STRING sizes and
-   the consumed counts come back to the host in one read.
+   the consumed counts come back to the host in one read. A STRING column of short strings is
+   copied one thread per string; a long string among them sends the column to cuDF's batched
+   copy (one more wait).
 6. **Advance.** The co-ranks at `target` are the rows consumed from each window. Cursors advance by
    them and the window buffers drop the consumed rows.
 
