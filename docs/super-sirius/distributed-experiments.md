@@ -256,6 +256,10 @@ GB200, 4 ranks per node, the sum of the 22 TPC-H query times in seconds.
 - **SF100000 on one node:** Q9 and Q13 do not fit in memory and spill to disk (about 2.5 TB and
   0.6 TB), so that run has spill compression on.
 - The build of these runs carries the planner rewrites for Q2, Q11, Q13, Q17 and Q18.
+- **To run a cell again:** the `distributed-sirius-bench` skill holds the commit, config,
+  environment and SQL of each cell: `bench.py reference` lists them and
+  `bench.py plan --reference sf30k-n2-gds` sets one up. The configs in [Config](#config) are
+  of earlier runs, not of this table.
 
 These runs are on [accel-etl](https://accel-etl.nvidia.com/runs). A run there holds every pass,
 so its totals are per pass and differ from the faster-run totals above. The SF10000 GDS run on
