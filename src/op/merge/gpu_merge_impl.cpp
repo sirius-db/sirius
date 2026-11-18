@@ -197,6 +197,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
           cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL);
         break;
       }
+      case cudf::aggregation::Kind::MERGE_LISTS: {
+        reduce_aggregation = cudf::make_merge_lists_aggregation<cudf::reduce_aggregation>();
+        break;
+      }
       case cudf::aggregation::Kind::NTH_ELEMENT: {
         if (!merge_nth_index[c].has_value()) {
           throw std::runtime_error(
@@ -435,6 +439,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
         // per-partition lists and drops duplicates, producing a deduplicated LIST per group.
         request.aggregations.push_back(
           cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
+      case cudf::aggregation::Kind::COLLECT_LIST: {
+        request.aggregations.push_back(
+          cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>());
         break;
       }
       default:

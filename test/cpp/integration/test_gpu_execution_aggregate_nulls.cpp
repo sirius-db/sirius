@@ -138,6 +138,46 @@ TEST_CASE_METHOD(AggNullFixture,
 }
 
 TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution grouped list retains values and NULLs",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  compare_gpu_vs_cpu("SELECT g, list(v), list(d) FROM agg_n GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution ungrouped list retains values and NULLs",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  compare_gpu_vs_cpu("SELECT list(v), list(d) FROM agg_n");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution list distinguishes empty input from zero groups",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  // Ungrouped aggregation returns one NULL list; GROUP BY produces no rows.
+  compare_gpu_vs_cpu("SELECT list(v) FROM agg_n WHERE g = 999");
+  compare_gpu_vs_cpu("SELECT g, list(v) FROM agg_n WHERE g = 999 GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution list merges partial batches",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  run_ok("CREATE TABLE list_many AS SELECT i % 2 AS g, i AS v FROM range(5000) t(i)");
+  run_ok("CHECKPOINT");
+  compare_gpu_vs_cpu("SELECT g, list(v), list(v * 2) FROM list_many GROUP BY g ORDER BY g");
+  compare_gpu_vs_cpu("SELECT list(v) FROM list_many");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "ordered list uses CPU until the GPU can preserve its order",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  expect_plan_fallback_matches_cpu("SELECT g, list(v ORDER BY v DESC) FROM agg_n GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution ungrouped COUNT(DISTINCT) ignores NULLs",
                  "[integration][gpu_execution][aggregate][nulls]")
 {

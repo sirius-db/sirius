@@ -24,6 +24,6 @@ expectations:
     queries: [Q03_V09]
 
   - outcome: plan_rejected
-    reason: "Unsupported expression in aggregate .*: list\\("
+    reason: 'Unsupported expression in projection .*: list_aggr\('
     issue: 2290
     queries: [Q01_V07]

@@ -239,6 +239,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
     if (bound_aggr.GetOrderBys()) {
+      // BindSortedAggregate replaces the implementation but retains the name "list".
+      // Translating that wrapper as plain COLLECT_LIST would silently discard ORDER BY.
+      if (sirius::from_duckdb_aggregate_name(bound_aggr.Function().GetName().GetIdentifierName()) ==
+          sirius::aggregate_id::list) {
+        throw duckdb::NotImplementedException(
+          "list() ORDER BY is not supported on the GPU (falling back to CPU): " +
+          bound_aggr.ToString());
+      }
       duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
     }
   }
@@ -950,6 +958,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
     if (aggregate.GetFilter()) { throw_if_aggregate_filter_unsupported(aggregate); }
+    if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) ==
+          sirius::aggregate_id::list &&
+        aggregate.GetChildren().size() == 1 &&
+        aggregate.GetChildren()[0]->GetReturnType().IsNested()) {
+      throw duckdb::NotImplementedException(
+        "list() over nested values is not supported on the GPU (falling back to CPU)");
+    }
     if (!aggregate.IsDistinct()) { continue; }
     if (sirius::from_duckdb_aggregate_name(aggregate.Function().GetName().GetIdentifierName()) !=
         sirius::aggregate_id::count) {
