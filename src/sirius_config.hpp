@@ -465,6 +465,11 @@ class configuration_input_error : public std::runtime_error {
 
 class parsed_sirius_config;
 
+namespace config {
+class node;
+struct user_config;
+}  // namespace config
+
 /// The egress NIC a REST pool would use (the configured @c rest.interface, else the default
 /// route's interface), as cuCascade discovers it; @c nullopt when there is none or it cannot be
 /// read.  cuCascade's own discovery in production.
@@ -663,9 +668,20 @@ struct sirius_config {
 class parsed_sirius_config {
  public:
   parsed_sirius_config();
+  /// The YAML file at @p path, which holds one document. @throws configuration_input_error naming
+  /// @p path when it cannot be read, is not well-formed YAML, or a value or a rule fails.
   static parsed_sirius_config from_file(const std::filesystem::path& path);
+  /// A document yaml-cpp has loaded; errors name @p source_path when given.
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
+  /// A document config::parse_yaml has read; errors name @p source_path when given.
+  /// @throws configuration_input_error when a value or a rule fails.
+  static parsed_sirius_config from_document(const config::node& document,
+                                            const std::filesystem::path& source_path = {});
+  /// The same intent from the typed user configuration: its user-defined values are read back, so
+  /// fallbacks fill in the rest and every block's rules hold, also for a configuration built in
+  /// code. @throws configuration_input_error when a value or a rule fails.
+  static parsed_sirius_config from_user_config(const config::user_config& user);
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
@@ -680,7 +696,49 @@ class parsed_sirius_config {
  private:
   struct Impl;
   explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  /// from_user_config, naming @p source_path in resolution errors.
+  static parsed_sirius_config from_user_config(const config::user_config& user,
+                                               const std::filesystem::path& source_path);
   std::shared_ptr<const Impl> impl_;
 };
+
+/**
+ * @brief Resolve what the user configured against this machine: memory spaces through the
+ * cuCascade configurator, hardware-derived defaults for every value the user left unset (thread
+ * and reactor counts, batch sizes, REST limits from the egress NIC), and the checks that need
+ * them.
+ *
+ * @param probe finds the egress NIC when a value derived from it is unset; tests inject one.
+ * @throws configuration_input_error when the configuration cannot work on @p topology.
+ */
+[[nodiscard]] sirius_config create_sirius_config(
+  const config::user_config& user,
+  const cucascade::memory::system_topology_info& topology,
+  const egress_nic_probe& probe = discover_egress_nic);
+
+/**
+ * @brief The user configuration that reproduces @p resolved: @p user's values and fallbacks, plus
+ * every value resolution derived from the machine for an option @p user left unset (thread and
+ * reactor counts, scan budgets, REST limits, preparation limits, batch sizes, the GPU count, and
+ * the initial host pools when every NUMA node got the same count). Resolving it again on the same
+ * machine gives a configuration that runs with the same values.
+ */
+[[nodiscard]] config::user_config effective_user_config(const config::user_config& user,
+                                                        const sirius_config& resolved);
+
+/**
+ * @brief The YAML text of the effective configuration of @p resolved, resolved from an empty
+ * configuration file: effective_user_config with every value spelled out, behind a comment saying
+ * what the file is. Developer-only settings are left out unless @p developer; the rest still
+ * resolves to the same values, since only fallbacks and values derived alike are left out.
+ */
+[[nodiscard]] std::string effective_config_text(const sirius_config& resolved, bool developer);
+
+/**
+ * @brief Write effective_config_text (developer-only settings in developer mode only) to @p path:
+ * creates the directory and replaces the file whole. @throws std::exception when it cannot be
+ * written.
+ */
+void write_effective_config(const std::filesystem::path& path, const sirius_config& resolved);
 
 }  // namespace sirius

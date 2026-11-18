@@ -1,7 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "config_loading.hpp"
 
-#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
+#include "config/yaml.hpp"
 
 #include <fstream>
 
@@ -25,12 +25,20 @@ parsed_sirius_config load_configuration(const std::filesystem::path& path)
       throw configuration_load_error(
         configuration_load_error_code::io, "Cannot read configuration file", path);
     }
-    return parsed_sirius_config::from_node(YAML::Load(contents), path);
+    config::node document;
+    try {
+      document = config::parse_yaml(contents);
+    } catch (const config::yaml_syntax_error& e) {
+      throw configuration_load_error(configuration_load_error_code::malformed_yaml, e.what(), path);
+    }
+    return parsed_sirius_config::from_document(document, path);
   } catch (const std::ios_base::failure&) {
     throw configuration_load_error(
       configuration_load_error_code::io, "Cannot read configuration file", path);
-  } catch (const YAML::Exception& e) {
-    throw configuration_load_error(configuration_load_error_code::malformed_yaml, e.what(), path);
+  } catch (const config::config_error& e) {
+    // Well-formed YAML with a duplicate or non-scalar key.
+    throw configuration_load_error(
+      configuration_load_error_code::invalid_configuration, e.what(), path);
   } catch (const configuration_input_error& e) {
     throw configuration_load_error(configuration_load_error_code::invalid_configuration, e.what());
   }

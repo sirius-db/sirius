@@ -524,6 +524,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::parsed_sirius_config& config);
 
+  /// \brief Initialize the Sirius context with the user's configuration: it is resolved against
+  /// this machine (sirius::create_sirius_config) once telemetry is up.
+  void initialize(const sirius::config::user_config& config);
+
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
    *
@@ -1201,6 +1205,9 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   void read_config_file_if_exists();
 
   bool disabled_{false};
+  /// Whether a config file was loaded; without one, the effective configuration is written to
+  /// ~/.sirius/config.yml once the context is up.
+  bool config_file_found_{false};
   sirius::parsed_sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };

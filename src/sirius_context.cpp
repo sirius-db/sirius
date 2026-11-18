@@ -95,6 +95,11 @@ namespace {
 static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
 static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
+/// Written to ~/.sirius when Sirius starts without a config file: what it runs with.
+static constexpr std::string_view EFFECTIVE_CONFIG_FILE_NAME = "config.yml";
+/// Set to 0 (or false, off, no) to keep Sirius from writing the effective configuration (tests
+/// do).
+static constexpr std::string_view EFFECTIVE_CONFIG_ENV_NAME = "SIRIUS_WRITE_EFFECTIVE_CONFIG";
 
 optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
 {
@@ -187,6 +192,17 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
 ///   1. SIRIUS_CONFIG_FILE environment variable (explicit path)
 ///   2. ./sirius.yaml in the current working directory
 ///   3. ~/.sirius/sirius.yaml in the user's home directory
+/// $HOME/.sirius, or std::nullopt when HOME is unset or not an absolute path (an empty HOME
+/// would otherwise resolve against the working directory).
+std::optional<std::filesystem::path> sirius_home_dir()
+{
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) { return std::nullopt; }
+  std::filesystem::path dir(home);
+  if (!dir.is_absolute()) { return std::nullopt; }
+  return dir / std::string(CONFIG_FILE_DIR);
+}
+
 /// Returns std::nullopt if none of the candidates exist.
 std::optional<std::string> get_config_file_path()
 {
@@ -199,14 +215,36 @@ std::optional<std::string> get_config_file_path()
   if (std::filesystem::exists(cwd_path)) { return cwd_path.string(); }
 
   // 3. Home directory
-  const char* home_dir = std::getenv("HOME");
-  if (home_dir != nullptr) {
-    auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
-                     std::string(CONFIG_FILE_NAME);
+  if (auto const dir = sirius_home_dir()) {
+    auto home_path = *dir / std::string(CONFIG_FILE_NAME);
     if (std::filesystem::exists(home_path)) { return home_path.string(); }
   }
 
   return std::nullopt;
+}
+
+/// Record what Sirius runs with in ~/.sirius/config.yml when the user gave no config file. A
+/// failure to write is logged, never fatal.
+void write_effective_config_file(const sirius::sirius_config& resolved)
+{
+  if (auto const* write = std::getenv(std::string(EFFECTIVE_CONFIG_ENV_NAME).c_str())) {
+    std::string value(write);
+    std::ranges::transform(value, value.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (value == "0" || value == "false" || value == "off" || value == "no") { return; }
+  }
+  auto const dir = sirius_home_dir();
+  if (!dir) {
+    SIRIUS_LOG_INFO("HOME is not an absolute path; not writing the effective configuration");
+    return;
+  }
+  auto const path = *dir / std::string(EFFECTIVE_CONFIG_FILE_NAME);
+  try {
+    sirius::write_effective_config(path, resolved);
+    SIRIUS_LOG_INFO("Wrote the effective configuration to {}", path.string());
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+      "Could not write the effective configuration to {}: {}", path.string(), e.what());
+  }
 }
 
 bool sirius_disabled_by_env()
@@ -920,6 +958,11 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
   cudf::set_pinned_memory_resource(*prev_pinned_mr_);
   cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
   prev_pinned_mr_.reset();
+}
+
+void SiriusContext::initialize(const sirius::config::user_config& config)
+{
+  initialize(sirius::parsed_sirius_config::from_user_config(config));
 }
 
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
@@ -2448,6 +2491,7 @@ void SiriusContextExtensionCallback::initialize_context()
 
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
+  if (!config_file_found_) { write_effective_config_file(context->get_config()); }
   context_ = std::move(context);
 }
 
@@ -2505,7 +2549,8 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
-    config_ = sirius::parsed_sirius_config::from_file(*config_path);
+    config_            = sirius::parsed_sirius_config::from_file(*config_path);
+    config_file_found_ = true;
     SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error

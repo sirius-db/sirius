@@ -17,6 +17,7 @@ target_sources(
           sirius_sql_rewrite.cpp)
 
 add_subdirectory(compression)
+add_subdirectory(config)
 add_subdirectory(creator)
 add_subdirectory(cuda)
 add_subdirectory(data)

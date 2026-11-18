@@ -32,7 +32,7 @@ namespace sirius::creator {
  */
 enum class request_type { active, lookahead };
 
-/// ADL-discoverable string conversion so yaml_reader can parse request_type values.
+/// ADL-discoverable string conversion for request_type values.
 inline bool string_to_enum(std::string_view sv, request_type& out)
 {
   static const std::unordered_map<std::string_view, request_type> map = {
@@ -64,7 +64,7 @@ inline bool enum_to_string(request_type type, std::string& s)
  */
 enum class priority_order { sink, source };
 
-/// ADL-discoverable string conversion so yaml_reader can parse priority_order values.
+/// ADL-discoverable string conversion for priority_order values.
 inline bool string_to_enum(std::string_view sv, priority_order& out)
 {
   static const std::unordered_map<std::string_view, priority_order> map = {
