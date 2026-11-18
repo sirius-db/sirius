@@ -151,6 +151,151 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
+### Subquery Aggregates from the Delim Join's Rows
+
+**Motivation:** DuckDB decorrelates `l_quantity < (SELECT avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` (TPC-H q17) and q2's `MIN(ps_supplycost)` over the EUROPE suppliers into a delim join whose subquery side joins the outer rows' distinct keys back to a fresh scan of the subquery's tables. When the outer rows already hold every subquery row for their key, that second scan, and the join against the keys, are redundant.
+
+**Mechanism:** a logical rewrite on the transparent path's copy of DuckDB's optimized plan, before Sirius plans it. `DELIM_JOIN(O, ... AGGREGATE(I))` becomes `CTE(O) { JOIN(CTE_SCAN, ... AGGREGATE(CTE_SCAN)) }` with the same join type and conditions: the outer rows are materialized once and grouped by their key. Under `delim_join_as_cte = true`, where DuckDB has already made `O` a CTE and restricts `I` by a SEMI join against `SELECT DISTINCT key FROM CTE_SCAN`, the aggregate's input becomes a scan of that CTE instead. The aggregate keeps its table indexes, so nothing above it changes.
+
+**When it applies:** both sides are flattened into a product of leaves filtered by the conjunction of their predicates. `I` must be the subquery's rows `S` restricted by one `S.a = key` equality, and `O` must be `S' x P` where every leaf of `S` maps to exactly one scan of the same table view (or of the same CTE) in `S'`, the predicates over `S'` alone are exactly `S`'s, and every predicate across `S'` and `P` reads `S'` only through `a`. The join key must be `a` or a column of `P` equated with it. Then the outer rows with key `k` are `S`'s rows with `a = k`, each repeated the same number of times, which leaves MIN and MAX unchanged, and AVG too when its input is an INTEGER, a BIGINT, or a DECIMAL of width 5 to 18 (a DOUBLE sum depends on the order rows are added in). Repetition also scales AVG's sum: DuckDB sums those inputs in 128 bits, which no row count can overflow, while SMALLINT and DECIMAL(1-4) sum in 64 bits and HUGEINT and DECIMAL(19-38) in 128 bits, either of which can overflow on repeated rows where the original aggregate does not. A `key IS NOT NULL` filter replaces the subquery's `=` when no join already rejects NULL keys. Anything else declines: SUM, COUNT, DISTINCT or filtered aggregates, extra filters on either side, correlation on another column, an aggregate argument the outer rows do not output, or more than one duplicate-eliminated column.
+
+**Code path:**
+- `src/planner/sirius_plan_delim_aggregate_reuse.cpp` — matcher (`match_aggregate`) and both rewrites
+- `src/transparent/sirius_optimizer_extension.cpp` — runs it on the captured plan copy, planning without it if it throws
+- `src/transparent/read_view_registry.cpp` — read-view validation accepts a plan that reads an identical view fewer times
+
+**Config:** `enable_delim_aggregate_reuse` (default: `true`, see [Configuration](configuration.md)).
+
+### Correlated EXISTS MIN/MAX Rewrite
+
+**Motivation:** `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)` ("another row with the same key and a different value") decorrelates into a join of the outer rows and `t` on `=` with `<>` as a residual, which emits every same-key pair. TPC-H q21 has an `EXISTS` and a `NOT EXISTS` of this form over `lineitem`, so it also scans `lineitem` three times.
+
+**Mechanism:** `rewrite_correlated_inequality_exists` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), before column bindings are resolved, so a replacement only has to emit the same bindings as the nodes it replaces. If it throws, the plan is copied again without it. It matches each subquery in either shape DuckDB produces:
+
+```
+delim_join_as_cte = false:  DELIM_JOIN (SEMI/ANTI, or MARK under FILTER(mark); IS NOT DISTINCT FROM)
+                             ├─ outer rows
+                             └─ [PROJECTION...] ← INNER JOIN(T, DELIM_GET) on  t.k = d.k  AND  t.x <> d.x
+delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = outer.k  AND  t.x <> outer.x
+```
+
+Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
+
+```
+CTE rows = outer rows
+ └─ FILTER   EXISTS:     mn <> rows.x OR mx <> rows.x    (per subquery; projection map: the original columns)
+             NOT EXISTS: (that) IS NULL OR NOT (that)
+     └─ LEFT JOIN on rows.k IS NOT DISTINCT FROM a.k
+         ├─ CTE_SCAN rows
+         └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+              ← SEMI JOIN(T, SELECT DISTINCT k FROM CTE_SCAN rows) on t.k = k
+```
+
+This is the shape DuckDB itself gives a correlated scalar aggregate under `delim_join_as_cte = true`, so the merged plan has no delim join in either setting. Columns that operators above read from the outer rows are read from the CTE scan instead.
+
+`EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
+
+Plain SEMI/ANTI joins (`delim_join_as_cte = true`) over a table pinned in GPU memory, with every column they read, are left unmerged unless they are estimated not to fit on the GPU. Each such join scans its subquery's table and hashes its rows. That beats the merged aggregate only when the scans are cheap and the rows fit: q21 at SF1000 on a GB300 runs in 0.475 s unmerged against 0.531 s merged with `lineitem` pinned in GPU memory, but 8.2 s against 6.5 s without the pin. On a 32 GB RTX 4500 reading from S3, merging wins at SF1000 (10.7 s against 11.7 s) and at SF3000, where the unmerged joins spill (271 s against 54 s). The size estimate is the largest subquery scan's base-table row count times its key and value widths, since DuckDB's estimates of the subqueries' filters can be several times too low. The budget is the smallest GPU's downgrade threshold (`downgrade_trigger_fraction` of its capacity). Delim joins are merged regardless, as the merge was faster in every measured case.
+
+Because the merged plan reads one view fewer times than the original, `compare_read_views` (`src/transparent/read_view_registry.cpp`) accepts a candidate that reads an identical view fewer times, while still rejecting one that reads a new view, reads a view more often, or drops the only scan of a view.
+
+**Limits:**
+- Exactly one key and one value correlation, on an `INTEGER`/`BIGINT` key. The value must be an integer, fixed-point, temporal or duration type.
+- With `delim_join_as_cte = true`, plans where DuckDB keeps the delim join as a MARK join over a CTE scan (filtered or nullable subqueries) are not matched.
+
+**Code path:** `src/planner/sirius_plan_exists_rewrite.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`
+
+**Config:** `enable_exists_minmax_rewrite` (default `true`, see [Configuration](configuration.md)).
+
+### Partial Aggregate Below a Payload Join
+
+**Motivation:** TPC-H q10 sums `lineitem ⋈ orders` revenue and groups by seven keys, four of them `customer` strings. The join with `customer` repeats those strings for every matching lineitem row (0.7 GB becomes 9.7 GB at SF500), and every operator up to the group-by carries them. Summing each customer's rows first lets the join bring in each customer's strings once.
+
+**Mechanism:** `push_partial_aggregates_below_joins` runs on the transparent path's copy of DuckDB's optimized plan (`sirius_optimizer_hook`), after the subquery rewrites. For an aggregate over inner joins whose arguments all come from one subtree `S`:
+
+```
+AGGREGATE(groups; sum(x))                 AGGREGATE(groups; sum(partial))
+ └─ JOIN ... (adds group-by strings)       └─ JOIN ...
+     └─ S                                       └─ AGGREGATE(columns of S read above it; sum(x))
+                                                    └─ S
+```
+
+`S` is the argument side of the lowest join whose other side supplies a variable-width column the aggregate groups by. The new aggregate groups by every column of `S` that the joins above it or the original aggregate's groups read. Rows of `S` that agree on those columns pair with the same rows of every join above, so combining them first changes no result, whether or not any join key is unique. The original aggregate keeps its table indexes and output types, so nothing above it changes. The joins' projection maps are rebuilt for the new columns, and the rewritten subtree is checked with DuckDB's `ColumnBindingResolver` before it is kept.
+
+DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported_optimizers.hpp`). It carries aggregate states through `combine` and `finalize`, which the GPU cannot run, and it only considers the join directly under the aggregate, which in q10 is `nation`.
+
+**Measured** (TPC-H SF500 Parquet, one RTX PRO 6000, warm): q10's `customer` join outputs 21.0 M rows (3.8 GB) instead of 57.4 M (10.4 GB). The query runs in 0.30 s instead of 0.39 s with its columns pinned on the GPU, and in 1.52 s instead of 1.64 s unpinned. TPC-DS q11 at SF100 goes from 0.29 s to 0.18 s pinned, and the TPC-Havoc Q18 variants that filter a per-order total with `HAVING` from about 14.7 s to 10.3 s unpinned.
+
+**When it applies:**
+- Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
+- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
+- Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
+- The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
+- Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.
+- A join that computes its key from a column of `S` (`1 / x`, a cast) does so only from integer, DECIMAL, BOOLEAN, DATE, TIME, TIMESTAMP or UUID columns. Values of other types can group together and still differ: `0.0` and `-0.0` are one group, but `1 / x` sends them to opposite infinities. A bare column of any fixed-width type is fine.
+- `S` is not already grouped.
+
+**Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
+
+**Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
+
+### Subquery Keys Carried Across an Equality
+
+**Motivation:** under `delim_join_as_cte = true`, DuckDB restricts a decorrelated subquery to the outer rows' distinct keys with a SEMI join on the column the correlation names. In TPC-Havoc Q05_V01 that column is `s_nationkey`, and the subquery also says `c_nationkey = s_nationkey`. DuckDB's filter combiner derives `c_nationkey = key` only when the keys are a relation in a filter over cross products, which is their form with `delim_join_as_cte = false`; a SEMI join's condition is outside its reach. So `customer` gets no restriction, join ordering puts it last, and `customer`, `orders` and `lineitem` are read for every nation instead of the outer rows' five.
+
+**Mechanism:** `carry_subquery_keys_across_equalities` runs in the pre-optimize hook, on DuckDB's own plan, so that join ordering sees its result:
+
+```
+FILTER(x = y, ...)                          FILTER(x = y, ...)
+ └─ SEMI ON x = key                          └─ SEMI ON y = key
+     ├─ L                             →          ├─ SEMI ON x = key
+     └─ scan of __duckdb_delim_dedup_M           │   ├─ L
+                                                 │   └─ scan of __duckdb_delim_dedup_M
+                                                 └─ scan of __duckdb_delim_dedup_M
+```
+
+Every row the filter keeps has `x = y`, so the added join removes only rows the filter removes anyway, and results cannot change. DuckDB then moves each key join onto its table and starts the join order from the restricted tables, as it does with `delim_join_as_cte = false`.
+
+**When it applies:** the filter directly above a subquery's key joins, or a filter or INNER join condition inside `L` that passes its columns through, has a top-level `=` between two plain columns of one type, one of which a key join restricts. Each other relation of `L` in that equality class gets one key join, up to three per key column. The dedup CTE ends in an aggregate, so DuckDB keeps it materialized when it is read twice, and the delim CTE keeps the two readers its restriction proof needs.
+
+**Limits:** the equality must be a plain one (no cast, not under `OR`). An `EXISTS` DuckDB plans as a MARK join on the outer rows has no key relation to carry.
+
+**Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
+
+**Config:** `enable_subquery_key_carry` (default `false`, see [Configuration](configuration.md)). Off by default for now: the rewrite is not yet tested on multiple GPUs, and a query that falls back to the CPU after the hook has run executes the rewritten plan.
+
+### EXISTS Answered from an Aggregate Subquery
+
+**Motivation:** a query that selects a correlated aggregate and keeps only the outer rows that have subquery rows, such as TPC-Havoc Q05_V01's revenue per nation `WHERE EXISTS (the same joins)`, runs the subquery's joins twice.
+
+**Mechanism:** `answer_exists_from_aggregate` runs in the pre-optimize hook, before the rule above:
+
+```
+CTE __duckdb_delim_N                                  CTE __duckdb_delim_N
+ ├─ PROJECTION(..., mark)                              ├─ PROJECTION(..., TRUE)
+ │   └─ FILTER(mark)                                   │   └─ X
+ │       └─ MARK JOIN(X, S)                     →      └─ ... INNER join-back
+ └─ ... LEFT join-back                                       ├─ scan of N
+       ├─ scan of N                                          └─ AGGREGATE(GROUP BY key) ← S ⋉ keys
+       └─ AGGREGATE(GROUP BY key) ← S ⋉ keys
+```
+
+The aggregate has a group for a key exactly when `S` has a row for it, which is what the `EXISTS` tests. An INNER join-back therefore keeps exactly the outer rows the `EXISTS` kept, whatever the aggregate's value: a group whose `SUM` is NULL still joins.
+
+**When it applies:** all of the following, each of which a counterexample forced:
+- The join-back is LEFT or INNER, with one condition per key, onto an aggregate grouped exactly by the keys and reached through projections only. A `HAVING` puts a filter there, and `COUNT` keeps a SINGLE join; neither matches.
+- The delim CTE's rows are a projection of `FILTER(mark)` over the MARK join, the filter has no other predicate, and the two joins pair their keys column by column.
+- Both sides read the same rows: flattened into leaves and predicates, their scans are the same sources in the same order (`capture_bound_read_view`, selector included), their predicates are the same set, and the key is the same column.
+- NULL keys are handled alike: the subquery matches keys with `=`, so a null-safe `EXISTS` qualifies only when its side carries `IS NOT NULL` on the key column.
+- Only the join-back and the key read see the CTE's rows, and DuckDB's own conditions for restricting them hold.
+- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines.
+
+**Limits:** the two subqueries must list their tables in the same order. An `EXISTS` with no aggregate subquery over the same rows is untouched.
+
+**Code path:** `src/planner/delim_cte_rewrites.cpp` (`match_exists_twin`), sharing `flatten` with the delim aggregate reuse (`src/planner/sirius_plan_flat_tree.cpp`); called from `src/transparent/sirius_optimizer_extension.cpp` for queries headed to the GPU.
+
+**Config:** `enable_exists_from_aggregate` (default `false`, see [Configuration](configuration.md)). Off by default for now, for the same two reasons as the rule above, and because a scan DuckDB has no row estimate for reports one row, which passes the size guard on `X`.
+
 ### Sorted-Key Grouped Aggregation
 
 **Motivation:** cuDF's hash group-by pays for a hash table and global atomics even when a batch's keys are already in order. TPC-H q18 groups lineitem by `l_orderkey`, which a table pinned in key order delivers sorted; its per-batch partial aggregation was 631 ms of q18's kernel time at SF1000.
@@ -183,7 +328,7 @@ Two fast paths live inside the dense path. When every slot in the domain is occu
 
 **Config:** Always on. On its own it changes little; it lets the sorted aggregation paths apply.
 
-### Low-Cardinality Grouped Aggregation (experimental)
+### Low-Cardinality Grouped Aggregation
 
 **Motivation:** With only a handful of groups, cuDF's hash group-by makes thousands of threads update the same few shared-memory slots, and its DECIMAL128 sums are compare-and-swap loops. TPC-H q1 has four groups; its per-batch aggregation took about 68 ms per batch at SF1000.
 
@@ -200,7 +345,7 @@ It applies only to one or two non-null one-character STRING keys, at most 64 gro
 - `src/op/aggregate/low_cardinality_groupby.hpp` — `try_low_cardinality_groupby()`
 - `src/op/aggregate/gpu_aggregate_impl.cpp` — dispatch in `grouped_aggregate_table()`
 
-**Config:** `SIRIUS_EXP_LOWCARD_GROUPBY=1` (environment variable, off by default; see [Configuration](configuration.md#grouped-aggregation-experimental)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
+**Config:** `enable_low_cardinality_groupby` (SQL or YAML, enabled by default; see [Configuration](configuration.md#grouped-aggregation)). TPC-H SF1000 on a GB300: q1 0.767 s → 0.267 s.
 
 ### Distinct Hash Join (PR #558)
 
@@ -222,17 +367,17 @@ Parquet scans declare no PRIMARY KEY; for them, [Pin-Proven Unique Join Keys](#p
 **Motivation:** The distinct hash join needs a proof that the build keys are unique, and for a base table the only proof was a declared PRIMARY KEY. Parquet tables declare none, so every join over pinned parquet took the two-pass `cudf::hash_join` (a count pass, then a retrieve pass), even for keys such as `o_orderkey` or `s_suppkey`. The runtime distinctness check is off by default (issue #1600).
 
 **Mechanism:** Two parts:
-1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports an output column whose pinned column was proven distinct at pin time. Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
-2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column automatically, in addition to the columns late materialization names. An automatic column must be an integer, and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`.
+1. **Planner:** for a `LogicalGet` without a catalog table, `prove_unique_from_pin()` resolves the scan's parquet files, finds the pinned entry for exactly those files, and reports every output column whose pinned column was proven distinct at pin time, each as a key on its own (`prove_unique_columns()` tracks alternative keys, so a join on any one of them is proven). Filters and projections above the scan keep the proof valid, because a subset of distinct values is distinct. The join then takes `cudf::distinct_hash_join` as for a PRIMARY KEY.
+2. **Pin time:** the proof is the uniqueness probe that late materialization also uses (`late_mat::unique_probe`: no nulls, every chunk distinct, and chunk ranges disjoint or an exact sort over the whole column). The pin observes every column of a parquet pin (and of a native table's pin when late materialization is on). A column must be an integer (or any column of a table under one million rows, such as `nation.n_name`, which a late-materialization ride can use), and an unsorted chunk is sorted on the spot to count its distinct values, so a value repeated within a chunk refuses the column at once and nothing is retained for the exact stage; a repeat across chunks is caught only by the exact stage's final check. The exact stage is bounded, across all the columns it retains together, by `pin_table_unique_exact_max_bytes`; when it, the free GPU memory or a reservation is short, integer columns keep their check ahead of the others.
 
 Composite keys are not covered, because the proof is per column.
 
 **Code path:**
 - `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_from_pin()`, `prove_unique_columns()`
-- `src/late_mat/pin_uniqueness.cpp` — `pin_unique_automatic_selection()`, `unique_probe`, `exact_uniqueness_byte_cap()`
-- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — selection and attaching the facts
+- `src/late_mat/pin_uniqueness.cpp` — `unique_probe`, `exact_uniqueness_byte_cap()`
+- `src/pin_table.cpp` — probe and exact-stage retention during pinning; `src/sirius_extension.cpp` — which pins are observed, and attaching the facts
 
-**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the automatic probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `n_name`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
+**Config:** `pin_table_prove_unique_keys` (default: `true`; also a `sirius.operator_params` YAML key, see [Operator Parameters](configuration.md#operator-parameters)) gates both the probing and the planner's use of the facts. TPC-H SF1000 on a GB300: the pin proves `c_custkey`, `n_nationkey`, `o_orderkey`, `p_partkey`, `r_regionkey` and `s_suppkey`; q5 −49 ms, q9 −47 ms, q3 −25 ms, and six more queries −11 to −21 ms; total pin time over the 22 per-query pins +2.6 s.
 
 ### Scan Scheduling Tuning (PR #507)
 
@@ -428,7 +573,7 @@ result materialization restore native carriers.
 
 **Config:** Always on. TPC-H SF1000 on a GB300: q1 0.769 s → 0.752 s (−17 ms); the other queries are unchanged within noise.
 
-### Late Materialization (unreleased, experimental)
+### Late Materialization
 
 **Motivation:** A query that selects wide columns carries them from the scan to whatever finally
 reads them — through joins that copy them beside their keys, partitions that write them to a
@@ -455,10 +600,12 @@ distinctness proof.
 - `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
 - `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
 
-**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
-`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
-which no group-by-rowid ride is admissible. Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
-floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+**Config:** `enable_late_materialization` controls the feature (SQL or YAML, enabled by default);
+The pin-time uniqueness probe (`pin_table_prove_unique_keys`, on by default) supplies the proof
+that a group-by-rowid ride needs. The connection-local `late_materialization_min_boundaries`,
+`late_materialization_min_value_x_boundaries`, `late_materialization_min_value_compressed`, and
+`late_materialization_count_defer` settings tune the floors and the count-on-deferred path.
+Composes with `enable_compressed_materialization`
 (default on) — a deferred column riding through a carrier-restore cast is carried past it rather
 than suppressing the deferral.
 
@@ -568,7 +715,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
 
-**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives its own libcurl multi handle), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
+**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives HTTP/1.1 connection pools on its own io_uring ring, with kTLS or user-space TLS for HTTPS endpoints), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
 
 **Code path:**
 - `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST reactor and context over the shared `templated_ioctx` base

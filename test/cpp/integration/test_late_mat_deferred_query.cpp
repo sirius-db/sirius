@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-// A deferral installed and executed by a real query, end to end. GPU required,
-// and SIRIUS_EXP_LATE_MAT must be set in the ENVIRONMENT — the gate is read
-// once per process, so this case skips rather than lying when it is off.
+// A deferral installed and executed by a real query, end to end. GPU required.
+// SQL enable_late_materialization selects the query-local policy; it defaults to true.
 //
 // Everything else in the suite tests a half: the walk decides on hand-built
 // plans, the port materializes against a hand-built pin. Only here does a plan
@@ -304,7 +303,8 @@ struct deferred_query_case {
   /// Pin the table compressed. Across GPUs the installer must then DECLINE the
   /// deferral, since a compressed chunk decodes only where it lives, and the
   /// query must still come back right as an ordinary scan.
-  bool compressed_pin = false;
+  bool compressed_pin              = false;
+  bool enable_late_materialization = true;
 };
 
 /// Pin, run, compare with the CPU, and prove the deferral did what the case
@@ -343,8 +343,7 @@ void run_deferred_query(deferred_query_case const& c)
 
   // c_custkey rides REAL — it is the join key and a group key — so proving it
   // distinct over the pin is what admits the ride past the aggregates. The
-  // probe reads this per pin, so setting it here is enough.
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+  // pin proves it, because late materialization is on.
 
   // The plan register is process-wide and keyed by pin name, so the compressed
   // pin gets a name of its own.
@@ -354,8 +353,11 @@ void run_deferred_query(deferred_query_case const& c)
 
   // GPU tier: a deferral addresses rows by their position in device-resident
   // pinned storage, so nothing installs against a host pin.
+  // Pin metadata must remain usable when a later query enables the optimization.
+  REQUIRE_FALSE(con.Query("SET enable_late_materialization = false")->HasError());
   auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(customer_glob) +
-                       ", tier='gpu', name=" + sirius::test::sql_literal(pin_name) + ");");
+                       ", tier='gpu', name=" + sirius::test::sql_literal(pin_name) +
+                       ", compression => " + (c.compressed_pin ? "true" : "false") + ");");
   REQUIRE(pin);
   if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
   REQUIRE_FALSE(pin->HasError());
@@ -373,6 +375,10 @@ void run_deferred_query(deferred_query_case const& c)
     REQUIRE(compressed > 0);
   }
 
+  REQUIRE_FALSE(con
+                  .Query(c.enable_late_materialization ? "SET enable_late_materialization = true"
+                                                       : "SET enable_late_materialization = false")
+                  ->HasError());
   auto const before        = sirius::late_mat::deferrals_installed();
   auto const remote_before = sirius::late_mat::remote_batches_materialized();
   // The installer says why it declined at INFO, and nowhere else.
@@ -389,7 +395,9 @@ void run_deferred_query(deferred_query_case const& c)
   REQUIRE_FALSE(res->HasError());
   REQUIRE(rows_of(*res) == expected);
 
-  if (c.compressed_pin) {
+  if (!c.enable_late_materialization) {
+    REQUIRE(sirius::late_mat::deferrals_installed() == before);
+  } else if (c.compressed_pin) {
     // The right answer alone proves nothing here: a deferral that installed
     // anyway could come back right by luck of placement. None may install, and
     // the installer must have given the multi-GPU reason.
@@ -416,7 +424,6 @@ void run_deferred_query(deferred_query_case const& c)
     }
   }
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   auto unpin = con.Query("CALL unpin_table(" + sirius::test::sql_literal(pin_name) + ");");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());
@@ -426,20 +433,21 @@ void run_deferred_query(deferred_query_case const& c)
 
 TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_mat][deferred_query]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) {
-    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the end-to-end deferral case");
-    return;
-  }
   run_deferred_query({.num_gpus = 1, .scan_task_batch_size = 100'000'000, .tag = "late_mat_query"});
+}
+
+TEST_CASE("a query can disable late materialization after pinning",
+          "[late_mat][deferred_query][optimization_settings]")
+{
+  run_deferred_query({.num_gpus                    = 1,
+                      .scan_task_batch_size        = 100'000'000,
+                      .tag                         = "late_mat_query_disabled",
+                      .enable_late_materialization = false});
 }
 
 TEST_CASE("a deferred payload pinned across two GPUs is gathered from both",
           "[late_mat][deferred_query][multi_gpu]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) {
-    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the two-GPU deferral case");
-    return;
-  }
   if (!sirius::test::has_gpus(2)) { return; }
   // 1 MB batches: each ~1.4 MB customer file becomes its own chunk, and the
   // pin's per-batch round-robin lands them on both GPUs.
@@ -450,10 +458,6 @@ TEST_CASE("a deferred payload pinned across two GPUs is gathered from both",
 TEST_CASE("a compressed pin across two GPUs is declined and the query still comes back right",
           "[late_mat][deferred_query][multi_gpu]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) {
-    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the two-GPU compressed-pin case");
-    return;
-  }
   if (!sirius::test::has_gpus(2)) { return; }
   run_deferred_query({.num_gpus             = 2,
                       .scan_task_batch_size = 1'000'000,
@@ -527,10 +531,6 @@ void generate_rider_parquet(rider_files const& files)
 TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
           "[late_mat][deferred_query]")
 {
-  if (!sirius::late_mat::late_mat_enabled()) {
-    WARN("SIRIUS_EXP_LATE_MAT unset; skipping the end-to-end rider case");
-    return;
-  }
   if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
     sirius::test::g_shared_env->pause();
   }
@@ -569,11 +569,10 @@ TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
   REQUIRE(fb);
   REQUIRE_FALSE(fb->HasError());
 
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey,n_name,n_nationkey", 1);
   for (auto const& [path, name] : {std::pair{files.customer, "late_mat_rider_customer"},
                                    std::pair{files.nation, "late_mat_rider_nation"}}) {
     auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(path.string()) +
-                         ", tier='gpu', name='" + name + "');");
+                         ", tier='gpu', name='" + name + "', compression => false);");
     REQUIRE(pin);
     if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
     REQUIRE_FALSE(pin->HasError());
@@ -590,7 +589,6 @@ TEST_CASE("the bigger bundle owns the port and the smaller one rides along",
   // a rider. If nation claimed the port first, customer's bundle could not install at all.
   CHECK(sirius::late_mat::deferrals_installed() >= before + 2);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   for (auto const* name : {"late_mat_rider_customer", "late_mat_rider_nation"}) {
     auto unpin = con.Query(std::string("CALL unpin_table('") + name + "');");
     REQUIRE(unpin);
@@ -628,9 +626,6 @@ std::string compressed_query_for(fs::path const& customer,
 TEST_CASE("a compressed pin under filtered decode and late materialization answers correctly",
           "[late_mat][dynamic_filter][deferred_query][.late_mat_fused]")
 {
-  if (!sirius::late_mat::late_mat_enabled() || !sirius::decompression_pushdown_enabled()) {
-    SKIP("needs SIRIUS_EXP_LATE_MAT=1 and SIRIUS_EXP_FUSED_SCAN_FILTER=1 in the environment");
-  }
   if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
     sirius::test::g_shared_env->pause();
   }
@@ -696,7 +691,6 @@ TEST_CASE("a compressed pin under filtered decode and late materialization answe
   run_ok("SET pin_table_compression_max_compressed_fraction = 1000;");
   run_ok("SET pin_table_input_compression_plan_dir = " + sirius::test::sql_literal(tmp.string()) +
          ";");
-  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
   run_ok("CALL pin_table(" + sirius::test::sql_literal(customer.string()) +
          ", tier='gpu', name='late_mat_compressed_customer');");
   auto const census = sirius::test::census_entry(con, "late_mat_compressed_customer");
@@ -715,7 +709,6 @@ TEST_CASE("a compressed pin under filtered decode and late materialization answe
   // sirius_gpu_scan_operator::decode_consumer() withholding those probes.
   REQUIRE(sirius::late_mat::deferrals_installed() == before);
 
-  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   run_ok("CALL unpin_table('late_mat_compressed_customer');");
   run_ok("SET pin_table_compression = false;");
 }

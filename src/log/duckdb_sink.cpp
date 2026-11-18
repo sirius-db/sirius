@@ -22,6 +22,7 @@
 
 #include <format>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace sirius::log {
@@ -59,6 +60,10 @@ class duckdb_sink final : public sink {
 
   // DuckDB owns the level; nothing to set here.
   void set_level(level) override {}
+
+  // DuckDB decides per record, and can be (re)enabled at any time with `CALL enable_logging()`,
+  // so cuCascade's gate must let everything through rather than mirror a snapshot.
+  [[nodiscard]] std::optional<level> min_accepted_level() const override { return std::nullopt; }
 
   [[nodiscard]] bool should_log(level lvl) const override
   {
