@@ -20,8 +20,6 @@
 #include "log/logging.hpp"
 
 #include <cudf/column/column_view.hpp>
-#include <cudf/null_mask.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/detail/error.hpp>
@@ -30,6 +28,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/cudf/host_table.hpp>
@@ -38,7 +37,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <cassert>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -46,107 +45,6 @@ namespace sirius {
 namespace spill {
 
 namespace {
-
-// Layout planning is a faithful transcription of the cucascade fast converter's planning pass
-// (cucascade/src/cudf/representation_converter_builtins.cpp, convert_gpu_to_host_fast). Keeping
-// the algorithm identical keeps the emitted column_metadata layout byte-identical, so the
-// unchanged builtin HOST->GPU converter can restore from it.
-
-/// @p alignment must be a power of two.
-std::size_t align_up(std::size_t offset, std::size_t alignment) noexcept
-{
-  return (offset + alignment - 1u) & ~(alignment - 1u);
-}
-
-/// True for column types that store element data in a flat device buffer. Nested types carry
-/// their payload in children instead (STRING's chars buffer is handled in plan_column_copy).
-bool column_has_data_buffer(const cudf::column_view& col) noexcept
-{
-  switch (col.type().id()) {
-    case cudf::type_id::STRING:
-    case cudf::type_id::LIST:
-    case cudf::type_id::STRUCT:
-    case cudf::type_id::DICTIONARY32:
-    case cudf::type_id::EMPTY: return false;
-    default: return true;
-  }
-}
-
-/**
- * @brief Recursively plan the buffer layout for one column, filling in column_metadata.
- *
- * @note Assumes the column view has offset == 0 (i.e. the table is not a slice) — same contract
- * as the builtin converter this replaces.
- */
-cucascade::memory::column_metadata plan_column_copy(const cudf::column_view& col,
-                                                    std::size_t& current_offset,
-                                                    ::cuda::stream_ref stream)
-{
-  assert(col.offset() == 0 && "column_view with non-zero offset is not supported");
-
-  cucascade::memory::column_metadata meta{};
-  meta.type_id    = static_cast<int32_t>(col.type().id());
-  meta.num_rows   = col.size();
-  meta.null_count = col.null_count();
-  meta.scale      = 0;
-
-  if (col.type().id() == cudf::type_id::DECIMAL32 || col.type().id() == cudf::type_id::DECIMAL64 ||
-      col.type().id() == cudf::type_id::DECIMAL128) {
-    meta.scale = col.type().scale();
-  }
-
-  if (col.nullable()) {
-    meta.has_null_mask    = true;
-    meta.null_mask_size   = cudf::bitmask_allocation_size_bytes(col.size());
-    current_offset        = align_up(current_offset, 8u);
-    meta.null_mask_offset = current_offset;
-    current_offset += meta.null_mask_size;
-  } else {
-    meta.has_null_mask    = false;
-    meta.null_mask_offset = 0;
-    meta.null_mask_size   = 0;
-  }
-
-  if (col.type().id() == cudf::type_id::STRING) {
-    // Offsets live in child(0) and may be INT32 or INT64 (large strings); chars_size() handles
-    // both widths.
-    if (col.size() > 0 && col.num_children() > 0 && col.data<char>() != nullptr) {
-      auto const chars_bytes = cudf::strings_column_view(col).chars_size(stream);
-      if (chars_bytes > 0) {
-        current_offset   = align_up(current_offset, 8u);
-        meta.has_data    = true;
-        meta.data_offset = current_offset;
-        meta.data_size   = static_cast<std::size_t>(chars_bytes);
-        current_offset += meta.data_size;
-      } else {
-        meta.has_data    = false;
-        meta.data_offset = 0;
-        meta.data_size   = 0;
-      }
-    } else {
-      meta.has_data    = false;
-      meta.data_offset = 0;
-      meta.data_size   = 0;
-    }
-  } else if (column_has_data_buffer(col) && col.size() > 0) {
-    meta.has_data    = true;
-    meta.data_size   = static_cast<std::size_t>(col.size()) * cudf::size_of(col.type());
-    current_offset   = align_up(current_offset, 8u);
-    meta.data_offset = current_offset;
-    current_offset += meta.data_size;
-  } else {
-    meta.has_data    = false;
-    meta.data_offset = 0;
-    meta.data_size   = 0;
-  }
-
-  meta.children.reserve(static_cast<std::size_t>(col.num_children()));
-  for (cudf::size_type i = 0; i < col.num_children(); ++i) {
-    meta.children.push_back(plan_column_copy(col.child(i), current_offset, stream));
-  }
-
-  return meta;
-}
 
 /**
  * @brief Queue copy ops for @p size device bytes into the host allocation.
@@ -267,13 +165,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   const cudf::table_view view = gpu_source.get_table_view();
 
   // Pass 1: plan the allocation layout.
-  std::size_t current_offset = 0;
-  std::vector<cucascade::memory::column_metadata> columns;
-  columns.reserve(static_cast<std::size_t>(view.num_columns()));
-  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    columns.push_back(plan_column_copy(view.column(i), current_offset, stream));
-  }
-  const std::size_t total_size = current_offset;
+  auto [columns, total_size] = cucascade::plan_gpu_to_host_copy(view, stream);
 
   // Pass 2: allocate pinned host blocks (draws down the caller's reservation).
   auto mr = target_memory_space

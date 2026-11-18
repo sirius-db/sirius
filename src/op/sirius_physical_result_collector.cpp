@@ -18,6 +18,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
+#include <memory/host_reservation.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -26,6 +27,8 @@
 #include <telemetry/nvtx.hpp>
 
 // cucascade
+#include <cucascade/cudf/builtin_converters.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -125,96 +128,95 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
 void sirius_physical_materialized_collector::sink(const operator_data& input_data,
                                                   ::cuda::stream_ref stream)
 {
+  std::unique_ptr<cucascade::memory::reservation> reservation;
+  sink_with_reservation(input_data, stream, reservation);
+}
+
+void sirius_physical_materialized_collector::sink_with_reservation(
+  const operator_data& input_data,
+  ::cuda::stream_ref stream,
+  std::unique_ptr<cucascade::memory::reservation>& reservation)
+{
   nvtx_scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
-  auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = pipelineable_input.get_data_batches();
+  using cucascade::memory::Tier;
 
-  if (input_batches.empty()) {
-    return;  // todo(kevin) we should handle this case properly
+  auto const& input   = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto const& batches = input.get_data_batches();
+  if (batches.empty()) { return; }
+
+  auto position = input.get_position();
+  if (position && batches.size() != 1) {
+    throw internal_exception("Positioned result requires one output batch");
   }
 
-  auto position = pipelineable_input.get_position();
-  {
-    std::lock_guard<std::mutex> guard(lock);
-    if (position && input_batches.size() != 1) {
-      throw internal_exception("Positioned result requires one output batch");
-    }
-    if (_positioned && *_positioned != position.has_value()) {
-      throw internal_exception("Cannot mix positioned and unpositioned query results");
-    }
-    _positioned = position.has_value();
-    if (position && !_seen_positions.insert(*position).second) {
-      throw internal_exception("Duplicate query result position");
+  // Retain the read locks from sizing through the copies so that the staging requirement is
+  // computed from the exact representations to be copied.
+  auto inputs = input.get_read_only_batches();
+  if (inputs.size() != batches.size()) {
+    throw invalid_input_exception("Materialized result contains a null batch");
+  }
+  std::optional<std::size_t> staging_bytes;
+  for (const auto& ro : inputs) {
+    auto const* data = ro.get_data();
+    if (!data) { throw invalid_input_exception("Materialized result batch has no data"); }
+    if (data->get_current_tier() == Tier::GPU && data->get_size_in_bytes() != 0) {
+      staging_bytes = std::max(staging_bytes.value_or(0),
+                               cucascade::gpu_to_host_staging_bytes(
+                                 data->cast<cucascade::gpu_table_representation>(), stream));
     }
   }
 
-  auto sink_single_batch = [this, position, stream](
-                             std::shared_ptr<cucascade::data_batch> const& input_batch) {
-    // Acquire read-only access to inspect the batch
-    auto ro    = input_batch->to_read_only();
-    auto* data = ro.get_data();
-
-    if (!data) {
-      throw invalid_input_exception(
-        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+  const cucascade::memory::memory_space* unreserved_host_space = nullptr;
+  if (staging_bytes) {
+    if (reservation) {
+      auto required =
+        memory::host_reservation_size(reservation->get_memory_space(), *staging_bytes);
+      if (!required || reservation->size() < *required) { reservation.reset(); }
     }
-    if (data->get_size_in_bytes() == 0) { return; }
-
-    std::optional<cucascade::read_only_data_batch> result_ro_opt;
-
-    if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
-      // Use clone_to to clone directly into HOST representation
-      auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      auto& memory_mgr = sirius_ctx->get_memory_manager();
-
-      auto host_spaces = memory_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    if (!reservation) {
+      auto ctx         = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      auto host_spaces = ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
       if (host_spaces.empty()) {
         throw internal_exception(
           "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
           "collection");
       }
-      // Pick the host space with the most available memory.
-      /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
-      auto const* mem_space =
-        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
-          return a->get_available_memory() < b->get_available_memory();
-        });
+      reservation = memory::try_reserve_host(host_spaces, *staging_bytes);
+      if (!reservation) {
+        // Prefer the pool with the most available memory for the unreserved copy.
+        unreserved_host_space =
+          *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto* a, auto* b) {
+            return a->get_available_memory() < b->get_available_memory();
+          });
+        SIRIUS_LOG_WARN(
+          "sirius_physical_materialized_collector: HOST reservation failed for {} staging bytes. "
+          "Proceeding without a reservation.",
+          *staging_bytes);
+      }
+    }
+  }
 
+  auto local_collection =
+    duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
+  duckdb::ColumnDataAppendState append_state;
+  local_collection->InitializeAppend(append_state);
+
+  for (const auto& ro : inputs) {
+    auto const* data = ro.get_data();
+    if (data->get_size_in_bytes() == 0) { continue; }
+
+    std::optional<cucascade::read_only_data_batch> result_ro;
+    if (data->get_current_tier() == Tier::GPU) {
       auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
-
-      auto host_reservation =
-        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
-          data->get_size_in_bytes());
-
-      // clone_to: creates new batch with data converted to host_data_representation
-      if (host_reservation == nullptr) {
-        SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
-          "bytes) — proceeding without reservation, converter may OOM",
-          ro.get_batch_id(),
-          data->get_size_in_bytes());
-      }
+      auto probe = telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id);
       auto result_batch =
-        host_reservation != nullptr
-          ? ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              *host_reservation,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
-          : ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              mem_space,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
-
-      // Access the result batch's data. Declared outside the if-block so result_ro outlives
-      // the branch — data points into it and must not dangle when we reach the assert below.
-      result_ro_opt = result_batch->to_read_only();
-      data          = result_ro_opt->get_data();
-
+        reservation ? ro.clone_to<cucascade::host_data_representation>(
+                        registry, next_batch_id, *reservation, stream, std::move(probe))
+                    : ro.clone_to<cucascade::host_data_representation>(
+                        registry, next_batch_id, unreserved_host_space, stream, std::move(probe));
+      result_ro = result_batch->to_read_only();
+      data      = result_ro->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw invalid_input_exception(
@@ -239,40 +241,31 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
 
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, result_column_types);
-    duckdb::ColumnDataCollection local_collection(_client_ctx, result_column_types);
-    duckdb::ColumnDataAppendState append_state;
-    local_collection.InitializeAppend(append_state);
-
-    // Append into a task-local collection so chunk copies do not hold the shared lock.
     while (true) {
-      // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we
-      // are passing local variable chunk reader by reference. We should investigate if this can
-      // cause any issues (e.g., if duckdb does not consume all data from the chunk reader in
-      // append and we move to the next chunk reader, then the previous chunk reader's state will
-      // be lost).
       duckdb::DataChunk chunk;
       if (!chunk_reader.get_next_chunk(chunk)) { break; }
-
-      local_collection.Append(append_state, chunk);
+      local_collection->Append(append_state, chunk);
     }
+  }
 
-    // Combine moves the local segments into the result collection without copying their rows.
-    std::lock_guard<std::mutex> guard(lock);
+  // Every batch has been staged and its HOST blocks returned. Publish the whole task at once.
+  reservation.reset();
+  std::lock_guard<std::mutex> guard(lock);
+  if (_positioned && *_positioned != position.has_value()) {
+    throw internal_exception("Cannot mix positioned and unpositioned query results");
+  }
+  if (position) {
+    if (!_positioned_collections.try_emplace(*position, std::move(local_collection)).second) {
+      throw internal_exception("Duplicate query result position");
+    }
+  } else {
     if (!result_collection) {
       result_collection =
         duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
     }
-    if (position) {
-      auto collection =
-        duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, result_column_types);
-      collection->Combine(local_collection);
-      _positioned_collections.emplace(*position, std::move(collection));
-    } else {
-      result_collection->Combine(local_collection);
-    }
-  };
-
-  std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);
+    result_collection->Combine(*local_collection);
+  }
+  _positioned = position.has_value();
 }
 
 }  // namespace op

@@ -94,6 +94,9 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  /// Secondary task reservation, independently owned from the GPU reservation.
+  std::unique_ptr<cucascade::memory::reservation> host_reservation;
+
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
 
