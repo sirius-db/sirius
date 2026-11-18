@@ -263,18 +263,13 @@ TEST_CASE("a semi or anti join carries join evidence", "[dynamic_filter][evidenc
   }
 }
 
-TEST_CASE("a right-family join publishes only with filters, accumulation and a Bloom budget",
+TEST_CASE("a right-family join publishes exactly when dynamic filters are enabled",
           "[dynamic_filter][evidence]")
 {
   sirius::operator_params params;
-  params.enable_dynamic_filter                 = true;
-  params.enable_dynamic_filter_multi_partition = true;
-  REQUIRE(params.max_dynamic_filter_bloom_bytes_per_gpu() > 0);
+  params.enable_dynamic_filter = true;
   CHECK(sirius::planner::right_family_publication_enabled(params));
-
-  SECTION("dynamic filters off") { params.enable_dynamic_filter = false; }
-  SECTION("Bloom accumulation off") { params.enable_dynamic_filter_multi_partition = false; }
-  SECTION("no Bloom budget") { params.scan_task_batch_size = 0; }
+  params.enable_dynamic_filter = false;
   CHECK_FALSE(sirius::planner::right_family_publication_enabled(params));
 }
 

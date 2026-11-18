@@ -39,7 +39,6 @@
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
-#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -654,10 +653,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    auto options               = duckdb::query_operator_options(context);
-    const auto& op_params      = *options;
-    auto* const stats          = &sirius_context->get_dynamic_filter_stats();
-    bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
+    auto options          = duckdb::query_operator_options(context);
+    const auto& op_params = *options;
+    auto* const stats     = &sirius_context->get_dynamic_filter_stats();
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -684,24 +682,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const needs_early_publication =
-      op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
-    bool const discovery_runs =
-      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-      !gpu_spaces.empty() && !host_spaces.empty() &&
-      (!needs_early_publication || right_family_publication_enabled(op_params));
+    bool const discovery_runs     = build_evidence &&
+                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+                                !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
       bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
         auto const& condition = conditions[key.planner_condition_index];
-        // Right-family partitioning waits for the probe. Only register keys that the
-        // pre-partition accumulator can publish before that scan drains.
-        if (needs_early_publication &&
-            !sirius::op::detail::accumulated_bloom_builder::supports(key.storage_type)) {
-          continue;
-        }
         descent_policy const policy{.descend_build_blocks = true,
                                     .preserve_nulls       = key.preserve_nulls};
         // Terminal ordinals are local to each terminal, not the probe entry schema.
@@ -860,7 +849,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
-       .enable_multi_partition    = multi_partition,
        .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu()}};
 
     auto join = make_hash_join(op,

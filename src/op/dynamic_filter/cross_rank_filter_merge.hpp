@@ -29,8 +29,9 @@ class sirius_dynamic_filter;
  * @brief Merges one join's membership filters with the same join's filters in other processes,
  * whose builds hold the rest of its keys.
  *
- * A publication session calls exactly one of merge() or leave(), once, and a cancelled one
- * neither. A merge() that throws has still taken part in every key, so no leave() follows it.
+ * A publication session calls exactly one of merge() or leave(), once, except that one cancelled
+ * before its construction starts calls neither; one cancelled after its construction started
+ * leaves. A merge() that throws has still taken part in every key, so no leave() follows it.
  */
 class cross_rank_filter_merge {
  public:

@@ -16,13 +16,14 @@
 
 /**
  * @file build_input_certification.hpp
- * @brief The decision the build PARTITION (`hash_join_partition_observer`) and
- * `sirius_physical_build_filter` share before they certify their complete build input and begin a
- * `dynamic_filter_publication_session` accumulation.
+ * @brief The decision `build_input_certifier` makes for a dynamic-filter construction site, the
+ * build PARTITION (`hash_join_partition_observer`) or `sirius_physical_build_filter`, before it
+ * certifies the site's complete build input and begins a `dynamic_filter_publication_session`
+ * attempt.
  *
  * `read_build_port_facts` captures an operator's input ports as a plain `build_port_facts` value,
  * and the pure `certify_decision` maps it to pending, a `construction_decline`, or proceed. On
- * proceed the caller certifies its `build_arrival_ledger`, which yields the
+ * proceed `build_input_certifier` certifies its `build_arrival_ledger`, which yields the
  * `complete_build_inventory` or one of the ledger's own declines.
  */
 

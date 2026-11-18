@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -74,12 +75,12 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 
 // Dynamic-filter counter deltas for one query execution.
 struct publication_deltas {
-  std::uint64_t producers_enabled                    = 0;
-  std::uint64_t membership_filters_built             = 0;
-  std::uint64_t publications_finished                = 0;
-  std::uint64_t publications_skipped_build_not_whole = 0;
-  std::uint64_t filters_pushed                       = 0;
-  std::uint64_t accumulation_publications_finished   = 0;
+  std::uint64_t producers_enabled                  = 0;
+  std::uint64_t membership_filters_built           = 0;
+  std::uint64_t publications_finished              = 0;
+  std::uint64_t filters_pushed                     = 0;
+  std::uint64_t accumulation_publications_finished = 0;
+  std::uint64_t zone_map_filters_built             = 0;
 };
 
 struct switch_comparison {
@@ -99,11 +100,10 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
     .publications_finished    = after.publications_finished - before.publications_finished,
-    .publications_skipped_build_not_whole =
-      after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
-    .filters_pushed = after.filters_pushed - before.filters_pushed,
+    .filters_pushed           = after.filters_pushed - before.filters_pushed,
     .accumulation_publications_finished =
-      after.accumulation_publications_finished - before.accumulation_publications_finished};
+      after.accumulation_publications_finished - before.accumulation_publications_finished,
+    .zone_map_filters_built = after.zone_map_filters_built - before.zone_map_filters_built};
 }
 
 // Publication completes before these probes, making the enabled/disabled counter deltas
@@ -309,14 +309,11 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
   }
 
-  SECTION("a multi-partition build publishes nothing without accumulation")
+  SECTION("a multi-partition build publishes its complete filter")
   {
     // Correctness stake: a filter built from one partition's slice of the build keys would drop
-    // probe rows that do join, so this must be pinned on a build that really spans partitions.
-    // Accumulation (on by default) legitimately publishes for such a build, so it is turned off
-    // here to pin the whole-build path alone.
-    sirius::test::scoped_sirius_setting accumulation_off(
-      con, "enable_dynamic_filter_multi_partition", false);
+    // probe rows that do join, so this must be pinned on a build that really spans partitions. The
+    // build PARTITION constructs from every batch of the certified build.
     // The summed columns exist only to keep the projection from pruning them, widening the build
     // past broadcast candidacy. Reaching a genuinely partition-sliced build needs all three pins:
     // broadcast off, a small hash-partition target so the natural count exceeds one, and a build
@@ -336,8 +333,7 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
       "where l.l_shipdate >= date '1992-01-01'");
 
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
-    REQUIRE(deltas.on.publications_finished == 0);
-    REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
+    REQUIRE(deltas.on.publications_finished > 0);
   }
 
   SECTION("an unfiltered aggregate build supplies no publication evidence")
@@ -539,8 +535,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT;");
 
   sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   // TPC-Havoc Q05_V01 shape: the correlated scalar subquery makes a delim CTE of the outer rows,
   // and the (NOT) EXISTS over the larger `items` sits in that CTE's body, with the filtered
   // `parts` as its outer side. An item's qty is its fk modulo 5, so the subquery keeps some keys
@@ -679,8 +673,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   std::string const join_type = GENERATE("SEMI", "ANTI");
   std::string const input_case =
     GENERATE("matching", "no matching keys", "runtime empty probe", "runtime empty build");
-  bool const enable_accumulation = GENERATE(false, true);
-  CAPTURE(join_type, input_case, enable_accumulation);
+  CAPTURE(join_type, input_case);
 
   run_ok("SET gpu_execution = false;");
   run_ok("CREATE TABLE retained (id INTEGER, k INTEGER, keep INTEGER);");
@@ -698,8 +691,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   // relation on the physical build side when its runtime filter produces no rows.
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", enable_accumulation);
   auto const probe_filter = input_case == "runtime empty probe" ? " AND p.v = 50 " : " ";
   auto const build_filter =
     input_case == "runtime empty build" ? "WHERE s.keep = 2" : "WHERE s.keep = 1";
@@ -714,12 +705,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   auto const deltas = require_switch_result_equivalence(*con, query);
   REQUIRE(deltas.off.producers_enabled == 0);
-  if (enable_accumulation) {
-    REQUIRE(deltas.on.producers_enabled > 0);
-  } else {
-    REQUIRE(deltas.on.producers_enabled == 0);
-    REQUIRE(deltas.on.accumulation_publications_finished == 0);
-  }
+  REQUIRE(deltas.on.producers_enabled > 0);
   auto const expected_rows = input_case == "runtime empty build" ? 0
                              : input_case == "matching"          ? (join_type == "SEMI" ? 3 : 1)
                                                                  : (join_type == "SEMI" ? 0 : 4);
@@ -741,6 +727,61 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - right semi and anti joins publish every key type and filter kind",
+                 "[integration][gpu_execution][dynamic_filter][right_family]")
+{
+  std::string const join_type = GENERATE("SEMI", "ANTI");
+  std::string const key_type  = GENERATE("BIGINT", "VARCHAR", "DATE", "DECIMAL(15,2)");
+  // A few retained keys make a small IN-list; many make a hash IN-list, or a Bloom filter when no
+  // IN-list may take any L2.
+  std::string const kind = GENERATE("small_in_list", "hash_in_list", "bloom");
+  CAPTURE(join_type, key_type, kind);
+  auto const key = [&](std::string const& value) {
+    return key_type == "DATE" ? "(DATE '2020-01-01' + (" + value + ")::INTEGER)"
+                              : "(" + value + ")::" + key_type;
+  };
+  auto const retained_rows = kind == "small_in_list" ? 5 : 400;
+
+  run_ok("SET gpu_execution = false;");
+  run_ok("CREATE TABLE retained AS SELECT range AS id, " + key("range * 3") +
+         " AS k, (range % 2)::INTEGER AS keep FROM range(" + std::to_string(retained_rows) + ");");
+  run_ok("CREATE TABLE probes AS SELECT " + key("range % 2000") +
+         " AS k, (range % 7)::INTEGER AS v FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
+  sirius::test::coverage_gate_disable_guard gate_off(*con);
+  sirius::test::scoped_sirius_setting zone_maps(*con, "enable_dynamic_zone_map_filter", true);
+  sirius::test::scoped_setting fraction(
+    *con, "dynamic_filter_inlist_max_l2_fraction", kind == "bloom" ? 0 : 1);
+  auto const query = "SELECT s.id, s.k FROM retained s " + join_type +
+                     " JOIN probes p ON s.k = p.k WHERE s.keep = 1";
+  auto explanation = con->Query("EXPLAIN " + query);
+  REQUIRE(explanation);
+  REQUIRE_FALSE(explanation->HasError());
+  INFO(explanation->ToString());
+  REQUIRE(explanation->ToString().find("Join Type: RIGHT_" + join_type) != std::string::npos);
+
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  auto const deltas = require_switch_result_equivalence(*con, query);
+  REQUIRE(deltas.on.producers_enabled > 0);
+  REQUIRE(deltas.on.membership_filters_built > 0);
+  REQUIRE(deltas.on.zone_map_filters_built > 0);
+  REQUIRE(deltas.on.filters_pushed > 0);
+  // The join's one key published the membership filter kind this case set up.
+  std::vector<std::string> key_lines;
+  for (auto const& record : logs.records()) {
+    if (record.message.starts_with("[dynamic_filter_key] ")) {
+      key_lines.push_back(record.message);
+    }
+  }
+  REQUIRE(key_lines.size() == 1);
+  INFO(key_lines.front());
+  CHECK(key_lines.front().find(" kind=" + kind + " ") != std::string::npos);
+  CHECK(key_lines.front().ends_with(" reason=-"));
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - catalog nonnull probes admit null-safe right-family filters",
                  "[integration][gpu_execution][dynamic_filter][right_family][join_key_nullability]")
 {
@@ -759,8 +800,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const probe_filter = empty_probe ? " AND p.v = 50 " : " ";
   auto const query        = "SELECT s.id, s.k FROM retained s " + join_type +
                      " JOIN probes p ON s.k IS NOT DISTINCT FROM p.k" + probe_filter +
@@ -882,8 +921,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT;");
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const grouping = deduplicate ? " GROUP BY id, k" : "";
   auto const query =
     "WITH shared AS MATERIALIZED (SELECT id, k FROM retained) "
@@ -1013,8 +1050,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   run_ok("CHECKPOINT");
   sirius::test::disabled_optimizers_guard shape(*con, "statistics_propagation");
   sirius::test::coverage_gate_disable_guard gate_off(*con);
-  sirius::test::scoped_sirius_setting accumulation(
-    *con, "enable_dynamic_filter_multi_partition", true);
   auto const query =
     "WITH matches AS MATERIALIZED (SELECT k FROM rf_matches) SELECT c.k FROM rf_candidates c " +
     join_type + " JOIN matches m ON c.k IS NOT DISTINCT FROM m.k WHERE c.keep=1";

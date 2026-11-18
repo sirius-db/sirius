@@ -63,14 +63,15 @@ struct dynamic_filter_publication_policy {
   bool emit_zone_map_filters            = false;
   double domain_coverage_threshold      = default_dynamic_filter_domain_coverage_threshold;
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
-  bool enable_multi_partition           = false;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
   //! Membership filters are Blooms only, never IN-lists.
   bool bloom_only = false;
   //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
   //! build's rows, and max_bloom_bytes_per_gpu does not cut it. Zero: sized from the build.
   std::size_t fixed_bloom_keys = 0;
-  //! Publish even an empty build, or with every target drained, rather than skip the publication.
+  //! Publish even an empty build, or with every channel closed, rather than skip the publication.
+  //! Closed channels still count `publications_skipped_targets_drained`; the process builds its
+  //! filters only for the other processes' cross-rank merge.
   bool publish_when_empty_or_drained = false;
 };
 
@@ -168,10 +169,6 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] double inlist_max_l2_fraction() const noexcept
   {
     return _policy.inlist_max_l2_fraction;
-  }
-  [[nodiscard]] bool multi_partition_enabled() const noexcept
-  {
-    return _policy.enable_multi_partition && enabled();
   }
   [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
   {

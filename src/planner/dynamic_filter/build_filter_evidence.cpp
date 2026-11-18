@@ -98,8 +98,7 @@ bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op)
 
 bool right_family_publication_enabled(sirius::operator_params const& params)
 {
-  return params.enable_dynamic_filter && params.enable_dynamic_filter_multi_partition &&
-         params.max_dynamic_filter_bloom_bytes_per_gpu() > 0;
+  return params.enable_dynamic_filter;
 }
 
 }  // namespace sirius::planner

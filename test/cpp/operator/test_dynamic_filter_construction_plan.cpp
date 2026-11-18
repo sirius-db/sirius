@@ -17,7 +17,7 @@
 /*
  * Host-only tests of `plan_construction`, the per-key policy that chooses each admitted key's
  * filters from the facts of a certified build inventory. The membership kind is checked against
- * `choose_membership_filter` called with the inputs the whole-build (one-shot) publisher passes.
+ * `choose_membership_filter` called with the inputs a single batch of the same rows would pass.
  */
 
 #include "helper/numeric_narrowing.hpp"
@@ -136,9 +136,11 @@ planned plan_for(std::vector<key_case> const& cases,
 }
 
 /**
- * @brief The kind the one-shot publisher chooses for `valid_rows` valid keys of `type`.
+ * @brief The kind a single batch of `valid_rows` valid keys of `type` gets.
  */
-membership_filter_kind one_shot_kind(cudf::data_type type, std::size_t valid_rows, std::size_t l2)
+membership_filter_kind single_batch_kind(cudf::data_type type,
+                                         std::size_t valid_rows,
+                                         std::size_t l2)
 {
   return op::choose_membership_filter(
     {.build_rows     = valid_rows,
@@ -189,7 +191,7 @@ op::dynamic_filter_key_outcome const& outcome_of(op::construction_plan const& pl
 
 }  // namespace
 
-TEST_CASE("each key's membership kind equals the one-shot choice",
+TEST_CASE("each key's membership kind equals the single-batch choice",
           "[dynamic_filter][construction_plan]")
 {
   auto const recorded  = GENERATE(type(cudf::type_id::INT32),
@@ -206,7 +208,7 @@ TEST_CASE("each key's membership kind equals the one-shot choice",
 
   auto const result = plan_for({plain_key(recorded, null_rows)}, rows, limits(l2)).plan;
   auto const valid  = rows - null_rows;
-  CHECK(planned_kind(result, 0) == one_shot_kind(recorded, valid, l2));
+  CHECK(planned_kind(result, 0) == single_batch_kind(recorded, valid, l2));
   auto const* key = key_of(result, 0);
   REQUIRE(key != nullptr);
   CHECK(key->construction_type == recorded);
@@ -214,6 +216,7 @@ TEST_CASE("each key's membership kind equals the one-shot choice",
     CHECK(exact->valid_rows == valid);
   }
   if (auto const* bloom = std::get_if<op::bloom_membership>(&key->membership)) {
+    CHECK(bloom->rows == valid);
     CHECK(bloom->sized_rows == valid);
     CHECK(bloom->blocks == op::bloom_blocks_for(valid));
   }
@@ -236,7 +239,7 @@ TEST_CASE("the hash IN-list stops at the configured L2 fraction",
         membership_filter_kind::bloom);
 }
 
-TEST_CASE("an all-null key plans the one-shot empty set", "[dynamic_filter][construction_plan]")
+TEST_CASE("an all-null key plans the single-batch empty set", "[dynamic_filter][construction_plan]")
 {
   auto const known  = plan_for({plain_key(k_int32, 40)}, 40).plan;
   auto const* exact = std::get_if<op::exact_membership>(&key_of(known, 0)->membership);
@@ -256,10 +259,25 @@ TEST_CASE("an unknown null count plans a Bloom filter sized on every row",
   auto const result = plan_for({plain_key(k_int32, std::nullopt)}, 5).plan;
   auto const* bloom = std::get_if<op::bloom_membership>(&key_of(result, 0)->membership);
   REQUIRE(bloom != nullptr);
+  CHECK(bloom->rows == 5);
   CHECK(bloom->sized_rows == 5);
   CHECK(bloom->blocks == op::bloom_blocks_for(5));
   CHECK(result.selection.keys_sized_on_total_rows == 1);
   CHECK_FALSE(outcome_of(result, 0).valid_rows);
+}
+
+TEST_CASE("a fixed-size Bloom filter still counts the build's valid rows",
+          "[dynamic_filter][construction_plan]")
+{
+  auto limit             = limits();
+  limit.bloom_only       = true;
+  limit.fixed_bloom_keys = 4096;
+  auto const result      = plan_for({plain_key(k_int64, 4)}, 10, limit).plan;
+  auto const* bloom      = std::get_if<op::bloom_membership>(&key_of(result, 0)->membership);
+  REQUIRE(bloom != nullptr);
+  CHECK(bloom->rows == 6);
+  CHECK(bloom->sized_rows == 4096);
+  CHECK(bloom->blocks == op::bloom_blocks_for(4096));
 }
 
 TEST_CASE("the carrier rule picks each key's construction type",
