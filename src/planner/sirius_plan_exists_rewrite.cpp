@@ -90,7 +90,6 @@ struct exists_match {
   duckdb::LogicalComparisonJoin* join = nullptr;  ///< The join of the outer rows and T, replaced
   std::size_t outer_child             = 0;        ///< Index of the outer rows among its children
   bool negated                        = false;    ///< NOT EXISTS
-  unique_ptr<LogicalOperator>* t      = nullptr;  ///< Owning slot of T, the subquery rows
   ColumnBinding t_key;                            ///< Column of T equal to the key
   ColumnBinding t_value;                          ///< Column of T compared with `<>`
   ColumnBinding outer_key;
@@ -149,13 +148,6 @@ bool has_supported_types(exists_match const& match)
          cudf::is_timestamp(*value_cudf) || cudf::is_duration(*value_cudf);
 }
 
-bool has_arbitrary_condition(duckdb::LogicalComparisonJoin const& join)
-{
-  return join.conditions.empty() || std::ranges::any_of(join.conditions, [](auto const& condition) {
-           return !condition.IsComparison();
-         });
-}
-
 /// A SEMI or ANTI join of the outer rows and T on exactly one key and one value comparison, as
 /// DuckDB's optimizer leaves a decorrelated EXISTS, or as a client writes it. Every check is
 /// structural; anything unexpected declines and leaves DuckDB's plan alone.
@@ -169,14 +161,15 @@ std::optional<exists_match> match_exists(LogicalOperator& node)
   auto const type = join.join_type;
   if ((type != JoinType::SEMI && type != JoinType::ANTI && type != JoinType::RIGHT_SEMI &&
        type != JoinType::RIGHT_ANTI) ||
-      has_arbitrary_condition(join) || join.conditions.size() != 2) {
+      join.conditions.size() != 2 ||
+      !std::ranges::all_of(join.conditions,
+                           [](auto const& condition) { return condition.IsComparison(); })) {
     return std::nullopt;
   }
   exists_match match;
   match.join        = &join;
   match.outer_child = type == JoinType::SEMI || type == JoinType::ANTI ? 0 : 1;
   match.negated     = type == JoinType::ANTI || type == JoinType::RIGHT_ANTI;
-  match.t           = &join.children[1 - match.outer_child];
   bool has_key = false, has_value = false;
   for (auto const& condition : join.conditions) {
     auto const& outer_side = match.outer_child == 0 ? condition.GetLHS() : condition.GetRHS();
@@ -592,7 +585,7 @@ rewritten rewrite_merged(duckdb::ClientContext& context,
 {
   std::vector<peeled_scan> scans;
   for (auto& match : chain) {
-    auto scan = peel_scan(*match.t);
+    auto scan = peel_scan(match.join->children[1 - match.outer_child]);
     if (!scan) { return {}; }
     scans.push_back(std::move(*scan));
   }

@@ -44,9 +44,6 @@ enum class decline_reason : uint8_t {
   provider_internal,
   hidden_catalog,         ///< a registered catalog or scanned table is HIDDEN
   classification_failed,  ///< inspection failed or a registered catalog identity did not match
-  /// Sirius rewrote the plan before optimization and then did not take the query. DuckDB plans
-  /// the statement a second time, and this keeps both hooks out of that pass.
-  rewritten_plan_fallback,
 };
 
 struct classification_result {
@@ -81,13 +78,5 @@ decline_reason inspect_statement_for_hidden_catalog(
 decline_reason should_use_duckdb(duckdb::ClientContext& context,
                                  duckdb::LogicalOperator const* plan,
                                  duckdb::StatementProperties const* properties) noexcept;
-
-/// Throw InvalidInputException unless `delim_join_as_cte` is true on this connection.
-///
-/// Sirius plans only the form DuckDB gives correlated subqueries by default: a materialized CTE
-/// of the outer rows. With the setting off (deprecated in DuckDB) they arrive as delim joins,
-/// which Sirius has no operators for. Call this once the query is known to be one Sirius would
-/// run, so that statements that never reach the GPU, `SET` among them, keep working.
-void require_delim_join_as_cte(duckdb::ClientContext& context);
 
 }  // namespace sirius::transparent

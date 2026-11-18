@@ -45,32 +45,27 @@ std::size_t occurrences(std::string const& text, std::string const& word)
   return count;
 }
 
-void run_ok(duckdb::Connection& con, std::string const& sql)
+/// The result of @p sql, which must succeed.
+auto run_ok(duckdb::Connection& con, std::string const& sql)
 {
   auto result = con.Query(sql);
   REQUIRE(result);
   if (result->HasError()) { UNSCOPED_INFO("query failed: " << sql << ": " << result->GetError()); }
   REQUIRE_FALSE(result->HasError());
+  return result;
 }
 
 /// DuckDB's plan for @p query as it is planned for the GPU, Sirius's optimizer hooks included.
 std::string gpu_plan(duckdb::Connection& con, std::string const& query)
 {
   scoped_sirius_setting gpu(con, "gpu_execution", true);
-  auto result = con.Query("EXPLAIN " + query);
-  REQUIRE(result);
-  INFO(result->GetError());
-  REQUIRE_FALSE(result->HasError());
-  return result->ToString();
+  return run_ok(con, "EXPLAIN " + query)->ToString();
 }
 
 result_rows cpu_rows(duckdb::Connection& con, std::string const& query)
 {
   scoped_sirius_setting cpu_only(con, "gpu_execution", false);
-  auto result = con.Query(query);
-  REQUIRE(result);
-  REQUIRE_FALSE(result->HasError());
-  return sirius::test::collect_rows(*result);
+  return sirius::test::collect_rows(*run_ok(con, query));
 }
 
 /// @p query runs on the GPU, without a fallback, and returns the CPU's rows.
@@ -80,10 +75,7 @@ void compare_gpu_vs_cpu(duckdb::Connection& con, std::string const& query)
   auto const expected = cpu_rows(con, query);
   scoped_sirius_setting gpu(con, "gpu_execution", true);
   auto const before = sirius::test::get_transparent_execution_stats(con);
-  auto result       = con.Query(query);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO("GPU query failed: " << result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
+  auto const result = run_ok(con, query);
   sirius::test::require_transparent_execution_delta(
     before, sirius::test::get_transparent_execution_stats(con), 1, 0, 1);
   REQUIRE(sirius::test::collect_rows(*result) == expected);
@@ -148,24 +140,28 @@ void check_rewrites(duckdb::Connection& con)
 
   SECTION("results")
   {
-    bool const answer_exists = GENERATE(true, false);
-    bool const carry_keys    = GENERATE(true, false);
-    CAPTURE(answer_exists, carry_keys);
-    scoped_sirius_setting exists_switch(con, "enable_exists_from_aggregate", answer_exists);
-    scoped_sirius_setting carry_switch(con, "enable_subquery_key_carry", carry_keys);
+    // Loops, not GENERATE: a generator would run this function, and build the tables, once per
+    // combination.
+    for (bool const answer_exists : {true, false}) {
+      for (bool const carry_keys : {true, false}) {
+        CAPTURE(answer_exists, carry_keys);
+        scoped_sirius_setting exists_switch(con, "enable_exists_from_aggregate", answer_exists);
+        scoped_sirius_setting carry_switch(con, "enable_subquery_key_carry", carry_keys);
 
-    // Keys restricted on both tables; outer rows without subquery rows keep a NULL total.
-    compare_gpu_vs_cpu(con, scalar + outer_rows);
-    // The EXISTS answered from the subquery: key 7 stays, with a NULL total.
-    compare_gpu_vs_cpu(con, twin);
-    // The subquery inside an expression, and the mark of the removed join read by the query.
-    compare_gpu_vs_cpu(
-      con,
-      "SELECT p.pk, coalesce((SELECT sum(i.qty)" + rows + "), -1) AS total" + outer_rows + exists);
-    // Shapes the EXISTS rule declines stay as they were.
-    compare_gpu_vs_cpu(con, scalar + outer_rows + " AND NOT EXISTS (SELECT 1" + rows + ")");
-    compare_gpu_vs_cpu(con,
-                       "SELECT p.pk, (SELECT count(*)" + rows + ") AS n" + outer_rows + exists);
+        // Keys restricted on both tables; outer rows without subquery rows keep a NULL total.
+        compare_gpu_vs_cpu(con, scalar + outer_rows);
+        // The EXISTS answered from the subquery: key 7 stays, with a NULL total.
+        compare_gpu_vs_cpu(con, twin);
+        // The subquery inside an expression, and the mark of the removed join read by the query.
+        compare_gpu_vs_cpu(con,
+                           "SELECT p.pk, coalesce((SELECT sum(i.qty)" + rows + "), -1) AS total" +
+                             outer_rows + exists);
+        // Shapes the EXISTS rule declines stay as they were.
+        compare_gpu_vs_cpu(con, scalar + outer_rows + " AND NOT EXISTS (SELECT 1" + rows + ")");
+        compare_gpu_vs_cpu(con,
+                           "SELECT p.pk, (SELECT count(*)" + rows + ") AS n" + outer_rows + exists);
+      }
+    }
   }
 }
 
@@ -216,10 +212,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   SECTION("GPU planning turns the query down")
   {
-    run_ok("SET sirius_test_inject_read_view_mismatch = 'finalize';");
-    absl::Cleanup restore = [&] {
-      con->Query("SET sirius_test_inject_read_view_mismatch = 'off';");
-    };
+    scoped_sirius_setting inject{*con, "sirius_test_inject_read_view_mismatch", "finalize"};
     auto const before = replans();
     expect_plan_fallback_matches_cpu(twin);
     CHECK(replans() == before + 1);
@@ -230,10 +223,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 
   SECTION("the GPU fails while running the query")
   {
-    run_ok("SET sirius_test_inject_transparent_gpu_error = 'injected';");
-    absl::Cleanup restore = [&] {
-      con->Query("SET sirius_test_inject_transparent_gpu_error = '';");
-    };
+    scoped_sirius_setting inject{*con, "sirius_test_inject_transparent_gpu_error", "injected"};
     auto const before = replans();
     expect_runtime_fallback_matches_cpu(twin);
     CHECK(replans() == before + 1);

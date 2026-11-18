@@ -91,11 +91,11 @@ struct reuse {
   std::vector<std::vector<unique_ptr<Expression>>> arguments;  ///< Per aggregate
 };
 
-/// Whether @p aggregate's input, which reaches the outer rows' distinct values of the column
-/// @p keys records through @p keys, can be replaced by the outer rows @p outer themselves, read
-/// through a CTE scan with table index @p scan_index.
+/// Whether @p aggregate's input can be replaced by the outer rows @p outer themselves, read
+/// through a CTE scan with table index @p scan_index. @p sub is that input flattened, and
+/// @p keys the leaf and column through which it reads the outer rows' distinct keys.
 ///
-/// The input is flattened into S, the subquery's own rows, restricted by `S.a = keys.k`. The
+/// The input is S, the subquery's own rows, restricted by `S.a = keys.k`. The
 /// outer rows must flatten into S' x P with
 ///  - every leaf of S matching exactly one scan of the same source (a view, or a CTE) in S', and
 ///    no others in S',
@@ -109,18 +109,18 @@ struct reuse {
 std::optional<reuse> match_aggregate(duckdb::ClientContext& context,
                                      duckdb::LogicalAggregate& aggregate,
                                      LogicalOperator& outer,
-                                     key_source keys,
+                                     flat_tree const& sub,
+                                     key_source const& keys,
                                      TableIndex scan_index)
 {
-  if (aggregate.children.size() != 1 || aggregate.groups.size() != 1 ||
-      !grouped_by_its_group(aggregate) || aggregate.expressions.empty() ||
+  if (aggregate.groups.size() != 1 || !grouped_by_its_group(aggregate) ||
+      aggregate.expressions.empty() ||
       !std::ranges::all_of(aggregate.expressions, [](auto const& expression) {
         return reusable_aggregate(*expression);
       })) {
     return std::nullopt;
   }
-  flat_tree sub;
-  if (!flatten(*aggregate.children[0], sub, &keys) || !keys.leaf) { return std::nullopt; }
+  if (!keys.leaf) { return std::nullopt; }
   auto const key_column = keys.cte_column;
   flat_tree rows;
   if (!flatten(outer, rows, nullptr)) { return std::nullopt; }
@@ -323,20 +323,17 @@ struct rewriter {
   {
     auto& aggregate = node.Cast<duckdb::LogicalAggregate>();
     if (ctes.empty() || aggregate.children.size() != 1) { return; }
-    key_source probe;
-    probe.cte = true;
-    flat_tree scratch;
-    if (!flatten(*aggregate.children[0], scratch, &probe) || !probe.cte_index) { return; }
+    key_source keys{.cte = true};
+    flat_tree sub;
+    if (!flatten(*aggregate.children[0], sub, &keys) || !keys.cte_index) { return; }
     auto const cte = std::ranges::find_if(
-      ctes, [&](auto const* candidate) { return candidate->table_index == *probe.cte_index; });
+      ctes, [&](auto const* candidate) { return candidate->table_index == *keys.cte_index; });
     if (cte == ctes.end()) { return; }
-    auto& outer = *(*cte)->children[0];
-    key_source keys;
-    keys.cte              = true;
+    auto& outer           = *(*cte)->children[0];
     auto const scan_index = binder.GenerateTableIndex();
-    auto plan             = match_aggregate(context, aggregate, outer, keys, scan_index);
+    auto plan             = match_aggregate(context, aggregate, outer, sub, keys, scan_index);
     if (!plan) { return; }
-    reuse_rows(aggregate, scan_rows(scan_index, *probe.cte_index, outer), *plan);
+    reuse_rows(aggregate, scan_rows(scan_index, *keys.cte_index, outer), *plan);
     ++rewrites;
   }
 

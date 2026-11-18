@@ -138,6 +138,7 @@ class SiriusConnectionState : public ClientContextState {
     if (is_internal_query_active()) return;
     pinned_update_guard_.reset();
     execution_options.reset();
+    gpu_rewrite_ = gpu_rewrite::none;
   }
 
   // Access is serialized by the owning ClientContext. Workers only see execution_options.
@@ -188,15 +189,26 @@ class SiriusConnectionState : public ClientContextState {
     staged_cte_reader_proofs_.reset();
     captured_cte_reader_proofs_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
-    plan_rewritten_ = false;
+    gpu_rewrite_    = gpu_rewrite::none;
   }
 
   [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
 
   /// \brief The pre-optimize hook edited DuckDB's plan in this planning attempt, so the CPU plan
   /// DuckDB builds from it is not the one DuckDB would have made alone.
-  void mark_plan_rewritten() noexcept { plan_rewritten_ = true; }
-  [[nodiscard]] bool plan_rewritten() const noexcept { return plan_rewritten_; }
+  void mark_plan_rewritten() noexcept { gpu_rewrite_ = gpu_rewrite::applied; }
+  [[nodiscard]] bool plan_rewritten() const noexcept
+  {
+    return gpu_rewrite_ == gpu_rewrite::applied;
+  }
+
+  /// \brief Sirius leaves a rewritten query to DuckDB, which plans the statement once more in the
+  /// same planning attempt. Both optimizer hooks leave that second pass alone.
+  void replan_for_cpu() noexcept { gpu_rewrite_ = gpu_rewrite::replanning_for_cpu; }
+  [[nodiscard]] bool replanning_for_cpu() const noexcept
+  {
+    return gpu_rewrite_ == gpu_rewrite::replanning_for_cpu;
+  }
 
   /// \brief Current classification; provider_internal remains latched.
   [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
@@ -368,7 +380,13 @@ class SiriusConnectionState : public ClientContextState {
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
-  bool plan_rewritten_                                = false;
+  /// What the pre-optimize hook's GPU rewrites did to DuckDB's plan in this planning attempt.
+  enum class gpu_rewrite : uint8_t {
+    none,                ///< the plan is as DuckDB bound it
+    applied,             ///< rewritten for the GPU, and DuckDB's CPU plan with it
+    replanning_for_cpu,  ///< DuckDB is planning the statement again, without the rewrites
+  };
+  gpu_rewrite gpu_rewrite_ = gpu_rewrite::none;
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
@@ -425,8 +443,9 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
-    // Fallbacks, of either kind, for which DuckDB planned the statement again because Sirius had
-    // rewritten the plan before optimization: the CPU ran DuckDB's own plan, not the rewritten one.
+    // Statements Sirius rewrote before optimization and then did not run, at plan time or after a
+    // GPU failure, for which the statement was planned again: the CPU ran DuckDB's own plan, not
+    // the rewritten one.
     uint64_t fallback_replans = 0;
     // Subqueries the EXISTS MIN/MAX rewrite replaced in captured plans.
     uint64_t exists_minmax_rewrites = 0;
@@ -931,8 +950,8 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
-  /// \brief Record a fallback whose CPU plan DuckDB planned again, without Sirius's
-  /// pre-optimize rewrites.
+  /// \brief Record a rewritten statement that Sirius did not run and that was planned again
+  /// for the CPU, without Sirius's pre-optimize rewrites.
   void record_transparent_fallback_replan() noexcept;
 
   /// \brief Record @p count subqueries replaced by the EXISTS MIN/MAX rewrite.
@@ -1225,6 +1244,14 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Throw InvalidInputException unless `delim_join_as_cte` is true on this connection.
+///
+/// Sirius plans only the form DuckDB gives correlated subqueries by default: a materialized CTE
+/// of the outer rows. With the setting off (deprecated in DuckDB) they arrive as delim joins,
+/// which Sirius has no operators for. Call this once the query is known to be one Sirius would
+/// run, so that statements that never reach the GPU, `SET` among them, keep working.
+void require_delim_join_as_cte(ClientContext& context);
 
 /// \brief Read the per-session `like_swar_fastpath` setting (default true).
 bool like_swar_fastpath_enabled(ClientContext& context);

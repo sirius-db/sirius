@@ -24,7 +24,6 @@
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/enums/logical_operator_type.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
-#include <duckdb/common/exception.hpp>
 #include <duckdb/common/optional_ptr.hpp>
 #include <duckdb/common/shared_ptr.hpp>
 #include <duckdb/common/string_util.hpp>
@@ -268,15 +267,6 @@ decline_reason should_use_duckdb(duckdb::ClientContext& context,
   state->decline_attempt(reason);
   sirius->record_transparent_decline(reason);
   return reason;
-}
-
-void require_delim_join_as_cte(duckdb::ClientContext& context)
-{
-  if (bool_setting_is_true(context, "delim_join_as_cte")) { return; }
-  throw duckdb::InvalidInputException(
-    "Sirius runs queries only with delim_join_as_cte = true, DuckDB's default. "
-    "SET delim_join_as_cte = true to run this query on the GPU, or SET gpu_execution = false "
-    "to run it on the CPU.");
 }
 
 }  // namespace sirius::transparent

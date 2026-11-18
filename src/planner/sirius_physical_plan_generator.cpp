@@ -1717,10 +1717,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
   wrap_join_child(
     join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
-  bool probe_drives = false;
-  if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
-    probe_drives = join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
-  }
+  bool const probe_drives = join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
+                            join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
   bind_wrapped_join(join_op, probe_drives);
 }
 

@@ -1805,7 +1805,6 @@ void SiriusContext::record_transparent_decline(sirius::transparent::decline_reas
     case decline_reason::classification_failed:
       transparent_classification_failure_count_.fetch_add(1, std::memory_order_relaxed);
       break;
-    case decline_reason::rewritten_plan_fallback:  // counted as a fallback re-plan
     case decline_reason::none: break;
   }
 }
@@ -1900,6 +1899,19 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+void require_delim_join_as_cte(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("delim_join_as_cte", setting) && !setting.IsNull() &&
+      setting.GetValue<bool>()) {
+    return;
+  }
+  throw InvalidInputException(
+    "Sirius runs queries only with delim_join_as_cte = true, DuckDB's default. "
+    "SET delim_join_as_cte = true to run this query on the GPU, or SET gpu_execution = false "
+    "to run it on the CPU.");
+}
+
 bool like_swar_fastpath_enabled(ClientContext& context)
 {
   Value setting;
@@ -1959,15 +1971,13 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
   // DuckDB has already built its CPU plan, from the logical plan the pre-optimize hook may have
   // rewritten for the GPU. When Sirius then leaves such a query to DuckDB, have DuckDB plan the
-  // statement once more: the latched decline keeps both optimizer hooks out of that pass, and
-  // DuckDB does not call this function again, so the query runs the plan DuckDB makes alone.
+  // statement once more: `replan_for_cpu` keeps both optimizer hooks out of that pass, and DuckDB
+  // does not call this function again, so the query runs the plan DuckDB makes alone.
   auto const leave_to_duckdb = [&]() {
     if (!conn_state || !conn_state->plan_rewritten()) { return RebindQueryInfo::DO_NOT_REBIND; }
-    if (!conn_state->attempt_declined()) {
-      conn_state->decline_attempt(sirius::transparent::decline_reason::rewritten_plan_fallback);
-    }
+    conn_state->replan_for_cpu();
     record_transparent_fallback_replan();
-    SIRIUS_LOG_INFO("Transparent execution fallback: planning again without the GPU rewrites");
+    SIRIUS_LOG_INFO("Transparent execution: planning again without the GPU rewrites");
     return RebindQueryInfo::ATTEMPT_TO_REBIND;
   };
 
@@ -2023,7 +2033,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
   // From here on Sirius would run the query. An error, not a fallback: the CPU would answer
   // every query of the session without the user learning why.
-  sirius::transparent::require_delim_join_as_cte(context);
+  require_delim_join_as_cte(context);
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).

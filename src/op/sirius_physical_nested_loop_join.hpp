@@ -128,9 +128,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! Output column order: indices into right table columns (empty = identity 0,1,...,right_cols-1)
   duckdb::vector<std::size_t> right_output_col_idxs;
 
-  //! DuckDB's `mark_types` of a MARK join; empty for other join types
-  duckdb::vector<sirius::logical_type> delim_types;
-
  protected:
   // CachingOperator Interface
 
