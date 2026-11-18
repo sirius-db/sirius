@@ -333,9 +333,10 @@ TEST_CASE("Sort ranges spread one-row equal-key batches", "[sort_range_layout]")
   auto result = run_checked(int_batches(values), one_order(), 100000, 1000, true, true);
   REQUIRE(result.sample.num_ranges == 8);
   for (auto const& range : result.counted) {
-    // 250 expected rows; the fixed hash distributes 2000 batch IDs across eight ranges.
-    CHECK(range.rows >= 190);
-    CHECK(range.rows <= 310);
+    // 250 expected rows with a standard deviation near 15. Batch IDs vary with test order, so
+    // the bounds allow five deviations.
+    CHECK(range.rows >= 175);
+    CHECK(range.rows <= 325);
   }
 }
 

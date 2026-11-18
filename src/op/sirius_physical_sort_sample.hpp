@@ -198,6 +198,12 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
                                    cucascade::memory::memory_space* space,
                                    ::cuda::stream_ref stream);
 
+  //! Whether this operator's boundaries may carry equal-key fractions. A hook's never do.
+  [[nodiscard]] bool equal_key_fractions_enabled() const noexcept
+  {
+    return _split_equal_keys && _cross_rank_boundaries == nullptr;
+  }
+
   [[nodiscard]] BoundaryState boundary_state() const noexcept
   {
     return _boundary_state.load(std::memory_order_acquire);

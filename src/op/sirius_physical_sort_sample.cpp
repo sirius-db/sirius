@@ -347,7 +347,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     auto const repeated_boundaries = count_repeated_boundaries(_partition_boundaries.get(), stream);
     _range_stats                   = {.num_ranges          = _num_partitions,
                                       .repeated_boundaries = repeated_boundaries,
-                                      .split_equal_keys    = _split_equal_keys};
+                                      .split_equal_keys    = equal_key_fractions_enabled()};
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -552,7 +552,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                       .target_range_bytes    = max_partition_bytes,
                                       .num_ranges            = _num_partitions,
                                       .repeated_boundaries   = repeated_boundaries,
-                                      .split_equal_keys      = _split_equal_keys,
+                                      .split_equal_keys      = equal_key_fractions_enabled(),
                                       .split_boundaries      = static_cast<std::size_t>(split_boundaries)};
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
