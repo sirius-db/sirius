@@ -210,6 +210,21 @@ and why), then per batch the sources in the order they ran, the enumeration chos
 survivor count and whether the batch came back needing no further filtering. Enable
 `fused_scan_diagnostics` to emit these decisions at INFO level.
 
+### Reporting the rows the decode kept
+
+A decode that compacts can hand back the positions it kept, as an ascending INT32 index list over
+the pre-filter batch (`pushdown_outcome::survivor_rows`). It is produced only when the request
+asks (`pushdown_request::report_survivors`, set through
+`decompression_pushdown_scan::with_survivor_reporting()`), which only a scan carrying a
+late-materialization deferral does — that rowid addresses the pinned chunk by position, and a
+compacted batch no longer holds the chunk's rows in order.
+
+The answer is not re-derived: the tier-B route already materialized the index list to gather by,
+and every other route left the counted mask it balloted, so this either copies a buffer that
+exists or expands one (`mask_to_row_indices`). `pushdown_outcome::compacted` reports that rows
+were dropped at all — separately from `row_filtered`, which additionally claims the whole filter
+was carried — so a consumer can tell "no positions asked for" apart from "no rows dropped".
+
 ## Interaction with the downgrade executor
 
 GPU pins permanently occupy part of the downgrade budget, so heavy queries ride closer to
