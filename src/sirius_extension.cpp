@@ -74,7 +74,6 @@ extern "C" int cudaProfilerStop();
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/unsupported_optimizers.hpp"
-#include "transparent/connection_provenance.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
@@ -496,7 +495,7 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
-  sirius::transparent::require_delim_join_as_cte(context);
+  require_delim_join_as_cte(context);
 
   // Route Sirius-owned remote parquet reads through Sirius's own bind:
   // read_parquet('s3://…') -> sirius_read_parquet('s3://…'). DuckDB core has no

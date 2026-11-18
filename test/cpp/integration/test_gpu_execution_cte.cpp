@@ -31,16 +31,6 @@ class CteFixture : public sirius::test::GpuExecutionFixture {
       "CREATE TABLE ct AS SELECT range::BIGINT AS k, (range % 5)::BIGINT AS g FROM range(50);");
     run_ok("CHECKPOINT;");
   }
-
-  /// The error @p sql fails with.
-  std::string query_error(std::string const& sql)
-  {
-    auto result = con->Query(sql);
-    REQUIRE(result);
-    if (!result->HasError()) { UNSCOPED_INFO("expected an error, got: " << result->ToString()); }
-    REQUIRE(result->HasError());
-    return result->GetError();
-  }
 };
 
 }  // namespace

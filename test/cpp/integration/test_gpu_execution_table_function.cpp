@@ -83,15 +83,6 @@ class GpuExecutionTableFunctionFixture : public sirius::test::GpuExecutionFixtur
     return collect_rows(*result);
   }
 
-  std::string query_error(std::string const& sql)
-  {
-    auto result = con->Query(sql);
-    REQUIRE(result);
-    if (!result->HasError()) { UNSCOPED_INFO("expected an error, got: " << result->ToString()); }
-    REQUIRE(result->HasError());
-    return result->GetError();
-  }
-
   bool session_optimizer_enabled() const
   {
     return duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(*con->context);

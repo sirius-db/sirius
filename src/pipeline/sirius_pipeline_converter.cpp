@@ -224,10 +224,11 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     scheduled_[i]->set_pipeline_id(i);
   }
 
+  // One edge from @p src, whose sink produces the batches, into @p consumer's port in @p dst.
   auto emit = [&](op::sirius_physical_operator const& consumer,
-                  op::sirius_physical_operator* source_op,
                   const std::shared_ptr<sirius_pipeline>& src,
                   const std::shared_ptr<sirius_pipeline>& dst) {
+    auto* source_op    = src->get_sink().get();
     auto const port_id = consumer.input_port_for(*source_op);
     auto const barrier = consumer.input_barrier_for(*source_op);
     repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
@@ -255,7 +256,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         if (consumer == nullptr) {
           throw sirius::internal_exception("CTE_SCAN repository wiring has no logical consumer");
         }
-        emit(*consumer, sink_op, pipeline, dest_pipeline);
+        emit(*consumer, pipeline, dest_pipeline);
       }
       continue;
     }
@@ -268,7 +269,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     if (it == dest_for_op.end()) { continue; }
 
     const auto& dest = it->second;
-    emit(*parent_op, sink_op, pipeline, dest);
+    emit(*parent_op, pipeline, dest);
   }
 }
 

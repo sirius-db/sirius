@@ -23,6 +23,7 @@
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+#include "util/duckdb_error_message.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/execution/executor.hpp>
@@ -175,7 +176,8 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> plan_without_rewrites(
   } catch (duckdb::InterruptException&) {
     throw;
   } catch (std::exception& e) {
-    SIRIUS_LOG_INFO("Transparent execution: CPU fallback keeps the rewritten plan: {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution: CPU fallback keeps the rewritten plan: {}",
+                    sirius::sanitized_message(e));
     return nullptr;
   }
 }

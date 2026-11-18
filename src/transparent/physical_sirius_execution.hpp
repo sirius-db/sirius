@@ -122,8 +122,9 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared_;
 
   /// Whether the pre-optimize hook rewrote the logical plan `cpu_fallback_prepared_` was built
-  /// from. A runtime fallback then plans `query_sql_` again, without the rewrites, and runs that;
-  /// it keeps the stashed plan only when the statement cannot be planned from its text alone.
+  /// from. A runtime fallback then plans `query_sql_` again, without the rewrites, and runs that.
+  /// It keeps the stashed plan when the statement cannot be planned from its text alone: an
+  /// EXECUTE of a prepared statement, or a statement with parameters.
   bool plan_rewritten_ = false;
 
   /// Derived from the retained CPU plan before any SQL replan.

@@ -977,14 +977,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalComparisonJoin& op)
 {
-  switch (op.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
-      // return plan_asof_join(op);
-      throw duckdb::NotImplementedException("Asof join not supported in GPU");
-    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: return plan_comparison_join(op);
-    default:
-      throw duckdb::InternalException("Unrecognized operator type for LogicalComparisonJoin");
+  // The dispatcher sends only plain comparison joins here; it turns ASOF joins away itself.
+  if (op.type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    throw duckdb::InternalException("Unrecognized operator type for LogicalComparisonJoin");
   }
+  return plan_comparison_join(op);
 }
 
 }  // namespace sirius::planner

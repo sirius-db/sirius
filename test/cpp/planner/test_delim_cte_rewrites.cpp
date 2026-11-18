@@ -142,8 +142,7 @@ struct delim_rewrites_fixture {
     db  = sirius::test::open_sirius_db(db_dir.file("delim_rewrites.db").c_str(), cfg);
     con = std::make_unique<Connection>(*db);
     for (char const* sql :
-         {"SET delim_join_as_cte = true",
-          "CREATE TABLE nations (nk INTEGER, region VARCHAR)",
+         {"CREATE TABLE nations (nk INTEGER, region VARCHAR)",
           "INSERT INTO nations SELECT range, 'R' || (range % 5) FROM range(25)",
           // More rows than a quarter of `sales`.
           "CREATE TABLE many_nations (nk INTEGER, region VARCHAR)",
