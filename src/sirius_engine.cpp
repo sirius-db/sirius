@@ -24,7 +24,6 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_cte.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"

@@ -79,10 +79,9 @@ class scoped_sirius_setting final {
                         setting_value const& value)
     : con_(connection), name_(std::move(name))
   {
-    auto current = con_.Query("SELECT current_setting('" + name_ + "');");
-    REQUIRE(current);
-    REQUIRE_FALSE(current->HasError());
-    original_ = current->Collection().GetValue(0, 0);
+    // Read from the connection, so that saving a setting never runs a query through Sirius.
+    bool const found{con_.context->TryGetCurrentSetting(duckdb::Identifier(name_), original_)};
+    REQUIRE(found);
 
     auto applied = con_.Query("SET " + name_ + " = " + value.value.ToSQLString() + ";");
     REQUIRE(applied);

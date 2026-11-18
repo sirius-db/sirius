@@ -52,9 +52,7 @@
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
-#include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -504,11 +502,6 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     using type = sirius::op::SiriusPhysicalOperatorType;
     for (auto& child : node.children)
       if (child) visit(*child);
-    if (node.type == type::LEFT_DELIM_JOIN || node.type == type::RIGHT_DELIM_JOIN) {
-      auto& d = node.template Cast<sirius::op::sirius_physical_delim_join>();
-      if (d.join) visit(*d.join);
-      if (d.distinct_root) visit(*d.distinct_root);
-    }
     if (node.type != type::TABLE_SCAN) return;
     auto& scan = node.template Cast<sirius::op::sirius_physical_table_scan>();
     if (auto const* connector = lookup_connector(scan.function, scan.bind_data.get(), context);
@@ -957,13 +950,10 @@ void append_lineage(plan_lineage& output, plan_lineage const& input, Indices con
 
 // One bottom-up walk for the whole plan. Computed values have already marked their
 // inputs; only pass-through values need to carry leaf identities to their consumers.
-plan_lineage collect_semantic_lineage(
-  op::sirius_physical_operator& node,
-  bool force_all,
-  std::unordered_map<op::sirius_physical_operator*, plan_lineage>& aliases,
-  duckdb::ClientContext& context)
+plan_lineage collect_semantic_lineage(op::sirius_physical_operator& node,
+                                      bool force_all,
+                                      duckdb::ClientContext& context)
 {
-  if (auto it = aliases.find(&node); it != aliases.end()) return it->second;
   using type = op::SiriusPhysicalOperatorType;
   if (node.type == type::TABLE_SCAN && node.children.empty()) {
     auto& scan = node.Cast<op::sirius_physical_table_scan>();
@@ -1040,7 +1030,7 @@ plan_lineage collect_semantic_lineage(
   std::vector<plan_lineage> children;
   plan_lineage result;
   for (auto& child : node.children) {
-    children.push_back(collect_semantic_lineage(*child, force_all, aliases, context));
+    children.push_back(collect_semantic_lineage(*child, force_all, context));
     auto const& inputs = children.back().inputs;
     result.inputs.insert(result.inputs.end(), inputs.begin(), inputs.end());
   }
@@ -1049,19 +1039,7 @@ plan_lineage collect_semantic_lineage(
     // All inputs are already semantic; no need to duplicate that set for every output.
     result.columns.assign(node.types.size(), {});
   };
-  if (node.type == type::LEFT_DELIM_JOIN || node.type == type::RIGHT_DELIM_JOIN) {
-    auto& delim = node.Cast<op::sirius_physical_delim_join>();
-    if (!children.empty() && delim.join && delim.join->children.size() == 2) {
-      auto side                                 = node.type == type::LEFT_DELIM_JOIN ? 0 : 1;
-      aliases[delim.join->children[side].get()] = children[0];
-      if (delim.distinct)
-        for (auto index : delim.distinct->group_idx)
-          if (index >= 0) mark_semantic(lineage_at(children[0], index));
-      auto joined = collect_semantic_lineage(*delim.join, force_all, aliases, context);
-      result      = std::move(joined);
-    } else
-      all();
-  } else if (node.type == type::PROJECTION && children.size() == 1) {
+  if (node.type == type::PROJECTION && children.size() == 1) {
     for (auto const& expression : node.Cast<op::sirius_physical_projection>().select_list) {
       if (expression && expression->holds<ast::reference>())
         result.columns.push_back(
@@ -1356,7 +1334,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
   slot = entry->lower(scan, params, context, entry->filter_mode);
 }
 
-// Visit all owned subtrees, including the join and distinct trees outside children[].
+// Certify every TABLE_SCAN in the subtree.
 void certify_scans_recursive(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                              sirius::operator_params const& params,
                              duckdb::ClientContext& context,
@@ -1366,11 +1344,6 @@ void certify_scans_recursive(duckdb::unique_ptr<sirius::op::sirius_physical_oper
   for (auto& child : slot->children)
     certify_scans_recursive(child, params, context, provenance);
   using type = sirius::op::SiriusPhysicalOperatorType;
-  if (slot->type == type::LEFT_DELIM_JOIN || slot->type == type::RIGHT_DELIM_JOIN) {
-    auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
-    certify_scans_recursive(delim.join, params, context, provenance);
-    certify_scans_recursive(delim.distinct_root, params, context, provenance);
-  }
   if (slot->type == type::TABLE_SCAN) certify_table_scan(slot, params, context, provenance);
 }
 
@@ -1378,9 +1351,8 @@ void certify_scans_recursive(duckdb::unique_ptr<sirius::op::sirius_physical_oper
 //! source. Unlike the scan-companion wraps, no leaf child and no extra pipeline is created:
 //! GPU_VALUES is a first-class in-pipeline source driven by the normal task creation
 //! loop, exactly like GPU_SCAN (same shape as wrap_table_scan_source's replace path).
-//! A null-collection COLUMN_DATA_SCAN is the LEFT_DELIM_JOIN cached chunk scan (filled
-//! at runtime) — left as-is. The viability gates run BEFORE the collection is moved out so an
-//! unsupported type or oversized single-task source falls back to DuckDB CPU with its data intact.
+//! The viability gates run BEFORE the collection is moved out so an unsupported type or oversized
+//! single-task source falls back to DuckDB CPU with its data intact.
 void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                              std::size_t max_source_bytes)
 {
@@ -1390,7 +1362,6 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
       auto& col_scan = slot->Cast<sirius::op::sirius_physical_column_data_scan>();
-      if (!col_scan.collection) { return; }  // LEFT_DELIM_JOIN cached chunk scan — skip
       sirius::op::sirius_physical_gpu_values::throw_if_unsupported_types(slot->types);
       sirius::op::sirius_physical_gpu_values::throw_if_collection_too_large(*col_scan.collection,
                                                                             max_source_bytes);
@@ -1637,8 +1608,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 
       if (is_build && join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
         auto& join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-        if (!join.is_delim_join_inner() &&
-            (join.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        if ((join.join_type == duckdb::JoinType::RIGHT_SEMI ||
              join.join_type == duckdb::JoinType::RIGHT_ANTI) &&
             join.publishes_dynamic_filters() &&
             join.dynamic_filter_plan().multi_partition_enabled()) {
@@ -1736,8 +1706,8 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
 }
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
-//! chain (probe = children[0], build = children[1]) and bind the two inputs. The inner join of a
-//! RIGHT_DELIM_JOIN is sized from its build side even when it is right-family.
+//! chain (probe = children[0], build = children[1]) and bind the two inputs. A right-family hash
+//! join is sized from its probe side.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params,
                duckdb::SiriusContext* compressed_materialization_observer)
@@ -1747,11 +1717,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
   wrap_join_child(
     join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
-  bool probe_drives = false;
-  if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
-    auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
-  }
+  bool const probe_drives = join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN &&
+                            join_op.Cast<sirius::op::sirius_physical_hash_join>().is_right_family();
   bind_wrapped_join(join_op, probe_drives);
 }
 
@@ -1793,102 +1760,9 @@ void wrap_union(sirius::op::sirius_physical_operator& union_op)
   }
 }
 
-// Forward declaration: wrap_delim_join recurses into a DELIM JOIN's internal `join`/`distinct`
-// subtrees, which live outside `children[]`.
-void insert_gpu_pipeline_operators_recursive(
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-  const sirius::operator_params& op_params,
-  duckdb::ClientContext& context,
-  duckdb::SiriusContext* compressed_materialization_observer,
-  scan_contract_provenance const& contract_provenance);
-
-//! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
-//! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
-//! valid — moving a unique_ptr never relocates the object — and the fan-out wiring uses it.
-//! The propagation pass restores `distinct_root` in place, so this chain never carries a
-//! physical sidecar and its PARTITION needs no compressed-materialization observer.
-void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
-                         const sirius::operator_params& op_params)
-{
-  if (!delim_base.distinct_root) { return; }
-
-  auto original          = std::move(delim_base.distinct_root);
-  auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-
-  auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
-    original->types,
-    original->estimated_cardinality,
-    sirius::op::partition_spec{original_agg_ptr->get_output_grouping_indices(), {}, true});
-  auto* partition_ptr = partition.get();
-  partition->children.push_back(std::move(original));
-
-  auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-    original_agg_ptr, op_params.hash_partition_bytes);
-  // Bind the merge's input policy before converting the distinct fanout.
-  sirius::op::bind_partition_input(*merge, *partition_ptr);
-  merge->children.push_back(std::move(partition));
-
-  // Tag the chain top with the owning DELIM_JOIN so the tree-parent wiring redirects its
-  // output to each delim_scan's consumer pipeline instead of the DELIM_JOIN itself.
-  merge->set_owning_delim_join(&delim_base);
-
-  delim_base.distinct_root = std::move(merge);
-}
-
-//! Rewrite a DELIM JOIN's internal subtrees and wire the sibling pointers the operator needs
-//! at runtime (both the internal `join` and the distinct chain live in the tree):
-//!   - recurse into `delim->join` so its source/sink/join wraps fire — this plants the
-//!     CONCAT/PARTITION chain on the internal join's build side;
-//!   - recurse into the bare DISTINCT's children first, then wrap_delim_distinct above it,
-//!     so the chain wrap never re-visits the freshly-inserted wrappers;
-//!   - RIGHT_DELIM_JOIN: point `partition_join` at the freshly-inserted build-side PARTITION.
-void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                     const sirius::operator_params& op_params,
-                     duckdb::ClientContext& context,
-                     duckdb::SiriusContext* compressed_materialization_observer,
-                     scan_contract_provenance const& contract_provenance)
-{
-  auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
-
-  if (delim_base.join) {
-    insert_gpu_pipeline_operators_recursive(delim_base.join,
-                                            op_params,
-                                            context,
-                                            compressed_materialization_observer,
-                                            contract_provenance);
-  }
-  if (delim_base.distinct_root) {
-    // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
-    for (auto& child_slot : delim_base.distinct_root->children) {
-      insert_gpu_pipeline_operators_recursive(
-        child_slot, op_params, context, compressed_materialization_observer, contract_provenance);
-    }
-    wrap_delim_distinct(delim_base, op_params);
-  }
-
-  if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& right_delim = slot->Cast<sirius::op::sirius_physical_right_delim_join>();
-
-    auto* internal_join = delim_base.join.get();
-    if (internal_join && internal_join->children.size() >= 2) {
-      auto* build_child = internal_join->children[1].get();
-      if (build_child && build_child->type == sirius::op::SiriusPhysicalOperatorType::CONCAT &&
-          !build_child->children.empty()) {
-        auto* partition_build = build_child->children[0].get();
-        if (partition_build &&
-            partition_build->type == sirius::op::SiriusPhysicalOperatorType::PARTITION) {
-          right_delim.partition_join =
-            &partition_build->Cast<sirius::op::sirius_physical_partition>();
-        }
-      }
-    }
-  }
-}
-
 //! Post-order recursive walk over the plan tree: children are rewritten before the dispatch on
 //! `slot->type`, so freshly-inserted wrapper subtrees are never re-visited and no node can be
-//! double-wrapped. DELIM JOIN recurses into its internal `join`/`distinct` fields, which live
-//! outside `children[]`.
+//! double-wrapped.
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
@@ -1909,24 +1783,12 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
+    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN:
       replace_with_gpu_values(slot,
                               op_params.scan_task_batch_size == 0
                                 ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
                                 : op_params.scan_task_batch_size);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::DUMMY_SCAN: {
-      // A RIGHT_DELIM_JOIN build-placeholder DUMMY_SCAN carries no runtime data (the delim join
-      // fans its input directly to PARTITION_build), so a GPU_VALUES replacement would only
-      // materialize a phantom source; real DUMMY_SCANs are replaced.
-      auto& dummy = slot->Cast<sirius::op::sirius_physical_dummy_scan>();
-      if (!dummy.is_delim_join_placeholder()) {
-        replace_with_gpu_values(slot,
-                                op_params.scan_task_batch_size == 0
-                                  ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
-                                  : op_params.scan_task_batch_size);
-      }
-      break;
-    }
     case sirius::op::SiriusPhysicalOperatorType::WINDOW: {
       auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
       std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
@@ -1995,11 +1857,6 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
-    case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
-    case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
-      wrap_delim_join(
-        slot, op_params, context, compressed_materialization_observer, contract_provenance);
-      break;
     default: break;
   }
 }
@@ -2214,14 +2071,6 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   for (auto& child : op.children) {
     if (child) { set_parent_ops(*child, &op); }
   }
-  // DELIM JOIN keeps its internal `join`/`distinct_root` subtrees outside `children[]`;
-  // descend so their wrapped operators have tree parents for repository wiring.
-  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { set_parent_ops(*delim.join, &op); }
-    if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op); }
-  }
   // RESULT_COLLECTOR keeps its tree child in `plan` (a reference, outside `children[]`) —
   // it's the engine-injected root wrapper. Without descending, the wrapped sink's `_parent_op`
   // stays null and the wiring silently leaves the RESULT_COLLECTOR pipeline with no input
@@ -2245,10 +2094,8 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
 {
   using T = sirius::op::SiriusPhysicalOperatorType;
   switch (sink.type) {
-    // Joins and CTE/delim terminals have multiple inputs or bespoke sink wiring.
+    // Joins and CTE terminals have multiple inputs or bespoke sink wiring.
     case T::CTE:
-    case T::LEFT_DELIM_JOIN:
-    case T::RIGHT_DELIM_JOIN:
     case T::DENSE_COUNT_JOIN:
     case T::HASH_JOIN:
     case T::NESTED_LOOP_JOIN: return false;
@@ -2264,8 +2111,6 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
 //! Whether the path to the first downstream sink is unary, streaming, and safe to fuse.
 bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_operator& merge)
 {
-  // Delim-owned merges require sink wiring.
-  if (merge.owning_delim_join() != nullptr) { return false; }
   for (auto* cur = merge.get_parent_op(); cur != nullptr; cur = cur->get_parent_op()) {
     if (cur->is_sink()) { return terminal_sink_supports_fusion(*cur); }
     if (cur->is_source() || cur->children.size() != 1) { return false; }
@@ -2303,13 +2148,7 @@ void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   for (auto& child : op.children) {
     if (child) { mark_fusable_merge_pipelines(*child, fusion_enabled); }
   }
-  // Visit subtrees stored outside children[] as well.
-  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { mark_fusable_merge_pipelines(*delim.join, fusion_enabled); }
-    if (delim.distinct_root) { mark_fusable_merge_pipelines(*delim.distinct_root, fusion_enabled); }
-  }
+  // The result collector stores its subtree outside children[].
   if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     mark_fusable_merge_pipelines(op.Cast<sirius::op::sirius_physical_result_collector>().plan,
                                  fusion_enabled);
@@ -2329,10 +2168,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       ? *duckdb::query_operator_options(context)
       : sirius::operator_params::with_batch_size(sirius::config::derived_default_batch_size());
 
-  std::unordered_map<op::sirius_physical_operator*, plan_lineage> lineage_aliases;
   auto lineage_started = std::chrono::steady_clock::now();
-  collect_semantic_lineage(
-    *plan, contract_provenance.injections.lineage_unmodelled, lineage_aliases, context);
+  collect_semantic_lineage(*plan, contract_provenance.injections.lineage_unmodelled, context);
   contract_provenance.lineage_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                           std::chrono::steady_clock::now() - lineage_started)
                                           .count();
@@ -2383,9 +2220,35 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   }
 }
 
+namespace {
+
+bool has_delim_join(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) { return true; }
+  for (auto const& child : op.children) {
+    if (has_delim_join(*child)) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
+  // Sirius plans a correlated subquery only as the CTE DuckDB makes of it by default. With
+  // `delim_join_as_cte = false` (deprecated in DuckDB) a subquery DuckDB cannot flatten arrives as
+  // a delim join instead. Such a plan is declined here, before any pass reads it; every other
+  // plan runs under either value of the setting.
+  if (has_delim_join(*op)) {
+    constexpr auto message =
+      "the plan has a delim join, which Sirius does not run. It comes from a correlated subquery "
+      "planned with delim_join_as_cte = false; SET delim_join_as_cte = true (DuckDB's default) to "
+      "run the query on the GPU";
+    SIRIUS_LOG_WARN("Not running the query on the GPU: {}", message);
+    throw duckdb::NotImplementedException(message);
+  }
+
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Before binding resolution (DuckDB's own conversion is off in delim CTE plans): a MARK join
@@ -2565,7 +2428,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
     case duckdb::LogicalOperatorType::LOGICAL_ASOF_JOIN:
       throw duckdb::NotImplementedException("Asof join not supported");
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
       plan = create_plan(op.Cast<duckdb::LogicalComparisonJoin>());
       break;
@@ -2592,9 +2454,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       break;
     case duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET:
       plan = create_plan(op.Cast<duckdb::LogicalColumnDataGet>());
-      break;
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
-      plan = create_plan(op.Cast<duckdb::LogicalDelimGet>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXPRESSION_GET:
       plan = create_plan(op.Cast<duckdb::LogicalExpressionGet>());

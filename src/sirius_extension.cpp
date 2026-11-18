@@ -3687,7 +3687,7 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_delim_aggregate_reuse",
-                    "compute decorrelated subquery aggregates from the delim join's outer rows",
+                    "compute decorrelated subquery aggregates from the delim CTE's outer rows",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
                     SetEnableDelimAggregateReuse);

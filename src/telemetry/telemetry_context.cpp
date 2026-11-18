@@ -17,7 +17,6 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include "log/logging.hpp"
-#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_config.hpp"

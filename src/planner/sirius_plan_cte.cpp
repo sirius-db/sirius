@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -84,18 +82,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
     return create_plan(*op.children[1]);
   }
 
-  // Create the working_table that the PhysicalCTE will use for evaluation.
-  auto working_table =
-    duckdb::make_shared_ptr<duckdb::ColumnDataCollection>(context, op.children[0]->types);
-
-  // Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
-  recursive_cte_tables[op.table_index] = working_table;
+  // Register the CTE before planning its consumer: each CTE_REF of it adds its CTE_SCAN here.
   materialized_ctes[op.table_index] =
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
 
-  // Create the plan for the left side. This is the materialization.
+  // The definition, whose batches the CTE forwards to every scan's parent.
   auto left = create_plan(*op.children[0]);
-  // Initialize an empty vector to collect the scan operators.
+  // The consumer, which holds the CTE_SCANs.
   auto right = create_plan(*op.children[1]);
 
   // V2 uses materialized CTEs for correlated joins: parents need the consumer schema,
@@ -108,8 +101,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
                                                            std::move(left),
                                                            std::move(right),
                                                            op.estimated_cardinality);
-  cte->working_table = working_table;
-  // cte->working_table_gpu = working_table_gpu;
   cte->cte_scans = materialized_ctes[op.table_index];
 
   return std::move(cte);
