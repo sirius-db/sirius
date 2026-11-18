@@ -262,9 +262,10 @@ Every row the filter keeps has `x = y`, so the added join removes only rows the 
 **CPU fallback:** this rule and the next one edit DuckDB's own plan, which DuckDB also builds its CPU plan from. They therefore run only for a statement that can reach the GPU: GPU execution on, Sirius initialized, and a statement that returns rows (`INSERT ... SELECT`, `CREATE TABLE AS` and `COPY` are left alone). When Sirius then does not run a query a rule changed, the CPU gets the plan DuckDB makes alone:
 
 - If GPU planning turns the query down, `OnFinalizePrepare` asks DuckDB to plan the statement again (`ATTEMPT_TO_REBIND`), and the connection state records that it is re-planning for the CPU, which keeps both optimizer hooks out of that second pass.
-- If the GPU fails while running the query, `PhysicalSiriusExecution` plans the statement's SQL again under the internal-query guard and runs that plan. An `EXECUTE` of a prepared statement cannot be planned from its text, so it runs the CPU plan built from the rewritten plan, which returns the same rows.
+- A statement that returns rows but is not a `SELECT` is planned again the same way, since Sirius runs only `SELECT`s: `EXPLAIN ANALYZE`, and `INSERT`, `UPDATE` or `DELETE` with `RETURNING`.
+- If the GPU fails while running the query, `PhysicalSiriusExecution` plans the statement's SQL again under the internal-query guard and runs that plan. An `EXECUTE` of a prepared statement, or a statement with parameters, cannot be planned from its text, so it runs the CPU plan built from the rewritten plan, which returns the same rows. The plan made here lacks the Parquet footer statistics the pre-optimize hook adds.
 
-`transparent_execution_stats::fallback_replans` counts both. `EXPLAIN` shows the rewritten plan, since it describes what the GPU is given.
+`transparent_execution_stats::fallback_replans` counts all three. A plain `EXPLAIN` is the exception: it shows the rewritten plan, since it describes what the GPU is given and executes nothing.
 
 **Config:** `enable_subquery_key_carry` (default `true`, see [Configuration](configuration.md)).
 

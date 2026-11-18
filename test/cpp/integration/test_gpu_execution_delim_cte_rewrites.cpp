@@ -231,3 +231,37 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     CHECK(replans() == before + 1);
   }
 }
+
+// A statement that returns rows is rewritten like a query, but Sirius runs only SELECTs. One that
+// executes must run the plan DuckDB makes alone; a plain EXPLAIN keeps the rewritten plan.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a rewritten statement Sirius does not run is planned again",
+                 "[integration][gpu_execution][delim_cte_rewrites]")
+{
+  create_tables(*con);
+  auto const expected = cpu_rows(*con, twin);
+  run_ok("SET gpu_execution = true;");
+  auto replans = [&] {
+    return sirius::test::get_transparent_execution_stats(*con).fallback_replans;
+  };
+
+  auto before = replans();
+  run_ok("EXPLAIN ANALYZE " + twin + ";");
+  CHECK(replans() == before + 1);
+
+  run_ok("CREATE TABLE totals (pk INTEGER, pname VARCHAR, total HUGEINT);");
+  before        = replans();
+  auto inserted = con->Query("INSERT INTO totals " + twin + " RETURNING pk;");
+  REQUIRE(inserted);
+  if (inserted->HasError()) { UNSCOPED_INFO("insert failed: " << inserted->GetError()); }
+  REQUIRE_FALSE(inserted->HasError());
+  CHECK(inserted->RowCount() == expected.size());
+  CHECK(replans() == before + 1);
+
+  // Not planned again: a plain EXPLAIN, and a statement that returns no rows, which is never
+  // rewritten in the first place.
+  before = replans();
+  run_ok("EXPLAIN " + twin + ";");
+  run_ok("CREATE TABLE totals_copy AS " + twin + ";");
+  CHECK(replans() == before);
+}

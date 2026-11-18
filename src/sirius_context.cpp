@@ -2030,7 +2030,15 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     statement_type =
       prepared.physical_plan->Root().Cast<PhysicalExecute>().prepared->statement_type;
   }
-  if (statement_type != StatementType::SELECT_STATEMENT) { return RebindQueryInfo::DO_NOT_REBIND; }
+  if (statement_type != StatementType::SELECT_STATEMENT) {
+    // Sirius runs none of these. A plain EXPLAIN keeps a rewritten plan: it describes what the GPU
+    // is given and executes nothing. A statement that executes (EXPLAIN ANALYZE, DML with
+    // RETURNING, COPY) gets the plan DuckDB makes alone.
+    bool const plain_explain = statement_type == StatementType::EXPLAIN_STATEMENT &&
+                               !(prepared.physical_plan && prepared.physical_plan->Root().type ==
+                                                             PhysicalOperatorType::EXPLAIN_ANALYZE);
+    return plain_explain ? RebindQueryInfo::DO_NOT_REBIND : leave_to_duckdb();
+  }
   // From here on Sirius would run the query. An error, not a fallback: the CPU would answer
   // every query of the session without the user learning why.
   require_delim_join_as_cte(context);

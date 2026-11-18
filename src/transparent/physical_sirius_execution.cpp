@@ -137,7 +137,8 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
 
 // DuckDB's own CPU plan of @p sql, for a fallback whose stashed plan was built from a logical
 // plan the pre-optimize hook had rewritten for the GPU. The internal-query guard keeps that hook
-// out, so this is the plan DuckDB makes with GPU execution off.
+// out, so the plan has none of its rewrites. It also lacks the Parquet footer statistics the hook
+// gives every other plan, with GPU execution on or off.
 //
 // Returns null when @p sql cannot stand in for the statement: it is not one plain SELECT (an
 // EXECUTE of a prepared statement, for one), it has parameters, it fails to plan, or its result
