@@ -37,7 +37,8 @@ namespace sirius::transparent {
 
 namespace {
 
-/// Whether @p expr is DECIMAL `+`, `-`, `*` over columns, constants and widening DECIMAL casts.
+/// Whether @p expr is DECIMAL or DOUBLE `+`, `-`, `*` over columns, constants and widening DECIMAL
+/// casts.
 bool movable(duckdb::Expression const& expr)
 {
   switch (expr.GetExpressionClass()) {
@@ -62,9 +63,10 @@ bool movable(duckdb::Expression const& expr)
                  duckdb::DecimalType::GetWidth(source) - source_scale &&
                movable(child);
       }
-      auto const& name = function.Function().GetName().GetIdentifierName();
+      auto const& name  = function.Function().GetName().GetIdentifierName();
+      auto const result = function.GetReturnType().id();
       if ((name != "+" && name != "-" && name != "*") ||
-          function.GetReturnType().id() != duckdb::LogicalTypeId::DECIMAL) {
+          (result != duckdb::LogicalTypeId::DECIMAL && result != duckdb::LogicalTypeId::DOUBLE)) {
         return false;
       }
       return std::all_of(function.GetChildren().begin(),

@@ -73,7 +73,9 @@ struct pushdown_fixture {
                   "SELECT (i % 500)::BIGINT AS l_orderkey, (i % 37)::BIGINT AS l_partkey, (i % "
                   "7)::INTEGER AS l_linenumber, ((i % 50) + 1)::DECIMAL(15, 2) AS l_quantity, (i * "
                   "1.5)::DECIMAL(15, 2) AS l_extendedprice, ((i % 10) / 100.0)::DECIMAL(15, 2) AS "
-                  "l_discount, ((i % 8) / 100.0)::DECIMAL(15, 2) AS l_tax FROM range(4000) t(i)");
+                  "l_discount, ((i % 8) / 100.0)::DECIMAL(15, 2) AS l_tax, ((i % 50) + 1)::DOUBLE AS "
+                  "f_quantity, (i * 1.5)::DOUBLE AS f_extendedprice, ((i % 10) / 100.0)::DOUBLE AS "
+                  "f_discount, ((i % 8) / 100.0)::DOUBLE AS f_tax FROM range(4000) t(i)");
     parquet_table("orders",
                   "SELECT i::BIGINT AS o_orderkey, DATE '1995-01-01' + (i % 300)::INTEGER AS "
                   "o_orderdate, (i * 3.25)::DECIMAL(15, 2) AS o_totalprice FROM range(500) t(i)");
@@ -119,6 +121,9 @@ std::string yearly_sum(std::string const& amount,
 }
 
 constexpr char const* q9_amount = "l_extendedprice * (1 - l_discount) - l_tax * l_quantity";
+/// The same amount over the DOUBLE columns of a dataset without DECIMAL.
+constexpr char const* q9_amount_double =
+  "f_extendedprice * (1 - f_discount) - f_tax * f_quantity";
 
 }  // namespace
 
@@ -131,9 +136,19 @@ TEST_CASE_METHOD(pushdown_fixture,
   CHECK(moved == 1);
 }
 
+TEST_CASE_METHOD(pushdown_fixture,
+                 "a DOUBLE expression narrower than its inputs is computed below the inner join",
+                 "[planner][push_narrowing_expressions]")
+{
+  std::size_t moved = 0;
+  (void)rewritten(yearly_sum(q9_amount_double), moved);
+  CHECK(moved == 1);
+}
+
 TEST_CASE_METHOD(
   pushdown_fixture,
-  "expressions that would not narrow the rows, or are not DECIMAL arithmetic, stay above the join",
+  "expressions that would not narrow the rows, or are not DECIMAL or DOUBLE arithmetic, stay above "
+  "the join",
   "[planner][push_narrowing_expressions]")
 {
   struct variant {
