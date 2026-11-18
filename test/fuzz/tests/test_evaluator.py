@@ -838,6 +838,9 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(untagged.verdict, Verdict.RUNTIME_FALLBACK.value)
             self.assertEqual(wrong.verdict, Verdict.KNOWN_ISSUE.value)
             summary = report.finish()
+            # The known mismatch was compared; the two fallbacks were not.
+            self.assertEqual(summary["budget"]["compared"], 1)
+            self.assertEqual(summary["budget"]["lost_queries"]["known_issue"], 1)
             runtime = summary["gaps"]["runtime"]
             self.assertEqual(len(runtime), 1)
             self.assertEqual(runtime[0]["count"], 2)

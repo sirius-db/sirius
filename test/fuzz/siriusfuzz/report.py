@@ -22,6 +22,10 @@ from .artifacts import write_json
 from .config import FuzzConfig, FUZZ_DIR
 
 
+# Verdicts of a query whose CPU and GPU results were both produced and compared.
+_COMPARED_VERDICTS = ("ok", "mismatch", "tlp_mismatch", "variant_mismatch", "ambiguous")
+
+
 @dataclass
 class QueryRecord:
     worker: int
@@ -168,6 +172,7 @@ class Report:
         self.queries = 0
         self.generated = 0
         self.restart_queries = 0
+        self.compared = 0
         self.status = "complete"
         self.stop_reason = "budget completed"
         self.worker_context: dict[int, dict[str, Any]] = {}
@@ -200,13 +205,10 @@ class Report:
                 verdict = Verdict.KNOWN_ISSUE
                 break
         self.counts[rec.verdict] += 1
-        if rec.verdict not in (
-            "ok",
-            "mismatch",
-            "tlp_mismatch",
-            "variant_mismatch",
-            "ambiguous",
-        ):
+        # Judged as observed: a known mismatch still completed its comparison.
+        if observed.value in _COMPARED_VERDICTS:
+            self.compared += 1
+        else:
             bucket = rec.verdict
             self.loss_queries[bucket] += 1
             self.loss_seconds[bucket] += rec.elapsed_cpu + rec.elapsed_gpu
@@ -561,16 +563,7 @@ class Report:
             "tlp": dict(self.tlp_counts),
             "budget": {
                 "generated": self.generated,
-                "compared": sum(
-                    self.counts[k]
-                    for k in (
-                        "ok",
-                        "mismatch",
-                        "tlp_mismatch",
-                        "variant_mismatch",
-                        "ambiguous",
-                    )
-                ),
+                "compared": self.compared,
                 "lost_queries": {
                     **self.loss_queries,
                     "interrupted": max(0, self.generated - self.queries),
