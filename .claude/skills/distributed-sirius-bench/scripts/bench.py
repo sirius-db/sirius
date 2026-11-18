@@ -17,6 +17,7 @@ scripts and SQL, the client output and the reports. Steps, in order:
   smoke     --out DIR   a few queries once each, with pass/fail checks
   full      --out DIR   the benchmark queries, --runs times each
   report    --out DIR   print the results again; also works while a run is in progress
+  check     --out DIR   compare the answers of a TPC-H run with expected answers
 
 Steps that use nodes ask for confirmation at a terminal. Without a terminal they need --yes,
 which an agent passes only after the user has approved that step. Standard library only.
@@ -195,6 +196,11 @@ def with_gds(text, gds):
     return "\n".join(lines) + "\n"
 
 
+def on_site(recorded):
+    run = recorded.get("accel_etl_run")
+    return f"accel-etl run {run}" if run else "not on accel-etl"
+
+
 def reference_runs():
     doc = json.loads(REFERENCE.read_text())
     return doc["defaults"], doc["runs"]
@@ -208,8 +214,8 @@ def cmd_reference(_args):
     for name, run in sorted(runs.items(), key=lambda item: natural(item[0])):
         recorded = run["recorded"]
         print(
-            f"  {name:16s} SF{run['sf']:7s} {run['scans']:9s} {run['nodes']} node(s) "
-            f"{recorded['total_s']:8.1f} s   accel-etl run {recorded['accel_etl_run']}"
+            f"  {name:22s} SF{run['sf']:7s} {run['scans']:9s} {run['nodes']} node(s) "
+            f"{recorded['total_s']:8.1f} s   {on_site(recorded)}"
         )
     print("Set one up with: plan --reference NAME --data ... --checkout ... --out ...")
 
@@ -475,7 +481,7 @@ def show(plan):
                     "reference",
                     f"{reference['name']}: {reference['recorded']['total_s']} s recorded "
                     f"({reference['recorded']['total_of']}), "
-                    f"accel-etl run {reference['recorded']['accel_etl_run']}",
+                    f"{on_site(reference['recorded'])}",
                 ),
                 ("its dataset", reference["dataset"]),
             ]
@@ -580,10 +586,10 @@ def cmd_show(args):
 # ---------------------------------------------------------------------------- nodes
 
 
-def node_sh(plan, script, node=None):
+def node_sh(plan, script, node=None, minutes=5):
     """Runs a shell snippet where the nodes' file systems are visible."""
     if plan["launcher"] == "slurm":
-        cmd = ["srun", "-N1", "-n1", "--time=5"]
+        cmd = ["srun", "-N1", "-n1", f"--time={minutes}"]
         if plan["partition"]:
             cmd += ["-p", plan["partition"]]
         if node:
@@ -1430,7 +1436,7 @@ def report(plan, kind):
         lines += [
             "",
             f"Recorded for {reference['name']}: **{recorded['total_s']} s** "
-            f"({recorded['total_of']}), accel-etl run {recorded['accel_etl_run']}. "
+            f"({recorded['total_of']}), {on_site(recorded)}. "
             "Compare it with the best total of this run.",
         ]
     lines += [
@@ -1447,9 +1453,18 @@ def report(plan, kind):
             + ("; ".join(f"{k} ({v})" for k, v in logs[0].items()) or "none logged")
         )
         lines.append(f"- GDS held-read lines in the rank logs: {logs[1]}")
-    lines.append(
-        '- Answers were not compared with a reference: see SKILL.md, "Check the answers".'
-    )
+    check = run_dir / "check"
+    if (check / "rc").is_file():
+        same = (check / "rc").read_text().strip() == "0"
+        lines.append(
+            f"- Answers compared with {(check / 'source').read_text().strip()}: "
+            + ("all match" if same else "DIFFERENCES or missing answers")
+            + f". See `{check}/result.txt`"
+        )
+    else:
+        lines.append(
+            '- Answers were not compared with a reference: see SKILL.md, "Check the answers".'
+        )
     if problems:
         lines += ["", "## Problems", *[f"- {p}" for p in problems]]
     text = "\n".join(lines) + "\n"
@@ -1470,6 +1485,196 @@ def cmd_report(args):
         die("nothing has run yet in this folder")
     for kind in kinds:
         report(plan, kind)
+
+
+# ---------------------------------------------------------------------------- answers
+
+TPCH_TIES = ["3:revenue,o_orderdate", "18:o_totalprice,o_orderdate"]
+# Run on the node by `check` for --results parquet, before the comparison.
+ALIGN = r'''#!/usr/bin/env python3
+"""Written by bench.py check. In a Parquet answer an integer sum can come back as a DOUBLE and
+print as 123.0. Where the reference column holds only integers, this prints the run's whole
+numbers the same way, so that scripts/compare_answers.py compares them as integers."""
+import csv
+import io
+import re
+import sys
+
+
+def blocks(lines):
+    """{(query, run): (first, end)}: the lines of each answer, header first."""
+    found, current, state, first = {}, None, None, 0
+    for i, line in enumerate(lines):
+        marker = re.fullmatch(r'"?Q(\d+) run (\d+)"?', line.strip())
+        if marker:
+            current, state = (int(marker.group(1)), int(marker.group(2))), "marker"
+        elif current and line.startswith("Run Time (s): real"):
+            if state == "marker":
+                state, first = "body", i + 1
+            else:
+                found[current], current = (first, i), None
+    return found
+
+
+def rows(lines):
+    return [row for row in csv.reader(io.StringIO("\n".join(lines))) if row]
+
+
+def read(path):
+    with open(path, encoding="utf-8", errors="replace") as file:
+        return file.read().splitlines()
+
+
+client, kind, ref = sys.argv[1:4]
+lines = read(client)
+ref_lines = read(ref) if kind == "--ref-client" else []
+ref_blocks = blocks(ref_lines)
+changed = 0
+for (query, _), (first, end) in sorted(blocks(lines).items(), key=lambda b: -b[1][0]):
+    if kind == "--ref-client":
+        a, b = ref_blocks.get((query, 1), (0, 0))
+        want = rows(ref_lines[a:b])[1:]
+    else:
+        try:
+            want = rows(read(f"{ref}/q{query:02d}.csv"))[1:]
+        except OSError:
+            want = []
+    got = rows(lines[first:end])
+    width = len(got[0]) if got else 0
+    if len(got) < 2 or not want or any(len(row) != width for row in got + want):
+        continue
+    whole = [
+        j
+        for j in range(width)
+        if all(re.fullmatch(r"-?\d+", row[j]) for row in want)
+        and all(re.fullmatch(r"-?\d+(\.0+)?", row[j]) for row in got[1:])
+    ]
+    text = io.StringIO()
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(got[0])
+    for row in got[1:]:
+        writer.writerow(
+            [re.sub(r"\.0+$", "", cell) if j in whole else cell for j, cell in enumerate(row)]
+        )
+    new = text.getvalue().splitlines()
+    if new != lines[first:end]:
+        lines[first:end] = new
+        changed += 1
+with open(client, "w", encoding="utf-8") as file:
+    file.write("\n".join(lines) + "\n")
+print(f"whole numbers printed as integers in {changed} answer(s)", file=sys.stderr)
+'''
+
+
+def cmd_check(args):
+    """Compares a finished run's answers with expected ones, through the checkout's own tool."""
+    plan = load(args.out)
+    out = Path(plan["out"])
+    if plan["benchmark"] != "tpch":
+        die(
+            "`check` is for TPC-H runs: for another query set, run "
+            "<checkout>/scripts/compare_answers.py on the client output yourself"
+        )
+    if bool(args.expected) == bool(args.ref_client):
+        die("give one of --expected and --ref-client")
+    kind = args.kind or ("full" if (out / "full" / "rc").is_file() else "smoke")
+    run_dir = out / kind
+    if not (run_dir / "rc").is_file():
+        die(f"no finished {kind} run in {out}")
+    meta = json.loads((run_dir / "meta.json").read_text())
+    parts, big = meta.get("parts", [""]), Path(meta["big"])
+    groups = plan["sessions"] if len(parts) > 1 or parts[0] else [meta["queries"]]
+    check = run_dir / "check"
+    if check.exists():
+        shutil.rmtree(check)
+    check.mkdir()
+    o = q(str(check))
+    duckdb = "pixi run gateway/build/release/duckdb -unsigned -no-agent"
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Generated by bench.py check: one client output with every session's answers, the",
+        "# expected answers as one CSV file per query, then scripts/compare_answers.py.",
+        "set -uo pipefail",
+        PIXI_PATH,
+        *[
+            f"export {key}={q(value)}"
+            for key, value in sorted(plan["env"].items())
+            if key.startswith("PIXI_")
+        ],
+        f"cd {q(plan['checkout'])} || exit 1",
+    ]
+    if plan.get("results") == "parquet":
+        # Read back, an answer file looks to the tool like the client's output of that query.
+        sql = [".mode csv", ".timer on"]
+        for name, group in zip(parts, groups):
+            answers = str(big / name / "answers").replace("'", "''")
+            for qid in group:
+                for run in range(1, meta["runs"] + 1):
+                    sql += [
+                        f"SELECT '{qid} run {run}' AS marker;",
+                        f"FROM read_parquet('{answers}/{qid}-run{run}.parquet');",
+                    ]
+        (check / "answers.sql").write_text("\n".join(sql) + "\n")
+        lines.append(f"{duckdb} < {o}/answers.sql > {o}/client.txt 2>&1")
+    else:
+        clients = " ".join(q(str(big / name / "client.txt")) for name in parts)
+        lines.append(f"cat {clients} > {o}/client.txt")
+    if args.expected:
+        # Only the queries of this run: the tool counts a reference without an answer as not run.
+        e = q(args.expected.rstrip("/"))
+        lines += [f"mkdir {o}/expected", f": > {o}/expected.sql"]
+        for n in sorted({int(qid[1:]) for qid in meta["queries"]}):
+            stem, target = args.pattern.format(n=n), f"{o}/expected/q{n:02d}.csv"
+            lines += [
+                f"if [ -f {e}/{stem}.parquet ]; then",
+                f"  echo \"COPY (FROM read_parquet('{e}/{stem}.parquet')) TO '{target}' (FORMAT csv, HEADER);\" >> {o}/expected.sql",
+                f"elif [ -f {e}/{stem}.csv ]; then",
+                f"  cp {e}/{stem}.csv {target}",
+                "fi",
+            ]
+        lines.append(
+            f"[ ! -s {o}/expected.sql ] || {duckdb} -bail < {o}/expected.sql > {o}/expected.out 2>&1 "
+            f"|| {{ cat {o}/expected.out; exit 2; }}"
+        )
+        reference = f"--ref-dir {o}/expected --ref-pattern 'q{{n:02d}}.csv'"
+        source = f"the expected answers in {args.expected}"
+    else:
+        reference = f"--ref-client {q(args.ref_client)}"
+        source = f"the reference output {args.ref_client}"
+    ties = " ".join(f"--ties {tie}" for tie in TPCH_TIES)
+    if plan.get("results") == "parquet":
+        (check / "align.py").write_text(ALIGN)
+        lines.append(
+            f"python3 {o}/align.py {o}/client.txt "
+            + (f"--ref-dir {o}/expected" if args.expected else reference)
+        )
+    lines += [
+        f"python3 scripts/compare_answers.py {o}/client.txt {reference} {ties} > {o}/result.txt 2>&1",
+        "rc=$?",
+        f"cat {o}/result.txt",
+        "exit $rc",
+    ]
+    script = check / "check.sh"
+    script.write_text("\n".join(lines) + "\n")
+    (check / "source").write_text(source + "\n")
+    slurm = plan["launcher"] == "slurm"
+    confirm(
+        args,
+        f"Compare the answers of the {kind} run with {source}"
+        + (", in a short step on a node without a GPU" if slurm else ""),
+    )
+    result = node_sh(
+        plan, f"bash {q(str(script))}", (plan["nodes"] or [None])[0], minutes=30
+    )
+    print(result.stdout, end="")
+    if result.returncode not in (0, 1) or not (check / "result.txt").is_file():
+        die(f"the comparison did not run: {result.stderr.strip()[-400:]}")
+    (check / "rc").write_text(f"{result.returncode}\n")
+    say(
+        ("the answers match" if result.returncode == 0 else "the answers DIFFER")
+        + f": {check}/result.txt. `report` now says so in summary.md"
+    )
+    sys.exit(result.returncode)
 
 
 # ---------------------------------------------------------------------------- command line
@@ -1646,12 +1851,33 @@ def main():
         ("smoke", lambda a: cmd_run(a, "smoke"), "run the smoke test"),
         ("full", lambda a: cmd_run(a, "full"), "run the full benchmark"),
         ("report", cmd_report, "print the results"),
+        ("check", cmd_check, "compare the answers with expected answers"),
     ]:
         step = sub.add_parser(name, help=text)
         step.add_argument("--out", required=True, help="the run folder given to `plan`")
-        if name in ("preflight", "build", "smoke", "full"):
+        if name in ("preflight", "build", "smoke", "full", "check"):
             step.add_argument(
                 "--yes", action="store_true", help="the user has approved this step"
+            )
+        if name == "check":
+            step.add_argument(
+                "--expected",
+                help="folder with one expected answer per query, Parquet or CSV with a header",
+            )
+            step.add_argument(
+                "--pattern",
+                default="q{n:02d}",
+                help="file name of a query's expected answer, without its extension (default q{n:02d})",
+            )
+            step.add_argument(
+                "--ref-client",
+                help="instead of --expected: a client output with the same markers, such as "
+                "the same run.sql through another engine",
+            )
+            step.add_argument(
+                "--kind",
+                choices=["smoke", "full"],
+                help="which run to check (default: the full run if there is one)",
             )
         if name in ("build", "smoke", "full"):
             step.add_argument(

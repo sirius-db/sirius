@@ -40,6 +40,41 @@
       "sf": "100000",
       "statement_timeout": 900
     },
+    "sf100k-n1-gds-35f5573": {
+      "commit": "35f5573dd3e3dfe6e8d6148b68b0715fb9a096dc",
+      "config": "ref-gb200-sf100k-35f5573",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 24,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 1,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": null,
+        "date": "2026-11-18",
+        "note": "Measured on a local commit with the source of 35f5573d apart from log levels, formatting and two unit tests. Not on accel-etl. Q9 took 179.3 s in this pass and 122.0 s alone 50 minutes earlier on the same node.",
+        "pass_totals_s": [
+          1494.636
+        ],
+        "total_of": "one run of each query",
+        "total_s": 1494.6
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "gds",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
     "sf100k-n1-uring": {
       "commit": "93893ebab1df15f64b539e64508c418bdec52680",
       "config": "ref-gb200-sf100k",
@@ -367,6 +402,36 @@
         ],
         "total_of": "the faster of the two runs of each query",
         "total_s": 321.7
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n1-gds-35f5573": {
+      "commit": "35f5573dd3e3dfe6e8d6148b68b0715fb9a096dc",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 35,
+        "num_threads": 16,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 1,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": null,
+        "date": "2026-11-18",
+        "note": "Measured on a local commit with the source of 35f5573d apart from log levels, formatting and two unit tests. Not on accel-etl.",
+        "pass_totals_s": [
+          346.963,
+          319.81
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 319.7
       },
       "runs": 2,
       "scans": "gds",

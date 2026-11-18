@@ -94,8 +94,10 @@ never to a compute node). The skill folder and the run folder must be visible fr
 `bench.py reference` lists the 18 runs of the
 [Reference numbers](../../../docs/super-sirius/distributed-experiments.md#reference-numbers)
 table: `sf10k`, `sf30k` or `sf100k`, on `n1`, `n2` or `n4` nodes, with `gds` or `uring` (io_uring)
-scans. `plan --reference <name>` takes what made that number from the run's record in
-`reference/runs.json`, so ask the user only for the site inputs:
+scans. It also lists the two one-node GDS runs of that file's "One node since the join-side
+commits" section, `sf30k-n1-gds-35f5573` and `sf100k-n1-gds-35f5573`. `plan --reference <name>`
+takes what made that number from the run's record in `reference/runs.json`, so ask the user only
+for the site inputs:
 
 ```bash
 python3 <this folder>/scripts/bench.py plan --reference sf30k-n2-gds --data ... --checkout ... \
@@ -104,7 +106,7 @@ python3 <this folder>/scripts/bench.py plan --reference sf30k-n2-gds --data ... 
 
 | From the record | What the plan gets |
 |---|---|
-| Commit | `--commit`: `147b0f3` for SF10000 and for SF30000 on one node, `93893eb` for the other runs. Give a checkout that is at it, or a new folder to clone into |
+| Commit | `--commit`: `147b0f3` for SF10000 and for SF30000 on one node, `93893eb` for the other runs of the table, `35f5573d` for the two `-35f5573` runs. Give a checkout that is at it, or a new folder to clone into |
 | Config | A `ref-gb200-*` preset, plus the run's GDS threads and rate cap per rank for a GDS run |
 | Environment | `SIRIUS_GDS=1` and the UCX settings of the `ref-gb200-*.env` files, for io_uring runs too. `UCX_NET_DEVICES=bond0` is that cluster's; elsewhere give `--env UCX_NET_DEVICES=...` |
 | SQL | `SET parquet_footer_statistics = true` first. SF30000 and SF100000 use the query texts in `queries/tpch-standard` (the standard parameters), SF10000 the checkout's `orig` folder |
@@ -219,15 +221,30 @@ path of each pair of ranks (on GB200 NVL it should read `NIXL over the NVLink fa
 on shared storage differ by around ten percent between days and nodes, so do not call a smaller
 difference a change.
 
-**Check the answers.** Times mean little if the answers are wrong, and the script does not compare
-them. With a reference for the same data and the same query texts, use the branch's own tool:
+**Check the answers.** Times mean little if the answers are wrong, and `smoke` and `full` do not
+compare them. With a reference for the same data and the same query texts, `check` does:
 
 ```bash
-python3 <checkout>/scripts/compare_answers.py <client.txt> --ref-client <reference client output> \
-  --ties 3:revenue,o_orderdate --ties 18:o_totalprice,o_orderdate
+python3 .../bench.py check --out <run folder> --expected <folder> --yes
+python3 .../bench.py check --out <run folder> --ref-client <reference client output> --yes
 ```
 
-The reference can be the same `run.sql` (without its last line) run through the build's plain
+- `--expected` is a folder with one answer per query, `q01.parquet` or `q01.csv` (CSV with a
+  header); `--pattern` gives another file name. `--ref-client` is a client output with the same
+  markers.
+- It runs the checkout's `scripts/compare_answers.py` in a short step on a node, without a GPU:
+  rows in any order, numbers within 1e-6, and a LIMIT tie in Q3 or Q18 counts as a match. With
+  `--results parquet` it reads the answer files; an integer sum can be a DOUBLE there, so whole
+  numbers are printed as integers where the reference column holds integers, and the "seconds"
+  of its table are the time to read the file, not the query's. It checks the full run, or the
+  smoke run if there is no full run (`--kind`).
+- The result is in `<run folder>/<kind>/check/result.txt`, and `report` then says in
+  `summary.md` whether the answers match. `check` exits 1 if one differs.
+- Answers depend on the query parameters: expected answers for the standard TPC-H parameters fit
+  the texts in `queries/tpch-standard` (the SF30000 and SF100000 reference runs), not the `orig`
+  texts of the SF10000 reference runs.
+
+A reference can also be the same `run.sql` (without its last line) run through the build's plain
 DuckDB on the CPU; at SF10000 that needs about 15 minutes and 1 TB of memory, so run it as its own
 job and ask first. If no reference exists, say in the report that the answers were not checked.
 
@@ -242,6 +259,7 @@ job and ask first. If no reference exists, say in the report that the answers we
 | Fewer ranks `up,ready` than expected | A rank died during the run: its log under `rank-logs/` |
 | `supplier has ... rows` | The dataset is not the scale factor the user gave. Ask which is right |
 | `sbatch failed`, or a job that never starts | The site needs other options: ask the user and pass them with `--sbatch-args` |
+| `check` prints `NO REFERENCE` for a query | The expected folder has no `q<nn>.parquet` or `q<nn>.csv` for it: give `--pattern` |
 | Times far slower than expected | CPUs per rank (`scontrol show job <id>`), storage stalls, the exchange path |
 
 ## Rules that come from the cluster, not from this skill
@@ -267,15 +285,19 @@ job and ask first. If no reference exists, say in the report that the answers we
     two.
   - On one node, a smoke test and a full run of two sessions (Q1, then Q6) with
     `--results parquet`.
+  - `check` against expected answers in Parquet, with the texts of `queries/tpch-standard`: a
+    smoke test with CSV results, and a smoke test and a two-session full run with Parquet
+    results. Q1, Q6 and Q12 matched in each.
   - Earlier that day, the smoke test of the `gb200-sf10000` preset on one node.
-- **Checked with `--dry-run` only:** the 18 reference runs as a whole. For each, the script wrote
+- **Checked with `--dry-run` only:** the 20 reference runs as a whole. For each, the script wrote
   the config, the SQL statements and their order, the statement timeout, the commit, the rank
   count and the environment, and they equal the files of the recorded run.
 - **Tested only against stand-ins** for Slurm and for the client: a full benchmark of 22 queries,
   failure detection, a build from a fresh clone, and custom datasets (tables found
   automatically, a views file, queries chosen by name and by number).
 - **Not run at all:** four nodes, the `local` launcher, any GDS run through this script, a run at
-  SF30000 or SF100000, `--order pass`, a new clone at `--commit`, and `--results parquet` where
+  SF30000 or SF100000, `--order pass`, a new clone at `--commit`, `check` on all 22 queries or
+  with `--ref-client` on nodes, and `--results parquet` where
   Slurm confines a step to its CPUs (the client step asks for one CPU, and fetching a large
   result needs more).
 

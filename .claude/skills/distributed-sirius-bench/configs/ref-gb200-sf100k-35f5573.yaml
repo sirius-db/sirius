@@ -1,0 +1,20 @@
+# GB200 nodes, 4 GPUs each. The config of the SF100000 run since commit 35f5573d of the Reference numbers table
+# (docs/super-sirius/distributed-experiments.md). Use it through `plan --reference <run>`, which
+# adds the GDS scan settings of a GDS run; as written here the scans go through io_uring.
+# ref-gb200-sf100k without enable_build_side_swap, which that commit removed.
+sirius:
+  memory:
+    host: { capacity_bytes: 180Gi }
+    disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "@SPILL@" }
+  executor:
+    scan_manager:
+      num_threads: 32
+      uring_n_reactors: 4
+      cache: { mode: none }
+  operator_params:
+    max_dynamic_filter_bloom_bytes_per_gpu: 8Gi
+    max_build_probe_resident_bytes: 64Gi
+    max_build_hash_table_bytes: 64Gi
+    enable_complete_group_having: true
+    enable_narrowing_expression_pushdown: true
+  compression: { enable_spill_compression: true }
