@@ -1299,7 +1299,7 @@ class QueryGenerator:
         if scope.outer is None:
             return None
         sq = self.f.subqueries
-        # 7d92beaa: correlated IN commonly becomes a mixed null-safe/plain MARK
+        # Correlated IN commonly becomes a mixed null-safe/plain MARK
         # join. Keep it in the default sample, but spend most queries elsewhere.
         if mode == "in" and self.rng.random() >= sq.correlated_in_share:
             return None
@@ -1748,7 +1748,7 @@ class QueryGenerator:
         }
         src_kinds = list(sources.get(kind, []))
         if kind == "int" and not self.f.casts.float_to_int:
-            # 83b0c0ed: one-expression FLOAT -> BIGINT differs on negative half values.
+            # #2152: one-expression FLOAT -> BIGINT differs on negative half values.
             src_kinds.remove("float")
         if self.f.casts.temporal_numeric and kind in ("int", "float"):
             src_kinds += ["date", "timestamp"]
@@ -2237,7 +2237,7 @@ class QueryGenerator:
 
     def _minmax_arg(self, kind: str, scope: Scope, depth: int) -> Expr:
         arg = self._gen_expr(kind, scope, depth)
-        # c6aae63a: finite input can still yield NaN through 0.0/0.0; GPU MIN/MAX
+        # #2085/#2592: finite input can still yield NaN through 0.0/0.0; GPU MIN/MAX
         # orders that NaN differently from DuckDB. Preserve this shape in gaps mode.
         if any(
             isinstance(node, Arith) and node.op == "/" and node.kind == "float"

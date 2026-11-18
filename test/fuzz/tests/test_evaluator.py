@@ -81,6 +81,46 @@ class FakeSession:
         return self.gpu_behaviour(sql, cols, cpu_rows, self)
 
 
+class TlpCheck(unittest.TestCase):
+    """The partition check on a query whose base comparison already passed."""
+
+    def check(self, gpu_behaviour):
+        from siriusfuzz.schema_gen import Column, Dataset, Table
+
+        cfg = load_config(None, ["oracle.tlp_share=1.0"])
+        ev = Evaluator(cfg, FakeSession(gpu_behaviour), lambda m: None)
+        table = Table("t0", [Column("k", st.INTEGER), Column("c0_i", st.INTEGER)])
+        ev.set_dataset(Dataset([table], 0), "main")
+        col = ColumnRef("a0", "c0_i", st.INTEGER)
+        query = Select([SelectItem(col, "c0")], TableRef("t0", "a0"))
+        cols = [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)]
+        rec = QueryRecord(0, "d", 0, query.sql(), Verdict.OK.value)
+        ev._check_tlp(rec, query, ResultSet(cols, [(1, 1.5), (2, 2.5)]))
+        return rec
+
+    def test_partitions_that_add_up_keep_ok(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows) if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part))
+
+        rec = self.check(gpu)
+        self.assertEqual(rec.verdict, Verdict.OK.value)
+        self.assertTrue(rec.tlp["checked"])
+
+    def test_lost_row_is_a_tlp_mismatch(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows)[:1] if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part))
+
+        self.assertEqual(self.check(gpu).verdict, Verdict.TLP_MISMATCH.value)
+
+    def test_declined_partition_leaves_the_verdict_alone(self):
+        rec = self.check(gpu_plan_fallback)
+        self.assertEqual(rec.verdict, Verdict.OK.value)
+        self.assertFalse(rec.tlp["checked"])
+        self.assertEqual(rec.tlp["partition_status"], "error")
+
+
 def gpu_ok(sql, cols, rows, s):
     return RunResult("ok", ResultSet(cols, list(rows)))
 

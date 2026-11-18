@@ -29,7 +29,7 @@ struct = false
 [features]
 window_functions = true
 window_gaps = false
-window_cast_tiebreaks = true  # admitted after GB300 window campaign: 118/121 tagged queries OK
+window_cast_tiebreaks = true  # cast order keys for unsigned and narrow DECIMAL columns
 float_exact_keys = false
 distinct = true
 grouping_sets = true
@@ -94,7 +94,7 @@ enabled = ["add", "sub", "mul", "div", "int_div", "mod",
            "date_trunc", "upper", "round", "date_arith"]
 gap_enabled = []       # lower/abs/unary minus await the 95% admission gate
 variable_divisors = false  # avoid CPU division-by-zero skips in default runs
-regexp_backreferences = false  # 0fca855a: repeated match backreference differs on GPU
+regexp_backreferences = false  # #2650: repeated match backreference differs on GPU
 join_neighbours = false
 window_args = false
 date_trunc_units = ["day", "hour", "minute", "second"]  # year/quarter/month/week fall back
@@ -115,7 +115,7 @@ try = false
 [features.casts]
 enabled = true
 temporal_numeric = false  # declined in translate_cast
-float_to_int = false      # 83b0c0ed: FLOAT -> BIGINT rounds negative half values differently
+float_to_int = false      # #2152: FLOAT -> BIGINT rounds negative half values differently
 integer_narrowing = false
 integer_sign_change = false
 integer_out_of_range = false  # gaps: unchecked overflow and signed-to-unsigned casts

@@ -13,7 +13,7 @@ verdicts = ["runtime_fallback"]
 [[issue]]
 pattern = "^MARK join mixing a null-safe \\(IS NOT DISTINCT FROM\\) key with a plain key not supported in GPU$"
 issue = "sirius-db/sirius#1886"
-note = "7d92beaa: correlated IN becomes a MARK join with mixed null-safe and plain keys"
+note = "correlated IN becomes a MARK join with mixed null-safe and plain keys"
 verdicts = ["plan_fallback"]
 
 [[issue]]

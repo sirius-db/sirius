@@ -8,6 +8,16 @@ on DuckDB CPU and strict Sirius GPU. It reports `still differs`, `now matches`,
 whether that family's quarantine can be removed. Dataset-dependent failures are
 listed in [the corpus README](corpus/README.md).
 
+`fuzz corpus` exits 1 unless every file still differs. A file that starts
+matching means the engine fix landed: remove the file and lift its switch.
+
+`oracle.tlp_share` (default 0.1) adds a GPU-only check to that share of plain
+SELECT queries whose CPU comparison passed: the query is rerun under an integer
+predicate, its negation, and its IS NULL form, and the three results together
+must equal the original. A difference is a `tlp_mismatch`. A partition the GPU
+declines or fails leaves the query's verdict unchanged and is counted as
+`partition_failed` in the summary.
+
 Every campaign writes a coverage and budget table to `summary.txt`, machine-readable
 `coverage`, `accounting`, and `budget` sections to `summary.json`, and one row to
 `yield.jsonl` in the output root. Run `pixi run fuzz coverage-check <run-dir>`
@@ -28,7 +38,7 @@ is run manually; it is not installed in a scheduler.
 | `data.edge_values.nan_inf`, `features.aggregates.float_division_minmax` | nonfinite MIN/MAX inputs, including computed NaN | #2085, #2592 | `2085-nan-grouped-minmax.sql`, `2592-nan-ungrouped-max.sql` |
 | `data.edge_values.unicode_case` | Unicode case mappings | #2598 | `2598-unicode-case.sql` |
 | `data.edge_values.date_beyond_ns` | DATE values outside the nanosecond timestamp range (years 1 and 9999) | #2631 | `2631-date-trunc-far-date.sql` |
-| `features.scalar_functions.regexp_backreferences` | repeated match backreferences after multibyte text | unfiled `0fca855a` | `0fca855a-regex-backreference.sql` |
+| `features.scalar_functions.regexp_backreferences` | repeated match backreferences after multibyte text | #2650 | `2650-regex-backreference.sql` |
 
 The filtered MIN (#2593), floating AVG (#2591), and EXCEPT ALL/TopN (#2596)
 families have no dedicated generation quarantine; their saved reproducer or
@@ -201,8 +211,8 @@ Negated subqueries are counted separately as `subquery:not_in` and
 `subquery:not_exists`.
 The join switches `any_join`, `any_mixed`, `self_join`, `grouped_inputs`, `expression_keys`,
 and `on_filters` add those shapes when enabled. `any_mixed` and `on_filters` are
-gaps-only because mixed arithmetic ANY joins can hit GPU AST type error
-`5a54110e` and outer ON filters can hit an arbitrary-join planner decline.
+gaps-only because mixed arithmetic ANY joins can hit a GPU AST type error
+(#2153) and outer ON filters can hit an arbitrary-join planner decline.
 `max_tables` permits rare five
 and six table chains, and `star_share` chooses joins back to the first table.
 Four-or-more-table chains use semi/anti joins on `k` and no fact table: default
@@ -212,7 +222,7 @@ condition, so a focused acceptance run can collect enough samples.
 `self_join_share` similarly controls explicit self joins. Grouped joins carry
 `join:grouped_g` or `join:grouped_agg` for their exact join key.
 `aggregates.float_division_minmax` is gaps-only: finite inputs can produce NaN
-through division, and signature `c6aae63a` shows divergent MIN/MAX results.
+through division, and GPU MIN/MAX then differ from DuckDB (#2085, #2592).
 Each `queries.jsonl` record includes `generator_tags`, allowing per-shape
 verdict and fallback rates to be counted without inferring them from SQL text.
 
@@ -229,7 +239,8 @@ variants on about half the compared queries.
 
 `known_issues.toml` quarantines confirmed divergences by regex; every entry carries an issue link.
 
-**Phase 2b SQL shapes.** `features.window_functions` generates whole-partition `sum`, `avg`,
+**Window functions, aggregate filters and set operations.**
+`features.window_functions` generates whole-partition `sum`, `avg`,
 `count`, `min`, and `max`; ordered `rank`, `dense_rank`, and `row_number`; and running
 `sum`, `count`, `min`, and `max` with an explicit unbounded-preceding ROWS frame. It also
 generates multiple window specifications and a derived-table top-N-per-group filter. These
@@ -248,9 +259,9 @@ grouping, and window keys. `features.float_exact_keys` restores those shapes in 
 the known last-bit rounding issue stays measurable. `EXCEPT ALL` and `INTERSECT ALL` exclude
 floating-point keys because Sirius does not admit those keys for the `ALL` forms.
 
-**Phase 2c cast quarantine.** `features.casts.float_to_int` is off by default and on in gaps mode. A one-expression `CAST(FLOAT AS BIGINT)` check differs at negative half values (signature `83b0c0ed`), so default runs do not emit those casts.
+**Float-to-integer casts.** `features.casts.float_to_int` is off by default and on in gaps mode. A one-expression `CAST(FLOAT AS BIGINT)` check differs at negative half values (#2152), so default runs do not emit those casts.
 
-**Phase 2c expressions and data.** The scalar function list includes `upper`,
+**Expressions and edge-value data.** The scalar function list includes `upper`,
 `round` (FLOAT/DOUBLE with optional constant INTEGER precision), and date arithmetic.
 `features.scalar_functions.gap_enabled` adds `lower`, `abs`, and unary minus in gaps
 mode; those missed the initial per-shape 95% admission gate.
@@ -268,13 +279,13 @@ shapes. Integer narrowing and sign changes remain in gaps mode while overflow
 behavior differs; decimal scale reduction and timestamp second/millisecond
 casts also remain in gaps mode because one-expression checks found mismatches.
 `data.edge_values.unicode_case` exposes Unicode case-mapping differences in
-gaps mode. NaN/infinity data is also gaps-only after the Phase 2c campaigns
-found mismatches in floating aggregates; negative zero and date extremes stay on
+gaps mode. NaN/infinity data is also gaps-only because floating aggregates
+mismatch on it (#2085, #2592); negative zero and date extremes stay on
 by default. Rounding ties such as `0.125` and strings over 64 KiB have their
 own gaps switches. The long-string switch inserts at most one such value per small dataset;
 DuckDB-native GPU scans currently decline overflow strings.
 
-**Phase 2e type switches.** `types.decimal_widths` chooses the concrete DECIMAL
+**Type switches.** `types.decimal_widths` chooses the concrete DECIMAL
 widths used for generated columns. The type probe found native scan, filter,
 group, and join matches for `(9,2)`, `(9,9)`, `(12,2)`, `(18,0)`, `(18,4)`, and
 `(18,18)`; widths of 19 digits or more and `(4,0)` declined at scan. The
@@ -299,8 +310,8 @@ array scan/projection matches, while array range filters declined. Focused
 acceptance had 31/31 tagged projections OK.
 
 `data.strings.charset=utf8` includes accented Latin, CJK, and emoji. The
-repeated-match regexp backreference path is quarantined after signature
-`0fca855a`; the separate case-mapping gaps remain controlled by
+repeated-match regexp backreference path is quarantined under #2650; the
+separate case-mapping gaps remain controlled by
 `data.edge_values.unicode_case`.
 `data.strings.max_len` is a byte ceiling; lengths near 4,095 are rare so most
 strings remain short. The probe accepted 4,095 bytes and declined 4,096.
@@ -312,8 +323,8 @@ default, tagged when referenced.
 denominators for integer division and modulo in gaps mode. Default queries
 use nonzero literal divisors to avoid CPU division-by-zero skips.
 `features.scalar_functions.regexp_backreferences` keeps repeated match
-backreferences such as `\0\0` in gaps mode. Signature `0fca855a` duplicates
-the match on CPU but not GPU when UTF-8 characters precede it.
+backreferences such as `\0\0` in gaps mode. The CPU duplicates the match but
+the GPU does not when multi-byte characters precede it (#2650).
 TIME, TIMESTAMPTZ, INTERVAL, UUID, BLOB, ENUM, LIST, and STRUCT are not
 generated: the native scan declined every one of them in the
 probe, so their `types.*` switches are reserved for a future decoder pass.
@@ -324,7 +335,11 @@ otherwise the configuration's `sirius.configs` applies (by default the integrati
 partitions), and with `sirius.configs = []` the run
 uses whatever Sirius itself would pick up (`SIRIUS_CONFIG_FILE`, `./sirius.yaml`,
 `~/.sirius/sirius.yaml`, else built-in defaults). Whichever file is used is copied into the run
-and into every finding, so a replay elsewhere restores it.
+and into every finding, so a replay elsewhere restores it. `config/` also holds
+profiles for specific regimes: `micro16k.yaml`, `micro64k.yaml` and
+`micro256k.yaml` shrink scan, partition, concat and sort batches to that size so
+small tables span many batches; `lowmem.yaml` and `lowmem-disk.yaml` restrict
+memory, the latter with a disk tier.
 
 **Dataset layouts.** `[data.pin] tables_fraction`, `tiers`, and `compression` select a
 seeded subset of base tables to pin after `CHECKPOINT`. `[data.parquet]
@@ -333,7 +348,9 @@ views over Parquet files after `CHECKPOINT`. Pinned and Parquet subsets do not
 overlap. The selected tables, tiers, compression choices, and row-group size are
 recorded in a comment in each saved `dataset.sql`; `fuzz replay` recreates the
 Parquet files in its own work directory and reapplies pins after loading the
-dataset. CPU-only replay omits the Sirius pin calls.
+dataset. CPU-only replay omits the Sirius pin calls. A storage campaign is the
+default configuration with, for example,
+`--set data.pin.tables_fraction=0.5 --set data.parquet.tables_fraction=0.5`.
 
 ---
 
@@ -357,7 +374,7 @@ at a fact table. Large-tier joins use the `fk_tN = tN.k` relationship. The fuzze
 fact cross joins and inequality-only fact joins because they make the CPU
 reference unbounded.
 
-For a bounded run on the GB300, use `--set data.large.fraction=1.0` with one of
+For a bounded large-tier run, use `--set data.large.fraction=1.0` with one of
 `large-default.yaml`, `large-8m.yaml`, `large-lowmem.yaml`, or
 `large-lowmem-disk.yaml` through `--sirius-config`. The `large-8m` profile also
 needs `--set 'variants.settings.hash_partition_bytes=[8388608]'` and

@@ -223,6 +223,8 @@ class Report:
             self.tlp_counts["eligible"] += 1
             if rec.tlp.get("checked"):
                 self.tlp_counts["checked"] += 1
+            elif rec.tlp.get("partition_status"):
+                self.tlp_counts["partition_failed"] += 1
         for tag in set(rec.generator_tags):
             self.coverage.setdefault(tag, collections.Counter())[rec.verdict] += 1
         if verdict == Verdict.CPU_ERROR:
@@ -708,7 +710,8 @@ class Report:
         )
         lines.append(
             f"  TLP eligible={summary['tlp'].get('eligible', 0)} "
-            f"checked={summary['tlp'].get('checked', 0)}"
+            f"checked={summary['tlp'].get('checked', 0)} "
+            f"partition_failed={summary['tlp'].get('partition_failed', 0)}"
         )
         lines.extend(["", "coverage (queries, per 1000, OK/fallback/error %):"])
         for tag in _CLAIMED_FEATURES(self.cfg):

@@ -286,7 +286,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         "date": dt.datetime.now(dt.timezone.utc).isoformat(),
         "run_dir": str(run_dir),
         "engine_revision": env.get("checkout", {}).get("revision"),
-        "harness_revision": env.get("checkout", {}).get("revision"),
         "configuration": pathlib.Path(cfg.source_path).name,
         "config_hash": summary["config_hash"],
         "mode": args.mode,

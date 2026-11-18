@@ -90,7 +90,7 @@ def run_batch(cfg, n, seed):
     return ok, errors, qg.stats
 
 
-class Phase2eTypes(unittest.TestCase):
+class TypeCoverage(unittest.TestCase):
     def test_default_integer_divisors_are_nonzero_literals(self):
         from siriusfuzz import sqltypes as st
         from siriusfuzz.query_gen import Scope, ScopeTable
@@ -248,7 +248,7 @@ class Phase2eTypes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             session = cpu_session(tmp)
             try:
-                session.load_dataset(ds, "phase2e")
+                session.load_dataset(ds, "types")
                 for table in ds.tables:
                     for column in table.columns:
                         if column.type.kind == "decimal":
@@ -402,7 +402,7 @@ class Phase2eTypes(unittest.TestCase):
         self.assertGreater(qg.stats["type:varchar_long_below_limit"], 0)
 
 
-class Phase2cQuarantine(unittest.TestCase):
+class CastQuarantine(unittest.TestCase):
     def test_float_to_integer_cast_is_gap_only(self):
         from siriusfuzz import sqltypes as st
         from siriusfuzz.query_gen import Scope, ScopeTable
@@ -421,7 +421,7 @@ class Phase2cQuarantine(unittest.TestCase):
             self.assertEqual(seen_float, enabled)
 
 
-class Phase2dJoinBudget(unittest.TestCase):
+class JoinBudget(unittest.TestCase):
     def test_failed_generation_does_not_report_join_tag(self):
         from siriusfuzz.query_gen import GenerationFailed
 
@@ -671,7 +671,7 @@ class WindowTies(unittest.TestCase):
         )
 
 
-class Phase2cEdgeValues(unittest.TestCase):
+class EdgeValues(unittest.TestCase):
     def test_far_dates_need_gap_switch(self):
         far = {dt.date(1, 1, 1), dt.date(9999, 12, 31)}
         for enabled in (False, True):
@@ -717,7 +717,7 @@ class Phase2cEdgeValues(unittest.TestCase):
         self.assertEqual(len(values), 1)
 
 
-class Phase2cOracle(unittest.TestCase):
+class OracleTolerance(unittest.TestCase):
     def test_nonfinite_values_never_match_finite_values(self):
         from siriusfuzz import sqltypes as st
         from siriusfuzz.compare import ColumnInfo, ResultSet, cells_equal
@@ -731,7 +731,7 @@ class Phase2cOracle(unittest.TestCase):
         self.assertFalse(compare_results(left, right, False, Tolerances()).equal)
 
 
-class Phase2cShapes(unittest.TestCase):
+class ExpressionShapes(unittest.TestCase):
     def test_float_division_stays_out_of_default_minmax(self):
         for enabled in (False, True):
             cfg = load_config(
@@ -836,7 +836,7 @@ class Phase2cShapes(unittest.TestCase):
                     self.assertLessEqual(node.args[1].value, 6)
 
 
-class Phase2bShapes(unittest.TestCase):
+class WindowAndSetOpShapes(unittest.TestCase):
     def generated(self, overrides, count=1200):
         cfg = load_config(None, overrides)
         dg = DataGenerator(cfg, random.Random(20261112))

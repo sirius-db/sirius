@@ -64,7 +64,7 @@ class Joins:
     any_join: bool = True
     any_mixed: bool = gap_switch(
         False
-    )  # #2153 / 5a54110e: mixed arithmetic ANY GPU AST type error
+    )  # #2153: mixed arithmetic ANY GPU AST type error
     any_join_share: float = 1.0
     self_join: bool = True
     self_join_share: float = 0.2
@@ -105,7 +105,7 @@ class Aggregates:
     expression_args: bool = gap_switch(False)
     float_division_minmax: bool = gap_switch(
         False
-    )  # #2085/#2592 / c6aae63a: NaN from finite division
+    )  # #2085/#2592: NaN from finite division
     hugeint_sum: bool = gap_switch(False)
 
 
@@ -151,7 +151,7 @@ class ScalarFunctions:
     )  # default queries use nonzero integer divisors so DuckDB can evaluate them
     regexp_backreferences: bool = gap_switch(
         False
-    )  # unfiled 0fca855a: regexp_replace \0\0 duplicates on CPU but not GPU
+    )  # #2650: regexp_replace \0\0 duplicates on CPU but not GPU
     join_neighbours: bool = gap_switch(False)
     window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(
@@ -191,9 +191,7 @@ class Expressions:
 class Casts:
     enabled: bool = True
     temporal_numeric: bool = gap_switch(False)
-    float_to_int: bool = gap_switch(
-        False
-    )  # #2152 / 83b0c0ed: FLOAT -> BIGINT rounds differently
+    float_to_int: bool = gap_switch(False)  # #2152: FLOAT -> BIGINT rounds differently
     integer_narrowing: bool = gap_switch(False)  # #2580: out-of-range wraps
     integer_sign_change: bool = gap_switch(False)  # #2580: out-of-range wraps
     integer_out_of_range: bool = gap_switch(False)  # #2580: out-of-range wraps
@@ -243,7 +241,7 @@ class Features:
     window_functions: bool = True
     window_gaps: bool = gap_switch(False)
     # Cast unsigned and narrow DECIMAL columns into extra window order keys.
-    # Admitted on GB300; without it such scopes get rank().
+    # Without it such scopes get rank().
     window_cast_tiebreaks: bool = True
     float_exact_keys: bool = gap_switch(False)
     distinct: bool = True
@@ -369,7 +367,7 @@ class Oracle:
     ambiguity_filter: bool = True
     known_issues: str = "known_issues.toml"
     query_timeout_seconds: float = 60.0
-    cpu_timeout_seconds: float = 20.0
+    cpu_timeout_seconds: float = 10.0
     tlp_share: float = 0.1
     reduce: bool = True
     reduce_max_steps: int = 150

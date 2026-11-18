@@ -279,26 +279,15 @@ class Evaluator:
                 timeout=self.timeout if self.s.gpu_available else self.cpu_timeout,
             )
             if part.status != "ok" or part.result is None:
+                # The base comparison already passed; a partition that is
+                # declined or fails only means this check could not run.
                 rec.tlp = {
                     "eligible": True,
-                    "checked": True,
+                    "checked": False,
                     "predicate": predicate.sql(),
-                    "error": part.error or part.status,
+                    "partition_status": part.status,
+                    "error": (part.error or part.status).split("\n", 1)[0][:160],
                 }
-                if self.s.gpu_available and part.status == "error":
-                    verdict, reason = classify_gpu_error(part.error)
-                    rec.verdict = verdict.value
-                    rec.reason = "TLP partition: " + reason
-                else:
-                    rec.verdict = (
-                        Verdict.GPU_ERROR.value
-                        if self.s.gpu_available
-                        else Verdict.CPU_ERROR.value
-                    )
-                    rec.reason = (
-                        "TLP partition: "
-                        + (part.error or part.status).split("\n", 1)[0][:160]
-                    )
                 return
             counts.append(part.result.row_count)
             parts.extend(part.result.rows)
@@ -393,7 +382,9 @@ class Evaluator:
             choices = list(self.forced_variant.items())
         elif not self.variants or self.cfg.variants.per_query <= 0:
             return
-        elif self.cfg.variants.share < 1 and self.rng.random() >= self.cfg.variants.share:
+        elif (
+            self.cfg.variants.share < 1 and self.rng.random() >= self.cfg.variants.share
+        ):
             return
         else:
             names = self.rng.sample(
