@@ -240,17 +240,17 @@ GB200, 4 ranks per node, the sum of the 22 TPC-H query times in seconds.
 | SF10000 | GDS | 94.7 | 54.4 | 36.3 |
 | SF30000 | GDS | 321.7 | 184.8 | 109.2 |
 | SF100000 | GDS | 1,641.1 | 747.7 | 336.8 |
-| SF10000 | default backend | 237.1 | 128.0 | 72.2 |
-| SF30000 | default backend | 720.4 | 384.7 | 208.7 |
-| SF100000 | default backend | 3,263.0 | 1,508.9 | 725.8 |
+| SF10000 | io_uring | 237.1 | 128.0 | 72.2 |
+| SF30000 | io_uring | 720.4 | 384.7 | 208.7 |
+| SF100000 | io_uring | 3,263.0 | 1,508.9 | 725.8 |
 
 - **GDS** is `scan_manager.backend: gds`, set up as in the [GDS runbook](gds-runbook.md). Its
-  integration is not finished. It is faster than the default backend at the three scales by
-  2.50x, 2.24x and 1.99x on one node, 2.35x, 2.08x and 2.02x on two, and 1.99x, 1.91x and 2.15x
-  on four.
+  integration is not finished. It is faster than io_uring at the three scales by 2.50x, 2.24x
+  and 1.99x on one node, 2.35x, 2.08x and 2.02x on two, and 1.99x, 1.91x and 2.15x on four.
+- **io_uring** is the default scan backend: the config has no `scan_manager.backend` line.
 - **Totals:** SF10000 and SF30000 run each query twice and take the faster run. SF100000 runs
   each query once.
-- **SF100000, default backend, four nodes:** in the single pass one node's storage reads stopped
+- **SF100000, io_uring, four nodes:** in the single pass one node's storage reads stopped
   for about two minutes during Q5 and the pass took 849.7 s. Q5 run again alone on the same nodes
   took 48.2 s, which gives the 725.8 s of the table.
 - **SF100000 on one node:** Q9 and Q13 do not fit in memory and spill to disk (about 2.5 TB and
@@ -264,11 +264,11 @@ there is a separate session with the standard query parameters.
 | Scale | Scans | Nodes | Run | First pass (s) |
 |---|---|---|---|---|
 | SF10000 | GDS | 1 | [11807](https://accel-etl.nvidia.com/runs/11807/) | 99.4 |
-| SF10000 | default backend | 1 | [11808](https://accel-etl.nvidia.com/runs/11808/) | 245.3 |
+| SF10000 | io_uring | 1 | [11808](https://accel-etl.nvidia.com/runs/11808/) | 245.3 |
 | SF30000 | GDS | 1 | [11805](https://accel-etl.nvidia.com/runs/11805/) | 325.4 |
-| SF30000 | default backend | 1 | [11806](https://accel-etl.nvidia.com/runs/11806/) | 738.8 |
+| SF30000 | io_uring | 1 | [11806](https://accel-etl.nvidia.com/runs/11806/) | 738.8 |
 | SF100000 | GDS | 1 | [11810](https://accel-etl.nvidia.com/runs/11810/) | 1,641.1 |
-| SF100000 | default backend | 1 | [11809](https://accel-etl.nvidia.com/runs/11809/) | 3,263.0 |
+| SF100000 | io_uring | 1 | [11809](https://accel-etl.nvidia.com/runs/11809/) | 3,263.0 |
 
 ## Past 16 ranks
 
