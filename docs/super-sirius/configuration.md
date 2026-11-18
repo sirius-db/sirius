@@ -273,8 +273,8 @@ the process-wide SQL `spill_compression` semantics.
 | `spill_max_compressed_fraction` | — | finite double >= 0 | 0.75 | A spilled batch stays compressed only at or below this fraction of its device size. Independent of the input-table `max_compressed_fraction`. |
 | `spill_encode_reserve_fraction` | — | double in [0, 1] | 0.5 | Encode only when this fraction of the batch's size could be reserved in its GPU memory space; otherwise the batch spills uncompressed. `0` skips the check. |
 | `spill_encode_wait_ms` | — | milliseconds | 1000 | When the encoder's headroom is not grantable while other spill encodes run on the same GPU, wait up to this long for one of them to end and try again, instead of spilling the batch uncompressed at once. `0` never waits. |
-| `spill_read_cache_max_bytes` | — | bytes | 16Mi | A row-range reader (the windowed merge) copies the compressed payload of a spilled host or disk batch to the device once, whole, when it is at most this size, and decodes every row range from that copy; a larger payload is read range by range. `0` disables the copy. |
-| `spill_whole_decode_max_bytes` | — | bytes | 64Mi | The windowed merge decodes a spilled compressed batch whole, instead of window by window, when all its rows fit one merge window and it decodes to at most this size; the run is then windowed by slices of the decoded batch. `0` always reads by row range. |
+| `spill_read_cache_max_bytes` | — | bytes | 64Mi | A row-range reader (the windowed merge) copies the compressed payload of a spilled host or disk batch to the device once, whole, when it is at most this size, and decodes every row range from that copy; a larger payload is read range by range. `0` disables the copy. |
+| `spill_whole_decode_max_bytes` | — | bytes | 256Mi | The windowed merge decodes a spilled compressed batch whole, instead of window by window, when it has at most two merge windows of rows and decodes to at most this size; the run is then windowed by slices of the decoded batch. `0` always reads by row range. |
 
 ### How Downgrade Thresholds Work
 

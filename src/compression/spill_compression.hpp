@@ -62,10 +62,11 @@ struct spill_compression_settings {
   double encode_reserve_fraction{0.5};
   /// Largest compressed payload a row-range reader copies whole to the device before it
   /// decodes row ranges of it; 0 disables the copy (compression.spill_read_cache_max_bytes).
-  std::size_t read_cache_max_bytes{16ULL * 1024 * 1024};
-  /// Largest decoded size of a compressed batch the windowed merge decodes whole when its rows
-  /// fit one window; 0 always reads by row range (compression.spill_whole_decode_max_bytes).
-  std::size_t whole_decode_max_bytes{64ULL * 1024 * 1024};
+  std::size_t read_cache_max_bytes{64ULL * 1024 * 1024};
+  /// Largest decoded size of a compressed batch the windowed merge decodes whole when it has at
+  /// most two windows of rows; 0 always reads by row range
+  /// (compression.spill_whole_decode_max_bytes).
+  std::size_t whole_decode_max_bytes{256ULL * 1024 * 1024};
   /// Longest an encode whose headroom is not grantable waits for another encode on the same
   /// GPU to give its headroom back before the batch spills uncompressed, in milliseconds;
   /// 0 never waits (compression.spill_encode_wait_ms).

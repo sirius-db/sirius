@@ -645,12 +645,12 @@ struct compression_config {
   /// or disk batch to the device once, whole, when it is at most this many bytes, and decodes
   /// every row range from that copy. A larger payload is read range by range. 0 disables the
   /// copy.
-  std::size_t spill_read_cache_max_bytes{16ULL * 1024 * 1024};  // 16 MiB
+  std::size_t spill_read_cache_max_bytes{64ULL * 1024 * 1024};  // 64 MiB
 
   /// The windowed merge decodes a spilled compressed batch whole, instead of window by window,
-  /// when all its rows fit one merge window and it decodes to at most this many bytes. The run
-  /// is then windowed by slices of the decoded batch. 0 always reads by row range.
-  std::size_t spill_whole_decode_max_bytes{64ULL * 1024 * 1024};  // 64 MiB
+  /// when it has at most two merge windows of rows and decodes to at most this many bytes. The
+  /// run is then windowed by slices of the decoded batch. 0 always reads by row range.
+  std::size_t spill_whole_decode_max_bytes{256ULL * 1024 * 1024};  // 256 MiB
 
   /// When the encoder's headroom is not grantable while other spill encodes run on the same
   /// GPU, wait up to this many milliseconds for one of them to end and try again, instead of

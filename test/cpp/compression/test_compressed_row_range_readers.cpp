@@ -1265,7 +1265,7 @@ TEST_CASE("compressed readers copy a small host or disk payload to the device on
   } const restore;
 
   // The limit decides: at 0 nothing is copied, at the default the test batch is.
-  for (std::size_t limit : {std::size_t{0}, std::size_t{16} << 20}) {
+  for (std::size_t limit : {std::size_t{0}, std::size_t{64} << 20}) {
     sirius::compression::spill_compression_settings settings;
     settings.read_cache_max_bytes = limit;
     sirius::compression::set_spill_compression_settings(settings);

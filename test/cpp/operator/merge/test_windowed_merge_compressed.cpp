@@ -594,25 +594,25 @@ TEST_CASE("windowed_merger merges compressed runs of every spill plan in the thr
   CHECK(runs.representations() == representations);
 }
 
-TEST_CASE("windowed_merger decodes whole a compressed batch that fits one window",
+TEST_CASE("windowed_merger decodes whole a compressed batch of at most two windows",
           "[windowed_merge_compressed]")
 {
   if (!has_gpu()) { SKIP("No GPU available"); }
   tiers_fixture fx;
-  // Batches of at most 5,000 rows and of 9,000 and more, in the three tiers.
+  // Batches of at most two 2,500-row windows and of 7,000 rows and more, in the three tiers.
   const std::vector<run_shape> shapes{{.batch_rows = {20500}, .null_keys = 300},
                                       {.batch_rows = {4500, 4500}, .null_keys = 0},
                                       {.batch_rows = {3000}, .null_keys = 40},
                                       {.batch_rows = {4000, 4000, 4000}, .null_keys = 5000},
                                       {.batch_rows = {5000}, .null_keys = 0},
                                       {.batch_rows = {9000, 7000}, .null_keys = 1}};
-  constexpr std::size_t window_rows = 5000;
+  constexpr std::size_t window_rows = 2500;
   auto const keys                   = ascending_key();
 
   auto const merge_all = [&](std::size_t whole_decode_max_bytes) {
     scoped_spill_compression compression{2.0, whole_decode_max_bytes};
     compressed_runs runs(fx, shapes, 1);
-    // Host and disk batches of at most one window, which is what is decoded whole.
+    // Host and disk batches of at most two windows, which is what is decoded whole.
     std::size_t small_spilled = 0;
     std::size_t small_rows    = 0;
     for (auto const& run : runs.runs) {
@@ -620,7 +620,7 @@ TEST_CASE("windowed_merger decodes whole a compressed batch that fits one window
         auto ro           = batch->to_read_only();
         auto const rows   = sirius::representation_num_rows(*ro.get_data()).value();
         auto const on_gpu = ro.get_current_tier() == Tier::GPU;
-        if (!on_gpu && rows <= window_rows) {
+        if (!on_gpu && rows <= 2 * window_rows) {
           ++small_spilled;
           small_rows += rows;
         }
@@ -655,7 +655,7 @@ TEST_CASE("windowed_merger decodes whole a compressed batch that fits one window
 
   // On: the small host and disk batches are converted once each and sliced in place; the larger
   // ones, and the device batches, are still read window by window.
-  auto const whole = merge_all(std::size_t{64} << 20);
+  auto const whole = merge_all(std::size_t{256} << 20);
   CHECK(whole.conversions == whole.small_spilled);
   CHECK(whole.refill_rows == whole.total_rows - whole.small_rows);
 
