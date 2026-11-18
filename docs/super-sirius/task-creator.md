@@ -181,7 +181,7 @@ there is no separate repository completion protocol.
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If the producer finished: READY if batches remain. Otherwise READY when `plan_next_run()` finds a complete group among the parked batches, else WAITING on the producer. |
+| `get_next_task_hint()` | READY when `plan_next_run()` finds a group its GPU may sort now: a complete group among the parked batches, or the remainder once the producer finished. Otherwise WAITING on the producer, or no hint once the producer finished (a sort task in flight schedules the operator when it ends). |
 | `get_next_task_input_data()` | Claims the next group under the same policy as the hint and returns it as `pipelineable_operator_data`. After the producer finished, the remainder is packed into groups in repository order. |
 | Why custom | One task sorts a group of input batches as a single run; see [Operators](operators.md#sirius_physical_order--order_by) |
 
@@ -256,6 +256,8 @@ its own tasks finishing therefore has to ask for it: it calls
 |----------|-------------------------------|-----|
 | UNION | In `get_next_task_input_data()`, after it drains the active arm and moves to the next one | The next arm's batches are already waiting; no producer will schedule the operator for them |
 | MERGE_SORT (windowed route) | In `execute()`, after a task commits its cursors, when some partition has runs and no task in flight | A partition runs one task at a time, so its next task can be created only after the current one commits |
+| ORDER_BY (coalescing, with concurrent-run or backlog limits) | In `execute()`, after the task's runs are sorted | A group held back for its GPU, or a producer held back by `input_backlogged()`, has no other task to schedule it |
+| SORT_SAMPLE (with a backlog limit) | In `execute()` | Restarts a producer held back by `input_backlogged()` |
 
 Rules for such an operator:
 
@@ -267,6 +269,24 @@ Rules for such an operator:
   task has read it to the end, so `all_ports_empty()` stays false until the last run is consumed.
 - A rescheduled (retried) task reuses its input object. `get_next_task_input_data()` is not
   called again for it, so in-flight state must survive a failed attempt unchanged.
+
+## Producer Backpressure
+
+Two operator hooks let a consumer keep its input from piling up. Both default to off, and only
+ORDER_BY (coalescing mode) and SORT_SAMPLE use them, under `sort_input_backpressure`.
+
+- `input_backlogged(port)`. Before every task the creation loop makes for a pipeline, it asks
+  the operators fed by that pipeline's sink. If one answers true the loop ends without claiming
+  input, so a scan's splits stay in its connector and the scan manager's lookahead stops
+  preparing more. The consumer must call `schedule(this)` when one of its own tasks finishes;
+  that request walks the hint chain back to the producer and restarts its loop. An operator
+  that counts the producer's unfinished tasks may do so because a task is counted as completed
+  before its consumers are scheduled.
+- `runs_ahead_of_producer()`. `compute_pipeline_priorities()` first ranks pipelines in plan
+  order. A pipeline whose source returns true then trades places with the pipeline producing
+  its input; a chain of such pipelines (scan, ORDER_BY, SORT_SAMPLE → SORT_PARTITION) is
+  reversed as a whole and keeps its place among the other pipelines. The consumer's tasks are
+  then dispatched before the producer's queued ones.
 
 ## Non-pipelineable Task Inputs
 

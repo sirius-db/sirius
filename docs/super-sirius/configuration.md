@@ -984,7 +984,9 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `sort_partition_auto_sizing` | true | How the number of ORDER BY range partitions is chosen when `max_sort_partition_bytes` is 0. true: enough partitions to keep each one under `max_sort_partition_memory_fraction` of a GPU's memory limit, or under a tenth of the limit when the data and its sorted copy do not fit the GPUs; where the one-shot merge is used, also under the cuDF row limit and its GPU memory need; in `auto` mode, never several partitions that fall under the one-shot threshold without fitting the GPU together; and, with `sort_merge_mode = 'windowed'` on several GPUs, one partition per executor thread of a GPU (at most 4, no partition under 2 GiB). false: the previous rule, data bytes over the fraction of the GPU memory free at the moment the sort is sampled. |
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY: order string keys and multi-column keys by radix sorts over an encoding of the keys instead of cuDF's comparison sort. `false` is for A/B comparison. |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each, so a range partition receives few large sorted runs instead of one per input batch. See [Sort Run Coalescing](#sort-run-coalescing). |
-| `sort_coalesce_memory_fraction` | 0.25 | Share of one GPU's memory for the inputs of the local sorts running at the same time: one run is at most this fraction of the GPU divided by the GPU executor thread count. In (0, 1]. |
+| `sort_coalesce_memory_fraction` | 0.25 | Share of one GPU's memory for the inputs of the local sorts running at the same time: one run is at most this fraction of the GPU divided by `sort_coalesce_concurrent_runs`. In (0, 1]. |
+| `sort_coalesce_concurrent_runs` | 2 | Full runs one GPU sorts at the same time. 0: one per GPU executor thread, with no bound on the sorts running at once. |
+| `sort_input_backpressure` | true | The local sort and the range partitioning of ORDER BY are scheduled ahead of the tasks producing their input, and that producer is held back while unsorted input (or unpartitioned runs) of twice `sort_coalesce_memory_fraction` of every GPU is waiting. |
 | `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
 | `sort_merge_mode` | `auto` | Merge path of MERGE_SORT: `auto`, `windowed` or `one_shot`. See [Sort Merge](#sort-merge). |
 | `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge |
@@ -1042,7 +1044,9 @@ Three settings control which input batches the local sort of ORDER BY sorts toge
 | Setting | Type | Default | Meaning |
 |---------|------|---------|---------|
 | `sort_coalesce_runs` | BOOLEAN | true | On: the local sort concatenates groups of input batches and sorts each group as one run. Off: every input batch is sorted on its own (one run per batch), in the pipeline that produced it. |
-| `sort_coalesce_memory_fraction` | DOUBLE | 0.25 | Size of one run: `fraction × GPU memory limit / GPU executor threads` bytes of input (the smallest GPU when there are several). In (0, 1]. |
+| `sort_coalesce_memory_fraction` | DOUBLE | 0.25 | Input bytes of the runs one GPU sorts at the same time: `fraction × GPU memory limit` (the smallest GPU when there are several). In (0, 1]. |
+| `sort_coalesce_concurrent_runs` | UBIGINT | 2 | Size of one run: the bytes above divided by this. A GPU starts another sort only while the inputs of its running sorts stay within those bytes. 0: a run is the bytes above divided by the GPU executor thread count and any number of sorts run at once. |
+| `sort_input_backpressure` | BOOLEAN | true | On: the pipelines of the local sort and of the range partitioning are scheduled ahead of the pipeline producing their input, and that producer gets no new task while twice the bytes above, times the number of GPUs, are waiting (unsorted batches before a coalescing sort; sorted runs before the partitioning). Off: plan order; the producer is never held back. |
 | `sort_coalesce_string_keys` | BOOLEAN | true | On: a sort with a string key is coalesced like any other, provided `sort_key_encoding` is on. Off, or with `sort_key_encoding` off: it keeps the per-batch sort. |
 
 Why it matters: every sorted run is cut by range, so each range partition holds as many runs as
@@ -1051,14 +1055,23 @@ factor of `sort_merge_max_fan_in` in that count. A sort over fixed-width keys co
 row whatever the run size, so sorting larger runs removes merge passes for free. The run size is
 a memory bound, not a target derived from the data size: a sort task holds its input batches,
 their concatenation, the sort's scratch and the sorted copy. A run is also kept below 2^31 rows
-and, when the schema has a string column, below 2^31 bytes. A sort with a string key is
+and, when the schema has a string column, below 2^31 bytes of strings (what its batches hold
+beyond their fixed-width values and string offsets). A sort with a string key is
 coalesced only while `sort_key_encoding` is on: the encoded sort costs the same per row at any
 run size, while cuDF's comparison sort of string keys gets slower per row as a run grows, by
 more than the saved merge passes give back for keys with many distinct values.
 
-Why 0.25: for a 32 GiB sort under an 80 GiB limit it gives 7 runs per partition, which the
-default `sort_merge_max_fan_in` merges in one pass; 0.125 gives 14 runs and an extra pass, and
-0.5 and 1.0 make the sorts themselves spill.
+Why two concurrent runs instead of one per executor thread: with eight threads a run was 1/32
+of the GPU, less than two scan batches of the default size, so a sort larger than the GPU kept
+one run per scan batch. The sort is a small part of the work on a batch, so two sorts at a time
+keep up with the scan, and each covers several batches. Larger runs also mean larger pieces
+after the range partitioning; pieces of `spill_min_batch_bytes` or more are spilled compressed
+when spill compression is on.
+
+Why backpressure: a scan's tasks are created as its batches are prepared and scheduled before
+the sort's, so without it the scan finishes first and its whole output is spilled and read back
+for the sort, and the sorted runs again for the partitioning. See
+[Operators](operators.md#sirius_physical_order--order_by).
 
 Coalescing is not applied (the plan and the behaviour are those of `sort_coalesce_runs = false`)
 when a column of the sort's input is nested, when a sort key is not a plain column, and, when
@@ -1411,7 +1424,9 @@ SET enable_compressed_materialization = false;
 | `sort_partition_auto_sizing` | true | Automatic sort partition count from the GPU memory limit, the merge route, the number of GPUs and the cuDF row limit; false = previous rule (free GPU memory at sampling time) |
 | `sort_key_encoding` | true | Per-batch sort of ORDER BY uses radix sorts over an encoding of string and multi-column keys; `false` uses cuDF's comparison sort (A/B comparison) |
 | `sort_coalesce_runs` | true | ORDER BY sorts groups of input batches as one run each; see [Sort Run Coalescing](#sort-run-coalescing) |
-| `sort_coalesce_memory_fraction` | 0.25 | One coalesced run is at most this fraction of the GPU memory limit divided by the GPU executor thread count; in (0, 1] |
+| `sort_coalesce_memory_fraction` | 0.25 | Inputs of the local sorts one GPU runs at the same time, as a fraction of its memory limit; in (0, 1] |
+| `sort_coalesce_concurrent_runs` | 2 | One coalesced run is the fraction above divided by this; 0 = divided by the GPU executor thread count, any number of sorts at once |
+| `sort_input_backpressure` | true | Schedule the local sort and range partitioning ahead of their producer and hold the producer back while their input is backlogged |
 | `sort_coalesce_string_keys` | true | Coalesce runs also when a sort key is a string; applies only while `sort_key_encoding` is on |
 | `sort_merge_mode` | `auto` | MERGE_SORT merge path: `auto`, `windowed` or `one_shot` (kept for A/B testing, slated for removal); see [Sort Merge](#sort-merge) |
 | `sort_merge_window_rows` | 0 (derive) | Maximum rows per input window of the windowed merge; 0 or at least 1024 |

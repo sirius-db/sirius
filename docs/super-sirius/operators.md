@@ -485,7 +485,7 @@ It has two modes, chosen by the planner (`order_by_run_limits()` in `wrap_order_
 | Mode | Plan | Sort unit |
 |------|------|-----------|
 | per batch (`sort_coalesce_runs = false`, a string sort key with `sort_coalesce_string_keys = false` or `sort_key_encoding = false`, a nested column, or an operator built outside the planner) | `… → SORT_SAMPLE → ORDER_BY → input`; ORDER_BY is the sink of its input's pipeline | Each input batch of a task |
-| coalescing (default) | `… → SORT_SAMPLE → ORDER_BY → PASSTHROUGH_SINK → input`; ORDER_BY starts its own pipeline and reads the input's batches from a port (PARTIAL barrier) | A group of parked batches of up to `sort_coalesce_memory_fraction × GPU limit / executor threads` bytes, concatenated |
+| coalescing (default) | `… → SORT_SAMPLE → ORDER_BY → PASSTHROUGH_SINK → input`; ORDER_BY starts its own pipeline and reads the input's batches from a port (PARTIAL barrier) | A group of parked batches of up to `sort_coalesce_memory_fraction × GPU limit / sort_coalesce_concurrent_runs` bytes, concatenated |
 
 Why coalesce: SORT_PARTITION cuts every sorted run by range, so each partition holds one run per
 sort unit, however small the partition. MERGE_SORT reads at most `sort_merge_max_fan_in` runs per
@@ -501,9 +501,29 @@ Coalescing mode:
   not on a GPU (spilled, or being moved) form one more group. A group is complete when the next
   batch of its device would take it past the byte limit or 2^31 - 1 rows, or when it reaches the
   byte limit; a batch larger than the limit is a group of one. With a string column in the
-  schema a group also stays below 2^31 decoded bytes, which bounds every string column. Until a
-  group is complete the hint is WAITING on the producer. When the producer has finished, the
-  remainder is packed in repository order regardless of device.
+  schema a group also stays below 2^31 string bytes, counting for each batch what it holds
+  beyond its fixed-width values and string offsets (its decoded bytes when its row count is
+  unknown), which bounds every string column. Until a group is complete the hint is WAITING on
+  the producer. When the producer has finished, the remainder is packed in repository order
+  regardless of device.
+- **Concurrent runs** (`sort_coalesce_concurrent_runs`, `make_sort_run_limits()`). The inputs of
+  the runs one GPU sorts at the same time stay within `sort_coalesce_memory_fraction` of its
+  limit: a complete group is claimed only if it fits beside the groups already claimed for its
+  GPU and not yet sorted, or if nothing is being sorted there. A group that does not fit stays
+  parked; the sort task that finishes schedules the operator again. This is what lets a run
+  cover several input batches without every executor thread holding one. With the setting at 0
+  a run is the fraction divided by the executor thread count and any number are sorted at once.
+- **Input backpressure** (`sort_input_backpressure`). Without it a scan runs ahead of the sort:
+  its tasks are created as fast as its batches are prepared and are scheduled first, so the
+  unsorted batches fill the GPU and are spilled and read back whole. With it,
+  - ORDER_BY reports `input_backlogged()` while the parked batches plus the producer's
+    unfinished tasks (at the average batch size) reach twice the fraction of every GPU, and the
+    task creator creates no further task for the producing pipeline until a sort task finishes;
+  - SORT_SAMPLE does the same for the sorted runs waiting to be partitioned, once the
+    boundaries exist (not with cross-rank boundaries);
+  - the pipelines of ORDER_BY and SORT_SAMPLE are scheduled ahead of their producers
+    (`runs_ahead_of_producer()`, see [Task Creator](task-creator.md#producer-backpressure));
+  - the unsorted input is spilled after the query's other batches (downgrade priority -50).
 - **Task.** The input is a plain `pipelineable_operator_data`: the task creator places it by data
   locality and `prepare_for_processing()` brings spilled batches back to the GPU. `execute()`
   splits the task's batches into sort units again from the real tables (row count, bytes of each
@@ -519,7 +539,7 @@ Coalescing mode:
   line at INFO:
 
 ```
-[order_by][stats] op=<id> coalesce=<0|1> max_run_bytes=… tasks=… batches_in=… runs_out=… concat_bytes=…
+[order_by][stats] op=<id> coalesce=<0|1> max_run_bytes=… max_concurrent_bytes=… max_backlog_bytes=… tasks=… batches_in=… runs_out=… concat_bytes=…
 ```
 
 ### `sirius_physical_top_n` — `TOP_N`
