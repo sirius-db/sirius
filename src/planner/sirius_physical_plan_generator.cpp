@@ -2227,9 +2227,35 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   }
 }
 
+namespace {
+
+bool has_delim_join(duckdb::LogicalOperator const& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) { return true; }
+  for (auto const& child : op.children) {
+    if (has_delim_join(*child)) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
+  // Sirius plans a correlated subquery only as the CTE DuckDB makes of it by default. With
+  // `delim_join_as_cte = false` (deprecated in DuckDB) a subquery DuckDB cannot flatten arrives as
+  // a delim join instead. Such a plan is declined here, before any pass reads it; every other
+  // plan runs under either value of the setting.
+  if (has_delim_join(*op)) {
+    constexpr auto message =
+      "the plan has a delim join, which Sirius does not run. It comes from a correlated subquery "
+      "planned with delim_join_as_cte = false; SET delim_join_as_cte = true (DuckDB's default) to "
+      "run the query on the GPU";
+    SIRIUS_LOG_WARN("Not running the query on the GPU: {}", message);
+    throw duckdb::NotImplementedException(message);
+  }
+
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Before binding resolution (DuckDB's own conversion is off in delim CTE plans): a MARK join

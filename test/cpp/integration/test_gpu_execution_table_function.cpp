@@ -26,6 +26,7 @@
 #include <duckdb/main/settings.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 #include <string>
 #include <vector>
@@ -109,18 +110,26 @@ TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
   REQUIRE(query_rows("SELECT 42") == rows{{"42"}});
 }
 
+// With `delim_join_as_cte` off, only a plan that keeps a delim join is left to DuckDB.
 TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,
-                 "gpu_execution table function rejects delim_join_as_cte = false",
+                 "gpu_execution table function leaves a plan with a delim join to DuckDB",
                  "[integration][gpu_execution][table_function]")
 {
-  auto const expected = query_rows(group_query());
-  run_ok("SET delim_join_as_cte = false;");
-  auto const error = query_error(gpu_execution(group_query()));
-  CHECK(error.find("delim_join_as_cte = true") != std::string::npos);
+  // Correlated on an inequality, which keeps the delim join through DuckDB's optimizer.
+  auto const correlated = "SELECT count(*) FROM " + table() + " o WHERE v > (SELECT avg(v) FROM " +
+                          table() + " i WHERE i.x < o.x)";
+  auto const expected_group      = query_rows(group_query());
+  auto const expected_correlated = query_rows(correlated);
 
-  // The session recovers once the setting is back.
-  run_ok("SET delim_join_as_cte = true;");
-  CHECK(query_rows(gpu_execution(group_query())) == expected);
+  sirius::test::scoped_sirius_setting off{*con, "delim_join_as_cte", false};
+  CHECK(query_rows(gpu_execution(group_query())) == expected_group);
+  CHECK(query_rows(gpu_execution(correlated)) == expected_correlated);
+
+  // Without a CPU fallback, the error names the setting; a plan without a delim join still runs.
+  sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+  CHECK(query_error(gpu_execution(correlated)).find("delim_join_as_cte = true") !=
+        std::string::npos);
+  CHECK(query_rows(gpu_execution(group_query())) == expected_group);
 }
 
 TEST_CASE_METHOD(GpuExecutionTableFunctionFixture,

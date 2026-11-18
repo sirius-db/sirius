@@ -1922,19 +1922,6 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
-void require_delim_join_as_cte(ClientContext& context)
-{
-  Value setting;
-  if (context.TryGetCurrentSetting("delim_join_as_cte", setting) && !setting.IsNull() &&
-      setting.GetValue<bool>()) {
-    return;
-  }
-  throw InvalidInputException(
-    "Sirius runs queries only with delim_join_as_cte = true, DuckDB's default. "
-    "SET delim_join_as_cte = true to run this query on the GPU, or SET gpu_execution = false "
-    "to run it on the CPU.");
-}
-
 bool like_swar_fastpath_enabled(ClientContext& context)
 {
   Value setting;
@@ -2065,9 +2052,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                              PhysicalOperatorType::EXPLAIN_ANALYZE);
     return plain_explain ? RebindQueryInfo::DO_NOT_REBIND : leave_to_duckdb();
   }
-  // From here on Sirius would run the query. An error, not a fallback: the CPU would answer
-  // every query of the session without the user learning why.
-  require_delim_join_as_cte(context);
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).

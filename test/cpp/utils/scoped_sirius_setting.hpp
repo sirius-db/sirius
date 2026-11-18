@@ -79,8 +79,7 @@ class scoped_sirius_setting final {
                         setting_value const& value)
     : con_(connection), name_(std::move(name))
   {
-    // Read without a query: a SELECT would go through Sirius, which refuses to run one while
-    // `delim_join_as_cte` is off.
+    // Read from the connection, so that saving a setting never runs a query through Sirius.
     bool const found{con_.context->TryGetCurrentSetting(duckdb::Identifier(name_), original_)};
     REQUIRE(found);
 

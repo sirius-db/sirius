@@ -495,7 +495,6 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
-  require_delim_join_as_cte(context);
 
   // Route Sirius-owned remote parquet reads through Sirius's own bind:
   // read_parquet('s3://…') -> sirius_read_parquet('s3://…'). DuckDB core has no
