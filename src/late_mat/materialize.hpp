@@ -17,7 +17,7 @@
 #pragma once
 
 // Producing one deferred column, for a selection already prepared (env gate:
-// SIRIUS_EXP_LATE_MAT).
+// enable_late_materialization).
 //
 // prepare_selection resolved the rows once, for every column of the origin
 // table. This is the per-column half: for each batch the selection touches,

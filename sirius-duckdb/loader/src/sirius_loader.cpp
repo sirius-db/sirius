@@ -19,6 +19,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -30,14 +31,18 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_install_info.hpp"
+#include "duckdb/main/http/http_transport_manager.hpp"
+#include "duckdb/main/http/http_util.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <dlfcn.h>
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <string>
+#include <tuple>
 
 namespace {
 
@@ -45,6 +50,79 @@ constexpr char const* gpu_execution_setting = "gpu_execution";
 // Set by the backend entry point (sirius-duckdb/src/sirius/sirius_extension.cpp).
 constexpr char const* backend_init_started_key = "sirius_backend_init_started";
 constexpr char const* runtime_ready_key        = "sirius_runtime_ready";
+
+/// Whether the repository an installed backend came from now publishes a different build. Asks with
+/// the ETag recorded at install time and stops after the response headers, so nothing is
+/// downloaded. Best effort: any failure means no.
+struct backend_update_check {
+  static bool update_available(duckdb::DatabaseInstance& db, std::string const& extension_path)
+  {
+    try {
+      auto& fs        = duckdb::FileSystem::GetLocal(db);
+      auto const name = fs.ExtractBaseName(extension_path);
+      auto const info =
+        duckdb::ExtensionInstallInfo::TryReadInfoFile(fs, extension_path + ".info", name);
+      if (!info || info->mode != duckdb::ExtensionInstallMode::REPOSITORY || info->etag.empty() ||
+          !duckdb::StringUtil::StartsWith(info->repository_url, "http")) {
+        return false;
+      }
+      // Ask for the artifact UPDATE EXTENSIONS would install: the repository's current build, from
+      // the primary server, rather than the pinned version or backup recorded in full_path.
+      auto const repository = duckdb::ExtensionRepository::GetRepositoryByUrl(info->repository_url);
+      auto url              = duckdb::ExtensionHelper::ExtensionFinalizeUrlTemplate(
+        duckdb::ExtensionHelper::ExtensionUrlTemplate(&db, repository, ""), name);
+      // Like install: https only when httpfs provides it.
+      if (db.ExtensionIsLoaded("httpfs")) { duckdb::HTTPUtil::BumpToSecureProtocol(url); }
+      if (!may_download(db, url)) { return false; }
+      auto& manager = db.config.GetHTTPTransportManager();
+      auto session  = manager.CreateSession(db, url);
+      auto& params  = session.Parameters();
+      // A slow or unreachable repository must not hold up LOAD.
+      params.timeout                    = 2;
+      params.retries                    = 0;
+      params.follow_location            = false;
+      params.keep_alive                 = false;
+      params.skip_external_access_check = true;  // may_download applied install's rules
+      duckdb::HTTPHeaders headers(db);
+      headers.Insert("If-None-Match", info->etag);
+      bool newer = false;
+      duckdb::GetRequestInfo request(
+        url,
+        headers,
+        params,
+        [&](duckdb::HTTPResponse const& response) {
+          newer = response.status == duckdb::HTTPStatusCode::OK_200 && response.HasHeader("ETag") &&
+                  response.GetHeaderValue("ETag") != info->etag;
+          return false;  // The headers answer the question; skip the body.
+        },
+        [](duckdb::const_data_ptr_t, duckdb::idx_t) { return false; });
+      request.try_request = true;
+      std::ignore         = session.Request(request);
+      return newer;
+    } catch (...) {
+      return false;
+    }
+  }
+
+ private:
+  /// Mirrors the file access rules DuckDB applies to extension downloads.
+  static bool may_download(duckdb::DatabaseInstance& db, std::string const& url)
+  {
+    if (duckdb::Settings::Get<duckdb::EnableExternalAccessSetting>(db) ||
+        duckdb::ExtensionRepository::IsOfficialRepositoryUrl(url)) {
+      return true;
+    }
+    for (auto const& segment : duckdb::StringUtil::Split(duckdb::StringUtil::Lower(url), '/')) {
+      if (segment == "." || segment == ".." || duckdb::StringUtil::Contains(segment, "%2e")) {
+        return false;
+      }
+    }
+    auto const regular = duckdb::FileType::FILE_TYPE_REGULAR;
+    return db.config.CanAccessFile(url, regular) ||
+           (duckdb::StringUtil::StartsWith(url, "https://") &&
+            db.config.CanAccessFile("http://" + url.substr(8), regular));
+  }
+};
 
 /// Outcome of looking for a CUDA 12.8+ driver. Probed once per process.
 struct cuda_driver {
@@ -271,6 +349,12 @@ class sirius_loader {
     loader_status_ptr result = std::move(status);
     if (!result->backend_loaded) { register_fallback(result); }
     loader_.RegisterFunction(status_function::create(result));
+    if (install_failed_) {
+      // Only now is the fallback certain; a FATAL error or a rejected gpu_execution throws.
+      print(
+        "Sirius: queries run on DuckDB's CPU engine; SELECT fallback_reason FROM sirius_status() "
+        "shows why.");
+    }
   }
 
  private:
@@ -322,12 +406,82 @@ class sirius_loader {
       }
       duckdb::ExtensionInstallOptions options;
       options.repository = repository;
-      duckdb::ExtensionHelper::InstallExtension(
-        db, duckdb::FileSystem::GetLocal(db), backend, options);
+      auto& fs           = duckdb::FileSystem::GetLocal(db);
+      // Mirrors core's install layout, where install is a no-op when the file exists. If this
+      // drifts, the worst case is a missing or extra status line.
+      auto directory = duckdb::ExtensionHelper::ExtensionDirectory(db, fs);
+      if (repository.type == duckdb::ExtensionRepositoryType::USER_PROVIDED) {
+        directory = fs.JoinPath(fs.JoinPath(directory, "repositories"), repository.name);
+      }
+      auto const path      = fs.JoinPath(directory, backend + ".duckdb_extension");
+      auto const installed = fs.FileExists(path);
+      if (installed) {
+        duckdb::ExtensionHelper::InstallExtension(db, fs, backend, options);
+        if (backend_update_check::update_available(db, path)) {
+          try {
+            report(duckdb::StringUtil::Format(
+              "Sirius: an update for %s is available. Run UPDATE EXTENSIONS (%s); and restart "
+              "DuckDB to use it.",
+              backend,
+              backend));
+          } catch (...) {
+            // The notice is advisory; it must not keep the installed backend from loading.
+          }
+        }
+      } else {
+        install_with_status(backend, options);
+      }
     }
     auto connection = duckdb::Connection::CreateInternal(db);
     connection.Query(duckdb::StringUtil::Format("LOAD %s", duckdb::SQLString(backend)))
       ->ThrowIfError();
+  }
+
+  /// Installs a backend that is not installed yet, telling the user on stderr since the
+  /// download is large and core DuckDB installs silently.
+  void install_with_status(std::string const& backend, duckdb::ExtensionInstallOptions& options)
+  {
+    auto& db = loader_.GetDatabaseInstance();
+    report(duckdb::StringUtil::Format(
+      "Sirius: installing %s. This one-time download is large and may take a few minutes.",
+      backend));
+    auto const start   = std::chrono::steady_clock::now();
+    auto const elapsed = [&] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    try {
+      duckdb::ExtensionHelper::InstallExtension(
+        db, duckdb::FileSystem::GetLocal(db), backend, options);
+    } catch (...) {
+      // The reason stays out of it: it can span lines and contain the URL with credentials.
+      try {
+        report(duckdb::StringUtil::Format(
+          "Sirius: installing %s failed after %.1f s.", backend, elapsed()));
+      } catch (...) {
+      }
+      install_failed_ = true;
+      throw;
+    }
+    report(duckdb::StringUtil::Format("Sirius: installed %s in %.1f s.", backend, elapsed()));
+  }
+
+  void report(std::string const& message)
+  {
+    print(message);
+    log_info(message);
+  }
+
+  static void print(std::string const& message)
+  {
+    duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, message);
+    duckdb::Printer::Flush(duckdb::OutputStream::STREAM_STDERR);
+  }
+
+  void log_info(std::string const& message)
+  {
+    auto& db = loader_.GetDatabaseInstance();
+    using namespace duckdb;  // The logging macros use unqualified DuckDB names.
+    DUCKDB_LOG_INFO(db, message);
   }
 
   /// Leaves DuckDB's CPU execution untouched and makes explicit GPU requests fail.
@@ -352,14 +506,12 @@ class sirius_loader {
     option.info = duckdb::make_shared_ptr<fallback_gpu_execution_option>(status);
     config.AddExtensionOption(gpu_execution_setting, std::move(option));
     loader_.RegisterFunction(fallback_gpu_execution_function::create(status));
-    auto const message =
-      "Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine. " +
-      status->fallback_reason;
-    using namespace duckdb;  // The logging macros use unqualified DuckDB names.
-    DUCKDB_LOG_INFO(db, message);
+    log_info("Sirius GPU execution is unavailable; queries run on DuckDB's CPU engine. " +
+             status->fallback_reason);
   }
 
   duckdb::ExtensionLoader& loader_;
+  bool install_failed_ = false;  ///< A backend install was reported as failed on stderr
 };
 
 }  // namespace

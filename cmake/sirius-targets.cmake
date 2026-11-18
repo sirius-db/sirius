@@ -1,5 +1,9 @@
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
+if(SIRIUS_DISTRIBUTION_DEFAULTS)
+  target_compile_definitions(sirius_objects
+                             PRIVATE SIRIUS_DISTRIBUTION_DEFAULTS)
+endif()
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
 set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -48,20 +52,17 @@ set(SIRIUS_LINK_LIBRARIES
     cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     roaring::roaring
+    nixl::nixl
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
-    PkgConfig::NUMA
     PkgConfig::LIBURING
-    ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
     absl::strings
     utf8proc::utf8proc
-    kvikio::kvikio)
-if(BUILD_WITH_CTRACK)
-  list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
-endif()
+    # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+    CUDA::nvml)
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -90,6 +91,17 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    # zstd device code; needs a CUDA 12.4+ driver, below the 12.8 floor.
+    target_compile_options(
+      ${_target}
+      PRIVATE
+        "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+    )
+    if(NOT _target STREQUAL "sirius_objects")
+      target_link_options(
+        ${_target} PRIVATE
+        "$<DEVICE_LINK:-Xfatbin=-compress-all;--compress-mode=size>")
+    endif()
   endif()
 
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
@@ -121,7 +133,7 @@ foreach(_target sirius_objects sirius_core sirius_shared)
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
   # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io is the io
-  # library (uring/REST/kvikio reactors, fs_cache) Sirius consumes directly.
+  # library (uring/REST reactors, fs_cache) Sirius consumes directly.
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 

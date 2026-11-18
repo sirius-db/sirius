@@ -16,32 +16,28 @@ You are running SQL benchmarks for Sirius, a GPU-accelerated SQL query engine bu
 
 Currently this skill covers **TPC-H only**. TPC-DS support has been removed from this skill for now and will be added back later.
 
-## Step 0 — Choose the Benchmark Type (ask first)
+## Choose the Benchmark Type
 
-Before anything else, ask the user (via `AskUserQuestion`) which benchmark they want:
+Use the request to select the workflow. Ask only if the choice remains ambiguous:
 
-- **Regular benchmark**: the per-query timing + GPU-vs-CPU validation runner
-  (`performance_test.py`), running the 22 TPC-H queries × N iterations against a parquet or
-  `.duckdb` dataset, optionally pinned. Follow **Workflow H-B** and complete "Before Running the
-  Regular Benchmark".
-- **TPC-H official (power + throughput run)**: the spec-style refresh-function benchmark
-  (`tpch_power_throughput.py`) that interleaves the RF1 (insert) and RF2 (delete) refresh
-  functions with the query streams and reports Power@Size / Throughput@Size / QphH@Size. Follow
-  **Workflow H-C** and complete "Before Running the Official Run".
+- **Regular benchmark**: per-query timing and GPU-vs-CPU validation with
+  `performance_test.py` (Workflow H-B).
+- **TPC-H official (power + throughput run)**: refresh functions and Power@Size /
+  Throughput@Size / QphH@Size with `tpch_power_throughput.py` (Workflow H-C).
 
-The "Two Engines", "GPU-Compatible Queries", and "Identifying GPU Fallback and Errors" sections
-below apply to both. Do not start either run before completing that path's confirmation gate.
+The engine, GPU compatibility, and fallback sections below apply to both.
 
 ## Two Engines
 
 | Engine | Entry Point | Config | TPC-H Runner |
 |--------|-------------|--------|--------------|
-| **Super Sirius** | `gpu_execution("...")` | **Requires** `SIRIUS_CONFIG_FILE` | `performance_test.py --engine gpu` (or `both`) |
-| **DuckDB CPU** | Raw SQL (no GPU wrapping) | Unsets `SIRIUS_CONFIG_FILE` | `performance_test.py --engine cpu` (or `both`) |
+| **Super Sirius** | Normal SQL with `gpu_execution=true` | Optional for regular runs | `performance_test.py --engine gpu` (or `both`) |
+| **DuckDB CPU** | Raw SQL (no GPU wrapping) | No explicit `LOAD` | `performance_test.py --engine cpu` (or `both`) |
 
 **Config file behavior:**
-- Super Sirius: `SIRIUS_CONFIG_FILE` must be set and point to a valid file — the script errors if not
-- DuckDB CPU: `SIRIUS_CONFIG_FILE` is automatically unset — pure CPU baseline
+- Regular runner: uses `SIRIUS_CONFIG_FILE` when supplied, otherwise Sirius defaults.
+- Official power/throughput runner: requires `SIRIUS_CONFIG_FILE` pointing to a valid file.
+- DuckDB CPU: the runner does not issue an explicit extension `LOAD`.
 
 ## Working Directory
 
@@ -77,7 +73,7 @@ These messages land in the post-split per-query Sirius logs at `<benchmark_dir>/
 
 ```bash
 # Queries that fell back to DuckDB CPU
-grep -l "fallback to DuckDB" <benchmark_dir>/sirius/q*/sirius.log
+rg -l "Transparent execution fallback|fallback to DuckDB|falling back to DuckDB" <benchmark_dir>/sirius/q*/sirius.log
 
 # Sirius-level plan / execution errors
 grep -l "Error in SiriusGeneratePhysicalPlan" <benchmark_dir>/sirius/q*/sirius.log
@@ -109,7 +105,12 @@ Scripts are in `test/tpch_performance/`.
 
 ## Workflow H-A: Generate TPC-H Data
 
-**Generation gate — ALWAYS ask before generating.** Before generating anything (via `/dataset-manager` or the script below), ask the user whether the dataset already exists and where. A missing path is not proof the dataset doesn't exist — datasets are typically shared across worktrees (e.g. the main checkout's `test_datasets/`, not the current worktree's) or kept elsewhere on disk, so the user may already have it at a location you haven't checked. Generate only after the user explicitly confirms no existing dataset is available.
+**Dataset generation:** Check the supplied path and plausible shared locations, including the
+main checkout's `test_datasets/`, before concluding data is missing. A missing path alone does not
+mean a dataset must be generated. Generation can consume substantial time and disk, especially at
+large scale factors: use explicit authorization to generate it, or ask if generation is needed and
+not already authorized. For DuckDB generation, resolve whether a plain or clustered dataset is
+needed.
 
 Data generation is owned by the **`/dataset-manager`** skill — the single source of truth for both formats. Prefer delegating to it rather than calling the script directly. It produces:
 
@@ -139,22 +140,14 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--input <path>` — the dataset. A **parquet directory** (with `--data-source parquet`, default) or a single **`.duckdb` file** (with `--data-source duckdb`).
 - `--scale-factor <SF>` — the dataset scale used to render Q11 as `0.0001 / SF`. Always pass it explicitly; omission defaults to SF1 with a warning only for rollout compatibility.
 
-**Most-used flags** — the complete reference lives in `test/tpch_performance/CLAUDE.md` and `performance_test.py --help`; consult it rather than re-deriving flags here:
-- `--data-source {parquet,duckdb}` (default `parquet`) — input source/format. `parquet`: `--input` is a parquet directory (`read_parquet` scan). `duckdb`: `--input` is a single `.duckdb` file (GPU-native `seq_scan`). Works in all modes; `--pin` works for both.
-- `--engine {gpu,cpu,both}` (default `both`) — `gpu`/`both` load the Sirius extension; `cpu` does not.
-- `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
-- `--execution {cold,lukewarm,hot}` (optional; omit to change nothing) — the cache state to measure. Each value also sets `cache.mode` / `cache.eviction` in the Sirius config, overriding `--config`. `cold` drops the OS page cache and calls `reset_sirius_cache()` before every run (needs the sudo setup below); `lukewarm` drops the OS cache once then lets caches fill under LRU; `hot` runs iterations back-to-back per query.
-- `--precmd none|nsys|gdb` — `none` is the normal in-process benchmark; `nsys` is GPU-only and owned by the `profile-analyzer` skill; `gdb` runs each GPU query under batch-mode GDB. External runners have their own execution model and reject an explicit `--execution`.
-- `--pin {none,gpu,host}` (default `none`) — Sirius cache pre-load tier; rejected with `--engine cpu`.
-- `--pin-compression` (default off) — Simpatico-compressed pins; requires `--pin gpu|host`. Plan dir via `--compression-plan-dir` (defaults to the shipped `plans/tpch_sf1000`).
-- `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
-- `--name <NAME>` — label the output subdir instead of the default `tpch_<ts>_<mode>_<engine>_iter<N>`.
-
-The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `--output`, `--duckdb-profiling`, `--query-timeout`), the per-query pin column lists in `tpch_pin_columns.py`, and the shell-runner-only `--pinning-mode` path. (Note: `performance_test.py --data-source` is the harness's own 2-value flag, distinct from the legacy shell `benchmark_and_validate.sh --data-source`.)
+For the available flags and defaults, see `performance_test.py --help` and
+`test/tpch_performance/README.md`. The Python harness's `--data-source` differs from the legacy
+shell `benchmark_and_validate.sh --data-source`; the README also describes the shell-only
+`--pinning-mode` and per-query pin column lists.
 
 **Examples:**
 ```bash
-# SF1, hot cache, both engines, 2 iterations (parquet directory)
+# SF1, both engines, 2 iterations (parquet directory)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --scale-factor 1 \
@@ -188,17 +181,18 @@ pixi run python test/tpch_performance/performance_test.py \
   - *pinned*: `--pin gpu` or `--pin host` pre-loads the referenced columns into the Sirius cache.
 - To confirm a pinned run actually hit the cache, grep `<benchmark_dir>/sirius/q<N>/sirius.log` for `using cached_split_provider` (cache hit) vs `not all the columns are pinned for this query` (fell through to disk).
 
-### Cold-Run Benchmarking (`--execution cold`)
+### Cold-Run Benchmarking (`--profile cold`)
 
-`drop_os_cache()` writes `3` to `/proc/sys/vm/drop_caches` via passwordless `sudo`. Before running `--execution cold`, ask the user to run this one-time setup (do not proceed until the user confirms it is done):
-
-```bash
-echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
-```
+`performance_test.py` advises the OS to evict the dataset's local files with
+`posix_fadvise(DONTNEED)` before every run on either engine. It also resets the Sirius cache
+before each GPU run. Neither requires sudo.
+This is a filesystem hint, so filesystems may ignore it. Pinned table data remains resident;
+S3 input does not use this local-file eviction. Check the run logs and report these limits
+when interpreting cold timings.
 
 ### Output Layout
 
-A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+A timestamped benchmark dir `<output>/tpch_<ts>_<profile>_<engine>_iter<N>[_<NAME>]/` (`default` profile when unset) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/README.md` for the full layout.
 
 ---
 
@@ -236,16 +230,16 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 # One-time per SF: generate refresh sets (num_sets >= streams + 1)
 ./test/tpch_performance/generate_tpch_refresh.sh <SF> <num_sets>   # -> test_datasets/tpch_refresh_sf<SF>/
 
-# Only for varied predicates: per-stream query sets from qgen (streams 0..N)
+# Required for an official/spec run: per-stream query sets from qgen (streams 0..N)
 ./test/tpch_performance/generate_tpch_queries.sh <SF> <streams>    # -> test_datasets/tpch_queries_sf<SF>/
 
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 pixi run python test/tpch_performance/tpch_power_throughput.py \
     --sf <SF> --input <base.duckdb> --refresh-dir <refresh_dir> \
-    --mode both --pin gpu|host [--streams N] [--vary-predicates --query-dir <dir>]
+    --mode both --pin gpu|host [--streams N] --vary-predicates --query-dir <dir>
 ```
 
-**Flags** (full reference in `test/tpch_performance/CLAUDE.md`): `--mode power|throughput|both`
+**Flags** (full reference in `test/tpch_performance/README.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
 `--pin gpu|host` (always one of these), `--pin-compression/--no-pin-compression`
 (Simpatico-compressed pins; plan dir defaults to the shipped TPC-H plans),
@@ -266,95 +260,50 @@ a validation mismatch or an unexpected row-count after a refresh — treat it as
 
 ---
 
-# Before Running the Regular Benchmark (`performance_test.py`) — ALWAYS Confirm Every Parameter First
+# Before Running the Regular Benchmark (`performance_test.py`)
 
-**This is mandatory and must not be skipped.** Before invoking `performance_test.py`, you MUST confirm **every** parameter with the user via the `AskUserQuestion` tool — never silently assume defaults, and never skip this gate even when the request looks complete. Pre-fill any value the user already gave (present it as the recommended option) and ask for the rest, so a `/benchmark` run never starts with an unconfirmed configuration.
+Use parameters supplied by the user and applicable runner defaults. Check that the dataset path,
+format, and scale factor match; the scale factor controls Q11's threshold. For GPU runs, use the
+provided config or a valid `SIRIUS_CONFIG_FILE`. Ask only for information that cannot be determined
+and materially affects the run. If an input is missing, search for an existing dataset before
+considering generation (Workflow H-A).
 
-Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). Mark sensible defaults as "(Recommended)".
+Choose the requested execution profile, pin tier, compression plan, iteration count, queries,
+validation, and output location. Preserve the runner's constraints: CPU-only runs cannot pin;
+compression requires a GPU or host pin; validation requires both engines or supplied `--duckdb-results`; nsys and gdb external
+runners reject `--profile`. Verify that the extension is built for GPU runs. For comparisons, match the dataset, scale factor, queries, config, cache and
+pin settings, and execution shape unless the difference is the subject of the comparison.
+Report the exact invocation and the effective config path (or the source config path if no
+derived config was written) with the results.
 
-**Round 1 — data & engine**
-1. **Data source** (`--data-source`) — `parquet` or `duckdb`.
-2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. ALWAYS ask the user where the dataset lives — never assume a path, and never treat a missing path as "needs generating": the dataset may already exist at a different location (see the generation gate in Workflow H-A). If the given path doesn't exist, report that and ask for the correct location; offer generation via `/dataset-manager` only after the user confirms no existing dataset is available (generation can take significant time and disk at large scale factors — **never auto-generate**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
-3. **Scale factor** (`--scale-factor`) — the dataset's scale factor; this must match the input because it controls Q11's threshold.
-4. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
-5. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
-
-**Round 2 — execution shape**
-1. **Execution profile** (`--execution`, optional — omitted leaves the config untouched and runs iterations back-to-back) — `hot`, `lukewarm` (OS cache dropped once, LRU retention, round-robin), or `cold` (per-query OS cache drop + `reset_sirius_cache()`; needs the sudo setup below). `--precmd nsys|gdb` selects a separate GPU-only external runner; Nsight is owned by the `profile-analyzer` skill.
-2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
-3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins. When compression is chosen, always ask which plan directory to use — the shipped `src/compression/simpatico_codegen/plans/tpch_sf1000` (Recommended) or a user-supplied `--compression-plan-dir` path; never assume the default without confirming it.
-4. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
-5. **Queries** (`--queries`) — all 22 (default) or a subset like `1,3,6-10`.
-
-**Round 3 — output**
-1. **Validation** (`--validation`) — byte-compare GPU vs CPU after timing (requires `--engine both`).
-2. **Name** (`--name`) — optional label for the output subdir (e.g. `baseline`, `sf1000-host-pin`); if declined, omit it and let the default `tpch_<ts>_<mode>_<engine>_iter<N>` be used. Do not invent a name unprompted.
-
-After confirming, echo the final `performance_test.py` command back to the user before running it.
-
-**Environment prerequisites** (verify these yourself; they are not user questions):
-- Sirius extension built: `pixi run -e clang make release` (the runner loads `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` for any GPU engine).
-- For Super Sirius: `SIRIUS_CONFIG_FILE` set, or `--config <yaml>` passed (confirmed in Round 1).
+Inspect per-query Sirius logs for fallback and errors before describing timings as GPU results;
+check the cache-hit messages when pinning matters (see the sections above). A populated results
+file alone does not establish GPU execution.
 
 ---
 
-# Before Running the Official Run (`tpch_power_throughput.py`) — ALWAYS Confirm Every Parameter First
+# Before Running the Official Run (`tpch_power_throughput.py`)
 
-**Mandatory — do not skip.** Confirm every parameter with `AskUserQuestion` before invoking
-`tpch_power_throughput.py`. Pre-fill anything the user already gave (present it as the recommended
-option) and ask for the rest. Mark sensible defaults "(Recommended)".
+For an explicit official/spec run, use `--vary-predicates` with qgen-generated query streams;
+the runner's fixed-predicate default is not spec-compliant. If streams are missing, resolve
+generation authorization before running. For diagnostic runs, honor the requested predicate mode.
 
-**Round 1 — data (ask for the paths first; never generate before asking)**
-1. **Base dataset** (`--input`): the file-backed `.duckdb` file with native TPC-H tables (parquet
-   is not allowed here). Always ask the user where it lives. Never assume a path, and never treat a
-   missing path as "must generate" — these datasets are usually shared (e.g. the main checkout's
-   `test_datasets/tpch_sf<SF>.duckdb`, not the current worktree's), so one may already exist. Only
-   after the user confirms none exists, offer to generate a duckdb dataset via `/dataset-manager`
-   (or `generate_tpch_data.sh --format duckdb`); generation is slow and large at scale, so never
-   auto-generate.
-2. **Refresh data** (`--refresh-dir`): the directory of `orders.tbl.u*` / `lineitem.tbl.u*` /
-   `delete.*` sets. Always ask where it lives before generating anything. Only after the user
-   confirms it doesn't exist, generate it with `generate_tpch_refresh.sh <SF> <num_sets>` (needs
-   `num_sets >= streams + 1`). Confirm the directory holds at least `streams + 1` sets.
-3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`): the Sirius config YAML, required (the runner
-   refuses to start without one and has no default path). Always ask the user where the config
-   lives. Don't treat an already-set `SIRIUS_CONFIG_FILE` as the answer; present it as the
-   recommended option and confirm it.
-4. **Scale factor** (`--sf`): the SF of the dataset (also the metric's Size).
+Use supplied parameters and applicable runner defaults. Verify the base input is a file-backed
+DuckDB dataset at the requested scale factor, and use a valid supplied config or
+`SIRIUS_CONFIG_FILE`. Check existing shared locations for the base dataset, refresh sets, and,
+when varying predicates, query streams. Generation can be expensive; use explicit authorization
+or ask before generating missing data. Ensure refresh data has at least `streams + 1` sets and
+varied query data has streams 0 through N.
 
-**Round 2 — run shape**
-1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`). In `both` the
-   throughput run continues on the same pinned DB right after the power run, with no unpin/repin.
-2. **Predicates** (`--vary-predicates`): fixed for every stream (Recommended; required for
-   validation) or varied per stream (each stream's own qgen parameters — what an official run
-   requires; validation not supported). Always ask this — it decides whether validation is even
-   possible. Varied also needs a `--query-dir` of `stream<N>.sql` files: ask where it lives, and
-   only generate with `generate_tpch_queries.sh <SF> <num_streams>` once the user confirms none
-   exists.
-3. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
-   tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
-   off by default.
-4. **Pin compression** (`--pin-compression`): off (Recommended) or Simpatico-compressed pins.
-   Compression happens at pin time, so it needs the pinned tier from the previous question. When
-   compression is chosen, always ask which plan directory to use — present the shipped
-   `src/compression/simpatico_codegen/plans/tpch_sf1000` as the recommended option (covers 6 of
-   8 tables) against a user-supplied `--compression-plan-dir` path; never assume the default
-   without confirming it.
-5. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
-   SF). Ensure the refresh dir has `streams + 1` sets.
-6. **Validation** (`--validation`): only ask with fixed predicates (default on there): the
-   post-RF1/post-RF2 GPU rows are diffed against pure DuckDB in a child process once the pinned
-   phases finish, with the refreshes replayed on a fresh copy. It adds one base-DB copy and an
-   untimed CPU pass, but does not compete with the pin for memory. With varied predicates skip
-   the question — the runner rejects `--validation` — and tell the user the run is timing-only.
+Use the requested mode, pin tier, compression, streams, predicates, validation, and output
+settings. The run always pins; host pinning may be needed at large scale to avoid GPU OOM.
+Varied predicates require qgen query streams and cannot be validated by this runner; report that
+such a run is timing-only. Fixed-predicate validation adds a base database copy and an untimed
+CPU pass. Ask when an unresolved choice materially changes cost or the intended measurement.
+For comparisons, match the dataset, scale factor, mode, streams, predicates, pinning, config,
+and other execution settings except the variable under test. Report the exact invocation and
+effective config path with the results.
 
-`--baseline-pass` (clean pre-refresh pass, default on) and `--query-timeout` can take defaults
-unless the user asks otherwise.
-
-After confirming, echo the final command(s), including any `generate_tpch_refresh.sh` call (only
-if generation was confirmed), before running.
-
-**Environment prerequisites** (verify yourself; not user questions):
-- Sirius extension built (`sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension`).
-- `tpch-dbgen` available for refresh and query generation (`test_datasets/tpch-dbgen/`; both
-  scripts auto-unzip and build `dbgen`/`qgen` from `test_datasets/tpch-dbgen.zip` if missing).
+Verify that the Sirius extension is built. Refresh and query generation also need `tpch-dbgen`;
+the generation scripts can build it from `test_datasets/tpch-dbgen.zip`. Inspect Sirius logs for
+fallback and errors before presenting results as GPU execution.

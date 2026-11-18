@@ -132,7 +132,15 @@ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
   }
 
   auto& resource = staging_resource(host_staging_space);
-  auto staging   = resource.allocate_multiple_blocks(source.size());
+  auto staging   = [&] {
+    try {
+      return resource.allocate_multiple_blocks(source.size());
+    } catch (rmm::out_of_memory const& exhausted) {
+      throw host_staging_out_of_memory(std::string{"[enqueue_device_copy] HOST staging of "} +
+                                       std::to_string(source.size()) +
+                                       " bytes is unavailable: " + exhausted.what());
+    }
+  }();
   std::vector<void*> d2h_destinations;
   std::vector<void const*> d2h_sources;
   std::vector<void*> h2d_destinations;

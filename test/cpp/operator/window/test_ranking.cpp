@@ -446,10 +446,10 @@ TEST_CASE("ranking evaluator ranks a window without partition columns",
   duckdb::Connection con(db);
   REQUIRE_FALSE(con.Query(create_table)->HasError());
   rmm::cuda_stream owning_stream;
-  auto stream      = owning_stream.view();
-  auto mr          = cudf::get_current_device_resource_ref();
-  auto input       = make_input(stream, mr);
-  auto const order = GENERATE(
+  ::cuda::stream_ref stream = owning_stream;
+  auto mr                   = cudf::get_current_device_resource_ref();
+  auto input                = make_input(stream, mr);
+  auto const order          = GENERATE(
     direction{
       "ASC NULLS FIRST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_FIRST},
     direction{"ASC NULLS LAST", duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST},

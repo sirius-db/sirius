@@ -19,6 +19,7 @@
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
 #include "expression/ast/node.hpp"
@@ -27,7 +28,9 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -42,6 +45,55 @@
 // per key.
 
 namespace sirius::planner {
+
+namespace {
+
+//! Whether @p op is a projection that passes its child's columns through unchanged, in order.
+bool is_identity_projection(duckdb::LogicalOperator const& op)
+{
+  if (op.type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) { return false; }
+  auto const& child_types = op.children[0]->types;
+  if (op.expressions.size() != child_types.size()) { return false; }
+  for (duckdb::idx_t i = 0; i < op.expressions.size(); ++i) {
+    auto const& expression = *op.expressions[i];
+    if (expression.GetExpressionType() != duckdb::ExpressionType::BOUND_REF ||
+        expression.Cast<duckdb::BoundReferenceExpression>().Index() != i ||
+        expression.GetReturnType() != child_types[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+//! Whether every output column of @p op is one of its distinct targets, as a plain reference.
+bool targets_every_column(duckdb::LogicalDistinct const& op)
+{
+  std::vector<bool> targeted(op.types.size(), false);
+  for (auto const& target : op.distinct_targets) {
+    if (target->GetExpressionType() != duckdb::ExpressionType::BOUND_REF) { return false; }
+    auto const index = target->Cast<duckdb::BoundReferenceExpression>().Index();
+    if (index >= targeted.size()) { return false; }
+    targeted[index] = true;
+  }
+  return std::ranges::all_of(targeted, std::identity{});
+}
+
+}  // namespace
+
+bool sirius_physical_plan_generator::input_rows_are_distinct(duckdb::LogicalOperator const& op)
+{
+  auto const* input = &op;
+  while (is_identity_projection(*input)) {
+    input = input->children[0].get();
+  }
+  switch (input->type) {
+    case duckdb::LogicalOperatorType::LOGICAL_UNION:
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      return set_operation_deduplicates(input->Cast<duckdb::LogicalSetOperation>());
+    default: return false;
+  }
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
@@ -64,6 +116,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   // The dedup's output types are the child's, so the child must plan the declared schema.
   auto const& planned_types = plan->get_types();
   require_planned_schema(planned_types, op.types, "DISTINCT");
+
+  // The binder puts a DISTINCT over every distinct EXCEPT / INTERSECT, whose plan already ends in a
+  // full-row deduplication; grouping its rows again would remove nothing.
+  if (targets_every_column(op) && input_rows_are_distinct(*op.children[0])) { return plan; }
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   duckdb::vector<std::unique_ptr<sirius::ast::node>> projections;
