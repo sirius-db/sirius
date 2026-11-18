@@ -187,6 +187,9 @@ not constitute validation. This exact comparison does not use the text validator
 floating-point tolerance. Reusing `--duckdb-results` is currently text-only.
 
 CPU/GPU file counts and sizes may differ because the engines batch differently.
+Parquet result mode currently requires the serial benchmark runner
+(`--concurrency 1 --concurrency-mode identical`). The concurrent read-only runner
+rejects Parquet result mode rather than measuring client results as file export.
 Export measurements must not be mixed with query-only timings or interpreted as
 isolated writer cost. The default benchmark mode still returns normal client rows.
 

@@ -42,6 +42,7 @@ def arguments(**overrides):
         queries="1,6",
         scale_factor="1",
         duckdb_profiling=False,
+        result_format="rows",
     )
     return argparse.Namespace(**(defaults | overrides))
 
@@ -330,6 +331,10 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
     def test_invalid_combinations(self):
         for values in (
             dict(concurrency=0),
+            dict(result_format="parquet"),
+            dict(
+                result_format="parquet", concurrency=1, concurrency_mode="cooperative"
+            ),
             dict(mode="grouped"),
             dict(profile="cold"),
             dict(precmd="nsys"),
@@ -350,6 +355,7 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(SystemExit):
                 cb.check_arguments(arguments(**values))
         cb.check_arguments(arguments(concurrency=1, mode="isolated", profile="cold"))
+        cb.check_arguments(arguments(concurrency=1, result_format="parquet"))
         cb.check_arguments(arguments(pin="host", profile="hot"))
         cb.check_arguments(arguments(concurrency_mode="cooperative", concurrency=1))
         cb.check_arguments(

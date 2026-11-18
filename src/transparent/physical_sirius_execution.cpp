@@ -348,7 +348,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // A copy of the hook-captured plan keeps its CTE_REF indexes, so its proofs still hold.
         if (copied_from_hook) { planner.cte_reader_proofs = cte_reader_proofs_; }
         planner.copy_statement_sql = query_sql_;
-        sirius_plan = planner.create_plan(std::move(fresh_plan));
+        sirius_plan                = planner.create_plan(std::move(fresh_plan));
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);
         }

@@ -314,8 +314,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE(after.executions == before.executions + 1);
   REQUIRE(after.fallbacks == before.fallbacks);
   REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
-  if (sirius::late_mat::late_mat_enabled())
-    REQUIRE(sirius::late_mat::deferrals_installed() > deferrals);
+  REQUIRE(sirius::late_mat::deferrals_installed() > deferrals);
   run_ok("SET gpu_execution=false");
   for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
     auto cpu =

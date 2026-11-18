@@ -2138,14 +2138,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // directly and consumes it; we then re-plan from `unbound_statement` for
     // the actual execution path. PhysicalSiriusExecution falls back to
     // re-planning per execute when its `logical_plan_` is null.
-    auto planner                = conn_state
-                                    ? std::make_unique<sirius::planner::sirius_physical_plan_generator>(
+    auto planner = conn_state
+                     ? std::make_unique<sirius::planner::sirius_physical_plan_generator>(
                          context,
                          sirius::planner::scan_contract_provenance{
                            std::nullopt, conn_state->planning_generation()})
                      : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
 
-    planner->cte_reader_proofs = cte_reader_proofs;
+    planner->cte_reader_proofs  = cte_reader_proofs;
     planner->copy_statement_sql = current_query_sql;
     // Hand the validated plan over instead of discarding it, so the first execution can skip
     // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the

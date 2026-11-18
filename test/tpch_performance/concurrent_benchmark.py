@@ -56,6 +56,12 @@ def check_arguments(args):
         if args.stream_order is not None:
             raise SystemExit("--stream-order requires --concurrency > 1")
         return
+    if getattr(args, "result_format", "rows") != "rows":
+        raise SystemExit(
+            "--result-format parquet requires the serial runner "
+            "(--concurrency 1 and --concurrency-mode identical); "
+            "the concurrent runner measures read-only client results"
+        )
     if os.environ.get("SIRIUS_PRE_SQL", "").strip() and args.engine != "cpu":
         raise SystemExit(
             "SIRIUS_PRE_SQL is not supported by concurrent GPU workers: root session "
