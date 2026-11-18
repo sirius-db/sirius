@@ -130,7 +130,12 @@ HOST pool's block size. Batches already in the readable HOST representation need
 collector builds a task-local DuckDB collection and publishes it with its logical position after
 staging succeeds.
 
-If a HOST reservation cannot be obtained, the collector attempts staging from the shared pool.
+On a reservation miss, the task retains the computed batches and yields. The executor tries all
+compatible HOST pools and submits a byte-targeted request to a HOST downgrade executor when more
+capacity is needed. Reclaim uses the existing cache eviction rules, which protect reader-pinned
+and loading buffers. The executor retries the reservation through task admission and bounds
+reclamation attempts while rotating eligible pools.
+See [Pipeline execution](pipeline-execution.md#reschedule-handling).
 
 ## Downgrade Executor
 
@@ -140,7 +145,8 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
 
 ### Thread Model
 
-- **Processing thread**: dequeues `downgrade_request` objects sequentially from an `interruptible_mpmc` queue
+- The **processing thread** dequeues `downgrade_request` objects in eligibility order. The queue
+  supplies retry delays and can service ready requests while delayed requests are pending.
 - **Monitor thread** (if `monitor_period > 0`): each cycle, if the memory space reports `should_downgrade_memory()`, it applies a **stateless viability gate** (`has_viable_downgrade_target()`) before enqueuing. A request is only fired when a lower tier could plausibly accept the data:
   - A configured DISK tier is always a viable target.
   - Without DISK, only a GPU source has a lower tier (HOST). Viability is confirmed by probing each HOST space with a chunk-sized `make_reservation_or_null` (released immediately) — the ground truth for whether downgraded data can actually land, since HOST capacity reflects both live reservations and already-stored downgraded data.
@@ -155,12 +161,12 @@ The monitor is not on the correctness-critical path: the pipeline executor drive
 
 The downgrade executor uses a request-based model with tiered candidate fetching:
 
-1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
+1. The caller queues a predicate-driven `request_downgrade` or a byte-targeted `request_free_memory`. Callers can await a future or supply a completion callback for a byte-targeted request.
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
    - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle batches resident in the executor's source space one at a time
    - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue. Only the task's batches in the executor's source space are moved; inputs it holds in other spaces are left to that space's executor
-4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated both **before dispatching each candidate** (a request that is already satisfied — e.g. the caller's reservation landed, or the running query freed memory — spills nothing) and after each conversion. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
+4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated before dispatch and after each conversion. A satisfied request stops dispatching new candidates while in-flight work finishes. The future or completion callback receives the outcome after the workers settle.
 
 **Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
 

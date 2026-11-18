@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <memory>
+#include <span>
 #include <thread>
 
 namespace sirius::op {
@@ -56,6 +57,11 @@ struct executor_metrics {
   size_t tasks_executed{0};
 };
 
+struct host_pool_binding {
+  const cucascade::memory::memory_space* space;
+  parallel::downgrade_executor* downgrade;  ///< Optional reclaim executor for this pool.
+};
+
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
  *
@@ -71,9 +77,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    * @param mem_space Pointer to the memory space for GPU allocations
    * @param task_request_publisher Publisher to submit task requests
-   * @param downgrade_executor Pointer to the downgrade executor. This is used so that the
-   * gpu_pipeline_executor can request memory downgrade if it cannot obtain a reservation from the
-   * memory space.
+   * @param downgrade_executor Optional downgrade executor for the GPU memory space
+   * @param host_pools HOST pool bindings, borrowed for this executor's lifetime
    */
   explicit gpu_pipeline_executor(
     sirius::exec::query_lifecycle_registry& lifecycle,
@@ -81,7 +86,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
     sirius::parallel::downgrade_executor* downgrade_executor,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+    std::span<const host_pool_binding> host_pools = {});
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -166,10 +172,13 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
                     exec::bounded_thread_pool::slot slot,
                     quent::Handle<quent::TaskManagerLoopThread>& manager_thread_handle) noexcept;
 
+  void reclaim_host_for_task(gpu_pipeline_task& task, query_id_t query_id);
+
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
+  std::span<const host_pool_binding> _host_pools;
   /// Observer of query event transitions.  Never null; see task_creator.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};

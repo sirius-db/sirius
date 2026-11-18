@@ -94,7 +94,7 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    *
    * @param[in] input_data The input batches
    * @throws InvalidInputException if a batch has no data or resides in the DISK tier
-   * @throws InternalException if no HOST memory space is available for GPU input
+   * @throws memory::host_reservation_required if HOST staging capacity is unavailable
    * @note For now, we assume that the input batch, if in the HOST tier, is always in the
    * host_data_representation. If it is in the GPU tier, we convert it to the
    * host_data_representation. In the future, we should register converters for other
@@ -102,7 +102,7 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    */
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
-  /// Stage and publish one task's output, using the task's HOST reservation if available.
+  /// Stage and publish one task's output. A reservation miss leaves collector state untouched.
   void sink_with_reservation(const operator_data& input_data,
                              ::cuda::stream_ref stream,
                              std::unique_ptr<cucascade::memory::reservation>& reservation);

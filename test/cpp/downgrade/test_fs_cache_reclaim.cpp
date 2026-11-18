@@ -29,6 +29,7 @@
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/rest_reactor.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -575,6 +576,30 @@ TEST_CASE("HOST monitor stays quiet while paused and restarts on resume",
   pressure.reset();
 }
 
+TEST_CASE("A delayed HOST reclaim does not hold up ready requests and is canceled on pause",
+          "[downgrade_executor][fs_cache][downgrade_lifecycle]")
+{
+  reclaim_fixture fixture;
+  fixture.start();
+  std::promise<std::exception_ptr> done;
+  auto delayed = done.get_future();
+  fixture.executor->request_free_memory(
+    1,
+    [] { return false; },
+    [done = std::move(done)](std::size_t, std::exception_ptr error) mutable noexcept {
+      done.set_value(error);
+    },
+    1min);
+
+  auto ready = fixture.executor->request_free_memory(1);
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == 0);
+  CHECK(delayed.wait_for(0ms) == std::future_status::timeout);
+  fixture.executor->pause();
+  REQUIRE(delayed.wait_for(0ms) == std::future_status::ready);
+  CHECK(delayed.get() != nullptr);
+}
+
 namespace {
 
 /// One SiriusContext whose HOST executor binds the default local cache, with no DISK tier and a
@@ -674,6 +699,189 @@ TEST_CASE("SiriusContext reset rebinds HOST reclaim to each rebuilt local cache"
     CAPTURE(round);
     env.context->reset_caches();
     env.check_bound_to_current_cache();
+  }
+}
+
+TEST_CASE("Materialized results acquire HOST staging through task admission",
+          "[operator][physical_result_collector][result_cache_pressure_repro][isolated_context]")
+{
+  bool const two_host_pools = GENERATE(false, true);
+  // The portable pool has its own allocator and downgrade executor, even on single-NUMA CI.
+  std::string config_text = R"yaml(sirius:
+  topology:
+    num_gpus: 1
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 2GiB
+        reservation_limit_fraction: 1.0
+    host:
+      - numa_id: 0
+        memory_capacity: 512MiB
+        reservation_limit_fraction: 1.0
+        initial_number_pools: 1
+        pool_size: 1
+        block_size: 1MiB
+)yaml";
+  if (two_host_pools) {
+    config_text += R"yaml(      - numa_id: -1
+        memory_capacity: 512MiB
+        reservation_limit_fraction: 1.0
+        initial_number_pools: 1
+        pool_size: 1
+        block_size: 1MiB
+)yaml";
+  }
+  config_text += R"yaml(
+  executor:
+    pipeline:
+      num_threads: 1
+    downgrade:
+      num_threads: 1
+      monitor_period: 0ms
+    scan_manager:
+      num_threads: 1
+      uring_n_reactors: 1
+      cache:
+        mode: cucs
+        eviction: lru
+        min_prefetching_budget_fraction: 0.0
+        eviction_threshold_fraction: 1.0
+)yaml";
+  temporary_file config{config_text};
+  auto database = sirius::test::open_sirius_db(nullptr, config.path);
+  duckdb::Connection connection(*database);
+  auto context = connection.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(context != nullptr);
+  auto hosts = context->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+  REQUIRE(hosts.size() == (two_host_pools ? 2 : 1));
+  auto* host     = const_cast<cucascade::memory::memory_space*>(hosts.back());
+  auto* resource = host->get_memory_resource_of<Tier::HOST>();
+  auto block     = resource->get_block_size();
+  std::unique_ptr<cucascade::memory::reservation> first_pool_pressure;
+  if (two_host_pools) {
+    auto* first = const_cast<cucascade::memory::memory_space*>(hosts.front());
+    // Keep the first pool full of memory the reclaimer cannot free. Leave the cache to fill
+    // the second pool so the query has to try the other downgrade executor.
+    auto* first_resource = first->get_memory_resource_of<Tier::HOST>();
+    first_pool_pressure  = first->make_reservation_or_null(
+      first->get_max_memory() - first_resource->get_total_allocated_bytes());
+    REQUIRE(first_pool_pressure != nullptr);
+  }
+
+  REQUIRE_FALSE(connection.Query("SET enable_duckdb_fallback = false")->HasError());
+  auto const query = "SELECT i FROM (VALUES (20), (10), (40), (30)) t(i) ORDER BY i";
+  auto check_rows  = [&] {
+    const auto before = context->get_transparent_execution_stats();
+    auto result       = connection.Query(query);
+    INFO((result->HasError() ? result->GetError() : std::string{}));
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 4);
+    int expected = 10;
+    while (auto chunk = result->FetchRaw()) {
+      for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
+        CHECK(chunk->GetValue(0, i).GetValue<int>() == expected);
+        expected += 10;
+      }
+    }
+    CHECK(expected == 50);
+    CHECK(context->get_transparent_execution_stats().executions == before.executions + 1);
+  };
+  check_rows();
+
+  SECTION("disposable cache blocks are reclaimed by admission")
+  {
+    auto* fs_cache = context->get_scan_manager().io_ctx()->cache();
+    REQUIRE(fs_cache != nullptr);
+    const auto chunk           = fs_cache->chunk_size();
+    const auto non_cache_bytes = resource->get_total_allocated_bytes() - fs_cache->claimed_bytes();
+    const auto chunks = (host->get_max_memory() - resource->get_total_allocated_bytes()) / chunk;
+    REQUIRE(chunks > 1);
+    auto object = std::make_shared<cucascade::io::rest::rest_io_object>(
+      "result-staging-pressure", "unused", "unused", (chunks + 1) * chunk, "v1");
+    std::vector<cache::cache_handle> handles;
+    for (std::size_t i = 0; i < chunks; ++i) {
+      const cucascade::io::byte_range range{static_cast<std::int64_t>(i * chunk),
+                                            static_cast<std::int64_t>(chunk)};
+      handles.push_back(cache::fs_cache_test_access::prepared_reclaim_handle(
+        *fs_cache, *object, std::span{&range, 1}));
+    }
+    loading_hold protected_chunk(handles.front());
+    auto protected_chunks = handles.front().chunks();
+    handles.erase(handles.begin() + 1, handles.end());
+    const auto claimed = fs_cache->claimed_bytes();
+    REQUIRE_FALSE(host->make_reservation_or_null(block));
+
+    SECTION("the query succeeds and returns exactly its four rows") { check_rows(); }
+
+    SECTION("a rejected reclaim submission fails the query before retiring its result task")
+    {
+      auto& executor = context->get_downgrade_executor(hosts.front()->get_id());
+      executor.pause();
+      absl::Cleanup resume = [&] { executor.resume(); };
+      auto result          = connection.Query(query);
+      REQUIRE(result->HasError());
+      INFO(result->GetError());
+      CHECK(result->GetError().find("downgrade executor stopped accepting memory requests") !=
+            std::string::npos);
+      CHECK(context->get_query_lifecycle_registry().size() == 0);
+      CHECK(fs_cache->claimed_bytes() == claimed);
+      std::move(resume).Invoke();
+      check_rows();
+    }
+
+    SECTION("interrupting a query waiting for reclamation releases its task")
+    {
+      struct reclaim_gate {
+        std::promise<void> entered;
+        std::promise<void> release;
+        std::shared_future<void> released = release.get_future().share();
+        std::atomic<bool> first{true};
+      };
+      auto gate    = std::make_shared<reclaim_gate>();
+      auto entered = gate->entered.get_future();
+      fs_cache->set_before_reclaim_claim_for_testing([gate](cache::cached_chunk const&) {
+        if (gate->first.exchange(false)) {
+          gate->entered.set_value();
+          gate->released.wait();
+        }
+      });
+      auto query_result = std::async(std::launch::async, [&] { return connection.Query(query); });
+      absl::Cleanup unblock = [&] { gate->release.set_value(); };
+      REQUIRE(entered.wait_for(5s) == std::future_status::ready);
+      connection.Interrupt();
+      auto& lifecycle = context->get_query_lifecycle_registry();
+      REQUIRE(wait_until([&] {
+        return std::ranges::any_of(lifecycle.diagnostics(), [](auto const& status) {
+          return status.memory_waiters > 0 && !status.error.empty();
+        });
+      }));
+      std::move(unblock).Invoke();
+      REQUIRE(query_result.wait_for(5s) == std::future_status::ready);
+      REQUIRE(query_result.get()->HasError());
+      CHECK(lifecycle.size() == 0);
+      check_rows();
+    }
+
+    CHECK(fs_cache->claimed_bytes() < claimed);
+    auto* protected_buffer = protected_chunks->front();
+    CHECK(protected_buffer->state.get_state() == cache::chunk_state::loading);
+    CHECK(resource->get_total_allocated_bytes() == non_cache_bytes + fs_cache->claimed_bytes());
+  }
+
+  SECTION("genuine exhaustion retires the query and leaves the runtime reusable")
+  {
+    auto pressure = host->make_reservation_or_null(host->get_max_memory() -
+                                                   resource->get_total_allocated_bytes());
+    REQUIRE(pressure != nullptr);
+    const auto accounted = resource->get_total_allocated_bytes();
+    auto result          = connection.Query(query);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetError().find("Result collection could not reserve") != std::string::npos);
+    CHECK(resource->get_total_allocated_bytes() == accounted);
+    pressure.reset();
+    check_rows();
   }
 }
 

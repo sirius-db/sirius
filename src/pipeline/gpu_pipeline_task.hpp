@@ -97,6 +97,13 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Secondary task reservation, independently owned from the GPU reservation.
   std::unique_ptr<cucascade::memory::reservation> host_reservation;
 
+  /// Fully computed, pinned output waiting to resume at the materialized collector.
+  struct result_collection_retry {
+    std::size_t staging_bytes;
+    std::size_t reclaim_attempts = 0;
+  };
+  std::optional<result_collection_retry> collection_retry;
+
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
 
@@ -260,9 +267,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
 
   /// Restore the sink's deferred input, if it carries a port directive.
   ///
-  /// Split out from @ref publish_output so the caller can bound the OOM-reschedule window to the
-  /// restoration alone: a sink publishes incrementally, so an OOM inside sink() has already
-  /// committed batches and replaying its input would duplicate them.
+  /// Split out from @ref publish_output so GPU OOM recovery can retry restoration without
+  /// replaying any sink publication.
   std::unique_ptr<op::operator_data> materialize_sink_input(op::operator_data& output_data,
                                                             ::cuda::stream_ref stream);
 

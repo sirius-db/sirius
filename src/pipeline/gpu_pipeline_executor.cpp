@@ -23,6 +23,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
+#include "memory/host_reservation.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
@@ -31,10 +32,13 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <util/stream_check_wrapper.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <format>
@@ -43,6 +47,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 namespace sirius {
 namespace pipeline {
 
@@ -52,13 +57,15 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+  std::span<const host_pool_binding> host_pools)
   : sirius::parallel::itask_executor(
       lifecycle, config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
-    _downgrade_executor(downgrade_executor)
+    _downgrade_executor(downgrade_executor),
+    _host_pools(host_pools)
 {
 }
 
@@ -147,6 +154,92 @@ void gpu_pipeline_executor::manager_loop()
     // it serves every in-flight query on this device.
     process_task(std::move(pipeline_task), std::move(slot), manager_thread_handle);
   }
+}
+
+void gpu_pipeline_executor::reclaim_host_for_task(gpu_pipeline_task& task, query_id_t query_id)
+{
+  auto& state           = task.local_state()->cast<gpu_pipeline_task_local_state>();
+  const auto retry_info = *state.collection_retry;
+  if (!_task_creator) { throw std::logic_error("HOST admission requires a task creator"); }
+
+  struct reclaim_target {
+    const cucascade::memory::memory_space* space;
+    std::size_t reservation_bytes;
+    parallel::downgrade_executor* executor;
+  };
+  std::vector<reclaim_target> targets;
+  for (const auto& pool : _host_pools) {
+    if (!pool.downgrade) { continue; }
+    if (auto rounded = memory::host_reservation_size(*pool.space, retry_info.staging_bytes)) {
+      targets.push_back({pool.space, *rounded, pool.downgrade});
+    }
+  }
+  if (targets.empty()) {
+    throw rmm::out_of_memory(std::format(
+      "Result collection could not reserve {} staging bytes in any configured HOST space",
+      retry_info.staging_bytes));
+  }
+
+  // Try every eligible pool, even if the smallest deficit belongs to a pool full of live data.
+  // Bound retries, but allow a full sweep on systems with many HOST spaces.
+  constexpr std::size_t max_reclaim_attempts = 20;
+  if (retry_info.reclaim_attempts >= std::max(max_reclaim_attempts, targets.size())) {
+    throw rmm::out_of_memory(
+      std::format("Result collection could not reserve {} staging bytes in HOST memory after {} "
+                  "reclamation attempts",
+                  retry_info.staging_bytes,
+                  retry_info.reclaim_attempts));
+  }
+  const auto target_index = retry_info.reclaim_attempts % targets.size();
+  const auto target       = targets[target_index];
+  using namespace std::chrono_literals;
+  const auto delay = retry_info.reclaim_attempts != 0 && target_index == 0 ? 25ms : 0ms;
+
+  auto work = _query_lifecycle.try_acquire_work(query_id);
+  if (!work) { return; }
+  auto next = std::make_unique<gpu_pipeline_task_local_state>(std::move(state._input_data),
+                                                              state._start_operator_index);
+  next->set_preferred_device_id(_memory_space->get_device_id());
+  next->original_task_id = state.original_task_id;
+  next->retry_count      = state.retry_count;
+  next->collection_retry = retry_info;
+  ++next->collection_retry->reclaim_attempts;
+  auto retry = task.create_rescheduled_task(_task_creator->get_next_task_id(), std::move(next));
+  retry->retain_work(std::move(work));
+
+  auto completion      = task.get_completion_handler();
+  auto wait            = _query_lifecycle.begin_memory_wait(query_id);
+  auto* lifecycle      = &_query_lifecycle;
+  const auto headroom  = memory::host_reservation_headroom(*target.space);
+  const auto shortfall = target.reservation_bytes - std::min(target.reservation_bytes, headroom);
+  // The caller keeps the current attempt alive through submission so rejection cannot complete
+  // the pipeline before process_task records the error.
+  target.executor->request_free_memory(
+    shortfall,
+    [lifecycle, query_id, target] {
+      return !lifecycle->accepts_work(query_id) ||
+             memory::host_reservation_headroom(*target.space) >= target.reservation_bytes;
+    },
+    [lifecycle,
+     creator = _task_creator,
+     query_id,
+     completion,
+     retry = std::move(retry),
+     wait  = std::move(wait)](std::size_t, std::exception_ptr error) mutable noexcept {
+      try {
+        if (!lifecycle->accepts_work(query_id) || (completion && completion->has_error())) {
+          return;
+        }
+        if (error) { std::rethrow_exception(error); }
+        wait.reset();
+        creator->reschedule(std::move(retry));
+      } catch (...) {
+        auto failure = std::current_exception();
+        lifecycle->report_failure(failure, query_id);
+        if (completion) { completion->report_error(failure); }
+      }
+    },
+    delay);
 }
 
 void gpu_pipeline_executor::process_task(
@@ -385,8 +478,20 @@ void gpu_pipeline_executor::process_task(
         reservation->size());
     }
     memory_wait_activity.reset();
-    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
-          gpu_task->local_state())) {
+    if (auto* local_state = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state())) {
+      if (const auto& retry = local_state->collection_retry; retry) {
+        for (const auto& pool : _host_pools) {
+          local_state->host_reservation =
+            memory::try_reserve_host(*pool.space, retry->staging_bytes);
+          if (local_state->host_reservation) { break; }
+        }
+        if (!local_state->host_reservation) {
+          reservation.reset();
+          slot = exec::bounded_thread_pool::slot{};
+          reclaim_host_for_task(*gpu_task, query_id);
+          return;
+        }
+      }
       local_state->set_reservation(std::move(reservation), reservation_info);
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
@@ -504,8 +609,10 @@ void gpu_pipeline_executor::process_task(
               ex.what());
 
             auto intermediate_data = ex.release_intermediate_data();
-            if (auto pipelineable_data =
-                  dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+            auto* host_retry       = dynamic_cast<const host_reschedule_exception*>(&ex);
+            if (auto* pipelineable_data =
+                  dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get());
+                pipelineable_data && !host_retry) {
               // We want to release the read-only lock on the data so that when its added back to
               // the task queue it could be downgraded if needed.
               pipelineable_data->remove_read_only_lock();
@@ -526,6 +633,14 @@ void gpu_pipeline_executor::process_task(
               new_local_state->set_preferred_device_id(
                 cur_local->get_preferred_device_id().value());
             }
+            if (host_retry) {
+              auto pending = cur_local ? cur_local->collection_retry : std::nullopt;
+              new_local_state->collection_retry =
+                gpu_pipeline_task_local_state::result_collection_retry{
+                  .staging_bytes    = host_retry->staging_bytes,
+                  .reclaim_attempts = pending ? pending->reclaim_attempts : 0};
+              new_local_state->set_preferred_device_id(_memory_space->get_device_id());
+            }
 
             auto new_task_id =
               _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
@@ -537,10 +652,12 @@ void gpu_pipeline_executor::process_task(
             // (cross-GPU processing contention, follow-up #17). 50 ms gives
             // typical SF100 probe tasks time to finish their current work
             // without putting the rescheduled task into a tight busy-spin.
-            std::this_thread::sleep_for(
-              std::chrono::milliseconds(completion && completion->injections
-                                          ? completion->injections->gpu_task_retry_backoff_ms
-                                          : 50));
+            if (!host_retry) {
+              std::this_thread::sleep_for(
+                std::chrono::milliseconds(completion && completion->injections
+                                            ? completion->injections->gpu_task_retry_backoff_ms
+                                            : 50));
+            }
 
             // Schedule the rescheduled task. It goes back through manager_loop()
             // to acquire a fresh reservation before execution.

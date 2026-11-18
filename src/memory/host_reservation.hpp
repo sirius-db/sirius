@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 
 namespace sirius::memory {
 
@@ -36,6 +37,15 @@ namespace sirius::memory {
   const auto blocks = bytes / block + static_cast<std::size_t>(bytes % block != 0);
   if (blocks > space.get_max_memory() / block) { return std::nullopt; }
   return blocks * block;
+}
+
+[[nodiscard]] inline std::size_t host_reservation_headroom(
+  const cucascade::memory::memory_space& space)
+{
+  const auto* resource = space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  const auto used      = resource->get_total_allocated_bytes();
+  const auto limit     = space.get_max_memory();
+  return used < limit ? limit - used : 0;
 }
 
 /// Try to reserve the block-rounded size in a compatible pool.
@@ -58,5 +68,18 @@ namespace sirius::memory {
   }
   return nullptr;
 }
+
+/// A pre-publication miss carrying the exact copy size needed to resume. Admission rounds it for
+/// each candidate pool.
+class host_reservation_required : public std::runtime_error {
+ public:
+  explicit host_reservation_required(std::size_t bytes)
+    : std::runtime_error("Insufficient HOST memory to stage materialized query results"),
+      bytes(bytes)
+  {
+  }
+
+  const std::size_t bytes;
+};
 
 }  // namespace sirius::memory

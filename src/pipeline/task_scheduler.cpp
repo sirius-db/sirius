@@ -85,6 +85,20 @@ task_scheduler::task_scheduler(
   // that is already in _ready_devices.
   _self_publisher.emplace(_task_request_channel.make_publisher());
 
+  auto find_downgrade =
+    [downgrade_executors](cucascade::memory::memory_space_id id) -> parallel::downgrade_executor* {
+    if (downgrade_executors) {
+      for (auto const& executor : *downgrade_executors) {
+        if (executor->get_space_id() == id) { return executor.get(); }
+      }
+    }
+    return nullptr;
+  };
+
+  for (const auto* space : mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    _host_pools.push_back({space, find_downgrade(space->get_id())});
+  }
+
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
@@ -104,17 +118,6 @@ task_scheduler::task_scheduler(
           gpu_executor_cpu_affinity(it->cpu_cores, config.cpu_affinity_list);
       }
     }
-    // Find matching downgrade executor for this GPU space
-    sirius::parallel::downgrade_executor* dg_exec = nullptr;
-    if (downgrade_executors) {
-      for (auto& de : *downgrade_executors) {
-        if (de->get_space_id() == space->get_id()) {
-          dg_exec = de.get();
-          break;
-        }
-      }
-    }
-
     // Pass a publisher so gpu_pipeline_executor can submit task requests
     _gpu_executors.emplace(
       device_id,
@@ -122,8 +125,9 @@ task_scheduler::task_scheduler(
                                               config,
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
-                                              dg_exec,
-                                              _telemetry_context));
+                                              find_downgrade(space->get_id()),
+                                              _telemetry_context,
+                                              _host_pools));
   }
 }
 

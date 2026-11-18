@@ -346,6 +346,77 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
   REQUIRE(row_base == num_rows);
 }
 
+TEST_CASE("An undersized result reservation leaves the whole task unpublished",
+          "[operator][physical_result_collector][shared_context]")
+{
+  const bool positioned = GENERATE(false, true);
+  auto [db_owner, con]  = sirius::make_test_db_and_connection();
+  auto ctx              = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu             = get_default_gpu_space(ctx);
+  REQUIRE(gpu != nullptr);
+  auto hosts = ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+  REQUIRE_FALSE(hosts.empty());
+  auto* host            = const_cast<memory_space*>(hosts.front());
+  const auto block      = host->get_memory_resource_of<Tier::HOST>()->get_block_size();
+  const auto large_rows = block + 1;
+  rmm::cuda_stream stream;
+  auto make_batch = [&](std::size_t rows, int value) {
+    auto column = cudf::make_numeric_column(cudf::data_type(cudf::type_id::INT8),
+                                            static_cast<cudf::size_type>(rows),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            gpu->get_default_allocator());
+    REQUIRE(cudaMemsetAsync(column->mutable_view().data<int8_t>(), value, rows, stream.value()) ==
+            cudaSuccess);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                   *gpu,
+                                   stream,
+                                   telemetry::batch_telemetry_info{});
+  };
+  auto small = make_batch(4, 1);
+  auto large = make_batch(large_rows, 2);
+
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->types = {duckdb::LogicalType::TINYINT};
+  prepared->names = {"value"};
+  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(
+    sirius::from_duckdb_vec(prepared->types), 0);
+  sirius_prepared_statement_data statement(prepared, std::move(plan));
+  sirius::op::sirius_physical_materialized_collector collector(statement, *con.context);
+  auto input = positioned ? pipelineable_operator_data({large}, 7)
+                          : pipelineable_operator_data({small, large});
+
+  auto staging = host->make_reservation_or_null(block);
+  REQUIRE(staging != nullptr);
+  std::vector<std::unique_ptr<reservation>> pressure;
+  for (auto const* space : hosts) {
+    pressure.push_back(
+      const_cast<memory_space*>(space)->make_reservation_upto(space->get_max_memory()));
+  }
+  REQUIRE_THROWS_AS(collector.sink_with_reservation(input, stream, staging),
+                    sirius::memory::host_reservation_required);
+  CHECK(staging == nullptr);
+  pressure.clear();
+
+  REQUIRE_NOTHROW(collector.sink(input, stream));
+  if (positioned) { collector.sink(pipelineable_operator_data({small}, 2), stream); }
+  auto result      = collector.get_result();
+  std::size_t rows = 0;
+  while (auto chunk = result->FetchRaw()) {
+    auto values  = duckdb::FlatVector::GetData<int8_t>(chunk->data[0]);
+    bool correct = true;
+    for (std::size_t i = 0; i < chunk->size(); ++i) {
+      correct &= values[i] == (rows + i < 4 ? 1 : 2);
+    }
+    CHECK(correct);
+    rows += chunk->size();
+  }
+  CHECK(rows == 4 + large_rows);
+}
+
 TEST_CASE("sirius_physical_materialized_collector sink supports concurrent append",
           "[operator][physical_result_collector][concurrent][shared_context]")
 {

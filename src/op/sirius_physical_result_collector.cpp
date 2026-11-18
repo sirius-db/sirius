@@ -166,7 +166,6 @@ void sirius_physical_materialized_collector::sink_with_reservation(
     }
   }
 
-  const cucascade::memory::memory_space* unreserved_host_space = nullptr;
   if (staging_bytes) {
     if (reservation) {
       auto required =
@@ -174,25 +173,10 @@ void sirius_physical_materialized_collector::sink_with_reservation(
       if (!required || reservation->size() < *required) { reservation.reset(); }
     }
     if (!reservation) {
-      auto ctx         = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      auto host_spaces = ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
-      if (host_spaces.empty()) {
-        throw internal_exception(
-          "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
-          "collection");
-      }
-      reservation = memory::try_reserve_host(host_spaces, *staging_bytes);
-      if (!reservation) {
-        // Prefer the pool with the most available memory for the unreserved copy.
-        unreserved_host_space =
-          *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto* a, auto* b) {
-            return a->get_available_memory() < b->get_available_memory();
-          });
-        SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: HOST reservation failed for {} staging bytes. "
-          "Proceeding without a reservation.",
-          *staging_bytes);
-      }
+      auto ctx    = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      reservation = memory::try_reserve_host(
+        ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST), *staging_bytes);
+      if (!reservation) { throw memory::host_reservation_required(*staging_bytes); }
     }
   }
 
@@ -207,14 +191,13 @@ void sirius_physical_materialized_collector::sink_with_reservation(
 
     std::optional<cucascade::read_only_data_batch> result_ro;
     if (data->get_current_tier() == Tier::GPU) {
-      auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
-      auto probe = telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id);
-      auto result_batch =
-        reservation ? ro.clone_to<cucascade::host_data_representation>(
-                        registry, next_batch_id, *reservation, stream, std::move(probe))
-                    : ro.clone_to<cucascade::host_data_representation>(
-                        registry, next_batch_id, unreserved_host_space, stream, std::move(probe));
+      auto result_batch  = ro.clone_to<cucascade::host_data_representation>(
+        sirius::converter_registry::get(),
+        next_batch_id,
+        *reservation,
+        stream,
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
       result_ro = result_batch->to_read_only();
       data      = result_ro->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
