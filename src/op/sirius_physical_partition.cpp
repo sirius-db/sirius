@@ -146,7 +146,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto record_actual_bytes = [&] {
     // Only successful executions contribute to the final projection-error report. In particular,
     // an OOM-rescheduled task must not count the same input once for every attempt.
-    if (_enable_size_estimation && input_batch_ro.get_data()) {
+    if (input_batch_ro.get_data()) {
       _actual_bytes.fetch_add(input_batch_ro.get_data()->get_size_in_bytes(),
                               std::memory_order_relaxed);
     }
@@ -462,6 +462,10 @@ void sirius_physical_partition::on_input_batch_pushed(std::string_view port,
 void sirius_physical_partition::on_finalize_operator()
 {
   if (_input_observer) { _input_observer->finalize_input(); }
+  SIRIUS_LOG_DEBUG("sirius_physical_partition id {} input total: {} bytes, partitions {}",
+                   this->get_operator_id(),
+                   _actual_bytes.load(std::memory_order_relaxed),
+                   layout() ? layout()->placement->num_partitions() : 0);
   if (!_enable_size_estimation) { return; }
   std::lock_guard<std::mutex> guard(lock);
   auto const actual = _actual_bytes.load(std::memory_order_relaxed);

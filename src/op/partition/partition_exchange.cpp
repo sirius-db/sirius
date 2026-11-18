@@ -21,7 +21,9 @@
 #include "pipeline/sirius_pipeline.hpp"  // IWYU pragma: keep
 
 #include <algorithm>
+#include <format>
 #include <stdexcept>
+#include <string>
 
 namespace sirius::op {
 namespace {
@@ -115,16 +117,25 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
       throw std::logic_error("partition exchange inputs must share a placement");
     }
   }
+  std::string received;
+  for (std::size_t i = 0; i < _inputs.size(); ++i) {
+    received += std::format("{}PARTITION {}: {} bytes, {} rows",
+                            i == 0 ? "" : "; ",
+                            _inputs[i]->get_operator_id(),
+                            stats[i].bytes,
+                            stats[i].rows);
+  }
   SIRIUS_LOG_DEBUG(
     "partition_exchange resolved {} inputs on sizing input {}: {} partitions, mode {}, sized from "
-    "{} bytes and {} rows, placement {}",
+    "{} bytes and {} rows, placement {}; received so far: {}",
     _inputs.size(),
     _sizing_input,
     layouts.front().placement->num_partitions(),
     mode_name(layouts.front().mode),
     stats[_sizing_input].bytes,
     stats[_sizing_input].rows,
-    layouts.front().placement->to_string());
+    layouts.front().placement->to_string(),
+    received);
   for (std::size_t i = 0; i < layouts.size(); ++i) {
     _inputs[i]->set_layout(std::move(layouts[i]));
   }
