@@ -101,6 +101,7 @@ class gpu_aggregate_impl {
    *        split is faster with few groups and slower with very many (see
    *        sirius_physical_grouped_aggregate::split_wide_sum_max_groups).
    * @param[out] num_groups If not null, receives the number of groups in the output.
+   * @param enable_low_cardinality_groupby Query policy for the specialized aggregation kernel.
    *
    * @return The output data batch: the group keys, one column per aggregate, then the carried
    * columns.
@@ -118,7 +119,8 @@ class gpu_aggregate_impl {
     const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
     const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
     bool split_wide_integer_sums                                             = false,
-    cudf::size_type* num_groups                                              = nullptr);
+    cudf::size_type* num_groups                                              = nullptr,
+    bool enable_low_cardinality_groupby                                      = true);
 
   /**
    * @brief Perform local grouped aggregate over several grouping sets on the input data batch.
@@ -126,6 +128,10 @@ class gpu_aggregate_impl {
    * This is the local step of ROLLUP, CUBE and GROUPING SETS. It works in two steps:
    * 1. Aggregate the batch grouped by all keys in `group_idx`, like `local_grouped_aggregate()`.
    * 2. For each grouping set, aggregate that result again grouped by only the keys in the set.
+   *    Sets are computed in decreasing order of key count, and each starts from the smallest
+   *    already-computed result whose keys contain its own (for ROLLUP, the level above it).
+   *    STRING keys that step 1 dictionary-encodes stay as INT32 codes through these
+   *    re-aggregations and are decoded once per set.
    *
    * For example, with keys `(a, b)` and `ROLLUP(a, b)`, the output has these rows:
    * - set `{a, b}`, set id 0: one row per `(a, b)`, as in step 1
@@ -173,7 +179,8 @@ class gpu_aggregate_impl {
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info                    = {},
     const std::vector<std::optional<std::uint64_t>>& aggregate_input_max_abs = {},
-    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {});
+    const std::vector<bool>& aggregate_is_wide_integer_sum                   = {},
+    bool enable_low_cardinality_groupby                                      = true);
 };
 
 }  // namespace op

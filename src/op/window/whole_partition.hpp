@@ -30,16 +30,6 @@
 
 namespace sirius::op {
 
-/// 10^@p digits as a signed 128 bit integer.
-constexpr __int128_t int128_pow10(int digits)
-{
-  __int128_t value = 1;
-  for (int i = 0; i < digits; ++i) {
-    value *= 10;
-  }
-  return value;
-}
-
 /**
  * @brief One aggregate to evaluate over the whole partition.
  */

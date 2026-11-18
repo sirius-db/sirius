@@ -20,6 +20,10 @@ namespace duckdb {
 class LogicalOperator;
 }  // namespace duckdb
 
+namespace sirius {
+struct operator_params;
+}  // namespace sirius
+
 namespace sirius::planner {
 
 /**
@@ -35,5 +39,22 @@ namespace sirius::planner {
  * This admits build evidence only; it does not resolve CTE producers or move filter targets.
  */
 [[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
+
+/**
+ * @brief Tests for a SEMI or ANTI comparison join (either side variant) in the subtree.
+ *
+ * Such a join only removes rows, so it reduces the build like a filter does. DuckDB's join-filter
+ * test does not count it; without this, a table reduced only by a join (the shape
+ * `delim_join_as_cte` gives a correlated subquery's domain) publishes no filter.
+ */
+[[nodiscard]] bool build_subtree_has_filtering_join(duckdb::LogicalOperator const& op);
+
+/**
+ * @brief Whether a RIGHT_SEMI or RIGHT_ANTI join can publish dynamic filters under @p params.
+ *
+ * Such a join sizes its partitions from the whole probe input, so its filters must be out before
+ * the probe is read. That takes dynamic filters, Bloom accumulation and a non-zero Bloom budget.
+ */
+[[nodiscard]] bool right_family_publication_enabled(sirius::operator_params const& params);
 
 }  // namespace sirius::planner

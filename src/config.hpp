@@ -16,27 +16,13 @@
 
 #pragma once
 
-#include <cstdint>
 #include <mutex>
 #include <string>
 
 namespace duckdb {
 
-// If you are adding a new field to this struct, then you also need to make the following changes:
-// * Specify the default value in config.cpp
-// * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp
-// for examples)
+/// Process-wide logging settings; defaults live in config.cpp.
 struct Config {
-  // For duckdb scan task:
-  //  - the default batch size
-  // TODO: probably want to use sirius config for this value
-  static uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE;
-
-  // For sort partitioning:
-  //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
-  static uint64_t MAX_SORT_PARTITION_BYTES;
-
-  // Logging configuration
   inline static std::recursive_mutex logging_mutex;
   static std::string LOG_BACKEND;
   static std::string LOG_LEVEL;
@@ -45,15 +31,3 @@ struct Config {
 };
 
 }  // namespace duckdb
-
-namespace sirius {
-
-struct Config {
-  static const uint64_t NUM_GPU_EXECUTOR_THREADS         = 2;
-  static const uint64_t NUM_PIPELINE_EXECUTOR_THREADS    = 1;
-  static const uint64_t NUM_DUCKDB_SCAN_EXECUTOR_THREADS = 2;
-  static const uint64_t NUM_DOWNGRADE_EXECUTOR_THREADS   = 1;
-  static const uint64_t NUM_GPU                          = 1;
-};
-
-}  // namespace sirius
