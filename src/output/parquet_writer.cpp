@@ -86,12 +86,12 @@ cudf::column_view parquet_view(parquet_field const& field,
   bool const small_decimal = field.type.is_decimal() && field.type.decimal_precision() <= 4 &&
                              column.type().id() == cudf::type_id::INT16;
   bool const decimal = field.type.is_decimal() && cudf::is_fixed_point(column.type());
-  // Decimal carrier widths may differ before normalization; the scale must not.
+  // Decimal carriers may be wider than the declared precision (e.g. INT64-backed
+  // Parquet DECIMAL(9,s)). Preserve that exact representation; the scale must match.
   // Every other input must already have the declared physical type, including
   // nested children. Reject mismatches before constructing metadata or files.
   if ((!small_decimal && !decimal && column.type() != expected) ||
-      (decimal && (column.type().scale() != expected.scale() ||
-                   cudf::size_of(column.type()) > cudf::size_of(expected))))
+      (decimal && column.type().scale() != expected.scale()))
     throw std::runtime_error("Parquet export physical type mismatch for field: " + field.name);
   bool const list = field.type.id() == type_id::LIST || field.type.id() == type_id::ARRAY;
   if (column.num_children() !=
@@ -123,7 +123,7 @@ cudf::column_view parquet_view(parquet_field const& field,
   }
   // Aggregate fast paths can retain DECIMAL64 for a declared DECIMAL(38,s).
   // Footer precision must fit the physical carrier even when all actual values
-  // are small. Widen recursively; wider-than-declared carriers were rejected above.
+  // are small. Widen recursively without narrowing an already wider carrier.
   if (field.type.is_decimal() && cudf::is_fixed_point(column.type())) {
     auto const required = physical_type(field.type);
     if (cudf::size_of(column.type()) < cudf::size_of(required)) {

@@ -8,6 +8,7 @@
 #include "utils/gpu_execution_fixture.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -247,7 +248,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
-                 "Parquet writer rejects mismatched physical types before opening a file",
+                 "Parquet writer validates physical types before opening output",
                  "[parquet_export_gpu][integration][copy_schema_check]")
 {
   export_directory root;
@@ -274,12 +275,95 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   }
   sirius::output::parquet_export_spec spec;
   spec.fields = {field};
+  if (kind == 3) {
+    REQUIRE_NOTHROW(sirius::output::write_parquet_part(spec,
+                                                       cudf::table_view({column->view()}),
+                                                       root.path / "compatible.parquet",
+                                                       cudf::get_default_stream()));
+    REQUIRE(std::filesystem::exists(root.path / "compatible.parquet"));
+    return;
+  }
   REQUIRE_THROWS_WITH(sirius::output::write_parquet_part(spec,
                                                          cudf::table_view({column->view()}),
                                                          root.path / "invalid.parquet",
                                                          cudf::get_default_stream()),
                       Catch::Matchers::ContainsSubstring("physical type mismatch"));
   REQUIRE_FALSE(std::filesystem::exists(root.path / "invalid.parquet"));
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "GPU COPY preserves wide Parquet decimal carriers and logical precision",
+                 "[parquet_export_gpu][integration][parquet_wide_decimal]")
+{
+  export_directory root;
+  auto const source_type = GENERATE(cudf::type_id::DECIMAL64, cudf::type_id::DECIMAL128);
+  auto column =
+    cudf::make_fixed_point_column(cudf::data_type{source_type, -2}, 6, cudf::mask_state::ALL_NULL);
+  int64_t const values[] = {999999999, -999999999, 123, -456, 0, 0};
+  __int128_t wide_values[6];
+  std::copy(std::begin(values), std::end(values), std::begin(wide_values));
+  auto const* data = source_type == cudf::type_id::DECIMAL64
+                       ? static_cast<void const*>(values)
+                       : static_cast<void const*>(wide_values);
+  auto const bytes = source_type == cudf::type_id::DECIMAL64 ? sizeof(values) : sizeof(wide_values);
+  REQUIRE(cudaMemcpy(column->mutable_view().head<void>(), data, bytes, cudaMemcpyHostToDevice) ==
+          cudaSuccess);
+  cudf::bitmask_type const mask = 31;
+  REQUIRE(
+    cudaMemcpy(column->mutable_view().null_mask(), &mask, sizeof(mask), cudaMemcpyHostToDevice) ==
+    cudaSuccess);
+  column->set_null_count(1);
+  // Seed independently of the Sirius writer under test. cuDF uses the column's
+  // width for physical storage and the explicit metadata for logical precision.
+  cudf::table_view table({column->view()});
+  cudf::io::table_input_metadata metadata(table);
+  metadata.column_metadata[0].set_name("d").set_decimal_precision(9).set_nullability(true);
+  auto options = cudf::io::parquet_writer_options::builder(
+                   cudf::io::sink_info((root.path / "input.parquet").string()), table)
+                   .metadata(std::move(metadata))
+                   .build();
+  cudf::io::write_parquet(options);
+  run_ok("SET gpu_execution=false");
+  auto input_schema = con->Query("SELECT type, precision, scale FROM parquet_schema(" +
+                                 quote(root.path / "input.parquet") + ") WHERE name='d'");
+  REQUIRE_FALSE(input_schema->HasError());
+  auto const expected_physical =
+    source_type == cudf::type_id::DECIMAL64 ? "INT64" : "FIXED_LEN_BYTE_ARRAY";
+  REQUIRE(sirius::test::collect_rows(*input_schema) ==
+          std::vector<std::vector<std::string>>{{expected_physical, "9", "2"}});
+  for (bool empty : {false, true}) {
+    auto const cpu   = root.path / (empty ? "cpu_empty" : "cpu");
+    auto const gpu   = root.path / (empty ? "gpu_empty" : "gpu");
+    auto const query = "SELECT d FROM read_parquet(" + quote(root.path / "input.parquet") + ")" +
+                       (empty ? " WHERE false" : "");
+    run_ok("SET gpu_execution=false");
+    run_ok("COPY (" + query + ") TO " + quote(cpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    run_ok("SET gpu_execution=true");
+    run_ok("SET enable_duckdb_fallback=false");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    run_ok("COPY (" + query + ") TO " + quote(gpu) + " (FORMAT PARQUET, PER_THREAD_OUTPUT true)");
+    auto const after = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(after.executions == before.executions + 1);
+    REQUIRE(after.fallbacks == before.fallbacks);
+    REQUIRE(after.runtime_fallbacks == before.runtime_fallbacks);
+    run_ok("SET gpu_execution=false");
+    for (auto const* prefix : {"SELECT * FROM ", "DESCRIBE SELECT * FROM "}) {
+      auto cpu_result =
+        con->Query(std::string(prefix) + "read_parquet(" + quote(cpu / "*.parquet") + ")");
+      auto gpu_result =
+        con->Query(std::string(prefix) + "read_parquet(" + quote(gpu / "*.parquet") + ")");
+      REQUIRE_FALSE(cpu_result->HasError());
+      REQUIRE_FALSE(gpu_result->HasError());
+      REQUIRE(sirius::test::collect_rows(*cpu_result) == sirius::test::collect_rows(*gpu_result));
+    }
+    // A nonresident scan passes the wide cuDF carrier through to COPY. Empty
+    // output uses its schema-only DECIMAL32 column; both retain SQL DECIMAL(9,2).
+    auto output_schema = con->Query("SELECT type, precision, scale FROM parquet_schema(" +
+                                    quote(gpu / "*.parquet") + ") WHERE name='d'");
+    REQUIRE_FALSE(output_schema->HasError());
+    REQUIRE(sirius::test::collect_rows(*output_schema) ==
+            std::vector<std::vector<std::string>>{{empty ? "INT32" : expected_physical, "9", "2"}});
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
