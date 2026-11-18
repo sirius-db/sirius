@@ -79,7 +79,7 @@ mask_buffer make_mask(std::size_t bytes,
   return mask_buffer{
     stream,
     mr,
-    (bytes / sizeof(cudf::bitmask_type)) + (bytes % sizeof(cudf::bitmask_type) != 0),
+    (bytes / sizeof(mask_buffer::value_type)) + (bytes % sizeof(mask_buffer::value_type) != 0),
     ::cuda::no_init};
 #else
   return mask_buffer{bytes, stream, mr};
