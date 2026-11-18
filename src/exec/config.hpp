@@ -27,8 +27,7 @@ namespace sirius::exec {
 using cucascade::exec::default_gpu_pipeline_num_threads;
 using cucascade::exec::thread_pool_config;
 
-/// Default downgrade pool size. The scan-manager pool takes the cores these leave over
-/// (see scan_manager::default_scan_manager_num_threads).
+/// Unresolved downgrade fallback; hardware resolution derives the configured default.
 inline constexpr int default_downgrade_num_threads = 1;
 
 /// Configuration for the downgrade executor.

@@ -1,13 +1,16 @@
 target_sources(
   sirius_objects
-  PRIVATE connector_registry.cpp
+  PRIVATE aggregate_binding.cpp
+          connector_registry.cpp
           decimal_sum_input_bounds.cpp
           delim_cte_proof.cpp
+          delim_cte_rewrites.cpp
           late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
           dynamic_filter/dynamic_filter_key_admission.cpp
           dynamic_filter/dynamic_filter_target_discovery.cpp
+          distributed_plan.cpp
           gpu_admission.cpp
           join_implied_filters.cpp
           join_key_nullability.cpp
@@ -32,10 +35,12 @@ target_sources(
           sirius_plan_exists_rewrite.cpp
           sirius_plan_expression_get.cpp
           sirius_plan_filter.cpp
+          sirius_plan_flat_tree.cpp
           sirius_plan_get.cpp
           sirius_plan_limit.cpp
           sirius_plan_narrowing_policy.cpp
           sirius_plan_order.cpp
+          sirius_plan_partial_aggregate_pushdown.cpp
           sirius_plan_projection.cpp
           sirius_plan_projection_utils.cpp
           sirius_plan_recursive_cte.cpp

@@ -42,6 +42,7 @@
 #include "planner/query.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -252,11 +253,11 @@ struct cached_databatch_provider : public databatch_provider {
   /// ids would then address rows the batch no longer holds.
   void prepare_origin_annotation()
   {
-    if (!late_mat::late_mat_enabled()) { return; }
+    // Origins are pin metadata; query-local policy controls whether a ride is installed.
     // A scan that is not stamped looks exactly like one that is stamped and
     // never used, so each refusal says which one it was.
-    auto const decline = [](char const* why) {
-      if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+    auto const decline = [this](char const* why) {
+      if (_pushdown_req.fused_scan.diagnostics) {
         std::fprintf(stderr, "sirius: late-mat origin not stamped: %s\n", why);
       }
     };
@@ -283,7 +284,7 @@ struct cached_databatch_provider : public databatch_provider {
       _chunk_row_start[c + 1] = _chunk_row_start[c] + pinned_chunk_rows(_entry, c);
     }
     _origin_columns = std::move(columns);
-    if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+    if (_pushdown_req.fused_scan.diagnostics) {
       std::fprintf(stderr,
                    "sirius: late-mat origin stamped: chunks=%zu rows=%lld columns=%zu\n",
                    chunk_count,
@@ -351,10 +352,13 @@ struct cached_databatch_provider : public databatch_provider {
   void attach_memberships(Representation& projected,
                           std::vector<op::scan::applied_entry>& history) const
   {
-    // The MVCC mask is already attached. Keep the provider defaults for prefetch;
-    // scan_operator_input::prepare_for_processing applies the split policy if conversion is still
-    // pending.
-    op::scan::attach_membership_probes(projected, _consumer.get(), {}, history);
+    // Prefetch may decode before a scan worker sees the split, so it must carry the same policy.
+    op::scan::attach_membership_probes(
+      projected,
+      _consumer.get(),
+      {.enable_fused_scan_filter = _pushdown_req.enable_fused_scan_filter,
+       .fused_scan               = _pushdown_req.fused_scan},
+      history);
   }
 
   std::shared_ptr<cucascade::data_batch> get_host_databatch(
@@ -367,7 +371,8 @@ struct cached_databatch_provider : public databatch_provider {
       auto projected = compressed->select_columns(_column_indices);
       // The host payload's plans become available after reconstruction. Attach only to
       // this query's projection; the converter narrows the request against those plans.
-      if (!_pushdown_req.empty()) {
+      if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter ||
+          _pushdown_req.fused_scan.diagnostics) {
         projected->set_pushdown_scan(
           std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req));
       }
@@ -408,7 +413,8 @@ struct cached_databatch_provider : public databatch_provider {
         // dropping stays on for a masked chunk: the mask attached below is ANDed into the
         // same selection, so the compacted rows are the visible ones.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
-        if (!_pushdown_req.empty()) {
+        if (!_pushdown_req.empty() || !_pushdown_req.enable_fused_scan_filter ||
+            _pushdown_req.fused_scan.diagnostics) {
           auto const scan =
             std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices);
@@ -854,7 +860,7 @@ std::optional<std::string> admit_group_key_extension(
 }
 
 /// Complete and install one pinned scan's deferral, or leave the plan alone and
-/// say why (env gate: SIRIUS_EXP_LATE_MAT).
+/// say why (query setting: enable_late_materialization).
 ///
 /// The plan side weighs the ride; only here is it known whether this scan's rows
 /// are ADDRESSABLE — a pin-order id means something exactly when a served batch
@@ -889,7 +895,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
                                               bool serves_whole_chunks,
                                               std::size_t gpu_space_count)
 {
-  if (!late_mat::late_mat_enabled()) { return {}; }
+  if (!scan_op.operator_options().enable_late_materialization) { return {}; }
   // An uninstalled deferral looks exactly like one that installed and did
   // nothing, so every refusal says which it was.
   auto const decline = [&scan_op](std::string_view why) {
@@ -949,10 +955,13 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // A bundle whose pinned columns are COMPRESSED is worth more than its ride
   // alone once the scan can skip decoding what it replaces with a rowid, so it
   // gets its own floor. The two are the same number until someone measures the
-  // difference (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED).
+  // difference (late_materialization_min_value_compressed).
   late_mat::defer_policy policy;
+  auto const& options           = scan_op.operator_options();
+  policy.min_boundaries         = options.late_materialization_min_boundaries;
+  policy.min_value_x_boundaries = options.late_materialization_min_value_x_boundaries;
   if (has_compressed_chunk) {
-    policy.min_value_bytes = late_mat::min_value_bytes_compressed(policy.min_value_bytes);
+    policy.min_value_bytes = options.late_materialization_min_value_compressed;
   }
   auto const planned = sirius::planner::plan_deferral(scan_op, policy);
   for (auto const& outcome : planned.census) {
@@ -982,7 +991,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // must hold, and the second is the one the plan pass cannot see: the pinned
   // values must carry no nulls, or counting a rowid that is never null would
   // count rows COUNT(col) skips.
-  if (late_mat::count_on_deferred_enabled() && planned.count_only_bundle) {
+  if (options.late_materialization_count_defer && planned.count_only_bundle) {
     bool null_free = true;
     for (auto const position : planned.positions) {
       if (position >= selected_columns.size()) {
@@ -1234,10 +1243,11 @@ struct installed_ride {
 void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
                              std::vector<installed_ride> const& rides)
 {
-  if (!late_mat::late_mat_enabled() || candidates.empty()) { return; }
+  if (candidates.empty()) { return; }
 
   for (auto const& candidate : candidates) {
-    auto& scan_op      = *candidate.scan;
+    auto& scan_op = *candidate.scan;
+    if (!scan_op.operator_options().enable_late_materialization) { continue; }
     auto const& entry  = *candidate.entry;
     auto const decline = [&scan_op](std::string_view why) {
       SIRIUS_LOG_INFO(
@@ -1248,7 +1258,10 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
     // must still repay is its own rowid.
     // A rider repays only its own rowid: it joins a ride somebody else already
     // argued for, so the floor that prices INSTALLING one does not apply.
-    late_mat::defer_policy const rider_policy{.min_value_bytes = 1, .min_value_x_boundaries = 0};
+    late_mat::defer_policy const rider_policy{
+      .min_value_bytes        = 1,
+      .min_value_x_boundaries = 0,
+      .min_boundaries         = scan_op.operator_options().late_materialization_min_boundaries};
     auto const planned = sirius::planner::plan_deferral(scan_op, rider_policy);
     if (!planned.installable() || !planned.group_extension.has_value()) { continue; }
     auto const& extension = *planned.group_extension;
@@ -1865,7 +1878,8 @@ void sirius_scan_manager::prepare_for_query(
   // order, `nation` is listed before `customer`, and its 16 B/row ride would otherwise shut out
   // customer's 96 B/row one. Ties keep the listed order. Only the visiting order changes; every
   // scan is still visited exactly once.
-  if (late_mat::late_mat_enabled() && cached_assignments.size() > 1) {
+  if (cached_assignments.size() > 1 &&
+      cached_assignments.front().op->operator_options().enable_late_materialization) {
     std::vector<std::pair<std::int64_t, std::size_t>> saving_and_index;
     saving_and_index.reserve(cached_assignments.size());
     for (std::size_t index = 0; index < cached_assignments.size(); ++index) {
@@ -1962,7 +1976,10 @@ void sirius_scan_manager::prepare_for_query(
     auto const& ingestible = assignment.op->get_ingestible();
     auto pushdown_req      = sirius::op::build_pushdown_request(
       ingestible.filter_analysis(), slot_map, ingestible.output_prefix_width());
-    if (!sirius::decompression_pushdown_enabled()) {
+    pushdown_req.enable_fused_scan_filter =
+      assignment.op->operator_options().enable_fused_scan_filter;
+    pushdown_req.fused_scan = assignment.op->operator_options().fused_scan;
+    if (!assignment.op->operator_options().enable_fused_scan_filter) {
       // Answering an equality off a dictionary is independent of the gate; row
       // dropping is not, so give it up when the gate is off.
       auto const unfiltered =
@@ -1996,7 +2013,7 @@ void sirius_scan_manager::prepare_for_query(
     auto& assignment = cached_assignments[i];
     auto& inputs     = provider_inputs_by_assignment[i];
     auto consumer    = assignment.op->decode_consumer();
-    if (sirius::decompression_pushdown_enabled()) {
+    if (assignment.op->operator_options().enable_fused_scan_filter) {
       if (assignment.op->consumer() && !consumer) {
         SIRIUS_LOG_INFO(
           "[late-mat] operator {}: dynamic decode attachments withheld — deferral addresses whole "
@@ -2004,6 +2021,7 @@ void sirius_scan_manager::prepare_for_query(
           assignment.op->get_operator_id());
       }
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        assignment.op->operator_options().fused_scan.diagnostics,
         "[decompression-pushdown] entry '{}': consumer={} request: {} slot(s), "
         "covers_whole_filter={}",
         assignment.entry_name,
@@ -3078,10 +3096,12 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Merge only pins for the same source and row coverage. Shape checks alone
-    // cannot distinguish equally sized tables.
+    // Merge only pins for the same source and row coverage. Device-chunked GPU
+    // entries must be replaced when an automatic re-pin falls back to raw storage.
+    // Shape checks alone cannot distinguish equally sized tables.
     if (existing_it->second->cache_info.same_source_as(cache_info) &&
-        existing_it->second->num_rows == new_num_rows) {
+        existing_it->second->num_rows == new_num_rows &&
+        existing_it->second->device_chunks.empty()) {
       // SQL re-pin holds exclusive maintenance. Preserve the direct API's existing
       // refusal while readers borrow this generation; online replacement is not enabled.
       if (existing_it->second.use_count() > 1) {
@@ -3426,7 +3446,9 @@ void sirius_scan_manager::insert_pinned_entry_device(
   std::vector<sirius::device_pin_chunk> chunks,
   cucascade::memory::memory_space& memory_space,
   sirius::pinned_column_storage_matrix column_storage,
-  pinned_entry_metadata metadata)
+  pinned_entry_metadata metadata,
+  duckdb::vector<duckdb::LogicalType> column_types,
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
   validate_declared_unique_columns(cache_info, metadata);
@@ -3458,6 +3480,18 @@ void sirius_scan_manager::insert_pinned_entry_device(
       return chunks[chunk].columns[column]->type();
     });
 
+  // Compression changes the payload representation, not the validity of the
+  // native min/max capture. Preserve it just as the raw and host pin paths do.
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
+  auto pin_zone_maps        = pinned_zone_maps::from_capture(
+    std::move(column_types), std::move(chunk_stats), column_count, chunks.size());
+  if (stats_supplied && !pin_zone_maps.has_stats()) {
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry_device] zone-map capture shape mismatch; "
+      "pinning '{}' without statistics",
+      name);
+  }
+
   pinned_entry entry;
   entry.cache_info     = std::move(cache_info);
   entry.tier           = cucascade::memory::Tier::GPU;
@@ -3465,6 +3499,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   entry.num_rows       = new_num_rows;
   entry.device_chunks  = std::move(chunks);
   entry.column_storage = std::move(column_storage);
+  entry.zone_maps      = std::move(pin_zone_maps);
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::insert_pinned_entry_device] '{}' chunks={} rows={}",
                    name,
@@ -3504,7 +3539,8 @@ void sirius_scan_manager::publish_pinned_entry(const std::string& name, pinned_e
 {
   // Caller holds the registry lock. Allocate all fallible metadata before publication.
   auto generation = std::make_shared<pinned_entry>(std::move(entry));
-  if (late_mat::late_mat_enabled()) {
+  // Pins can be shared by connections with different query policies. Always retain the handle.
+  {
     auto handle = std::make_shared<late_mat::pin_entry_handle>(
       name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
     handle->set_entry(generation);
@@ -3742,49 +3778,6 @@ sirius_scan_manager::find_pinned_entries_for_parquet_files(
     if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { matches.push_back(entry); }
   }
   return matches;
-}
-
-std::vector<int> sirius_scan_manager::compressed_gpu_pin_owner_devices(
-  const op::scan::ingestible_table_info& table_info) const
-{
-  // Snapshot owners, then match outside the lock: the parquet matcher canonicalizes paths.
-  std::vector<std::shared_ptr<const pinned_entry>> snapshot;
-  {
-    std::lock_guard pin_lk{_pinned_entries_mutex};
-    snapshot.reserve(_pinned_entries.size());
-    for (auto const& [name, entry] : _pinned_entries) {
-      if (entry->tier == cucascade::memory::Tier::GPU && !entry->device_chunks.empty()) {
-        snapshot.push_back(entry);
-      }
-    }
-  }
-
-  // The same identity calls as cache_entry_info::can_serve_with_columns, without its column
-  // and visibility gates, so every entry try_match_cached_entry can pick is matched here.
-  auto const same_source = [&table_info](cache_entry_info const& cached) {
-    if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_parquet_files(p->resolved_file_paths);
-    }
-    if (auto const* d =
-          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info)) {
-      return cached.matches_duckdb_table(
-        d->catalog_name, d->schema_name, d->table_name, d->table_identity);
-    }
-    return false;
-  };
-
-  std::vector<int> owners;
-  for (auto const& entry : snapshot) {
-    if (!same_source(entry->cache_info)) { continue; }
-    for (auto const& chunk : entry->device_chunks) {
-      if (chunk.compressed) {
-        owners.push_back(chunk.compressed->get_memory_space().get_device_id());
-      }
-    }
-  }
-  std::ranges::sort(owners);
-  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
-  return owners;
 }
 
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,

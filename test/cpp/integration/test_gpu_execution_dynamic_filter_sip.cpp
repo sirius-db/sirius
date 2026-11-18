@@ -523,6 +523,46 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - a converted join built on its outer side keeps results",
+                 "[integration][gpu_execution][dynamic_filter][mark_conversion]")
+{
+  run_ok("SET gpu_execution = false;");
+  run_ok(
+    "CREATE TABLE parts AS SELECT (range % 50)::INTEGER AS pk, "
+    "concat('p', range % 3) AS pname FROM range(100);");
+  run_ok("INSERT INTO parts VALUES (NULL, 'p1'), (NULL, 'p2'), (1, NULL);");
+  // Large enough that DuckDB estimates the subquery at several times the outer rows.
+  run_ok(
+    "CREATE TABLE items AS SELECT range::INTEGER AS id, (range % 60)::INTEGER AS fk, "
+    "(range % 5)::INTEGER AS qty FROM range(30000);");
+  run_ok("INSERT INTO items VALUES (30000, NULL, 1), (30001, 1, NULL), (30002, NULL, NULL);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_sirius_setting native_cte(*con, "delim_join_as_cte", true);
+  sirius::test::scoped_sirius_setting accumulation(
+    *con, "enable_dynamic_filter_multi_partition", true);
+  // TPC-Havoc Q05_V01 shape: the correlated scalar subquery makes a delim CTE of the outer rows,
+  // and the (NOT) EXISTS over the larger `items` sits in that CTE's body, with the filtered
+  // `parts` as its outer side. An item's qty is its fk modulo 5, so the subquery keeps some keys
+  // and drops others; both tables hold NULL keys.
+  std::string const predicate = GENERATE("EXISTS", "NOT EXISTS");
+  CAPTURE(predicate);
+  std::string const query =
+    "SELECT p.pk, (SELECT sum(i2.qty) FROM items i2 WHERE i2.fk = p.pk) FROM parts p "
+    "WHERE p.pname = 'p1' AND " +
+    predicate + " (SELECT 1 FROM items i WHERE i.fk = p.pk AND i.qty > 1)";
+
+  auto const deltas = require_switch_result_equivalence(*con, query);
+  // Only a RIGHT_SEMI or RIGHT_ANTI join publishes from the stage ahead of its build partition,
+  // so this counter shows that the join was flipped, and that it was not with filters off.
+  REQUIRE(deltas.off.accumulation_publications_finished == 0);
+  REQUIRE(deltas.on.accumulation_publications_finished > 0);
+
+  dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - DuckDB's semi join into a delim CTE keeps results",
                  "[integration][gpu_execution][dynamic_filter][delim_cte_proof]")
 {

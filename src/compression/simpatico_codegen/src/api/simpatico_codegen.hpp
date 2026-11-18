@@ -220,7 +220,7 @@ std::unique_ptr<cudf::table> decompress(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 /// Decompress a column subset with the caller's row filter applied DURING the
-/// decode (experimental, env gate SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request
+/// decode (experimental, query policy enable_fused_scan_filter). @p request
 /// carries the conjuncts a decode can resolve plus the output shape tag per
 /// selected column (see codegen/selection/selection.hpp).
 ///

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "simpatico_codegen/src/codegen/selection/decompression_pushdown_policy.hpp"
+
 #include <cudf/types.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -65,8 +67,8 @@ namespace sirius {
 // chunk can honour is decided per chunk, inside — the scan never inspects a
 // compression plan and never names a kernel.
 //
-// The mechanism is experimental and gated on SIRIUS_EXP_FUSED_SCAN_FILTER;
-// with the gate off every request is simply left unapplied, which is
+// The query's enable_fused_scan_filter policy travels with each request;
+// when disabled every request is simply left unapplied, which is
 // indistinguishable from an ordinary decompress.
 
 /// Inclusive bounds in the DECODED integer domain — the values a decoder
@@ -141,6 +143,9 @@ struct membership_measurement_request {
 /// fresher join-filter set, or dropping the row selection once measured
 /// unprofitable) are made by copy — see @ref decompression_pushdown_scan.
 struct pushdown_request {
+  /// Query-local master policy; retained even when this request has no predicates.
+  bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   /// One selected column's share of the filter. Entries are parallel to the
   /// column list the decode is asked for; a shorter vector leaves the tail
   /// unfiltered.
@@ -369,6 +374,8 @@ class decompression_pushdown_scan {
     /// columns). False when a column is exempt from that ceiling, in which case
     /// the reservation must cover the full width.
     bool survivors_bounded = false;
+    /// The request's surviving-row ceiling, capped at full width for thresholds above one.
+    double max_surviving_fraction = 1.0;
   };
   [[nodiscard]] compaction_forecast forecast_compaction(
     simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const;

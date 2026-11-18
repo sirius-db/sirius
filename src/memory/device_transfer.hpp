@@ -17,6 +17,7 @@
 #pragma once
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda/stream>
 
@@ -37,6 +38,18 @@ using transfer_readiness = std::variant<source_already_complete, cucascade::cuda
 
 enum class device_transfer_route { none, local, peer_copy, host_staging };
 enum class device_transfer_policy { automatic, force_host_staging };
+
+/**
+ * @brief The pinned HOST memory a staged copy needs could not be allocated
+ *
+ * It is an rmm::out_of_memory, so a caller that retries on out-of-memory still retries. The
+ * memory that ran out is the staging HOST space, not either GPU, so a caller that sizes GPU
+ * reservations from out-of-memory failures should not grow them for this one.
+ */
+class host_staging_out_of_memory : public rmm::out_of_memory {
+ public:
+  using rmm::out_of_memory::out_of_memory;
+};
 
 /**
  * @brief Copies device bytes using a granted source pool or managed pinned HOST staging
@@ -62,6 +75,7 @@ enum class device_transfer_policy { automatic, force_host_staging };
  *
  * @throw std::invalid_argument if byte extents, memory spaces, or destination stream do not match
  * @throw std::runtime_error if required HOST staging is unavailable
+ * @throw host_staging_out_of_memory if @p host_staging_space cannot supply the staging blocks
  */
 [[nodiscard]] device_transfer_route enqueue_device_copy(
   std::span<std::byte> destination,

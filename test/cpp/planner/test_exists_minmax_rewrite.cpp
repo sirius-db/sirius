@@ -205,8 +205,10 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   CHECK(rewrites(q21_shape_query) == 2);
 
   auto merged = physical_plan(q21_shape_query);
-  // One LEFT delim join and one aggregate answer both subqueries.
-  CHECK(delim_join_types(merged.get()) == std::vector{duckdb::JoinType::LEFT});
+  // One aggregate answers both subqueries, joined to the outer rows read twice from one CTE.
+  CHECK(delim_join_types(merged.get()).empty());
+  CHECK(collect(merged.get(), T::CTE).size() == 1);
+  CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
 
   set_flag(false);
   auto unrewritten = physical_plan(q21_shape_query);
@@ -279,7 +281,9 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
   CHECK(rewrites(q21_shape_query) == 2);
   auto merged = physical_plan(q21_shape_query);
-  CHECK(delim_join_types(merged.get()) == std::vector{duckdb::JoinType::LEFT});
+  CHECK(delim_join_types(merged.get()).empty());
+  CHECK(collect(merged.get(), T::CTE).size() == 1);
+  CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
   CHECK(collect(merged.get(), T::GPU_SCAN).size() == 2);
 }
 

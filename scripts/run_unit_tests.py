@@ -17,14 +17,9 @@ The run has five steps:
              GPUs visible, skipped when fewer than two are.
   multi_gpu  The [multi_gpu] tests with all GPUs visible. Skipped when fewer
              than two GPUs are visible.
-  late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
-             gate is read once per process, so these tests need a process of
-             their own. The hidden [.late_mat_fused] tests run alone in a
-             second process: they skip when either gate is off, and Catch2
-             fails a run in which every test skipped, so a misconfigured gate
-             fails the step instead of passing unnoticed. That process sets
-             SIRIUS_EXP_FUSED_SCAN_FILTER=1 to override an inherited value; the
-             test binary arms that gate itself only when it is unset.
+  late_mat   The late-materialization tests, followed by the hidden
+             [.late_mat_fused] tests in a separate process. Both optimizations
+             are enabled by default; their master controls are SQL settings.
 
 The run stops after a step that fails. Arguments after -- are Catch2 options
 passed to every process. Every process writes its console output (unittest.log)
@@ -286,17 +281,14 @@ def main() -> int:
                     Job(
                         label=step,
                         cmd=cmd,
-                        env={"SIRIUS_EXP_LATE_MAT": "1"},
+                        env={},
                         log_dir=log_root / step,
                         prefix="[late_mat] ",
                     ),
                     Job(
                         label="late_mat_fused",
                         cmd=fused_cmd,
-                        env={
-                            "SIRIUS_EXP_LATE_MAT": "1",
-                            "SIRIUS_EXP_FUSED_SCAN_FILTER": "1",
-                        },
+                        env={},
                         log_dir=log_root / "late_mat_fused",
                         prefix="[late_mat_fused] ",
                     ),

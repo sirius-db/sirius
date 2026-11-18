@@ -3,12 +3,14 @@
 """Exercise the real loader with CUDA-free backend and driver fixtures."""
 
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
@@ -22,6 +24,60 @@ parser.add_argument("--build-dir", type=Path, required=True)
 args, remaining = parser.parse_known_args()
 args.duckdb = args.duckdb.resolve()
 args.build_dir = args.build_dir.resolve()
+
+
+class Repository(ThreadingHTTPServer):
+    """Serves an extension repository over HTTP with a settable ETag."""
+
+    def __init__(self, root):
+        self.root = root
+        self.etag = '"1"'
+        # ETags of files other than the current builds, by path relative to the root.
+        self.etags = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_HEAD(handler):
+                handler.respond(send_body=False)
+
+            def do_GET(handler):
+                handler.respond(send_body=True)
+
+            def respond(handler, send_body):
+                path = self.root / handler.path.lstrip("/")
+                # Remote installs ask for the .gz name; DuckDB also accepts an uncompressed body.
+                if path.suffix == ".gz":
+                    path = path.with_suffix("")
+                if not path.is_file():
+                    handler.send_error(404)
+                    return
+                etag = self.etags.get(str(path.relative_to(self.root)), self.etag)
+                if handler.headers.get("If-None-Match") == etag:
+                    handler.send_response(304)
+                    handler.send_header("ETag", etag)
+                    handler.end_headers()
+                    return
+                body = path.read_bytes()
+                handler.send_response(200)
+                handler.send_header("ETag", etag)
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                if send_body:
+                    handler.wfile.write(body)
+
+            def log_message(handler, *_):
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+    def stop(self):
+        self.shutdown()
+        self.server_close()
 
 
 class LoaderTests(unittest.TestCase):
@@ -321,21 +377,29 @@ class LoaderTests(unittest.TestCase):
             "Cannot load sirius_cuda13 while sirius_cuda12 is already loaded",
         )
 
-    def test_auto_install_from_repository(self):
+    def repository_with_backend(self, version):
+        """Lays out a local extension repository holding the given test backend."""
         result = self.query(
             "SELECT library_version, source_id, platform FROM pragma_version(), pragma_platform();"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         host = json.loads(result.stdout)[0]
-        version = (
+        version_dir = (
             host["source_id"]
             if "dev" in host["library_version"]
             else host["library_version"]
         )
         repository = self.root / "repository"
-        destination = repository / version / host["platform"] / self.backend(13).name
+        destination = (
+            repository / version_dir / host["platform"] / self.backend(version).name
+        )
         destination.parent.mkdir(parents=True)
-        shutil.copyfile(self.backend(13), destination)
+        shutil.copyfile(self.backend(version), destination)
+        self.revision, self.platform = version_dir, host["platform"]
+        return repository
+
+    def test_auto_install_from_repository(self):
+        repository = self.repository_with_backend(13)
         result = self.query(
             f"SET autoinstall_extension_repository={quote(repository)};"
             f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",
@@ -359,6 +423,65 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
+
+    def test_reports_backend_update(self):
+        server = Repository(self.repository_with_backend(13))
+        self.addCleanup(server.stop)
+        load = (
+            f"SET autoinstall_extension_repository={quote(server.url)};"
+            f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;"
+        )
+        notice = (
+            "Sirius: an update for sirius_cuda13 is available. "
+            "Run UPDATE EXTENSIONS (sirius_cuda13); and restart DuckDB to use it.\n"
+        )
+
+        result = self.query(load, autoinstall=True)
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertIn("Sirius: installed sirius_cuda13", result.stderr)
+
+        # The installed build is current.
+        result = self.query(load, autoinstall=True)
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertEqual(result.stderr, "")
+
+        # A new build is published: LOAD reports it but keeps the installed one.
+        server.etag = '"2"'
+        result = self.query(load, autoinstall=True)
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertEqual(result.stderr, notice)
+
+        # The check is skipped without autoinstall.
+        result = self.query(load)
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertEqual(result.stderr, "")
+
+        # An unreachable repository does not affect LOAD.
+        server.stop()
+        result = self.query(load, autoinstall=True)
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertEqual(result.stderr, "")
+
+    def test_reports_update_for_pinned_version(self):
+        repository = self.repository_with_backend(13)
+        name = self.backend(13).name
+        pinned = Path("sirius_cuda13/v0") / self.revision / self.platform / name
+        (repository / pinned).parent.mkdir(parents=True)
+        shutil.copyfile(self.backend(13), repository / pinned)
+        server = Repository(repository)
+        self.addCleanup(server.stop)
+        server.etags[str(pinned)] = '"v0"'
+        result = self.query(
+            f"FORCE INSTALL sirius_cuda13 FROM {quote(server.url)} VERSION 'v0';"
+            f"SET autoinstall_extension_repository={quote(server.url)};"
+            f"LOAD {quote(self.loader)}; SELECT sirius_test_backend() AS backend;",
+            autoinstall=True,
+        )
+        # The current build differs from the pinned one, as UPDATE EXTENSIONS would find.
+        self.assertEqual(self.rows(result), [{"backend": 13}])
+        self.assertIn(
+            "Sirius: an update for sirius_cuda13 is available.", result.stderr
+        )
 
     def test_loader_has_no_cuda_or_engine_dependency(self):
         result = subprocess.run(
