@@ -3405,7 +3405,8 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     config,
     option_visibility::user,
     "enable_duckdb_fallback",
-    "Whether to enable fallback to duckdb execution after an error is detected",
+    "Allow GPU-candidate statements to fall back to DuckDB on planning or execution failure; "
+    "DuckDB-only statements are unaffected (GPU COPY never replays runtime failures)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
                            // prior connection's SET may have mutated (that leaked the

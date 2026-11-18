@@ -18,13 +18,18 @@ During task execution:
 1. `compute_task()` iterates over **every** operator in `operators`, calling `execute()` on each
 2. `publish_output()` then calls `sink()` on the last operator to push results to downstream ports
 
+The executor stamps optional `delivery_metadata` onto the actual input before each `execute()`
+call. It contains the original task ID and retry count, without a query ID. COPY uses that
+identity within its query-local session to distinguish retries from separate CTE/UNION
+deliveries of the same physical batch. See [Parquet output](parquet-output.md).
+
 An operator's position in a pipeline is determined by `sirius_engine::initialize_internal()`. Many blocking operators appear as both the source (first) of one pipeline and the sink (last) of another — they accumulate data as a sink, then emit results as a source. See the [Operator Summary Table](#operator-summary-table) for the full per-operator breakdown.
 
 ### Key Methods
 
 | Method | Purpose |
 |--------|---------|
-| `execute(input_data, stream)` | Called on **every** operator during `compute_task()` |
+| `execute(input_data, stream)` | Called on **every** operator during `compute_task()`; task delivery metadata is available through `input_data.delivery()` |
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
 | `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
@@ -693,7 +698,7 @@ and decisions belong to concrete consumers. Indexed batch publication is inherit
 ### `sirius_physical_result_collector` / `sirius_physical_materialized_collector` — `RESULT_COLLECTOR`
 **File:** `src/op/sirius_physical_result_collector.hpp`
 
-Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
+Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor uses `is_query_terminal()` to recognize result collection, streaming output, and Parquet COPY completion.
 
 The materialized collector builds local collections in parallel. For positioned input, it combines
 them by ascending position in `get_result()`, independently of task completion order.
@@ -705,7 +710,7 @@ Returns an empty result set for queries with contradicted filters.
 
 ## Operator Summary Table
 
-After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators have `execute()` called during `compute_task()`; only the last operator additionally has `sink()` called via `publish_output()`.
+After pipeline finalization, `source` and `sink` are just aliases for the first and last operator in the `operators` list. All operators enter through `execute()` during `compute_task()` with delivery metadata on their input; only the last operator additionally has `sink()` called via `publish_output()`.
 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
