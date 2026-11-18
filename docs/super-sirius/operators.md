@@ -986,6 +986,10 @@ Each MERGE_SORT logs one line per query at INFO, built by `merge::format_merge_s
 - `refill_bytes_host`, `_disk` and `_compressed` split `refill_bytes` by where a refill read
   from. A GPU-tier batch read through a reader counts in `refill_bytes` only.
 - `runs_read_compressed` counts (run, windowed task) pairs, not distinct runs.
+- `fallback_conversions` counts batches converted whole to the GPU tier: those no row-range
+  reader can serve, and the compressed batches of at most two windows that the merge decodes
+  whole (`compression.spill_whole_decode_max_bytes`). The rows of the latter are sliced in
+  place, so they are in none of the `refill_*` counters and not in `runs_read_compressed`.
 - `shrinks` counts windowed inputs that shrank their window for an OOM retry.
 - The keys and their order are the contract with `test/sort_performance/bench_metrics.py`
   (`test_bench_metrics_source_formats.py` fails when they drift): append new keys at the end.
