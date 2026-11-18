@@ -1245,14 +1245,6 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
 
-/// \brief Throw InvalidInputException unless `delim_join_as_cte` is true on this connection.
-///
-/// Sirius plans only the form DuckDB gives correlated subqueries by default: a materialized CTE
-/// of the outer rows. With the setting off (deprecated in DuckDB) they arrive as delim joins,
-/// which Sirius has no operators for. Call this once the query is known to be one Sirius would
-/// run, so that statements that never reach the GPU, `SET` among them, keep working.
-void require_delim_join_as_cte(ClientContext& context);
-
 /// \brief Read the per-session `like_swar_fastpath` setting (default true).
 bool like_swar_fastpath_enabled(ClientContext& context);
 
