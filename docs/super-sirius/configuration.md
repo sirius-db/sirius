@@ -1371,15 +1371,20 @@ permitted CPU boundary and reports the locality fallback. CPU restrictions do no
 or change memory-binding policy, and ranks sharing a socket are not automatically assigned
 exclusive CPU or memory shares.
 
-Each preparation source selects a stable worker domain from the query's eligible GPU
+Each preparation source selects a stable coalescing domain from the query's eligible GPU
 domains. A manager-wide cursor rotates the starting domain across queries, including
 independent single-source scans; each query rotates within its own eligible GPU-domain set.
 If CPU restrictions leave none of the query's GPU-local domains available, the query uses
 the first permitted manager domain instead. That domain may be remote from all of the
 query's GPUs; CPU restrictions still apply. This exception also applies when a per-query
 GPU limit selects only GPUs whose local domains were excluded.
-Its metadata jobs and Parquet coalescer operations share the source's stable domain. Workers do
-not steal domain-routed jobs from other domains. Final GPU batch placement is unchanged;
+Independent metadata jobs rotate across the query's eligible domains, so a single source
+can use metadata workers in multiple domains. Each whole job executes in its assigned domain;
+plain Parquet creates one metadata job per file. There is no persistent file-to-domain mapping,
+so separate jobs referencing the same file may use different domains. A source's Parquet
+coalescer operations retain their stable domain. Workers do not steal domain-routed jobs from
+other domains. Metadata may therefore be produced in a different domain from its coalescer.
+This routing does not select I/O reactor or driver queues. Final GPU batch placement is unchanged;
 CPU placement does not imply page migration or pin all batches to one GPU.
 
 The query dispatcher alternates pending metadata and coalescing work when both are ready.

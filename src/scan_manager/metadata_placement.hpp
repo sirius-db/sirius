@@ -37,7 +37,7 @@ struct metadata_placement {
 };
 
 // A manager-wide cursor spreads independent attempts across their eligible domains.
-// Rotating only the starting point preserves each source's stable locality and GPU subset.
+// Rotating only the starting point preserves each coalescer's stable locality and GPU subset.
 inline void rotate_metadata_domains(std::vector<int>& domains, std::atomic<size_t>& next)
 {
   if (domains.size() < 2) return;

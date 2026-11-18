@@ -221,7 +221,7 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
     bool output_done = false;
     // Opt-in to worker execution of coalescer calls instead of inline control work.
     bool asynchronous = false;
-    // Stable pool domain shared by this source's metadata and coalescing jobs;
+    // Stable pool domain for this source's coalescing jobs;
     // -1 means unrouted. This is not an OS NUMA node ID.
     int domain = -1;
     // Last completed worker snapshots, used for budgets/deadlines while another
@@ -276,9 +276,10 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
   std::optional<size_t> free_slot;
   std::deque<size_t> ready_results;
   std::vector<source_state> sources;
-  // Pool domain indices eligible for this query's active GPUs; source assignments
-  // rotate across this subset, keeping metadata and coalescing colocated.
+  // Pool domain indices eligible for this query's active GPUs. Metadata jobs
+  // rotate across this subset; each source's coalescer keeps its stable domain.
   std::vector<int> metadata_domains;
+  size_t next_metadata_job_domain = 0;
   std::map<unit_key, std::shared_ptr<preparation_unit>> units;
   std::deque<pending_batch> batches;
   lifecycle phase = lifecycle::constructed;
@@ -1509,15 +1510,23 @@ void preparation_coordinator::state::dispatch_job(
       return;
     }
     if (before_submit) before_submit();
+    int domain = -1;
     {
       std::lock_guard check(gate->mutex);
       gate->check_interrupted();
+      auto const count =
+        metadata_domains.empty() ? dispatcher->num_domains() : metadata_domains.size();
+      if (count) {
+        auto const next = next_metadata_job_domain;
+        domain = metadata_domains.empty() ? static_cast<int>(next) : metadata_domains[next];
+        next_metadata_job_domain = (next + 1) % count;
+      }
     }
     dispatcher->enqueue(
       [submitted = std::move(submitted)]() mutable {
         submitted.ticket->st->execute_job(submitted.work, submitted.ticket);
       },
-      source.domain);
+      domain);
     lock.lock();
   }
 }

@@ -207,7 +207,8 @@ struct fixture {
                    std::optional<preparation_options> options   = std::nullopt,
                    native_reader_executor* native               = nullptr,
                    coordinator_pool* coordinators               = nullptr,
-                   std::vector<std::vector<int>> domains        = {})
+                   std::vector<std::vector<int>> domains        = {},
+                   std::vector<int> metadata_domains            = {})
     : pool(static_cast<int>(workers), "preparation_test", {}, nullptr, std::move(domains)),
       dispatcher(pool),
       coordinator(completion,
@@ -220,7 +221,8 @@ struct fixture {
                                                        0,
                                                        partial_batch_options{50, 20ms, 20ms}}),
                   native,
-                  coordinators)
+                  coordinators,
+                  std::move(metadata_domains))
   {
     coordinator.after_publication_for_testing(
       [this](size_t id, auto const& metadata, size_t bytes) {

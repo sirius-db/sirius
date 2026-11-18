@@ -301,9 +301,11 @@ failures likewise reach query completion before pending work is discarded or fin
 drain is observable. The first query error wins. Cancellation does not preempt an in-progress
 library call.
 
-Workers have permanent NUMA-domain assignments. Sources retain their selected domain for both
-metadata and coalescing, and the dispatcher fairly selects the two work classes without executing
-callbacks on the submitting coordinator. Completed operations are consumed in rotating source
+Workers have permanent NUMA-domain assignments. Independent metadata jobs rotate across the
+query's eligible domains; a whole job runs in its assigned domain, while each source's coalescer
+retains its selected domain. There is no persistent per-file routing state or cross-domain stealing.
+The dispatcher fairly selects the two work classes without executing callbacks on the submitting
+coordinator. Completed operations are consumed in rotating source
 order, at most one per control turn; a repeatedly ready source cannot continually bypass another
 ready completion. These policies do not preempt running reads or bound shared admission delay.
 See configuration for CPU allowance, fallback rules and separate worker-thread budgets.

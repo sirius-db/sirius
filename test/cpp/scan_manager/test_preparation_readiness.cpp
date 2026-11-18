@@ -3637,6 +3637,81 @@ TEST_CASE("independent single-source queries can coalesce on different eligible 
   }
 }
 
+TEST_CASE("one source distributes whole metadata jobs across its eligible domains",
+          "[coordinator][async_coalescing][metadata_job_domains][review_regression]")
+{
+  using namespace sirius::exec;
+  auto allowed = thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  std::vector<std::vector<int>> masks;
+  for (size_t i = 0; i < 3; ++i)
+    masks.push_back({allowed[i % allowed.size()]});
+  std::vector<int> requested;
+  SECTION("no explicit subset uses all pool domains") {}
+  SECTION("query subset retains its order and excludes other domains") { requested = {2, 0}; }
+  SECTION("one eligible domain keeps all jobs in that domain") { requested = {1}; }
+  auto const eligible        = requested.empty() ? std::vector<int>{0, 1, 2} : requested;
+  constexpr size_t job_count = 12;
+  preparation_options options{job_count, 4, 8, 1};
+  fixture f(3, 4, k_interrupt_check_interval, options, nullptr, nullptr, masks, requested);
+
+  // Capture actual domain workers, so identity assertions remain meaningful
+  // even on a one-CPU host where every logical domain has the same CPU mask.
+  std::vector<std::thread::id> domain_workers;
+  for (int domain = 0; domain < 3; ++domain) {
+    auto ready  = std::make_shared<std::promise<std::thread::id>>();
+    auto result = ready->get_future();
+    f.pool.schedule([ready] { ready->set_value(std::this_thread::get_id()); }, 0, domain);
+    REQUIRE(result.wait_for(1s) == std::future_status::ready);
+    domain_workers.push_back(result.get());
+  }
+  std::vector<std::shared_ptr<hold>> held;
+  for (size_t i = 0; i < eligible.size(); ++i)
+    held.push_back(f.make_hold());
+  std::vector<std::thread::id> observed(job_count);
+  std::atomic<unsigned> wrong_coalescer{0}, advances{0};
+  auto coalescer         = std::make_shared<worker_accumulator>(100);
+  auto inspect_coalescer = [&] {
+    if (std::this_thread::get_id() != domain_workers[eligible.front()] ||
+        thread_util::get_current_thread_affinity() != masks[eligible.front()])
+      ++wrong_coalescer;
+  };
+  coalescer->before_advance = [&] {
+    ++advances;
+    inspect_coalescer();
+  };
+  coalescer->before_partial = inspect_coalescer;
+  coalescer->before_flush   = inspect_coalescer;
+  auto out                  = std::make_shared<sink>();
+  f.source(coalescer, out, finite_jobs(job_count, [&](int id) {
+             auto const index = static_cast<size_t>(id);
+             observed[index]  = std::this_thread::get_id();
+             if (index < held.size()) held[index]->wait();
+             return std::make_unique<tagged>(id);
+           }));
+  auto guard = f.shutdown_guard();
+  f.start();
+  // Every eligible domain must start a metadata job while the first remains
+  // blocked. A single source-domain queue would leave the other workers idle.
+  for (size_t i = 0; i < held.size(); ++i) {
+    INFO("metadata job " << i << " assigned domain " << eligible[i]);
+    REQUIRE(held[i]->await());
+    CHECK(observed[i] == domain_workers[eligible[i]]);
+  }
+  for (auto const& wait : held)
+    wait->release();
+  REQUIRE(out->await(1));
+  out->consume();
+  f.finish();
+  for (size_t i = 0; i < job_count; ++i)
+    CHECK(observed[i] == domain_workers[eligible[i % eligible.size()]]);
+  CHECK(advances == job_count);
+  CHECK(wrong_coalescer == 0);
+  CHECK(out->count() == 1);
+  CHECK(out->close_calls == 1);
+  CHECK_FALSE(f.completion.has_error());
+}
+
 TEST_CASE("unfinished async input honors minimum fill before its next advance",
           "[coordinator][async_coalescing][partial_batch][review_regression][review_20261116]")
 {
