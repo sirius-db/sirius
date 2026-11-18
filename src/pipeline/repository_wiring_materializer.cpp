@@ -70,8 +70,8 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
       op_id, wiring.port_id, std::make_unique<::cucascade::shared_data_repository>());
 
     auto* repo = data_repo_manager.get_repository(op_id, wiring.port_id).get();
-    downgrade::label_repository(repo,
-                                std::format("{} {}/{}", next_op->get_name(), op_id, wiring.port_id));
+    downgrade::label_repository(
+      repo, std::format("{} {}/{}", next_op->get_name(), op_id, wiring.port_id));
 
     next_op->add_port(wiring.port_id,
                       std::make_unique<op::sirius_physical_operator::port>(

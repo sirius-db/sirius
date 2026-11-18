@@ -78,9 +78,9 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
+#include "planner/build_side_choice.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
-#include "planner/build_side_choice.hpp"
 #include "planner/scan_reuse_rewrites.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -1763,8 +1763,7 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
     if (hash_join.build_counts() && !right_stream) {
       throw std::logic_error("a hash join counting its build matches must stream its probe");
     }
-    probe_drives =
-      hash_join.is_right_family() && !hash_join.is_delim_join_inner() && !right_stream;
+    probe_drives = hash_join.is_right_family() && !hash_join.is_delim_join_inner() && !right_stream;
   }
   bind_wrapped_join(join_op, probe_drives);
 }

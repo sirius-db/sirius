@@ -105,8 +105,8 @@ std::optional<task_creation_hint> partition_exchange::prepare_impl(bool resolve)
   }
   auto& driver = *_inputs[_sizing_input];
   // The scan's size is known, so this needs no estimate, and once true it stays true.
-  bool const scan_holds = _deferred_scan && !driver.input_complete() &&
-                          driver.received_bytes() >= _deferred_scan->bytes;
+  bool const scan_holds =
+    _deferred_scan && !driver.input_complete() && driver.received_bytes() >= _deferred_scan->bytes;
   if (!driver.input_complete() && !scan_holds) {
     auto hint = driver.sizing_hint();
     if (hint && hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA) { return hint; }

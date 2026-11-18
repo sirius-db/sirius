@@ -49,10 +49,10 @@ void flip(duckdb::LogicalComparisonJoin& join)
 {
   std::swap(join.children[0], join.children[1]);
   for (auto& condition : join.conditions) {
-    condition = duckdb::JoinCondition(
-      condition.RightReference()->Copy(),
-      condition.LeftReference()->Copy(),
-      duckdb::FlipComparisonExpression(condition.GetComparisonType()));
+    condition =
+      duckdb::JoinCondition(condition.RightReference()->Copy(),
+                            condition.LeftReference()->Copy(),
+                            duckdb::FlipComparisonExpression(condition.GetComparisonType()));
   }
   std::swap(join.left_projection_map, join.right_projection_map);
 }

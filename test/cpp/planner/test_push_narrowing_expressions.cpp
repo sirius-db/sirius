@@ -69,13 +69,14 @@ struct pushdown_fixture {
       "SET disabled_optimizers = 'in_clause,compressed_materialization,"
       "partial_aggregate_pushdown,grouping_sets,aggregate_reuse,distinct_aggregate_rewrite,"
       "scalar_fn_pushdown,late_materialization'");
-    parquet_table("lineitem",
-                  "SELECT (i % 500)::BIGINT AS l_orderkey, (i % 37)::BIGINT AS l_partkey, (i % "
-                  "7)::INTEGER AS l_linenumber, ((i % 50) + 1)::DECIMAL(15, 2) AS l_quantity, (i * "
-                  "1.5)::DECIMAL(15, 2) AS l_extendedprice, ((i % 10) / 100.0)::DECIMAL(15, 2) AS "
-                  "l_discount, ((i % 8) / 100.0)::DECIMAL(15, 2) AS l_tax, ((i % 50) + 1)::DOUBLE AS "
-                  "f_quantity, (i * 1.5)::DOUBLE AS f_extendedprice, ((i % 10) / 100.0)::DOUBLE AS "
-                  "f_discount, ((i % 8) / 100.0)::DOUBLE AS f_tax FROM range(4000) t(i)");
+    parquet_table(
+      "lineitem",
+      "SELECT (i % 500)::BIGINT AS l_orderkey, (i % 37)::BIGINT AS l_partkey, (i % "
+      "7)::INTEGER AS l_linenumber, ((i % 50) + 1)::DECIMAL(15, 2) AS l_quantity, (i * "
+      "1.5)::DECIMAL(15, 2) AS l_extendedprice, ((i % 10) / 100.0)::DECIMAL(15, 2) AS "
+      "l_discount, ((i % 8) / 100.0)::DECIMAL(15, 2) AS l_tax, ((i % 50) + 1)::DOUBLE AS "
+      "f_quantity, (i * 1.5)::DOUBLE AS f_extendedprice, ((i % 10) / 100.0)::DOUBLE AS "
+      "f_discount, ((i % 8) / 100.0)::DOUBLE AS f_tax FROM range(4000) t(i)");
     parquet_table("orders",
                   "SELECT i::BIGINT AS o_orderkey, DATE '1995-01-01' + (i % 300)::INTEGER AS "
                   "o_orderdate, (i * 3.25)::DECIMAL(15, 2) AS o_totalprice FROM range(500) t(i)");
@@ -122,8 +123,7 @@ std::string yearly_sum(std::string const& amount,
 
 constexpr char const* q9_amount = "l_extendedprice * (1 - l_discount) - l_tax * l_quantity";
 /// The same amount over the DOUBLE columns of a dataset without DECIMAL.
-constexpr char const* q9_amount_double =
-  "f_extendedprice * (1 - f_discount) - f_tax * f_quantity";
+constexpr char const* q9_amount_double = "f_extendedprice * (1 - f_discount) - f_tax * f_quantity";
 
 }  // namespace
 

@@ -102,7 +102,9 @@ std::optional<ColumnBinding> column_ref(Expression const& expression)
 }
 
 bool contains(duckdb::vector<ColumnBinding> const& bindings, ColumnBinding const& binding)
-{ return std::find(bindings.begin(), bindings.end(), binding) != bindings.end(); }
+{
+  return std::find(bindings.begin(), bindings.end(), binding) != bindings.end();
+}
 
 /// The carrier @p expression is a plain reference to, if it is one.
 carrier const* carrier_of(Expression const& expression, std::vector<carrier> const& carriers)

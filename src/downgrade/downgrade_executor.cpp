@@ -310,7 +310,7 @@ void downgrade_executor::processing_loop()
 
           convertible_data_batch_provider provider(repo);
           auto const consumer = downgrade::repository_label(repo);
-          auto candidates = provider.get_all_convertible(
+          auto candidates     = provider.get_all_convertible(
             source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
 
           // Snapshot candidate sizes so target-carrying requests can right-size their final pick
@@ -620,9 +620,8 @@ void downgrade_executor::processing_loop()
                                        moved.disk_batches,
                                        moved.disk_bytes);
           }
-          SIRIUS_LOG_DEBUG("[downgrade] [{}] by consumer (batches/bytes): {}",
-                           _source_label,
-                           by_consumer);
+          SIRIUS_LOG_DEBUG(
+            "[downgrade] [{}] by consumer (batches/bytes): {}", _source_label, by_consumer);
         }
       });
     }
