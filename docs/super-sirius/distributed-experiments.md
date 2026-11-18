@@ -311,6 +311,8 @@ One node, GDS, the datasets, config and method of the table above, in seconds:
 - **Not repeated:** SF10000, the io_uring runs, and every run on two and four nodes. Those cells
   of the table above are still the earlier build's.
 - The runs used the same source as `35f5573d` apart from log levels, formatting and two unit tests.
+- **To run them again:** `bench.py plan --reference sf30k-n1-gds-35f5573` and
+  `sf100k-n1-gds-35f5573` of the `distributed-sirius-bench` skill.
 
 ## Past 16 ranks
 
