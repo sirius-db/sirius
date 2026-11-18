@@ -433,9 +433,6 @@ sirius:
 Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
 key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
 
-`uring.prefetch_reactors` is deprecated: the reactor priority tiers replaced prefetch-reactor partitioning, so the key is
-accepted and ignored with a warning, and will be removed.
-
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 The native REST backend speaks HTTP/1.1 over io_uring; it does not use libcurl.
@@ -787,6 +784,7 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
 | `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
 | `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
@@ -799,8 +797,6 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
-
-**Note:** admission includes every GPU that holds a Simpatico-compressed chunk of a GPU-tier pin matching a source scanned by the query, even when `topology.gpus_per_query` or `admission_bytes_per_gpu` would admit fewer. Owner discovery matches source identity before pin binding, so it can include owners of a pin that ultimately does not serve the scan. For example, a compressed pin containing only `k` across two GPUs still widens a query selecting unpinned `v` from the same parquet source, even with `topology.gpus_per_query: 1`. A compressed chunk is decoded on the GPU that holds it, so narrowing the query away from that GPU would leave the chunk with nowhere to be decoded; the engine logs `[gpu_alloc] admission widened ...` when this applies. Uncompressed GPU-tier pins and host-tier pins are copied to the admitted GPUs and do not widen the set.
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -831,9 +827,8 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
@@ -963,14 +958,15 @@ requires startup configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_backend` | `spdlog`; `duckdb` in released extensions | Log sink: `spdlog`, `duckdb`, or `noop` |
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
 | `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
-- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
-  `sirius_log_level` and `sirius_log_flush_seconds`.
-- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+- **`spdlog`** (default in source builds): writes the daily-rotated
+  `<sirius_log_dir>/sirius_<date>.log`, honouring `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`** (default in the released `sirius_cuda12`/`sirius_cuda13` extensions, which are
+  built with `-DSIRIUS_DISTRIBUTION_DEFAULTS=ON`): routes logs into DuckDB's own logging under the `Sirius` log type; enable and
   read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
@@ -985,9 +981,11 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 `SIRIUS_LOG_LEVEL` environment variables.
 
 The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
-If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
-the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
-the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+If none is set, it leaves the current log sink unchanged. In source builds, if only
+`SIRIUS_LOG_LEVEL` is set, the default `spdlog` backend writes to `./log/sirius_<date>.log`; if
+only `SIRIUS_LOG_DIR` is set, the default `spdlog` backend writes there. Libraries built with
+`SIRIUS_DISTRIBUTION_DEFAULTS` default to `duckdb`, so they need `SIRIUS_LOG_BACKEND=spdlog` for
+file logs. An unknown backend leaves the current sink in
 place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
@@ -1081,6 +1079,8 @@ SET enable_compressed_materialization = false;
 | `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
 | `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
+| `enable_subquery_key_carry` | false | Under `delim_join_as_cte`, restrict every table a subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins; see [Optimizations](optimizations.md#subquery-keys-carried-across-an-equality). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_subquery_key_carry` in YAML. |
+| `enable_exists_from_aggregate` | false | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group; see [Optimizations](optimizations.md#exists-answered-from-an-aggregate-subquery). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_exists_from_aggregate` in YAML. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -1221,7 +1221,7 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
 | `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
 | `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
-| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. A batch that also has a dictionary output uses `fused_scan_max_selectivity` instead, if larger. |
 | `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
 | `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 

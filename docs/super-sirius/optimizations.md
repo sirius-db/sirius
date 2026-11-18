@@ -182,13 +182,16 @@ delim_join_as_cte = true:   [RIGHT_]SEMI/ANTI JOIN(outer rows, T) on  t.k = oute
 Either comparison may be null-safe (`IS NOT DISTINCT FROM` for the key, `IS DISTINCT FROM` for the value). Two or more matched joins nested through their outer rows whose scans read the same source (`capture_bound_read_view`) on the same base key column are replaced together, with one scan of `T`:
 
 ```
-FILTER   EXISTS:     mn <> outer.x OR mx <> outer.x      (per subquery; projection map: the original columns)
-         NOT EXISTS: (that) IS NULL OR NOT (that)
- └─ LEFT DELIM_JOIN on outer.k IS NOT DISTINCT FROM a.k
-     ├─ outer rows
-     └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
-          ← INNER JOIN(T, DELIM_GET(k))
+CTE rows = outer rows
+ └─ FILTER   EXISTS:     mn <> rows.x OR mx <> rows.x    (per subquery; projection map: the original columns)
+             NOT EXISTS: (that) IS NULL OR NOT (that)
+     └─ LEFT JOIN on rows.k IS NOT DISTINCT FROM a.k
+         ├─ CTE_SCAN rows
+         └─ a = AGGREGATE(GROUP BY k: MIN(x), MAX(x) FILTER (WHERE <its filters>) per subquery)
+              ← SEMI JOIN(T, SELECT DISTINCT k FROM CTE_SCAN rows) on t.k = k
 ```
+
+This is the shape DuckDB itself gives a correlated scalar aggregate under `delim_join_as_cte = true`, so the merged plan has no delim join in either setting. Columns that operators above read from the outer rows are read from the CTE scan instead.
 
 `EXISTS ... t.x <> outer.x` holds exactly when `MIN(t.x) <> outer.x OR MAX(t.x) <> outer.x` over the rows with that key, with NULL comparisons never counting as different. For `IS DISTINCT FROM` the aggregate also records whether a NULL `t.x` was seen. For NOT EXISTS the filter keeps rows with no group and rows whose comparison is unknown. When some subqueries compare keys null-safely and others with `=`, the latter skip the NULL-key group through an `IS NOT NULL` predicate. A lone subquery is left alone: replacing its join with a `GROUP BY` over the same rows is rarely faster.
 
@@ -235,6 +238,63 @@ DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported
 **Code path:** `src/planner/sirius_plan_partial_aggregate_pushdown.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp`, which plans without it if it throws.
 
 **Config:** `enable_partial_aggregate_below_join` (default `true`, see [Configuration](configuration.md)).
+
+### Subquery Keys Carried Across an Equality
+
+**Motivation:** under `delim_join_as_cte = true`, DuckDB restricts a decorrelated subquery to the outer rows' distinct keys with a SEMI join on the column the correlation names. In TPC-Havoc Q05_V01 that column is `s_nationkey`, and the subquery also says `c_nationkey = s_nationkey`. DuckDB's filter combiner derives `c_nationkey = key` only when the keys are a relation in a filter over cross products, which is their form with `delim_join_as_cte = false`; a SEMI join's condition is outside its reach. So `customer` gets no restriction, join ordering puts it last, and `customer`, `orders` and `lineitem` are read for every nation instead of the outer rows' five.
+
+**Mechanism:** `carry_subquery_keys_across_equalities` runs in the pre-optimize hook, on DuckDB's own plan, so that join ordering sees its result:
+
+```
+FILTER(x = y, ...)                          FILTER(x = y, ...)
+ └─ SEMI ON x = key                          └─ SEMI ON y = key
+     ├─ L                             →          ├─ SEMI ON x = key
+     └─ scan of __duckdb_delim_dedup_M           │   ├─ L
+                                                 │   └─ scan of __duckdb_delim_dedup_M
+                                                 └─ scan of __duckdb_delim_dedup_M
+```
+
+Every row the filter keeps has `x = y`, so the added join removes only rows the filter removes anyway, and results cannot change. DuckDB then moves each key join onto its table and starts the join order from the restricted tables, as it does with `delim_join_as_cte = false`.
+
+**When it applies:** the filter directly above a subquery's key joins, or a filter or INNER join condition inside `L` that passes its columns through, has a top-level `=` between two plain columns of one type, one of which a key join restricts. Each other relation of `L` in that equality class gets one key join, up to three per key column. The dedup CTE ends in an aggregate, so DuckDB keeps it materialized when it is read twice, and the delim CTE keeps the two readers its restriction proof needs.
+
+**Limits:** the equality must be a plain one (no cast, not under `OR`). An `EXISTS` DuckDB plans as a MARK join on the outer rows has no key relation to carry.
+
+**Code path:** `src/planner/delim_cte_rewrites.cpp`, called from `src/transparent/sirius_optimizer_extension.cpp` (`rewrite_delim_ctes`), for queries headed to the GPU.
+
+**Config:** `enable_subquery_key_carry` (default `false`, see [Configuration](configuration.md)). Off by default for now: the rewrite is not yet tested on multiple GPUs, and a query that falls back to the CPU after the hook has run executes the rewritten plan.
+
+### EXISTS Answered from an Aggregate Subquery
+
+**Motivation:** a query that selects a correlated aggregate and keeps only the outer rows that have subquery rows, such as TPC-Havoc Q05_V01's revenue per nation `WHERE EXISTS (the same joins)`, runs the subquery's joins twice.
+
+**Mechanism:** `answer_exists_from_aggregate` runs in the pre-optimize hook, before the rule above:
+
+```
+CTE __duckdb_delim_N                                  CTE __duckdb_delim_N
+ ├─ PROJECTION(..., mark)                              ├─ PROJECTION(..., TRUE)
+ │   └─ FILTER(mark)                                   │   └─ X
+ │       └─ MARK JOIN(X, S)                     →      └─ ... INNER join-back
+ └─ ... LEFT join-back                                       ├─ scan of N
+       ├─ scan of N                                          └─ AGGREGATE(GROUP BY key) ← S ⋉ keys
+       └─ AGGREGATE(GROUP BY key) ← S ⋉ keys
+```
+
+The aggregate has a group for a key exactly when `S` has a row for it, which is what the `EXISTS` tests. An INNER join-back therefore keeps exactly the outer rows the `EXISTS` kept, whatever the aggregate's value: a group whose `SUM` is NULL still joins.
+
+**When it applies:** all of the following, each of which a counterexample forced:
+- The join-back is LEFT or INNER, with one condition per key, onto an aggregate grouped exactly by the keys and reached through projections only. A `HAVING` puts a filter there, and `COUNT` keeps a SINGLE join; neither matches.
+- The delim CTE's rows are a projection of `FILTER(mark)` over the MARK join, the filter has no other predicate, and the two joins pair their keys column by column.
+- Both sides read the same rows: flattened into leaves and predicates, their scans are the same sources in the same order (`capture_bound_read_view`, selector included), their predicates are the same set, and the key is the same column.
+- NULL keys are handled alike: the subquery matches keys with `=`, so a null-safe `EXISTS` qualifies only when its side carries `IS NOT NULL` on the key column.
+- Only the join-back and the key read see the CTE's rows, and DuckDB's own conditions for restricting them hold.
+- The outer side `X` still selects rows without the `EXISTS` (a predicate that is not a column equality or a NULL check, DuckDB's test for keeping a delim CTE), and can produce at most a quarter of the subquery's largest scan. Without the `EXISTS`, the CTE holds all of `X`. The bound on `X` is the product of its scans' rows, not their sum: nothing proves a join key unique, so a join may pair every row of one table with every row of another. `X` must be table scans under inner joins, cross products, filters and projections; any other operator declines.
+
+**Limits:** the two subqueries must list their tables in the same order. An `EXISTS` with no aggregate subquery over the same rows is untouched.
+
+**Code path:** `src/planner/delim_cte_rewrites.cpp` (`match_exists_twin`), sharing `flatten` with the delim aggregate reuse (`src/planner/sirius_plan_flat_tree.cpp`); called from `src/transparent/sirius_optimizer_extension.cpp` for queries headed to the GPU.
+
+**Config:** `enable_exists_from_aggregate` (default `false`, see [Configuration](configuration.md)). Off by default for now, for the same two reasons as the rule above, and because a scan DuckDB has no row estimate for reports one row, which passes the size guard on `X`.
 
 ### Sorted-Key Grouped Aggregation
 
