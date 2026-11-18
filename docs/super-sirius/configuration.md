@@ -205,8 +205,12 @@ Disk spaces with equal `io` settings share one context.
 
 With the defaults, spill files are written and read with POSIX calls on eight reactor threads,
 device data staged through pinned memory, exactly as on a host without GPUDirect Storage. This
-needs neither `libcufile` nor the `nvidia-fs` driver at run time: with `direct_io: false` the
-cuFile driver is never opened and no device staging slots are registered.
+needs neither `libcufile` nor the `nvidia-fs` driver at run time: with `direct_io: false` no
+spill file is opened with O_DIRECT, no transfer goes through cuFile and no device staging slots
+are registered. The cuFile reactors still probe the platform once, when the context is built at
+startup: where `libcufile` can be loaded they open the cuFile driver and log the mode it reports
+(`cufile: cuFile ... reports GPUDirect Storage`, or compatibility mode), and where it cannot
+they log that cuFile is unavailable and serve the same POSIX path.
 `io: { backend: automatic, direct_io: true, reactors: 0 }` is cuCascade's own default. In a build without `cufile.h` (no cuFile reactors compiled in)
 the default `backend` is `automatic` instead, which there means io_uring.
 
