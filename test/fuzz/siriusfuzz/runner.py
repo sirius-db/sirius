@@ -151,6 +151,9 @@ class Evaluator:
         self.rng = random.Random()
         self.sqlsmith = cfg.oracle.reduce_sqlsmith != "off"
         self.forced_variant: dict[str, Any] | None = None
+        # Replay of a tlp_mismatch: the saved predicate and partition queries.
+        self.forced_tlp: dict[str, Any] | None = None
+        self._tlp_failed_query: Query | None = None
         self.replay_mode: str | None = None
 
     def set_dataset(self, ds: Dataset, alias: str) -> None:
@@ -172,6 +175,7 @@ class Evaluator:
             verdict=Verdict.OK.value,
             comparison=mode,
         )
+        self._tlp_failed_query = None
         rec.labels = labels(query) if query is not None else []
         cpu = self.s.run(sql, gpu=False, timeout=self.cpu_timeout)
         rec.elapsed_cpu = cpu.elapsed
@@ -224,7 +228,15 @@ class Evaluator:
         rec.phase_seconds["setting_variants"] = time.monotonic() - started
         if rec.verdict == Verdict.OK.value:
             started = time.monotonic()
-            self._check_tlp(rec, query, gpu.result)
+            if self.forced_tlp:
+                self._run_tlp(
+                    rec,
+                    self.forced_tlp["predicate"],
+                    self.forced_tlp["partition_sql"],
+                    gpu.result,
+                )
+            else:
+                self._check_tlp(rec, query, gpu.result)
             rec.phase_seconds["tlp_check"] = time.monotonic() - started
         return rec
 
@@ -266,44 +278,79 @@ class Evaluator:
             return
         col = self.rng.choice(choices)
         predicate = Compare("<", col, Literal(0, col.type))
-        branches = (predicate, Not(predicate), IsNull(predicate))
-        parts = []
-        counts = []
-        for branch in branches:
+        partitions = []
+        for branch in (predicate, Not(predicate), IsNull(predicate)):
             q = copy.deepcopy(query)
             q.order_by = []
             q.where = branch if q.where is None else Logical("AND", [q.where, branch])
-            part = self.s.run(
-                q.sql(),
-                gpu=self.s.gpu_available,
-                timeout=self.timeout if self.s.gpu_available else self.cpu_timeout,
-            )
-            if part.status != "ok" or part.result is None:
-                # The base comparison already passed; a partition that is
-                # declined or fails only means this check could not run.
-                rec.tlp = {
-                    "eligible": True,
-                    "checked": False,
-                    "predicate": predicate.sql(),
-                    "partition_status": part.status,
-                    "error": (part.error or part.status).split("\n", 1)[0][:160],
-                }
-                return
-            counts.append(part.result.row_count)
-            parts.extend(part.result.rows)
+            partitions.append(q)
+        self._run_tlp(
+            rec, predicate.sql(), [q.sql() for q in partitions], baseline, partitions
+        )
+
+    def _run_tlp(
+        self,
+        rec: QueryRecord,
+        predicate: str,
+        partition_sql: list[str],
+        baseline: ResultSet,
+        partitions: list[Query] | None = None,
+    ) -> None:
+        """Run the saved partition queries; their rows together must equal ``baseline``."""
+        gpu = self.s.gpu_available
         rec.tlp = {
             "eligible": True,
-            "checked": True,
-            "predicate": predicate.sql(),
-            "partition_rows": counts,
-            "baseline_rows": baseline.row_count,
+            "checked": False,
+            "predicate": predicate,
+            "partition_sql": partition_sql,
         }
+        parts = []
+        counts = []
+        for index, sql in enumerate(partition_sql):
+            part = self.s.run(
+                sql, gpu=gpu, timeout=self.timeout if gpu else self.cpu_timeout
+            )
+            if part.status == "ok" and part.result is not None:
+                counts.append(part.result.row_count)
+                parts.extend(part.result.rows)
+                continue
+            rec.tlp["partition_status"] = part.status
+            rec.tlp["error"] = (part.error or part.status).split("\n", 1)[0][:160]
+            verdict, reason = None, ""
+            if part.status == "error" and gpu:
+                verdict, reason = classify_gpu_error(part.error)
+                if verdict in (Verdict.PLAN_FALLBACK, Verdict.RUNTIME_FALLBACK):
+                    # The base comparison passed and the GPU declines this
+                    # partition: the check could not run, nothing failed.
+                    return
+            # The partition query is itself the reproducer: it becomes the
+            # record's SQL so the finding replays as a plain CPU/GPU run.
+            rec.tlp["base_sql"] = rec.sql
+            rec.sql = sql
+            self._tlp_failed_query = partitions[index] if partitions else None
+            if part.status == "crash":
+                self._crashed(rec, part, "" if gpu else "CPU phase: ")
+            elif part.status == "timeout":
+                rec.verdict = (Verdict.TIMEOUT if gpu else Verdict.CPU_TIMEOUT).value
+                limit = self.timeout if gpu else self.cpu_timeout
+                rec.reason = f"consistency-check partition exceeded {limit}s"
+            elif verdict is not None:
+                rec.verdict = verdict.value
+                rec.reason = reason
+                rec.detail = part.error.split("\n", 1)[0][:500]
+            else:
+                rec.verdict = Verdict.CPU_ERROR.value
+                rec.reason = part.error.split("\n", 1)[0][:200]
+            return
+        rec.tlp.update(
+            checked=True, partition_rows=counts, baseline_rows=baseline.row_count
+        )
         union = ResultSet(baseline.columns, parts)
         outcome = compare_results(baseline, union, False, self.tol)
         if not outcome.equal:
             rec.verdict = Verdict.TLP_MISMATCH.value
             rec.reason = outcome.detail
-            rec.detail = f"TLP {predicate.sql()} counts={counts}: {outcome.detail}"
+            rec.detail = f"TLP {predicate} counts={counts}: {outcome.detail}"
             rec.diffs = outcome.diffs
 
     # -- helpers -------------------------------------------------------------
@@ -437,6 +484,8 @@ class Evaluator:
     # -- reduction -------------------------------------------------------------
 
     def reduce(self, rec: QueryRecord, query: Query | None) -> None:
+        if rec.tlp.get("base_sql"):
+            query = self._tlp_failed_query  # rec.sql is the failed partition
         if query is None or rec.verdict in (Verdict.TIMEOUT.value, Verdict.CRASH.value):
             return
         check = self._make_still_fails(rec)

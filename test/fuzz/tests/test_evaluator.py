@@ -120,6 +120,60 @@ class TlpCheck(unittest.TestCase):
         self.assertFalse(rec.tlp["checked"])
         self.assertEqual(rec.tlp["partition_status"], "error")
 
+    def test_failed_partition_is_a_finding_on_the_partition_query(self):
+        outcomes = {
+            Verdict.CRASH: RunResult("crash", error="Segmentation fault", exitcode=-11),
+            Verdict.TIMEOUT: RunResult("timeout"),
+            Verdict.GPU_INTERNAL_ERROR: RunResult(
+                "error", error="Invalid Error: CUDA error: an illegal memory access"
+            ),
+        }
+        for verdict, outcome in outcomes.items():
+            with self.subTest(verdict=verdict):
+                rec = self.check(lambda sql, cols, rows, s: outcome)
+                self.assertEqual(rec.verdict, verdict.value)
+                self.assertTrue(verdict.is_finding())
+                self.assertIn('"c0_i" < ', rec.sql)
+                self.assertEqual(rec.sql, rec.tlp["partition_sql"][0])
+                self.assertNotIn("WHERE", rec.tlp["base_sql"])
+
+    def test_replay_reruns_the_saved_partitions(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows)[:1] if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part if "WHERE" in sql else rows))
+
+        found = self.check(gpu)
+        self.assertEqual(found.verdict, Verdict.TLP_MISMATCH.value)
+        ev = Evaluator(load_config(None), FakeSession(gpu), lambda m: None)
+        ev.variants = {}
+        ev.replay_mode = "multiset"
+        base = found.sql
+        self.assertEqual(ev.evaluate(None, base, 0, "replay", 0).verdict, "ok")
+        ev.forced_tlp = {k: found.tlp[k] for k in ("predicate", "partition_sql")}
+        self.assertEqual(
+            ev.evaluate(None, base, 0, "replay", 0).verdict,
+            Verdict.TLP_MISMATCH.value,
+        )
+
+
+class DropDataset(unittest.TestCase):
+    def test_parquet_copies_are_removed_with_the_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session.__new__(Session)
+            session.db_dir = pathlib.Path(tmp) / "db"
+            session.db_dir.mkdir()
+            session.attached = {"d0": session.db_dir / "d0.duckdb"}
+            session.cpu_mirror_aliases = set()
+            session.dataset_pins = {}
+            session.shell = SimpleNamespace(alive=False)
+            folder = session._parquet_dir("d0")
+            folder.mkdir(parents=True)
+            (folder / "t0.parquet").write_bytes(b"x")
+            (folder.parent / "d0.sql").write_text("-- kept")
+            session.drop_dataset("d0")
+            self.assertFalse(folder.exists())
+            self.assertTrue((folder.parent / "d0.sql").exists())
+
 
 def gpu_ok(sql, cols, rows, s):
     return RunResult("ok", ResultSet(cols, list(rows)))

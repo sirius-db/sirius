@@ -115,6 +115,7 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
             ev.timeout = timeout
             ev.forced_variant = payload.get("variant")
             ev.replay_mode = payload.get("comparison", "multiset")
+            ev.forced_tlp = payload.get("tlp")
             ev.variants = {}  # replay only the recorded variant, never a random one
             if ev.forced_variant:
                 for name in ev.forced_variant:

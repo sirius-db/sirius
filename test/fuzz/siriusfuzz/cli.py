@@ -498,6 +498,16 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
         },
     )
     baseline_settings = meta.get("runtime", {}).get("session_settings") or {}
+    # A tlp_mismatch only shows in its partition queries, which a SQL-only
+    # replay cannot regenerate; rerun the saved ones against the saved query.
+    saved_tlp = meta.get("tlp") or {}
+    replay_tlp = (
+        {k: saved_tlp[k] for k in ("predicate", "partition_sql")}
+        if meta.get("verdict") == "tlp_mismatch"
+        and saved_tlp.get("partition_sql")
+        and query.name != "reduced.sql"
+        else None
+    )
     result = execute_probe(
         {
             "operation": "replay",
@@ -511,6 +521,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             "config": str(work / "config.toml"),
             "variant": meta.get("variant"),
             "comparison": comparison,
+            "tlp": replay_tlp,
             "session_settings": baseline_settings,
             "timeout": args.timeout,
         },

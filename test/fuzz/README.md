@@ -14,9 +14,11 @@ matching means the engine fix landed: remove the file and lift its switch.
 `oracle.tlp_share` (default 0.1) adds a GPU-only check to that share of plain
 SELECT queries whose CPU comparison passed: the query is rerun under an integer
 predicate, its negation, and its IS NULL form, and the three results together
-must equal the original. A difference is a `tlp_mismatch`. A partition the GPU
-declines or fails leaves the query's verdict unchanged and is counted as
-`partition_failed` in the summary.
+must equal the original. A difference is a `tlp_mismatch`; the finding saves
+the three partition queries and `fuzz replay` reruns them. A partition the GPU
+declines leaves the query's verdict unchanged and is counted as
+`partition_failed` in the summary. A partition that errors, times out or
+crashes is a finding whose query is that partition.
 
 Every campaign writes a coverage and budget table to `summary.txt`, machine-readable
 `coverage`, `accounting`, and `budget` sections to `summary.json`, and one row to
@@ -335,11 +337,7 @@ otherwise the configuration's `sirius.configs` applies (by default the integrati
 partitions), and with `sirius.configs = []` the run
 uses whatever Sirius itself would pick up (`SIRIUS_CONFIG_FILE`, `./sirius.yaml`,
 `~/.sirius/sirius.yaml`, else built-in defaults). Whichever file is used is copied into the run
-and into every finding, so a replay elsewhere restores it. `config/` also holds
-profiles for specific regimes: `micro16k.yaml`, `micro64k.yaml` and
-`micro256k.yaml` shrink scan, partition, concat and sort batches to that size so
-small tables span many batches; `lowmem.yaml` and `lowmem-disk.yaml` restrict
-memory, the latter with a disk tier.
+and into every finding, so a replay elsewhere restores it.
 
 **Dataset layouts.** `[data.pin] tables_fraction`, `tiers`, and `compression` select a
 seeded subset of base tables to pin after `CHECKPOINT`. `[data.parquet]
@@ -375,8 +373,7 @@ fact cross joins and inequality-only fact joins because they make the CPU
 reference unbounded.
 
 For a bounded large-tier run, use `--set data.large.fraction=1.0` with one of
-`large-default.yaml`, `large-8m.yaml`, `large-lowmem.yaml`, or
-`large-lowmem-disk.yaml` through `--sirius-config`. The `large-8m` profile also
+`large-default.yaml` or `large-8m.yaml` through `--sirius-config`. The `large-8m` profile also
 needs `--set 'variants.settings.hash_partition_bytes=[8388608]'` and
 `--set 'variants.settings.max_sort_partition_bytes=[8388608]'` so randomized
 per-query settings do not override the YAML. Use

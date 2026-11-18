@@ -733,12 +733,15 @@ class Session:
             )
             self.timings["pin_setup"] += time.monotonic() - started
 
+    def _parquet_dir(self, alias: str) -> pathlib.Path:
+        return self.db_dir.parent / "datasets" / alias
+
     def apply_dataset_variants(self, alias: str, variants: dict[str, Any]) -> None:
         """Apply saved physical layout after CHECKPOINT, also during replay."""
         self.use(alias)
         for name, row_group_size in variants.get("parquet", {}).items():
             started = time.monotonic()
-            folder = self.db_dir.parent / "datasets" / alias
+            folder = self._parquet_dir(alias)
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"{name}.parquet"
             self.execute(
@@ -784,6 +787,8 @@ class Session:
                 p = self.db_dir / f"{a}.duckdb{suffix}"
                 if p.exists():
                     p.unlink()
+            # Parquet copies of this dataset's tables (apply_dataset_variants).
+            shutil.rmtree(self._parquet_dir(a), ignore_errors=True)
             self.attached.pop(a, None)
         self.current_alias = None
 
