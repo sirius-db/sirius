@@ -463,8 +463,20 @@ class scan_operator_input : public op::operator_data {
   void report_membership_keep(
     std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
 
+  /// Whether this split's own decoded table stays in the cached batch beside the scan output: a
+  /// deferring split skips the steal, so the decode's allocation and the output's copy of the
+  /// columns it keeps coexist at peak. Before preparation this is forecast from the batch still
+  /// needing conversion.
+  [[nodiscard]] bool keeps_decoded_table() const;
+
+  /// Bytes of the rowid column a deferral substitutes into this split's output, at the full rowid
+  /// width: one per reported survivor, or per row of the split's origin before decode.
+  [[nodiscard]] std::size_t deferred_rowid_bytes() const;
+
   /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
   bool _decoded_input_reused{false};
+  /// Set by prepare_for_processing when a deferral kept the converted table in the cached batch.
+  bool _decoded_table_kept{false};
   /// Per-query readahead bookkeeping this split reports into; null when the
   /// producer does not track readahead.
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;

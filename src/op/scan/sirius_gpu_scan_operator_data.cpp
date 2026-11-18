@@ -24,6 +24,7 @@
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <late_mat/column_origin.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -444,7 +445,9 @@ void scan_operator_input::prepare_for_processing(
       // allocating GPU operation follows the take, so an OOM retry can never re-enter materialize
       // on a consumed split. A deferring split breaks that premise — substitution allocates the
       // rowid after the take — so it keeps the view path and the wrapper keeps its source.
-      if (converted_here && converted_table_transferable() && !late_mat_wants_survivors) {
+      if (converted_here && converted_table_transferable() && late_mat_wants_survivors) {
+        _decoded_table_kept = true;
+      } else if (converted_here && converted_table_transferable()) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
@@ -655,6 +658,29 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   return get_estimated_working_set_size_in_bytes(std::nullopt);
 }
 
+bool scan_operator_input::keeps_decoded_table() const
+{
+  if (!late_mat_wants_survivors || !is_resident() || stolen_table || stolen_table_consumed) {
+    return false;
+  }
+  if (_decoded_table_kept) { return true; }
+  auto const& batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
+  if (!batch || _decoded_input_reused) { return false; }
+  auto ro          = batch->to_read_only();
+  auto const* data = ro.get_data();
+  return data != nullptr &&
+         (ro.get_current_tier() != ::cucascade::memory::Tier::GPU ||
+          dynamic_cast<::cucascade::gpu_table_representation const*>(data) == nullptr);
+}
+
+std::size_t scan_operator_input::deferred_rowid_bytes() const
+{
+  if (!late_mat_wants_survivors || !origin) { return 0; }
+  auto const rows = pushdown_survivors ? static_cast<std::size_t>(pushdown_survivors->size())
+                                       : static_cast<std::size_t>(origin->range.rows);
+  return rows * sizeof(std::uint64_t);
+}
+
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
   std::optional<int> device) const
 {
@@ -673,13 +699,17 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
     return decode_bytes;
   }
   auto const batch_bytes = get_estimated_size_in_bytes();
+  // A deferral's rowid column is allocated beside every envelope below, whether or not the table
+  // was stolen.
+  auto const rowid_bytes = deferred_rowid_bytes();
   if (mvcc_keep_mask.has_mask()) {
     // A masked resident chunk is filtered by copy at materialize: the input
     // batch and the compacted output (up to input-sized) coexist at peak,
     // alongside the BOOL8 expansion column (1 B/row) and the uploaded bitmask
     // words. A pending row filter needs no extra headroom: its phase peaks at
     // mask output + predicate + compacted output, inside the same envelope.
-    return 2 * batch_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes();
+    return 2 * batch_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes() +
+           rowid_bytes;
   }
   if (pushdown_row_filtered) {
     // The decode already compacted this split to its surviving rows, and batch_bytes reports that
@@ -689,7 +719,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
     // input + output stay within 2x compacted either way — the pre-decode 2x
     // FULL-WIDTH envelope below no longer applies.
     bool const stolen = stolen_table != nullptr || stolen_table_consumed;
-    return stolen ? batch_bytes : 2 * batch_bytes;
+    return (stolen ? batch_bytes : 2 * batch_bytes) + rowid_bytes;
   }
   // A dynamic-filter consumer is wired to this operator whenever it sits downstream of a join
   // build, regardless of whether that build has published yet -- consumer is stamped before task
@@ -706,6 +736,10 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
   // The scan's cached checkpoint filters a borrowed resident batch whether or not decompression
   // pushdown is enabled: it builds the membership masks over the batch, then gathers the survivors
   // into a new table.
+  //
+  // The branches below that assume the decoded table moves into the output add that output's copy
+  // back for a split whose deferral keeps the table in the cached batch.
+  bool const kept                    = keeps_decoded_table();
   bool const cached_checkpoint       = cached_checkpoint_possible();
   bool const dynamic_filter_possible = enable_fused_scan_filter && consumer != nullptr &&
                                        !consumer->decode_bindings().empty() &&
@@ -724,7 +758,8 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row
       // columns) plus the compacted outputs, and such splits steal their table,
-      // so there is no second output copy. The surviving row count is bounded
+      // so there is no second output copy unless a deferral keeps the table in
+      // the cached batch. The surviving row count is bounded
       // by the selectivity ceiling unless a column is exempt from it, in which
       // case size for up to full width. A decode that gives compaction up
       // re-runs the full-width path and over-allocates into the adaptor's
@@ -741,8 +776,10 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
       // The cached checkpoint needs no more: such a split's table leaves the cached batch once
       // decoded, unless a refused carrier-converting transfer leaves the checkpoint the compacted
       // table, which this envelope sizes as it does post_filter_and_project's copy.
-      auto const cap = forecast.max_surviving_fraction;
-      return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
+      auto const cap       = forecast.max_surviving_fraction;
+      auto const compacted = static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
+      auto const rowids    = static_cast<std::size_t>(static_cast<double>(rowid_bytes) * cap);
+      return batch_bytes / 4 + (kept ? 2 * compacted : compacted) + rowids;
     }
     if (!row_filter_pending && !cached_checkpoint) {
       // A wired dynamic filter, NO static one and no cached checkpoint, so nothing here filters by
@@ -751,16 +788,16 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
       // and post_filter_and_project then has no predicate to apply. Either way the peak is one
       // full-width decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4 B/row a
       // projected column carries), not two full widths.
-      return batch_bytes + batch_bytes / 4;
+      return (kept ? 2 * batch_bytes : batch_bytes) + batch_bytes / 4 + rowid_bytes;
     }
     // post_filter_and_project or the cached checkpoint filters by copy: the materialized input and
     // the compacted output (up to input-sized) coexist at peak. The BOOL8 predicate column (1
     // B/row) hides inside the 2x conservatism (any projected column is >= 4 B/row).
-    return 2 * batch_bytes;
+    return 2 * batch_bytes + rowid_bytes;
   }
   // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is
   // at most batch-sized, so plain batch_bytes stays accurate.
-  return batch_bytes;
+  return (kept ? 2 * batch_bytes : batch_bytes) + rowid_bytes;
 }
 
 }  // namespace sirius::op::scan
