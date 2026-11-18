@@ -196,6 +196,17 @@ whose length does not match the rows handed on throws too. A scan whose INGESTIB
 survivors (the duckdb-native one filters with a plain select) is still refused at install, since
 the residual half would have nothing to say.
 
+Admission asks the port's own resolver (`resolve_pinned_layout` / `resolve_pinned_column`) about
+every deferred origin, primary bundle and riders alike, before it installs anything. Pinning
+narrows each chunk from its own range, so one column can be INT8 in one chunk and INT32 in the
+next; the port reads a deferred column at one width, so such a column is declined at plan time
+rather than failing at the port after the scan gave its values up.
+
+A deferring split never hands its freshly decoded table straight out of the cached wrapper.
+Substitution allocates the rowid after that point, so a direct steal would leave an
+out-of-memory retry nothing to re-read; the split takes the view-backed path and the wrapper keeps
+the decoded table until substitution commits.
+
 Dynamic membership filters do not meet a deferral during decode: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint applies those filters after substitution instead. Should a deferring scan's decode remove rows without reporting its survivors, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
 
 With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
