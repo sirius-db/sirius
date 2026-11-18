@@ -1,0 +1,27 @@
+# GB200 nodes, 4 GPUs each. The SF10000 config of docs/super-sirius/distributed-experiments.md:
+# tuned on 1 node, used unchanged on 2, and for a first check at SF100.
+sirius:
+  memory:
+    gpu:
+      usage_limit_fraction: 0.8841
+      downgrade_trigger_fraction: 0.9089
+      downgrade_stop_fraction: 0.6786
+    host: { capacity_bytes: 200Gi }
+    disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "@SPILL@" }
+  executor:
+    pipeline: { num_threads: 7 }
+    task_creator: { num_threads: 1 }
+    downgrade: { num_threads: 2 }
+    scan_manager: { num_threads: 9, uring_n_reactors: 1, cache: { mode: none } }
+  operator_params:
+    scan_task_batch_size: 901Mi
+    hash_partition_bytes: 1067Mi
+    concat_batch_bytes: 2552Mi
+    sort_sample_bytes: 201Mi
+    max_build_hash_table_bytes: 6358Mi
+    max_build_probe_resident_bytes: 16Gi
+    max_sort_partition_memory_fraction: 0.4330
+    mark_join_build_switch_ratio: 10.1054
+    dynamic_filter_domain_coverage_threshold: 0.6257
+    dynamic_filter_keep_threshold: 0.8144
+    max_dynamic_filter_bloom_bytes_per_gpu: 2577Mi
