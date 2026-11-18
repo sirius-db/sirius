@@ -70,76 +70,17 @@ bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
-/// The option as `query_operator_options` resolves it, without creating the session's overrides:
-/// those snapshot the global configuration, which would stop the session from seeing later
-/// changes to it.
-bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
+/// Whether a plan optimization is on: its `operator_params` switch as `query_operator_options`
+/// resolves it, without creating the session's overrides. Those snapshot the global
+/// configuration, which would stop the session from seeing later changes to it.
+bool plan_optimization_enabled(duckdb::ClientContext& context,
+                               bool sirius::operator_params::* option)
 {
   auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_delim_aggregate_reuse;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_delim_aggregate_reuse;
-  }
+  if (state && state->execution_options) { return (*state->execution_options).*option; }
+  if (state && state->operator_overrides) { return (*state->operator_overrides).*option; }
   auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_minmax_rewrite;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_minmax_rewrite;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool partial_aggregate_below_join_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_partial_aggregate_below_join;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_partial_aggregate_below_join;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_partial_aggregate_below_join;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool subquery_key_carry_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_subquery_key_carry;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_subquery_key_carry;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_subquery_key_carry;
-}
-
-/// The option as `query_operator_options` resolves it, without creating the session's overrides.
-bool exists_from_aggregate_enabled(duckdb::ClientContext& context)
-{
-  auto const state = duckdb::get_sirius_connection_state(context);
-  if (state && state->execution_options) {
-    return state->execution_options->enable_exists_from_aggregate;
-  }
-  if (state && state->operator_overrides) {
-    return state->operator_overrides->enable_exists_from_aggregate;
-  }
-  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return runtime && runtime->get_config().get_operator_params().enable_exists_from_aggregate;
+  return runtime && runtime->get_config().get_operator_params().*option;
 }
 
 /// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
@@ -287,7 +228,7 @@ bool rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
   bool changed  = false;
   // First: once the keys reach a second table, the subquery no longer has the single key join the
   // comparison of the two subqueries looks for.
-  if (exists_from_aggregate_enabled(context)) {
+  if (plan_optimization_enabled(context, &sirius::operator_params::enable_exists_from_aggregate)) {
     try {
       if (sirius::planner::answer_exists_from_aggregate(context, plan) > 0) { changed = true; }
     } catch (std::exception& e) {
@@ -296,7 +237,7 @@ bool rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalO
                        sirius::sanitized_message(e));
     }
   }
-  if (subquery_key_carry_enabled(context)) {
+  if (plan_optimization_enabled(context, &sirius::operator_params::enable_subquery_key_carry)) {
     try {
       if (sirius::planner::carry_subquery_keys_across_equalities(
             context, input.optimizer.binder, plan) > 0) {
@@ -496,7 +437,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     // first, so its failure starts over before the EXISTS rewrite has replaced anything.
     auto const rewrite_subqueries =
       [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
-      if (delim_aggregate_reuse_enabled(context)) {
+      if (plan_optimization_enabled(context,
+                                    &sirius::operator_params::enable_delim_aggregate_reuse)) {
         try {
           sirius::planner::reuse_delim_rows_for_subquery_aggregates(
             context, input.optimizer.binder, copy);
@@ -507,7 +449,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
           copy = copy_logical_plan(*captured, context);
         }
       }
-      if (!exists_minmax_rewrite_enabled(context)) { return 0; }
+      if (!plan_optimization_enabled(context,
+                                     &sirius::operator_params::enable_exists_minmax_rewrite)) {
+        return 0;
+      }
       try {
         return sirius::planner::rewrite_correlated_inequality_exists(
           context, input.optimizer.binder, copy, gpu_memory_budget(context));
@@ -522,7 +467,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     auto copy                     = copy_logical_plan(*captured, context);
     auto exists_rewrites          = rewrite_subqueries(copy);
     std::size_t pushed_aggregates = 0;
-    if (partial_aggregate_below_join_enabled(context)) {
+    if (plan_optimization_enabled(context,
+                                  &sirius::operator_params::enable_partial_aggregate_below_join)) {
       try {
         pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
           context, input.optimizer.binder, copy);
