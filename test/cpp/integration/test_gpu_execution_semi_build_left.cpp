@@ -15,8 +15,8 @@
  */
 
 // GPU-vs-CPU correctness for RIGHT_SEMI / RIGHT_ANTI joins built on the small kept side while the
-// large side streams through (semi_join_kept_build_ratio). DuckDB flips SEMI / ANTI to RIGHT_SEMI /
-// RIGHT_ANTI when the kept side is the smaller one, which is the shape these cases produce.
+// large side streams through. DuckDB flips SEMI / ANTI to RIGHT_SEMI / RIGHT_ANTI when the kept
+// side is the smaller one, which is the shape these cases produce.
 
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -31,6 +31,7 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -142,7 +143,8 @@ TEST_CASE_METHOD(SemiBuildLeftFixture,
     INFO(q);
     REQUIRE(kept_build_joins(*con, q) == 1);
   }
-  sirius::test::scoped_setting const off{*con, "semi_join_kept_build_ratio", 0};
+  // A kept side over the residency budget keeps the STANDARD build.
+  sirius::test::scoped_setting const over_budget{*con, "max_build_probe_resident_bytes", 1};
   for (auto const& q : kept_queries) {
     INFO(q);
     REQUIRE(kept_build_joins(*con, q) == 0);
@@ -153,11 +155,15 @@ TEST_CASE_METHOD(SemiBuildLeftFixture,
                  "semi_build_left - semi / anti with and without residual match the CPU",
                  "[integration][gpu_execution][join][semi_build_left]")
 {
-  auto const ratio = GENERATE(0, 1);
-  INFO("semi_join_kept_build_ratio = " << ratio);
-  sirius::test::scoped_setting const kept{*con, "semi_join_kept_build_ratio", std::uint64_t(ratio)};
+  auto const kept_build = GENERATE(true, false);
+  INFO("kept_build = " << kept_build);
+  std::optional<sirius::test::scoped_setting> over_budget;
+  if (!kept_build) {
+    over_budget.emplace(*con, "max_build_probe_resident_bytes", std::uint64_t{1});
+  }
   for (auto const& q : kept_queries) {
     INFO(q);
+    REQUIRE(kept_build_joins(*con, q) == (kept_build ? 1 : 0));
     compare_gpu_vs_cpu(q);
   }
 }
@@ -174,9 +180,27 @@ TEST_CASE_METHOD(SemiBuildLeftFixture,
   INFO("hash_partition_bytes = " << partition_bytes);
   sirius::test::scoped_setting const partition{*con, "hash_partition_bytes", partition_bytes};
   sirius::test::scoped_setting const table_budget{*con, "max_build_hash_table_bytes", 1024};
-  sirius::test::scoped_setting const resident_budget{*con, "max_build_probe_resident_bytes", 1024};
   for (auto const& q : kept_queries) {
     INFO(q);
+    REQUIRE(kept_build_joins(*con, q) == 1);
+    compare_gpu_vs_cpu(q);
+  }
+}
+
+TEST_CASE_METHOD(SemiBuildLeftFixture,
+                 "semi_build_left - residual over duplicate kept keys matches the CPU",
+                 "[integration][gpu_execution][join][semi_build_left]")
+{
+  // About 80 kept rows per key give each probe row more equality pairs than the kept build
+  // filters, so the residual runs as a mixed semi join.
+  for (auto const* kind : {"SEMI", "ANTI"}) {
+    std::string const q = std::string(
+                            "SELECT count(*), sum(id) FROM (SELECT k % 50 AS k, s, id FROM "
+                            "small) d ") +
+                          kind +
+                          " JOIN (SELECT k % 50 AS k, s FROM big) b ON d.k = b.k AND d.s <> b.s";
+    INFO(q);
+    REQUIRE(kept_build_joins(*con, q) == 1);
     compare_gpu_vs_cpu(q);
   }
 }

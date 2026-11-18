@@ -49,6 +49,7 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -834,18 +835,36 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                 .dynamic_filter_plan       = std::move(filter_plan),
                                 .dynamic_filter_stats_sink = stats});
     auto& hj  = *join;
-    if ((op.join_type == duckdb::JoinType::RIGHT_SEMI ||
-         op.join_type == duckdb::JoinType::RIGHT_ANTI) &&
-        op_params.semi_join_kept_build_ratio > 0.0 &&
-        static_cast<double>(lhs_cardinality) >=
-          op_params.semi_join_kept_build_ratio * static_cast<double>(rhs_cardinality)) {
-      hj.set_kept_build_streaming(true);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe est "
-        "{} rows, build est {} rows).",
-        duckdb::JoinTypeToString(op.join_type),
-        lhs_cardinality,
-        rhs_cardinality);
+    if (op.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        op.join_type == duckdb::JoinType::RIGHT_ANTI) {
+      // Every partition keeps its build rows resident until the whole probe is read, and that
+      // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
+      // when all of it fits the per-GPU BUILD_PROBE residency budget across the GPUs.
+      auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
+      auto const kept_bytes = sirius::memory::saturating_mul(
+        rhs_cardinality,
+        sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
+                                                op_params.avg_variable_column_bytes));
+      auto const budget =
+        sirius::memory::saturating_mul(num_gpus, op_params.max_build_probe_resident_bytes);
+      if (kept_bytes < budget) {
+        hj.set_kept_build_streaming(true);
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe "
+          "est {} rows, build est {} rows, {} bytes).",
+          duckdb::JoinTypeToString(op.join_type),
+          lhs_cardinality,
+          rhs_cardinality,
+          kept_bytes);
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} keeps the STANDARD build: its kept side, est {} "
+          "bytes, exceeds the {} GPU(s)' residency budget of {} bytes.",
+          duckdb::JoinTypeToString(op.join_type),
+          kept_bytes,
+          num_gpus,
+          budget);
+      }
     }
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));

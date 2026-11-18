@@ -2009,9 +2009,10 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
 }
 
-/// Largest number of equality-matched (probe, build) pairs one kept-build probe step materializes;
-/// a probe batch whose pairs exceed it is probed in row slices.
-static constexpr std::size_t k_max_kept_build_pairs = std::size_t{1} << 28;
+/// Bounds on the equality-matched (probe, kept) pairs a residual kept-build probe task filters;
+/// above either, it runs a mixed semi join instead.
+static constexpr std::size_t k_max_kept_build_pairs               = std::size_t{1} << 28;
+static constexpr std::size_t k_max_kept_build_pairs_per_probe_row = 8;
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute_kept_build(
   std::vector<cucascade::read_only_data_batch> const& input_batches,
@@ -2093,7 +2094,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute_kept_build(
     if (build_rows > 0) {
       RMM_CUDA_TRY(
         cudaMemsetAsync(slot.kept_matched->data(), 0, slot.kept_matched->size(), stream.get()));
-      // Only a residual needs the (probe, kept) pairs; without one each probe batch is hashed.
+      // A residual sizes each probe batch's equality pairs against the kept keys.
       if (num_equality_conditions < conditions.size()) {
         slot.hash_table =
           std::make_unique<cudf::hash_join>(build_keys.keys, compare_nulls(), stream);
@@ -2115,54 +2116,55 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute_kept_build(
   auto const build_full = get_cudf_table_view(slot.build_table.value());
   auto const probe_full = get_cudf_table_view(input_batches[0]);
   cudf::device_span<std::uint8_t> const flags{slot.kept_matched->data(), slot.kept_matched->size()};
-  bool const has_residual = num_equality_conditions < conditions.size();
-  if (!has_residual && !flags.empty() && probe_full.num_rows() > 0) {
-    // Mark the kept rows whose key occurs in this probe batch, without materializing pairs.
+  if (!flags.empty() && probe_full.num_rows() > 0) {
+    // Mark the kept rows that match this probe batch, without materializing (probe, kept) pairs.
     auto probe_keys =
       prepare_join_keys(input_batches[0], left_key_col_indices, _hash_key_types, stream);
-    auto probe_table   = make_right_filtered_join(probe_keys.keys, compare_nulls(), stream);
-    auto const matched = probe_table.semi_join(slot.kept_keys, stream);
-    kept_build::mark_rows(flags, *matched, stream);
-  } else if (slot.hash_table && probe_full.num_rows() > 0) {
-    auto probe_keys =
-      prepare_join_keys(input_batches[0], left_key_col_indices, _hash_key_types, stream);
-    sirius::gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    auto const predicate = has_residual ? translator.translate_join_conditions(
-                                            conditions, num_equality_conditions, conditions.size())
-                                        : std::nullopt;
-    if (has_residual) {
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> matched;
+    if (num_equality_conditions == conditions.size()) {
+      auto probe_table = make_right_filtered_join(probe_keys.keys, compare_nulls(), stream);
+      matched          = probe_table.semi_join(slot.kept_keys, stream);
+    } else {
+      // Filtering the equality pairs is faster while they stay few; duplicate keys can multiply
+      // them, so past that bound the existence-only mixed semi join runs instead.
+      auto const pairs        = slot.hash_table->inner_join_size(probe_keys.keys, stream);
+      bool const filter_pairs = pairs <= k_max_kept_build_pairs &&
+                                pairs <= k_max_kept_build_pairs_per_probe_row *
+                                           static_cast<std::size_t>(probe_full.num_rows());
+      sirius::gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+      // The mixed semi join takes the kept rows as its left table, swapping the residual's sides.
+      auto const predicate = translator.translate_join_conditions(
+        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/!filter_pairs);
       if (!predicate) {
         throw std::runtime_error(
           "In sirius_physical_hash_join: failed to translate kept-build residual conditions to a "
           "cuDF AST predicate");
       }
-    }
-    cudf::size_type const rows = probe_keys.keys.num_rows();
-    cudf::size_type step       = rows;
-    for (cudf::size_type begin = 0; begin < rows;) {
-      cudf::size_type const end = std::min(rows, begin + step);
-      auto const keys_slice     = cudf::slice(probe_keys.keys, {begin, end}, stream).front();
-      auto const pairs          = slot.hash_table->inner_join_size(keys_slice, stream);
-      if (pairs > k_max_kept_build_pairs && end - begin > 1) {
-        step = std::max<cudf::size_type>(1, (end - begin) / 2);
-        continue;
+      if (filter_pairs) {
+        auto [probe_idx, build_idx] = slot.hash_table->inner_join(probe_keys.keys, pairs, stream);
+        if (!probe_idx->is_empty()) {
+          build_idx = cudf::filter_join_indices(probe_full,
+                                                build_full,
+                                                *probe_idx,
+                                                *build_idx,
+                                                predicate->back(),
+                                                cudf::join_kind::INNER_JOIN,
+                                                std::nullopt,
+                                                stream)
+                        .second;
+        }
+        matched = std::move(build_idx);
+      } else {
+        matched = cudf::mixed_left_semi_join(slot.kept_keys,
+                                             probe_keys.keys,
+                                             build_full,
+                                             probe_full,
+                                             predicate->back(),
+                                             compare_nulls(),
+                                             stream);
       }
-      auto [probe_idx, build_idx] = slot.hash_table->inner_join(keys_slice, pairs, stream);
-      if (has_residual && !probe_idx->is_empty()) {
-        auto const probe_slice = cudf::slice(probe_full, {begin, end}, stream).front();
-        auto filtered          = cudf::filter_join_indices(probe_slice,
-                                                  build_full,
-                                                  *probe_idx,
-                                                  *build_idx,
-                                                  predicate->back(),
-                                                  cudf::join_kind::INNER_JOIN,
-                                                  std::nullopt,
-                                                  stream);
-        build_idx              = std::move(filtered.second);
-      }
-      kept_build::mark_rows(flags, *build_idx, stream);
-      begin = end;
     }
+    kept_build::mark_rows(flags, *matched, stream);
   }
   // The emit task runs on another stream once every probe task has finished.
   stream.sync();

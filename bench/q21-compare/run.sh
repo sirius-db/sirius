@@ -97,7 +97,7 @@ generate_data() {
     done
   else
     log "generating SF$SF with DuckDB dbgen into $out (slow above SF100; prefer tpchgen-cli)"
-    (cd "$WORK/src/main" && pixi run python - "$SF" "$out") <<'EOF'
+    (cd "$ENV_DIR" && pixi run python - "$SF" "$out") <<'EOF'
 import sys, duckdb
 sf, out = sys.argv[1], sys.argv[2]
 con = duckdb.connect()
@@ -114,7 +114,7 @@ EOF
 effective_config() {
   local cfg=$WORK/config_effective.yaml
   if [[ -z $GPU_LIMIT ]]; then cp "$CONFIG" "$cfg"; echo "$cfg"; return; fi
-  pixi run --manifest-path "$WORK/src/main/pixi.toml" python - "$CONFIG" "$cfg" "$GPU_LIMIT" <<'EOF'
+  pixi run --manifest-path "$ENV_DIR/pixi.toml" python - "$CONFIG" "$cfg" "$GPU_LIMIT" <<'EOF'
 import sys, yaml
 src, dst, limit = sys.argv[1:]
 cfg = yaml.safe_load(open(src)) or {}
@@ -143,6 +143,9 @@ for spec in "${BRANCH_SPECS[@]}"; do
   [[ " $BRANCHES " == *" $name "* ]] || continue
   checkout_and_build "$name" "$url" "$ref" "$commit"
 done
+# Data generation and config rewriting borrow the first selected checkout's pixi environment.
+read -r first_branch _ <<<"$BRANCHES"
+ENV_DIR=$WORK/src/$first_branch
 [[ -n $DATA ]] || generate_data
 CFG=$(effective_config)
 log "data: $DATA, config: $CFG, pin: $PIN"

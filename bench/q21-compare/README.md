@@ -17,7 +17,7 @@ GPU budget; with `false` it always merges. Its decisions are logged as
 
 `kept` builds non-delim RIGHT_SEMI / RIGHT_ANTI joins (`delim_join_as_cte = true`) on the small kept
 side and streams the large side through, instead of concatenating and hashing the large side whole.
-`SET semi_join_kept_build_ratio = 0` restores main's plan on that build.
+A kept side larger than `max_build_probe_resident_bytes` × the GPU count keeps main's plan.
 
 ## Running
 
