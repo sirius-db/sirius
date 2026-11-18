@@ -63,8 +63,10 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/common/string_util.hpp>
 #include <duckdb/execution/operator/helper/physical_execute.hpp>
 #include <duckdb/execution/operator/helper/physical_prepare.hpp>
+#include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
@@ -1870,6 +1872,21 @@ void SiriusContext::record_lease_held_at_replay() noexcept
 
 namespace {
 
+// COPY FROM (including IMPORT DATABASE), CSV and single-file exports are
+// DuckDB-only operations, not failed GPU attempts. Keep this eligibility gate
+// separate from the option/schema validation of a GPU multipart Parquet COPY.
+bool is_gpu_copy_candidate(PreparedStatementData const& prepared)
+{
+  if (!prepared.physical_plan) return false;
+  auto const* root = &prepared.physical_plan->Root();
+  while (root->type == PhysicalOperatorType::EXECUTE)
+    root = &root->Cast<PhysicalExecute>().plan;
+  if (root->type != PhysicalOperatorType::COPY_TO_FILE) return false;
+  auto const& copy = root->Cast<PhysicalCopyToFile>();
+  return copy.per_thread_output &&
+         StringUtil::Lower(copy.function.name.GetIdentifierName()) == "parquet";
+}
+
 // With enable_duckdb_fallback off, surface a GPU plan-generation failure as a
 // normal query error. Sanitize INTERNAL/FATAL (which would invalidate the whole
 // database) to ExecutorException; keep other exception types as-is.
@@ -2001,6 +2018,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (statement_type != StatementType::SELECT_STATEMENT &&
       statement_type != StatementType::COPY_STATEMENT) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  if (statement_type == StatementType::COPY_STATEMENT && !is_gpu_copy_candidate(prepared)) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
   // Try to capture the SQL string while the active query context is alive —

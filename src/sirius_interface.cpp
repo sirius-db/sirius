@@ -109,6 +109,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
       auto* sink = &prepared.sirius_physical_plan->Cast<op::sirius_physical_parquet_sink>();
       engine.initialize(std::move(prepared.sirius_physical_plan));
       try {
+        sink->prepare();
         engine.execute();  // Returns only after all asynchronous plan users retire.
         if (context.IsInterrupted()) throw duckdb::InterruptException();
         auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");

@@ -7,11 +7,14 @@
 
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/string_util.hpp>
+#include <duckdb/main/client_data.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/parser/parsed_data/copy_info.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/parser/statement/copy_statement.hpp>
+#include <duckdb/parser/statement/execute_statement.hpp>
 #include <duckdb/parser/statement/prepare_statement.hpp>
 #include <duckdb/planner/operator/logical_copy_to_file.hpp>
 
@@ -46,7 +49,8 @@ output::parquet_field export_field(std::string name, duckdb::LogicalType const& 
   output::parquet_field field;
   field.name = std::move(name);
   // Do not turn HUGEINT into a Parquet DECIMAL silently: the SQL type would change.
-  if (type.id() == T::HUGEINT || type.id() == T::UHUGEINT || type.id() == T::SQLNULL)
+  if (type.id() == T::HUGEINT || type.id() == T::UHUGEINT || type.id() == T::SQLNULL ||
+      type.IsJSONType())
     throw duckdb::NotImplementedException("Sirius Parquet export cannot preserve type " +
                                           type.ToString());
   field.type = sirius::from_duckdb(type);
@@ -89,6 +93,11 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_generator:
   auto* original = parser.statements.front().get();
   if (original->type == duckdb::StatementType::PREPARE_STATEMENT)
     original = original->Cast<duckdb::PrepareStatement>().statement.get();
+  if (original && original->type == duckdb::StatementType::EXECUTE_STATEMENT) {
+    auto& statements = duckdb::ClientData::Get(context).prepared_statements;
+    auto entry       = statements.find(original->Cast<duckdb::ExecuteStatement>().name);
+    original         = entry == statements.end() ? nullptr : entry->second->unbound_statement.get();
+  }
   if (!original || original->type != duckdb::StatementType::COPY_STATEMENT)
     throw duckdb::NotImplementedException("Sirius COPY cannot validate original output options");
   auto const& original_info     = *original->Cast<duckdb::CopyStatement>().info;

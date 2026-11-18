@@ -53,6 +53,11 @@ parquet_session::parquet_session(parquet_export_spec spec) : spec_(std::move(spe
     spec_.directory = spec_.directory.parent_path();
 }
 parquet_session::~parquet_session() { abort(); }
+void parquet_session::prepare()
+{
+  std::lock_guard guard(mutex_);
+  start_locked();
+}
 void parquet_session::start_locked()
 {
   if (successful_ || aborted_) throw std::runtime_error("Parquet export is already finished");

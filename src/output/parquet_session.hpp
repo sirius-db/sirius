@@ -21,6 +21,8 @@ class parquet_session {
   parquet_session& operator=(parquet_session const&) = delete;
   using input_id                                     = std::uint64_t;
   using write_part = std::function<void(std::size_t, std::filesystem::path const&)>;
+  // Validate/create the destination before starting query execution.
+  void prepare();
   void write(input_id id,
              std::optional<std::size_t> position,
              std::vector<std::uint64_t> const& nonempty_rows,

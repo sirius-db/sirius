@@ -38,6 +38,9 @@ cudf::data_type physical_type(logical_type const& type)
     case type_id::DOUBLE: return cudf::data_type{C::FLOAT64};
     case type_id::VARCHAR: return cudf::data_type{C::STRING};
     case type_id::DATE: return cudf::data_type{C::TIMESTAMP_DAYS};
+    case type_id::STRUCT: return cudf::data_type{C::STRUCT};
+    case type_id::LIST:
+    case type_id::ARRAY: return cudf::data_type{C::LIST};
     case type_id::TIMESTAMP_SEC: return cudf::data_type{C::TIMESTAMP_SECONDS};
     case type_id::TIMESTAMP_MS: return cudf::data_type{C::TIMESTAMP_MILLISECONDS};
     case type_id::TIMESTAMP: return cudf::data_type{C::TIMESTAMP_MICROSECONDS};
@@ -79,6 +82,22 @@ cudf::column_view parquet_view(parquet_field const& field,
                                std::vector<std::unique_ptr<cudf::column>>& owners,
                                ::cuda::stream_ref stream)
 {
+  auto const expected      = physical_type(field.type);
+  bool const small_decimal = field.type.is_decimal() && field.type.decimal_precision() <= 4 &&
+                             column.type().id() == cudf::type_id::INT16;
+  bool const decimal = field.type.is_decimal() && cudf::is_fixed_point(column.type());
+  // Decimal carrier widths may differ before normalization; the scale must not.
+  // Every other input must already have the declared physical type, including
+  // nested children. Reject mismatches before constructing metadata or files.
+  if ((!small_decimal && !decimal && column.type() != expected) ||
+      (decimal && (column.type().scale() != expected.scale() ||
+                   cudf::size_of(column.type()) > cudf::size_of(expected))))
+    throw std::runtime_error("Parquet export physical type mismatch for field: " + field.name);
+  bool const list = field.type.id() == type_id::LIST || field.type.id() == type_id::ARRAY;
+  if (column.num_children() !=
+        static_cast<cudf::size_type>(field.children.size() + (list ? 1 : 0)) &&
+      (list || field.type.id() == type_id::STRUCT))
+    throw std::runtime_error("Parquet export nested schema mismatch for field: " + field.name);
   // cuDF scales raw seconds ticks during Parquet encoding. Normalize first so
   // +/-infinity and NULL survive, and finite overflow is rejected like CPU COPY.
   // This also applies to timestamp children reached recursively below.
@@ -104,7 +123,7 @@ cudf::column_view parquet_view(parquet_field const& field,
   }
   // Aggregate fast paths can retain DECIMAL64 for a declared DECIMAL(38,s).
   // Footer precision must fit the physical carrier even when all actual values
-  // are small. Widen recursively without narrowing an already wider carrier.
+  // are small. Widen recursively; wider-than-declared carriers were rejected above.
   if (field.type.is_decimal() && cudf::is_fixed_point(column.type())) {
     auto const required = physical_type(field.type);
     if (cudf::size_of(column.type()) < cudf::size_of(required)) {
@@ -114,7 +133,6 @@ cudf::column_view parquet_view(parquet_field const& field,
   }
   if (!field.children.empty()) {
     std::vector<cudf::column_view> children;
-    bool const list = field.type.id() == type_id::LIST || field.type.id() == type_id::ARRAY;
     if (list) children.push_back(column.child(0));
     for (std::size_t i = 0; i < field.children.size(); ++i)
       children.push_back(

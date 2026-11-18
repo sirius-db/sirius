@@ -18,6 +18,8 @@ Preexisting empty subdirectories are allowed and preserved. Files, symlinks, and
 nonempty directory trees are rejected. If the destination is absent, its parent
 must already exist. Relative local paths are resolved at planning time.
 Remote destinations are not supported by the GPU writer.
+The destination is validated and, if absent, created before query execution starts,
+so an invalid destination fails without computing the query result.
 
 When DuckDB's `enable_external_access` is false, the DuckDB frontend checks the
 destination and requires an `allowed_directories` prefix covering its generated
@@ -45,12 +47,27 @@ single-file behavior, which Sirius does not implement. Sirius writes **one part 
 arriving nonempty batch**, rather than one part per thread. It neither combines nor
 splits batches to target a file size. Encoded bytes will differ from GPU batch bytes.
 
-Explicit unsupported options, codecs, formats, and result types decline GPU planning
-with a logged reason. The original DuckDB plan runs when fallback is enabled; with
-`SET enable_duckdb_fallback = false`, the statement fails instead. DuckDB binding
+Only Parquet COPY with `PER_THREAD_OUTPUT true` is a GPU COPY candidate. `COPY FROM`,
+`IMPORT DATABASE`, CSV exports, and single-file exports execute on DuckDB regardless
+of `enable_duckdb_fallback`; these are ordinary CPU operations, not GPU fallbacks.
+The flag controls planning and execution failures of GPU candidates, rather than
+disabling all DuckDB execution. SQL `PREPARE`/`EXECUTE` and the prepared-statement
+API use the same candidate and option checks as direct statements.
+
+Within multipart Parquet COPY, explicit unsupported options, codecs, and result
+types decline GPU planning with a logged reason. The original DuckDB plan runs when
+fallback is enabled; with `SET enable_duckdb_fallback = false`, the statement fails instead. DuckDB binding
 errors remain binding errors. MAP and SQL types without a lossless export mapping
-are currently CPU cases. LIST, STRUCT, ARRAY, and supported scalar types carry
+are currently CPU cases. JSON also declines GPU export, including nested JSON,
+because writing it as VARCHAR would lose DuckDB's JSON annotation.
+LIST, STRUCT, ARRAY, and supported scalar types carry
 recursive names and decimal precision metadata into the writer.
+
+Scanning `DECIMAL(p,s)` columns with precision 1–4, such as `DECIMAL(4,2)`, is
+currently unsupported by the GPU scan/type mapping. Such exports follow the same
+planning-time fallback policy; the output operator does not add scan support.
+This existing limitation is tracked separately in
+[issue #2653](https://github.com/sirius-db/sirius/issues/2653).
 
 Available codecs depend on the installed cuDF Parquet writer and its runtime
 configuration. Sirius recognizes uncompressed, Snappy, Gzip, Brotli, Zstd, and LZ4
@@ -77,6 +94,10 @@ GPU without gathering the entire output or converting it to DuckDB CPU result ro
 Independent tasks and GPUs can write different parts concurrently. Existing safe
 grouped-merge fusion can feed it directly; additional sort-merge fusion is not
 required or enabled by this feature.
+
+GPU COPY currently supports single-node execution only. Distributed execution with
+`sirius_exchange_peers` does not support the export sink and follows the planning
+fallback policy.
 
 The first input with rows selects positioned or unordered mode. Empty inputs do
 not select a mode. Positioned filenames contain a zero-padded 20-digit position

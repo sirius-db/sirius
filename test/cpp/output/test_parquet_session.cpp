@@ -26,6 +26,34 @@ auto writer = [](std::size_t i, std::filesystem::path const& path) {
 };
 }  // namespace
 using namespace sirius::output;
+TEST_CASE("Parquet preparation validates the destination and cleans up before any writes",
+          "[parquet_export][cpu]")
+{
+  temporary_directory root;
+  auto target = root.path / "result";
+  {
+    parquet_session session({.directory = target});
+    session.prepare();
+    session.prepare();
+    REQUIRE(std::filesystem::is_directory(target));
+    REQUIRE(std::filesystem::is_empty(target));
+  }
+  REQUIRE_FALSE(std::filesystem::exists(target));
+  std::filesystem::create_directories(target / "nested");
+  {
+    parquet_session session({.directory = target});
+    session.prepare();
+  }
+  REQUIRE(std::filesystem::is_directory(target / "nested"));
+  std::ofstream(target / "nested/existing") << "keep";
+  parquet_session nonempty({.directory = target});
+  REQUIRE_THROWS_WITH(nonempty.prepare(), Catch::Matchers::ContainsSubstring("not empty"));
+  REQUIRE(std::filesystem::file_size(target / "nested/existing") == 4);
+  parquet_session missing_parent({.directory = root.path / "missing/result"});
+  REQUIRE_THROWS(missing_parent.prepare());
+  REQUIRE_FALSE(std::filesystem::exists(root.path / "missing"));
+}
+
 TEST_CASE("Parquet parts are visible before export completion", "[parquet_export][cpu]")
 {
   temporary_directory root;
