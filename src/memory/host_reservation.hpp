@@ -27,7 +27,13 @@
 
 namespace sirius::memory {
 
-/// HOST reservations are charged in whole blocks, with a reservation limit per space.
+/**
+ * @brief Round a HOST staging size to the memory space's reservation granularity.
+ *
+ * @param space Candidate memory space
+ * @param bytes Staging payload size in bytes
+ * @return Block-rounded size, or std::nullopt if the space cannot support the request
+ */
 [[nodiscard]] inline std::optional<std::size_t> host_reservation_size(
   const cucascade::memory::memory_space& space, std::size_t bytes)
 {
@@ -39,6 +45,12 @@ namespace sirius::memory {
   return blocks * block;
 }
 
+/**
+ * @brief Estimate how much capacity is available below the HOST reservation limit.
+ *
+ * @param space HOST memory space backed by a fixed-size HOST resource
+ * @return The reservation limit minus currently allocated bytes, clamped to zero
+ */
 [[nodiscard]] inline std::size_t host_reservation_headroom(
   const cucascade::memory::memory_space& space)
 {
@@ -48,7 +60,13 @@ namespace sirius::memory {
   return used < limit ? limit - used : 0;
 }
 
-/// Try to reserve the block-rounded size in a compatible pool.
+/**
+ * @brief Try to reserve enough HOST blocks for a staging payload.
+ *
+ * @param space Candidate memory space
+ * @param bytes Staging payload size in bytes
+ * @return The reservation, or nullptr if the space cannot admit it
+ */
 [[nodiscard]] inline std::unique_ptr<cucascade::memory::reservation> try_reserve_host(
   const cucascade::memory::memory_space& space, std::size_t bytes)
 {
@@ -59,7 +77,13 @@ namespace sirius::memory {
   return nullptr;
 }
 
-/// Look at every compatible space. The reservation itself is the authoritative admission test.
+/**
+ * @brief Try to reserve HOST staging capacity from the first pool that can admit the request.
+ *
+ * @param spaces Candidate memory spaces in the order they should be tried
+ * @param bytes Staging payload size in bytes
+ * @return The reservation, or nullptr if no space can admit it
+ */
 [[nodiscard]] inline std::unique_ptr<cucascade::memory::reservation> try_reserve_host(
   std::span<const cucascade::memory::memory_space* const> spaces, std::size_t bytes)
 {
@@ -69,10 +93,16 @@ namespace sirius::memory {
   return nullptr;
 }
 
-/// A pre-publication miss carrying the exact copy size needed to resume. Admission rounds it for
-/// each candidate pool.
+/**
+ * @brief A pre-publication miss carrying the copy size needed to resume.
+ */
 class host_reservation_required : public std::runtime_error {
  public:
+  /**
+   * @brief Construct a HOST reservation miss.
+   *
+   * @param bytes Copy size needed to resume, before rounding for a candidate HOST pool
+   */
   explicit host_reservation_required(std::size_t bytes)
     : std::runtime_error("Insufficient HOST memory to stage materialized query results"),
       bytes(bytes)

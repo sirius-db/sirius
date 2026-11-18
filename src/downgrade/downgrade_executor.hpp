@@ -154,11 +154,19 @@ class downgrade_executor {
    */
   std::future<size_t> request_free_memory(size_t bytes);
 
-  /// Callback form for admission retries. The callback runs after workers have settled, or
-  /// when the request is canceled. A rejected submission throws before it enters the queue.
-  /// `delay` determines when this request becomes eligible for processing.
-  /// Consider a single byte-targeted API returning an `exec::semi_future<size_t>` so callers
-  /// can either wait for completion or install a callback.
+  /**
+   * @brief Asynchronously request memory reclamation with a completion callback.
+   *
+   * @param bytes Target bytes to free from this executor's memory space
+   * @param stop Optional predicate that stops further reclamation when it returns true. It must
+   * be safe to call concurrently.
+   * @param on_complete Callback invoked after workers finish or a queued request is canceled.
+   * It receives the actual bytes freed and an exception pointer, which is null on success.
+   * @param delay Time before the queued request becomes eligible for processing
+   * @throws std::runtime_error if the executor is no longer accepting requests
+   * @todo Consider a single byte-targeted API returning an `exec::semi_future<size_t>` so callers
+   * can wait for completion or install a callback.
+   */
   void request_free_memory(size_t bytes,
                            std::function<bool()> stop,
                            downgrade_completion on_complete,

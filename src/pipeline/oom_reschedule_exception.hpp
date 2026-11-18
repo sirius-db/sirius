@@ -67,9 +67,18 @@ class oom_reschedule_exception : public task_reschedule_exception {
   using task_reschedule_exception::task_reschedule_exception;
 };
 
-/// The computed result has not been published and needs HOST admission before it can resume.
+/**
+ * @brief Reschedule request for a computed result waiting for HOST admission before publication.
+ */
 class host_reschedule_exception : public task_reschedule_exception {
  public:
+  /**
+   * @brief Capture the output needed to retry result collection.
+   *
+   * @param output Computed batches to preserve for the collection retry
+   * @param resume_operator_index Operator index at which to resume execution
+   * @param miss Reservation miss carrying the required HOST staging size
+   */
   host_reschedule_exception(std::unique_ptr<op::operator_data> output,
                             size_t resume_operator_index,
                             const memory::host_reservation_required& miss)

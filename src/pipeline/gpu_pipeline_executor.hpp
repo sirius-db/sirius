@@ -74,10 +74,12 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Constructs a new gpu_pipeline_executor with task execution configuration
    *
+   * @param lifecycle Registry for tracking query work and memory waits
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    * @param mem_space Pointer to the memory space for GPU allocations
    * @param task_request_publisher Publisher to submit task requests
    * @param downgrade_executor Optional downgrade executor for the GPU memory space
+   * @param telemetry_context Shared context for executor instrumentation
    * @param host_pools HOST pool bindings, borrowed for this executor's lifetime
    */
   explicit gpu_pipeline_executor(
