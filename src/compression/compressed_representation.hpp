@@ -254,9 +254,14 @@ class compressed_host_representation : public simpatico_compressed_representatio
  * Holds a shared compressed_device_blob: a single contiguous device payload buffer
  * plus a simpatico::compressed_table whose leaf channels_ are non-owning slices of
  * that payload (placed there at pin time via slab_memory_resource, no per-query copy).
- * The converter compressed_device_representation → gpu_table_representation calls
- * simpatico::decompress() directly on the cached table, decompressing only the selected
- * columns when a projection is set.
+ *
+ * The converter compressed_device_representation → gpu_table_representation takes one of
+ * two routes, and both decode only the selected columns when a projection is set:
+ * - To the GPU that holds the chunk, it calls simpatico::decompress() directly on the
+ *   cached table.
+ * - To any other GPU it cannot use the cached table, whose leaves point into the owner's
+ *   memory. It copies the selected columns' compressed buffers to the target GPU, rebuilds
+ *   a table there from the header, and decodes that. The chunk itself is only read.
  */
 class compressed_device_representation : public simpatico_compressed_representation {
  public:
@@ -297,6 +302,9 @@ class compressed_device_representation : public simpatico_compressed_representat
   [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
+  /// The shared chunk storage (defined in device_compressed_blob.hpp), or null when the chunk
+  /// carries none (see @ref has_table).
+  [[nodiscard]] const compressed_device_blob* blob() const noexcept { return _blob.get(); }
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {

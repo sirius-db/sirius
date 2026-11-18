@@ -14,6 +14,8 @@ vcpkg_from_github(
   fix-pq-kernel-optional.patch
   static-cuda-math.patch
   exclude-sources.patch
+  # Unfiltered brute-force search no longer links cuSPARSE.
+  split-filtered-brute-force.patch
   HEAD_REF
   main)
 

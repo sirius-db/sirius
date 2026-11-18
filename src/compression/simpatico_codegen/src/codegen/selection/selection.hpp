@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared types for evaluating a scan's filter while decompressing
-// (env gate: SIRIUS_EXP_FUSED_SCAN_FILTER).
+// (query policy: enable_fused_scan_filter).
 //
 // Owned by the wave orchestration. Included by:
 //   - the JIT decode variants (ballot-to-mask, mask-consuming) as kernel-arg
@@ -19,6 +19,7 @@
 #pragma once
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
 
 #include <cudf/column/column_view.hpp>
 
@@ -98,9 +99,11 @@ struct range_predicate {
 //                 the shared survivor index map. Costs about the unfiltered
 //                 path, so it is admitted only at low selectivity: once the
 //                 survivor count is known the batch proceeds iff
-//                 survivors/rows <= SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL
+//                 survivors/rows <= fused_scan.full_route_max_selectivity
 //                 (default 0.10), else the decode gives compaction up
 //                 (measured losses at high selectivity: q1 +43.5%, q5 +6.2%).
+//                 Beside a dict_codes output the ceiling is
+//                 fused_scan.max_selectivity instead.
 //   bitpack_mask— a bitpack root decoded straight into a compacted
 //                 survivor_count-row column, skipping the writes for rejected
 //                 rows.
@@ -110,7 +113,9 @@ struct range_predicate {
 //                 survivor count. Economics differ from the write-skipping
 //                 routes: this wins 2.1-2.6x at ALL selectivities (it skips the
 //                 full string materialization round trip), so the selectivity
-//                 ceiling does NOT apply to a batch with such an output.
+//                 ceiling does NOT apply to a batch with such an output, and a
+//                 batch that also has `full` outputs gets the ordinary ceiling
+//                 rather than the full-route one.
 //   str_split   — str_split strings: masked offsets reconstruction plus a
 //                 survivor-only chars byte-gather. Shaped like the dictionary
 //                 case (skipped char materialization scales with selectivity)
@@ -181,6 +186,9 @@ struct bool8_filter_directive {
 // precondition and falls back to the unfiltered path when any fail.
 // Source-count cap: ranges + equalities + probes <= 8, one source per kernel.
 struct scan_filter_request {
+  /// Explicit caller policy, independent of the executing worker thread or process environment.
+  bool enable_fused_scan_filter = true;
+  fused_scan_policy fused_scan;
   std::vector<filter_column_directive> filters;                 // range conjuncts
   std::vector<bool8_filter_directive> bool8_filters;            // dictionary-answered equalities
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes

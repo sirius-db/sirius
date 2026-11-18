@@ -18,6 +18,7 @@
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/type_conversions.hpp"
+#include "memory/device_transfer.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/detail/read_retirement.hpp"
 #include "op/scan/parquet_scan_types.hpp"
@@ -137,6 +138,10 @@ class sized_input : public sirius::op::operator_data {
 
 class prepare_oom_input : public sirius::op::operator_data {
  public:
+  /// With @p host_staging the shortage is of the pinned HOST memory a cross-GPU copy stages
+  /// through, not of the task's GPU memory.
+  explicit prepare_oom_input(bool host_staging = false) : host_staging_(host_staging) {}
+
   [[nodiscard]] sirius::op::operator_data_type get_type() const override
   {
     return sirius::op::operator_data_type::BASE;
@@ -145,8 +150,14 @@ class prepare_oom_input : public sirius::op::operator_data {
 
   void prepare_for_processing(const ::cucascade::memory::memory_space*, ::cuda::stream_ref) override
   {
+    if (host_staging_) {
+      throw sirius::memory::host_staging_out_of_memory("injected HOST staging OOM");
+    }
     throw rmm::out_of_memory("injected prepare OOM");
   }
+
+ private:
+  bool host_staging_;
 };
 
 // Minimal idata_representation stub that reports different compressed vs uncompressed
@@ -1486,6 +1497,62 @@ TEST_CASE("gpu_pipeline_task prepare OOM resumes at the current start index",
 
   SECTION("resumed task keeps start index 1") { expect_resume_at(1); }
   SECTION("first attempt resumes at start index 0") { expect_resume_at(0); }
+}
+
+// A cross-GPU copy that runs out of pinned HOST staging is retried like a GPU OOM, but a larger
+// GPU reservation would not help it, and the attempt's peak says nothing about the input's GPU
+// needs. A GPU OOM raises the retry floor and records a failure, the HOST shortage does neither.
+TEST_CASE("gpu_pipeline_task prepare HOST staging OOM retries without growing the GPU reservation",
+          "[gpu_pipeline_task][prepare_oom_resume]")
+{
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+  auto const host_staging = GENERATE(true, false);
+  CAPTURE(host_staging);
+
+  constexpr std::size_t kReservationSize = 1ULL * 1024 * 1024;
+
+  auto ctx          = create_two_operator_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  auto* const global    = global_state.get();
+  auto input            = std::make_unique<prepare_oom_input>(host_staging);
+  auto* const installed = input.get();
+  auto state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input));
+  auto* const local = state.get();
+  auto task         = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    /*task_id=*/1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::move(state),
+    std::move(global_state));
+
+  auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
+  auto reservation = f.manager->request_reservation(
+    cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize);
+  REQUIRE(reservation != nullptr);
+  auto const reservation_bytes = reservation->size();
+  local->set_reservation(std::move(reservation), info);
+  auto const history_before = global->get_memory_history().size();
+
+  rmm::cuda_stream stream;
+  try {
+    advance_to_reserving(*task);
+    task->execute(stream);
+    FAIL("prepare OOM must reschedule the task");
+  } catch (sirius::pipeline::oom_reschedule_exception& ex) {
+    CHECK(ex.get_resume_operator_index() == 0);
+    CHECK(ex.release_intermediate_data().get() == installed);
+  }
+  if (host_staging) {
+    CHECK(local->get_retry_reservation_floor() == 0);
+    CHECK(global->get_memory_history().size() == history_before);
+  } else {
+    CHECK(local->get_retry_reservation_floor() >= 2 * reservation_bytes);
+    CHECK(global->get_memory_history().size() == history_before + 1);
+  }
 }
 
 // ---------------------------------------------------------------------------

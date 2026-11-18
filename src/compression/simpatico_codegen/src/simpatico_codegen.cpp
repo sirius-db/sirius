@@ -294,7 +294,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
   return selected;
 }
 
-// ── Filtering while decoding (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ────────
+// ── Filtering while decoding (query policy enable_fused_scan_filter) ────────
 //
 // Two waves inside one converter call:
 //   wave 1: ballot the filter columns into mask words, round-robin on the pool
@@ -321,7 +321,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //   Dynamically, once the survivor count is known — both regimes report
 //           declined_unselective, so the caller can remember it for the scan:
 //           - any `full` output: proceed iff survivors/rows <= TIERB_MAX_SEL
-//             (0.10);
+//             (0.10), or <= MAX_SEL (0.35) when a dict_codes output is present;
 //           - otherwise: give compaction up above MAX_SEL (0.35), unless a
 //             dict_codes output is present (that gather wins at every
 //             selectivity).
@@ -329,7 +329,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 
 // The index walk is reachable from here (its launcher and the
 // decode_selection.prefer_index_decode routing are both live). Effective kill
-// switch: set SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL to a tiny value (the parse
+// switch: set fused_scan_index_walk_max_selectivity to a tiny value (the setting
 // requires > 0).
 
 // Both waves submit typed session requests through the same plan interpreter.
@@ -351,7 +351,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // Preconditions — all checked before touching the device. A refusal is a
   // normal-path decision (the caller runs the unfiltered decode, byte-identical
   // to what it would have run anyway), not an error; the reason line only
-  // appears under SIRIUS_EXP_FUSED_SCAN_DIAG.
+  // appears when fused_scan_diagnostics is enabled.
   //
   // Most of these are structural — index bounds, arity, chunk geometry, the
   // source cap — and protect the kernels from a request that would fault or
@@ -368,23 +368,23 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // decompression_pushdown_scan::for_chunk, whose narrowing is what makes the claim true).
   // They are host-side plan-tree walks, once per batch, against device work
   // measured in milliseconds.
-  auto refuse = [](char const* why) {
-    if (sc::decompression_pushdown_diag_enabled())
+  auto refuse = [&request](char const* why) {
+    if (request.fused_scan.diagnostics)
       std::fprintf(stderr, "simpatico: filtered decode refused: %s\n", why);
     return std::nullopt;
   };
-  if (!sc::decompression_pushdown_enabled()) return refuse("env gate off");
   size_t const k_range = request.filters.size();
+  if (!request.enable_fused_scan_filter) return refuse("query policy disabled");
   size_t const k_bool8 = request.bool8_filters.size();
   // Membership cap (drop-tail, sound — see max_membership_sources).
-  size_t const k_member    = std::min(request.membership_filters.size(),
-                                   sc::decompression_pushdown_max_membership_sources());
+  size_t const k_member =
+    std::min(request.membership_filters.size(), request.fused_scan.max_membership_sources);
   size_t const k_total     = k_range + k_bool8 + k_member;
   result.source_generation = request.source_generation;  // echoed on every outcome
-  if (k_member < request.membership_filters.size() && sc::decompression_pushdown_diag_enabled()) {
+  if (k_member < request.membership_filters.size() && request.fused_scan.diagnostics) {
     std::fprintf(stderr,
                  "simpatico: filtered decode membership sources capped %zu -> %zu "
-                 "(SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER)\n",
+                 "(fused_scan_max_membership_sources)\n",
                  request.membership_filters.size(),
                  k_member);
   }
@@ -480,7 +480,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     }
   }
 
-  if (sc::decompression_pushdown_diag_enabled()) {
+  if (request.fused_scan.diagnostics) {
     std::string line = "simpatico: filtered decode wave-1 sources:";
     for (auto const& f : request.filters) {
       line += " range(col ";
@@ -695,7 +695,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       return refuse("every membership source declined");
     }
 
-    if (declined_members > 0 && sc::decompression_pushdown_diag_enabled()) {
+    if (declined_members > 0 && request.fused_scan.diagnostics) {
       std::fprintf(stderr,
                    "simpatico: %zu of %zu membership probe(s) declined this chunk (rows=%lld); the "
                    "decode carries the rest and the join filters the remainder\n",
@@ -736,6 +736,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     //  * `full` outputs present: proceed only at sel <= the full-route threshold
     //    (default 0.10) — a full decode plus gather costs about the unfiltered
     //    path, so only a near-empty survivor set pays for the compacted batch.
+    //    A dict_codes output raises that to the 0.35 write-skip threshold: its
+    //    survivor-count-independent savings outweigh the full columns' gather,
+    //    which giving up would not avoid either, since the scan's filter then
+    //    gathers the plain batch (TPC-H q12 at SF1000, 15% surviving, a full
+    //    l_orderkey beside a dictionary l_shipmode: 0.49 s -> 0.20 s).
     //  * no `full`: the 0.35 write-skip threshold (the mask walk costs about
     //    the plain decode at sel .5) covering bitpack_mask / delta_mask AND
     //    str_split (whose char-gather savings are dictionary-like in shape but
@@ -755,21 +760,22 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       any_full |= routes[i] == sc::decode_route::full;
     }
     double const sel_frac = static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    bool const give_up =
-      any_full ? sel_frac > sc::decompression_pushdown_full_route_max_selectivity()
-               : (sel_frac > sc::decompression_pushdown_max_selectivity() && !any_dict_gather);
+    bool const full_threshold_binds =
+      any_full && (!any_dict_gather || request.fused_scan.full_route_max_selectivity >=
+                                         request.fused_scan.max_selectivity);
+    double const threshold = full_threshold_binds ? request.fused_scan.full_route_max_selectivity
+                                                  : request.fused_scan.max_selectivity;
+    bool const give_up     = sel_frac > threshold && (any_full || !any_dict_gather);
     if (give_up) {
-      double const threshold = any_full ? sc::decompression_pushdown_full_route_max_selectivity()
-                                        : sc::decompression_pushdown_max_selectivity();
-      char const* env_name =
-        any_full ? "SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL" : "SIRIUS_EXP_FUSED_SCAN_MAX_SEL";
-      if (sc::decompression_pushdown_diag_enabled()) {
+      char const* setting_name = full_threshold_binds ? "fused_scan_full_route_max_selectivity"
+                                                      : "fused_scan_max_selectivity";
+      if (request.fused_scan.diagnostics) {
         std::fprintf(stderr,
                      "simpatico: filtered decode gave compaction up: sel=%.4f > %.4f (%s, "
                      "survivors=%lld/%lld)\n",
                      sel_frac,
                      threshold,
-                     env_name,
+                     setting_name,
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
@@ -792,13 +798,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     for (auto const t : routes)
       any_bitpack_mask |= t == sc::decode_route::bitpack_mask;
     bool const index_walk_pick =
-      any_bitpack_mask && sel_frac <= sc::decompression_pushdown_index_walk_max_selectivity();
-    if (sc::decompression_pushdown_diag_enabled()) {
+      any_bitpack_mask && sel_frac <= request.fused_scan.index_walk_max_selectivity;
+    if (request.fused_scan.diagnostics) {
       std::fprintf(stderr,
                    "simpatico: filtered decode row enumeration: %s (sel=%.4f, max=%.4f)\n",
                    index_walk_pick ? "index list" : "mask bits",
                    sel_frac,
-                   sc::decompression_pushdown_index_walk_max_selectivity());
+                   request.fused_scan.index_walk_max_selectivity);
     }
 
     // Survivor indices are built on s0 and shared by the delivered columns that consume them.
@@ -861,6 +867,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       }
       auto const& column = table.columns[selected[i]];
       decode_selection selection;
+      selection.diagnostics        = request.fused_scan.diagnostics;
       selection.mask               = &sel;
       selection.survivor_count     = sel.survivor_count;
       selection.survivor_indices   = survivor_indices;
@@ -1223,7 +1230,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,streams]"};
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, streams, mr)) {
-    if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+    if (request.fused_scan.diagnostics) {
       int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_b = 0;
       for (auto const t : result.routes) {
         n_a += t == sirius::codegen::decode_route::bitpack_mask;

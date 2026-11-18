@@ -896,9 +896,10 @@ void bind_enumeration(VariantLaunchArgs& va,
 void report_enumeration(char const* what,
                         VariantLaunchArgs const& va,
                         std::int64_t num_rows,
-                        std::int64_t survivors)
+                        std::int64_t survivors,
+                        bool diagnostics)
 {
-  if (!::sirius::codegen::decompression_pushdown_diag_enabled()) { return; }
+  if (!diagnostics) { return; }
   auto const chunks = (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
   char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
   auto const cpb    = cdj::chunks_per_block(va.shape);
@@ -989,7 +990,7 @@ void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
     va, cdj::kShapeMaskConsume, cdj::kShapeIndexConsume, cdj::kShapeSparseConsume, mask, rows);
   va.out_dtype         = out_dtype;
   auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
-  report_enumeration("value decode", va, num_rows, survivors);
+  report_enumeration("value decode", va, num_rows, survivors, rows.diagnostics);
   // A row set carries its own geometry, so there is no mask to check it against
   // — the same exemption the str_split metadata launch already makes.
   launch_decode_fused_tree_impl(
@@ -1017,7 +1018,7 @@ void launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                    rows.by_index() ? row_enumeration{} : rows);
   va.len_out           = dev(lengths_out);
   auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
-  report_enumeration("str_split metadata", va, num_string_rows, survivors);
+  report_enumeration("str_split metadata", va, num_string_rows, survivors, rows.diagnostics);
   launch_decode_fused_tree_impl(tree,
                                 labeled,
                                 dtype,
@@ -1050,7 +1051,7 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
   va.keys_chars        = dev(keys_chars);
   va.key_width         = key_width;
   auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
-  report_enumeration("dictionary gather", va, num_rows, survivors);
+  report_enumeration("dictionary gather", va, num_rows, survivors, rows.diagnostics);
   launch_decode_fused_tree_impl(
     tree, labeled, dtype, num_rows, out_chars, va, rows.by_row_set() ? nullptr : &mask, frame);
 }
