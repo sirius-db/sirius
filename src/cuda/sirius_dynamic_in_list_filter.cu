@@ -21,6 +21,7 @@
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/prepared_build_keys.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
@@ -28,6 +29,7 @@
 #include <cudf/utilities/traits.hpp>
 
 // cccl
+#include <cuco/extent.cuh>
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
@@ -46,6 +48,7 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
@@ -64,6 +67,9 @@ constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 // makes an already-chosen set sparser: estimated_set_bytes (and so IN-list vs Bloom selection)
 // is always evaluated at the baseline factor.
 constexpr std::size_t kGrowthCandidates[] = {4, 3};
+static_assert(kGrowthCandidates[0] >= kGrowthCandidates[1] &&
+                kGrowthCandidates[0] >= kCapacityFactor,
+              "in_list_storage_upper_bound sizes the set at the first growth candidate");
 
 [[nodiscard]] std::size_t capacity_factor_for(std::size_t num_keys, std::size_t key_bytes) noexcept
 {
@@ -83,6 +89,17 @@ constexpr std::size_t kGrowthCandidates[] = {4, 3};
 
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
+
+/**
+ * @brief The capacity the constructor requests for `num_keys` keys at `factor` slots per key.
+ */
+[[nodiscard]] std::size_t requested_capacity(std::size_t num_keys, std::size_t factor) noexcept
+{
+  auto const capacity = num_keys > std::numeric_limits<std::size_t>::max() / factor
+                          ? std::numeric_limits<std::size_t>::max()
+                          : factor * num_keys;
+  return std::max(capacity, kMinCapacity);
+}
 
 using detail::set_alloc;
 using detail::set_type;
@@ -114,23 +131,15 @@ set_owner<KeyT> make_set(std::size_t capacity,
 }
 
 template <class KeyT>
-set_owner<KeyT> build_set(membership_key_domain const& domain,
-                          cudf::column_view const& keys,
+set_owner<KeyT> build_set(cudf::column_view const& prepared,
                           std::size_t capacity,
                           rmm::device_async_resource_ref mr,
                           cuda::stream_ref stream)
 {
   auto set = make_set<KeyT>(capacity, mr, stream);
-  if (keys.size() > 0) {
-    // The build column may sit at a same-family carrier other than the rep; the iterator converts
-    // per element instead of materializing a rep-typed copy.
-    bool const inserted =
-      detail::with_build_key_iterator<KeyT>(domain, keys, stream, mr, [&](auto first, auto last) {
-        set->insert_async(first, last, stream);
-      });
-    if (!inserted) {
-      throw std::logic_error("[sirius_dynamic_in_list_filter] build carrier does not fit its rep.");
-    }
+  if (prepared.size() > 0) {
+    auto const* first = prepared.data<KeyT>();
+    set->insert_async(first, first + prepared.size(), stream);
   }
   return set;
 }
@@ -192,22 +201,38 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
                                                              ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
 {
-  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
-  // device; `build.compacted` stays alive until insert_async is queued on `stream`.
-  auto const build = prepare_membership_build("[sirius_dynamic_in_list_filter]", keys, stream, mr);
-  _domain          = build.domain;
-  _num_keys        = static_cast<std::size_t>(build.keys.size());
+  // The prepared column frees stream-ordered after the insert is queued on `stream`.
+  auto const prepared = prepare_build_column("[sirius_dynamic_in_list_filter]", keys, stream, mr);
+  construct(prepared.domain, prepared.keys->view(), stream, mr);
+}
+
+sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(membership_key_domain const& domain,
+                                                             cudf::column_view const& prepared,
+                                                             ::cuda::stream_ref stream,
+                                                             rmm::device_async_resource_ref mr)
+{
+  detail::require_prepared("[sirius_dynamic_in_list_filter]", domain, prepared);
+  construct(domain, prepared, stream, mr);
+}
+
+void sirius_dynamic_in_list_filter::construct(membership_key_domain const& domain,
+                                              cudf::column_view const& prepared,
+                                              ::cuda::stream_ref stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  _domain   = domain;
+  _num_keys = static_cast<std::size_t>(prepared.size());
 
   cuda::stream_ref const s{stream.get()};
   auto const rep_bytes = membership_rep_bytes(_domain.rep);
   auto const factor    = capacity_factor_for(_num_keys, rep_bytes);
-  auto const capacity  = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
+  auto const capacity  = requested_capacity(_num_keys, factor);
   _set                 = std::make_unique<set_impl>();
-  _set->source_device  = build.source_device;
+  _set->source_device  = detail::current_device("[sirius_dynamic_in_list_filter]");
   auto source          = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return std::make_unique<set_replica>(_set->source_device,
-                                         build_set<key_type>(_domain, build.keys, capacity, mr, s));
+                                         build_set<key_type>(prepared, capacity, mr, s));
   });
   SIRIUS_LOG_DEBUG(
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
@@ -223,7 +248,13 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
 {
   // Nullable keys are accepted: null build slots are compacted out at construction.
-  return membership_key_supported(keys.type());
+  return supports(keys.type(), static_cast<std::size_t>(keys.size() - keys.null_count()));
+}
+
+bool sirius_dynamic_in_list_filter::supports(cudf::data_type key_type,
+                                             std::size_t /*valid_rows*/) noexcept
+{
+  return membership_key_supported(key_type);
 }
 
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
@@ -404,6 +435,46 @@ bool sirius_dynamic_in_list_filter::prepare_fused_probe(cudf::column_view const&
 }
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }
+
+std::size_t sirius_dynamic_in_list_filter::set_slots(std::size_t num_keys,
+                                                     std::size_t capacity_factor) noexcept
+{
+  // The rounding cuco applies when the set is constructed with this capacity.
+  return static_cast<std::size_t>(
+    cuco::make_valid_extent<static_cast<std::int32_t>(detail::kCgSize), detail::kBucketSize>(
+      requested_capacity(num_keys, capacity_factor))
+      .value());
+}
+
+std::size_t sirius_dynamic_in_list_filter::storage_bytes() const noexcept
+{
+  if (!_set) { return 0; }
+  auto const* source = _set->find(_set->source_device);
+  if (source == nullptr || !source->has_set()) { return 0; }
+  return std::visit(
+    [](auto const& set) {
+      using key_type = typename std::decay_t<decltype(*set)>::key_type;
+      return static_cast<std::size_t>(set->capacity()) * sizeof(key_type);
+    },
+    source->set);
+}
+
+std::size_t in_list_storage_upper_bound(std::size_t num_keys, membership_key_rep rep) noexcept
+{
+  auto constexpr maximum = std::numeric_limits<std::size_t>::max();
+  auto const rep_bytes   = membership_rep_bytes(rep);
+  auto const slots       = sirius_dynamic_in_list_filter::set_slots(num_keys, kGrowthCandidates[0]);
+  auto const set_bytes   = slots > maximum / rep_bytes ? maximum : slots * rep_bytes;
+  auto const needles     = num_keys > maximum / rep_bytes ? maximum : num_keys * rep_bytes;
+  auto const charge      = [](std::size_t bytes) {
+    return bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)
+                  ? maximum
+                  : detail::tracked_replica_allocation_bytes(bytes);
+  };
+  auto const set_charge    = charge(set_bytes);
+  auto const needle_charge = charge(needles);
+  return set_charge > maximum - needle_charge ? maximum : set_charge + needle_charge;
+}
 
 // Reports the *baseline* (kCapacityFactor) footprint — a lower bound on the real allocation
 // rather than an exact size, keeping the IN-list/Bloom choice independent of probe-side tuning.

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_outcome.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -31,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace cucascade {
 class data_batch;
@@ -92,19 +94,30 @@ class dynamic_filter_publication_session final {
                             dynamic_filter_publication_policy policy);
 
   /**
-   * @brief Starts accumulating against @p inventory. Call on an untracked thread (the task
-   * creator).
+   * @brief Names the join in this session's `[dynamic_filter_key]` lines
+   *
+   * The session emits one such DEBUG line per admitted key with a binding when it becomes terminal,
+   * after releasing its mutex (see `dynamic_filter_key_outcome.hpp`). `sirius_pipeline_converter`
+   * sets the identity once operators are numbered; until then the lines carry an empty identity.
+   */
+  void set_join_identity(dynamic_filter_join_identity identity) noexcept;
+
+  /**
+   * @brief Starts accumulating against `input`'s inventory, or records why its construction site
+   * declined.
+   *
+   * Call on an untracked thread (the task creator).
    *
    * Selects the active keys, sizes their shared geometry, requires working peer DMA between every
    * pair of replica GPUs, and allocates zeroed per-GPU partial arrays under per-GPU leases. When it
-   * returns false, the session behaves exactly as with accumulation disabled. Transitions the
-   * session OPEN -> COLLECTING.
+   * returns false, the session behaves exactly as with accumulation disabled, so a later path may
+   * still publish. Transitions the session OPEN -> COLLECTING.
    *
-   * @return true iff accumulation started; false when there is no inventory, no active key, a zero
-   * or over-cap geometry, no peer DMA, a refused lease, a recoverable failure, or the session is
-   * not open. The reason is counted.
+   * @return true iff accumulation started; false when `input` is a `construction_decline`, no
+   * active key, a zero or over-cap geometry, no peer DMA, a refused lease, a recoverable failure,
+   * or the session is not open. The reason is counted.
    */
-  [[nodiscard]] bool try_begin_accumulation(std::optional<complete_build_inventory> inventory);
+  [[nodiscard]] bool try_begin_accumulation(certified_build_input input);
 
   /**
    * @brief Whether accumulation has started, whatever its outcome.
@@ -217,9 +230,12 @@ class dynamic_filter_publication_session final {
 /**
  * @brief The counts one whole-build publication adds to `dynamic_filter_stats`, and the number of
  * targets that still accepted filters.
+ *
+ * `keys` has one outcome per admitted key of the plan; keys without a binding keep the default.
  */
 struct dynamic_filter_publication_outcome : dynamic_filter_stats_snapshot {
   std::size_t active_targets = 0;
+  std::vector<dynamic_filter_key_outcome> keys;  ///< One per admitted key, by admitted-key index
 };
 
 /**

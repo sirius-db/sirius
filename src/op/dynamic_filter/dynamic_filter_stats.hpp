@@ -49,8 +49,18 @@ namespace sirius::op {
  * separately counted position selection.
  *
  * Accumulation counters: `accumulations_started` counts attempts that allocated their partial
- * arrays. `accumulations_skipped_inventory` counts builds whose input could not be certified and
- * attempts ended because a task input could not be matched to exactly one certified batch.
+ * arrays. `accumulations_skipped_inventory` counts builds whose input had the wrong shape or whose
+ * arrival ledger disagreed with its repository, and attempts ended because a task input could not
+ * be matched to exactly one certified batch. The other certification declines are counted by
+ * reason: `accumulations_declined_pipeline_barrier` (an ORDER BY producer's PIPELINE barrier),
+ * `accumulations_declined_port_directive` (a late-materialization directive),
+ * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
+ * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
+ * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was
+ * sized on every row and no exact IN-list was considered. `filters_skipped_construction_invariant`
+ * counts filters dropped because staging found more valid rows than the inventory recorded;
+ * `filters_skipped_construction_admission` counts filters dropped because the root GPU refused the
+ * memory to build them.
  * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
  * published, including initialization leases, publication workspace, and a
  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
@@ -71,6 +81,10 @@ struct dynamic_filter_counters {
   Counter accumulation_completed_contributions{};
   Counter accumulation_duplicate_contributions{};
   Counter accumulations_skipped_inventory{};
+  Counter accumulations_declined_pipeline_barrier{};
+  Counter accumulations_declined_port_directive{};
+  Counter accumulations_declined_unreadable_arrival{};
+  Counter accumulations_declined_compressed_arrival{};
   Counter accumulations_skipped_admission{};
   Counter accumulations_skipped_error{};
   Counter accumulations_skipped_transient{};
@@ -82,6 +96,9 @@ struct dynamic_filter_counters {
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_bloom_unsupported{};
+  Counter keys_sized_on_total_rows{};
+  Counter filters_skipped_construction_invariant{};
+  Counter filters_skipped_construction_admission{};
   Counter producers_enabled{};
 
   Counter keys_considered{};
@@ -121,6 +138,10 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_completed_contributions,
   &dynamic_filter_counters<Counter>::accumulation_duplicate_contributions,
   &dynamic_filter_counters<Counter>::accumulations_skipped_inventory,
+  &dynamic_filter_counters<Counter>::accumulations_declined_pipeline_barrier,
+  &dynamic_filter_counters<Counter>::accumulations_declined_port_directive,
+  &dynamic_filter_counters<Counter>::accumulations_declined_unreadable_arrival,
+  &dynamic_filter_counters<Counter>::accumulations_declined_compressed_arrival,
   &dynamic_filter_counters<Counter>::accumulations_skipped_admission,
   &dynamic_filter_counters<Counter>::accumulations_skipped_error,
   &dynamic_filter_counters<Counter>::accumulations_skipped_transient,
@@ -132,6 +153,9 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
+  &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
+  &dynamic_filter_counters<Counter>::filters_skipped_construction_invariant,
+  &dynamic_filter_counters<Counter>::filters_skipped_construction_admission,
   &dynamic_filter_counters<Counter>::producers_enabled,
   &dynamic_filter_counters<Counter>::keys_considered,
   &dynamic_filter_counters<Counter>::keys_with_known_domain,

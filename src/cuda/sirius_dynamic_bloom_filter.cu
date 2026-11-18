@@ -25,11 +25,13 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policy.cuh>
 #include <cuco/bloom_filter_ref.cuh>
+#include <cuda/accumulation_partial.cuh>
 #include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
@@ -166,6 +168,21 @@ struct bloom_replica {
 
 namespace {
 template <class KeyT>
+std::unique_ptr<bloom_replica> build_prepared_bloom_replica(int device_id,
+                                                            cudf::column_view const& prepared,
+                                                            std::size_t num_blocks,
+                                                            rmm::device_async_resource_ref mr,
+                                                            ::cuda::stream_ref stream)
+{
+  auto filter = make_bloom<sirius_bloom<KeyT>>(num_blocks, mr, stream);
+  if (prepared.size() > 0) {
+    auto const* first = prepared.data<KeyT>();
+    filter->add_async(first, first + prepared.size(), stream);
+  }
+  return std::make_unique<bloom_replica>(device_id, std::move(filter));
+}
+
+template <class KeyT>
 std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    membership_key_domain const& domain,
                                                    cudf::column_view const& keys,
@@ -186,33 +203,9 @@ using raw_bloom_ref = cuco::bloom_filter_ref<Key,
                                              ::cuda::thread_scope_device,
                                              cuco::bloom_filter_policy<Key>>;
 
-/**
- * @brief Throws `detail::accumulation_cuda_error` for a failed CUDA call after clearing the error.
- *
- * @param status The result of the CUDA call
- * @param call The name of the CUDA call, used in the error message
- * @param kernel_launch Whether @p status comes from a kernel launch
- * @throws detail::accumulation_cuda_error if @p status is not `cudaSuccess`
- */
-void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
-{
-  if (status == cudaSuccess) { return; }
-  (void)cudaGetLastError();
-  throw detail::accumulation_cuda_error{status, kernel_launch, call};
-}
-
-using cucascade::cuda::cuda_event;
-
-/**
- * @brief Creates a timing-free event on @p device, restoring the current device afterwards.
- *
- * @param device The GPU the event belongs to
- */
-[[nodiscard]] cuda_event make_event_on(int device)
-{
-  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-  return cuda_event{};
-}
+using detail::check_cuda;
+using detail::cuda_event;
+using detail::make_event_on;
 
 /**
  * @brief One published replica of an accumulated key: the array and the partial stream that frees
@@ -260,24 +253,53 @@ template <class Key>
   return raw_bloom_ref<Key>{static_cast<block*>(bits), cuco::extent<std::size_t>{blocks}, {}, {}};
 }
 
+/**
+ * @brief Adds the valid rows of `keys`, a carrier of `domain`, to one accumulated array.
+ *
+ * Values convert per element to the rep (`with_build_key_iterator`); STRING keys are fingerprinted
+ * in-kernel, so nothing is allocated and nothing waits on the host.
+ *
+ * @throw detail::accumulation_invariant_error if `keys` is not a carrier of `domain`
+ */
 template <class Key>
 void add_accumulated_keys(rmm::device_buffer& bits,
                           std::size_t blocks,
+                          membership_key_domain const& domain,
                           cudf::column_view const& keys,
                           ::cuda::stream_ref stream)
 {
   if (keys.size() == 0) { return; }
-  auto const* begin = keys.data<Key>();
-  // A pending error belongs to earlier work; it must not be read below as this launch's.
-  check_cuda(cudaGetLastError(), "pending CUDA error before Bloom add_if_async");
   // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are not added.
-  accumulated_ref<Key>(bits.data(), blocks)
-    .add_if_async(begin,
-                  begin + keys.size(),
-                  thrust::counting_iterator<cudf::size_type>{0},
-                  detail::probe_validity_of(keys),
-                  stream);
-  check_cuda(cudaGetLastError(), "Bloom add_if_async", true);
+  auto const add = [&](auto first) {
+    // A pending error belongs to earlier work; it must not be read below as this launch's.
+    check_cuda(cudaGetLastError(), "pending CUDA error before Bloom add_if_async");
+    accumulated_ref<Key>(bits.data(), blocks)
+      .add_if_async(first,
+                    first + keys.size(),
+                    thrust::counting_iterator<cudf::size_type>{0},
+                    detail::probe_validity_of(keys),
+                    stream);
+    check_cuda(cudaGetLastError(), "Bloom add_if_async", true);
+  };
+  if (domain.family == membership_key_family::string_hash) {
+    if constexpr (std::is_same_v<Key, std::uint64_t>) {
+      if (keys.type().id() == cudf::type_id::STRING) {
+        detail::with_string_fingerprint_iterator(keys, stream, add);
+        return;
+      }
+    }
+    throw detail::accumulation_invariant_error{
+      "[accumulated_bloom_builder] a STRING key's contribution is not a STRING column"};
+  }
+  // The rep conversion needs no memory resource outside the string family.
+  bool const added = detail::with_build_key_iterator<Key>(
+    domain, keys, stream, rmm::mr::get_current_device_resource_ref(), [&](auto first, auto) {
+      add(first);
+    });
+  if (!added) {
+    throw detail::accumulation_invariant_error{
+      "[accumulated_bloom_builder] a contribution's key column is not a carrier of its key"};
+  }
 }
 
 // ORs the scratch slot of every source into the root chunk. Slot i of the buffer holds source i's
@@ -423,6 +445,25 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     using key_type = decltype(key_tag);
     return build_bloom_replica<key_type>(
       _impl->source_device, _domain, build.keys, num_blocks, mr, s);
+  });
+  _impl->replicas.push_back(std::move(source));
+}
+
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(membership_key_domain const& domain,
+                                                         cudf::column_view const& prepared,
+                                                         ::cuda::stream_ref stream,
+                                                         rmm::device_async_resource_ref mr)
+  : _domain{domain}
+{
+  detail::require_prepared("[sirius_dynamic_bloom_filter]", domain, prepared);
+  // Sized like the column constructor, on the valid keys, so both set the same bits.
+  auto const num_blocks = bloom_blocks_for(static_cast<std::size_t>(prepared.size()));
+  _impl                 = std::make_unique<impl>();
+  _impl->source_device  = detail::current_device("[sirius_dynamic_bloom_filter]");
+  auto source           = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    return build_prepared_bloom_replica<key_type>(
+      _impl->source_device, prepared, num_blocks, mr, ::cuda::stream_ref{stream.get()});
   });
   _impl->replicas.push_back(std::move(source));
 }
@@ -673,69 +714,45 @@ namespace detail {
 // accumulated_bloom_builder::impl
 //===----------------------------------------------------------------------===//
 struct accumulated_bloom_builder::impl {
+  using partial = accumulation_partial;
+
   /**
-   * @brief One GPU's private arrays and the exclusive stream that orders their use and release.
+   * @brief One key's array: its Bloom blocks, its bytes, and its transfer chunk.
    */
-  struct partial {
-    cucascade::memory::memory_space* space;
-    cucascade::memory::memory_space const* host_space;
-    int device_id;
-    std::shared_ptr<rmm::cuda_stream> stream;
-    std::vector<std::unique_ptr<rmm::device_buffer>> arrays;
-    std::optional<cuda_event> init;  // Recorded after the zero fill; every insert waits on it.
-    std::atomic<bool> contributed{false};
-    std::atomic<bool> const* leak_storage;
+  struct shape {
+    std::size_t blocks;
+    std::size_t raw_bytes;
+    std::size_t chunk_bytes;
 
-    partial(cucascade::memory::memory_space& owner,
-            cucascade::memory::memory_space const& host,
-            std::atomic<bool> const& leak)
-      : space{&owner},
-        host_space{&host},
-        device_id{owner.get_device_id()},
-        stream{std::make_shared<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking)},
-        leak_storage{&leak}
+    [[nodiscard]] std::size_t chunks() const noexcept
     {
-    }
-
-    ~partial()
-    {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      if (leak_storage->load()) {
-        // A failed host join left work that may still touch these arrays: never free them.
-        for (auto& array : arrays) {
-          (void)array.release();
-        }
-      }
-      init.reset();
-      arrays.clear();
-      stream.reset();
-    }
-
-    partial(partial const&)            = delete;
-    partial& operator=(partial const&) = delete;
-    partial(partial&&)                 = delete;
-    partial& operator=(partial&&)      = delete;
-
-    [[nodiscard]] ::cuda::stream_ref stream_ref() const noexcept
-    {
-      return ::cuda::stream_ref{stream->value()};
+      return ::cuda::ceil_div(raw_bytes, chunk_bytes);
     }
   };
 
-  impl(std::vector<key> active_keys, accumulated_bloom_geometry shape)
-    : keys{std::move(active_keys)}, geometry{shape}
+  impl(std::vector<key> active_keys,
+       std::vector<shape> key_shapes,
+       std::vector<membership_key_domain> key_domains)
+    : keys{std::move(active_keys)}, shapes{std::move(key_shapes)}, domains{std::move(key_domains)}
   {
+  }
+
+  /**
+   * @brief The largest chunk of any key: the size of one transfer slot.
+   */
+  [[nodiscard]] std::size_t max_chunk_bytes() const noexcept
+  {
+    return std::ranges::max(shapes, {}, &shape::chunk_bytes).chunk_bytes;
   }
 
   [[nodiscard]] partial* find(int device_id) const noexcept
   {
-    auto const found =
-      std::ranges::find(partials, device_id, [](auto const& entry) { return entry->device_id; });
-    return found == partials.end() ? nullptr : found->get();
+    return find_partial(partials, device_id);
   }
 
   std::vector<key> keys;
-  accumulated_bloom_geometry geometry;
+  std::vector<shape> shapes;                   // Per key
+  std::vector<membership_key_domain> domains;  // Per key, classified from its type
   std::atomic<bool> leak_storage{false};
   std::vector<std::unique_ptr<partial>> partials;  // Destroyed before leak_storage.
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
@@ -771,13 +788,14 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
                  std::span<partial* const> targets,
                  ::cuda::stream_ref stream,
                  std::byte* scratch)
-    : _geometry{owner.geometry},
+    : _owner{owner},
+      _chunk_slot{owner.max_chunk_bytes()},
       _root{root},
       _sources{sources},
       _targets{targets},
       _stream{stream},
       _scratch{scratch},
-      _slot_bytes{_sources.size() * owner.geometry.chunk_bytes},
+      _slot_bytes{_sources.size() * _chunk_slot},
       _ingress_done{make_event_on(root.device_id), make_event_on(root.device_id)},
       _merged{make_event_on(root.device_id), make_event_on(root.device_id)},
       _root_done{make_event_on(root.device_id)}
@@ -824,7 +842,8 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
    */
   void enqueue_chunk(std::size_t key_index, std::size_t offset)
   {
-    auto const bytes       = std::min(_geometry.chunk_bytes, _geometry.raw_bytes - offset);
+    auto const& shape      = _owner.shapes[key_index];
+    auto const bytes       = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
     auto const buffer      = _sequence % 2;
     auto* const root_chunk = static_cast<std::byte*>(_root.arrays[key_index]->data()) + offset;
     if (!_sources.empty()) {
@@ -879,7 +898,7 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
     for (std::size_t index = 0; index < _sources.size(); ++index) {
       auto const* source = _sources[index];
       auto const status  = cudaMemcpyPeerAsync(
-        slots + index * _geometry.chunk_bytes,
+        slots + index * _chunk_slot,
         _root.device_id,
         static_cast<std::byte const*>(source->arrays[key_index]->data()) + offset,
         source->device_id,
@@ -898,7 +917,7 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
                "cudaStreamWaitEvent(ingress)");
     enqueue_or_chunk(root_chunk,
                      _scratch + buffer * _slot_bytes,
-                     _geometry.chunk_bytes,
+                     _chunk_slot,
                      _sources.size(),
                      bytes,
                      root_stream);
@@ -928,7 +947,8 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
     }
   }
 
-  accumulated_bloom_geometry const& _geometry;
+  impl const& _owner;
+  std::size_t _chunk_slot;  // Bytes of one source's slot: the largest chunk of any key
   partial& _root;
   std::span<partial* const> _sources;
   std::span<partial* const> _targets;
@@ -943,22 +963,6 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   std::size_t _sequence = 0;                // Global chunk index over (key, offset)
 };
 
-namespace {
-
-template <class Fn>
-void dispatch_key_type(cudf::data_type type, Fn&& fn)
-{
-  switch (type.id()) {
-    case cudf::type_id::INT32: std::forward<Fn>(fn).template operator()<std::int32_t>(); break;
-    case cudf::type_id::INT64: std::forward<Fn>(fn).template operator()<std::int64_t>(); break;
-    default:
-      throw accumulation_invariant_error(
-        "[accumulated_bloom_builder] unsupported accumulated key type");
-  }
-}
-
-}  // namespace
-
 //===----------------------------------------------------------------------===//
 // accumulated_bloom_builder
 //===----------------------------------------------------------------------===//
@@ -972,6 +976,31 @@ accumulated_bloom_builder::accumulated_bloom_builder(accumulated_bloom_builder&&
   default;
 accumulated_bloom_builder& accumulated_bloom_builder::operator=(
   accumulated_bloom_builder&&) noexcept = default;
+
+namespace {
+
+/**
+ * @brief Classifies every key's type into the domain its filter is published with.
+ *
+ * @throw accumulation_invariant_error for a type no membership filter supports
+ */
+std::vector<membership_key_domain> classify_keys(
+  std::span<accumulated_bloom_builder::key const> keys)
+{
+  std::vector<membership_key_domain> domains;
+  domains.reserve(keys.size());
+  for (auto const& active : keys) {
+    auto const domain = classify_membership_key(active.type);
+    if (!domain) {
+      throw accumulation_invariant_error(
+        "[accumulated_bloom_builder] unsupported accumulated key type");
+    }
+    domains.push_back(*domain);
+  }
+  return domains;
+}
+
+}  // namespace
 
 std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
   std::vector<key> keys,
@@ -994,39 +1023,73 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
     throw accumulation_invariant_error{"invalid accumulated Bloom geometry"};
   }
   // clang-format on
+  std::vector<impl::shape> shapes(keys.size(),
+                                  {geometry.blocks, geometry.raw_bytes, geometry.chunk_bytes});
+  for (auto& active : keys) {
+    active.blocks = geometry.blocks;
+  }
+  auto domains = classify_keys(keys);
+  return create(std::make_unique<impl>(std::move(keys), std::move(shapes), std::move(domains)),
+                targets);
+}
+
+std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
+  std::vector<key> keys, std::span<dynamic_filter_replica_space const> targets)
+{
+  auto constexpr maximum = std::numeric_limits<std::size_t>::max();
+  if (keys.empty()) { throw accumulation_invariant_error{"accumulation without keys"}; }
+  std::vector<impl::shape> shapes;
+  shapes.reserve(keys.size());
+  std::size_t lease_bytes = 0;
   for (auto const& active : keys) {
-    if (!supports(active.type)) {
-      throw accumulation_invariant_error(
-        "[accumulated_bloom_builder] unsupported accumulated key type");
+    if (active.blocks == 0 || active.blocks > maximum / bloom_bytes_per_block) {
+      throw accumulation_invariant_error{"invalid accumulated Bloom key size"};
     }
-  }
-  auto state = std::make_unique<impl>(std::move(keys), geometry);
-  auto const lease_bytes =
-    state->keys.size() * tracked_replica_allocation_bytes(geometry.raw_bytes);
-  for (auto const& target : targets) {
-    auto& space = target.get_gpu_space();
-    if (state->find(space.get_device_id()) != nullptr) { continue; }
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{space.get_device_id()}};
-    auto owned =
-      std::make_unique<impl::partial>(space, target.get_host_staging_space(), state->leak_storage);
-    {
-      // Detach the lease before `owned` can be destroyed, so its frees cannot credit that tracker.
-      auto lease = scoped_replica_reservation::try_acquire(space, lease_bytes, owned->stream_ref());
-      if (!lease) { return std::nullopt; }
-      owned->arrays.reserve(state->keys.size());
-      for (std::size_t index = 0; index < state->keys.size(); ++index) {
-        owned->arrays.push_back(std::make_unique<rmm::device_buffer>(
-          geometry.raw_bytes, owned->stream_ref(), lease->allocator()));
-        check_cuda(cudaMemsetAsync(
-                     owned->arrays.back()->data(), 0, geometry.raw_bytes, owned->stream->value()),
-                   "cudaMemsetAsync(accumulated Bloom)");
-      }
+    auto const raw_bytes = active.blocks * bloom_bytes_per_block;
+    if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1) ||
+        tracked_replica_allocation_bytes(raw_bytes) > maximum - lease_bytes) {
+      throw accumulation_invariant_error{"invalid accumulated Bloom key size"};
     }
-    owned->init.emplace();
-    check_cuda(cudaEventRecord(owned->init->get(), owned->stream->value()),
-               "cudaEventRecord(accumulated Bloom init)");
-    state->partials.push_back(std::move(owned));
+    lease_bytes += tracked_replica_allocation_bytes(raw_bytes);
+    shapes.push_back({active.blocks, raw_bytes, accumulated_bloom_chunk_bytes(raw_bytes)});
   }
+  auto domains = classify_keys(keys);
+  return create(std::make_unique<impl>(std::move(keys), std::move(shapes), std::move(domains)),
+                targets);
+}
+
+std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key const> keys,
+                                                                 std::size_t replicas) noexcept
+{
+  auto constexpr maximum = std::numeric_limits<std::size_t>::max();
+  if (replicas < 2 || keys.empty()) { return 0; }
+  std::size_t chunk_slot = 0;
+  std::size_t chunks     = 0;
+  for (auto const& active : keys) {
+    if (active.blocks > maximum / bloom_bytes_per_block) { return maximum; }
+    auto const raw_bytes = active.blocks * bloom_bytes_per_block;
+    if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) { return maximum; }
+    auto const chunk = accumulated_bloom_chunk_bytes(raw_bytes);
+    chunk_slot       = std::max(chunk_slot, chunk);
+    chunks += ::cuda::ceil_div(raw_bytes, chunk);
+  }
+  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
+  auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
+  return chunk_slot > maximum / slots ? maximum
+                                      : tracked_replica_allocation_bytes(slots * chunk_slot);
+}
+
+std::optional<accumulated_bloom_builder> accumulated_bloom_builder::create(
+  std::unique_ptr<impl> state, std::span<dynamic_filter_replica_space const> targets)
+{
+  std::vector<std::size_t> array_bytes;
+  array_bytes.reserve(state->shapes.size());
+  for (auto const& shape : state->shapes) {
+    array_bytes.push_back(shape.raw_bytes);
+  }
+  auto partials = lease_partials(targets, array_bytes, /*zero_fill=*/true, state->leak_storage);
+  if (!partials) { return std::nullopt; }
+  state->partials = std::move(*partials);
   return accumulated_bloom_builder{std::move(state)};
 }
 
@@ -1065,10 +1128,13 @@ bool accumulated_bloom_builder::enqueue_add(cudf::table_view const& input,
       check_cuda(cudaStreamWaitEvent(stream.get(), target->init->get(), 0),
                  "cudaStreamWaitEvent(init)");
       for (std::size_t index = 0; index < _impl->keys.size(); ++index) {
-        auto const& active = _impl->keys[index];
-        dispatch_key_type(active.type, [&]<class Key>() {
-          add_accumulated_keys<Key>(
-            *target->arrays[index], _impl->geometry.blocks, input.column(active.ordinal), stream);
+        auto const& domain = _impl->domains[index];
+        detail::dispatch_key_rep(domain.rep, [&](auto key_tag) {
+          add_accumulated_keys<decltype(key_tag)>(*target->arrays[index],
+                                                  _impl->shapes[index].blocks,
+                                                  domain,
+                                                  input.column(_impl->keys[index].ordinal),
+                                                  stream);
         });
       }
       check_cuda(cudaEventRecord(done.get(), stream.get()), "cudaEventRecord(contribution)");
@@ -1136,7 +1202,14 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
     targets.push_back(entry.get());
     if (entry->contributed.load(std::memory_order_relaxed)) { sources.push_back(entry.get()); }
   }
-  auto const& geometry = _impl->geometry;
+  auto const& shapes     = _impl->shapes;
+  auto const chunk_slot  = _impl->max_chunk_bytes();
+  std::size_t all_bytes  = 0;
+  std::size_t all_chunks = 0;
+  for (auto const& shape : shapes) {
+    all_bytes += shape.raw_bytes;
+    all_chunks += shape.chunks();
+  }
   rmm::cuda_set_device_raii root_guard{root_device};
   std::unique_ptr<rmm::device_buffer> scratch;
   cucascade::memory::fixed_multiple_blocks_allocation staging;
@@ -1160,9 +1233,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
         }
       };
       if (direct) {
-        auto const total_chunks  = multiply(_impl->keys.size(), geometry.chunks_per_key());
-        auto const scratch_bytes = multiply(
-          multiply(std::min<std::size_t>(2, total_chunks), sources.size()), geometry.chunk_bytes);
+        auto const scratch_bytes =
+          multiply(multiply(std::min<std::size_t>(2, all_chunks), sources.size()), chunk_slot);
         try {
           allocate_scratch(scratch_bytes);
         } catch (rmm::out_of_memory const&) {
@@ -1173,7 +1245,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
         }
       }
       if (!direct) {
-        allocate_scratch(sources.empty() ? 0 : geometry.chunk_bytes);
+        allocate_scratch(sources.empty() ? 0 : chunk_slot);
         if (!targets.empty()) {
           auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
           if (host == nullptr || host->get_block_size() == 0) {
@@ -1181,12 +1253,11 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
               "accumulated publication requires fixed HOST blocks"};
           }
           auto const block_size = host->get_block_size();
-          auto const blocks =
-            geometry.chunk_bytes / block_size + (geometry.chunk_bytes % block_size != 0);
-          staging = host->allocate_multiple_blocks(geometry.chunk_bytes);
+          auto const blocks     = chunk_slot / block_size + (chunk_slot % block_size != 0);
+          staging               = host->allocate_multiple_blocks(chunk_slot);
           if (observation) { observation->host_staging_bytes = staging->size_bytes(); }
-          // The HOST copy loop walks `chunk_bytes` of this window.
-          if (staging->size_bytes() < geometry.chunk_bytes) {
+          // The HOST copy loop walks up to one largest chunk of this window.
+          if (staging->size_bytes() < chunk_slot) {
             throw accumulation_invariant_error{
               "accumulated publication HOST window is smaller than a chunk"};
           }
@@ -1206,8 +1277,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
         transport = publication_transport::PEER_COPY;
         pipeline->order_after_inserts();
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
-          for (std::size_t offset = 0; offset < geometry.raw_bytes;
-               offset += geometry.chunk_bytes) {
+          auto const& shape = shapes[key_index];
+          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
             pipeline->enqueue_chunk(key_index, offset);
           }
         }
@@ -1243,9 +1314,9 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
             wait(owner);
           };
         for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
-          for (std::size_t offset = 0; offset < geometry.raw_bytes;
-               offset += geometry.chunk_bytes) {
-            auto const bytes = std::min(geometry.chunk_bytes, geometry.raw_bytes - offset);
+          auto const& shape = shapes[key_index];
+          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
+            auto const bytes = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
             auto* root_chunk = static_cast<std::byte*>(root->arrays[key_index]->data()) + offset;
             for (auto* source : sources) {
               stage(*source,
@@ -1257,7 +1328,7 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
               // `root_chunk` run after it on the root stream.
               enqueue_or_chunk(root_chunk,
                                static_cast<std::byte const*>(scratch->data()),
-                               geometry.chunk_bytes,
+                               chunk_slot,
                                1,
                                bytes,
                                root->stream->value());
@@ -1303,11 +1374,12 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   scratch.reset();
   staging.reset();
   SIRIUS_LOG_DEBUG(
-    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s) of {} bytes "
+    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
+    "all, "
     "through {}: {} contributing source(s), {} target(s).",
     root->device_id,
     _impl->keys.size(),
-    geometry.raw_bytes,
+    all_bytes,
     transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
     sources.size(),
     targets.size());
@@ -1319,20 +1391,16 @@ void accumulated_bloom_builder::make_filters(int root_device)
 {
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
   filters.reserve(_impl->keys.size());
-  for (auto const& key : _impl->keys) {
-    auto const domain = classify_membership_key(key.type);
-    if (!domain) {
-      throw accumulation_invariant_error(
-        "[accumulated_bloom_builder] accumulated key type has no key domain");
-    }
+  for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
     auto filter           = std::make_unique<sirius_dynamic_bloom_filter::impl>();
     filter->source_device = root_device;
     filter->accumulated_replicas.reserve(_impl->partials.size());
     for (auto const& entry : _impl->partials) {
       filter->accumulated_replicas.push_back(std::make_unique<accumulated_bloom_replica>(
-        entry->device_id, _impl->geometry.blocks, entry->stream, nullptr));
+        entry->device_id, _impl->shapes[key_index].blocks, entry->stream, nullptr));
     }
-    filters.push_back(sirius_dynamic_bloom_filter::make_accumulated(*domain, std::move(filter)));
+    filters.push_back(
+      sirius_dynamic_bloom_filter::make_accumulated(_impl->domains[key_index], std::move(filter)));
   }
   // Allocate every host shell before transferring leased arrays. From this point, only nonthrowing
   // ownership moves run, and the builder keeps an owner even when no channel accepts a key.
@@ -1386,6 +1454,38 @@ accumulated_bloom_builder::inspect_replica(sirius_dynamic_bloom_filter const& fi
              "cudaMemcpyAsync(replica)");
   check_cuda(cudaStreamSynchronize(replica->stream->value()), "cudaStreamSynchronize(replica)");
   return contents;
+}
+
+std::optional<accumulated_bloom_builder::replica_contents>
+accumulated_bloom_builder::inspect_replica(sirius_dynamic_bloom_filter const& filter,
+                                           rmm::cuda_device_id device,
+                                           ::cuda::stream_ref stream)
+{
+  if (filter._impl && filter._impl->find_accumulated(device.value()) != nullptr) {
+    return inspect_replica(filter, device);
+  }
+  auto const* built = filter._impl ? filter._impl->find(device.value()) : nullptr;
+  if (built == nullptr || !built->has_bloom()) { return std::nullopt; }
+  rmm::cuda_set_device_raii guard{device};
+  auto const pending = cudaStreamQuery(stream.get());
+  if (pending != cudaErrorNotReady) { check_cuda(pending, "cudaStreamQuery(built Bloom)"); }
+  return std::visit(
+    [&](auto const& owner) -> std::optional<replica_contents> {
+      using filter_type = typename std::decay_t<decltype(owner)>::element_type;
+      replica_contents contents{
+        std::vector<std::byte>(owner->block_extent() * filter_type::words_per_block *
+                               sizeof(typename filter_type::word_type)),
+        pending == cudaSuccess};
+      check_cuda(cudaMemcpyAsync(contents.bytes.data(),
+                                 owner->data(),
+                                 contents.bytes.size(),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.get()),
+                 "cudaMemcpyAsync(built Bloom)");
+      check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(built Bloom)");
+      return contents;
+    },
+    built->bloom);
 }
 
 bool accumulated_bloom_builder::releasable_here() const noexcept

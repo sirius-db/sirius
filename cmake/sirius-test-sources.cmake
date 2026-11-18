@@ -292,9 +292,16 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_probe.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
+    test/cpp/operator/test_dynamic_filter_prepared_keys.cpp
+    test/cpp/operator/test_dynamic_filter_key_outcome.cpp
     test/cpp/operator/test_complete_build_inventory.cpp
+    test/cpp/operator/test_build_input_certification.cpp
+    test/cpp/operator/test_dynamic_filter_construction_plan.cpp
     test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
+    test/cpp/operator/test_accumulated_bloom_key_types.cpp
+    test/cpp/operator/test_exact_key_and_bounds_accumulation.cpp
+    test/cpp/operator/test_build_filter_construction.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
