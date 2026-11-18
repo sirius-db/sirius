@@ -171,16 +171,7 @@ bool is_generated(duckdb::LogicalMaterializedCTE const& cte, std::string_view pr
          std::string(prefix) + std::to_string(cte.table_index.index);
 }
 
-// The parts of one delim CTE as DuckDB's delim-to-CTE rewrite produces it:
-//   CTE __duckdb_delim_N (children[0] = outer rows,
-//     children[1] = CTE __duckdb_delim_dedup_M (children[0] = DISTINCT over a read of N,
-//       children[1] = the join-back: probe = a read of N, build = the subquery)).
-struct delim_cte_parts {
-  duckdb::LogicalMaterializedCTE* dedup    = nullptr;
-  duckdb::LogicalComparisonJoin* join_back = nullptr;
-  duckdb::LogicalCTERef* outer_row_read    = nullptr;
-  duckdb::LogicalCTERef* key_read          = nullptr;
-};
+}  // namespace
 
 std::optional<delim_cte_parts> match_delim_cte(duckdb::LogicalMaterializedCTE& cte)
 {
@@ -231,6 +222,8 @@ bool can_restrict(delim_cte_parts const& parts, duckdb::ClientContext& context)
   return requires_left_row &&
          can_restrict_domain(*parts.join_back->children[1], local_ctes, context);
 }
+
+namespace {
 
 template <class Fn>
 void for_each_delim_cte(LogicalOperator& op, Fn const& fn)

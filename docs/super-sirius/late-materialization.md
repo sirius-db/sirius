@@ -10,10 +10,10 @@ instead, and puts the values back at the far end by gathering them out of the pi
 works only for a **GPU-tier pinned** table — the values have to still exist somewhere
 addressable when the far end asks for them, and that is what the pin guarantees.
 
-## Turning it on (experimental)
+## Configuration
 
-```bash
-SIRIUS_EXP_LATE_MAT=1   # the gate; off = nothing below exists
+```sql
+SET enable_late_materialization = true; -- enabled by default; false disables deferrals
 ```
 
 The group-by-rowid ride and the riders need a key proven distinct over the pinned table. The pin
@@ -24,17 +24,22 @@ named: on TPC-H SF1000, q10's ride is admitted through `c_custkey`, and q5's and
 `nation.n_name`, with no further configuration.
 With `pin_table_prove_unique_keys = false` no column is proven and no ride or rider is admitted.
 
-Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
+Enabled by default and inert when disabled for the query. The census goes to the log under the `[late-mat]` tag, and
 every refusal says which refusal it was — a deferral that silently did not happen looks exactly
 like one that did nothing.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
-| `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
-| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
-| `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
-| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | = the ordinary floor | Separate floor for compressed origins. Inert until the decode-skip exists to measure. |
+| `enable_late_materialization` | true | Connection-local SQL master setting; also YAML `sirius.operator_params`. |
+| `late_materialization_min_boundaries` | 4 | Port crossings a ride must save. |
+| `late_materialization_min_value_x_boundaries` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
+| `late_materialization_count_defer` | false | Count-on-deferred (below). |
+| `late_materialization_min_value_compressed` | 1 | Separate floor for compressed origins; matches the ordinary floor by default. |
+
+All entries are connection-local SQL settings, also accepted under YAML
+`sirius.operator_params`. Integer thresholds must be nonnegative. Each query retains its own
+immutable snapshot; `RESET` restores the startup default and `SET GLOBAL` is rejected. The
+former `SIRIUS_EXP_LATE_MAT_*` environment controls in this table are no longer read.
 
 ## What a deferral is
 

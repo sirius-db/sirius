@@ -76,6 +76,32 @@ target_sources(sirius_unittest
 target_compile_definitions(sirius_unittest
                            PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES)
 
+# Compile the pin driver with a calling-thread-only staging failure hook for
+# regression tests. Production libraries keep the hook-free archive object.
+add_library(sirius_pin_table_test OBJECT src/pin_table.cpp)
+target_compile_definitions(
+  sirius_pin_table_test
+  PRIVATE SIRIUS_TEST_PIN_STAGING_OVERRIDES CCCL_DISABLE_WARPSPEED_SCAN
+          CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(
+  sirius_pin_table_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  sirius_pin_table_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+          ${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src)
+target_link_libraries(sirius_pin_table_test PRIVATE sirius_core duckdb_static)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_pin_table_test PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                         ON)
+  target_include_directories(sirius_pin_table_test BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest PRIVATE $<TARGET_OBJECTS:sirius_pin_table_test>)
+target_compile_definitions(sirius_unittest
+                           PRIVATE SIRIUS_TEST_PIN_STAGING_OVERRIDES)
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
@@ -147,6 +173,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
     test/cpp/memory/test_device_transfer_fault.cpp
     test/cpp/scan/test_arrow_discard_fault.cpp
+    test/cpp/compression/test_compressed_cross_gpu_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp

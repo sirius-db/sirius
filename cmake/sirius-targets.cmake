@@ -1,5 +1,9 @@
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
+if(SIRIUS_DISTRIBUTION_DEFAULTS)
+  target_compile_definitions(sirius_objects
+                             PRIVATE SIRIUS_DISTRIBUTION_DEFAULTS)
+endif()
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
 set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -54,7 +58,9 @@ set(SIRIUS_LINK_LIBRARIES
     simpatico
     PkgConfig::LIBURING
     OpenSSL::Crypto
-    absl::any_invocable)
+    absl::any_invocable
+    # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+    CUDA::nvml)
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)

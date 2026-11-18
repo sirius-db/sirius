@@ -29,14 +29,12 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <pipeline/batch_lock_utils.hpp>
 #include <scan_manager/readahead_scan_manager.hpp>
-#include <transparent/replay_admission.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -113,8 +111,9 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
 {
   if (!consumer && !current) { return std::nullopt; }
   std::vector<binding> bindings;
-  if (sirius::decompression_pushdown_enabled() && consumer && !options.selection_unprofitable &&
-      !options.uncomposed_mvcc_mask) {
+  if (options.enable_fused_scan_filter &&
+      (!current || current->request().enable_fused_scan_filter) && consumer &&
+      !options.selection_unprofitable && !options.uncomposed_mvcc_mask) {
     for (auto const& entry : consumer->decode_bindings()) {
       if (entry.column_index >= 0 && std::cmp_less(entry.column_index, n_slots)) {
         bindings.push_back(entry);
@@ -129,10 +128,12 @@ std::optional<detail::membership_refresh> detail::refresh_membership_probes(
   // A decode request without probes decodes exactly like none.
   if (selection.steps.empty() && !clears_probes) { return membership_refresh{}; }
   auto snap = snapshot_membership_probes(selection, n_slots);
+  sirius::pushdown_request fallback;
+  fallback.enable_fused_scan_filter = options.enable_fused_scan_filter;
+  fallback.fused_scan               = options.fused_scan;
   auto const base =
-    current
-      ? current
-      : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+    current ? current
+            : std::make_shared<const sirius::decompression_pushdown_scan>(std::move(fallback));
   return membership_refresh{
     base->with_membership_probes(std::move(snap.probes), snap.generation, snap.measurement),
     std::move(snap.attached)};
@@ -284,7 +285,8 @@ void scan_operator_input::prepare_for_processing(
       auto const* data = ro.get_data();
       // Convert when the data is not on the GPU tier, OR when it is on the GPU
       // tier but not already a plain gpu_table_representation (e.g. a
-      // compressed_device_representation, which must be decompressed in place).
+      // compressed_device_representation, which its converter decodes in place on the
+      // GPU that holds it and copies to the assigned GPU first on any other).
       auto const* gpu_rep = dynamic_cast<const ::cucascade::gpu_table_representation*>(data);
       needs_upload =
         data != nullptr && (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !gpu_rep);
@@ -318,33 +320,24 @@ void scan_operator_input::prepare_for_processing(
         mut.get_current_tier() != ::cucascade::memory::Tier::GPU ||
         dynamic_cast<cucascade::gpu_table_representation*>(mut.get_data()) == nullptr;
       if (converted_here) {
-        // A device-compressed pin is decoded in place: the decoder reads the compressed buffers
-        // where pin time left them. From another GPU that is a remote read when the pools have
-        // peer access and an illegal address when they do not, and the fault leaves the CUDA
-        // context unusable for the rest of the process. Refuse before anything touches the
-        // batch or launches a kernel. Admission keeps the owners of such pins in the query's GPU
-        // set, so reaching this means the task placement and the pin disagree.
-        if (auto const* compressed_pin =
-              dynamic_cast<::sirius::compressed_device_representation const*>(mut.get_data())) {
-          auto const& owner_space = compressed_pin->get_memory_space();
-          if (owner_space.get_id() != requested_memory_space->get_id()) {
-            throw transparent::classified_execution_error(
-              transparent::late_failure_cause::gpu_error,
-              "compressed pinned chunk is stored on GPU " +
-                std::to_string(owner_space.get_device_id()) + " but its scan was assigned to GPU " +
-                std::to_string(requested_memory_space->get_device_id()));
-          }
-        }
         bool const selection_unprofitable =
           pushdown_selection_unprofitable &&
           pushdown_selection_unprofitable->load(std::memory_order_relaxed);
-        if (selection_unprofitable) {
+        if (selection_unprofitable || !enable_fused_scan_filter) {
           // An earlier batch of this scan reported that compacting during decode
           // does not pay off; selectivity is uniform across batches, so drop the
           // row selection and stop paying for the attempt. Only the per-query
           // projected clone is touched — never the shared pin — and only this
           // operator's splits: another query's scan decides fresh.
-          auto drop_row_selection = [](auto* rep) {
+          auto drop_row_selection = [this](auto* rep) {
+            if (!enable_fused_scan_filter) {
+              auto request =
+                rep->pushdown_scan() ? rep->pushdown_scan()->request() : sirius::pushdown_request{};
+              request.enable_fused_scan_filter = false;
+              request.fused_scan               = fused_scan;
+              rep->set_pushdown_scan(
+                std::make_shared<const sirius::decompression_pushdown_scan>(std::move(request)));
+            }
             if (rep->pushdown_scan()) {
               rep->set_pushdown_scan(rep->pushdown_scan()->without_row_selection());
             }
@@ -380,8 +373,10 @@ void scan_operator_input::prepare_for_processing(
           auto refresh = [&](auto* rep) {
             attach_membership_probes(*rep,
                                      consumer.get(),
-                                     {.selection_unprofitable = selection_unprofitable,
-                                      .uncomposed_mvcc_mask   = mvcc_keep_mask.has_mask() &&
+                                     {.enable_fused_scan_filter = enable_fused_scan_filter,
+                                      .fused_scan               = fused_scan,
+                                      .selection_unprofitable   = selection_unprofitable,
+                                      .uncomposed_mvcc_mask     = mvcc_keep_mask.has_mask() &&
                                                               !rep->visibility_mask().has_mask()},
                                      decode_attached);
           };
@@ -667,19 +662,20 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
   // The scan's cached checkpoint filters a borrowed resident batch whether or not decompression
   // pushdown is enabled: it builds the membership masks over the batch, then gathers the survivors
   // into a new table.
-  bool const cached_checkpoint = cached_checkpoint_possible();
-  bool const dynamic_filter_possible =
-    sirius::decompression_pushdown_enabled() && consumer != nullptr &&
-    !consumer->decode_bindings().empty() && !mvcc_keep_mask.has_mask();
+  bool const cached_checkpoint       = cached_checkpoint_possible();
+  bool const dynamic_filter_possible = enable_fused_scan_filter && consumer != nullptr &&
+                                       !consumer->decode_bindings().empty() &&
+                                       !mvcc_keep_mask.has_mask();
   if (row_filter_pending || dynamic_filter_possible || cached_checkpoint) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
     bool const unprofitable = pushdown_selection_unprofitable &&
                               pushdown_selection_unprofitable->load(std::memory_order_relaxed);
     // The forecast reads the cached batch, so it is skipped when its result cannot matter.
-    auto const forecast = row_filter_pending && !dynamic_filter_possible && !unprofitable
-                            ? pushdown_compaction_forecast(*this)
-                            : sirius::decompression_pushdown_scan::compaction_forecast{};
+    auto const forecast =
+      enable_fused_scan_filter && row_filter_pending && !dynamic_filter_possible && !unprofitable
+        ? pushdown_compaction_forecast(*this)
+        : sirius::decompression_pushdown_scan::compaction_forecast{};
     if (forecast.compacts) {
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row
@@ -701,8 +697,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes(
       // The cached checkpoint needs no more: such a split's table leaves the cached batch once
       // decoded, unless a refused carrier-converting transfer leaves the checkpoint the compacted
       // table, which this envelope sizes as it does post_filter_and_project's copy.
-      auto const cap =
-        forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
+      auto const cap = forecast.max_surviving_fraction;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
     if (!row_filter_pending && !cached_checkpoint) {

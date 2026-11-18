@@ -36,24 +36,6 @@
 
 namespace {
 
-// Arm the gate before any test latches its function-local static, without
-// overriding an explicit setting. The fused path's contract is byte-identical
-// output, so this is behavior-neutral for the rest of the binary.
-struct fused_gate_armer {
-  fused_gate_armer()
-  {
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/0);
-    // The fused decode hands compaction back to the ordinary decode + residual
-    // filter once a range keeps more than 35% (10% on the full route) of a
-    // chunk's rows. These tables are a handful of rows on purpose, so nearly
-    // every predicate is above that; lift the caps so the in-decode mask, whose
-    // bounds are under test, is what actually answers.
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", "1", /*overwrite=*/0);
-    setenv("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", "1", /*overwrite=*/0);
-  }
-};
-[[maybe_unused]] fused_gate_armer const arm_fused_gate{};
-
 // Rows sit exactly on / around every cutoff used below: the qgen q1 cutoff
 // 1998-09-20 (= DATE '1998-12-01' - 72 days), the 1994 year-range bounds, the
 // epoch boundary (negative stored days), plus NULLs and duplicates.
@@ -61,6 +43,9 @@ class CastDatePredicateFixture : public sirius::test::GpuExecutionFixture {
  public:
   CastDatePredicateFixture()
   {
+    // Tiny tables keep most rows; lift this connection's caps so the in-decode mask answers.
+    run_ok("SET fused_scan_max_selectivity = 1;");
+    run_ok("SET fused_scan_full_route_max_selectivity = 1;");
     run_ok("CREATE TABLE t (id INTEGER, d DATE);");
     run_ok(
       "INSERT INTO t VALUES "
