@@ -284,6 +284,30 @@ totals leave those out.
 | SF100000 | io_uring | 2 | [11909](https://accel-etl.nvidia.com/runs/11909/) | 1,508.9 |
 | SF100000 | io_uring | 4 | [11910](https://accel-etl.nvidia.com/runs/11910/) | 725.8 |
 
+### One node since the join-side commits
+
+The numbers above are from a build before commit `35f5573d` (2026-11-18). Since that commit a
+hash join holds its filtered side when the unfiltered scan on its other side does not fit in one
+GPU, a small lookup table is joined after the aggregation, and a `+`, `-`, `*` expression over
+DOUBLE columns is computed below the join (as it already was for DECIMAL). None of this has an
+option to set. In TPC-H it changes Q9.
+
+One node, GDS, the datasets, config and method of the table above, in seconds:
+
+| Scale | 22 queries before | 22 queries after | Q9 before | Q9 after |
+|---|---|---|---|---|
+| SF30000 | 321.7 | 319.7 | 28.5 | 27.1 |
+| SF100000 | 1,641.1 | 1,494.6 | 328.8 | 179.3 |
+
+- **SF100000 Q9** has two modes: 179.3 s in the 22-query pass and 122.0 s alone an hour earlier on
+  the same node, against 338.8 s for the earlier build run next to it. It now writes 44 to 436 GB
+  to disk where it wrote about 2.5 TB. Q13 is unchanged and still writes about 0.6 TB.
+- **The other 21 queries at SF100000** sum to 1,315.3 s against 1,312.4 s.
+- **Answers** match the expected results for all 22 queries at both scales.
+- **Not repeated:** SF10000, the io_uring runs, and every run on two and four nodes. Those cells
+  of the table above are still the earlier build's.
+- The runs used the same source as `35f5573d` apart from log levels, formatting and two unit tests.
+
 ## Past 16 ranks
 
 Not run yet. Grow in steps (4, 8, then 18 nodes) with Q1 and Q9 before any full run, and check
