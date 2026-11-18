@@ -152,6 +152,49 @@ TEST_CASE_METHOD(AggNullFixture,
 }
 
 TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution list scalar reductions and length",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  compare_gpu_vs_cpu(
+    "WITH groups AS (SELECT g, list(v) AS vals FROM agg_n GROUP BY g) "
+    "SELECT g, list_sum(vals), list_avg(vals), len(vals) FROM groups");
+  compare_gpu_vs_cpu(
+    "WITH empty_input AS (SELECT list(v) AS vals FROM agg_n WHERE g = 999) "
+    "SELECT list_sum(vals), list_avg(vals), len(vals) FROM empty_input");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution list zip transform and sum",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  run_ok("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'");
+  compare_gpu_vs_cpu(
+    "WITH groups AS (SELECT g, list(v) AS vals, list(d) AS decimals "
+    "FROM agg_n GROUP BY g) "
+    "SELECT g, list_sum(list_transform(list_zip(vals, decimals), "
+    "x -> x[1] * (1 - x[2]))) FROM groups");
+  compare_gpu_vs_cpu(
+    "WITH groups AS (SELECT g, list(v) AS vals, list(d) AS decimals "
+    "FROM agg_n WHERE g = 999 GROUP BY g) "
+    "SELECT g, list_sum(list_transform(list_zip(vals, decimals), "
+    "x -> x[1] * (1 - x[2]))) FROM groups");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution list zip pads unequal and missing lists with NULL",
+                 "[integration][gpu_execution][aggregate][list]")
+{
+  run_ok("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'");
+  compare_gpu_vs_cpu(
+    "WITH all_values AS (SELECT g, list(v) AS vals FROM agg_n GROUP BY g), "
+    "small_values AS (SELECT g, list(v) AS small FROM agg_n "
+    "WHERE v < 20 GROUP BY g) "
+    "SELECT a.g, len(list_zip(vals, small)), "
+    "list_sum(list_transform(list_zip(vals, small), x -> x[2])) "
+    "FROM all_values a LEFT JOIN small_values b USING (g)");
+}
+
+TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution list distinguishes empty input from zero groups",
                  "[integration][gpu_execution][aggregate][list]")
 {
@@ -168,6 +211,12 @@ TEST_CASE_METHOD(AggNullFixture,
   run_ok("CHECKPOINT");
   compare_gpu_vs_cpu("SELECT g, list(v), list(v * 2) FROM list_many GROUP BY g ORDER BY g");
   compare_gpu_vs_cpu("SELECT list(v) FROM list_many");
+  run_ok("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'");
+  compare_gpu_vs_cpu(
+    "WITH groups AS (SELECT g, list(v) AS vals, list(v * 2) AS doubled "
+    "FROM list_many GROUP BY g) "
+    "SELECT g, list_sum(list_transform(list_zip(vals, doubled), "
+    "x -> x[2] - 2 * x[1])) FROM groups");
 }
 
 TEST_CASE_METHOD(AggNullFixture,

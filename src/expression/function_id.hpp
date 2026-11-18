@@ -39,8 +39,7 @@ enum class date_arithmetic_operation : uint8_t {
  * Backing type uint16_t pinned as ABI (locked at compile time in
  * test_function_id.cpp). The order is grouped by category for human
  * readability; integer values are part of the public ABI — new entries go
- * at the end of their category, never in the middle. Cardinality is
- * exactly 35 (D-01).
+ * at the end of the enum, never in the middle.
  */
 enum class function_id : uint16_t {
   // Arithmetic — 6 entries (also the contents of supported_ast_functions)
@@ -89,6 +88,12 @@ enum class function_id : uint16_t {
   round,
   abs,
   negate,  // unary minus: DuckDB's one-argument "-"
+
+  // List operations
+  list_aggr,
+  list_zip,
+  list_transform,
+  array_extract,
 };
 
 /**
