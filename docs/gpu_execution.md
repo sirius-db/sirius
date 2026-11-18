@@ -45,6 +45,15 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus');
 ```
 
+`gpu_execution` takes exactly one SQL statement; an empty string or several statements raise an
+error. Named parameters:
+
+- `enable_optimizer` (default `true`; `NULL` means the default): plan the query with DuckDB's
+  optimizer before Sirius takes it. `false` hands Sirius the unoptimized plan, for example to
+  test operators the optimizer would rewrite away. The session's own optimizer setting is left
+  unchanged.
+- `query_label`: names this query in telemetry, as `sirius_set_query_label` does.
+
 ### Transparent Execution
 
 When `gpu_execution` is enabled (the default after loading the extension), all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no `CALL gpu_execution('...')` wrapper needed:

@@ -46,6 +46,7 @@ mold = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 croaring = "*"
+boto3 = ">=1.44.1,<2"
 
 [pypi-dependencies]
 rumdl = ">=0.2.44"

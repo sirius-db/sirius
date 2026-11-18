@@ -16,13 +16,22 @@
 
 #pragma once
 
+#include "op/cross_rank_sort_boundaries.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "sirius_config.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/resource_ref.hpp>
 
 #include <atomic>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -55,6 +64,19 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
 
+  //! Target bytes to accumulate for the boundary sample.
+  [[nodiscard]] uint64_t sort_sample_bytes() const noexcept { return _sort_sample_bytes; }
+  //! Max partition bytes, or 0 to size partitions from the GPU memory fraction.
+  [[nodiscard]] size_t max_partition_bytes_override() const noexcept
+  {
+    return _max_partition_bytes_override;
+  }
+  //! Fraction of available GPU memory per partition.
+  [[nodiscard]] double max_partition_memory_fraction() const noexcept
+  {
+    return _max_partition_memory_fraction;
+  }
+
  public:
   bool is_source() const override { return true; }
   // SORT_SAMPLE is not a pipeline sink — it runs as an intermediate operator in the
@@ -85,7 +107,59 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Release the partition boundaries table to free GPU memory
   void clear_partition_boundaries() { _partition_boundaries.reset(); }
 
+  //! Boundaries come from @p hook instead of this operator's sample alone. Set while planning.
+  //! @throws std::logic_error once the boundary task has been claimed.
+  void set_cross_rank_boundaries(std::shared_ptr<cross_rank_sort_boundaries> hook)
+  {
+    if (boundary_state() != BoundaryState::NOT_DONE) {
+      throw std::logic_error(
+        "[sirius_physical_sort_sample::set_cross_rank_boundaries] the plan cannot change during "
+        "execution");
+    }
+    _cross_rank_boundaries = std::move(hook);
+  }
+  //! The hook set by set_cross_rank_boundaries(), or null when this operator's sample stands alone.
+  [[nodiscard]] cross_rank_sort_boundaries* cross_rank_boundaries() const noexcept
+  {
+    return _cross_rank_boundaries.get();
+  }
+
+  //! With a hook the boundary task is still owed, input or not, until it has been claimed.
+  [[nodiscard]] bool all_ports_empty() override;
+  //! With a hook the boundary task runs with no input, since the other processes wait for it.
+  //! get_next_task_input_data() has already claimed it (SCHEDULED) when the task creator asks.
+  [[nodiscard]] bool runs_without_input() const override
+  {
+    return _cross_rank_boundaries != nullptr && boundary_state() != BoundaryState::DONE;
+  }
+
+  //! A device INT32 column holding @p indices.
+  static std::unique_ptr<cudf::column> index_column(std::vector<int32_t> const& indices,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr);
+
+  //! Rows i * rows / parts of @p sorted for i in [1, parts), offset by @p first: parts - 1
+  //! evenly spaced boundaries.
+  static std::unique_ptr<cudf::table> evenly_spaced(cudf::table_view sorted,
+                                                    cudf::size_type first,
+                                                    cudf::size_type rows,
+                                                    std::size_t parts,
+                                                    ::cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr);
+
  private:
+  //! Evenly spaced boundaries for @p num_parts partitions from this operator's own sorted
+  //! @p sample_keys.
+  sort_boundaries local_boundaries(cudf::table_view sample_keys,
+                                   std::size_t num_parts,
+                                   cucascade::memory::memory_space* space,
+                                   ::cuda::stream_ref stream);
+
+  [[nodiscard]] BoundaryState boundary_state() const noexcept
+  {
+    return _boundary_state.load(std::memory_order_acquire);
+  }
+
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
 
@@ -106,6 +180,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Fraction of available GPU memory per partition (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  //! See set_cross_rank_boundaries().
+  std::shared_ptr<cross_rank_sort_boundaries> _cross_rank_boundaries;
 };
 
 }  // namespace op

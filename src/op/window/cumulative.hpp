@@ -67,7 +67,9 @@ struct cumulative_aggregate {
  *   Over decimals it is DECIMAL128 at the input scale and over floating point it is FLOAT64.
  * - `count` and `count_star` are INT64. `count` counts the non-NULL arguments so far and
  * `count_star` the rows so far.
- * - `min` and `max` keep the argument type. Floating point arguments are not supported.
+ * - `min` and `max` keep the argument type. Over floating point, NaN orders above every other
+ *   value: a running `max` is NaN from the first NaN on, and a running `min` is NaN while every
+ *   non-NULL value so far is NaN.
  *
  * `sum`, `min` and `max` are NULL until the first non-NULL argument of the partition and then
  * keep the running value, so a NULL argument does not reset or hide it.
