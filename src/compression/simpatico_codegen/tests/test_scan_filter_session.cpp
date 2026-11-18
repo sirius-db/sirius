@@ -910,6 +910,77 @@ void dict_codes_gather(simpatico::stream_pool& pool,
   expect(rejected, "dict_codes gather accepted a key width hint that contradicts the key chars");
 }
 
+// A full-width output caps compaction at full_route_max_selectivity, unless a dict_codes output
+// shares the batch: then the ordinary max_selectivity ceiling applies.
+void dict_codes_lifts_full_route_ceiling(simpatico::stream_pool& pool,
+                                         ::cuda::stream_ref stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  std::vector<std::string> const keys{"MAIL", "SHIP", "AIR"};
+  std::vector<std::string> strings(row_count);
+  for (int i = 0; i < row_count; ++i)
+    strings[i] = keys[(i * 5 + i / 7) % keys.size()];
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_strings_column(strings, {}, stream));
+  columns.push_back(sequence(0, stream, mr));
+  columns.push_back(sequence(10000, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed =
+    simpatico::compress_with_plan(input.view(),
+                                  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                                  "dictionary.indices -> bitpack\n---\ninput -> bitpack\n---\n"
+                                  "input -> identity\n",
+                                  stream,
+                                  mr);
+
+  auto filtered = [&](std::vector<std::size_t> const& selected,
+                      std::vector<sc::decode_route> routes,
+                      std::int64_t keep,
+                      sc::scan_filter_result& result) {
+    sc::scan_filter_request request;
+    request.routes = std::move(routes);
+    request.filters.push_back({selected.size() - 2, {0, keep - 1}});
+    expect(request.fused_scan.full_route_max_selectivity == 0.10 &&
+             request.fused_scan.max_selectivity == 0.35,
+           "default selectivity ceilings");
+    return simpatico::decompress_scan_filter(
+      compressed, selected, request, result, pool, stream, mr);
+  };
+  std::int64_t const fifth = row_count / 5;
+
+  sc::scan_filter_result result;
+  auto output =
+    filtered({0, 1, 2},
+             {sc::decode_route::dict_codes, sc::decode_route::bitpack_mask, sc::decode_route::full},
+             fifth,
+             result);
+  expect(result.applied && result.survivor_count == fifth,
+         "a dict_codes output keeps compaction above the full-route ceiling");
+  std::vector<std::string> const expected_strings(strings.begin(), strings.begin() + fifth);
+  auto expected = make_strings_column(expected_strings, {}, stream);
+  expect(strings_equal(expected->view(), output->view().column(0), stream),
+         "dict_codes strings beside a full output");
+  auto const full = read<std::int32_t>(output->view().column(2), stream);
+  for (std::int64_t i = 0; i < fifth; ++i)
+    expect(full[i] == 10000 + i, "full output gathered beside a dict_codes output");
+  output.reset();
+
+  output =
+    filtered({1, 2}, {sc::decode_route::bitpack_mask, sc::decode_route::full}, fifth, result);
+  expect(!result.applied && result.status == sc::scan_filter_status::declined_unselective,
+         "without a dict_codes output the full-route ceiling applies");
+  output.reset();
+
+  output =
+    filtered({0, 1, 2},
+             {sc::decode_route::dict_codes, sc::decode_route::bitpack_mask, sc::decode_route::full},
+             row_count / 2,
+             result);
+  expect(!result.applied && result.status == sc::scan_filter_status::declined_unselective &&
+           output->num_rows() == row_count,
+         "a dict_codes output still declines above max_selectivity beside a full output");
+}
+
 }  // namespace
 
 int main()
@@ -933,6 +1004,7 @@ int main()
     bool8_delivery(pool, stream, resource);
     nullable_bool8_declines(pool, stream, resource);
     dict_codes_gather(pool, stream, resource);
+    dict_codes_lifts_full_route_ceiling(pool, stream, resource);
     nullable_full_route_declines(pool, stream, resource);
     aliased_borrowed_lanes(pool, stream, resource);
     cuda_check(pool.sync_all());
