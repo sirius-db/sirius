@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Plan, build, smoke-test and benchmark TPC-H on Distributed Sirius through its gateway.
+"""Plan, build, smoke-test and benchmark a query set on Distributed Sirius through its gateway.
+
+The query set is TPC-H by default (--benchmark tpch), or any dataset with a folder of .sql files
+(--benchmark custom).
 
 One run folder (--out) holds everything: plan.json, the resolved Sirius config, the generated
 scripts and SQL, the client output and the reports. Steps, in order:
@@ -31,7 +34,7 @@ from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
 PRESETS = SKILL / "configs"
-TABLES = "customer lineitem nation orders part partsupp region supplier".split()
+TPCH_TABLES = "customer lineitem nation orders part partsupp region supplier".split()
 DEFAULT_REPO = "https://github.com/sirius-db/sirius.git"
 # The submodules the branch's build instructions name; those a branch does not have are skipped.
 DEFAULT_SUBMODULES = (
@@ -43,11 +46,11 @@ q = shlex.quote
 
 
 def say(*parts):
-    print("[tpch-bench]", *parts, flush=True)
+    print("[bench]", *parts, flush=True)
 
 
 def die(message, code=1):
-    print(f"[tpch-bench] ERROR: {message}", file=sys.stderr, flush=True)
+    print(f"[bench] ERROR: {message}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
@@ -61,7 +64,7 @@ def confirm(args, what):
             "and rerun with --yes once they agree.",
             2,
         )
-    if input(f"[tpch-bench] {what}. Proceed? [y/N] ").strip().lower() not in (
+    if input(f"[bench] {what}. Proceed? [y/N] ").strip().lower() not in (
         "y",
         "yes",
     ):
@@ -82,15 +85,43 @@ def save(plan):
 # ---------------------------------------------------------------------------- inputs
 
 
-def parse_queries(text):
-    """'1-22' or '1,6,12' -> [1, 6, 12]."""
+def tpch_ids(text):
+    """'1-22' or '1,6,12' -> ['Q1', 'Q6', 'Q12']."""
     numbers = []
     for part in str(text).split(","):
         lo, _, hi = part.strip().partition("-")
         numbers += range(int(lo), int(hi or lo) + 1)
     if not numbers or min(numbers) < 1 or max(numbers) > 22:
-        raise ValueError("queries are numbers from 1 to 22, such as 1-22 or 1,6,12")
-    return numbers
+        raise ValueError(
+            "TPC-H queries are numbers from 1 to 22, such as 1-22 or 1,6,12"
+        )
+    return [f"Q{n}" for n in numbers]
+
+
+def natural(name):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
+def pick(selection, available, what):
+    """Query names chosen from the folder: 'all', names, or numbers and ranges (7, 1-5)."""
+    if not selection or selection == "all":
+        return list(available)
+    picked = []
+    for part in (p.strip() for p in selection.split(",") if p.strip()):
+        if part in available:
+            picked.append(part)
+            continue
+        lo, _, hi = part.partition("-")
+        if not (lo.isdigit() and (hi.isdigit() or not hi)):
+            die(f"{what}: no query named '{part}' among {', '.join(available[:12])}")
+        for n in range(int(lo), int(hi or lo) + 1):
+            match = [a for a in available if re.fullmatch(rf"[A-Za-z_]*0*{n}", a)]
+            if len(match) != 1:
+                die(
+                    f"{what}: query number {n} matches {match or 'no file'} in the queries folder"
+                )
+            picked += match
+    return picked
 
 
 def check_sf(text):
@@ -158,24 +189,37 @@ def cmd_plan(args):
                 missing.append("--" + name.replace("_", "-"))
                 return None
             while value in (None, ""):
-                value = input(f"[tpch-bench] {label}: ").strip()
+                value = input(f"[bench] {label}: ").strip()
         while check and check(str(value)):
             if not sys.stdin.isatty():
                 die(f"--{name.replace('_', '-')} {value}: {check(str(value))}")
             print(f"  {check(str(value))}")
-            value = input(f"[tpch-bench] {label}: ").strip()
+            value = input(f"[bench] {label}: ").strip()
         return value
 
+    tpch = args.benchmark == "tpch"
     branch = need("branch", "Branch to test")
     checkout = need(
         "checkout", "Checkout folder, existing or to create (absolute path)", check_abs
     )
-    data = need(
-        "data",
-        "Dataset folder, one subfolder of Parquet files per table (absolute path)",
-        check_abs,
-    )
-    sf = need("sf", "Scale factor of that dataset", check_sf)
+    data = args.data
+    if not args.views_sql:
+        data = need(
+            "data",
+            "Dataset folder, one subfolder of Parquet files per table (absolute path)",
+            check_abs,
+        )
+    if tpch:
+        sf = need("sf", "Scale factor of that dataset", check_sf)
+    else:
+        sf = args.sf
+        if sf and check_sf(sf):
+            die(f"--sf {sf}: {check_sf(sf)}")
+        args.queries_dir = need(
+            "queries_dir",
+            "Folder of .sql files, one query per file (absolute path)",
+            check_abs,
+        )
     mode = need(
         "mode",
         "Execution mode, 'single' (one node, all its GPUs) or 'multi' (several nodes)",
@@ -230,7 +274,7 @@ def cmd_plan(args):
     if text and "@SPILL@" in text:
         if not spill and sys.stdin.isatty():
             spill = input(
-                "[tpch-bench] Spill folder, on a disk with free space (absolute path): "
+                "[bench] Spill folder, on a disk with free space (absolute path): "
             ).strip()
         if not spill:
             die("this config has @SPILL@: give --spill-dir", 2)
@@ -245,10 +289,22 @@ def cmd_plan(args):
         die(
             "this config needs " + ", ".join(f"--env {key}=<value>" for key in unset), 2
         )
-    try:
-        full, smoke = parse_queries(args.queries), parse_queries(args.smoke_queries)
-    except ValueError as error:
-        die(str(error))
+    for name in ("views_sql", "setup_sql"):
+        if getattr(args, name) and not Path(getattr(args, name)).is_file():
+            die(
+                f"--{name.replace('_', '-')}: {getattr(args, name)} is not a readable file here"
+            )
+    if tpch:
+        try:
+            full = tpch_ids(args.queries or "1-22")
+            smoke = tpch_ids(args.smoke_queries or "1,6,12")
+        except ValueError as error:
+            die(str(error))
+        tables = None if args.views_sql else TPCH_TABLES
+    else:  # resolved in preflight, where the queries folder and the dataset are visible
+        full, smoke = None, None
+        tables = [t for t in (args.tables or "auto").split(",") if t]
+        tables = None if args.views_sql and not args.tables else tables
 
     out_dir = Path(out)
     if (out_dir / "plan.json").exists() and not args.replace:
@@ -260,8 +316,12 @@ def cmd_plan(args):
         "branch": branch,
         "repo": args.repo,
         "checkout": checkout.rstrip("/"),
-        "data": data.rstrip("/"),
-        "sf": str(sf),
+        "benchmark": args.benchmark,
+        "name": args.name or ("TPC-H" if tpch else Path(data or args.queries_dir).name),
+        "data": (data or "").rstrip("/"),
+        "tables": tables,
+        "views_sql": args.views_sql,
+        "sf": str(sf) if sf else None,
         "mode": mode,
         "launcher": launcher,
         "nodes": nodes,
@@ -278,6 +338,8 @@ def cmd_plan(args):
         "statement_timeout": args.statement_timeout,
         "queries_dir": args.queries_dir,
         "setup_sql": args.setup_sql,
+        "query_selection": args.queries,
+        "smoke_selection": args.smoke_queries,
         "queries": full,
         "runs": args.runs,
         "smoke_queries": smoke,
@@ -289,9 +351,10 @@ def cmd_plan(args):
     save(plan)
     show(plan)
     if sys.stdin.isatty() and not args.yes:
-        if input(
-            "[tpch-bench] Are these inputs correct? [y/N] "
-        ).strip().lower() not in ("y", "yes"):
+        if input("[bench] Are these inputs correct? [y/N] ").strip().lower() not in (
+            "y",
+            "yes",
+        ):
             (out_dir / "plan.json").unlink()
             die("plan discarded: run `plan` again", 2)
     say(f"plan saved in {out_dir}/plan.json. Next: preflight --out {out_dir}")
@@ -310,8 +373,16 @@ def show(plan):
         ("branch", plan["branch"]),
         ("repository", plan["repo"]),
         ("checkout", plan["checkout"]),
-        ("dataset", plan["data"]),
-        ("scale factor", plan["sf"]),
+        ("benchmark", f"{plan['name']} ({plan['benchmark']})"),
+        ("dataset", plan["data"] or "defined by the views file"),
+        ("tables", tables_text(plan)),
+        (
+            "views",
+            plan["views_sql"]
+            or "one per table, read_parquet(<dataset>/<table>/*.parquet)",
+        ),
+        ("queries folder", plan["queries_dir"] or f"<checkout>/{QUERIES_SUBDIR}"),
+        ("scale factor", plan["sf"] or "not given"),
         ("mode", f"{plan['mode']}, {where(plan)}"),
         (
             "launcher",
@@ -328,11 +399,11 @@ def show(plan):
         ),
         (
             "smoke test",
-            f"queries {','.join(map(str, plan['smoke_queries']))}, once each",
+            f"{query_text(plan['smoke_queries'], plan['smoke_selection'] or 'the first 3')}, once each",
         ),
         (
             "full benchmark",
-            f"{len(plan['queries'])} queries, {plan['runs']} run(s) each",
+            f"{query_text(plan['queries'], plan['query_selection'] or 'all')}, {plan['runs']} run(s) each",
         ),
         (
             "statement timeout",
@@ -360,6 +431,21 @@ def show(plan):
     print("  Keys the config does not set keep the engine's defaults.")
 
 
+def tables_text(plan):
+    if plan["tables"] is None:
+        return "defined by the views file"
+    if plan["tables"] == ["auto"]:
+        return "every subfolder of the dataset with Parquet files (found in preflight)"
+    return ", ".join(plan["tables"])
+
+
+def query_text(ids, selection):
+    if ids is None:
+        return f"{selection} (resolved in preflight)"
+    head = ", ".join(ids[:8]) + (f" ... ({len(ids)} in all)" if len(ids) > 8 else "")
+    return f"{len(ids)} queries: {head}"
+
+
 def cmd_show(args):
     show(load(args.out))
 
@@ -384,14 +470,26 @@ def node_sh(plan, script, node=None):
 
 
 def node_facts(plan, node=None):
-    c, d, o = q(plan["checkout"]), q(plan["data"]), q(plan["out"])
+    c, d, o = q(plan["checkout"]), q(plan["data"] or "/nonexistent"), q(plan["out"])
+    tables = plan["tables"] or []
+    checks = []
+    if tables == ["auto"]:
+        checks.append(
+            f'for t in {d}/*/; do ls "$t"*.parquet > /dev/null 2>&1 && echo "FOUND_TABLE=$(basename "$t")"; done'
+        )
+    else:
+        checks += [
+            f"echo TABLE_{t}=$(ls {d}/{q(t)}/*.parquet 2> /dev/null | wc -l)"
+            for t in tables
+        ]
+    if plan["queries_dir"] and plan["benchmark"] != "tpch":
+        checks.append(
+            f'for f in {q(plan["queries_dir"])}/*.sql; do [ -f "$f" ] && echo "QUERY_FILE=$(basename "$f" .sql)"; done'
+        )
     script = "\n".join(
         [
             "echo HOST=$(hostname)",
-            *[
-                f"echo TABLE_{t}=$(ls {d}/{t}/*.parquet 2> /dev/null | wc -l)"
-                for t in TABLES
-            ],
+            *checks,
             f"[ -e {c}/build/release/libsirius.so ] && [ -x {c}/gateway/build/release/duckdb ] && echo BUILD=yes || echo BUILD=no",
             f"[ -d {c}/.git ] && echo \"COMMIT=$(git -C {c} log -1 --format='%h %s')\" && "
             f"echo BRANCH=$(git -C {c} rev-parse --abbrev-ref HEAD) && "
@@ -402,8 +500,11 @@ def node_facts(plan, node=None):
         ]
     )
     result = node_sh(plan, script, node)
-    facts = dict(
-        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    lines = [line.split("=", 1) for line in result.stdout.splitlines() if "=" in line]
+    facts = dict(lines)
+    facts["FOUND_TABLES"] = sorted(v for k, v in lines if k == "FOUND_TABLE")
+    facts["QUERY_FILES"] = sorted(
+        (v for k, v in lines if k == "QUERY_FILE"), key=natural
     )
     if result.returncode != 0 or "HOST" not in facts:
         die(
@@ -446,15 +547,29 @@ def cmd_preflight(args):
     ]
     if problems:
         die("; ".join(problems))
-    gpus = set()
+    gpus, discovered, query_files = set(), None, None
     for node in plan["nodes"] or [None]:
         facts = node_facts(plan, node)
         host = facts["HOST"]
-        empty = [t for t in TABLES if facts.get(f"TABLE_{t}", "0") == "0"]
-        if empty:
-            problems.append(
-                f"{host}: no Parquet files in {plan['data']}/<table>/ for {', '.join(empty)}"
-            )
+        if plan["tables"] == ["auto"]:
+            found = facts["FOUND_TABLES"]
+            empty = [] if found else ["any table"]
+            if found and not discovered:
+                discovered = found
+            if not found:
+                problems.append(
+                    f"{host}: no subfolder of {plan['data']} holds Parquet files"
+                )
+        else:
+            empty = [
+                t for t in plan["tables"] or [] if facts.get(f"TABLE_{t}", "0") == "0"
+            ]
+            if empty:
+                problems.append(
+                    f"{host}: no Parquet files in {plan['data']}/<table>/ for {', '.join(empty)}"
+                )
+        if plan["benchmark"] != "tpch" and not query_files:
+            query_files = facts["QUERY_FILES"]
         if facts.get("OUT") != "yes":
             problems.append(
                 f"{host}: the run folder {plan['out']} is not visible there"
@@ -477,6 +592,27 @@ def cmd_preflight(args):
             )
     if len(gpus) > 1:
         problems.append(f"the nodes have different GPU counts: {sorted(gpus)}")
+    if discovered:
+        plan["tables"] = discovered
+        say(f"tables found: {', '.join(discovered)}")
+    if plan["benchmark"] != "tpch":
+        bad = [f for f in query_files or [] if not re.fullmatch(r"[A-Za-z0-9_.-]+", f)]
+        if not query_files:
+            problems.append(f"no .sql files in {plan['queries_dir']}")
+        elif bad:
+            problems.append(
+                f"query file names may hold letters, digits, '_', '.', '-' only: {bad}"
+            )
+        else:
+            plan["queries"] = pick(plan["query_selection"], query_files, "--queries")
+            plan["smoke_queries"] = (
+                pick(plan["smoke_selection"], query_files, "--smoke-queries")
+                if plan["smoke_selection"]
+                else plan["queries"][:3]
+            )
+            say(
+                f"queries: {query_text(plan['queries'], '')}; smoke test: {', '.join(plan['smoke_queries'])}"
+            )
     if problems:
         plan["preflight"] = "failed"
         save(plan)
@@ -528,7 +664,7 @@ def cmd_build(args):
         "\n".join(
             [
                 "#!/usr/bin/env bash",
-                "# Generated by tpch_bench.py: clone if absent, then build Sirius and the gateway.",
+                "# Generated by bench.py: clone if absent, then build Sirius and the gateway.",
                 "set -euo pipefail",
                 PIXI_PATH,
                 f"[ -d {c}/.git ] || git clone --branch {q(plan['branch'])} {q(plan['repo'])} {c}",
@@ -597,17 +733,26 @@ def q11_fraction(sf):
     return format(Context(prec=4).divide(Decimal("0.0001"), Decimal(sf)), "f")
 
 
-def fetch_queries(plan, numbers):
+def query_files(plan, qid):
+    """Candidate file names of a query: TPC-H accepts q7.sql, q07.sql or 7.sql."""
+    if plan["benchmark"] == "tpch":
+        n = int(qid[1:])
+        return [f"q{n}.sql", f"q{n:02d}.sql", f"{n}.sql"]
+    return [f"{qid}.sql"]
+
+
+def fetch_queries(plan, ids):
     """Copies the query texts into the run folder, through a node if this host cannot see them."""
     cache = Path(plan["out"]) / "queries"
     cache.mkdir(exist_ok=True)
-    wanted = [n for n in sorted(set(numbers)) if not (cache / f"q{n}.sql").is_file()]
+    wanted = [i for i in dict.fromkeys(ids) if not (cache / f"{i}.sql").is_file()]
     if not wanted:
         return cache
     source = plan["queries_dir"] or f"{plan['checkout']}/{QUERIES_SUBDIR}"
     script = f"cd {q(source)} || exit 1\n" + "\n".join(
-        f"echo '@@Q{n}'; cat q{n}.sql 2> /dev/null || cat q{n:02d}.sql 2> /dev/null || cat {n}.sql"
-        for n in wanted
+        f"echo '@@{i}'; "
+        + " || ".join(f"cat {q(f)} 2> /dev/null" for f in query_files(plan, i))
+        for i in wanted
     )
     if Path(source).is_dir():
         result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
@@ -617,30 +762,34 @@ def fetch_queries(plan, numbers):
         die(
             f"could not read the queries in {source} (give --queries-dir to `plan`): {result.stderr.strip()[-300:]}"
         )
-    for block in result.stdout.split("@@Q")[1:]:
-        number, _, text = block.partition("\n")
+    for block in result.stdout.split("@@")[1:]:
+        qid, _, text = block.partition("\n")
         if not text.strip():
-            die(f"query {number} in {source} is empty")
-        (cache / f"q{int(number)}.sql").write_text(text)
+            die(f"query {qid} in {source} is empty or missing")
+        (cache / f"{qid}.sql").write_text(text)
     return cache
 
 
 def write_sql(plan, kind, run_dir):
-    numbers = plan["smoke_queries"] if kind == "smoke" else plan["queries"]
+    ids = plan["smoke_queries"] if kind == "smoke" else plan["queries"]
     runs = 1 if kind == "smoke" else plan["runs"]
-    cache = fetch_queries(plan, numbers)
+    cache = fetch_queries(plan, ids)
+    tpch = plan["benchmark"] == "tpch"
     lines = [".mode csv", ".timer on"]
     if plan["setup_sql"]:
         lines.append(Path(plan["setup_sql"]).read_text().strip())
-    data = plan["data"].replace("'", "''")
-    lines += [
-        f"CREATE OR REPLACE VIEW {t} AS FROM read_parquet('{data}/{t}/*.parquet');"
-        for t in TABLES
-    ]
+    if plan["views_sql"]:
+        lines.append(Path(plan["views_sql"]).read_text().strip())
+    else:
+        data = plan["data"].replace("'", "''")
+        lines += [
+            f"CREATE OR REPLACE VIEW \"{t}\" AS FROM read_parquet('{data}/{t}/*.parquet');"
+            for t in plan["tables"]
+        ]
     notes = []
-    for number in numbers:
-        text = (cache / f"q{number}.sql").read_text().strip().rstrip(";").strip()
-        if number == 11:
+    for qid in ids:
+        text = (cache / f"{qid}.sql").read_text().strip().rstrip(";").strip()
+        if tpch and qid == "Q11":
             literals = set(re.findall(r"\*\s*(0\.0+[1-9]\d*)\b", text))
             if len(literals) == 1:
                 fraction = q11_fraction(plan["sf"])
@@ -651,12 +800,12 @@ def write_sql(plan, kind, run_dir):
                     "Q11: fraction not found in the query text, so it was left as written. Check it is 0.0001 / SF"
                 )
         for run in range(1, runs + 1):
-            lines += [f"SELECT 'Q{number} run {run}' AS marker;", text + ";"]
-    if kind == "smoke":
+            lines += [f"SELECT '{qid} run {run}' AS marker;", text + ";"]
+    if kind == "smoke" and tpch:
         lines.append("SELECT 'SFCHECK' AS marker, count(*) AS suppliers FROM supplier;")
     lines.append("FROM sirius_gateway_status();")
     (run_dir / "run.sql").write_text("\n".join(lines) + "\n")
-    return numbers, runs, notes
+    return ids, runs, notes
 
 
 # ---------------------------------------------------------------------------- launch
@@ -703,7 +852,7 @@ def slurm_session(plan, run_dir, big):
     return "\n".join(
         [
             "#!/usr/bin/env bash",
-            "# Generated by tpch_bench.py. One run is one Slurm job with fresh ranks: start the gateway",
+            "# Generated by bench.py. One run is one Slurm job with fresh ranks: start the gateway",
             "# and one rank per GPU (scripts/sirius_slurm.sbatch), send run.sql, cancel the job.",
             "set -uo pipefail",
             PIXI_PATH,
@@ -743,14 +892,14 @@ def local_session(plan, run_dir, big):
     others = " ".join(plan["nodes"][1:])
     env = dict(
         exports(plan, run_dir),
-        SIRIUS_CLUSTER="tpch-bench",
+        SIRIUS_CLUSTER="sirius-bench",
         SIRIUS_GATEWAY_JOIN_WAIT="120",
         SIRIUS_GATEWAY_MIN_RANKS=str(plan["ranks"]),
     )
     return "\n".join(
         [
             "#!/usr/bin/env bash",
-            "# Generated by tpch_bench.py, after docs/super-sirius/distributed-experiments-no-slurm.md:",
+            "# Generated by bench.py, after docs/super-sirius/distributed-experiments-no-slurm.md:",
             "# a gateway, one rank per GPU here and on the other machines, the client, then stop it all.",
             "# Only for machines that Slurm does not schedule.",
             "set -uo pipefail",
@@ -854,16 +1003,16 @@ def cmd_run(args, kind):
 # ---------------------------------------------------------------------------- results
 
 
-def parse_client(path):
+def parse_client(path, ids):
     """The second 'Run Time' after a marker is the query's; the first is the marker's own."""
     times, errors, status_rows, sf_rows = {}, [], 0, None
     current, seen = None, 0
     with open(path, encoding="utf-8", errors="replace") as file:
         for raw in file:
             line = raw.rstrip("\r\n")
-            marker = re.fullmatch(r'"?Q(\d+) run (\d+)"?', line.strip())
-            if marker:
-                current, seen = (int(marker.group(1)), int(marker.group(2))), 0
+            marker = re.fullmatch(r'"?(.+?) run (\d+)"?', line.strip())
+            if marker and marker.group(1) in ids:
+                current, seen = (marker.group(1), int(marker.group(2))), 0
                 continue
             timed = re.match(r"Run Time \(s\): real ([0-9.]+)", line)
             if timed and current:
@@ -876,7 +1025,7 @@ def parse_client(path):
                 errors.append(
                     (
                         (
-                            f"Q{current[0]} run {current[1]}"
+                            f"{current[0]} run {current[1]}"
                             if current
                             else "outside a query"
                         ),
@@ -920,7 +1069,7 @@ def report(plan, kind):
     if not client.is_file():
         say(f"{kind}: no client output yet ({client})")
         return False
-    times, errors, ready, sf_rows = parse_client(client)
+    times, errors, ready, sf_rows = parse_client(client, set(meta["queries"]))
     problems = []
     if done and (run_dir / "rc").read_text().strip() != "0":
         problems.append(
@@ -928,7 +1077,7 @@ def report(plan, kind):
         )
     problems += [f"{where_}: {text}" for where_, text in errors[:10]]
     expected = [(n, r) for n in meta["queries"] for r in range(1, meta["runs"] + 1)]
-    lost = [f"Q{n} run {r}" for n, r in expected if (n, r) not in times]
+    lost = [f"{n} run {r}" for n, r in expected if (n, r) not in times]
     if done and lost:
         problems.append("no time for " + ", ".join(lost))
     if done and ready != plan["ranks"]:
@@ -936,7 +1085,7 @@ def report(plan, kind):
             f"{ready} of {plan['ranks']} ranks were up and ready in the final status"
         )
     sf_line = None
-    if kind == "smoke":
+    if kind == "smoke" and plan["benchmark"] == "tpch":
         want = Decimal(plan["sf"]) * 10000
         sf_line = f"supplier has {sf_rows} rows; SF {plan['sf']} expects {want:f}"
         if done and (sf_rows is None or Decimal(sf_rows) != want):
@@ -951,11 +1100,12 @@ def report(plan, kind):
         writer.writerows([n, r, times.get((n, r), "")] for n, r in expected)
     state = "in progress" if not done else ("FAIL" if problems else "PASS")
     lines = [
-        f"# TPC-H {kind}: {state}",
+        f"# {plan['name']} {kind}: {state}",
         "",
         f"- Branch `{plan['branch']}`, build `{plan['build']['commit']}`",
         f"- {plan['ranks']} ranks, {where(plan)}, launcher {plan['launcher']}",
-        f"- Dataset `{plan['data']}`, scale factor {plan['sf']}",
+        f"- Dataset `{plan['data'] or plan['views_sql']}`"
+        + (f", scale factor {plan['sf']}" if plan["sf"] else ""),
         f"- Sirius config: {plan['config_label']}"
         + (f" (`{plan['config_file']}`)" if plan["config_file"] else ""),
         *[f"- {note}" for note in meta["notes"]],
@@ -974,7 +1124,7 @@ def report(plan, kind):
             totals[i] += value or 0
             complete[i] &= value is not None
         lines.append(
-            f"| Q{n} | "
+            f"| {n} | "
             + " | ".join("" if v is None else f"{v:.2f}" for v in row)
             + " |"
         )
@@ -1037,6 +1187,16 @@ def main():
     )
 
     plan = sub.add_parser("plan", help="record and validate the inputs")
+    plan.add_argument(
+        "--benchmark",
+        choices=["tpch", "custom"],
+        default="tpch",
+        help="tpch (default): the 22 TPC-H queries; custom: any dataset and a folder of .sql files",
+    )
+    plan.add_argument(
+        "--name",
+        help="name of the query set in the reports (default: TPC-H, or the dataset folder's name)",
+    )
     plan.add_argument("--branch", help="branch to test")
     plan.add_argument(
         "--checkout", help="checkout folder: used if it exists, cloned there if not"
@@ -1044,7 +1204,15 @@ def main():
     plan.add_argument(
         "--data", help="dataset folder with one subfolder of Parquet files per table"
     )
-    plan.add_argument("--sf", help="scale factor of the dataset")
+    plan.add_argument(
+        "--tables",
+        help="custom: the tables (subfolders of --data), comma-separated; default auto, every subfolder with Parquet files",
+    )
+    plan.add_argument(
+        "--views-sql",
+        help="file whose statements create the tables or views, instead of one read_parquet view per table (other formats, other layouts)",
+    )
+    plan.add_argument("--sf", help="scale factor of the dataset (required for tpch)")
     plan.add_argument(
         "--mode",
         choices=["single", "multi"],
@@ -1099,14 +1267,15 @@ def main():
     )
     plan.add_argument(
         "--queries-dir",
-        help=f"folder with q1.sql ... q22.sql (default: <checkout>/{QUERIES_SUBDIR})",
+        help=f"folder of .sql files, one query per file; required for custom (tpch default: <checkout>/{QUERIES_SUBDIR})",
     )
     plan.add_argument(
         "--setup-sql",
         help="file with statements to run before the views, such as SET lines",
     )
     plan.add_argument(
-        "--queries", default="1-22", help="queries of the full benchmark (default 1-22)"
+        "--queries",
+        help="queries of the full benchmark: tpch numbers and ranges (default 1-22); custom file names without .sql, numbers, or all (default)",
     )
     plan.add_argument(
         "--runs",
@@ -1116,8 +1285,7 @@ def main():
     )
     plan.add_argument(
         "--smoke-queries",
-        default="1,6,12",
-        help="queries of the smoke test (default 1,6,12)",
+        help="queries of the smoke test (tpch default 1,6,12; custom default: the first three)",
     )
     plan.add_argument(
         "--big-dir",

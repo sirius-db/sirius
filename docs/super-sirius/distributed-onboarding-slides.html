@@ -422,7 +422,7 @@ FROM sirius_gateway_status();                             -- one row per rank, o
 <div class="card"><p class="n">5</p><h3>Check the logs</h3><p>Every peer on the expected path, no error, every rank <code>up,ready</code>.</p></div>
 <div class="card"><p class="n">6</p><h3>Report</h3><p>Commit, config, nodes, dataset layout, cold and warm seconds, what failed.</p></div>
 </div>
-<p class="note"><strong>In Claude Code,</strong> <code>/sirius-tpch-bench</code> walks through these steps, with a smoke test before the benchmark. <strong>Start narrow:</strong> a few queries before all 22.</p>
+<p class="note"><strong>In Claude Code,</strong> <code>/distributed-sirius-bench</code> walks through these steps, with a smoke test before the benchmark. <strong>Start narrow:</strong> a few queries before all 22.</p>
 </div>
 <footer class="foot"><span>Source: distributed-experiments.md · distributed-experiments-no-slurm.md</span><span class="number">16 / 22</span></footer>
 </article></section>
@@ -549,7 +549,7 @@ export UCX_NET_DEVICES=&lt;iface&gt;  # the ranks' interface</pre>
 <tr><td>4</td><td><code>distributed-experiments.md</code></td><td>Benchmarks on GB200 under Slurm, and the reference numbers</td></tr>
 <tr><td></td><td><code>distributed-experiments-no-slurm.md</code>, <code>-aws.md</code></td><td>The same without Slurm, and on an AWS instance</td></tr>
 <tr><td></td><td><code>gds-runbook.md</code></td><td>Reading through GDS; what to do when storage stalls</td></tr>
-<tr><td></td><td><code>.claude/skills/sirius-tpch-bench/</code></td><td>The skill that runs a smoke test and a benchmark</td></tr>
+<tr><td></td><td><code>.claude/skills/distributed-sirius-bench/</code></td><td>The skill that runs a smoke test and a benchmark</td></tr>
 </tbody></table>
 <p class="note"><strong>In the code:</strong> <code>src/planner/distributed_plan.cpp</code>, <code>src/exchange/</code>, <code>gateway/src/</code>, <code>scripts/sirius_*.sh</code>.</p>
 </div>

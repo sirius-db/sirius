@@ -1,17 +1,19 @@
 ---
-name: sirius-tpch-bench
+name: distributed-sirius-bench
 description: >
-  Run TPC-H on Distributed Sirius through its gateway, one rank per GPU, on one node or several,
-  with or without Slurm: plan, preflight, build, a smoke test, then the full benchmark, with the
-  Sirius configuration shown and approved before anything starts. Use it for a distributed
-  smoke test or benchmark of a branch. For a single-process run, use the benchmark skill.
+  Run a query set on Distributed Sirius through its gateway, one rank per GPU, on one node or
+  several, with or without Slurm: TPC-H by default, or any dataset with a folder of .sql files.
+  Plan, preflight, build, a smoke test, then the full benchmark, with the Sirius configuration
+  shown and approved before anything starts. Use it for a distributed smoke test or benchmark of
+  a branch. For a single-process run, use the benchmark skill.
 disable-model-invocation: true
 ---
 
-# sirius-tpch-bench
+# distributed-sirius-bench
 
-Runs TPC-H on Distributed Sirius: one gateway, one engine process (a rank) per GPU, SQL sent
-through the client. `scripts/tpch_bench.py`, next to this file, does the mechanical work and keeps
+Runs a query set on Distributed Sirius: one gateway, one engine process (a rank) per GPU, SQL sent
+through the client. The query set is TPC-H by default, or any dataset you point it at (section
+1a). `scripts/bench.py`, next to this file, does the mechanical work and keeps
 everything about a run in one run folder. Your part is to collect the inputs, get the user's
 approval at each gate, and read the results critically.
 
@@ -33,10 +35,11 @@ Where a question tool exists (AskUserQuestion in Claude Code), use it; otherwise
 | Input | Flag | Notes |
 |---|---|---|
 | Branch to test | `--branch` | |
-| Dataset location | `--data` | A folder with one subfolder of Parquet files per TPC-H table |
-| Scale factor | `--sf` | Of that dataset. The smoke test checks it against the `supplier` row count |
+| Benchmark | `--benchmark tpch` or `custom` | TPC-H (default), or any dataset and queries: section 1a |
+| Dataset location | `--data` | A folder with one subfolder of Parquet files per table |
+| Scale factor | `--sf` | TPC-H: required; the smoke test checks it against the `supplier` row count, and Q11 uses it. Custom: optional, shown in the reports |
 | Execution mode | `--mode single` or `--mode multi` | Single: one node, all its GPUs. Multi: several nodes, all GPUs of each. For multi also ask which nodes (`--nodes a,b`) or, with Slurm, how many (`--num-nodes`) |
-| Sirius configuration | `--config` | Run `tpch_bench.py configs` and show the list: a preset, the user's own YAML file, or `engine-defaults` |
+| Sirius configuration | `--config` | Run `bench.py configs` and show the list: a preset, the user's own YAML file, or `engine-defaults` |
 
 You also need to know where things go. Ask if the conversation does not already say:
 
@@ -50,9 +53,27 @@ You also need to know where things go. Ask if the conversation does not already 
 | Large output | `--big-dir` | The client output reaches gigabytes at large scale factors. Keep it off a `$HOME` near its quota |
 | Extra environment | `--env KEY=VALUE` | For the gateway and the ranks. Where `$HOME` has a quota, `--env PIXI_CACHE_DIR=<a folder on scratch>` keeps Pixi's cache out of it |
 
-Other flags have defaults that rarely change: `--runs 2` (cold, then warm), `--queries 1-22`,
-`--smoke-queries 1,6,12`, `--statement-timeout`, `--queries-dir`, `--setup-sql`, `--env KEY=VALUE`.
-`tpch_bench.py plan --help` lists them all.
+Other flags have defaults that rarely change: `--runs 2` (cold, then warm), `--queries` (TPC-H:
+`1-22`), `--smoke-queries` (TPC-H: `1,6,12`), `--statement-timeout`, `--setup-sql`,
+`--env KEY=VALUE`. `bench.py plan --help` lists them all.
+
+## 1a. Any other dataset
+
+With `--benchmark custom` the script makes no assumption about the tables or the queries:
+
+| Input | Flag | Notes |
+|---|---|---|
+| Queries | `--queries-dir` | Required. A folder of `.sql` files, one query per file. A query's name is its file name without `.sql` (letters, digits, `_`, `.`, `-`) |
+| Which queries | `--queries` | `all` (default), names (`q7,q12`), or numbers and ranges (`1-5`), which match the number at the end of a file name |
+| Smoke test | `--smoke-queries` | Same forms. Default: the first three queries, in natural order |
+| Tables | `--tables` | Default `auto`: one view per subfolder of `--data` that holds Parquet files, named after the subfolder. Or a comma-separated list |
+| Views | `--views-sql` | Instead of the generated views, a file whose statements create the tables or views: CSV, another layout, a DuckDB file. `--data` is then optional |
+| Report name | `--name` | Default: the dataset folder's name |
+
+The TPC-H specifics (the Q11 fraction and the `supplier` row-count check) apply only to
+`--benchmark tpch`. A custom smoke test passes on the other checks: no error, a time for every
+query, every rank up and ready. So ask the user how they will know the answers are right (a
+reference engine, expected files), and say in the report if nothing checked them.
 
 Run the script on a host where it can start jobs: with Slurm, one where `sbatch` works. If that is
 not the host you are on, run every command below there (for example over `ssh` to the head node,
@@ -61,7 +82,7 @@ never to a compute node). The skill folder and the run folder must be visible fr
 ## 2. Plan and confirm
 
 ```bash
-python3 <this folder>/scripts/tpch_bench.py plan --branch ... --data ... --sf ... --mode ... \
+python3 <this folder>/scripts/bench.py plan --branch ... --data ... --sf ... --mode ... \
   --config ... --checkout ... --out ... [--nodes ...] [--partition ...] [--spill-dir ...] --yes
 ```
 
@@ -73,12 +94,14 @@ its questions instead.
 ## 3. Preflight and build
 
 ```bash
-python3 .../tpch_bench.py preflight --out <run folder> --yes   # short checks on the nodes
-python3 .../tpch_bench.py build     --out <run folder> --yes   # clone if absent, then build
+python3 .../bench.py preflight --out <run folder> --yes   # short checks on the nodes
+python3 .../bench.py build     --out <run folder> --yes   # clone if absent, then build
 ```
 
-- Preflight checks the tools on this host and, on each node, that the dataset has all eight tables
-  and that the run folder is visible. It counts the GPUs, which gives the number of ranks.
+- Preflight checks the tools on this host and, on each node, that every table has Parquet files
+  and that the run folder is visible. It counts the GPUs, which gives the number of ranks. For a
+  custom benchmark it also finds the tables (with `--tables auto`) and resolves the query
+  selection against the files in `--queries-dir`; show the user the lists it prints.
 - Build reuses a build that is already there and says which commit it is. It builds only when
   there is none, or with `--rebuild`. A fresh build takes 35 to 40 minutes on 144 cores, so under
   Slurm it runs as its own job on one node.
@@ -90,8 +113,8 @@ python3 .../tpch_bench.py build     --out <run folder> --yes   # clone if absent
 ## 4. Show the Sirius configuration, then the smoke test
 
 ```bash
-python3 .../tpch_bench.py show  --out <run folder>
-python3 .../tpch_bench.py smoke --out <run folder> --yes
+python3 .../bench.py show  --out <run folder>
+python3 .../bench.py smoke --out <run folder> --yes
 ```
 
 `show` prints the plan again, now with the rank count and the build's commit, followed by the full
@@ -100,7 +123,8 @@ Put that in front of the user and wait for a yes before the smoke test.
 
 The smoke test starts the gateway and the ranks, runs a few queries once each, and passes only if
 all of these hold: the client exited cleanly, no statement returned an error, every query has a
-time, every rank is `up` and `ready` in the final status, and `supplier` has `10000 x SF` rows.
+time, every rank is `up` and `ready` in the final status, and, for TPC-H, `supplier` has
+`10000 x SF` rows.
 `--dry-run` writes the launch script and the SQL without starting anything, which is a good way to
 show the user exactly what will run.
 
@@ -112,7 +136,7 @@ in a loop: after a job whose ranks were killed, wait until the node is idle agai
 Tell the user the smoke result and ask before starting:
 
 ```bash
-python3 .../tpch_bench.py full --out <run folder> --yes
+python3 .../bench.py full --out <run folder> --yes
 ```
 
 It refuses to run unless the smoke test passed for this plan. A full run can take from minutes to
@@ -120,8 +144,8 @@ hours, longer than a tool call may wait. Start it in the background, with its ou
 and look at progress with `report`, which works while the run is going:
 
 ```bash
-nohup python3 .../tpch_bench.py full --out <run folder> --yes > <run folder>/full.log 2>&1 &
-python3 .../tpch_bench.py report --out <run folder>
+nohup python3 .../bench.py full --out <run folder> --yes > <run folder>/full.log 2>&1 &
+python3 .../bench.py report --out <run folder>
 ```
 
 Interrupting the script cancels the Slurm job (or stops the gateway and ranks). If you stop it any
@@ -175,11 +199,11 @@ job and ask first. If no reference exists, say in the report that the answers we
   get the node drained. The `local` launcher uses `ssh` to other machines and is only for machines
   Slurm does not schedule.
 - One job per node at a time. Ask before holding four or more nodes.
-- Start narrow: the smoke test, then a few queries (`--queries 1,6,12`), before all 22.
+- Start narrow: the smoke test, then a few queries (`--queries 1,6,12`), before the whole set.
 - The `gb200-gds-one-node` preset reads through GPUDirect Storage. Read
   `docs/super-sirius/gds-runbook.md` in the checkout first, probe the node, and tell the storage
   admins before the first GDS run on a node. It was written for one node.
-- The query texts come from `<checkout>/test/tpch_performance/tpch_queries/orig/` unless
+- TPC-H query texts come from `<checkout>/test/tpch_performance/tpch_queries/orig/` unless
   `--queries-dir` says otherwise. Say in the report which set ran: numbers from different query
   parameters do not compare.
 
@@ -189,7 +213,8 @@ job and ask first. If no reference exists, say in the report that the answers we
   `gb200-sf10000` preset with the default scan backend, SF10000. Plan, preflight, build reuse and
   the smoke test all worked, and the smoke test passed.
 - **Tested only against stand-ins** for Slurm and for the client: the full benchmark, failure
-  detection, and a build from a fresh clone.
+  detection, a build from a fresh clone, and custom datasets (tables found automatically, a
+  views file, queries chosen by name and by number).
 - **Not run at all:** several nodes, the `local` launcher, the GDS preset.
 
 For any of the untested paths, run the step with `--dry-run` first, read the generated script with
