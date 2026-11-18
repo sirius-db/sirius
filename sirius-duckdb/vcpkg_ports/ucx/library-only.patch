@@ -1,0 +1,23 @@
+UCX 1.22.0: build only libraries and package metadata.
+
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -43,17 +43,7 @@
+ 	src/uct \
+ 	src/ucp
+ 
+-SUBDIRS += \
+-	src/tools/vfs \
+-	src/tools/info \
+-	src/tools/perf \
+-	src/tools/profile \
+-	bindings/go \
+-	bindings/java \
+-	test/apps \
+-	examples \
+-	cmake \
+-	config
++SUBDIRS += cmake config
+ 
+ if HAVE_GTEST
+ SUBDIRS += test/gtest

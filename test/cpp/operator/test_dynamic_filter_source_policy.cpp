@@ -23,7 +23,9 @@
 
 #include <catch.hpp>
 
+#include <array>
 #include <cstddef>
+#include <limits>
 
 namespace {
 
@@ -220,9 +222,9 @@ TEST_CASE("membership policy keeps a fitting IN-list at any fraction without a B
 TEST_CASE("domain-coverage gate fires at and above its threshold",
           "[dynamic_filter][source_policy]")
 {
-  REQUIRE(domain_coverage_gate_fires(50, 100, /*build_key_proven_unique=*/true, kThreshold));
-  REQUIRE(domain_coverage_gate_fires(51, 100, /*build_key_proven_unique=*/true, kThreshold));
-  REQUIRE_FALSE(domain_coverage_gate_fires(49, 100, /*build_key_proven_unique=*/true, kThreshold));
+  REQUIRE(domain_coverage_gate_fires(50, 100, /*build_key_eligible=*/true, kThreshold));
+  REQUIRE(domain_coverage_gate_fires(51, 100, /*build_key_eligible=*/true, kThreshold));
+  REQUIRE_FALSE(domain_coverage_gate_fires(49, 100, /*build_key_eligible=*/true, kThreshold));
 }
 
 TEST_CASE("domain-coverage gate is disabled for an untraceable key domain",
@@ -230,15 +232,60 @@ TEST_CASE("domain-coverage gate is disabled for an untraceable key domain",
 {
   // A key whose base table could not be traced reports cardinality 0. The gate must stand down
   // rather than divide by it -- even for a proven-unique key.
-  REQUIRE_FALSE(
-    domain_coverage_gate_fires(1'000'000, 0, /*build_key_proven_unique=*/true, kThreshold));
+  REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 0, /*build_key_eligible=*/true, kThreshold));
+  REQUIRE_FALSE(domain_coverage_gate_fires(0, 0, true, kThreshold));
 }
 
-TEST_CASE("domain-coverage gate fires only for proven-unique keys",
+TEST_CASE("domain-coverage gate rejects build counts larger than the domain",
           "[dynamic_filter][source_policy]")
 {
-  // Row retention does not measure domain coverage for duplicate keys, so they never fire the
-  // gate even at or above the table cardinality.
+  REQUIRE_FALSE(domain_coverage_gate_fires(101, 100, true, 0.9));
+  REQUIRE_FALSE(domain_coverage_gate_fires(101, 100, true, 0.45));
+  REQUIRE_FALSE(domain_coverage_gate_fires(101, 100, true, 1.0));
+
+  // Check inconsistency before floating-point conversion can erase the one-row difference.
+  constexpr auto max_rows = std::numeric_limits<std::size_t>::max();
+  REQUIRE_FALSE(domain_coverage_gate_fires(max_rows, max_rows - 1, true, 1.0));
+  REQUIRE(domain_coverage_gate_fires(max_rows, max_rows, true, 1.0));
+}
+
+TEST_CASE("domain-coverage gate does not skip filters for an empty build",
+          "[dynamic_filter][source_policy]")
+{
+  REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.9));
+  REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.45));
+  // Plans transport thresholds unvalidated; an empty build stays filtered even at zero.
+  REQUIRE_FALSE(domain_coverage_gate_fires(0, 100, true, 0.0));
+}
+
+TEST_CASE("domain-coverage gate preserves configured threshold boundaries",
+          "[dynamic_filter][source_policy]")
+{
+  REQUIRE_FALSE(domain_coverage_gate_fires(899, 1'000, true, 0.9));
+  REQUIRE(domain_coverage_gate_fires(900, 1'000, true, 0.9));
+  REQUIRE(domain_coverage_gate_fires(901, 1'000, true, 0.9));
+  REQUIRE_FALSE(domain_coverage_gate_fires(449, 1'000, true, 0.45));
+  REQUIRE(domain_coverage_gate_fires(450, 1'000, true, 0.45));
+  REQUIRE(domain_coverage_gate_fires(451, 1'000, true, 0.45));
+}
+
+TEST_CASE("domain-coverage gate counts rows in a domain with holes",
+          "[dynamic_filter][source_policy]")
+{
+  constexpr std::array domain_values{10, 100, 1'000, 10'000};
+  constexpr std::array build_values{domain_values.front(), domain_values.back()};
+
+  // Both endpoints survive, but the build covers only half of the domain's rows.
+  REQUIRE_FALSE(domain_coverage_gate_fires(build_values.size(), domain_values.size(), true, 0.9));
+  REQUIRE(domain_coverage_gate_fires(build_values.size(), domain_values.size(), true, kThreshold));
+  REQUIRE(domain_coverage_gate_fires(domain_values.size(), domain_values.size(), true, 0.9));
+}
+
+TEST_CASE("domain-coverage gate requires per-key uniqueness eligibility",
+          "[dynamic_filter][source_policy]")
+{
+  // Without per-key uniqueness evidence, row retention cannot establish coverage even at or above
+  // the table cardinality.
   REQUIRE_FALSE(domain_coverage_gate_fires(900'000, 1'000'000, false, 0.9));
   REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, false, 0.9));
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 0.9));

@@ -99,7 +99,6 @@ add_library(
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
-  src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
@@ -128,6 +127,11 @@ set_target_properties(
              CUDA_STANDARD_REQUIRED ON)
 if(VCPKG_BUILD)
   set_target_properties(simpatico PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  target_compile_options(
+    simpatico
+    PRIVATE
+      "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+  )
 endif()
 target_compile_options(
   simpatico

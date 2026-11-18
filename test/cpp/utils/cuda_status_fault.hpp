@@ -55,7 +55,8 @@ class scoped_cuda_status_fault {
     enqueue_copy_batch          = 9,
     record_event                = 10,
     create_event                = 11,
-    synchronize_stream_unjoined = 12
+    synchronize_stream_unjoined = 12,
+    synchronize_event           = 13
   };
   // When the faulting call has a non-null stream, @p delay queues a host callback that sleeps for
   // that duration, holding up later work on the stream. Most wrappers queue the callback before

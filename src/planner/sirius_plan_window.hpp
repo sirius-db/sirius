@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "expression/ast/node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/window/cumulative.hpp"
 #include "op/window/ranking.hpp"
 #include "op/window/whole_partition.hpp"
 #include "sirius_config.hpp"
@@ -52,11 +53,15 @@ struct ranking_window_expression {
   duckdb::idx_t output_slot;
 };
 
+/// The kinds of window expression. A stage holds one kind.
+enum class window_kind { whole_partition, ranking, cumulative };
+
 // Planning IR only: not an executable operator. All slots index the prepared input
 // (original columns followed by hidden expressions), except output_slot, which
 // indexes the visible output (original columns followed by window results).
-// A window holds either `expressions` (aggregates over the whole partition) or `rankings`
-// (ranking functions over `ranking_order`), never both.
+// `kind` says what a window holds: `expressions` with aggregates over the whole partition,
+// `rankings` with ranking functions over `ranking_order`, or `expressions` with running aggregates
+// over `ranking_order` (the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`).
 struct window_plan {
   duckdb::idx_t input_width;
   duckdb::vector<duckdb::LogicalType> prepared_types;
@@ -65,8 +70,10 @@ struct window_plan {
   std::vector<std::unique_ptr<ast::node>> hidden_expressions;
   std::vector<whole_partition_expression> expressions;
   std::vector<ranking_window_expression> rankings;
-  // Order key slots, direction and NULL placement shared by all `rankings`.
+  // Order key slots, direction and NULL placement shared by all `rankings`, or by all running
+  // aggregates.
   op::ranking_order ranking_order;
+  window_kind kind = window_kind::whole_partition;
 };
 
 /**

@@ -8,7 +8,8 @@ an installed shared or static Sirius CMake package and runs GPU SQL tests
 through the normal DuckDB extension test target. The root CMake project builds
 the Sirius libraries and C++ tests.
 
-For local development, `pixi run make` builds Sirius and its C++ tests, installs
+For local development, install [Pixi](https://pixi.sh/latest/installation/) 0.84.1 or newer.
+`pixi run make` builds Sirius and its C++ tests, installs
 Sirius under `build/release/install`, and builds the shared DuckDB extension in
 `sirius-duckdb/`. Use `pixi run make release` for just Sirius and its C++ tests,
 or invoke standalone CMake directly:
@@ -36,10 +37,11 @@ Tools:
   set `LIBCLANG_PATH` if libclang is not on CMake's or the system's search path
 - `xxhsum` (xxHash 0.8) to fingerprint embedded JIT headers
 
-CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `kvikio`, `nvcomp`, `spdlog`,
+CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `nvcomp`, `spdlog`,
 `yaml-cpp`, `roaring`, and `absl`, plus `OpenSSL`, `ZLIB`, and `CUDAToolkit`.
-`pkg-config` modules: `numa`, `liburing`, and `libcurl`. Use the RAPIDS versions
-pinned in `pixi.toml`.
+`pkg-config` modules: `liburing`, plus `libcurl` when
+`SIRIUS_BUILD_TESTS` is on (the S3 test fixture uploads with it). Use the RAPIDS
+versions pinned in `pixi.toml`.
 
 The `duckdb`, `substrait`, and `cucascade` submodules are built from source.
 `cuco` and Corrosion are used from installed CMake packages when found and are

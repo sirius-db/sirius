@@ -69,6 +69,14 @@ struct iceberg_delete_set : prepared_visibility {
   std::string_view data_file;
   std::span<int64_t const> positions;
   uint64_t source_dv_count = 0;
+  // Eager V2 inputs preserve signed, out-of-file legacy positions. Deferred
+  // inputs retain strict bounds validation even when the consumer clips ranges.
+  void validate_file_bounds(int64_t rows) const
+  {
+    if (rows < 0 || (!legacy_positions_ && !positions.empty() &&
+                     (positions.front() < 0 || positions.back() >= rows)))
+      throw std::invalid_argument("deferred delete position is outside its file");
+  }
 
  private:
   void validate(uint64_t count)

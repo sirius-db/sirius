@@ -45,11 +45,8 @@ START_TIMEOUT_SECONDS = (
 UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
 _SENTINEL = "siriusfuzz"
 _ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
-_FALLBACK_BANNER = (
-    "=============================================\n",
-    "Error in Sirius GPU execution, fallback to DuckDB\n",
-    "=============================================\n",
-)
+_FALLBACK_RULE = "=============================================\n"
+_FALLBACK_TITLE = "Error in Sirius GPU execution, fallback to DuckDB\n"
 
 
 class SessionError(RuntimeError):
@@ -411,15 +408,27 @@ def _split_stderr(lines: list[str]) -> tuple[str, str]:
     return "", "".join(lines).strip()
 
 
+def _fallback_banner_length(lines: list[str], index: int) -> int:
+    """The number of lines of the fallback banner at ``index`` (rule, title, optional
+    ``Reason:`` line, rule), or 0 if none starts there."""
+    if lines[index : index + 2] != [_FALLBACK_RULE, _FALLBACK_TITLE]:
+        return 0
+    end = index + 2
+    if end < len(lines) and lines[end].startswith("Reason: "):
+        end += 1
+    return end + 1 - index if end < len(lines) and lines[end] == _FALLBACK_RULE else 0
+
+
 def _strip_fallback_banners(lines: list[str]) -> tuple[list[str], list[str]]:
     """Keep Sirius's stdout-only fallback notice out of the shell's JSON result."""
     output: list[str] = []
     banners: list[str] = []
     index = 0
     while index < len(lines):
-        if tuple(lines[index : index + len(_FALLBACK_BANNER)]) == _FALLBACK_BANNER:
-            banners.extend(_FALLBACK_BANNER)
-            index += len(_FALLBACK_BANNER)
+        banner = _fallback_banner_length(lines, index)
+        if banner:
+            banners.extend(lines[index : index + banner])
+            index += banner
         else:
             output.append(lines[index])
             index += 1
