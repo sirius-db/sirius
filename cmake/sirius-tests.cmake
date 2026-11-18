@@ -173,6 +173,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
     test/cpp/memory/test_device_transfer_fault.cpp
     test/cpp/scan/test_arrow_discard_fault.cpp
+    test/cpp/compression/test_compressed_cross_gpu_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp
