@@ -392,7 +392,10 @@ struct operator_params {
 };
 
 struct telemetry_config {
-  bool enable_quent{true};
+  /// Off in released extensions (SIRIUS_DISTRIBUTION_DEFAULTS), on otherwise.
+  static bool const default_enable_quent;
+
+  bool enable_quent{default_enable_quent};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};
@@ -597,10 +600,9 @@ struct sirius_config {
     return _compression_config;
   }
 
-  /// Initial GPU admission cap per query. 0 = use all active GPUs (default).
-  /// Initially limits admission to the first @c gpus_per_query entries of the sorted
-  /// active-GPU list. Admission can then add GPUs holding compressed GPU-tier pins
-  /// that match a scanned source, even if those pins ultimately do not serve the scan.
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:

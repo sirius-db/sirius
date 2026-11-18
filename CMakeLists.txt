@@ -32,6 +32,10 @@ if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
   message(FATAL_ERROR "Enable at least one Sirius library output")
 endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
+option(
+  SIRIUS_DISTRIBUTION_DEFAULTS
+  "Default to DuckDB logging and no Quent telemetry, for released extensions"
+  OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK

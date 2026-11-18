@@ -22,6 +22,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/query_admission.hpp"
 #include "exec/query_lifecycle_registry.hpp"
+#include "log/sink.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -56,6 +57,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -1128,11 +1130,36 @@ class SiriusContext : public ClientContextState {
 /// null (best-effort) path never throws.
 void install_configured_log_sink(DatabaseInstance* db);
 
+/// Makes a Sirius load all-or-nothing for the process-wide logging state. It holds
+/// `Config::logging_mutex` for the whole load, so loads and logging settings (`SET sirius_log_*`,
+/// the FFI) cannot interleave with it, and a load that is not committed restores the log sink and
+/// `Config::LOG_*` values it found.
+class logging_load_transaction {
+ public:
+  logging_load_transaction();
+  ~logging_load_transaction();
+  logging_load_transaction(logging_load_transaction const&)            = delete;
+  logging_load_transaction& operator=(logging_load_transaction const&) = delete;
+
+  void commit() noexcept { committed_ = true; }
+
+ private:
+  std::unique_lock<std::recursive_mutex> log_lock_;
+  std::shared_ptr<sirius::log::sink> previous_sink_;
+  std::string previous_backend_;
+  std::string previous_dir_;
+  std::string previous_level_;
+  bool committed_ = false;
+};
+
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
-  SiriusContextExtensionCallback();
+  /// Installs the configured log sink for @p db before reading sirius.yaml, so the duckdb
+  /// backend also captures configuration and initialization messages. Without a database the
+  /// duckdb backend leaves the current sink in place.
+  explicit SiriusContextExtensionCallback(DatabaseInstance* db = nullptr);
 
   /// Finish runtime initialization after process-wide setup that must precede
   /// the first NVTX/runtime-initialization call.
@@ -1198,11 +1225,12 @@ bool like_swar_fastpath_enabled(ClientContext& context);
 /// `sirius.operator_params` entry is what a connection inherits until it sets its own.
 bool compressed_materialization_enabled(ClientContext& context);
 
-/// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
+/// \brief Print the "GPU execution failed, falling back to DuckDB" banner with the GPU error.
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
 /// piped/redirected output is not corrupted. Shared by the transparent runtime
 /// fallback and the explicit gpu_execution() CALL path so the message stays in sync.
-void print_cpu_fallback_banner();
+/// Newlines in the reason are flattened so the banner keeps a fixed shape.
+void print_cpu_fallback_banner(std::string_view reason);
 
 }  // namespace duckdb

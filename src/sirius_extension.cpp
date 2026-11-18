@@ -123,14 +123,18 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 
 namespace duckdb {
 
-constexpr char QUERY_LABEL_PARAM_KEY[] = "query_label";
+constexpr char QUERY_LABEL_PARAM_KEY[]      = "query_label";
+constexpr char ENABLE_OPTIMIZER_PARAM_KEY[] = "enable_optimizer";
 
 namespace {
 
@@ -364,7 +368,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // Bind-time discovery survives failures before execution can rebuild a plan.
   // A missing plan must never grant permission to replay.
   sirius::transparent::plan_source_policy source_policy{{}, false};
-  bool enable_optimizer;
+  bool enable_optimizer    = true;
   bool statement_read_only = true;
   // Schema captured at bind time; each execution rebuilds its
   // PreparedStatementData from these (parameterized execution is not
@@ -400,16 +404,25 @@ struct SiriusTableFunctionData : public TableFunctionData {
       context, SetScope::LOCAL, Value::BOOLEAN(original_enable_optimizer));
   }
 
+  //! Parses gpu_execution's SQL argument, which must hold exactly one statement.
+  static unique_ptr<SQLStatement> ParseStatement(ClientContext& context, const string& sql)
+  {
+    Parser parser(context);
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1) {
+      throw InvalidInputException("gpu_execution expects exactly one SQL statement, got %llu",
+                                  parser.statements.size());
+    }
+    return std::move(parser.statements[0]);
+  }
+
   unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context, bool* read_only = nullptr)
   {
     PrepareConnection(context);
     unique_ptr<LogicalOperator> plan;
     try {
-      Parser parser(context);
-      parser.ParseQuery(query);
-
       Planner planner(context);
-      planner.CreatePlan(std::move(parser.statements[0]));
+      planner.CreatePlan(ParseStatement(context, query));
       D_ASSERT(planner.plan);
       if (read_only) *read_only = planner.properties.IsReadOnly();
 
@@ -455,9 +468,12 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
                                                               vector<LogicalType>& return_types,
                                                               vector<Identifier>& names)
 {
-  auto result              = make_uniq<SiriusTableFunctionData>();
-  result->query            = input.inputs[0].ToString();
-  result->enable_optimizer = true;
+  auto result   = make_uniq<SiriusTableFunctionData>();
+  result->query = input.inputs[0].ToString();
+  if (auto it = input.named_parameters.find(ENABLE_OPTIMIZER_PARAM_KEY);
+      it != input.named_parameters.end() && !it->second.IsNull()) {
+    result->enable_optimizer = BooleanValue::Get(it->second);
+  }
 
   std::optional<std::string> query_label = std::nullopt;
   // take any query_label that was set using sirius_set_query_label SQL call
@@ -496,10 +512,8 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   // execution's window (GPUExecutionFunction) so every execution observes the
   // pin registry and configuration current at execute time — a plan built at
   // bind would carry pin-registry pointers a later unpin invalidates.
-  Parser parser(context);
-  parser.ParseQuery(result->query);
   Planner planner(context);
-  planner.CreatePlan(std::move(parser.statements[0]));
+  planner.CreatePlan(SiriusTableFunctionData::ParseStatement(context, result->query));
   D_ASSERT(planner.plan);
   if (planner.plan) {
     result->source_policy = sirius::transparent::derive_plan_source_policy(*planner.plan, context);
@@ -686,7 +700,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
         throw std::runtime_error("Sirius CPU replay refused: " + gpu_error.RawMessage());
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
-      print_cpu_fallback_banner();
+      print_cpu_fallback_banner(gpu_error.RawMessage());
       auto cpu_replay = run_internal_cpu_fallback_query(
         context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {
@@ -2509,7 +2523,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusRegistration::GPUExecutionBind,
                               SiriusRegistration::GPUExecutionInitGlobal);
   gpu_execution.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
-    options.Add("enable_optimizer", LogicalType::BOOLEAN);
+    options.Add(ENABLE_OPTIMIZER_PARAM_KEY, LogicalType::BOOLEAN);
     options.Add(QUERY_LABEL_PARAM_KEY, LogicalType::VARCHAR);
   });
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
@@ -4063,6 +4077,7 @@ static void check_cuda_driver_version()
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  logging_load_transaction logging_transaction;
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -4070,7 +4085,7 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>(&db);
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
@@ -4081,11 +4096,6 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->initialize_context();
   }
   config.GetCallbackManager().Register(std::move(callback));
-
-  // The ctor already installed the db-independent backend; reinstall now that the
-  // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
-  // unknown backend name is reported here rather than swallowed by the ctor.
-  install_configured_log_sink(&db);
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
@@ -4131,6 +4141,7 @@ static void LoadInternal(ExtensionLoader& loader)
     publish_transparent_optimizer_mask(config);
     db.GetObjectCache().Put(SiriusRuntimeReady::KEY, make_shared_ptr<SiriusRuntimeReady>());
   }
+  logging_transaction.commit();
 }
 
 }  // namespace duckdb

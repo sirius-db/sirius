@@ -325,7 +325,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //   Dynamically, once the survivor count is known — both regimes report
 //           declined_unselective, so the caller can remember it for the scan:
 //           - any `full` output: proceed iff survivors/rows <= TIERB_MAX_SEL
-//             (0.10);
+//             (0.10), or <= MAX_SEL (0.35) when a dict_codes output is present;
 //           - otherwise: give compaction up above MAX_SEL (0.35), unless a
 //             dict_codes output is present (that gather wins at every
 //             selectivity).
@@ -740,6 +740,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     //  * `full` outputs present: proceed only at sel <= the full-route threshold
     //    (default 0.10) — a full decode plus gather costs about the unfiltered
     //    path, so only a near-empty survivor set pays for the compacted batch.
+    //    A dict_codes output raises that to the 0.35 write-skip threshold: its
+    //    survivor-count-independent savings outweigh the full columns' gather,
+    //    which giving up would not avoid either, since the scan's filter then
+    //    gathers the plain batch (TPC-H q12 at SF1000, 15% surviving, a full
+    //    l_orderkey beside a dictionary l_shipmode: 0.49 s -> 0.20 s).
     //  * no `full`: the 0.35 write-skip threshold (the mask walk costs about
     //    the plain decode at sel .5) covering bitpack_mask / delta_mask AND
     //    str_split (whose char-gather savings are dictionary-like in shape but
@@ -759,14 +764,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       any_full |= routes[i] == sc::decode_route::full;
     }
     double const sel_frac = static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    bool const give_up    = any_full
-                              ? sel_frac > request.fused_scan.full_route_max_selectivity
-                              : (sel_frac > request.fused_scan.max_selectivity && !any_dict_gather);
+    bool const full_threshold_binds =
+      any_full && (!any_dict_gather || request.fused_scan.full_route_max_selectivity >=
+                                         request.fused_scan.max_selectivity);
+    double const threshold = full_threshold_binds ? request.fused_scan.full_route_max_selectivity
+                                                  : request.fused_scan.max_selectivity;
+    bool const give_up     = sel_frac > threshold && (any_full || !any_dict_gather);
     if (give_up) {
-      double const threshold = any_full ? request.fused_scan.full_route_max_selectivity
-                                        : request.fused_scan.max_selectivity;
-      char const* setting_name =
-        any_full ? "fused_scan_full_route_max_selectivity" : "fused_scan_max_selectivity";
+      char const* setting_name = full_threshold_binds ? "fused_scan_full_route_max_selectivity"
+                                                      : "fused_scan_max_selectivity";
       if (request.fused_scan.diagnostics) {
         std::fprintf(stderr,
                      "simpatico: filtered decode gave compaction up: sel=%.4f > %.4f (%s, "

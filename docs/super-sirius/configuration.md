@@ -798,8 +798,6 @@ configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulat
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
 
-**Note:** admission includes every GPU that holds a Simpatico-compressed chunk of a GPU-tier pin matching a source scanned by the query, even when `topology.gpus_per_query` or `admission_bytes_per_gpu` would admit fewer. Owner discovery matches source identity before pin binding, so it can include owners of a pin that ultimately does not serve the scan. For example, a compressed pin containing only `k` across two GPUs still widens a query selecting unpinned `v` from the same parquet source, even with `topology.gpus_per_query: 1`. A compressed chunk is decoded on the GPU that holds it, so narrowing the query away from that GPU would leave the chunk with nowhere to be decoded; the engine logs `[gpu_alloc] admission widened ...` when this applies. Uncompressed GPU-tier pins and host-tier pins are copied to the admitted GPUs and do not widen the set.
-
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
 `max_build_probe_resident_bytes` is connection-local: `SET` and `RESET` affect only the
@@ -829,7 +827,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
@@ -960,14 +958,15 @@ requires startup configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_backend` | `spdlog`; `duckdb` in released extensions | Log sink: `spdlog`, `duckdb`, or `noop` |
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
 | `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
-- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
-  `sirius_log_level` and `sirius_log_flush_seconds`.
-- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+- **`spdlog`** (default in source builds): writes the daily-rotated
+  `<sirius_log_dir>/sirius_<date>.log`, honouring `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`** (default in the released `sirius_cuda12`/`sirius_cuda13` extensions, which are
+  built with `-DSIRIUS_DISTRIBUTION_DEFAULTS=ON`): routes logs into DuckDB's own logging under the `Sirius` log type; enable and
   read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
@@ -982,9 +981,11 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 `SIRIUS_LOG_LEVEL` environment variables.
 
 The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
-If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
-the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
-the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+If none is set, it leaves the current log sink unchanged. In source builds, if only
+`SIRIUS_LOG_LEVEL` is set, the default `spdlog` backend writes to `./log/sirius_<date>.log`; if
+only `SIRIUS_LOG_DIR` is set, the default `spdlog` backend writes there. Libraries built with
+`SIRIUS_DISTRIBUTION_DEFAULTS` default to `duckdb`, so they need `SIRIUS_LOG_BACKEND=spdlog` for
+file logs. An unknown backend leaves the current sink in
 place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
@@ -1221,7 +1222,7 @@ The specialized path applies only to eligible batches and otherwise uses cuDF's 
 | `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
 | `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
 | `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
-| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. A batch that also has a dictionary output uses `fused_scan_max_selectivity` instead, if larger. |
 | `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
 | `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
 

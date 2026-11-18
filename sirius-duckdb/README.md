@@ -156,7 +156,13 @@ Use separate extension directories when testing both layouts.
 
 `LOAD sirius` reuses an installed backend; it does not update it or require its
 Sirius version to match the loader. Updating only the loader can therefore leave
-an older backend installed. The loader only selects and loads the backend; it
+an older backend installed. When `autoinstall_known_extensions` is enabled and the
+backend came from an HTTP repository, the first `LOAD sirius` in a database asks that
+repository whether it publishes a different build, using the ETag recorded at install
+time and without downloading it. If so, it prints a notice to stderr suggesting
+`UPDATE EXTENSIONS`. The check never fails `LOAD`. It uses two-second network
+timeouts, but a stalled DNS lookup or a server that answers very slowly can delay
+`LOAD` further. The loader only selects and loads the backend; it
 does not link against the engine API.
 
 Run `UPDATE EXTENSIONS;` to update the installed loader and backend(s) from their
