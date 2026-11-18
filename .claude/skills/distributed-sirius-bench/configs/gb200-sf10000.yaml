@@ -1,5 +1,6 @@
 # GB200 nodes, 4 GPUs each. The SF10000 config of docs/super-sirius/distributed-experiments.md:
 # tuned on 1 node, used unchanged on 2, and for a first check at SF100.
+# Not the config of the Reference numbers table of that file: for those runs use `plan --reference`.
 sirius:
   memory:
     gpu:

@@ -1,0 +1,506 @@
+{
+  "defaults": {
+    "branch": "experimental/distributed-sirius",
+    "exclusive": true,
+    "setup_sql": "sql/footer-statistics.sql"
+  },
+  "runs": {
+    "sf100k-n1-gds": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 24,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 1,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11810,
+        "date": "2026-11-16",
+        "note": "A composite of eight sessions: each query's time is its first run without an error. A storage read stall ended the first session, so Q3 ran again alone; Q13 ran again in a session of its own.",
+        "pass_totals_s": [
+          1641.051
+        ],
+        "total_of": "one run of each query",
+        "total_s": 1641.1
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "gds",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf100k-n1-uring": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 1,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11809,
+        "date": "2026-11-16",
+        "pass_totals_s": [
+          3263.03
+        ],
+        "total_of": "one run of each query",
+        "total_s": 3263.0
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "io_uring",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf100k-n2-gds": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 16,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 2,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11907,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          747.696
+        ],
+        "total_of": "one run of each query",
+        "total_s": 747.7
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "gds",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf100k-n2-uring": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 2,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11909,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          1508.901
+        ],
+        "total_of": "one run of each query",
+        "total_s": 1508.9
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "io_uring",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf100k-n4-gds": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 24,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 4,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11908,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          336.791
+        ],
+        "total_of": "one run of each query",
+        "total_s": 336.8
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "gds",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf100k-n4-uring": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf100k",
+      "dataset": "tpch-rs-float-no-delta/scale-100000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 4,
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11910,
+        "date": "2026-11-17",
+        "note": "In the pass one node's storage reads stopped for about two minutes during Q5 (172.1 s). Q5 run again alone on the same nodes took 48.2 s, which gives the 725.8 s.",
+        "pass_totals_s": [
+          849.657
+        ],
+        "total_of": "one run of each query",
+        "total_s": 725.8
+      },
+      "results": "parquet",
+      "runs": 1,
+      "scans": "io_uring",
+      "sessions": [
+        "1,2,3,4,6,7,8,10",
+        "11,13,14,15,16,17,19,20,22",
+        "5,18,21",
+        "12",
+        "9"
+      ],
+      "sf": "100000",
+      "statement_timeout": 900
+    },
+    "sf10k-n1-gds": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "gds": {
+        "max_gb_per_s": 50,
+        "num_threads": 32,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 1,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11807,
+        "date": "2026-11-16",
+        "note": "The accel-etl run is a second session of this setup with the standard query parameters (99.4 s, 96.2 s).",
+        "pass_totals_s": [
+          99.093,
+          95.136
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 94.7
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf10k-n1-uring": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "nodes": 1,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11808,
+        "date": "2026-11-16",
+        "pass_totals_s": [
+          245.271,
+          238.255
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 237.1
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf10k-n2-gds": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "gds": {
+        "max_gb_per_s": 50,
+        "num_threads": 32,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 2,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11899,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          58.336,
+          54.536
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 54.4
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf10k-n2-uring": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "nodes": 2,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11901,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          135.996,
+          128.08
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 128.0
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf10k-n4-gds": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "gds": {
+        "max_gb_per_s": 50,
+        "num_threads": 32,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 4,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11900,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          39.54,
+          36.398
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 36.3
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf10k-n4-uring": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float/scale-10000: Parquet, money columns DOUBLE",
+      "nodes": 4,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "recorded": {
+        "accel_etl_run": 11902,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          78.114,
+          72.58
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 72.2
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "10000",
+      "statement_timeout": 300
+    },
+    "sf30k-n1-gds": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 35,
+        "num_threads": 16,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 1,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11805,
+        "date": "2026-11-16",
+        "pass_totals_s": [
+          325.401,
+          324.368
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 321.7
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n1-uring": {
+      "commit": "147b0f315ff434f5a47ec58e5a4476b54b0ece33",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 1,
+      "order": "query",
+      "queries": "1-8,10-22,9",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11806,
+        "date": "2026-11-16",
+        "pass_totals_s": [
+          738.846,
+          722.587
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 720.4
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n2-gds": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 16,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 2,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11903,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          198.105,
+          185.361
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 184.8
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n2-uring": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 2,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11905,
+        "date": "2026-11-17",
+        "note": "In each pass one statement paused for more than 90 s; the faster-run total leaves those out.",
+        "pass_totals_s": [
+          484.458,
+          478.026
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 384.7
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n4-gds": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "gds": {
+        "max_gb_per_s": 30,
+        "num_threads": 24,
+        "read_timeout_s": 30,
+        "slow_read_ms_per_mib": 0
+      },
+      "nodes": 4,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11904,
+        "date": "2026-11-17",
+        "pass_totals_s": [
+          112.015,
+          109.919
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 109.2
+      },
+      "runs": 2,
+      "scans": "gds",
+      "sf": "30000",
+      "statement_timeout": 600
+    },
+    "sf30k-n4-uring": {
+      "commit": "93893ebab1df15f64b539e64508c418bdec52680",
+      "config": "ref-gb200-sf10k-sf30k",
+      "dataset": "tpch-rs-float-no-delta/scale-30000: Parquet, money columns DOUBLE, no delta encoding",
+      "nodes": 4,
+      "order": "pass",
+      "queries": "1-22",
+      "queries_dir": "queries/tpch-standard",
+      "recorded": {
+        "accel_etl_run": 11906,
+        "date": "2026-11-17",
+        "note": "In each pass one statement paused for more than 90 s; the faster-run total leaves those out.",
+        "pass_totals_s": [
+          322.236,
+          302.009
+        ],
+        "total_of": "the faster of the two runs of each query",
+        "total_s": 208.7
+      },
+      "runs": 2,
+      "scans": "io_uring",
+      "sf": "30000",
+      "statement_timeout": 600
+    }
+  }
+}

@@ -8,7 +8,9 @@ One run folder (--out) holds everything: plan.json, the resolved Sirius config, 
 scripts and SQL, the client output and the reports. Steps, in order:
 
   configs               list the Sirius config presets shipped with this skill
-  plan ...              record and validate the inputs (asks for missing ones at a terminal)
+  reference             list the runs of the branch's Reference numbers table
+  plan ...              record and validate the inputs (asks for missing ones at a terminal);
+                        --reference NAME takes them from the record of a reported run
   show      --out DIR   print the plan and the Sirius configuration that will be used
   preflight --out DIR   check the tools, the nodes, the dataset and the build
   build     --out DIR   clone the branch if needed and build it
@@ -34,6 +36,7 @@ from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent
 PRESETS = SKILL / "configs"
+REFERENCE = SKILL / "reference" / "runs.json"
 TPCH_TABLES = "customer lineitem nation orders part partsupp region supplier".split()
 DEFAULT_REPO = "https://github.com/sirius-db/sirius.git"
 # The submodules the branch's build instructions name; those a branch does not have are skipped.
@@ -177,8 +180,79 @@ def cmd_configs(_args):
     )
 
 
+def with_gds(text, gds):
+    """Puts the GDS scan settings of a reference run under the config's scan_manager key."""
+    lines = text.splitlines()
+    at = [i for i, line in enumerate(lines) if line.strip() == "scan_manager:"]
+    if len(at) != 1:
+        die("the GDS settings need one 'scan_manager:' line of its own in the config")
+    pad = " " * (len(lines[at[0]]) - len(lines[at[0]].lstrip()) + 2)
+    settings = ", ".join(f"{key}: {value}" for key, value in gds.items())
+    lines[at[0] + 1 : at[0] + 1] = [
+        f"{pad}backend: gds",
+        f"{pad}gds: {{ {settings} }}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def reference_runs():
+    doc = json.loads(REFERENCE.read_text())
+    return doc["defaults"], doc["runs"]
+
+
+def cmd_reference(_args):
+    _, runs = reference_runs()
+    print(
+        "Runs of the Reference numbers table, docs/super-sirius/distributed-experiments.md:"
+    )
+    for name, run in sorted(runs.items(), key=lambda item: natural(item[0])):
+        recorded = run["recorded"]
+        print(
+            f"  {name:16s} SF{run['sf']:7s} {run['scans']:9s} {run['nodes']} node(s) "
+            f"{recorded['total_s']:8.1f} s   accel-etl run {recorded['accel_etl_run']}"
+        )
+    print("Set one up with: plan --reference NAME --data ... --checkout ... --out ...")
+
+
+def reference_inputs(args):
+    """Fills the inputs the user did not give from the record of a reported run."""
+    defaults, runs = reference_runs()
+    run = runs.get(args.reference)
+    if not run:
+        die(f"no reference run '{args.reference}': `reference` lists them")
+    if args.benchmark != "tpch":
+        die("a reference run is a TPC-H run")
+    named = len([n for n in (args.nodes or "").split(",") if n])
+    if (named or args.num_nodes or run["nodes"]) != run["nodes"]:
+        die(f"{args.reference} ran on {run['nodes']} node(s)")
+    values = dict(defaults, **run)
+    values["mode"] = "single" if run["nodes"] == 1 else "multi"
+    values["num_nodes"] = None if named else run["nodes"]
+    for key in ("setup_sql", "queries_dir"):
+        if values.get(key):
+            values[key] = str(SKILL / values[key])
+    if values.get("sessions"):
+        values["sessions"] = ";".join(values["sessions"])
+    if args.queries or args.sessions:  # the user's selection replaces the record's
+        values["queries"] = values["sessions"] = None
+    gds = None if args.config else run.get("gds")
+    for key in (
+        "branch sf mode num_nodes commit config queries_dir setup_sql queries sessions "
+        "runs order results exclusive statement_timeout"
+    ).split():
+        if getattr(args, key) is None and values.get(key) is not None:
+            setattr(args, key, values[key])
+    return {
+        "name": args.reference,
+        "dataset": run["dataset"],
+        "gds": gds,
+        "recorded": run["recorded"],
+    }
+
+
 def cmd_plan(args):
     missing = []
+    reference = reference_inputs(args) if args.reference else None
 
     def need(name, label, check=None, default=None):
         value = getattr(args, name)
@@ -270,6 +344,9 @@ def cmd_plan(args):
     if launcher == "local" and mode == "multi" and len(nodes) != count:
         die("without Slurm, name the machines with --nodes (the first is this one)")
     label, text, env = read_config(config)
+    if reference and reference["gds"]:
+        text = with_gds(text, reference["gds"])
+        label += f", with the GDS scan settings of {reference['name']}"
     spill = args.spill_dir
     if text and "@SPILL@" in text:
         if not spill and sys.stdin.isatty():
@@ -294,9 +371,16 @@ def cmd_plan(args):
             die(
                 f"--{name.replace('_', '-')}: {getattr(args, name)} is not a readable file here"
             )
+    if args.queries and args.sessions:
+        die("give --queries or --sessions, not both")
+    sessions = None
     if tpch:
         try:
-            full = tpch_ids(args.queries or "1-22")
+            if args.sessions:
+                sessions = [tpch_ids(group) for group in args.sessions.split(";")]
+                full = [qid for group in sessions for qid in group]
+            else:
+                full = tpch_ids(args.queries or "1-22")
             smoke = tpch_ids(args.smoke_queries or "1,6,12")
         except ValueError as error:
             die(str(error))
@@ -313,7 +397,9 @@ def cmd_plan(args):
     if text:
         (out_dir / "config.yaml").write_text(text)
     plan = {
+        "reference": reference,
         "branch": branch,
+        "commit": args.commit,
         "repo": args.repo,
         "checkout": checkout.rstrip("/"),
         "benchmark": args.benchmark,
@@ -341,7 +427,12 @@ def cmd_plan(args):
         "query_selection": args.queries,
         "smoke_selection": args.smoke_queries,
         "queries": full,
-        "runs": args.runs,
+        "session_selection": args.sessions,
+        "sessions": sessions,
+        "runs": args.runs or 2,
+        "order": args.order or "query",
+        "results": args.results or "csv",
+        "exclusive": bool(args.exclusive),
         "smoke_queries": smoke,
         "big_dir": args.big_dir,
         "submodules": args.submodules,
@@ -369,8 +460,34 @@ def where(plan):
 
 def show(plan):
     ranks = plan.get("ranks")
+    reference = plan.get("reference")
+    shape = (
+        ", all queries once, then all again" if plan.get("order") == "pass" else ""
+    ) + (
+        f", in {len(plan['session_selection'].split(';'))} sessions, each with new ranks"
+        if plan.get("session_selection")
+        else ""
+    )
     rows = [
+        *(
+            [
+                (
+                    "reference",
+                    f"{reference['name']}: {reference['recorded']['total_s']} s recorded "
+                    f"({reference['recorded']['total_of']}), "
+                    f"accel-etl run {reference['recorded']['accel_etl_run']}",
+                ),
+                ("its dataset", reference["dataset"]),
+            ]
+            if reference
+            else []
+        ),
         ("branch", plan["branch"]),
+        (
+            "commit",
+            plan.get("commit")
+            or "the checkout's; for a new clone the head of the branch",
+        ),
         ("repository", plan["repo"]),
         ("checkout", plan["checkout"]),
         ("benchmark", f"{plan['name']} ({plan['benchmark']})"),
@@ -387,7 +504,8 @@ def show(plan):
         (
             "launcher",
             plan["launcher"]
-            + (f", partition {plan['partition']}" if plan["partition"] else ""),
+            + (f", partition {plan['partition']}" if plan["partition"] else "")
+            + (", exclusive nodes" if plan.get("exclusive") else ""),
         ),
         (
             "ranks",
@@ -403,7 +521,16 @@ def show(plan):
         ),
         (
             "full benchmark",
-            f"{query_text(plan['queries'], plan['query_selection'] or 'all')}, {plan['runs']} run(s) each",
+            f"{query_text(plan['queries'], plan['query_selection'] or plan.get('session_selection') or 'all')}, "
+            f"{plan['runs']} run(s) each{shape}",
+        ),
+        (
+            "results",
+            (
+                "Parquet files, written by a second client"
+                if plan.get("results") == "parquet"
+                else "CSV, through the client"
+            ),
         ),
         (
             "statement timeout",
@@ -491,9 +618,10 @@ def node_facts(plan, node=None):
             "echo HOST=$(hostname)",
             *checks,
             f"[ -e {c}/build/release/libsirius.so ] && [ -x {c}/gateway/build/release/duckdb ] && echo BUILD=yes || echo BUILD=no",
-            f"[ -d {c}/.git ] && echo \"COMMIT=$(git -C {c} log -1 --format='%h %s')\" && "
+            f"[ -e {c}/.git ] && echo \"COMMIT=$(git -C {c} log -1 --format='%h %s')\" && "
             f"echo BRANCH=$(git -C {c} rev-parse --abbrev-ref HEAD) && "
-            f"echo DIRTY=$(git -C {c} status --porcelain --untracked-files=no | wc -l)",
+            f"echo DIRTY=$(git -C {c} status --porcelain --untracked-files=no | wc -l) && "
+            f"echo HEAD=$(git -C {c} rev-parse HEAD)",
             f"[ -d {o} ] && echo OUT=yes || echo OUT=no",
             "echo GPUS=$(nvidia-smi -L 2> /dev/null | wc -l)",
             "echo CPUS=$(nproc 2> /dev/null)",
@@ -511,6 +639,19 @@ def node_facts(plan, node=None):
             f"could not run a check on {node or 'a node'}: {result.stderr.strip()[-400:]}"
         )
     return facts
+
+
+def wrong_commit(plan, facts):
+    """What to tell the user if the checkout exists at another commit than the plan's."""
+    want, have = plan.get("commit"), facts.get("HEAD")
+    if want and not have and facts.get("BUILD") == "yes":
+        return "git cannot read the checkout's commit, so it cannot be checked against the plan's"
+    if want and have and not have.startswith(want):
+        return (
+            f"the checkout is at {have[:9]}, the plan says {want[:9]}. Give a checkout at "
+            "that commit: the script does not switch one"
+        )
+    return None
 
 
 def slurm_gpus(plan, node):
@@ -586,7 +727,13 @@ def cmd_preflight(args):
             f"{host}: dataset {'incomplete' if empty else 'ok'}, {count or '?'} GPU(s), "
             f"build {'present at ' + facts.get('COMMIT', '?') if facts.get('BUILD') == 'yes' else 'absent'}"
         )
-        if facts.get("BRANCH") and facts["BRANCH"] != plan["branch"]:
+        if wrong_commit(plan, facts):
+            problems.append(f"{host}: {wrong_commit(plan, facts)}")
+        elif (
+            not plan.get("commit")
+            and facts.get("BRANCH")
+            and facts["BRANCH"] != plan["branch"]
+        ):
             say(
                 f"  note: the checkout is on '{facts['BRANCH']}', the plan says '{plan['branch']}'"
             )
@@ -604,7 +751,16 @@ def cmd_preflight(args):
                 f"query file names may hold letters, digits, '_', '.', '-' only: {bad}"
             )
         else:
-            plan["queries"] = pick(plan["query_selection"], query_files, "--queries")
+            if plan.get("session_selection"):
+                plan["sessions"] = [
+                    pick(group, query_files, "--sessions")
+                    for group in plan["session_selection"].split(";")
+                ]
+                plan["queries"] = [qid for group in plan["sessions"] for qid in group]
+            else:
+                plan["queries"] = pick(
+                    plan["query_selection"], query_files, "--queries"
+                )
             plan["smoke_queries"] = (
                 pick(plan["smoke_selection"], query_files, "--smoke-queries")
                 if plan["smoke_selection"]
@@ -638,8 +794,11 @@ def cmd_build(args):
         die("run `preflight` first")
     out, c = Path(plan["out"]), q(plan["checkout"])
     facts = node_facts(plan, (plan["nodes"] or [None])[0])
+    if wrong_commit(plan, facts):
+        die(wrong_commit(plan, facts))
     if (
-        facts.get("BRANCH")
+        not plan.get("commit")  # a checkout at the plan's commit is right on any branch
+        and facts.get("BRANCH")
         and facts["BRANCH"] != plan["branch"]
         and not args.use_existing_checkout
     ):
@@ -659,6 +818,9 @@ def cmd_build(args):
             f"({plan['build']['dirty_files']} modified tracked files). Pass --rebuild to build again."
         )
         return
+    clone = f"git clone --branch {q(plan['branch'])} {q(plan['repo'])} {c}"
+    if plan.get("commit"):
+        clone += f" && git -C {c} checkout --detach {q(plan['commit'])}"
     script = out / "build.sh"
     script.write_text(
         "\n".join(
@@ -667,7 +829,7 @@ def cmd_build(args):
                 "# Generated by bench.py: clone if absent, then build Sirius and the gateway.",
                 "set -euo pipefail",
                 PIXI_PATH,
-                f"[ -d {c}/.git ] || git clone --branch {q(plan['branch'])} {q(plan['repo'])} {c}",
+                f"[ -e {c}/.git ] || {{ {clone}; }}",
                 f"cd {c}",
                 "subs=",
                 f"for s in {plan['submodules']}; do",
@@ -770,11 +932,39 @@ def fetch_queries(plan, ids):
     return cache
 
 
-def write_sql(plan, kind, run_dir):
-    ids = plan["smoke_queries"] if kind == "smoke" else plan["queries"]
-    runs = 1 if kind == "smoke" else plan["runs"]
+def client2(plan, run_dir, big):
+    """The second client of --results parquet."""
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Generated by bench.py (--results parquet). This client attaches the gateway but does not",
+        "# CONNECT: its statements run here and reach the gateway through quack_query_by_name, so",
+        "# COPY writes the Parquet files on this side. The init file holds the token: owner only.",
+        "set -euo pipefail",
+        "state=$HOME/.sirius/gateways/$SIRIUS_CLUSTER",
+        "gateway='' gateway_token='' gateway_fingerprint=''",
+        "# shellcheck disable=SC1091",
+        'source "$state/gateway.conf"',
+        "(",
+        "  umask 077",
+        "  {",
+        '    echo "SET GLOBAL http_timeout = 86400;"',
+        "    echo \"ATTACH 'quack:$gateway' AS sirius (TOKEN '$gateway_token'"
+        "${gateway_fingerprint:+, SSL_FINGERPRINT '$gateway_fingerprint'});\"",
+        '  } > "$state/client2.init.sql"',
+        ")",
+        f"mkdir -p {q(str(big))}/answers",
+        f"cd {q(plan['checkout'])}",
+        "exec pixi run gateway/build/release/duckdb -unsigned -no-agent -bail "
+        f'-init "$state/client2.init.sql" < {q(str(run_dir))}/run2.sql',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_sql(plan, kind, run_dir, ids, runs, big):
+    """Writes the SQL of one session and returns the notes for the report."""
     cache = fetch_queries(plan, ids)
     tpch = plan["benchmark"] == "tpch"
+    parquet = plan.get("results") == "parquet"
     lines = [".mode csv", ".timer on"]
     if plan["setup_sql"]:
         lines.append(Path(plan["setup_sql"]).read_text().strip())
@@ -786,7 +976,7 @@ def write_sql(plan, kind, run_dir):
             f"CREATE OR REPLACE VIEW \"{t}\" AS FROM read_parquet('{data}/{t}/*.parquet');"
             for t in plan["tables"]
         ]
-    notes = []
+    notes, texts = [], {}
     for qid in ids:
         text = (cache / f"{qid}.sql").read_text().strip().rstrip(";").strip()
         if tpch and qid == "Q11":
@@ -799,13 +989,45 @@ def write_sql(plan, kind, run_dir):
                 notes.append(
                     "Q11: fraction not found in the query text, so it was left as written. Check it is 0.0001 / SF"
                 )
-        for run in range(1, runs + 1):
-            lines += [f"SELECT '{qid} run {run}' AS marker;", text + ";"]
-    if kind == "smoke" and tpch:
-        lines.append("SELECT 'SFCHECK' AS marker, count(*) AS suppliers FROM supplier;")
-    lines.append("FROM sirius_gateway_status();")
-    (run_dir / "run.sql").write_text("\n".join(lines) + "\n")
-    return ids, runs, notes
+        texts[qid] = text
+    passes = range(1, runs + 1)
+    if plan.get("order") == "pass":
+        order = [(qid, run) for run in passes for qid in ids]
+    else:
+        order = [(qid, run) for qid in ids for run in passes]
+    answers = str(big).replace("'", "''") + "/answers"
+    body = []
+    for qid, run in order:
+        body.append(f"SELECT '{qid} run {run}' AS marker;")
+        if not parquet:
+            body.append(texts[qid] + ";")
+            continue
+        if "$q$" in texts[qid]:
+            die(f"{qid}: --results parquet cannot send a query that contains $q$")
+        # The statement's time is the query, the fetch and the write of the file.
+        body.append(
+            f"COPY (FROM quack_query_by_name('sirius', $q${texts[qid]}$q$)) "
+            f"TO '{answers}/{qid}-run{run}.parquet';"
+        )
+    check = (
+        ["SELECT 'SFCHECK' AS marker, count(*) AS suppliers FROM supplier;"]
+        if kind == "smoke" and tpch
+        else []
+    )
+    status = "FROM sirius_gateway_status();"
+    if parquet:
+        # The connected client makes the views; the second one runs the queries.
+        (run_dir / "run.sql").write_text("\n".join(lines + check) + "\n")
+        (run_dir / "run2.sql").write_text(
+            "\n".join([".mode csv", ".timer on"] + body) + "\n"
+        )
+        (run_dir / "status.sql").write_text(f".mode csv\n{status}\n")
+        (run_dir / "client2.sh").write_text(client2(plan, run_dir, big))
+    else:
+        (run_dir / "run.sql").write_text(
+            "\n".join(lines + body + check + [status]) + "\n"
+        )
+    return notes
 
 
 # ---------------------------------------------------------------------------- launch
@@ -820,6 +1042,17 @@ def exports(plan, run_dir):
     return env
 
 
+def client_steps(plan, r, b, client):
+    """The shell commands that send the SQL; their exit code is the client's."""
+    steps = f"{client} -bail < {r}/run.sql > {b}/client.txt 2>&1"
+    if plan.get("results") == "parquet":
+        steps += (
+            f" && bash {r}/client2.sh > {b}/client2.txt 2>&1; rc=$?; "
+            f"{client} < {r}/status.sql >> {b}/client.txt 2>&1; (exit $rc)"
+        )
+    return steps
+
+
 def slurm_session(plan, run_dir, big):
     c, r, b = q(plan["checkout"]), q(str(run_dir)), q(str(big))
     sbatch = [
@@ -832,6 +1065,7 @@ def slurm_session(plan, run_dir, big):
     sbatch += ["-w", q(",".join(plan["nodes"]))] if plan["nodes"] else []
     sbatch += [f"--time={plan['time_limit']}"] if plan["time_limit"] else []
     sbatch += [plan["sbatch_args"]] if plan["sbatch_args"] else []
+    sbatch += ["--exclusive"] if plan.get("exclusive") else []
     sbatch += ["-o", f"{r}/job.out", "--job-name=sirius", "--gpus-per-task=1"]
     # Wrapped, so that it works when the checkout and the spill folder are visible on the nodes
     # only. The engine does not create its spill folder.
@@ -842,7 +1076,7 @@ def slurm_session(plan, run_dir, big):
     submit = " ".join(sbatch) + f" --wrap {q(inner)}"
     client = q(
         f"{PIXI_PATH}; cd {c} && git log -1 --oneline > {r}/env.txt; "
-        f"pixi run sirius-client -bail < {r}/run.sql > {b}/client.txt 2>&1"
+        + client_steps(plan, r, b, "pixi run sirius-client")
     )
     run_client = (
         f'srun --jobid="$job" --overlap -N1 -n1 --gpus=0 bash -c {client}'
@@ -935,7 +1169,7 @@ def local_session(plan, run_dir, big):
             f'for n in $NODES; do ssh "$n" "$on_node --check --data {plan["data"]}" || exit 1; done',
             f"scripts/sirius_node.sh > {r}/node.out 2>&1 &",
             f'for n in $NODES; do ssh "$n" "$on_node" > {r}/node-$n.out 2>&1 & done',
-            f"scripts/sirius_client.sh -bail < {r}/run.sql > {b}/client.txt 2>&1 &",
+            f"( {client_steps(plan, r, b, 'scripts/sirius_client.sh')} ) &",
             "wait $!",
             "rc=$?",
             "sleep 5    # the ranks flush their logs every 3 s",
@@ -961,36 +1195,72 @@ def cmd_run(args, kind):
         shutil.rmtree(run_dir)
     run_dir.mkdir()
     big = Path(plan["big_dir"]) / kind if plan["big_dir"] else run_dir
-    big.mkdir(parents=True, exist_ok=True)
-    numbers, runs, notes = write_sql(plan, kind, run_dir)
+    if big != run_dir and big.exists():
+        if not args.rerun:
+            die(f"{big} exists: pass --rerun to replace it")
+        shutil.rmtree(big)
+    numbers = plan["smoke_queries"] if kind == "smoke" else plan["queries"]
+    runs = 1 if kind == "smoke" else plan["runs"]
+    sessions = plan.get("sessions") if kind == "full" else None
+    # A session is one job with new ranks. Several of them get a subfolder each: s1, s2, ...
+    parts = (
+        [(f"s{k}", group) for k, group in enumerate(sessions, 1)]
+        if sessions
+        else [("", numbers)]
+    )
     slurm = plan["launcher"] == "slurm"
-    script = run_dir / "session.sh"
-    script.write_text((slurm_session if slurm else local_session)(plan, run_dir, big))
+    notes = []
+    for name, group in parts:
+        (run_dir / name).mkdir(exist_ok=True)
+        (big / name).mkdir(parents=True, exist_ok=True)
+        notes += write_sql(plan, kind, run_dir / name, group, runs, big / name)
+        (run_dir / name / "session.sh").write_text(
+            (slurm_session if slurm else local_session)(
+                plan, run_dir / name, big / name
+            )
+        )
+    notes = list(dict.fromkeys(notes))
+    script = run_dir / parts[0][0] / "session.sh"
     (run_dir / "meta.json").write_text(
-        json.dumps({"queries": numbers, "runs": runs, "notes": notes, "big": str(big)})
+        json.dumps(
+            {
+                "queries": numbers,
+                "runs": runs,
+                "notes": notes,
+                "big": str(big),
+                "parts": [name for name, _ in parts],
+            }
+        )
     )
     what = (
         f"{kind} run: {len(numbers)} queries x {runs} run(s) on {plan['ranks']} ranks, {where(plan)}, "
         f"config {plan['config_label']}"
+        + (f", in {len(parts)} sessions" if sessions else "")
     )
     say(what)
     for note in notes:
         say(note)
-    say(f"script: {script}   SQL: {run_dir}/run.sql")
+    say(f"script: {script}   SQL: {script.parent}/run.sql")
     if args.dry_run:
         say("dry run: nothing started")
         return
     confirm(args, what[0].upper() + what[1:])
-    command = (
-        ["bash", str(script)]
-        if slurm
-        else [
-            "bash",
-            "-c",
-            f"{PIXI_PATH}; cd {q(plan['checkout'])} && pixi run bash {q(str(script))}",
-        ]
-    )
-    rc = subprocess.call(command)
+    for name, group in parts:
+        script = run_dir / name / "session.sh"
+        if sessions:
+            say(f"session {name}: {', '.join(group)}")
+        command = (
+            ["bash", str(script)]
+            if slurm
+            else [
+                "bash",
+                "-c",
+                f"{PIXI_PATH}; cd {q(plan['checkout'])} && pixi run bash {q(str(script))}",
+            ]
+        )
+        rc = subprocess.call(command)
+        if rc:  # do not start the next session on nodes where this one failed
+            break
     (run_dir / "rc").write_text(f"{rc}\n")
     ok = report(plan, kind)
     if ok:
@@ -1040,13 +1310,14 @@ def parse_client(path, ids):
     return times, errors, status_rows, sf_rows
 
 
-def scan_rank_logs(run_dir):
+def scan_rank_logs(run_dir, parts):
     paths, held, limit = Counter(), 0, 500 * 1024 * 1024
-    logs = (
-        [p for p in (run_dir / "rank-logs").rglob("*") if p.is_file()]
-        if (run_dir / "rank-logs").is_dir()
-        else []
-    )
+    logs = [
+        p
+        for name in parts
+        for p in (run_dir / name / "rank-logs").rglob("*")
+        if p.is_file()
+    ]
     if not logs or sum(p.stat().st_size for p in logs) > limit:
         return None
     for log in logs:
@@ -1064,12 +1335,29 @@ def scan_rank_logs(run_dir):
 def report(plan, kind):
     run_dir = Path(plan["out"]) / kind
     meta = json.loads((run_dir / "meta.json").read_text())
-    client = Path(meta["big"]) / "client.txt"
+    parts = meta.get("parts", [""])
+    client = Path(meta["big"]) / parts[0] / "client.txt"
     done = (run_dir / "rc").is_file()
     if not client.is_file():
         say(f"{kind}: no client output yet ({client})")
         return False
-    times, errors, ready, sf_rows = parse_client(client, set(meta["queries"]))
+    # With --results parquet the times are in the second client's output.
+    times, errors, ups, sf_rows = {}, [], {}, None
+    for name in parts:
+        files = ["client.txt"] + (
+            ["client2.txt"] if plan.get("results") == "parquet" else []
+        )
+        for file in files:
+            path = Path(meta["big"]) / name / file
+            if not path.is_file():
+                continue
+            found = parse_client(path, set(meta["queries"]))
+            times.update(found[0])
+            errors += found[1]
+            ups[name] = ups.get(name, 0) + found[2]
+            sf_rows = found[3] if sf_rows is None else sf_rows
+    ready = min(ups.values())
+    short = [name for name, up in ups.items() if up != plan["ranks"]]
     problems = []
     if done and (run_dir / "rc").read_text().strip() != "0":
         problems.append(
@@ -1080,9 +1368,10 @@ def report(plan, kind):
     lost = [f"{n} run {r}" for n, r in expected if (n, r) not in times]
     if done and lost:
         problems.append("no time for " + ", ".join(lost))
-    if done and ready != plan["ranks"]:
+    if done and short:
         problems.append(
             f"{ready} of {plan['ranks']} ranks were up and ready in the final status"
+            + (f" of session {', '.join(short)}" if short[0] else "")
         )
     sf_line = None
     if kind == "smoke" and plan["benchmark"] == "tpch":
@@ -1092,7 +1381,7 @@ def report(plan, kind):
             problems.append(
                 sf_line + ": the dataset does not look like this scale factor"
             )
-    logs = scan_rank_logs(run_dir)
+    logs = scan_rank_logs(run_dir, parts)
 
     with open(run_dir / "timings.csv", "w", newline="") as file:
         writer = csv.writer(file)
@@ -1135,6 +1424,15 @@ def report(plan, kind):
         )
         + " |"
     )
+    reference = plan.get("reference")
+    if reference and kind == "full":
+        recorded = reference["recorded"]
+        lines += [
+            "",
+            f"Recorded for {reference['name']}: **{recorded['total_s']} s** "
+            f"({recorded['total_of']}), accel-etl run {recorded['accel_etl_run']}. "
+            "Compare it with the best total of this run.",
+        ]
     lines += [
         "",
         "## Checks",
@@ -1185,6 +1483,9 @@ def main():
     sub.add_parser("configs", help="list the config presets").set_defaults(
         run=cmd_configs
     )
+    sub.add_parser(
+        "reference", help="list the runs of the Reference numbers table"
+    ).set_defaults(run=cmd_reference)
 
     plan = sub.add_parser("plan", help="record and validate the inputs")
     plan.add_argument(
@@ -1197,7 +1498,17 @@ def main():
         "--name",
         help="name of the query set in the reports (default: TPC-H, or the dataset folder's name)",
     )
+    plan.add_argument(
+        "--reference",
+        metavar="NAME",
+        help="a run of the Reference numbers table (`reference` lists them): its record gives "
+        "the commit, config, queries, order and timeout; a flag given here replaces its value",
+    )
     plan.add_argument("--branch", help="branch to test")
+    plan.add_argument(
+        "--commit",
+        help="commit to test: checked out in a new clone; an existing checkout must be at it",
+    )
     plan.add_argument(
         "--checkout", help="checkout folder: used if it exists, cloned there if not"
     )
@@ -1278,10 +1589,31 @@ def main():
         help="queries of the full benchmark: tpch numbers and ranges (default 1-22); custom file names without .sql, numbers, or all (default)",
     )
     plan.add_argument(
+        "--sessions",
+        help="instead of --queries: groups of queries separated by ';', each group one job "
+        "with new ranks, such as '1-8;9;10-22'",
+    )
+    plan.add_argument(
         "--runs",
         type=int,
-        default=2,
-        help="runs of each query in a row (default 2: cold, warm)",
+        help="runs of each query (default 2: cold, warm)",
+    )
+    plan.add_argument(
+        "--order",
+        choices=["query", "pass"],
+        help="query (default): the runs of a query in a row; pass: all queries once, then all again",
+    )
+    plan.add_argument(
+        "--results",
+        choices=["csv", "parquet"],
+        help="csv (default): the client prints the rows; parquet: a second client writes each "
+        "result as a Parquet file under --big-dir, so no time goes to printing rows",
+    )
+    plan.add_argument(
+        "--exclusive",
+        action="store_true",
+        default=None,
+        help="with Slurm: the job takes its nodes exclusively, so no other job shares them",
     )
     plan.add_argument(
         "--smoke-queries",

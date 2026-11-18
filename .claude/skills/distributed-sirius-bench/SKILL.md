@@ -57,6 +57,16 @@ Other flags have defaults that rarely change: `--runs 2` (cold, then warm), `--q
 `1-22`), `--smoke-queries` (TPC-H: `1,6,12`), `--statement-timeout`, `--setup-sql`,
 `--env KEY=VALUE`. `bench.py plan --help` lists them all.
 
+Five more shape the run itself. A reference run (section 1b) sets them from its record:
+
+| Flag | Notes |
+|---|---|
+| `--commit` | The commit to test. A new clone is checked out at it; an existing checkout must already be at it |
+| `--order pass` | All queries once, then all again, instead of the runs of a query in a row |
+| `--sessions '1-8;9;10-22'` | Instead of `--queries`: each group is one job with new ranks. The report adds them up |
+| `--results parquet` | A second client writes each result as a Parquet file under `--big-dir`, so a query's time has no printing of rows in it. The time then includes the fetch and the write of the file |
+| `--exclusive` | With Slurm: the job takes its nodes exclusively. Without it another job can share the node's CPUs |
+
 ## 1a. Any other dataset
 
 With `--benchmark custom` the script makes no assumption about the tables or the queries:
@@ -78,6 +88,47 @@ reference engine, expected files), and say in the report if nothing checked them
 Run the script on a host where it can start jobs: with Slurm, one where `sbatch` works. If that is
 not the host you are on, run every command below there (for example over `ssh` to the head node,
 never to a compute node). The skill folder and the run folder must be visible from that host.
+
+## 1b. A run of the Reference numbers table
+
+`bench.py reference` lists the 18 runs of the
+[Reference numbers](../../../docs/super-sirius/distributed-experiments.md#reference-numbers)
+table: `sf10k`, `sf30k` or `sf100k`, on `n1`, `n2` or `n4` nodes, with `gds` or `uring` (io_uring)
+scans. `plan --reference <name>` takes what made that number from the run's record in
+`reference/runs.json`, so ask the user only for the site inputs:
+
+```bash
+python3 <this folder>/scripts/bench.py plan --reference sf30k-n2-gds --data ... --checkout ... \
+  --out ... --spill-dir ... [--big-dir ...] [--nodes a,b] [--partition ...] --yes
+```
+
+| From the record | What the plan gets |
+|---|---|
+| Commit | `--commit`: `147b0f3` for SF10000 and for SF30000 on one node, `93893eb` for the other runs. Give a checkout that is at it, or a new folder to clone into |
+| Config | A `ref-gb200-*` preset, plus the run's GDS threads and rate cap per rank for a GDS run |
+| Environment | `SIRIUS_GDS=1` and the UCX settings of the `ref-gb200-*.env` files, for io_uring runs too. `UCX_NET_DEVICES=bond0` is that cluster's; elsewhere give `--env UCX_NET_DEVICES=...` |
+| SQL | `SET parquet_footer_statistics = true` first. SF30000 and SF100000 use the query texts in `queries/tpch-standard` (the standard parameters), SF10000 the checkout's `orig` folder |
+| Order | `--order pass` for five of the SF30000 runs; Q9 last for the others |
+| SF100000 | Five sessions, one run per query, `--results parquet`. Give `--big-dir` |
+| Launch | `--exclusive`: the recorded runs had their nodes to themselves |
+| Statement timeout | 300 s, 600 s or 900 s by scale |
+
+- `plan` prints the recorded total and, under "its dataset", the dataset the run read. `--data`
+  must be that dataset: the same scale factor with DECIMAL money columns or other row groups
+  gives other times.
+- A flag the user gives replaces the record's value. The run is then not the reference run any
+  more: say so in the report.
+- The SF100000 preset sets `enable_build_side_swap`, which exists only up to the recorded commit:
+  a later commit refuses the config. To test a later commit with these settings, give
+  `--commit` and a copy of the preset without that key as `--config`.
+- A GDS run follows the GDS rule at the end of this file: the runbook, the probe, the storage
+  admins.
+- An SF100000 run is five jobs, one after another; each has its files in `full/s1` to `full/s5`.
+  A session that fails stops the ones after it. Find the cause, then plan the sessions that are
+  left in a new run folder with `--sessions`; do not rerun in a loop.
+- `summary.md` of the full run repeats the recorded total. Compare it with "best" for SF10000 and
+  SF30000 and with run 1 for SF100000, and read the record's `note` first: `sf100k-n1-gds` is
+  a composite of eight sessions, and `sf100k-n4-uring` counts Q5 from a rerun.
 
 ## 2. Plan and confirm
 
@@ -200,22 +251,33 @@ job and ask first. If no reference exists, say in the report that the answers we
   Slurm does not schedule.
 - One job per node at a time. Ask before holding four or more nodes.
 - Start narrow: the smoke test, then a few queries (`--queries 1,6,12`), before the whole set.
-- The `gb200-gds-one-node` preset reads through GPUDirect Storage. Read
+- The `gb200-gds-one-node` preset and the `-gds` reference runs read through GPUDirect Storage. Read
   `docs/super-sirius/gds-runbook.md` in the checkout first, probe the node, and tell the storage
-  admins before the first GDS run on a node. It was written for one node.
+  admins before the first GDS run on a node. The preset was written for one node; the reference
+  runs on two and four nodes cap each rank's read rate (`gds.max_gb_per_s`).
 - TPC-H query texts come from `<checkout>/test/tpch_performance/tpch_queries/orig/` unless
   `--queries-dir` says otherwise. Say in the report which set ran: numbers from different query
   parameters do not compare.
 
 ## What the script has and has not been tested on
 
-- **Run for real once** (2026-11-18): one GB200 node under Slurm, an existing build, the
-  `gb200-sf10000` preset with the default scan backend, SF10000. Plan, preflight, build reuse and
-  the smoke test all worked, and the smoke test passed.
-- **Tested only against stand-ins** for Slurm and for the client: the full benchmark, failure
-  detection, a build from a fresh clone, and custom datasets (tables found automatically, a
-  views file, queries chosen by name and by number).
-- **Not run at all:** several nodes, the `local` launcher, the GDS preset.
+- **Run for real** (2026-11-18, GB200 under Slurm, existing builds, SF10000, io_uring scans):
+  - The smoke test of `plan --reference sf10k-n1-uring` on one node and of `sf10k-n2-uring` on two
+    nodes. Q1, Q6 and Q12 took 14.9 s, 10.4 s and 8.8 s on one node and 9.4 s, 5.5 s and 4.6 s on
+    two.
+  - On one node, a smoke test and a full run of two sessions (Q1, then Q6) with
+    `--results parquet`.
+  - Earlier that day, the smoke test of the `gb200-sf10000` preset on one node.
+- **Checked with `--dry-run` only:** the 18 reference runs as a whole. For each, the script wrote
+  the config, the SQL statements and their order, the statement timeout, the commit, the rank
+  count and the environment, and they equal the files of the recorded run.
+- **Tested only against stand-ins** for Slurm and for the client: a full benchmark of 22 queries,
+  failure detection, a build from a fresh clone, and custom datasets (tables found
+  automatically, a views file, queries chosen by name and by number).
+- **Not run at all:** four nodes, the `local` launcher, any GDS run through this script, a run at
+  SF30000 or SF100000, `--order pass`, a new clone at `--commit`, and `--results parquet` where
+  Slurm confines a step to its CPUs (the client step asks for one CPU, and fetching a large
+  result needs more).
 
 For any of the untested paths, run the step with `--dry-run` first, read the generated script with
 the user, and treat the first smoke test as the test of that path.
