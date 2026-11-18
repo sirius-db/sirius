@@ -644,7 +644,8 @@ void finish_assembly(sirius_gpu_scan_operator const& scan,
   auto const mr        = input.gpu_memory_space->get_default_allocator();
   auto const& deferred = scan.deferred_output();
   if (!deferred.empty()) {
-    auto composed = compose_survivors(input.pushdown_survivors.get(),
+    bool const residual_filtered = assembly.survivors != nullptr;
+    auto composed                = compose_survivors(input.pushdown_survivors.get(),
                                       assembly.survivors.get(),
                                       input.pushdown_compacted,
                                       stream,
@@ -660,6 +661,7 @@ void finish_assembly(sirius_gpu_scan_operator const& scan,
                                 stream,
                                 mr);
     detail::check_read_checkpoint(detail::read_checkpoint::SUBSTITUTION);
+    if (input.pushdown_survivors) { late_mat::note_survivor_batch(residual_filtered); }
   }
   // A resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with the
   // feature on, queried with it off) and must then restore to native. AFTER substitution: the
