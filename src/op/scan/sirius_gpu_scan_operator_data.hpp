@@ -388,7 +388,8 @@ class scan_operator_input : public op::operator_data {
   /// sirius_gpu_scan_operator::execute.
   std::shared_ptr<cudf::column const> pushdown_survivors;
   /// Whether this split's scan carries a late-materialization deferral, so the
-  /// decode must be asked to report which rows it kept. Stamped by
+  /// decode must be asked to report which rows it kept, and the freshly decoded
+  /// table must stay in the wrapper until substitution commits. Stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data, which is the only
   /// place that knows. False leaves the decode exactly as it was.
   bool late_mat_wants_survivors{false};

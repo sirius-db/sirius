@@ -29,6 +29,7 @@
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
+#include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -1116,6 +1117,39 @@ TEST_CASE("a deferring scan decodes whole compressed chunks and its endpoint fil
     std::vector<std::uint64_t> expected_rowids;
     for (cudf::size_type row = 0; row < kRows; ++row) {
       if (row % 100 < 10) { expected_rowids.push_back(static_cast<std::uint64_t>(row)); }
+    }
+    auto scanned = scan.execute(split, stream);
+    auto* output = dynamic_cast<scan_output_operator_data*>(scanned.get());
+    REQUIRE(output != nullptr);
+    auto lease = output->get_data_batches().front()->to_read_only();
+    auto view  = sirius::get_cudf_table_view(lease);
+    REQUIRE(to_host<std::uint64_t>(view.column(1), stream) == expected_rowids);
+  }
+  SECTION("an OOM at rowid substitution leaves the decoded split to its retry")
+  {
+    // Unfiltered, the decoded table is otherwise free to leave the wrapper before substitution.
+    auto const compacting = GENERATE(false, true);
+    CAPTURE(compacting);
+    serve(compacting ? scan.consumer() : scan.decode_consumer());
+    auto input  = scan.get_next_task_input_data();
+    auto& split = dynamic_cast<scan_operator_input&>(*input);
+    if (compacting) { split.consumer = scan.consumer(); }
+    split.prepare_for_processing(space, stream);
+    CHECK(split.stolen_table == nullptr);
+    REQUIRE(split.pushdown_compacted == compacting);
+    {
+      sirius::op::scan::detail::read_retirement_test_hooks fault(
+        sirius::op::scan::detail::read_checkpoint::SUBSTITUTION, false);
+      REQUIRE_THROWS_AS(scan.execute(split, stream), rmm::out_of_memory);
+    }
+    REQUIRE_FALSE(split.stolen_table_consumed);
+
+    split.prepare_for_processing(space, stream);
+    std::vector<std::uint64_t> expected_rowids;
+    for (cudf::size_type row = 0; row < kRows; ++row) {
+      if (!compacting || row % 100 < 10) {
+        expected_rowids.push_back(static_cast<std::uint64_t>(row));
+      }
     }
     auto scanned = scan.execute(split, stream);
     auto* output = dynamic_cast<scan_output_operator_data*>(scanned.get());

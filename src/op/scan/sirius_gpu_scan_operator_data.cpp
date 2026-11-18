@@ -442,8 +442,9 @@ void scan_operator_input::prepare_for_processing(
       // carrier-converting split retains the whole source until execute's transactional steal has
       // built every replacement cast; a non-converting split can detach immediately because no
       // allocating GPU operation follows the take, so an OOM retry can never re-enter materialize
-      // on a consumed split.
-      if (converted_here && converted_table_transferable()) {
+      // on a consumed split. A deferring split breaks that premise — substitution allocates the
+      // rowid after the take — so it keeps the view path and the wrapper keeps its source.
+      if (converted_here && converted_table_transferable() && !late_mat_wants_survivors) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
