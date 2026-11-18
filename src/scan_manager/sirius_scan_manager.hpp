@@ -397,6 +397,14 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
+/// Whether late materialization can restore the nulls of the pinned column at
+/// @p column_position: its gather shape carries validity through, or the pin
+/// proves the column holds none. A compressed chunk carrying no blob answers
+/// neither, so a pin with one is refused. Deferral admission asks this of every
+/// column a primary bundle or a rider defers.
+[[nodiscard]] bool pinned_column_nulls_restorable(pinned_entry const& entry,
+                                                  std::size_t column_position);
+
 /// True when every column of @p column_ids that @p entry carries still maps, in
 /// every chunk, to the pin-time native cuDF type @p returned_types declares. A
 /// column the entry lacks is skipped (coverage is checked separately) and an

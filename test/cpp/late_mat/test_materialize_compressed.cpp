@@ -54,6 +54,7 @@
 #include <compression/compressed_representation.hpp>
 #include <compression/device_compressed_blob.hpp>
 #include <late_mat/materialize.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -369,6 +370,44 @@ TEST_CASE("a compressed chunk reports its null count without decoding",
   // zero — the whole point of the count is that the gate can trust it.
   REQUIRE_FALSE(simpatico::column_null_count(nullable.table(), 9).has_value());
   REQUIRE(simpatico::column_validity(nullable.table(), 9) == nullptr);
+}
+
+TEST_CASE("deferral admission takes a nullable compressed column and refuses a chunk with no blob",
+          "[late_mat][materialize_compressed][admission]")
+{
+  auto const stream        = rmm::cuda_stream_view{};
+  auto const nullable_rows = GENERATE(false, true);
+  CAPTURE(nullable_rows);
+  fake_compressed_pin pin({kChunk, kChunk}, kBitpackPlan, nullable_rows, stream);
+  auto* gpu_space = pin.manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+
+  sirius::scan_manager::pinned_entry entry;
+  entry.tier             = cucascade::memory::Tier::GPU;
+  entry.cache_info.names = {"value"};
+  for (auto const& compressed : pin.chunks) {
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = gpu_space;
+    chunk.compressed   = compressed;
+    entry.device_chunks.push_back(std::move(chunk));
+  }
+  // Every chunk records its validity, so the decode restores the nulls rather than the gate having
+  // to prove there are none.
+  REQUIRE(sirius::scan_manager::pinned_column_nulls_restorable(entry, 0));
+  REQUIRE_FALSE(sirius::scan_manager::pinned_column_nulls_restorable(entry, 1));
+
+  // A chunk loaded for its row count alone can neither restore nulls nor count them, which refuses
+  // the column whether or not the other chunks hold any.
+  sirius::device_pin_chunk count_only;
+  count_only.memory_space = gpu_space;
+  count_only.compressed   = std::make_shared<sirius::compressed_device_representation>(
+    *gpu_space,
+    /*blob=*/nullptr,
+    std::vector<std::string>{"value"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/static_cast<std::size_t>(kChunk) * sizeof(std::int32_t),
+    kChunk);
+  entry.device_chunks.push_back(std::move(count_only));
+  REQUIRE_FALSE(sirius::scan_manager::pinned_column_nulls_restorable(entry, 0));
 }
 
 TEST_CASE("the dense route decodes a whole nullable batch", "[late_mat][materialize_compressed]")
