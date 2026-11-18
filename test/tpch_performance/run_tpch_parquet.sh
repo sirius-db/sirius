@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run TPC-H GPU queries against Parquet files
+# Run TPC-H queries against Parquet or views supplied by setup SQL.
 #
 # By default, all specified queries run in a single DuckDB session (single-
 # session mode).  This keeps the Sirius scan cache valid across queries.
@@ -23,6 +23,7 @@
 #
 # Options:
 #   --parquet-dir <path>  Directory containing TPC-H parquet files
+#   --setup-sql <path>    SQL file that creates the eight TPC-H views
 #   --iterations <N>      Number of iterations per query (default: 2)
 #   --timeout <seconds>   Kill DuckDB session after N seconds (default: 1200)
 #   --multi-session       Run each query in its own DuckDB process
@@ -44,15 +45,21 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SIRIUS_DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 
 PARQUET_DIR=""
+SETUP_SQL=""
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
 DROP_OS_CACHE=false
 MULTI_SESSION=false
 PINNING_MODE="none"
 PIN_AFTER_ITERATION=0
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] || [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ] || [ "${1:-}" = "--pin-after-iteration" ]; do
+while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--setup-sql" ] ||
+      [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] ||
+      [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ] || [ "${1:-}" = "--pin-after-iteration" ]; do
     if [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
+        shift 2
+    elif [ "$1" = "--setup-sql" ]; then
+        SETUP_SQL="$2"
         shift 2
     elif [ "$1" = "--iterations" ]; then
         NUM_ITERATIONS="$2"
@@ -84,7 +91,7 @@ case "$PINNING_MODE" in
 esac
 
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 [--parquet-dir <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>] <engine> <scale_factor> <query_numbers...>"
+    echo "Usage: $0 [--parquet-dir <path> | --setup-sql <path>] [--iterations <N>] [--timeout <seconds>] [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>] <engine> <scale_factor> <query_numbers...>"
     echo "Example: $0 sirius 100 \`seq 1 22\`"
     echo "  --iterations N      Number of iterations per query (default: 2, 1 cold + N-1 warm)"
     echo "  --timeout N         Kill the DuckDB session after N seconds (default: 1200, 0 = no timeout)"
@@ -130,6 +137,11 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     exit 1
 fi
 
+if [ -n "$SETUP_SQL" ] && [ "$PINNING_MODE" != "none" ]; then
+    echo "ERROR: --pinning-mode requires the Parquet view setup." >&2
+    exit 1
+fi
+
 if [ "$PINNING_MODE" = "pinned-hot" ] && [ "$MULTI_SESSION" = true ] && [ "$ENGINE" = "sirius" ]; then
     echo "ERROR: --pinning-mode pinned-hot requires single-session mode; remove --multi-session."
     exit 1
@@ -146,59 +158,34 @@ fi
 # routes queries through GPU when SiriusContext is initialized.
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 
-has_parquet_data() {
-    local parquet_dir="$1"
-    local parquet_file
-    for parquet_file in "$parquet_dir"/*.parquet "$parquet_dir"/*/*.parquet; do
-        [ -f "$parquet_file" ] && return 0
-    done
-    return 1
-}
-
-ensure_parquet_data() {
-    if [ -d "$PARQUET_DIR" ] && has_parquet_data "$PARQUET_DIR"; then
-        return 0
-    fi
-
-    echo "Parquet directory not found: $PARQUET_DIR"
-    echo "Generating TPC-H SF${SF} dataset..."
-    (
-        cd "$SCRIPT_DIR" &&
-            pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
-    )
-    local status=$?
-    if [ "$status" -ne 0 ]; then
-        echo "ERROR: failed to generate parquet data for SF${SF} (exit code ${status})."
-        return "$status"
-    fi
-
-    if ! [ -d "$PARQUET_DIR" ] || ! has_parquet_data "$PARQUET_DIR"; then
-        echo "ERROR: parquet data is still unavailable after generation: $PARQUET_DIR"
-        return 1
-    fi
-}
-
-ensure_parquet_data
-status=$?
-if [ "$status" -ne 0 ]; then
-    exit "$status"
-fi
-
-# Build CREATE VIEW statements.
-# Match single files (table.parquet), partitioned (table_0.parquet, ...),
-# and subdirectory layouts (table/*.parquet).
-TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
 VIEW_SQL=""
-for TABLE_NAME in "${TPCH_TABLES[@]}"; do
-    FILES=()
-    for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
-             "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
-             "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
-        [ -f "$f" ] && FILES+=("'$f'")
+if [ -n "$SETUP_SQL" ]; then
+    if [ ! -s "$SETUP_SQL" ] || ! VIEW_SQL=$(cat -- "$SETUP_SQL"); then
+        echo "ERROR: could not read TPC-H setup SQL: $SETUP_SQL" >&2
+        exit 1
+    fi
+    # Save complete result tables for validation, without agent-mode estimates.
+    DUCKDB_ARGS+=(-no-agent -cmd ".mode duckbox" -cmd ".maxrows -1")
+    if [ "$ENGINE" = "duckdb" ]; then
+        DUCKDB_ARGS+=(-bail)
+    fi
+else
+    source "$SCRIPT_DIR/tpch_parquet_data.sh"
+    ensure_parquet_data "$SF" "$PARQUET_DIR" || exit "$?"
+    # Match single files (table.parquet), partitioned (table_0.parquet, ...),
+    # and subdirectory layouts (table/*.parquet).
+    TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
+    for TABLE_NAME in "${TPCH_TABLES[@]}"; do
+        FILES=()
+        for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
+                 "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
+                 "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
+            [ -f "$f" ] && FILES+=("'$f'")
+        done
+        FILE_LIST=$(IFS=,; echo "${FILES[*]}")
+        VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
     done
-    FILE_LIST=$(IFS=,; echo "${FILES[*]}")
-    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
-done
+fi
 
 if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
@@ -220,9 +207,13 @@ if [ "$MULTI_SESSION" = true ]; then
     SESSION_MODE="multi (fresh process per query)"
 fi
 
-echo "Running TPC-H queries against SF${SF} parquet data"
+echo "Running TPC-H queries against SF${SF} data"
 echo "Engine: $ENGINE"
-echo "Parquet dir: $PARQUET_DIR"
+if [ -n "$SETUP_SQL" ]; then
+    echo "Setup SQL: $SETUP_SQL"
+else
+    echo "Parquet dir: $PARQUET_DIR"
+fi
 echo "Session: $SESSION_MODE"
 if [ "$DROP_OS_CACHE" = true ]; then
     echo "Drop OS cache: enabled"
@@ -482,7 +473,7 @@ run_single_session() {
 }
 
 # =============================================================================
-# Multi-session mode: each query in its own fresh DuckDB process (duckdb only)
+# Multi-session mode: each query in its own fresh DuckDB process
 # =============================================================================
 run_multi_session() {
     local RUN_STATUS=0
@@ -651,26 +642,37 @@ fi
 # ---------------------------------------------------------------------------
 # Split the Sirius log into per-query segments.
 #
-# Under Super Sirius transparent execution, each query iteration is logged as
-# "QueryBegin: SQL: <raw SQL>" — there is no `call gpu_execution(...)` wrapper.
-# Skip the session prologue (CREATE VIEW for view setup) and any pinning-mode
-# CALLs (pin_table / unpin_table) so the remaining QueryBegin lines correspond
-# 1:1 to user query iterations. We group every NUM_ITERATIONS consecutive
-# entries into one query segment and copy it to Q_DIR/sirius.log. The combined
-# log is kept in OUTPUT_DIR.
+# Skip the session prologue and pinning calls so the remaining QueryBegin
+# lines correspond 1:1 to query iterations. Group every NUM_ITERATIONS
+# entries into one query segment and copy it to Q_DIR/sirius.log. Original logs
+# remain in OUTPUT_DIR.
 # ---------------------------------------------------------------------------
 if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DIR:-}" ] && [ ${#VALID_QUERIES[@]} -gt 0 ]; then
-    # spdlog daily sink names files sirius_YYYY-MM-DD.log; find the most recent one.
+    # Date-named logs sort chronologically; a query can span the midnight rotation.
+    LOG_FILES=()
     LOG_FILE=""
     for f in "$OUTPUT_DIR"/sirius*.log; do
-        [ -f "$f" ] && LOG_FILE="$f"
+        [ -f "$f" ] && LOG_FILES+=("$f")
     done
+    if [ "${#LOG_FILES[@]}" -eq 1 ]; then
+        LOG_FILE="${LOG_FILES[0]}"
+    elif [ "${#LOG_FILES[@]}" -gt 1 ]; then
+        MERGED_LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/tpch_gpu_log_XXXXXX.log")
+        if [ -n "$MERGED_LOG_FILE" ]; then
+            trap 'rm -f -- "$MERGED_LOG_FILE"' EXIT
+        fi
+        if [ -n "$MERGED_LOG_FILE" ] && cat -- "${LOG_FILES[@]}" > "$MERGED_LOG_FILE"; then
+            LOG_FILE="$MERGED_LOG_FILE"
+        else
+            echo "WARNING: could not combine Sirius logs for per-query validation." >&2
+        fi
+    fi
     if [ -n "$LOG_FILE" ]; then
         echo ""
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
         readarray -t QB_LINES < <(
-            grep -nE 'QueryBegin:' "$LOG_FILE" \
-                | grep -ivE 'QueryBegin:[[:space:]]*(SQL:[[:space:]]*)?(CREATE VIEW|CALL[[:space:]]+(pin_table|unpin_table))' \
+            grep -nE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: ' "$LOG_FILE" \
+                | grep -ivE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: (CREATE VIEW |LOAD |SET |CALL[[:space:]]+(pin_table|unpin_table))' \
                 | cut -d: -f1
         )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")

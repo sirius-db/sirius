@@ -62,7 +62,10 @@ namespace sirius::test::mgpu {
  * not caching, so they set cache=none explicitly.
  */
 struct mgpu_env_params {
-  int num_gpus                        = 2;
+  int num_gpus = 2;
+  // topology.gpus_per_query: admit each query onto at most this many GPUs. Omitted from the
+  // yaml when 0, which leaves every GPU admitted.
+  int gpus_per_query                  = 0;
   std::string cache                   = "none";  // none | table_gpu | table_host | parquet
   uint64_t scan_task_batch_size       = 100'000'000;
   uint64_t hash_partition_bytes       = 10'000'000;
@@ -95,9 +98,9 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
   f << "sirius:\n"
        "  topology:\n"
        "    num_gpus: "
-    << params.num_gpus
-    << "\n"
-       "  memory:\n"
+    << params.num_gpus << "\n";
+  if (params.gpus_per_query > 0) { f << "    gpus_per_query: " << params.gpus_per_query << "\n"; }
+  f << "  memory:\n"
        "    gpu:\n";
   if (params.usage_limit_bytes != 0) {
     f << "      usage_limit_bytes: " << params.usage_limit_bytes << "\n";

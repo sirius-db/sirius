@@ -423,7 +423,7 @@ and only the first call takes effect.
 
 Retryable execution failures are modeled as a small exception hierarchy: `task_reschedule_exception` is the base, with two subclasses —
 
-- `oom_reschedule_exception` — a GPU operator ran out of memory. Carries `intermediate_data` (partial results computed so far) and `_resume_operator_index` (which operator to resume from).
+- `oom_reschedule_exception` — a GPU operator ran out of memory. Carries `intermediate_data` (partial results computed so far) and `_resume_operator_index` (which operator to resume from). A GPU OOM also raises the task's retry reservation floor to at least twice its reservation and records the failure in the pipeline's memory history. When preparing the task's input runs out of the pinned HOST memory a cross-GPU copy stages through (`memory::host_staging_out_of_memory`, from `memory::enqueue_device_copy`), the task is rescheduled the same way, but the floor and the history are left unchanged, because a larger GPU reservation would not help.
 - `cuda_launch_reschedule_exception` — a transient CUDA kernel-launch failure. `gpu_pipeline_task` translates retryable `thrust::system_error` codes (`cudaErrorLaunchOutOfResources` / `cudaErrorInvalidValue`, seen from concurrent PDL launches in `cudf::hash_partition`) into this exception rather than failing the query.
 
 The GPU executor catches the **base** `task_reschedule_exception` and:
