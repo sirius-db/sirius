@@ -231,6 +231,32 @@ TEST_CASE_METHOD(OrderByCoalesceFixture,
 }
 
 TEST_CASE_METHOD(OrderByCoalesceFixture,
+                 "coalesced ORDER BY: concurrent runs and input backpressure",
+                 "[integration][gpu_execution][order_by_coalesce]")
+{
+  create_table("oc_bp",
+               "SELECT CAST(hash(i) % 100003 AS INTEGER) AS k, "
+               "       CASE WHEN i % 2 = 0 THEN 'col_e_A' ELSE 'col_e_B' END AS s, "
+               "       CAST(i AS BIGINT) AS id "
+               "FROM range(1500000) AS t(i)");
+
+  // Every combination sorts the same rows: one sort at a time, two, one per executor thread,
+  // with the producer held back and not, with a fixed-width key and with a string key.
+  for (const char* runs : {"1", "2", "0"}) {
+    for (const char* backpressure : {"true", "false"}) {
+      INFO("sort_coalesce_concurrent_runs = " << runs << ", sort_input_backpressure = "
+                                              << backpressure);
+      set("sort_coalesce_concurrent_runs", runs);
+      set("sort_input_backpressure", backpressure);
+      check_order("SELECT k, s, id FROM oc_bp ORDER BY k, id");
+      check_order("SELECT s, k, id FROM oc_bp ORDER BY s, k DESC, id");
+      // The partitioning runs ahead of the sort also when the sort stays per batch.
+      check_order("SELECT k, id FROM oc_bp WHERE k % 7 = 3 ORDER BY k DESC, id");
+    }
+  }
+}
+
+TEST_CASE_METHOD(OrderByCoalesceFixture,
                  "coalesced ORDER BY: settings",
                  "[integration][gpu_execution][order_by_coalesce]")
 {
@@ -243,6 +269,8 @@ TEST_CASE_METHOD(OrderByCoalesceFixture,
   CHECK(current("sort_coalesce_runs").GetValue<bool>());
   CHECK(current("sort_coalesce_string_keys").GetValue<bool>());
   CHECK(current("sort_coalesce_memory_fraction").GetValue<double>() == Approx(0.25));
+  CHECK(current("sort_coalesce_concurrent_runs").GetValue<uint64_t>() == 2);
+  CHECK(current("sort_input_backpressure").GetValue<bool>());
 
   for (const char* bad : {"0", "-0.5", "1.5", "'nan'::DOUBLE"}) {
     auto result = con->Query(std::string("SET sort_coalesce_memory_fraction = ") + bad);

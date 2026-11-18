@@ -600,6 +600,129 @@ TEST_CASE("sirius_physical_order run planning consumes every batch exactly once"
   CHECK(groups < 97);
 }
 
+TEST_CASE("sirius_physical_order run planning bounds strings by their own bytes",
+          "[physical_order][coalesce]")
+{
+  auto limits                    = limits_of(1000);
+  limits.max_string_column_bytes = 100;
+  auto const with_strings = [](uint64_t id, std::size_t bytes, std::size_t string_bytes) {
+    auto batch         = parked(id, bytes, 10);
+    batch.string_bytes = string_bytes;
+    return batch;
+  };
+  // 300 decoded bytes each, 40 of them characters: two batches fit under the string limit, the
+  // third starts the next group.
+  std::vector<parked_batch> batches{
+    with_strings(1, 300, 40), with_strings(2, 300, 40), with_strings(3, 300, 40)};
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, true, false) == indices({0, 1}));
+  // Without a string column the bound does not apply and the byte limit closes the group.
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, false).empty());
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, true) == indices({0, 1, 2}));
+  // A group that reaches the string limit exactly is complete.
+  std::vector<parked_batch> exact{with_strings(1, 300, 50), with_strings(2, 300, 50)};
+  CHECK(sirius_physical_order::plan_next_run(exact, limits, true, false) == indices({0, 1}));
+  // A batch without a bound of its own counts with all its bytes.
+  std::vector<parked_batch> unbounded{with_strings(1, 300, 40), parked(2, 300, 10)};
+  CHECK(sirius_physical_order::plan_next_run(unbounded, limits, true, false) == indices({0}));
+}
+
+TEST_CASE("sirius_physical_order run planning holds a group back while its GPU sorts enough",
+          "[physical_order][coalesce]")
+{
+  auto limits                 = limits_of(100);
+  limits.max_concurrent_bytes = 200;
+  std::vector<parked_batch> batches{parked(1, 60, 1, 0), parked(2, 60, 1, 0), parked(3, 60, 1, 0)};
+
+  using sorting = sirius_physical_order::sorting_bytes_by_device;
+  // Nothing sorting, or room for the group: it is claimed.
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, false, sorting{}) ==
+        indices({0}));
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, false, sorting{{0, 140}}) ==
+        indices({0}));
+  // No room on device 0: its group waits, also when the producer has finished.
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, false, sorting{{0, 141}})
+          .empty());
+  CHECK(
+    sirius_physical_order::plan_next_run(batches, limits, false, true, sorting{{0, 141}}).empty());
+  // What another device sorts does not count.
+  CHECK(sirius_physical_order::plan_next_run(batches, limits, false, false, sorting{{1, 500}}) ==
+        indices({0}));
+  // A device that is not sorting takes a group larger than the limit.
+  std::vector<parked_batch> big{parked(1, 900, 1, 0)};
+  CHECK(sirius_physical_order::plan_next_run(big, limits, false, false, sorting{{0, 0}}) ==
+        indices({0}));
+  CHECK(sirius_physical_order::plan_next_run(big, limits, false, false, sorting{{0, 1}}).empty());
+
+  // The group of a busy device is passed over for the complete group of another one.
+  std::vector<parked_batch> two_devices{parked(1, 60, 1, 0),
+                                        parked(2, 60, 1, 0),
+                                        parked(3, 60, 1, 1),
+                                        parked(4, 60, 1, 0),
+                                        parked(5, 60, 1, 1)};
+  CHECK(sirius_physical_order::plan_next_run(
+          two_devices, limits, false, false, sorting{{0, 190}}) == indices({2}));
+  // Without the limit the planning is unchanged.
+  CHECK(sirius_physical_order::plan_next_run(
+          two_devices, limits_of(100), false, false, sorting{{0, 190}}) == indices({0}));
+
+  // The tail counts against the device holding most of it.
+  std::vector<parked_batch> tail{parked(1, 30, 1, 0), parked(2, 40, 1, 1), parked(3, 20, 1, -1)};
+  CHECK(sirius_physical_order::run_device(tail, {0, 1, 2}) == 1);
+  CHECK(sirius_physical_order::run_device(tail, {2}) == -1);
+  CHECK(sirius_physical_order::plan_next_run(tail, limits, false, true, sorting{{1, 150}}).empty());
+  CHECK(sirius_physical_order::plan_next_run(tail, limits, false, true, sorting{{0, 150}}) ==
+        indices({0, 1, 2}));
+}
+
+TEST_CASE("sirius_physical_order run limits from the engine sizes", "[physical_order][coalesce]")
+{
+  auto const gib = std::size_t{1} << 30;
+  // Two full runs at a time: a run is half the share, the share bounds the sorts running at
+  // once, and the producer is held back at twice the share of every GPU.
+  auto const limits = sirius::op::make_sort_run_limits(80 * gib, 1, 8, 0.25, 2, true);
+  REQUIRE(limits);
+  CHECK(limits->max_run_bytes == 10 * gib);
+  CHECK(limits->max_concurrent_bytes == 20 * gib);
+  CHECK(limits->max_backlog_bytes == 40 * gib);
+  CHECK(sirius::op::make_sort_run_limits(80 * gib, 4, 8, 0.25, 2, true)->max_backlog_bytes ==
+        160 * gib);
+  // The backlog limit exceeds what the groups still being filled can hold (one per GPU and one
+  // for batches that are not on a GPU), so a complete group exists whenever it is reached.
+  for (std::size_t gpus : {1, 2, 4, 8}) {
+    for (std::size_t runs : {1, 2, 8}) {
+      auto const l = sirius::op::make_sort_run_limits(80 * gib, gpus, 8, 0.25, runs, true);
+      REQUIRE(l);
+      CHECK(l->max_backlog_bytes >= (gpus + 1) * l->max_run_bytes);
+    }
+  }
+  // 0 concurrent runs: the previous rule, one run per executor thread and no bound.
+  auto const per_thread = sirius::op::make_sort_run_limits(80 * gib, 1, 8, 0.25, 0, false);
+  REQUIRE(per_thread);
+  CHECK(per_thread->max_run_bytes == 20 * gib / 8);
+  CHECK(per_thread->max_concurrent_bytes == 0);
+  CHECK(per_thread->max_backlog_bytes == 0);
+  CHECK_FALSE(sirius::op::make_sort_run_limits(0, 1, 8, 0.25, 2, true));
+  CHECK_FALSE(sirius::op::make_sort_run_limits(4, 1, 8, 0.25, 2, true));
+}
+
+TEST_CASE("sirius_physical_order bytes per row that are not string characters",
+          "[physical_order][coalesce]")
+{
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR));
+  auto const logical = sirius::from_duckdb_vec(std::move(types));
+  // 8 + 4 and a 32-bit offset per string.
+  CHECK(sirius_physical_order::non_character_row_bytes(logical, {}) == 16);
+  // A narrower physical carrier counts at its own width, a wider one at the logical width.
+  CHECK(sirius_physical_order::non_character_row_bytes(logical,
+                                                       {cudf::data_type{cudf::type_id::INT32},
+                                                        cudf::data_type{cudf::type_id::INT64},
+                                                        cudf::data_type{cudf::type_id::STRING}}) ==
+        12);
+}
+
 TEST_CASE("sirius_physical_order coalescing sorts a task's batches as one run",
           "[physical_order][coalesce]")
 {
