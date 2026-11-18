@@ -85,9 +85,10 @@ Run the wrapper's SQL tests from the root:
 pixi run make -C sirius-duckdb test_release
 ```
 
-## CUDA-selecting core extensions
+## CUDA-selecting loader
 
-The core-extension layout has three artifacts:
+Sirius ships as three artifacts: the core `sirius` loader and two community
+backends.
 
 - `sirius`: a CUDA-free loader built from `loader/`, with no Sirius package or CUDA toolkit dependency.
 - `sirius_cuda12`: the backend built with CUDA 12.
@@ -135,10 +136,13 @@ into a silent CPU fallback.
 | `gpu_execution` | Transparent GPU execution is active for this session; `false` under `SIRIUS_DISABLE` |
 | `fallback_reason` | Why GPU execution is unavailable; `NULL` once the backend loaded |
 
-This layout is for DuckDB core distribution: the loader follows DuckDB's
-autoload policy, trusting core signatures and using DuckDB's configured
-auto-install repository, not the repository it came from. Community signatures
-are not supported.
+The loader `sirius` is a core extension; the backends `sirius_cuda12` and
+`sirius_cuda13` are community extensions. The loader installs a backend from
+DuckDB's configured auto-install repository, not the repository the loader came
+from. If that is DuckDB's default core repository, the loader uses the community
+repository instead; other repositories, such as mirrors and local test
+repositories, are used as configured. Loading a community backend requires
+`allow_community_extensions`, which is on by default.
 
 These are Linux glibc amd64/arm64 SBSA builds; Jetson/Tegra is not supported.
 The loader does not detect or reject unsupported GPU architectures.

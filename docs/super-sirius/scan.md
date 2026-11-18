@@ -346,7 +346,7 @@ CALL pin_table('/path/to/lineitem.parquet',
                cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate']);
 
 -- A duckdb-native base table can be pinned too:
-CALL pin_table('my_table', name = 'my_table', format = 'duckdb', tier = 'host');
+CALL pin_table(format = 'duckdb', name = 'my_table', tier = 'host');
 
 SELECT SUM(l_extendedprice * l_quantity)
   FROM read_parquet('/path/to/lineitem.parquet')

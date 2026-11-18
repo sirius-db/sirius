@@ -1,6 +1,6 @@
 # `gpu_execution`
 
-`gpu_execution` is the recommended execution path — out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. It currently works with **Parquet** data format.
+`gpu_execution` is the recommended execution path — out-of-core execution with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling. It works with both **Parquet** and **DuckDB-native** storage.
 
 ## Building
 
@@ -15,12 +15,12 @@ DuckDB wrapper using Pixi.
 
 ## Configuration
 
-`gpu_execution` requires a config file in YAML format. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
+`gpu_execution` reads an optional YAML config file; without one, built-in defaults apply. See the [Configuration documentation](super-sirius/configuration.md) for the full reference, including [config file resolution order](super-sirius/configuration.md#config-file-resolution), all available options, and [byte suffixes](super-sirius/configuration.md#byte-suffixes). An example config file is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
 ## Running
 
 ```bash
-export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml
+export SIRIUS_CONFIG_FILE=/path/to/sirius.yaml  # optional
 pixi run sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
@@ -72,7 +72,7 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
-Queries with unsupported operators fall back silently to DuckDB CPU execution. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
+Queries with unsupported operators fall back silently to DuckDB CPU execution, unless `enable_duckdb_fallback` is `false`. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
 
 ```sql
 SET gpu_execution = false;          -- this connection only
@@ -87,7 +87,7 @@ To re-enable:
 SET gpu_execution = true;
 ```
 
-**How it works:** Two optimizer extensions are registered at extension load time. A pre-optimizer hook disables DuckDB optimizers incompatible with Sirius (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). A post-optimizer hook captures the optimized logical plan and attempts GPU plan generation via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if plan generation throws, the original DuckDB CPU plan runs unchanged.
+**How it works:** At extension load, Sirius disables DuckDB optimizers whose plan shapes it cannot execute (such as `IN_CLAUSE`, `COMPRESSED_MATERIALIZATION`, and `LATE_MATERIALIZATION`). For each query, an optimizer hook keeps a copy of the optimized logical plan. Once DuckDB has built its CPU physical plan, Sirius generates a GPU plan from that copy via `sirius_physical_plan_generator`. If plan generation succeeds, a `PhysicalSiriusExecution` node replaces the DuckDB physical plan and the query runs on GPU; if it fails, the original DuckDB CPU plan runs unchanged, or the error is raised when `enable_duckdb_fallback` is `false`. See [Execution Flow](super-sirius/execution-flow.md).
 
 ## Generating Test Datasets
 
