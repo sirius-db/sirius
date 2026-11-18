@@ -786,7 +786,9 @@ TEST_CASE("the effective configuration file resolves alike in every build",
       REQUIRE(executor != nullptr);
       auto const* sm = executor->find("scan_manager");
       REQUIRE(sm != nullptr);
-      REQUIRE((sm->find("rest") != nullptr) == developer);
+      REQUIRE(sm->find("rest") != nullptr);
+      REQUIRE((sm->find("rest")->find("queue_depth") != nullptr) == developer);
+      REQUIRE((sm->find("uring") != nullptr) == developer);
     }
   }
 }
@@ -811,10 +813,10 @@ TEST_CASE("the effective configuration file", "[config][config_create]")
   auto const written = sirius::config::read_user_config(slurp(path));
   REQUIRE(written.executor.pipeline.num_threads.get() ==
           resolved.get_gpu_pipeline_executor_config().num_threads);
-  REQUIRE(written.max_concurrent_queries.get() == 1);  // fallbacks are spelled out too
+  REQUIRE(written.memory.gpu.usage_limit.user_defined());  // fallbacks are spelled out too
 
   sirius::write_effective_config(path, resolved);  // a second start replaces it
   REQUIRE(files() == 1);
-  REQUIRE(sirius::config::read_user_config(slurp(path)).max_concurrent_queries.get() == 1);
+  REQUIRE(sirius::config::read_user_config(slurp(path)).memory.gpu.usage_limit.user_defined());
   std::filesystem::remove_all(dir);
 }

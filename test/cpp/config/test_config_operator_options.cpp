@@ -207,26 +207,23 @@ TEST_CASE("operator options write what they read", "[config][config_operator]")
 TEST_CASE("every operator option's scope, fallback and audience", "[config][config_operator]")
 {
   operator_options const op;
-  auto const query   = option_scope::query;
-  auto const session = option_scope::session;
-  // The planner switches SQL exposes only under SIRIUS_ENABLE_TEST_OPTIONS are developer-only.
-  auto const developer = std::vector<std::string>{"enable_dynamic_filter",
-                                                  "enable_dynamic_filter_multi_partition",
-                                                  "enable_dynamic_zone_map_filter",
-                                                  "enable_pinned_zone_map_pruning",
-                                                  "enable_decimal_sum_stats_bound",
-                                                  "enable_dense_count_join",
-                                                  "enable_delim_aggregate_reuse",
-                                                  "enable_exists_minmax_rewrite",
-                                                  "enable_partial_aggregate_below_join",
-                                                  "enable_subquery_key_carry",
-                                                  "enable_exists_from_aggregate"};
-  auto check           = [&](const auto& option, option_scope scope, bool has_fallback) {
+  auto const query      = option_scope::query;
+  auto const session    = option_scope::session;
+  auto const production = std::vector<std::string>{"max_broadcast_join_size",
+                                                   "max_sort_partition_bytes",
+                                                   "hash_partition_bytes",
+                                                   "concat_batch_bytes",
+                                                   "cross_join_task_bytes",
+                                                   "sort_sample_bytes",
+                                                   "max_build_hash_table_bytes",
+                                                   "scan_task_batch_size",
+                                                   "max_build_probe_resident_bytes"};
+  auto check            = [&](const auto& option, option_scope scope, bool has_fallback) {
     INFO(option.key());
     REQUIRE(option.scope() == scope);
     REQUIRE(option.fallback().has_value() == has_fallback);
     REQUIRE(option.is_developer() ==
-            (std::find(developer.begin(), developer.end(), option.key()) != developer.end()));
+            (std::find(production.begin(), production.end(), option.key()) == production.end()));
   };
   check(op.enable_late_materialization, query, true);
   check(op.enable_fused_scan_filter, query, true);

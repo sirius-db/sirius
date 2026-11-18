@@ -43,6 +43,18 @@ std::string read_error(std::string_view text)
   return {};
 }
 
+/// The dotted path of every value below @p n, which is at @p path.
+void leaf_paths(const node& n, const std::string& path, std::vector<std::string>& out)
+{
+  if (!n.is_mapping()) {
+    out.push_back(path);
+    return;
+  }
+  for (auto const& [key, child] : n.entries()) {
+    leaf_paths(child, path + "." + key, out);
+  }
+}
+
 }  // namespace
 
 TEST_CASE("the user configuration declares every key once", "[config][config_user]")
@@ -213,6 +225,7 @@ TEST_CASE("a dump outside developer mode leaves developer-only settings out",
   executor:
     scan_manager:
       uring_n_reactors: 2
+      rest_n_reactors: 3
       rest:
         queue_depth: 512
       uring:
@@ -225,21 +238,86 @@ TEST_CASE("a dump outside developer mode leaves developer-only settings out",
 )");
   auto const prod   = parse_yaml(write_user_config(config, write_options{true, false}));
   auto const& root  = *prod.find("sirius");
+  REQUIRE(root.find("max_concurrent_queries") == nullptr);
   REQUIRE(root.find("space") == nullptr);
+  REQUIRE(root.find("topology") == nullptr);
+  REQUIRE(root.find("telemetry") == nullptr);
   auto const& sm = *root.find("executor")->find("scan_manager");
-  REQUIRE(sm.find("uring_n_reactors") != nullptr);
-  REQUIRE(sm.find("rest") == nullptr);
+  REQUIRE(sm.find("uring_n_reactors") == nullptr);
+  REQUIRE(sm.find("rest_n_reactors")->text() == "3");
+  REQUIRE(sm.find("rest")->find("queue_depth") == nullptr);
+  REQUIRE(sm.find("rest")->find("pin_to_irq_cpus") != nullptr);
+  // Blocks the user wrote with nothing but developer-only settings are left out whole.
   REQUIRE(sm.find("uring") == nullptr);
   REQUIRE(sm.find("preparation") == nullptr);
-  REQUIRE(sm.find("cache") != nullptr);  // product settings keep their fallbacks
+  REQUIRE(sm.find("cache") != nullptr);  // production settings keep their fallbacks
   auto const& op = *root.find("operator_params");
   REQUIRE(op.find("hash_partition_bytes") != nullptr);
   REQUIRE(op.find("scan_task_batch_size") != nullptr);
   REQUIRE(op.find("enable_dynamic_filter") == nullptr);
-  REQUIRE(root.find("max_concurrent_queries")->text() == "2");
+  REQUIRE(root.find("compression")->entries().size() == 1);
 
   // Developer mode, and every in-process use that needs a faithful copy, keeps them.
   auto const all = parse_yaml(write_user_config(config, true));
   REQUIRE(all.find("sirius")->find("space") != nullptr);
+  REQUIRE(all.find("sirius")->find("max_concurrent_queries")->text() == "2");
   REQUIRE(all.find("sirius")->find("operator_params")->find("enable_dynamic_filter") != nullptr);
+}
+
+TEST_CASE("the production settings", "[config][config_user]")
+{
+  // Every key a dump outside developer mode writes, from a configuration that sets every key
+  // (and the other spelling of the host capacity).
+  std::vector<std::string> keys;
+  for (auto const& config :
+       {read_user_config(slurp(data_dir() / "valid_every_key.yaml")),
+        read_user_config("sirius:\n  memory:\n    host:\n      capacity_fraction: 0.5\n")}) {
+    leaf_paths(*parse_yaml(write_user_config(config, write_options{true, false})).find("sirius"),
+               "sirius",
+               keys);
+  }
+  std::ranges::sort(keys);
+  keys.erase(std::ranges::unique(keys).begin(), keys.end());
+  REQUIRE(keys == std::vector<std::string>{
+                    "sirius.compression.enable_spill_compression",
+                    "sirius.executor.downgrade.num_threads",
+                    "sirius.executor.pipeline.num_threads",
+                    "sirius.executor.scan_manager.backend",
+                    "sirius.executor.scan_manager.cache.eviction",
+                    "sirius.executor.scan_manager.cache.eviction_threshold_fraction",
+                    "sirius.executor.scan_manager.cache.min_prefetching_budget_fraction",
+                    "sirius.executor.scan_manager.cache.mode",
+                    "sirius.executor.scan_manager.max_readahead_scans",
+                    "sirius.executor.scan_manager.memory_prefetcher.enable",
+                    "sirius.executor.scan_manager.num_threads",
+                    "sirius.executor.scan_manager.rest.conn_max_age_s",
+                    "sirius.executor.scan_manager.rest.max_connections",
+                    "sirius.executor.scan_manager.rest.min_mtu",
+                    "sirius.executor.scan_manager.rest.pin_to_irq_cpus",
+                    "sirius.executor.scan_manager.rest_n_reactors",
+                    "sirius.executor.task_creator.num_threads",
+                    "sirius.memory.disk.capacity_bytes",
+                    "sirius.memory.disk.disk_id",
+                    "sirius.memory.disk.downgrade_root_dirs",
+                    "sirius.memory.gpu.downgrade_stop_fraction",
+                    "sirius.memory.gpu.downgrade_trigger_fraction",
+                    "sirius.memory.gpu.reservation_limit_fraction",
+                    "sirius.memory.gpu.usage_limit_fraction",
+                    "sirius.memory.host.block_size",
+                    "sirius.memory.host.capacity_bytes",
+                    "sirius.memory.host.capacity_fraction",
+                    "sirius.memory.host.downgrade_stop_fraction",
+                    "sirius.memory.host.downgrade_trigger_fraction",
+                    "sirius.memory.host.initial_number_pools",
+                    "sirius.memory.host.pool_size",
+                    "sirius.memory.host.reservation_limit_fraction",
+                    "sirius.operator_params.concat_batch_bytes",
+                    "sirius.operator_params.cross_join_task_bytes",
+                    "sirius.operator_params.hash_partition_bytes",
+                    "sirius.operator_params.max_broadcast_join_size",
+                    "sirius.operator_params.max_build_hash_table_bytes",
+                    "sirius.operator_params.max_build_probe_resident_bytes",
+                    "sirius.operator_params.max_sort_partition_bytes",
+                    "sirius.operator_params.scan_task_batch_size",
+                    "sirius.operator_params.sort_sample_bytes"});
 }

@@ -24,9 +24,10 @@ Configuration passes through two representations:
    declared once, with its key, type, fallback, validator, mutually exclusive alternatives
    (`capacity_bytes` | `capacity_fraction`), whether it is required when its block is present,
    its scope (`session`: read at startup; `query`: a DuckDB `SET` can override it per
-   connection), and whether it is developer-only. `user_defined()` tells a value the user wrote
-   from a fallback. `read_user_config()` reads YAML text; `write_user_config()` writes the user's
-   values back (optionally every fallback and developer-only setting too).
+   connection), and whether it is a production setting (any other is developer-only).
+   `user_defined()` tells a value the user wrote from a fallback. `read_user_config()` reads YAML
+   text; `write_user_config()` writes the user's values back (optionally with every fallback too,
+   or only the production settings).
 2. **`sirius::sirius_config`** — the runtime configuration.
    `sirius::create_sirius_config(user, topology, nic_probe)` builds it: memory spaces through
    cuCascade's configurator, then a hardware-derived default for every option the user left unset
@@ -51,28 +52,35 @@ Initial host pools target 10% of that node's RAM, capped by the host budget and 
 ### Effective configuration (`~/.sirius/config.yml`)
 
 When Sirius starts without a config file, it writes the configuration it runs with to
-`~/.sirius/config.yml` (replaced on every such start, readable by the owner only). Every value is
-spelled out: the defaults, and what was derived from this machine — thread and reactor counts,
-CPU affinities, scan budgets, REST limits, preparation limits, operator batch sizes, the GPU count,
-initial host pools. Resolving that file again on the same machine runs with the same values;
-derived values are this machine's, so the file may not suit another. The file is a record and is
-not on the search path above; copy it to `~/.sirius/sirius.yaml` to make those values your
-configuration.
+`~/.sirius/config.yml` (replaced on every such start, readable by the owner only). Every
+production setting (below) is spelled out: its default, or what was derived from this machine —
+thread and reactor counts, REST limits, operator batch sizes, initial host pools. Derived values
+are this machine's, so the file may not suit another. The file is a record and is not on the
+search path above; copy it to `~/.sirius/sirius.yaml` to make those values your configuration.
 
-Developer-only settings (below) are written only by a build with **developer mode** on: configure
-with `-DSIRIUS_DEVELOPER_MODE=ON` (`pixi run cmake -DSIRIUS_DEVELOPER_MODE=ON build/release`, then
-`pixi run make`; the setting stays in the CMake cache). Left out, they resolve as they did the
+Every other setting is developer-only. All settings are read in every build, but only a build with
+**developer mode** on writes the developer-only ones to this file: configure with
+`-DSIRIUS_DEVELOPER_MODE=ON` (`pixi run cmake -DSIRIUS_DEVELOPER_MODE=ON build/release`, then
+`pixi run make`; the setting stays in the CMake cache). Resolving the file again on the same
+machine runs with the same values; developer-only settings it leaves out resolve as they did the
 first time. Set `SIRIUS_WRITE_EFFECTIVE_CONFIG` to `0`, `false`, `off` or `no` to skip writing the
 file (`sirius_unittest` does).
 
-Developer-only settings: `sirius.space`, `sirius.executor.scan_manager.{rest, rest.tls, uring,
-preparation}`, and the planner switches that SQL exposes only under `SIRIUS_ENABLE_TEST_OPTIONS`
-(`enable_dynamic_filter`, `enable_dynamic_filter_multi_partition`,
-`enable_dynamic_zone_map_filter`, `enable_pinned_zone_map_pruning`,
-`enable_decimal_sum_stats_bound`, `enable_dense_count_join`, `enable_delim_aggregate_reuse`,
-`enable_exists_minmax_rewrite`, `enable_partial_aggregate_below_join`,
-`enable_subquery_key_carry`, `enable_exists_from_aggregate`). They are read in every build;
-developer mode only decides whether the effective configuration shows them.
+Production settings (a setting with two spellings, such as `usage_limit_fraction` and
+`usage_limit_bytes`, is one setting):
+
+| Block | Keys |
+|---|---|
+| `sirius.memory.gpu` | `usage_limit_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction` |
+| `sirius.memory.host` | `capacity_bytes`, `capacity_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction`, `block_size`, `pool_size`, `initial_number_pools` |
+| `sirius.memory.disk` | `disk_id`, `capacity_bytes`, `downgrade_root_dirs` |
+| `sirius.executor.task_creator`, `.pipeline`, `.downgrade` | `num_threads` |
+| `sirius.executor.scan_manager` | `num_threads`, `backend`, `rest_n_reactors`, `max_readahead_scans` |
+| `sirius.executor.scan_manager.rest` | `pin_to_irq_cpus`, `max_connections`, `min_mtu`, `conn_max_age_s` |
+| `sirius.executor.scan_manager.cache` | `mode`, `eviction`, `min_prefetching_budget_fraction`, `eviction_threshold_fraction` |
+| `sirius.executor.scan_manager.memory_prefetcher` | `enable` |
+| `sirius.operator_params` | `max_broadcast_join_size`, `max_sort_partition_bytes`, `hash_partition_bytes`, `concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`, `max_build_hash_table_bytes`, `scan_task_batch_size`, `max_build_probe_resident_bytes` |
+| `sirius.compression` | `enable_spill_compression` |
 
 ### Concurrent query admission
 

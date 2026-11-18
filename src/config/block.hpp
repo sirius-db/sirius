@@ -22,7 +22,7 @@ class block_base;
 struct write_options {
   /// Also the fallbacks of options the user left alone, not only user-defined values.
   bool include_fallbacks = false;
-  /// Also developer-only options and blocks (see config_option::is_developer()).
+  /// Also developer-only options (see config_option::is_developer()).
   bool include_developer = true;
 
   write_options() = default;
@@ -34,11 +34,6 @@ struct write_options {
   {
   }
 };
-
-/// A block that holds developer-only settings declares
-/// `static constexpr bool developer_block = true;`: a dump outside developer mode leaves it out.
-template <class Block>
-concept developer_block = requires { requires Block::developer_block; };
 
 /**
  * @brief A configuration block as file adapters see it: read from a node, written to a node.
@@ -67,11 +62,12 @@ class config_block {
   virtual void read(const node& n, std::string_view path, environment env) = 0;
 
   /// The mapping read() reads back to the same values: user-defined values only, plus fallbacks
-  /// when options.include_fallbacks, without developer-only options and blocks unless
+  /// when options.include_fallbacks, without developer-only options unless
   /// options.include_developer, in declaration order. Absent nested blocks and empty lists are
-  /// omitted; a nested block the user defined is kept even when empty. A dump with fallbacks is a
-  /// snapshot to look at: reading it back makes every value, and every block it names,
-  /// user-defined.
+  /// omitted; a nested block the user defined is kept even when empty. Without developer-only
+  /// options, a block or list left with nothing to write is omitted, as is a list with any such
+  /// element. A dump with fallbacks is a snapshot to look at: reading it back makes every value,
+  /// and every block it names, user-defined.
   [[nodiscard]] virtual node write(const write_options& options) const = 0;
 
   /// Throw std::logic_error for a declaration bug in this block or any block nested in it: an
@@ -378,11 +374,8 @@ class block_base : public config_block {
   template <class B>
   static void write_field(const nested_block<B>& field, node& out, const write_options& options)
   {
-    if constexpr (developer_block<B>) {
-      if (!options.include_developer) { return; }
-    }
     auto child = field.block->write(options);
-    if (!child.entries().empty() || field.block->user_defined()) {
+    if (!child.entries().empty() || (field.block->user_defined() && options.include_developer)) {
       out.set(field.key, std::move(child));
     }
   }
@@ -433,14 +426,13 @@ class block_base : public config_block {
   template <class B>
   static void write_field(const block_list<B>& field, node& out, const write_options& options)
   {
-    if constexpr (developer_block<B>) {
-      if (!options.include_developer) { return; }
-    }
     if (field.blocks->empty()) { return; }
     node::sequence_type elements;
     elements.reserve(field.blocks->size());
     for (auto const& block : *field.blocks) {
       elements.push_back(block.write(options));
+      // An element without its developer-only settings would read back as another one.
+      if (elements.back().entries().empty() && !options.include_developer) { return; }
     }
     out.set(field.key, node::sequence(std::move(elements)));
   }
