@@ -8,7 +8,7 @@
 html{scroll-behavior:smooth;scroll-padding-top:24px}
 body{margin:0;font:17px/1.65 var(--sans);color:var(--ink);background:var(--paper);-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-underline-offset:2px}
-.layout{display:grid;grid-template-columns:248px minmax(0,1fr);max-width:1200px;margin:0 auto}
+.layout{display:grid;grid-template-columns:clamp(200px,18vw,260px) minmax(0,1fr)}
 nav{position:sticky;top:0;align-self:start;height:100vh;overflow:auto;padding:36px 16px 36px 28px;border-right:1px solid var(--rule);font-size:14.5px}
 nav .brand{font-weight:600;font-size:15.5px;color:var(--ink)}
 nav .brand small{display:block;font:500 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--soft);margin-top:5px}
@@ -16,7 +16,8 @@ nav strong{display:block;font:500 11px var(--mono);letter-spacing:.16em;text-tra
 nav a{display:block;color:var(--muted);text-decoration:none;padding:4px 10px;margin-left:-12px;border-left:2px solid transparent;line-height:1.35}
 nav a:hover{color:var(--ink)}
 nav a.on{color:var(--ink);border-left-color:var(--accent-bright);font-weight:600}
-main{padding:56px 56px 96px;max-width:920px;counter-reset:sec}
+main{padding:56px clamp(20px,4vw,64px) 96px;min-width:0;counter-reset:sec}
+.paths,.cards,figure,.note,.warn,details{max-width:1200px}
 .eyebrow{font:500 12px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
 h1{font-size:46px;line-height:1.08;font-weight:600;letter-spacing:-1.4px;margin:0 0 14px}
 .lead{font-size:21px;line-height:1.45;color:var(--muted);margin:0 0 20px;max-width:34em}
@@ -29,14 +30,17 @@ ul,ol{margin:0 0 16px;padding-left:22px}
 li{margin-bottom:7px;max-width:42em}
 .src{font:12px/1.5 var(--mono);color:var(--soft);margin:0 0 18px;max-width:none}
 .src code{background:none;padding:0;font-size:1em}
-table{width:100%;border-collapse:collapse;font-size:15px;line-height:1.5;margin:12px 0 22px}
+.tw{overflow-x:auto;margin:12px 0 22px}
+table{width:100%;border-collapse:collapse;font-size:15px;line-height:1.5;margin:0}
+td code{overflow-wrap:anywhere}
+td:last-child:not(.num){min-width:14em}
 th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--rule)}
 thead th{font:500 11px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--soft);border-bottom:1px solid var(--rule-strong);padding-bottom:8px}
 tbody tr:last-child td{border-bottom:0}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 td.hero{font-size:17px;font-weight:600;color:var(--accent)}
 code{font:.86em var(--mono);background:var(--code);padding:1px 5px;border-radius:4px}
-pre{background:var(--code);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;overflow:auto;margin:10px 0 18px;line-height:1.55}
+pre{background:var(--code);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;margin:10px 0 18px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
 pre code{background:none;padding:0;font-size:13.5px}
 td pre{margin:0 0 6px}
 .note,.warn{border:1px solid #dbe9bd;border-left:3px solid var(--accent-bright);background:var(--accent-tint);border-radius:6px;padding:12px 16px;margin:14px 0 22px;font-size:15.5px}
@@ -67,7 +71,7 @@ details[open]>summary::after{content:"\2212"}
 details[open]>summary{border-bottom:1px solid var(--rule)}
 details>summary small{font-weight:400;color:var(--soft);font-size:13.5px;margin-left:auto}
 details>.in{padding:4px 16px 2px}
-details table{margin:0 0 6px}
+details .tw{margin:0 0 6px}
 .steps{counter-reset:s;list-style:none;padding:0;margin:14px 0 20px}
 .steps>li{counter-increment:s;position:relative;padding:0 0 2px 46px;margin-bottom:14px;max-width:44em}
 .steps>li::before{content:counter(s);position:absolute;left:0;top:1px;width:28px;height:28px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent);font:600 13px var(--mono);display:flex;align-items:center;justify-content:center}
@@ -130,7 +134,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 
 <h2 id="words">Vocabulary</h2>
 <p>The documents, the commands and the logs use these words. Nine carry most of the meaning.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:170px">Word</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td><b>Rank</b></td><td>One Sirius process (DuckDB with the Sirius extension) on one GPU. Ranks are numbered from 0. Rank 0 returns the result of every query.</td></tr>
@@ -142,9 +146,9 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td><b>NIXL</b></td><td>The transfer library the exchange is built on (with a UCX backend). It writes GPU memory of one rank into GPU memory of another.</td></tr>
 <tr><td><b>DDL log</b></td><td>The statements the gateway keeps (views, <code>SET</code>, <code>INSERT</code> …) and runs again on restarted ranks.</td></tr>
 <tr><td><b>Fail-stop</b></td><td>The failure rule: when a rank or the transport is lost, nothing is repaired in place. Every rank restarts.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <details><summary>Thirteen more words<small>transport, storage, benchmarks, hardware</small></summary><div class="in">
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:170px">Word</th><th>Meaning</th></tr></thead>
 <tbody>
 <tr><td><b>Frame, ring, credit</b></td><td>Each rank has a send ring and a receive ring of fixed-size frames (16 MiB by default). A credit is the right to fill one frame of a peer's receive ring.</td></tr>
@@ -160,7 +164,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td><b>Gateway console</b></td><td>The DuckDB shell that <code>pixi run sirius-gateway</code> opens. Administrative calls such as <code>sirius_gateway_drop_rank</code> run there.</td></tr>
 <tr><td><b>UCX, <code>cuda_ipc</code></b></td><td>UCX is the communication library under NIXL. <code>cuda_ipc</code> is its transport that copies directly between two GPUs; it needs the two GPUs to have peer access to each other.</td></tr>
 <tr><td><b>GB200, NVL4, NVL72</b></td><td>The hardware the branch was measured on. NVL4 is one node with 4 GPUs and 2 Grace CPU sockets. NVL72 is one rack of 18 such nodes in one NVLink domain.</td></tr>
-</tbody></table>
+</tbody></table></div>
 </div></details>
 
 <h2 id="architecture">Architecture</h2>
@@ -192,13 +196,13 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <line x1="32" y1="374" x2="928" y2="374" stroke="#e2e2e2" stroke-width="1"/><text class="mono" x="32" y="394" font-size="9" fill="#6f6f6f" letter-spacing=".14em">LEGEND</text><path d="M118,390.5 H144" fill="none" stroke="#5b5b5b" stroke-width="1.4" marker-end="url(#arch-a-std)"/><text x="152" y="395" font-size="12.0" fill="#5b5b5b">statement, over Quack</text><path d="M339,390.5 H365" fill="none" stroke="#4c7800" stroke-width="1.8" marker-end="url(#arch-a-acc)"/><text x="373" y="395" font-size="12.0" fill="#5b5b5b">rows between ranks</text><path d="M539,390.5 H565" fill="none" stroke="#5b5b5b" stroke-width="1.4" stroke-dasharray="5,4" marker-end="url(#arch-a-std)"/><text x="573" y="395" font-size="12.0" fill="#5b5b5b">each rank scans its own share</text>
 </svg>
 </div><figcaption>The gateway (green) is the one piece every statement passes through. Ranks exchange rows directly with each other, and each rank reads its own share of the files.</figcaption></figure>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:150px">Part</th><th>What it does</th><th>What it does not do</th></tr></thead>
 <tbody>
 <tr><td><b>Gateway</b></td><td>Orders statements across all clients, gives each query a number, sends it to every rank in parallel, returns rank 0's result, keeps the DDL log, restarts the ranks after a failure.</td><td>It does not plan or execute queries: the ranks do.</td></tr>
 <tr><td><b>Rank</b></td><td>Plans the statement with DuckDB and Sirius, rewrites the plan for distribution, scans its share, exchanges rows with the other ranks, runs every operator on its GPU.</td><td>It does not coordinate the others: every rank works from the same statement and reaches the same plan.</td></tr>
 <tr><td><b>Launch scripts</b></td><td><code>sirius_gateway.sh</code>, <code>sirius_node.sh</code>, <code>sirius_rank_node.sh</code>, <code>sirius_client.sh</code>, <code>sirius_slurm.sbatch</code>: start the processes, register ranks with the gateway, restart a rank that exits.</td><td></td></tr>
-</tbody></table>
+</tbody></table></div>
 <div class="note"><p><b>The one rule everything follows from:</b> every rank must run the same statements, in the same order, with the same query numbers. Exchange streams are numbered by query, so ranks that disagree on the number could not find each other's data. The gateway exists to guarantee this.</p></div>
 
 <h2 id="statement">Life of a statement</h2>
@@ -240,7 +244,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <li><b>Number and send.</b> The gateway takes the next query number K, and sends <code>SET sirius_distributed_query_id = K</code> and then the statement to every rank in parallel. The ranks must run together: they wait on each other inside the exchanges.</li>
 <li><b>Return and record.</b> When every rank is done, the gateway returns rank 0's result. A statement that succeeded on every rank and is not a <code>SELECT</code>, <code>EXPLAIN</code> or transaction statement is added to the DDL log.</li>
 </ol>
-<table>
+<div class="tw"><table>
 <thead><tr><th>Statement</th><th>Where it runs</th></tr></thead>
 <tbody>
 <tr><td>Queries, DDL, <code>INSERT</code>, <code>COPY</code>, ordinary <code>SET</code></td><td>Every rank</td></tr>
@@ -249,7 +253,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td><code>SET</code> of a setting the gateway controls (<code>sirius_exchange_*</code>, <code>enable_duckdb_fallback</code>, <code>gpu_execution</code>, the query number)</td><td>Refused</td></tr>
 <tr><td><code>PREPARE</code>, <code>EXECUTE</code></td><td>Refused: a prepared plan keeps the query number it was planned with</td></tr>
 <tr><td>Other <code>sirius_gateway_*</code>, <code>quack_*</code>, <code>sirius_rank_*</code> calls</td><td>Refused from clients: gateway console only. The exception is <code>sirius_gateway_add_rank</code> and <code>sirius_gateway_drop_rank</code> when the gateway was started without ranks of its own, so that nodes can register theirs</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Things that surprise newcomers, all consequences of the ranks sharing one session each:</p>
 <ul>
 <li>A client's <code>SET</code> reaches every client's later statements, and is replayed after a restart.</li>
@@ -286,17 +290,17 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 </div><figcaption>TPC-H Q12 (a join of <code>orders</code> and <code>lineitem</code>, a group-by and an <code>ORDER BY</code>) on any number of ranks. The top lane is work each rank does on its own GPU; the bottom lane is the four exchanges. Each exchange is an <code>EXCHANGE_SINK</code> that ends the producer's pipeline and an <code>EXCHANGE_SOURCE</code> that starts the consumer's. The filter the join sends back to the <code>orders</code> scan is in <a href="#filters">Filters across ranks</a>.</figcaption></figure>
 
 <h3>The four exchange modes</h3>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:110px">Mode</th><th>Where each row goes</th><th>Used for</th></tr></thead>
 <tbody>
 <tr><td><code>hash</code></td><td>To the rank chosen by a hash of the key columns</td><td>Joins (both sides by join key), grouped aggregation (by group key)</td></tr>
 <tr><td><code>broadcast</code></td><td>To every rank</td><td>A small join build side; nested-loop joins. The probe side stays where it is</td></tr>
 <tr><td><code>range</code></td><td>To the rank that owns the key's range</td><td>A global <code>ORDER BY</code>: every rank derives the same boundaries from a shared sample</td></tr>
 <tr><td><code>gather</code></td><td>To one rank (rank 0)</td><td>Ungrouped aggregates, top-N, and the final result</td></tr>
-</tbody></table>
+</tbody></table></div>
 
 <details><summary>Where the rewrite puts each exchange<small>seven plan shapes</small></summary><div class="in">
-<table>
+<div class="tw"><table>
 <thead><tr><th>Plan shape</th><th>Exchange</th></tr></thead>
 <tbody>
 <tr><td>Hash join</td><td><code>hash</code> on the join keys, below each side's partition step</td></tr>
@@ -306,7 +310,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td>Ungrouped aggregate; top-N</td><td><code>gather</code> to rank 0 between the partial and the merge</td></tr>
 <tr><td>Sort (<code>ORDER BY</code>)</td><td><code>range</code> between the sample and the partitioned sort</td></tr>
 <tr><td>The result</td><td><code>gather</code> to rank 0, in rank order after a distributed sort</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Scans, filters, projections and dynamic filters stay on the rank where their input is.</p>
 </div></details>
 
@@ -374,7 +378,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <h2 id="exchange">Moving rows between ranks</h2>
 <p class="src">Source: <code>distributed-sirius.md</code>, "Layers"</p>
 <p>The exchange is built in layers. Each is tested without the ones above it.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:150px">Layer</th><th>What it does</th><th style="width:250px">Code</th></tr></thead>
 <tbody>
 <tr><td><b>Wire format</b></td><td>A batch travels as one byte stream cut into frames, in the layout the host memory tier already uses. So the same frames can land on the GPU or in host memory. Columns are fixed-width or strings.</td><td><code>src/exchange/wire.*</code>, <code>batch_io.*</code></td></tr>
@@ -382,7 +386,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td><b>NIXL fabric</b></td><td>Registers the rings with NIXL's UCX backend, fetches every peer's metadata, sends a hello. After that everything is a NIXL write or a notification.</td><td><code>src/exchange/nixl_fabric.*</code></td></tr>
 <tr><td><b>Operators</b></td><td><code>EXCHANGE_SINK</code> routes batches by mode; <code>EXCHANGE_SOURCE</code> starts a pipeline with what the senders sent.</td><td><code>src/op/sirius_physical_exchange_{sink,source}.*</code></td></tr>
 <tr><td><b>Collectives</b></td><td><code>all_gather()</code>: every rank sends one small table to every rank and waits for all. Used for sort samples, the plan-shape check and the Bloom merge, and in the code also for a HAVING optimization (<code>enable_complete_group_having</code>).</td><td><code>src/exchange/all_gather.*</code></td></tr>
-</tbody></table>
+</tbody></table></div>
 
 <h3>Flow control: credits</h3>
 <ul>
@@ -393,14 +397,14 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 
 <h3>Which path the bytes take</h3>
 <p>Each rank chooses a path to each peer at start, and logs it.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th>The peer is</th><th>Path</th><th>Measured</th></tr></thead>
 <tbody>
 <tr><td>On this host, GPUs with peer access</td><td>UCX <code>cuda_ipc</code>, zero-copy GPU to GPU</td><td></td></tr>
 <tr><td>On this host, no peer access between the GPUs</td><td>Host staging: one copy into a pinned shared-memory mirror of the peer's receive ring (<code>/dev/shm</code>), then host to GPU</td><td>Without the mirror UCX stages over TCP at about 1 GB/s</td></tr>
 <tr><td>On another node of the same NVLink domain (GB200 NVL)</td><td>NVLink. The rings are allocated with a fabric handle so that the other node can map them</td><td>Up to about 780 GB/s each way per GPU pair, against about 98 GB/s over the RDMA rails</td></tr>
 <tr><td>On another host, no NVLink</td><td>TCP lanes: extra NIXL agents, each with its own connection and thread</td><td>19.0 GB/s each way with 16 lanes between two ranks on a 200 Gb/s port, against 0.19 without lanes</td></tr>
-</tbody></table>
+</tbody></table></div>
 <div class="note"><p><b>Check the path in the engine log.</b> On a GB200 NVL system each rank's engine log (<a href="#start">where the logs are</a>) should show every peer as<br><code>exchange: rank 0 (GPU ...) -&gt; rank 5 (GPU ..., NVLink domain ...): NIXL over the NVLink fabric</code><br>For two ranks on different nodes, any other path means that pair uses the network. After connecting, a rank also times one large write to each NVLink peer and warns below 150 GB/s: UCX then did not take <code>cuda_ipc</code>.</p></div>
 
 <h2 id="filters">Filters across ranks</h2>
@@ -442,7 +446,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <text x="616" y="206" font-size="12.5" fill="#5b5b5b" text-anchor="middle">restarts every rank and replays the DDL log</text>
 </svg>
 </div><figcaption>The cluster state that <code>sirius_gateway_status()</code> reports. There is no path from <code>failed</code> back to <code>ready</code> without a restart of every rank. After <code>sirius_gateway_stop</code>, a statement no longer starts the ranks: only <code>sirius_gateway_start</code> or <code>sirius_gateway_restart</code> does.</figcaption></figure>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:260px">Event</th><th>What happens</th></tr></thead>
 <tbody>
 <tr><td>A query fails on one rank (an error)</td><td>That rank tells its peers and the query is aborted on every rank. The next query runs normally.</td></tr>
@@ -453,14 +457,14 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td>A statement runs too long</td><td>After <code>gateway.statement_timeout</code> (3600 s by default) the gateway cancels it on every rank. The ranks keep serving if they stop in time.</td></tr>
 <tr><td>A node is added</td><td>Start <code>sirius-node</code> on it. Every rank restarts at the next statement.</td></tr>
 <tr><td>A node is removed</td><td>Its ranks stay registered and every restart fails until they are dropped on the gateway's console: <code>CALL sirius_gateway_drop_rank('&lt;host&gt;:&lt;port&gt;')</code>.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <div class="note"><p>Statements that carry credentials (<code>CREATE SECRET</code>, a <code>SET</code> of a token or key) are not written to the saved <code>ddl.sql</code>. They are replayed when only the ranks restart, and lost when the gateway itself restarts: run them again then, or put them in <code>sirius_gateway_rank_init</code>.</p></div>
 
 <h2 id="start">Getting started</h2>
 <p class="src">Source: <code>distributed-quickstart.md</code>, <code>distributed-gateway.md</code> "Quick path", <code>distributed-experiments.md</code> "Setup"</p>
 
 <h3>1. What you need</h3>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:330px">What</th><th>Why</th></tr></thead>
 <tbody>
 <tr><td>Linux, an NVIDIA GPU (Turing or newer), CUDA 13.x or 12.x, <code>io_uring</code> enabled, Git, Pixi 0.78 or newer</td><td>The machine requirements of Sirius itself (<code>docs/README.md</code>)</td></tr>
@@ -469,7 +473,7 @@ as of commit <code>d9d973a</code> (18 November 2026). Each section names its sou
 <tr><td>A shared <code>$HOME</code></td><td>Nodes and clients read the gateway's address, token and TLS fingerprint from <code>~/.sirius/gateways/&lt;cluster&gt;/gateway.conf</code>. Without it, pass <code>--gateway HOST:PORT --token-file FILE</code> to <code>sirius-node</code></td></tr>
 <tr><td>Free TCP ports, open between the machines</td><td>The gateway listens on 9494. The rank on a node's i-th GPU listens on 9500 + i (Quack) and 27000 + i (exchange)</td></tr>
 <tr><td>About 8 GB free in <code>$HOME</code> and 14 GB for the checkout</td><td>Pixi's package cache (<code>PIXI_CACHE_DIR</code> moves it) and the build. With <code>$HOME</code> at its quota, jobs fail within seconds</td></tr>
-</tbody></table>
+</tbody></table></div>
 
 <h3>2. Build</h3>
 <pre><code>export CHECKOUT=&lt;where the checkout goes&gt; DATA=&lt;the dataset&gt; OUT=&lt;a new run folder&gt;   # absolute paths
@@ -480,7 +484,7 @@ pixi run build-distributed            # once: Sirius (which includes NIXL) and t
 <p>The build takes 35 to 40 minutes on 144 cores. On a cluster that Slurm schedules, run it as a Slurm job, not on a login node.</p>
 
 <h3>3. Start it: pick the case that fits</h3>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:200px">Case</th><th>Commands</th></tr></thead>
 <tbody>
 <tr><td><b>One machine</b>, the gateway starts the ranks</td><td><pre><code>pixi run sirius-gateway 4      # 4 ranks, rank i on GPU i; clients on port 9494
@@ -492,7 +496,7 @@ pixi run sirius-client                         # on any machine with the build a
 <tr><td><b>Slurm</b></td><td><pre><code>sbatch -N2 scripts/sirius_slurm.sbatch         # from the checkout: gateway + 4 ranks per node
 SIRIUS_CLUSTER=&lt;job id&gt; pixi run sirius-client</code></pre>The gateway is named after the job id and serves until the job ends. <code>--ntasks-per-node=2</code> uses 2 GPUs per node.</td></tr>
 <tr><td><b>No gateway</b>, one host, for development</td><td><pre><code>pixi run scripts/distributed_run_sql.sh 4 /tmp/q12.sql</code></pre>Runs a SQL file on 4 local GPUs, rank i on GPU i, and prints rank 0's output.</td></tr>
-</tbody></table>
+</tbody></table></div>
 <div class="warn"><p><b>On a node that Slurm schedules, use Slurm for everything.</b> Start processes with <code>sbatch</code> or <code>srun</code>, never over <code>ssh</code>. A stray process can make the next job fail and get the node drained. Run one job per node at a time.</p></div>
 
 <h3>4. Run SQL</h3>
@@ -507,7 +511,7 @@ FROM sirius_gateway_status();                             -- one row per rank, o
 </ul>
 
 <h3>5. Where things are</h3>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:360px">Path</th><th>What</th></tr></thead>
 <tbody>
 <tr><td><code>~/.sirius/gateways/&lt;cluster&gt;/gateway.conf</code></td><td>The gateway's address, token, TLS fingerprint and id. Nodes read it again every 10 s</td></tr>
@@ -515,7 +519,7 @@ FROM sirius_gateway_status();                             -- one row per rank, o
 <tr><td><code>/tmp/sirius_node_&lt;user&gt;_&lt;cluster&gt;/rank_&lt;port&gt;/rank.log</code></td><td>The output of each rank's process, on its node; <code>register.log</code> beside it has the gateway's answers</td></tr>
 <tr><td><code>&lt;checkout&gt;/log/sirius_&lt;date&gt;.log</code>, or <code>$SIRIUS_RANK_LOG_ROOT/&lt;host&gt;-&lt;port&gt;/</code></td><td>The engine log, where the <code>exchange:</code> and <code>[gds]</code> lines are: one file shared by all ranks, or one folder per rank when <code>SIRIUS_RANK_LOG_ROOT</code> is set</td></tr>
 <tr><td><code>/tmp/sirius_gateway_&lt;user&gt;_&lt;cluster&gt;</code></td><td>Logs of ranks the gateway started itself</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>These folders hold the gateway's token. Remove it from logs before sharing them.</p>
 
 <h2 id="configure">Configure</h2>
@@ -538,7 +542,7 @@ FROM sirius_gateway_status();                             -- one row per rank, o
       frame_bytes: 16777216
       send_frames: 32
       recv_frames_per_peer: 16</code></pre>
-<table>
+<div class="tw"><table>
 <thead><tr><th>Key</th><th>Variable</th><th>Default</th><th>What</th></tr></thead>
 <tbody>
 <tr><td><code>cluster</code></td><td><code>SIRIUS_CLUSTER</code></td><td><code>default</code></td><td>Names the gateway and its state folder. One gateway per name</td></tr>
@@ -549,16 +553,16 @@ FROM sirius_gateway_status();                             -- one row per rank, o
 <tr><td><code>node.gpus</code></td><td><code>SIRIUS_NODE_GPUS</code></td><td><code>all</code></td><td>The GPUs that get a rank</td></tr>
 <tr><td><code>exchange.mnnvl</code></td><td><code>SIRIUS_GATEWAY_EXCHANGE_MNNVL</code></td><td><code>auto</code></td><td><code>require</code> fails instead of silently using the network</td></tr>
 <tr><td><code>ucx.tls</code>, <code>ucx.net_devices</code></td><td><code>UCX_TLS</code>, <code>UCX_NET_DEVICES</code></td><td>the GPU rail NICs (the fastest RDMA ports that are in no bond) with every transport, else <code>cuda_copy,cuda_ipc,tcp,self</code></td><td>Keep the defaults unless ranks cannot connect. Never list <code>bond0</code> together with the rail NICs</td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>An error in the section (an unknown key, a wrong type) stops the scripts before they apply any of it. Engine settings a newcomer meets first:</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:340px">Engine key</th><th>What</th></tr></thead>
 <tbody>
 <tr><td><code>memory.host.capacity_bytes</code></td><td>Host memory per rank for data moved off the GPU. On a GB200 node (about 478 GiB per socket for 2 ranks) 200Gi works; 250Gi and more got ranks killed by the kernel</td></tr>
 <tr><td><code>memory.disk.downgrade_root_dirs</code></td><td>The spill folder. Create it first, on a disk with free space</td></tr>
 <tr><td><code>executor.scan_manager.backend</code></td><td>Leave the default, or <code>gds</code> (see <a href="#gds">below</a>). Do not use <code>kvikio</code> on GPFS: it stalled every rank</td></tr>
 <tr><td><code>operator_params.max_dynamic_filter_bloom_bytes_per_gpu</code></td><td>The Bloom filter cap. Set it in the file only; a <code>SET</code> fails. It does not limit a Bloom filter merged across ranks</td></tr>
-</tbody></table>
+</tbody></table></div>
 
 <h2 id="benchmark">Run a benchmark</h2>
 <p class="src">Source: <code>distributed-experiments.md</code>; without Slurm: <code>distributed-experiments-no-slurm.md</code>; on AWS: <code>distributed-experiments-aws.md</code></p>
@@ -622,7 +626,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <h2 id="numbers">What to expect</h2>
 <p class="src">Source: <code>distributed-experiments.md</code>, "Reference numbers"; <code>distributed-sirius.md</code>; <code>distributed-experiments-aws.md</code></p>
 <p>GB200, 4 ranks per node. Each figure is the sum of the 22 TPC-H query times, in seconds. Lower is faster.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th>Scale</th><th>Scans</th><th class="num">1 node · 4 GPUs</th><th class="num">2 nodes · 8 GPUs</th><th class="num">4 nodes · 16 GPUs</th></tr></thead>
 <tbody>
 <tr><td>SF10000 (nominal 10 TB)</td><td>GDS</td><td class="num hero">94.7</td><td class="num hero">54.4</td><td class="num hero">36.3</td></tr>
@@ -631,7 +635,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td>SF10000</td><td>io_uring</td><td class="num">237.1</td><td class="num">128.0</td><td class="num">72.2</td></tr>
 <tr><td>SF30000</td><td>io_uring</td><td class="num">720.4</td><td class="num">384.7</td><td class="num">208.7</td></tr>
 <tr><td>SF100000</td><td>io_uring</td><td class="num">3,263.0</td><td class="num">1,508.9</td><td class="num">725.8</td></tr>
-</tbody></table>
+</tbody></table></div>
 <ul>
 <li><b>io_uring is the default scan backend:</b> the config has no <code>scan_manager.backend</code> line. <b>GDS</b> is <code>scan_manager.backend: gds</code>; its integration is not finished.</li>
 <li><b>GDS against io_uring:</b> faster at the three scales by 2.50, 2.24 and 1.99 times on one node, by 2.35, 2.08 and 2.02 on two, and by 1.99, 1.91 and 2.15 on four.</li>
@@ -642,7 +646,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 </ul>
 <details><summary>These runs on accel-etl<small>18 runs, first pass</small></summary><div class="in">
 <p>A run there holds every pass, so its totals are per pass and differ from the faster-run totals above. The SF10000 GDS run on one node is a separate session with the standard query parameters. In the SF30000 io_uring runs on two and four nodes each pass has one statement that paused for more than 90 s; the faster-run totals leave those out.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th>Scale</th><th>Scans</th><th class="num">Nodes</th><th>Run</th><th class="num">First pass (s)</th></tr></thead>
 <tbody>
 <tr><td>SF10000</td><td>GDS</td><td class="num">1</td><td><a href="https://accel-etl.nvidia.com/runs/11807/">11807</a></td><td class="num">99.4</td></tr>
@@ -663,14 +667,14 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td>SF100000</td><td>io_uring</td><td class="num">1</td><td><a href="https://accel-etl.nvidia.com/runs/11809/">11809</a></td><td class="num">3,263.0</td></tr>
 <tr><td>SF100000</td><td>io_uring</td><td class="num">2</td><td><a href="https://accel-etl.nvidia.com/runs/11909/">11909</a></td><td class="num">1,508.9</td></tr>
 <tr><td>SF100000</td><td>io_uring</td><td class="num">4</td><td><a href="https://accel-etl.nvidia.com/runs/11910/">11910</a></td><td class="num">725.8</td></tr>
-</tbody></table>
+</tbody></table></div>
 </div></details>
 <div class="note"><p><b>More GPUs do not help a query that waits for storage.</b> TPC-H Q12 at SF1000 took 6.38 s warm on four GB200 GPUs and 6.4 s on one: it is bound by the <code>lineitem</code> scan, which every rank reads from the same shared storage. On an AWS <code>g7e.24xlarge</code> at SF3000, going from 2 to 4 ranks made Q1 to Q7 4% faster, because two NVMe disks cap reads at about 13.5 GB/s. Measure the storage ceiling first, and report the storage with every number.</p></div>
 
 <h2 id="trouble">Troubleshooting</h2>
 <p class="src">Source: <code>distributed-quickstart.md</code>, "Troubleshooting"; <code>distributed-experiments.md</code>, "Known failures"</p>
 <p>Look first at <code>FROM sirius_gateway_status();</code>, then at the rank's <code>rank.log</code> and <code>register.log</code>.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:360px">Symptom</th><th>Cause and fix</th></tr></thead>
 <tbody>
 <tr><td><code>FAIL no Sirius build at ...</code></td><td>Run <code>pixi run build-distributed</code> on that machine</td></tr>
@@ -684,7 +688,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td>Ranks killed in the middle of a query</td><td>The host memory tier is too large: lower <code>memory.host.capacity_bytes</code> (200Gi works on a GB200 node)</td></tr>
 <tr><td>Q3 or Q18 differ from the reference</td><td>A tie at the <code>LIMIT</code>: check the order columns (<code>--ties</code>)</td></tr>
 <tr><td>A statement hangs with idle ranks</td><td>Seen rarely. The statement timeout cancels it and the next statement restarts the ranks</td></tr>
-</tbody></table>
+</tbody></table></div>
 
 <h2 id="limits">Limits</h2>
 <p class="src">Source: <code>distributed-sirius.md</code>, "Limits" and "The plan rewrite"; <code>distributed-gateway.md</code>, "Limits"</p>
@@ -711,7 +715,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <h2 id="code">Code map and tests</h2>
 <p class="src">Source: <code>distributed-sirius.md</code>, "Files" and "Tests"; <code>distributed-gateway.md</code>, "Files" and "Tests"</p>
 <details><summary>Files, by role<small>12 rows</small></summary><div class="in">
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:400px">Path</th><th>Role</th></tr></thead>
 <tbody>
 <tr><td><code>src/planner/distributed_plan.*</code></td><td>The plan rewrite, the plan-shape check, each rank's share of a table's files</td></tr>
@@ -726,11 +730,11 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td><code>scripts/sirius_gateway.sh</code>, <code>sirius_node.sh</code>, <code>sirius_rank_node.sh</code>, <code>sirius_client.sh</code>, <code>sirius_slurm.sbatch</code></td><td>The launchers behind the pixi tasks</td></tr>
 <tr><td><code>scripts/launcher_env.sh</code>, <code>sirius_net.sh</code>, <code>sirius_distributed_config.py</code></td><td>UCX defaults, address and interface choice, reading <code>sirius.distributed</code></td></tr>
 <tr><td><code>scripts/distributed_run_sql.sh</code>, <code>distributed_test_nixl.sh</code>, <code>distributed_test_nixl_pairs.sh</code></td><td>One-host launcher without a gateway; transport tests on several GPUs and on two nodes</td></tr>
-</tbody></table>
+</tbody></table></div>
 </div></details>
 <p><b>To add a distributed behaviour</b> you add an implementation under <code>src/op/distributed/</code>, an interface beside the operator if none fits, and a case in <code>distribute_plan()</code>. You do not add an operator class.</p>
 <details><summary>Tests, by tag<small>6 rows</small></summary><div class="in">
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:330px">Test tag or file</th><th>Covers</th></tr></thead>
 <tbody>
 <tr><td><code>[exchange][wire]</code>, <code>[exchange][batch_io]</code>, <code>[exchange][transport]</code></td><td>Frames, credits, shuffled notifications, no room, failed writes, over an in-process loopback fabric</td></tr>
@@ -739,13 +743,13 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td><code>[exchange][nixl]</code>, <code>[exchange][path]</code></td><td>Two ranks in one process over NIXL; the path rule</td></tr>
 <tr><td><code>[nixl_multiprocess]</code>, <code>[nixl_bandwidth]</code>, <code>[nixl_pairs]</code> (hidden)</td><td>One rank per process and GPU: <code>pixi run scripts/distributed_test_nixl.sh 4</code>; GPU pairs on two nodes</td></tr>
 <tr><td><code>gateway/test/sql/*.test</code></td><td>The gateway on CPU ranks: fan-out, fail-stop, registry, joins, DDL log and replay, autostart</td></tr>
-</tbody></table>
+</tbody></table></div>
 </div></details>
 
 <h2 id="branch">What the branch adds</h2>
 <p class="src">Source: the commit history of the branch against <code>main</code> (251 commits ahead, 47 behind at <code>258002d</code>)</p>
 <p>What the 251 commits up to <code>258002d</code> add, grouped by theme (counts are approximate; dates are 22 October to 17 November 2026). Since then the branch gained two documentation commits and the benchmark skill.</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:190px">Theme</th><th class="num" style="width:80px">Commits</th><th>What it adds</th><th style="width:270px">Where</th></tr></thead>
 <tbody>
 <tr><td><b>Exchange transport</b></td><td class="num">about 59</td><td>The wire format for batches, the credit-based transport and the NIXL fabric. Later: host staging through shared memory, NVLink between nodes, TCP lanes, and many fail-stop fixes</td><td><code>src/exchange/</code></td></tr>
@@ -759,15 +763,15 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td><b>Planner rewrites for TPC-H</b></td><td class="num">7</td><td>Scan reuse (Q18, Q17, Q2, Q11), computing a narrowing expression below the join (Q9), counting build matches in a right join (Q13), a HAVING applied to groups the Parquet footers prove whole. Only the last is specific to distributed mode</td><td><code>src/planner/scan_reuse_rewrites.*</code>, <code>src/transparent/push_narrowing_expressions.*</code></td></tr>
 <tr><td><b>Spill, memory, scheduler</b></td><td class="num">5</td><td>One file open per spilled batch, spill order, a downstream-first task priority (<code>SIRIUS_PRIORITY_DOWNSTREAM_FIRST=1</code>)</td><td><code>src/downgrade/</code>, <code>src/creator/task_creator.cpp</code></td></tr>
 <tr><td><b>Tests and documents</b></td><td class="num">about 66</td><td>126 test cases under <code>test/cpp/exchange/</code>, 7 gateway test files, and the documents this page summarizes</td><td><code>test/cpp/exchange/</code>, <code>gateway/test/sql/</code>, <code>docs/super-sirius/</code></td></tr>
-</tbody></table>
+</tbody></table></div>
 <p>Three planner options a newcomer will see in configs:</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:330px">Option (<code>operator_params</code>)</th><th style="width:80px">Default</th><th>What</th></tr></thead>
 <tbody>
 <tr><td><code>enable_narrowing_expression_pushdown</code></td><td>true</td><td>Computes a projection's expression below the inner join (TPC-H Q9)</td></tr>
 <tr><td><code>enable_complete_group_having</code></td><td>true</td><td>Distributed only: applies a HAVING to partial groups that the Parquet footers prove whole</td></tr>
 <tr><td><code>enable_build_side_swap</code></td><td>false</td><td>Experimental: builds an inner join on its filtered side. Its commit says no gain is established</td></tr>
-</tbody></table>
+</tbody></table></div>
 <h3>Where the documents and the code differ</h3>
 <p>A code review of the branch found the documents accurate on every port, default, setting name and script. These are the differences a newcomer could trip on:</p>
 <ul>
@@ -780,7 +784,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 
 <h2 id="read">Where to read more</h2>
 <p>All in <a href="https://github.com/sirius-db/sirius/tree/experimental/distributed-sirius/docs/super-sirius"><code>docs/super-sirius/</code></a> on the branch. Suggested order:</p>
-<table>
+<div class="tw"><table>
 <thead><tr><th style="width:310px">Document</th><th>Read it for</th></tr></thead>
 <tbody>
 <tr><td>1. <a href="https://github.com/sirius-db/sirius/blob/experimental/distributed-sirius/docs/super-sirius/distributed-quickstart.md"><code>distributed-quickstart.md</code></a></td><td>The three commands, every <code>sirius.distributed</code> key, recovery, Slurm, the launch errors</td></tr>
@@ -793,7 +797,7 @@ FILE=/data/lineitem/part.0.parquet CHECKOUT=/path/to/sirius sbatch -w &lt;node&g
 <tr><td><a href="https://github.com/sirius-db/sirius/blob/experimental/distributed-sirius/.claude/skills/sirius-tpch-bench/SKILL.md"><code>.claude/skills/sirius-tpch-bench/</code></a></td><td>The skill that runs a distributed smoke test and benchmark</td></tr>
 <tr><td><a href="https://github.com/sirius-db/sirius/blob/experimental/distributed-sirius/docs/super-sirius/configuration.md"><code>configuration.md</code></a></td><td>Every engine key and setting</td></tr>
 <tr><td><a href="https://github.com/sirius-db/sirius/blob/experimental/distributed-sirius/docs/super-sirius/architecture-overview.md"><code>architecture-overview.md</code></a></td><td>How Sirius works inside one process: component ownership, thread model, execution lifecycle</td></tr>
-</tbody></table>
+</tbody></table></div>
 
 </main></div>
 <script>
