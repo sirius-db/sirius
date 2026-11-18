@@ -154,3 +154,27 @@ TEST_CASE_METHOD(OrderNullsGPUExecutionFixture,
     }
   }
 }
+
+TEST_CASE_METHOD(OrderNullsGPUExecutionFixture,
+                 "gpu_execution ORDER BY splits a heavy key across ranges",
+                 "[integration][gpu_execution][order_by]")
+{
+  run_ok(
+    "CREATE TABLE ord_heavy AS "
+    "SELECT CASE WHEN i < 5000 THEN 7 ELSE CAST(i AS INTEGER) END AS k, "
+    "CAST(i AS INTEGER) AS v FROM range(10000) AS t(i);");
+  run_ok("CHECKPOINT;");
+  scoped_setting sort_partition(*this, "max_sort_partition_bytes", "4096");
+
+  compare_gpu_vs_cpu_ordered("SELECT k FROM ord_heavy ORDER BY k");
+  compare_gpu_vs_cpu("SELECT k, v FROM ord_heavy ORDER BY k");
+  run_ok("SET gpu_execution = true;");
+  auto ordered = con->Query("SELECT k, v FROM ord_heavy ORDER BY k");
+  REQUIRE(ordered);
+  REQUIRE_FALSE(ordered->HasError());
+  auto rows = collect_rows(*ordered, false);
+  REQUIRE(rows.size() == 10000);
+  for (std::size_t i = 1; i < rows.size(); ++i) {
+    CHECK(std::stoi(rows[i - 1][0]) <= std::stoi(rows[i][0]));
+  }
+}

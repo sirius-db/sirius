@@ -32,6 +32,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/reduction/unique_count.hpp>
+#include <cudf/search.hpp>
 
 #include <rmm/error.hpp>
 
@@ -149,8 +150,51 @@ sort_boundaries sirius_physical_sort_sample::local_boundaries(
   auto const rows = sample_keys.num_rows();
   // Single partition — no boundaries needed
   if (num_parts <= 1 || rows == 0) { return {}; }
-  return {num_parts,
-          evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator())};
+  auto boundaries =
+    evenly_spaced(sample_keys, 0, rows, num_parts, stream, space->get_default_allocator());
+  if (!_split_equal_keys) { return {num_parts, std::move(boundaries), {}}; }
+
+  std::vector<cudf::order> column_order;
+  std::vector<cudf::null_order> null_precedence;
+  for (auto const& ord : orders) {
+    column_order.push_back(to_cudf_order(ord.type));
+    null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));
+  }
+  auto lo = cudf::lower_bound(sample_keys,
+                              boundaries->view(),
+                              column_order,
+                              null_precedence,
+                              stream,
+                              space->get_default_allocator());
+  auto hi = cudf::upper_bound(sample_keys,
+                              boundaries->view(),
+                              column_order,
+                              null_precedence,
+                              stream,
+                              space->get_default_allocator());
+  std::vector<int32_t> first(num_parts - 1), past(num_parts - 1);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(first.data(),
+                                lo->view().data<int32_t>(),
+                                first.size() * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(past.data(),
+                                hi->view().data<int32_t>(),
+                                past.size() * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  std::vector<double> fractions(num_parts - 1);
+  for (std::size_t i = 1; i < num_parts; ++i) {
+    auto const q = std::min<std::size_t>(static_cast<std::size_t>(rows) * i / num_parts, rows - 1);
+    auto const a = static_cast<std::size_t>(first[i - 1]);
+    auto const b = static_cast<std::size_t>(past[i - 1]);
+    if (a > q || q >= b) {
+      throw internal_exception("Sort sample boundary is outside its equal-key run");
+    }
+    fractions[i - 1] = static_cast<double>(q - a) / static_cast<double>(b - a);
+  }
+  return {num_parts, std::move(boundaries), std::move(fractions)};
 }
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
@@ -299,8 +343,11 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         : sort_boundaries{};
     _num_partitions                = made.num_partitions;
     _partition_boundaries          = std::move(made.table);
+    _equal_key_fractions           = std::move(made.equal_key_fractions);
     auto const repeated_boundaries = count_repeated_boundaries(_partition_boundaries.get(), stream);
-    _range_stats = {.num_ranges = _num_partitions, .repeated_boundaries = repeated_boundaries};
+    _range_stats                   = {.num_ranges          = _num_partitions,
+                                      .repeated_boundaries = repeated_boundaries,
+                                      .split_equal_keys    = _split_equal_keys};
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
@@ -489,7 +536,11 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         : local_boundaries(sort_keys_view, num_parts, space, stream);
     _num_partitions                = made.num_partitions;
     _partition_boundaries          = std::move(made.table);
+    _equal_key_fractions           = std::move(made.equal_key_fractions);
     auto const repeated_boundaries = count_repeated_boundaries(_partition_boundaries.get(), stream);
+    auto const split_boundaries    = std::count_if(_equal_key_fractions.begin(),
+                                                _equal_key_fractions.end(),
+                                                [](double fraction) { return fraction > 0; });
     _range_stats                   = {.complete_input        = complete_input,
                                       .sample_batches        = valid_batches.size(),
                                       .sample_rows           = total_rows,
@@ -500,7 +551,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                       .est_source            = est_source,
                                       .target_range_bytes    = max_partition_bytes,
                                       .num_ranges            = _num_partitions,
-                                      .repeated_boundaries   = repeated_boundaries};
+                                      .repeated_boundaries   = repeated_boundaries,
+                                      .split_equal_keys      = _split_equal_keys,
+                                      .split_boundaries      = static_cast<std::size_t>(split_boundaries)};
 
     // sort_partition runs in the same gpu_pipeline_task immediately after this
     // execute() returns, so _partition_boundaries is visible before partition runs.

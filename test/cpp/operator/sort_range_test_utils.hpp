@@ -116,7 +116,8 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
                          std::uint64_t sort_sample_bytes,
                          std::uint64_t max_partition_bytes,
                          std::size_t estimated_cardinality,
-                         bool upstream_finished)
+                         bool upstream_finished,
+                         bool split_equal_keys = false)
 {
   if (batches.empty()) { throw std::runtime_error("Sort-range test needs input"); }
   auto table = sirius::get_cudf_table_view(*batches.front());
@@ -127,6 +128,7 @@ inline layout run_layout(std::vector<std::shared_ptr<cucascade::data_batch>> con
   auto types = sirius::from_duckdb_vec(duck_types);
   op::sirius_physical_sort_sample sample(
     types, op::copy_orders(orders), estimated_cardinality, sort_sample_bytes, max_partition_bytes);
+  sample.set_split_equal_keys(split_equal_keys);
   op::sirius_physical_sort_partition partition(
     types, op::copy_orders(orders), {}, estimated_cardinality);
   partition.set_sample_op(&sample);

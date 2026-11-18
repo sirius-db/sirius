@@ -53,6 +53,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     std::size_t num_ranges            = 1;
     // Unset if counting failed with an error the task would retry on.
     std::optional<std::size_t> repeated_boundaries = 0;
+    bool split_equal_keys                          = false;
+    std::size_t split_boundaries                   = 0;
   };
 
   [[nodiscard]] range_sample_stats const& get_range_sample_stats() const noexcept
@@ -117,8 +119,13 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override to pull sample bytes before boundary computation, then one batch at a time
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  //! Get the computed partition boundaries (P-1 rows, sort key columns only)
+  //! Get the computed partition boundaries (P-1 rows, all sort keys). When splitting equal keys,
+  //! get_equal_key_fractions() gives the fraction of matching rows preceding each boundary.
   const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
+  [[nodiscard]] std::vector<double> const& get_equal_key_fractions() const noexcept
+  {
+    return _equal_key_fractions;
+  }
 
   //! Get the computed number of partitions
   size_t get_num_partitions() const { return _num_partitions; }
@@ -143,6 +150,17 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     }
     _cross_rank_boundaries = std::move(hook);
   }
+  //! Enable splitting rows equal to a boundary. Set while planning, before input is claimed.
+  void set_split_equal_keys(bool enabled)
+  {
+    if (boundary_state() != BoundaryState::NOT_DONE) {
+      throw std::logic_error(
+        "[sirius_physical_sort_sample::set_split_equal_keys] the plan cannot change during "
+        "execution");
+    }
+    _split_equal_keys = enabled;
+  }
+  [[nodiscard]] bool split_equal_keys() const noexcept { return _split_equal_keys; }
   //! The hook set by set_cross_rank_boundaries(), or null when this operator's sample stands alone.
   [[nodiscard]] cross_rank_sort_boundaries* cross_rank_boundaries() const noexcept
   {
@@ -187,6 +205,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Partition boundary rows (P-1 rows containing sort key column values)
   std::unique_ptr<cudf::table> _partition_boundaries;
+  std::vector<double> _equal_key_fractions;
+  bool _split_equal_keys = false;
 
   //! Number of partitions computed from the sample
   size_t _num_partitions = 1;

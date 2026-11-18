@@ -125,13 +125,15 @@ layout run_checked(std::vector<std::shared_ptr<cucascade::data_batch>> const& ba
                    duckdb::vector<duckdb::BoundOrderByNode> const& orders,
                    std::uint64_t sample_bytes,
                    std::uint64_t target_bytes,
-                   bool finished = true)
+                   bool finished         = true,
+                   bool split_equal_keys = false)
 {
   std::size_t cardinality = 0;
   for (auto const& batch : batches) {
     cardinality += sirius::get_cudf_table_view(*batch).num_rows();
   }
-  auto result = run_layout(batches, orders, sample_bytes, target_bytes, cardinality, finished);
+  auto result = run_layout(
+    batches, orders, sample_bytes, target_bytes, cardinality, finished, split_equal_keys);
   check_layout(result, batches, orders);
   return result;
 }
@@ -162,7 +164,7 @@ TEST_CASE("Sort ranges count the single-range path", "[sort_range_layout]")
   CHECK(result.counted.front().slices == 2);
 }
 
-TEST_CASE("Sort ranges keep a heavy key together (current behaviour, #2579)", "[sort_range_layout]")
+TEST_CASE("Sort ranges keep a heavy key together with splitting off", "[sort_range_layout]")
 {
   std::vector<std::vector<std::int32_t>> values(4);
   for (auto& batch : values) {
@@ -188,8 +190,7 @@ TEST_CASE("Sort ranges keep a heavy key together (current behaviour, #2579)", "[
   CHECK(ranges_with_key == 1);
 }
 
-TEST_CASE("Sort ranges with all equal keys use one range (current behaviour, #2579)",
-          "[sort_range_layout]")
+TEST_CASE("Sort ranges with all equal keys use one range with splitting off", "[sort_range_layout]")
 {
   auto batches =
     int_batches(std::vector<std::vector<std::int32_t>>(4, std::vector<std::int32_t>(250, 7)));
@@ -197,6 +198,50 @@ TEST_CASE("Sort ranges with all equal keys use one range (current behaviour, #25
   CHECK(std::count_if(result.counted.begin(), result.counted.end(), [](auto const& r) {
           return r.rows > 0;
         }) == 1);
+}
+
+TEST_CASE("Sort ranges split a key covering forty percent of rows", "[sort_range_layout]")
+{
+  std::vector<std::vector<std::int32_t>> values(4);
+  for (auto& batch : values) {
+    for (int i = 0; i < 150; ++i) {
+      batch.push_back(i);
+    }
+    batch.insert(batch.end(), 100, 75);
+    std::sort(batch.begin(), batch.end());
+  }
+  auto result = run_checked(int_batches(values), one_order(), 100000, 80, true, true);
+  REQUIRE(result.sample.num_ranges == 50);
+  CHECK(result.sample.split_equal_keys);
+  CHECK(result.sample.split_boundaries > 0);
+  auto ranges_with_key =
+    std::count_if(result.keys.begin(), result.keys.end(), [](auto const& rows) {
+      return std::any_of(rows.begin(), rows.end(), [](auto const& row) {
+        return row[0] == key_cell{std::int64_t{75}};
+      });
+    });
+  CHECK(ranges_with_key > 1);
+  for (auto const& range : result.counted) {
+    // Four 250-row batches give a 20-row share; each batch can round by one row.
+    CHECK(range.rows >= 16);
+    CHECK(range.rows <= 24);
+  }
+}
+
+TEST_CASE("Sort ranges spread all equal keys", "[sort_range_layout]")
+{
+  auto batches =
+    int_batches(std::vector<std::vector<std::int32_t>>(4, std::vector<std::int32_t>(250, 7)));
+  auto first  = run_checked(batches, one_order(), 100000, 80, true, true);
+  auto second = run_checked(batches, one_order(), 100000, 80, true, true);
+  REQUIRE(first.sample.num_ranges == 50);
+  CHECK(first.sample.split_boundaries == 49);
+  for (std::size_t i = 0; i < first.counted.size(); ++i) {
+    // Each of the four batches can round the 20-row share by at most one.
+    CHECK(first.counted[i].rows >= 16);
+    CHECK(first.counted[i].rows <= 24);
+    CHECK(first.counted[i].rows == second.counted[i].rows);
+  }
 }
 
 TEST_CASE("Sort ranges preserve NULL-heavy orders", "[sort_range_layout]")
@@ -219,6 +264,14 @@ TEST_CASE("Sort ranges preserve NULL-heavy orders", "[sort_range_layout]")
         make_numeric_batch_with_nulls<std::int32_t>(*space, values, valid, cudf::type_id::INT32);
       auto orders = one_order(duckdb::LogicalType::INTEGER, direction, nulls);
       run_checked({batch}, orders, 100000, 80);
+      auto split = run_checked({batch}, orders, 100000, 80, true, true);
+      CHECK(split.sample.split_boundaries > 0);
+      auto const share = 200 / split.sample.num_ranges;
+      for (auto const& range : split.counted) {
+        // One fully sampled batch gives each range either floor or ceil of its share.
+        CHECK(range.rows >= share);
+        CHECK(range.rows <= share + 1);
+      }
     }
   }
 }
@@ -233,7 +286,57 @@ TEST_CASE("Sort ranges preserve two keys", "[sort_range_layout]")
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(order(0, duckdb::LogicalType::BIGINT));
   orders.push_back(order(1, duckdb::LogicalType::BIGINT));
-  run_checked({batch}, orders, 100000, 80);
+  auto split = run_checked({batch}, orders, 100000, 80, true, true);
+  CHECK(split.sample.split_boundaries == 0);
+  for (auto const& range : split.counted) {
+    // Unique full keys divide 300 rows into 60 five-row ranges.
+    CHECK(range.rows == 5);
+  }
+}
+
+TEST_CASE("Sort ranges split a repeated pair of keys", "[sort_range_layout]")
+{
+  auto* space = get_default_gpu_space();
+  std::vector<std::int64_t> first, second;
+  for (int i = 0; i < 150; ++i) {
+    first.push_back(i);
+    second.push_back(0);
+  }
+  first.insert(first.end(), 100, 75);
+  second.insert(second.end(), 100, 0);
+  std::vector<std::pair<std::int64_t, std::int64_t>> pairs;
+  for (std::size_t i = 0; i < first.size(); ++i) {
+    pairs.emplace_back(first[i], second[i]);
+  }
+  std::sort(pairs.begin(), pairs.end());
+  for (std::size_t i = 0; i < pairs.size(); ++i) {
+    first[i]  = pairs[i].first;
+    second[i] = pairs[i].second;
+  }
+  auto batch =
+    make_two_column_batch<std::int64_t, std::int64_t>(*space, first, second, cudf::type_id::INT64);
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(order(0, duckdb::LogicalType::BIGINT));
+  orders.push_back(order(1, duckdb::LogicalType::BIGINT));
+  auto result = run_checked({batch}, orders, 100000, 160, true, true);
+  CHECK(result.sample.split_boundaries > 0);
+  CHECK(std::count_if(result.keys.begin(), result.keys.end(), [](auto const& rows) {
+          return std::any_of(rows.begin(), rows.end(), [](auto const& row) {
+            return row[0] == key_cell{std::int64_t{75}} && row[1] == key_cell{std::int64_t{0}};
+          });
+        }) > 1);
+}
+
+TEST_CASE("Sort ranges spread one-row equal-key batches", "[sort_range_layout]")
+{
+  std::vector<std::vector<std::int32_t>> values(2000, std::vector<std::int32_t>{7});
+  auto result = run_checked(int_batches(values), one_order(), 100000, 1000, true, true);
+  REQUIRE(result.sample.num_ranges == 8);
+  for (auto const& range : result.counted) {
+    // 250 expected rows; the fixed hash distributes 2000 batch IDs across eight ranges.
+    CHECK(range.rows >= 190);
+    CHECK(range.rows <= 310);
+  }
 }
 
 TEST_CASE("Sort ranges preserve string keys", "[sort_range_layout]")
