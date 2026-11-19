@@ -14,10 +14,11 @@ nvcomp-Cascaded, bitcomp, ANS, bitextract/bitjoin — specified via a human-read
 
 ## Quick start
 
-Simpatico is built and tested as part of Sirius. From the Sirius repository root:
+Simpatico is built and tested as part of Sirius. Initialize the build submodules
+as shown in the [source quick start](../../../docs/README.md#quick-start). From
+the Sirius repository root:
 
 ```bash
-git submodule update --init --recursive
 pixi run make
 pixi run build/release/test/cpp/sirius_unittest "[compression]"
 ```

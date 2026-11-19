@@ -33,10 +33,10 @@ environment. The fuzzer drives the DuckDB shell that the Sirius build produces
 `sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension` automatically.
 For CPU-only use, any DuckDB CLI works (`--shell`, or `SIRIUSFUZZ_SHELL`).
 
-**1. Build** Sirius:
+**1. Build** Sirius. Initialize the build submodules as shown in the
+[source quick start](../../docs/README.md#quick-start), then run:
 
 ```bash
-git submodule update --init --recursive
 pixi run make
 ```
 
