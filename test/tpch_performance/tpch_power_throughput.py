@@ -72,12 +72,14 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 
 import duckdb
@@ -815,6 +817,7 @@ def open_benchmark_db(
     compression_plan_dir=None,
     pin_layout=None,
     duckdb_memory_limit="32GB",
+    pin_compression=None,
 ):
     """Connect writable, LOAD Sirius, CHECKPOINT, pin the TPC-H tables.
 
@@ -835,10 +838,14 @@ def open_benchmark_db(
     log(f"Loading Sirius extension from {EXTENSION_PATH}")
     sql(con, f"LOAD '{EXTENSION_PATH}'")
     sql(con, "CHECKPOINT")
+    if pin_compression is None:
+        pin_compression = bool(compression_plan_dir)
     sql(
         con,
-        f"SET pin_table_compression = {'true' if compression_plan_dir else 'false'}",
+        f"SET pin_table_compression = {'true' if pin_compression else 'false'}",
     )
+    if pin_compression and not compression_plan_dir:
+        log("Enabling Simpatico pin compression (automatic plans)")
     if compression_plan_dir:
         log(f"Enabling Simpatico pin compression (plans: {compression_plan_dir})")
         sql(
@@ -897,28 +904,46 @@ def close_benchmark_db(con, pin_tier, pin_layout=None, close=True):
             con.close()
 
 
-def compressed_pin_count(log_dir, timeout_s=10.0):
-    """Count pins the engine compressed, via the pin_table INFO log marker.
+_PIN_COVERAGE = re.compile(r"\] pin '(.*)': (\d+)/(\d+) chunk\(s\) compressed")
+_PIN_SIZE_SKIP = re.compile(
+    r"\[pin_table\] '(.*)': about \d+ bytes uncompressed, below the \d+ bytes "
+    r"automatic compression needs; pinning uncompressed"
+)
 
-    The marker is written during CALL pin_table, well before the pins finish,
-    but the log sink may flush late; poll briefly before concluding zero.
+
+def pin_compression_counts(log_dir, timeout_s=10.0):
+    """Count compressed pins and completed pins skipped by the automatic table-size gate.
+
+    Each record is written when its CALL pin_table finishes materializing, but the
+    log sink may flush late; poll briefly before concluding zero.
     """
 
     def scan():
         found = 0
+        size_skips = Counter()
+        uncompressed = Counter()
         for name in os.listdir(log_dir):
             if not name.endswith(".log"):
                 continue
             with open(os.path.join(log_dir, name), errors="replace") as f:
-                found += sum("compressing with plan" in line for line in f)
-        return found
+                for line in f:
+                    match = _PIN_COVERAGE.search(line)
+                    if match:
+                        name, compressed, total = match.groups()
+                        found += int(compressed) > 0
+                        if int(compressed) == 0 and int(total) > 0:
+                            uncompressed[name] += 1
+                    skip = _PIN_SIZE_SKIP.search(line)
+                    if skip:
+                        size_skips[skip.group(1)] += 1
+        return found, sum((size_skips & uncompressed).values())
 
     deadline = time.time() + timeout_s
-    count = scan()
-    while count == 0 and time.time() < deadline:
+    counts = scan()
+    while counts[0] == 0 and time.time() < deadline:
         time.sleep(0.5)
-        count = scan()
-    return count
+        counts = scan()
+    return counts
 
 
 # Connections deliberately kept open by --rollback-scratch (see benchmark_db);
@@ -995,6 +1020,7 @@ def benchmark_db(args, run_dir, filename):
         args.compression_plan_dir if args.pin_compression else None,
         args.pin_layout_entries,
         args.duckdb_memory_limit,
+        pin_compression=args.pin_compression,
     )
     if args.rollback_scratch:
         # Keep every refresh mutation out of the base file so deleting the .wal
@@ -1014,14 +1040,25 @@ def benchmark_db(args, run_dir, filename):
         log("Rollback scratch armed: WAL-only mutations, restore = delete .wal")
     try:
         if args.pin_compression:
-            compressed = compressed_pin_count(os.environ["SIRIUS_LOG_DIR"])
-            if compressed == 0:
+            compressed, skipped = pin_compression_counts(os.environ["SIRIUS_LOG_DIR"])
+            expected = (
+                len(args.pin_layout_entries)
+                if args.pin_layout_entries is not None
+                else len(union_columns_by_table())
+            )
+            if compressed:
+                log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
+            elif skipped == expected and expected > 0:
+                log(
+                    f"Simpatico: all {skipped} pins skipped by the automatic table-size gate; "
+                    "continuing with uncompressed pins"
+                )
+            else:
                 raise SystemExit(
                     "--pin-compression was requested but no pinned table was "
                     "compressed; the run would silently measure uncompressed "
                     "data. Check the sirius log for '[pin_table]' warnings."
                 )
-            log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
         yield con
     finally:
         # Cleanup must not destroy results already earned: if the database died
@@ -1550,16 +1587,15 @@ def parse_args():
         "--pin-compression",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Compress the pinned tables with Simpatico; needs a pinned tier "
-        "and per-table plan files (--compression-plan-dir)",
+        help="Compress the pinned tables with Simpatico; needs a pinned tier. "
+        "Plans are selected automatically unless --compression-plan-dir is given",
     )
     p.add_argument(
         "--compression-plan-dir",
         type=str,
         default=None,
         help="Directory of per-table Simpatico plan files (<table>.<ext>) for "
-        "--pin-compression (default: the SF1000 plans under "
-        "src/compression/simpatico_codegen/plans)",
+        "--pin-compression; tables without one get automatic plans",
     )
     p.add_argument(
         "--staged-refresh",
@@ -1761,16 +1797,13 @@ def main():
             "baseline (--mode both)"
         )
 
-    # Simpatico compression happens at pin time, so it needs a pinned tier, and
-    # it is a no-op without at least one plan file naming a TPC-H table.
+    # Simpatico compression happens at pin time, so it needs a pinned tier. A plan
+    # directory must name at least one TPC-H table, or it would change nothing.
     compression_tables = []
     if args.pin_compression:
         if args.pin == "none":
             raise SystemExit("--pin-compression needs a pinned tier (--pin gpu|host)")
-        if args.compression_plan_dir is None:
-            args.compression_plan_dir = os.path.join(
-                REPO_ROOT, "src/compression/simpatico_codegen/plans/tpch_sf1000"
-            )
+    if args.pin_compression and args.compression_plan_dir is not None:
         args.compression_plan_dir = os.path.abspath(args.compression_plan_dir)
         if not os.path.isdir(args.compression_plan_dir):
             raise SystemExit(
@@ -1835,11 +1868,13 @@ def main():
     log(f"Predicates:    {'qgen per stream' if args.vary_predicates else 'fixed'}")
     if args.vary_predicates:
         log(f"Query dir:     {args.query_dir}")
-    if args.pin_compression:
+    if args.pin_compression and compression_tables:
         log(
             f"Compression:   simpatico ({len(compression_tables)} table plans: "
             f"{', '.join(compression_tables)})"
         )
+    elif args.pin_compression:
+        log("Compression:   simpatico (automatic plans)")
 
     power = throughput = None
     # A failing throughput run must not discard a power run that already

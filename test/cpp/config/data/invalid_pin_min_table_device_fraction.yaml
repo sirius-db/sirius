@@ -1,0 +1,3 @@
+sirius:
+  compression:
+    min_table_device_fraction: -1

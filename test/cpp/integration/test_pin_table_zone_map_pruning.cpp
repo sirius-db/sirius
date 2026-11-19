@@ -246,6 +246,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
 
     require_ok(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;"),
                "disable size gate");
+    require_ok(con.Query("SET pin_table_compression_min_table_device_fraction = 0;"),
+               "disable table size gate");
     for (auto const* tier : {"host", "gpu"}) {
       for (bool const compression : {false, true}) {
         DYNAMIC_SECTION("tier = " << tier << ", compression = " << compression)
@@ -330,6 +332,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks
 
     require_ok(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;"),
                "disable size gate");
+    require_ok(con.Query("SET pin_table_compression_min_table_device_fraction = 0;"),
+               "disable table size gate");
     for (auto const* tier : {"host", "gpu"}) {
       for (bool const compression : {false, true}) {
         DYNAMIC_SECTION("tier = " << tier << ", compression = " << compression)

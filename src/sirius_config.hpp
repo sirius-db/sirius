@@ -431,6 +431,14 @@ struct compression_config {
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
+  /// Select plans automatically for a GPU-tier pin only when its uncompressed size (the first
+  /// chunk's bytes per row times the table's rows) is at least this fraction of the memory of
+  /// the GPUs it pins to. A smaller pin is stored uncompressed: it frees little GPU memory and
+  /// its scans still pay for decoding. Host pins are not gated, as fewer bytes always shorten
+  /// their host-to-device copies. Explicit table plans are not gated either. Finite and
+  /// non-negative; 0 disables the gate.
+  double min_table_device_fraction{0.05};
+
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
