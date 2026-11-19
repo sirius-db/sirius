@@ -5,6 +5,13 @@ updates:
     directory: /
     schedule:
       interval: daily
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: cargo
     directories:
@@ -20,3 +27,19 @@ updates:
         patterns:
           - "arrow*"
           - "parquet*"
+      protobuf:
+        patterns:
+          - "pbjson*"
+          - "prost*"
+          - "protox*"
+          - "tonic*"
+          - "substrait*"
+      cxx:
+        patterns:
+          - "cxx*"
+      cargo:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
