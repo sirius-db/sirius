@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "helper/cuda_launch_error.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/cudf_sort_order.hpp"
@@ -33,6 +34,8 @@
 #include <cudf/reduction/unique_count.hpp>
 
 #include <rmm/error.hpp>
+
+#include <thrust/system/system_error.h>
 
 #include <algorithm>
 #include <cmath>
@@ -60,12 +63,15 @@ std::optional<std::size_t> count_repeated_boundaries(cudf::table const* boundari
 {
   if (!boundaries || boundaries->num_rows() == 0) { return 0; }
   auto const view = boundaries->view();
+  // Diagnostic only. Retrying boundary computation would re-enter the completed collective's
+  // hook, which rejects the retry and fails the query. So an error the task would retry on
+  // leaves the count unavailable; any other error propagates.
   try {
     return view.num_rows() - cudf::unique_count(view, cudf::null_equality::EQUAL, stream);
   } catch (rmm::out_of_memory const&) {
-    // This is only a diagnostic. The distributed hook has already released its gathered
-    // sample, so retrying boundary computation here would repeat a completed collective.
-    // Keep the valid boundaries and distinguish an unavailable count from zero repeats.
+    return std::nullopt;
+  } catch (thrust::system_error const& error) {
+    if (!is_retryable_launch_error(static_cast<cudaError_t>(error.code().value()))) { throw; }
     return std::nullopt;
   }
 }
