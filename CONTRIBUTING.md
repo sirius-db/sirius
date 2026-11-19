@@ -92,6 +92,18 @@ Public re-exports can be declared using Clang's `IWYU pragma: export` and
 
 The `duckdb/` and `sirius-duckdb/vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
 
+The StarRocks submodule names match their paths under `experimental/starrocks/`.
+If you initialized them before the names were aligned, run the following from
+the repository root to register the current names. Git can reuse the existing
+checkouts, even if their internal Git directories use the older names. If you
+previously deinitialized them, Git may download fresh copies on the next update.
+Local branches from those checkouts stay in the Git directories under the old
+names.
+
+```bash
+git submodule init -- experimental/starrocks/starrocks experimental/starrocks/brpc
+```
+
 ## Migrating your local clone from `dev` to `main`
 
 Sirius's default branch was renamed from `dev` to `main`
