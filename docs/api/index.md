@@ -8,6 +8,7 @@ API.
 New fallible public C++ operations report errors through
 `std::expected<T, sirius::Error>`. Factory methods return allocation failures as
 `ErrorCode::allocation_failure`; the default builder constructor may throw.
+Constructing an argument, such as a filesystem path, can also throw before entering a factory.
 The public API therefore requires C++23 and standard-library support for
 `std::expected`.
 
@@ -20,7 +21,7 @@ The public API therefore requires C++23 and standard-library support for
 The API is under active development. These pages describe the headers on the
 repository's default branch; they do not promise ABI stability.
 
-## Construct a physical plan
+## Construct a physical plan {#cpp_plan_construction}
 
 This example describes a Parquet scan and a filter on its first column. The caller supplies
 the file schema. Construction does not open the file or initialize a GPU.
@@ -65,5 +66,3 @@ on your target:
 target_link_libraries(my_app PRIVATE sirius::sirius)
 target_compile_features(my_app PRIVATE cxx_std_23)
 ```
-
-Preparing arguments may also throw before a factory is called.

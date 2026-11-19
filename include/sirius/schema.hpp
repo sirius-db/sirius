@@ -15,10 +15,17 @@
 #include <vector>
 
 namespace sirius {
-/// Primitive column type. Values may be copied between threads.
+/// Physical type of a schema field or expression. Values may be copied between threads.
+/// @code{.cpp}
+/// auto type = sirius::DataType::int64;
+/// @endcode
 enum class DataType : sirius_data_type { boolean = SIRIUS_TYPE_BOOLEAN, int64 = SIRIUS_TYPE_INT64 };
 
-/// Owned field descriptor. Concurrent readers are safe while its members are unmodified.
+/// One named column. Schema::create copies the descriptor, including its name.
+/// Concurrent readers are safe while its members are unmodified.
+/// @code{.cpp}
+/// sirius::Field id_field{"id", sirius::DataType::int64, false};
+/// @endcode
 struct Field {
   std::string name;                  ///< Nonempty, case-sensitive UTF-8 name.
   DataType type{DataType::boolean};  ///< Physical value type.
@@ -26,6 +33,7 @@ struct Field {
 };
 
 /** @brief Validated ordered fields with unique names.
+ * @see @ref cpp_plan_construction "Construct a physical plan" for a complete example.
  * @par Thread safety
  * Copies share immutable storage. Concurrent const operations and copying are safe
  * while the source is alive. Assignment and destruction require exclusive access
@@ -35,12 +43,12 @@ class Schema {
  public:
   /// Share ownership of the same immutable object.
   /// @code{.cpp}
-  /// Schema copy = value;
+  /// sirius::Schema copy = *schema;
   /// @endcode
   Schema(const Schema& other) noexcept : handle_(other.handle_) { sirius_schema_retain(handle_); }
   /// Replace this reference with another owning reference.
   /// @code{.cpp}
-  /// copy = value;
+  /// copy = *schema;
   /// @endcode
   Schema& operator=(const Schema& other) noexcept
   {
@@ -51,14 +59,20 @@ class Schema {
   }
   /// Release this owning reference.
   /// @code{.cpp}
-  /// { auto copy = value; }
+  /// { auto copy = *schema; }
   /// @endcode
   ~Schema() noexcept { sirius_schema_release(handle_); }
 
-  /// Copy the fields into an immutable schema.
+  /// Copy the fields in their supplied order. Column indices follow this order.
+  /// Returns ErrorCode::invalid_argument for an empty schema, unsupported types, duplicate or
+  /// invalid names, or a field list too large to represent. Names must be nonempty UTF-8 without
+  /// embedded NUL bytes. Name comparison is case-sensitive and compares the exact bytes. Allocation
+  /// and unexpected native failures return ErrorCode::allocation_failure and
+  /// ErrorCode::internal_error, respectively.
   /// @code{.cpp}
   /// sirius::Field fields[] = {{"id", sirius::DataType::int64, false}};
   /// auto schema = sirius::Schema::create(fields);
+  /// if (!schema) return std::unexpected(schema.error());
   /// @endcode
   [[nodiscard]] static std::expected<Schema, Error> create(std::span<const Field> fields) noexcept
   {
@@ -85,13 +99,16 @@ class Schema {
 
   /// Return the number of fields.
   /// @code{.cpp}
-  /// auto columns = schema.size();
+  /// auto columns = schema->size();
   /// @endcode
   [[nodiscard]] std::size_t size() const noexcept { return sirius_schema_field_count(handle_); }
 
-  /// Return an owning copy of the field at a zero-based position.
+  /// Return an owning copy of the field at a zero-based position. The field and its
+  /// name remain usable after the schema is destroyed. An out-of-range index or a name too large
+  /// for std::string returns ErrorCode::invalid_argument. Copying the name can return
+  /// ErrorCode::allocation_failure. Unexpected native failures return ErrorCode::internal_error.
   /// @code{.cpp}
-  /// auto first = schema.field(0);
+  /// auto first = schema->field(0);
   /// @endcode
   [[nodiscard]] std::expected<Field, Error> field(std::size_t index) const noexcept
   {
