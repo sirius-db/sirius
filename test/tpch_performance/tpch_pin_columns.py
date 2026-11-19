@@ -281,14 +281,26 @@ def _pin_call(
         f"SIRIUS_PIN_TIER_{table.upper()}", os.environ.get("SIRIUS_PIN_TIER", "gpu")
     )
     col_literals = ",".join(f"'{c}'" for c in cols)
+    # An explicit allowlist keeps all other tables raw even when the session
+    # enables pin compression and the engine can choose plans automatically.
+    compression_tables = os.environ.get("SIRIUS_PIN_COMPRESSION_TABLES")
+    compression_arg = ""
+    if compression_tables is not None:
+        selected = {name.strip().lower() for name in compression_tables.split(",")}
+        compression_arg = (
+            f", compression={'true' if table.lower() in selected else 'false'}"
+        )
     if data_source == "duckdb":
         return (
             f"CALL pin_table(format='duckdb', tier='{tier}', "
-            f"name='{table}', cols=[{col_literals}]);"
+            f"name='{table}', cols=[{col_literals}]{compression_arg});"
         )
     path = pin_globs[table] if pin_globs is not None else detect_pin_glob(source, table)
     path_literal = path.replace("'", "''")
-    return f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    return (
+        f"CALL pin_table('{path_literal}', tier='{tier}', name='{table}', "
+        f"cols=[{col_literals}]{compression_arg});"
+    )
 
 
 def emit_pin(

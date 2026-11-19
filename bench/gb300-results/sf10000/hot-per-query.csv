@@ -1,0 +1,23 @@
+query,iteration_0_s,iteration_1_s,source_config
+q1,36.292368,28.581828,regular hot
+q2,4.375754,2.469082,regular hot
+q3,31.439288,30.892151,regular hot
+q4,19.488250,11.353387,regular hot
+q5,37.946731,38.211948,regular hot
+q6,23.968435,24.350467,regular hot
+q7,44.156737,43.600504,regular hot
+q8,47.676915,49.934863,regular hot
+q9,86.538011,87.578930,regular hot
+q10,56.203902,55.164320,special Q10 hot (8Gi hash table)
+q11,4.642757,2.708416,regular hot
+q12,25.179334,25.476795,regular hot
+q13,23.937830,15.636293,regular hot
+q14,39.921803,39.334506,regular hot
+q15,36.701263,36.043302,regular hot
+q16,3.485133,2.908345,regular hot
+q17,50.883107,52.251556,regular hot
+q18,47.789850,42.891326,regular hot
+q19,41.759559,40.791326,regular hot
+q20,44.791179,42.602795,regular hot
+q21,64.325397,64.544971,regular hot
+q22,6.218388,3.005248,regular hot
