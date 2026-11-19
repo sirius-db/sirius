@@ -1,7 +1,7 @@
 # Per-query Quent tier movements
 
 These are the byte counts recorded by Quent for the original GB300 TPC-H
-Parquet runs. The SF1000 pin and SF3000 timing results were later replaced;
+Parquet runs. The SF1000 pin, SF3000, and SF10000 cold/hot timing results were later replaced;
 these movement counts still refer to their earlier runs. [Per-query totals](per-query.csv) sum both iterations for cold
 and hot (one iteration for pin); [per-execution values](per-execution.csv) keep
 the iterations separate. Every Q1–Q22 appears, including zero-move queries.

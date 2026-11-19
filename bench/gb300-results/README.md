@@ -6,6 +6,8 @@ was updated from a run on commit `220d1447a60f443745f53196fc6c4bbd85478075`.
 The SF3000 cold and hot results were rerun on commit
 `dd588a0bc731304a92db86684bf4e8535d4f10a8`; its host-pin result was rerun
 on commit `56f49801607afbf1353ebded286e562c64012fe4`.
+The SF10000 cold and hot results were rerun on commit
+`6865c9dcf477c3948f944a0f9291f1fd68fc076f`.
 The cold/hot/per-query-pin
 snapshot uses one GPU and TPC-H Parquet at SF100, SF300, SF1000, SF3000, and SF10000; the
 concurrency snapshot below covers SF100, SF300, and SF1000. The configs are in
@@ -34,7 +36,7 @@ enabled. These config updates do not constitute a benchmark rerun.
 | SF300 | 20.477 / 20.386 | 15.258 / 13.389 | 3.273 |
 | SF1000 | 65.080 / 65.099 | 47.432 / 40.771 | 7.017 |
 | SF3000 | 187.668 / 185.831 | 146.419 / 118.721 | 21.927 |
-| SF10000 | 767.324 / 783.834 | 777.722 / 740.332 | Unavailable: Q13 host pin failed |
+| SF10000 | 779.923 / 808.187 | 806.164 / 810.056 | Unavailable: Q13 host pin failed |
 
 Times sum the 22 query executions; setup, cache flushing, and pin/unpin time are
 excluded. Cold and hot use two iterations, spill compression, RA8, and no pinning.
@@ -45,7 +47,8 @@ SF10000 cold and hot totals combine a 21-query run with a separate Q10 run using
 the saved 8 GiB build-hash-table limit. They are composite query-time sums, not
 uninterrupted 22-query session times. The regular cold and hot configs use the
 same settings at all five scales; the Q10 configs differ only by that hash
-limit.
+limit. In the updated SF10000 runs, Q10 took 35.302984 / 32.995593 s cold and
+41.690828 / 31.833478 s hot.
 
 The SF100, SF300, SF1000, and SF3000 pin results use `bench/gb300-pin/config.yaml`, one hot-profile
 iteration, per-query host pinning, and Simpatico input compression. The pinned
@@ -65,9 +68,9 @@ is no selected SF10000 pin timing to report.
 Each `sf*/` directory contains the selected per-query CSVs. `manifest.json`
 records the exact totals, config paths, checksums, and the SF10000 pin failure.
 CSV line endings were normalized from CRLF to LF; the manifest retains both the
-original snapshot and current checksums. The SF1000 pin and SF3000 CSVs are
-selected replacements, with their source commits and superseded totals recorded
-separately in the manifest.
+original snapshot and current checksums. The SF1000 pin, SF3000, and SF10000
+cold/hot CSVs are selected replacements, with their source commits and
+superseded totals recorded separately in the manifest.
 The later SF10000 fresh-instance cold rerun remains outside this snapshot.
 SF100 and SF300 were copied to the same RAID dataset mount as the larger scales
 before their six runs. They used the same Sirius source commit, binary, configs,
@@ -76,7 +79,7 @@ and Simpatico plans as the earlier selected runs.
 [Per-query Quent tier movements](quent-transfers/README.md) report how many
 bytes entered host and disk memory during the original SF1000, SF3000, and
 SF10000 query executions. Those trace counts have not been refreshed for the
-newer SF1000 pin or SF3000 timings.
+newer SF1000 pin, SF3000, or SF10000 cold/hot timings.
 
 ## Host-pinned Parquet concurrency
 
