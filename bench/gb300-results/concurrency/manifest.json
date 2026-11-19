@@ -9,6 +9,7 @@
   },
   "base_config": "bench/gb300-pin/config.yaml",
   "base_config_sha256": "05ee1859be0123cf8f2bf4a851953169375ce40f028a2aedcec455f565ee977c",
+  "current_base_config_sha256": "b671547162bcdda552607662901c0cfdebf7f71c6a6bee5be0fe91b9d20fa191",
   "simpatico_plans": {
     "bench/sf1000-repro/plans/lineitem.txt": "7523e0156194273025386cd25d92e8dbbbda9daeb7db94e5d21b9f234a3114ba",
     "bench/sf1000-repro/plans/orders.txt": "6880dd98ec1e2dac0056cd2620b233d2923e2065ebc00659385776fef468fcc5"

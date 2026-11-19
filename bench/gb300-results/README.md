@@ -8,6 +8,21 @@ concurrency snapshot below covers SF100, SF300, and SF1000. The configs are in
 `bench/gb300-hot/`, `bench/gb300-pin/`, and the two SF10k Q10 directories. The
 `--profile` option now preserves those YAML cache settings.
 
+The saved configs use the current names `scan_manager.backend: native` and
+`scan_manager.cache.mode: cucs`. The benchmarked versions spelled both values
+`sirius`; those spellings are aliases for the same backend and cache mode. The
+manifest retains the original config checksums separately from the checksums of
+the files in this PR. Sirius `main` now defaults to `native`, `cucs`, and LRU
+eviction; these configs keep the values explicit for reproducibility, including
+the cold config's intentional `idle` eviction. The old
+`SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`, and
+`SIRIUS_EXP_LOWCARD_GROUPBY` environment flags are no longer read; the matching
+SQL/YAML optimization settings default to enabled. The old
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` flag is also no longer read; eligible
+pinned Parquet columns are checked for uniqueness by default. Late
+materialization currently refuses host-tier pins, even though its setting is
+enabled. These config updates do not constitute a benchmark rerun.
+
 | Scale | Cold, iterations 0 / 1 (s) | Hot, iterations 0 / 1 (s) | Host pin (s) |
 | ---: | ---: | ---: | ---: |
 | SF100 | 7.862 / 7.777 | 6.484 / 5.532 | 1.612 |

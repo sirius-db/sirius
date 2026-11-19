@@ -1,8 +1,8 @@
 {
   "checksums_sha256": {
-    "bench/gb300-cold/config.yaml": "bdb108fd8fe888e6ca0542ed5e98141049eb9eb83cf33725f8c7e4b476ff7cbf",
-    "bench/gb300-hot/config.yaml": "0d30afde6b37135819b59eaf46821d06ed99278c6cf96fc1e201ef734bfad237",
-    "bench/gb300-pin/config.yaml": "05ee1859be0123cf8f2bf4a851953169375ce40f028a2aedcec455f565ee977c",
+    "bench/gb300-cold/config.yaml": "0553ff8d5a0bd614c339ae8851f02ecd50d4a0b2d98faa1ff5c44cb2426af4e6",
+    "bench/gb300-hot/config.yaml": "25e9cf7fbba828ba207579fd95bea1e2971a4b31487dfc45e84910b5df5541fa",
+    "bench/gb300-pin/config.yaml": "b671547162bcdda552607662901c0cfdebf7f71c6a6bee5be0fe91b9d20fa191",
     "bench/gb300-results/sf100/cold-per-query.csv": "b59991159bdd31740218232df23a8e17f9d40f8fe8ea91133cd64b79ab95293b",
     "bench/gb300-results/sf100/hot-per-query.csv": "82ffafc4862787931b85d06a0bd0ea680d7e9452357e1b4eb242d27e0af718e9",
     "bench/gb300-results/sf100/pin-per-query.csv": "d879128e11c324bd68360c981ac93d7e6f9247f32b313ae951969c036481c318",
@@ -17,10 +17,17 @@
     "bench/gb300-results/sf3000/cold-per-query.csv": "23c01e5752884e1bd3c9a969ab34c9ee971e8285cef275f1e35a81a3a32a0c68",
     "bench/gb300-results/sf3000/hot-per-query.csv": "39cef565a40e48964bf968e98207a55e8256a0f8c4161d78c2487c77c22714a4",
     "bench/gb300-results/sf3000/pin-per-query.csv": "31162db0a84b3391a1d10fe61f1376823d4e9e63d68459da0abe907b34887161",
-    "bench/gb300-sf10k-q10-cold/config.yaml": "a7dbe70532e5708972711e4c763e6179d218b5f805df325e9ae920d1e47090a8",
-    "bench/gb300-sf10k-q10-hot/config.yaml": "9c4279da81edddb44d473a7fc9ecdba6f1bc4719be58b7581c0840b4ea1ff155",
+    "bench/gb300-sf10k-q10-cold/config.yaml": "4882706ad8b3e937b4c45681b2671b1a894a9ed459dab4e581d0c48e39e44887",
+    "bench/gb300-sf10k-q10-hot/config.yaml": "31f5f84dfad4f635b1aaa11c4c835903e254154f6c80f585496513595e9a8b18",
     "src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
     "src/compression/simpatico_codegen/plans/tpch_sf1000/orders.txt": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "original_config_checksums_sha256": {
+    "bench/gb300-cold/config.yaml": "bdb108fd8fe888e6ca0542ed5e98141049eb9eb83cf33725f8c7e4b476ff7cbf",
+    "bench/gb300-hot/config.yaml": "0d30afde6b37135819b59eaf46821d06ed99278c6cf96fc1e201ef734bfad237",
+    "bench/gb300-pin/config.yaml": "05ee1859be0123cf8f2bf4a851953169375ce40f028a2aedcec455f565ee977c",
+    "bench/gb300-sf10k-q10-cold/config.yaml": "a7dbe70532e5708972711e4c763e6179d218b5f805df325e9ae920d1e47090a8",
+    "bench/gb300-sf10k-q10-hot/config.yaml": "9c4279da81edddb44d473a7fc9ecdba6f1bc4719be58b7581c0840b4ea1ff155"
   },
   "concurrency": 1,
   "csv_line_endings": "Selected CSV values unchanged; CRLF line endings normalized to LF for the repository.",
