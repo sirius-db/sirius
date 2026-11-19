@@ -166,6 +166,22 @@ struct port_materialize_directive {
 /// Called by planner::install_deferral, and by nothing else.
 void note_deferral_installed() noexcept;
 
+/// How many deferring scan batches built their rowid from the positions a
+/// compacting decode reported, and how many of those a residual filter then
+/// reduced again, so the two stages' positions had to be composed.
+///
+/// A deferral over a filtered compressed pin gives the same answer whether or
+/// not the decode compacted, so these are what show a test took that path.
+/// Monotonic and process-wide, like deferrals_installed.
+struct survivor_batch_counts {
+  std::uint64_t decode_reported = 0;
+  std::uint64_t composed        = 0;
+};
+[[nodiscard]] survivor_batch_counts survivor_batches() noexcept;
+
+/// Called by the scan's finish_assembly, and by nothing else.
+void note_survivor_batch(bool composed) noexcept;
+
 /// The two halves, which only mean anything together.
 struct defer_pair {
   deferred_scan_output scan;

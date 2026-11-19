@@ -361,6 +361,18 @@ void read_unresolved(duckdb::ClientContext& context,
   scan.unresolved.clear();
 }
 
+/// The statistics of each of \p files, in order, reading the footers the cache does not answer.
+/// Not limited: for the callers that process every file.
+std::vector<std::shared_ptr<file_statistics const>> statistics_of_all(
+  duckdb::ClientContext& context,
+  std::vector<duckdb::OpenFileInfo> const& files,
+  duckdb::ParquetOptions const& options)
+{
+  auto scan = cached_statistics(context, files, options);
+  read_unresolved(context, files, options, scan);
+  return std::move(scan.files);
+}
+
 duckdb::BaseStatistics const* find(file_statistics const& file, duckdb::Identifier const& name)
 {
   for (auto const& [column, stats] : file.columns) {
@@ -657,9 +669,19 @@ std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
 {
   duckdb::ParquetOptions const options(context);
   std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
-  auto scan = cached_statistics(context, files, options);
-  read_unresolved(context, files, options, scan);
-  return scan.files.size();
+  return statistics_of_all(context, files, options).size();
+}
+
+std::size_t parquet_files_row_count(duckdb::ClientContext& context,
+                                    std::vector<std::string> const& paths)
+{
+  duckdb::ParquetOptions const options(context);
+  std::vector<duckdb::OpenFileInfo> const files(paths.begin(), paths.end());
+  std::size_t rows = 0;
+  for (auto const& file : statistics_of_all(context, files, options)) {
+    rows += file->num_rows;
+  }
+  return rows;
 }
 
 std::size_t detail::merged_statistics_cache_size()

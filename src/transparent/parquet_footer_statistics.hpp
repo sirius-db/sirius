@@ -100,6 +100,11 @@ void copy_parquet_scan_row_count(duckdb::LogicalGet const& from, duckdb::Logical
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths);
 
+/// \brief The rows in all of \p paths, summed from their footers through the same cache as
+/// read_parquet_footer_statistics. Throws when a footer cannot be read.
+[[nodiscard]] std::size_t parquet_files_row_count(duckdb::ClientContext& context,
+                                                  std::vector<std::string> const& paths);
+
 namespace detail {
 /// What the caches keep once no planning is running.
 struct cache_capacities {

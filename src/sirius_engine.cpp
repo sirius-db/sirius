@@ -157,7 +157,7 @@ sirius_engine::~sirius_engine()
   try {
     query_handle_.finished();
   } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what()); });
   }
 }
 
@@ -299,14 +299,14 @@ void sirius_engine::execute()
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Error executing query: {}", e.what()); });
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Unknown error executing query");
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Unknown error executing query"); });
     cancel_dynamic_filter_publications();
     quiesce_plan_users();
     throw;

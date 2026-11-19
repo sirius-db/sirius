@@ -36,144 +36,185 @@ void expect_violation(std::optional<core::violation> const& actual,
   }
 }
 
+struct intrinsic_row {
+  std::string core::settings::* member;
+  std::string value;
+  std::string_view field;
+  reason why;
+  std::string_view text;
+};
+std::vector<intrinsic_row> const intrinsic_rows{
+  {&core::settings::endpoint, "", "endpoint", reason::required, "required"},
+  {&core::settings::region, "", "region", reason::required, "required"},
+  {&core::settings::access_key, "", "access_key", reason::required, "required"},
+  {&core::settings::secret_key, "", "secret_key", reason::required, "required"},
+  {&core::settings::endpoint,
+   "host:9000",
+   "endpoint",
+   reason::endpoint_missing_scheme,
+   "missing scheme (expected http:// or https://)"},
+  {&core::settings::endpoint,
+   "ftp://host",
+   "endpoint",
+   reason::endpoint_bad_scheme,
+   "scheme must be http or https"},
+  {&core::settings::endpoint,
+   "https://ho st",
+   "endpoint",
+   reason::endpoint_control_bytes,
+   "must not contain control bytes or spaces"},
+  {&core::settings::endpoint,
+   std::string("https://ho\0st", 13),
+   "endpoint",
+   reason::endpoint_control_bytes,
+   "must not contain control bytes or spaces"},
+  {&core::settings::endpoint,
+   "https://host\x7f",
+   "endpoint",
+   reason::endpoint_control_bytes,
+   "must not contain control bytes or spaces"},
+  {&core::settings::endpoint,
+   "https://",
+   "endpoint",
+   reason::endpoint_missing_host,
+   "missing host"},
+  {&core::settings::endpoint,
+   "https://:443",
+   "endpoint",
+   reason::endpoint_missing_host,
+   "missing host"},
+  {&core::settings::endpoint,
+   "https://host/path",
+   "endpoint",
+   reason::endpoint_has_path,
+   "must be scheme://host[:port] with no path, query or fragment"},
+  {&core::settings::endpoint,
+   "https://host?q",
+   "endpoint",
+   reason::endpoint_has_path,
+   "must be scheme://host[:port] with no path, query or fragment"},
+  {&core::settings::endpoint,
+   "https://host#f",
+   "endpoint",
+   reason::endpoint_has_path,
+   "must be scheme://host[:port] with no path, query or fragment"},
+  {&core::settings::endpoint,
+   "https://CORE_SECRET_SENTINEL@host",
+   "endpoint",
+   reason::endpoint_has_user_info,
+   "must not contain user-info"},
+  {&core::settings::endpoint,
+   "https://[::1",
+   "endpoint",
+   reason::endpoint_unterminated_ipv6,
+   "unterminated IPv6 literal"},
+  {&core::settings::endpoint,
+   "https://[::1]tail",
+   "endpoint",
+   reason::endpoint_malformed,
+   "malformed"},
+  {&core::settings::endpoint,
+   "https://host:",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::endpoint,
+   "https://host:0",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::endpoint,
+   "https://host:65536",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::endpoint,
+   "https://host:000001",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::endpoint,
+   "https://host:+1",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::endpoint,
+   "https://host:x",
+   "endpoint",
+   reason::endpoint_bad_port,
+   "port must be a decimal number in 1..65535"},
+  {&core::settings::uri_prefix,
+   "http://bucket/",
+   "uri_prefix",
+   reason::prefix_shape,
+   "must be s3://bucket/ or s3://bucket/prefix/"},
+  {&core::settings::uri_prefix,
+   "s3://bucket/path",
+   "uri_prefix",
+   reason::prefix_no_trailing_slash,
+   "must end with '/'"},
+  {&core::settings::uri_prefix,
+   "s3://bucket/path?query/",
+   "uri_prefix",
+   reason::prefix_query_or_fragment,
+   "must not contain a query or fragment"},
+  {&core::settings::uri_prefix,
+   "s3://bucket/path/../other/",
+   "uri_prefix",
+   reason::prefix_unmatchable_segment,
+   "contains a segment no key can match byte-for-byte (empty, '.', '..' or percent-encoded)"},
+};
+
 }  // namespace
 
 TEST_CASE("Object-store scope validates intrinsic field and reason pairs", "[object_store_scope]")
 {
-  struct row {
-    std::string core::settings::* member;
-    std::string value;
-    std::string_view field;
-    reason why;
-    std::string_view text;
-  };
-  std::vector<row> const rows{
-    {&core::settings::endpoint, "", "endpoint", reason::required, "required"},
-    {&core::settings::region, "", "region", reason::required, "required"},
-    {&core::settings::access_key, "", "access_key", reason::required, "required"},
-    {&core::settings::secret_key, "", "secret_key", reason::required, "required"},
-    {&core::settings::endpoint,
-     "host:9000",
-     "endpoint",
-     reason::endpoint_missing_scheme,
-     "missing scheme (expected http:// or https://)"},
-    {&core::settings::endpoint,
-     "ftp://host",
-     "endpoint",
-     reason::endpoint_bad_scheme,
-     "scheme must be http or https"},
-    {&core::settings::endpoint,
-     "https://ho st",
-     "endpoint",
-     reason::endpoint_control_bytes,
-     "must not contain control bytes or spaces"},
-    {&core::settings::endpoint,
-     std::string("https://ho\0st", 13),
-     "endpoint",
-     reason::endpoint_control_bytes,
-     "must not contain control bytes or spaces"},
-    {&core::settings::endpoint,
-     "https://host\x7f",
-     "endpoint",
-     reason::endpoint_control_bytes,
-     "must not contain control bytes or spaces"},
-    {&core::settings::endpoint,
-     "https://",
-     "endpoint",
-     reason::endpoint_missing_host,
-     "missing host"},
-    {&core::settings::endpoint,
-     "https://:443",
-     "endpoint",
-     reason::endpoint_missing_host,
-     "missing host"},
-    {&core::settings::endpoint,
-     "https://host/path",
-     "endpoint",
-     reason::endpoint_has_path,
-     "must be scheme://host[:port] with no path, query or fragment"},
-    {&core::settings::endpoint,
-     "https://host?q",
-     "endpoint",
-     reason::endpoint_has_path,
-     "must be scheme://host[:port] with no path, query or fragment"},
-    {&core::settings::endpoint,
-     "https://host#f",
-     "endpoint",
-     reason::endpoint_has_path,
-     "must be scheme://host[:port] with no path, query or fragment"},
-    {&core::settings::endpoint,
-     "https://CORE_SECRET_SENTINEL@host",
-     "endpoint",
-     reason::endpoint_has_user_info,
-     "must not contain user-info"},
-    {&core::settings::endpoint,
-     "https://[::1",
-     "endpoint",
-     reason::endpoint_unterminated_ipv6,
-     "unterminated IPv6 literal"},
-    {&core::settings::endpoint,
-     "https://[::1]tail",
-     "endpoint",
-     reason::endpoint_malformed,
-     "malformed"},
-    {&core::settings::endpoint,
-     "https://host:",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::endpoint,
-     "https://host:0",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::endpoint,
-     "https://host:65536",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::endpoint,
-     "https://host:000001",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::endpoint,
-     "https://host:+1",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::endpoint,
-     "https://host:x",
-     "endpoint",
-     reason::endpoint_bad_port,
-     "port must be a decimal number in 1..65535"},
-    {&core::settings::uri_prefix,
-     "http://bucket/",
-     "uri_prefix",
-     reason::prefix_shape,
-     "must be s3://bucket/ or s3://bucket/prefix/"},
-    {&core::settings::uri_prefix,
-     "s3://bucket/path",
-     "uri_prefix",
-     reason::prefix_no_trailing_slash,
-     "must end with '/'"},
-    {&core::settings::uri_prefix,
-     "s3://bucket/path?query/",
-     "uri_prefix",
-     reason::prefix_query_or_fragment,
-     "must not contain a query or fragment"},
-    {&core::settings::uri_prefix,
-     "s3://bucket/path/../other/",
-     "uri_prefix",
-     reason::prefix_unmatchable_segment,
-     "contains a segment no key can match byte-for-byte (empty, '.', '..' or percent-encoded)"},
-  };
-  for (auto const& test : rows) {
+  for (auto const& test : intrinsic_rows) {
     INFO(test.field << " reason " << static_cast<unsigned>(test.why));
     auto value         = valid_settings();
     value.*test.member = test.value;
     expect_violation(core::check_settings(value, {}), test.field, test.why, test.text);
   }
+}
+
+TEST_CASE("Object-store intrinsic checks share field rules but defer environment",
+          "[object_store_scope]")
+{
+  for (std::uint32_t selector : {0U, 1U, 2U, 3U, 256U, UINT32_MAX}) {
+    CHECK(core::is_declared_transport(selector) == (selector < 3));
+    CHECK(core::is_declared_signing_mode(selector) == (selector < 2));
+  }
+  for (auto const& row : intrinsic_rows) {
+    INFO(row.field);
+    auto value           = valid_settings();
+    value.*row.member    = row.value;
+    auto const intrinsic = core::check_settings_intrinsic(value);
+    auto const full      = core::check_settings(value, {});
+    REQUIRE(full);
+    if (row.member == &core::settings::uri_prefix) {
+      CHECK_FALSE(intrinsic);
+      CHECK(full->field == row.field);
+      CHECK(full->why == row.why);
+    } else {
+      REQUIRE(intrinsic);
+      CHECK(intrinsic->field == full->field);
+      CHECK(intrinsic->why == full->why);
+    }
+  }
+  temporary_files files;
+  auto value           = valid_settings();
+  value.ca_bundle_path = files.directory.string();
+  CHECK_FALSE(core::check_settings_intrinsic(value));
+  expect_violation(core::check_settings(value, {}),
+                   "ca_bundle_path",
+                   reason::ca_bundle_not_regular_file,
+                   "is not a regular file");
+  value.uri_prefix = "http://invalid/";
+  CHECK_FALSE(core::check_settings_intrinsic(value));
+  expect_violation(core::check_settings(value, {}),
+                   "ca_bundle_path",
+                   reason::ca_bundle_not_regular_file,
+                   "is not a regular file");
 }
 
 TEST_CASE("Object-store scope preserves endpoint and field precedence", "[object_store_scope]")

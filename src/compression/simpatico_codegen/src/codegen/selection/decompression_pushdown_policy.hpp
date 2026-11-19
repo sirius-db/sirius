@@ -16,7 +16,8 @@ struct fused_scan_policy {
   /// Maximum surviving-row fraction for compactable outputs. Dictionary
   /// gathers may bypass this ceiling, so their forecasts remain unbounded.
   double max_selectivity = 0.35;
-  /// Full-width decode plus gather pays off only at low selectivity.
+  /// Full-width decode plus gather pays off only at low selectivity. A batch
+  /// that also has a dictionary gather uses max_selectivity, if larger.
   double full_route_max_selectivity = 0.10;
   /// Prefer survivor-index enumeration below this fraction. A tiny positive
   /// value effectively disables the index walk.

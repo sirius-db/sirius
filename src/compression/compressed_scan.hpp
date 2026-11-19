@@ -207,6 +207,16 @@ struct pushdown_request {
   /// adds no conjunct and counts towards neither @ref empty nor @ref selects_rows.
   std::optional<std::size_t> output_prefix_width;
 
+  /// Ask the decode to hand back the positions of the rows it kept, as
+  /// ascending chunk-local indices (@ref pushdown_outcome::survivor_rows).
+  ///
+  /// Set only by a scan carrying a late-materialization deferral: its rowid
+  /// addresses the pinned chunk, and a compacted batch no longer holds that
+  /// chunk's rows in order. Costs one index-list expansion of the selection
+  /// mask the decode already built, plus 4 bytes per surviving row; off, the
+  /// decode does neither.
+  bool report_survivors = false;
+
   [[nodiscard]] bool empty() const noexcept;
   /// True iff any entry asks for rows to be DROPPED (as opposed to a column
   /// being answered in place, which changes no row count).
@@ -307,9 +317,25 @@ struct pushdown_outcome {
   /// as unfiltered by them as one decoded without them.
   bool membership_skipped = false;
 
+  /// The decode DROPPED rows: the columns are compacted to the survivors, so
+  /// the batch no longer holds the chunk's rows in order.
+  ///
+  /// Distinct from @ref row_filtered, which additionally claims the whole
+  /// filter was carried. A partially applied request compacts without setting
+  /// that, and a consumer addressing the pinned chunk by position has to know.
+  bool compacted = false;
+
+  /// Chunk-local positions of the rows @ref compacted kept, ascending, INT32,
+  /// one entry per output row. Populated only when the request asked
+  /// (@ref pushdown_request::report_survivors); null otherwise.
+  ///
+  /// Shared rather than owned so the outcome stays copyable, which is what lets
+  /// it ride on the representation as a value.
+  std::shared_ptr<cudf::column const> survivor_rows;
+
   [[nodiscard]] bool any() const noexcept
   {
-    return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
+    return row_filtered || selection_unprofitable || compacted || !predicate_columns.empty() ||
            visibility_mask_applied || filter_only_columns_dropped || membership_keep.has_value() ||
            membership_skipped;
   }
@@ -345,6 +371,11 @@ class decompression_pushdown_scan {
   /// A copy of this scan whose request carries the scan's per-slot restore types.
   [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_output_types(
     std::vector<std::optional<cudf::data_type>> output_types) const;
+
+  /// This scan with @c pushdown_request::report_survivors set — what a split
+  /// carrying a late-materialization deferral attaches before its decode.
+  /// Never null: it only adds an obligation to a request that already exists.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_survivor_reporting() const;
 
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
   /// is parallel to the selected column list; @p measurement says whether the decode reports

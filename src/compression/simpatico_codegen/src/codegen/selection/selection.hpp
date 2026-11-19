@@ -102,6 +102,8 @@ struct range_predicate {
 //                 survivors/rows <= fused_scan.full_route_max_selectivity
 //                 (default 0.10), else the decode gives compaction up
 //                 (measured losses at high selectivity: q1 +43.5%, q5 +6.2%).
+//                 Beside a dict_codes output the ceiling is
+//                 fused_scan.max_selectivity instead.
 //   bitpack_mask— a bitpack root decoded straight into a compacted
 //                 survivor_count-row column, skipping the writes for rejected
 //                 rows.
@@ -111,7 +113,9 @@ struct range_predicate {
 //                 survivor count. Economics differ from the write-skipping
 //                 routes: this wins 2.1-2.6x at ALL selectivities (it skips the
 //                 full string materialization round trip), so the selectivity
-//                 ceiling does NOT apply to a batch with such an output.
+//                 ceiling does NOT apply to a batch with such an output, and a
+//                 batch that also has `full` outputs gets the ordinary ceiling
+//                 rather than the full-route one.
 //   str_split   — str_split strings: masked offsets reconstruction plus a
 //                 survivor-only chars byte-gather. Shaped like the dictionary
 //                 case (skipped char materialization scales with selectivity)
