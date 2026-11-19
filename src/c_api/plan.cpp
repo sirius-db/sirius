@@ -131,10 +131,10 @@ std::string describe(const sirius_plan_node& root)
 
 sirius_status sirius_schema_create(const sirius_field* fields,
                                    size_t count,
-                                   sirius_schema** out,
-                                   sirius_error** error) noexcept
+                                   sirius_schema** out_schema,
+                                   sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_schema, out_error, [&] {
     require(fields && count, "Expected a nonempty schema");
     std::vector<field> result;
     std::set<std::string> names;
@@ -156,36 +156,36 @@ size_t sirius_schema_field_count(const sirius_schema* schema) noexcept
 }
 sirius_status sirius_schema_field(const sirius_schema* schema,
                                   size_t index,
-                                  sirius_field* out,
-                                  sirius_error** error) noexcept
+                                  sirius_field* out_field,
+                                  sirius_error** out_error) noexcept
 {
-  if (out) { *out = {}; }
-  return checked(error, [&] {
-    require(schema && out, "Schema or output pointer is NULL");
+  if (out_field) { *out_field = {}; }
+  return checked(out_error, [&] {
+    require(schema && out_field, "Schema or output pointer is NULL");
     require(index < schema->fields.size(), "Field index is out of range");
     const auto& field = schema->fields[index];
-    *out = {field.name.c_str(), field.name.size(), field.type, uint32_t{field.nullable}};
+    *out_field = {field.name.c_str(), field.name.size(), field.type, uint32_t{field.nullable}};
   });
 }
 sirius_status sirius_plan_scan_parquet(const char* path,
-                                       size_t size,
+                                       size_t path_size,
                                        const sirius_schema* schema,
-                                       sirius_plan_node** out,
-                                       sirius_error** error) noexcept
+                                       sirius_plan_node** out_node,
+                                       sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_node, out_error, [&] {
     require(schema != nullptr, "Schema is NULL");
-    auto name = bytes(path, size);
+    auto name = bytes(path, path_size);
     require(!has_uri_scheme(name), "Expected a local file path without a URI scheme");
     return new sirius_plan_node(acquire(schema), parquet_scan{std::move(name)}, 1);
   });
 }
 sirius_status sirius_expression_column(const sirius_plan_node* input,
                                        size_t index,
-                                       sirius_expression** out,
-                                       sirius_error** error) noexcept
+                                       sirius_expression** out_expression,
+                                       sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_expression, out_error, [&] {
     require(input != nullptr, "Input node is NULL");
     require(index < input->schema->fields.size(), "Column index is out of range");
     const auto& field = input->schema->fields[index];
@@ -193,17 +193,18 @@ sirius_status sirius_expression_column(const sirius_plan_node* input,
   });
 }
 sirius_status sirius_expression_literal_int64(int64_t value,
-                                              sirius_expression** out,
-                                              sirius_error** error) noexcept
+                                              sirius_expression** out_expression,
+                                              sirius_error** out_error) noexcept
 {
-  return create(
-    out, error, [&] { return new sirius_expression(SIRIUS_TYPE_INT64, false, {}, value, 1); });
+  return create(out_expression, out_error, [&] {
+    return new sirius_expression(SIRIUS_TYPE_INT64, false, {}, value, 1);
+  });
 }
 sirius_status sirius_expression_literal_boolean(uint32_t value,
-                                                sirius_expression** out,
-                                                sirius_error** error) noexcept
+                                                sirius_expression** out_expression,
+                                                sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_expression, out_error, [&] {
     require(value <= 1, "Boolean literal must be 0 or 1");
     return new sirius_expression(SIRIUS_TYPE_BOOLEAN, false, {}, value != 0, 1);
   });
@@ -211,10 +212,10 @@ sirius_status sirius_expression_literal_boolean(uint32_t value,
 sirius_status sirius_expression_compare(const sirius_expression* left,
                                         sirius_comparison operation,
                                         const sirius_expression* right,
-                                        sirius_expression** out,
-                                        sirius_error** error) noexcept
+                                        sirius_expression** out_expression,
+                                        sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_expression, out_error, [&] {
     require(left && right, "Comparison operand is NULL");
     require(operation <= SIRIUS_COMPARISON_GREATER_EQUAL, "Unknown comparison");
     require(left->type == right->type, "Comparison types differ");
@@ -234,10 +235,10 @@ sirius_status sirius_expression_compare(const sirius_expression* left,
 }
 sirius_status sirius_plan_filter(const sirius_plan_node* input,
                                  const sirius_expression* predicate,
-                                 sirius_plan_node** out,
-                                 sirius_error** error) noexcept
+                                 sirius_plan_node** out_node,
+                                 sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_node, out_error, [&] {
     require(input && predicate, "Filter input or predicate is NULL");
     require(predicate->type == SIRIUS_TYPE_BOOLEAN, "Filter predicate is not Boolean");
     require(!predicate->scope || predicate->scope.get() == input,
@@ -273,10 +274,10 @@ sirius_schema* sirius_plan_node_schema(const sirius_plan_node* node) noexcept
   return node ? node->schema.get() : nullptr;
 }
 sirius_status sirius_plan_from_root(const sirius_plan_node* root,
-                                    sirius_plan** out,
-                                    sirius_error** error) noexcept
+                                    sirius_plan** out_plan,
+                                    sirius_error** out_error) noexcept
 {
-  return create(out, error, [&] {
+  return create(out_plan, out_error, [&] {
     require(root != nullptr, "Root is NULL");
     return new sirius_plan(acquire(root), describe(*root));
   });

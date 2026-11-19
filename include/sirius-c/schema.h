@@ -41,7 +41,7 @@ typedef struct sirius_field {
  * every call. Never release a reference concurrently with its use. Output slots require
  * exclusive access. Borrowed inspection results live until their owning handle is released. */
 typedef struct sirius_schema sirius_schema;
-/** Copy a nonempty array of fields into an owned schema. fields and out must not be NULL.
+/** Copy a nonempty array of fields into an owned schema. fields and out_schema must not be NULL.
  * @code{.c}
  * sirius_field field = {"id", 2, SIRIUS_TYPE_INT64, 1};
  * sirius_schema *schema = NULL;
@@ -50,16 +50,16 @@ typedef struct sirius_schema sirius_schema;
  */
 SIRIUS_EXPORT sirius_status sirius_schema_create(const sirius_field* fields,
                                                  size_t count,
-                                                 sirius_schema** out,
-                                                 sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                                 sirius_schema** out_schema,
+                                                 sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Return the number of fields; zero for NULL.
  * @code{.c}
  * size_t columns = sirius_schema_field_count(schema);
  * @endcode
  */
 SIRIUS_EXPORT size_t sirius_schema_field_count(const sirius_schema* schema) SIRIUS_C_NOEXCEPT;
-/** Borrow a field by zero-based position. out is cleared on failure. The returned name
- * is owned by schema; schema and out must not be NULL.
+/** Borrow a field by zero-based position. out_field is cleared on failure. The returned name
+ * is owned by schema; schema and out_field must not be NULL.
  * @code{.c}
  * sirius_field field = {0};
  * sirius_status status = sirius_schema_field(schema, 0, &field, NULL);
@@ -67,8 +67,8 @@ SIRIUS_EXPORT size_t sirius_schema_field_count(const sirius_schema* schema) SIRI
  */
 SIRIUS_EXPORT sirius_status sirius_schema_field(const sirius_schema* schema,
                                                 size_t index,
-                                                sirius_field* out,
-                                                sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                                sirius_field* out_field,
+                                                sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Acquire another owning reference without allocating; NULL is allowed.
  * @code{.c}
  * sirius_schema_retain(schema);

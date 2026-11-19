@@ -59,19 +59,19 @@ enum {
  * to identify that literal POSIX filename.
  * Relative paths use the working directory at future preparation time.
  * No file is opened or schema inferred; preparation must bind the source
- * and check its schema and engine support. schema and out must not be NULL.
+ * and check its schema and engine support. schema and out_node must not be NULL.
  * @code{.c}
  * sirius_plan_node *scan = NULL;
  * sirius_status status = sirius_plan_scan_parquet("data.parquet", 12, schema, &scan, NULL);
  * @endcode
  */
 SIRIUS_EXPORT sirius_status sirius_plan_scan_parquet(const char* path,
-                                                     size_t size,
+                                                     size_t path_size,
                                                      const sirius_schema* schema,
-                                                     sirius_plan_node** out,
-                                                     sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                                     sirius_plan_node** out_node,
+                                                     sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Create a reference scoped to input at a zero-based column position. Its type and
- * nullability come from the schema. input and out must not be NULL.
+ * nullability come from the schema. input and out_expression must not be NULL.
  * @code{.c}
  * sirius_expression *column = NULL;
  * sirius_status status = sirius_expression_column(scan, 0, &column, NULL);
@@ -79,31 +79,30 @@ SIRIUS_EXPORT sirius_status sirius_plan_scan_parquet(const char* path,
  */
 SIRIUS_EXPORT sirius_status sirius_expression_column(const sirius_plan_node* input,
                                                      size_t column,
-                                                     sirius_expression** out,
-                                                     sirius_error** error) SIRIUS_C_NOEXCEPT;
-/** Create a non-null Int64 literal with no input scope. out must not be NULL.
+                                                     sirius_expression** out_expression,
+                                                     sirius_error** out_error) SIRIUS_C_NOEXCEPT;
+/** Create a non-null Int64 literal with no input scope. out_expression must not be NULL.
  * @code{.c}
  * sirius_expression *ten = NULL;
  * sirius_status status = sirius_expression_literal_int64(10, &ten, NULL);
  * @endcode
  */
-SIRIUS_EXPORT sirius_status sirius_expression_literal_int64(int64_t value,
-                                                            sirius_expression** out,
-                                                            sirius_error** error) SIRIUS_C_NOEXCEPT;
+SIRIUS_EXPORT sirius_status sirius_expression_literal_int64(
+  int64_t value, sirius_expression** out_expression, sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Create a non-null Boolean literal with no input scope. value is exactly 0 or 1;
- * out must not be NULL.
+ * out_expression must not be NULL.
  * @code{.c}
  * sirius_expression *yes = NULL;
  * sirius_status status = sirius_expression_literal_boolean(1, &yes, NULL);
  * @endcode
  */
 SIRIUS_EXPORT sirius_status sirius_expression_literal_boolean(
-  uint32_t value, sirius_expression** out, sirius_error** error) SIRIUS_C_NOEXCEPT;
+  uint32_t value, sirius_expression** out_expression, sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Compare two expressions with identical types and compatible scopes. An unscoped
  * expression is compatible with either scope; otherwise both must reference the same input node.
  * Int64 supports all comparisons; Boolean supports equality and inequality. The result is
  * Boolean, nullable if either operand is nullable. SQL NULL comparisons produce NULL.
- * left, right, and out must not be NULL.
+ * left, right, and out_expression must not be NULL.
  * @code{.c}
  * sirius_expression *predicate = NULL;
  * sirius_status status = sirius_expression_compare(column, SIRIUS_COMPARISON_GREATER, ten,
@@ -113,11 +112,11 @@ SIRIUS_EXPORT sirius_status sirius_expression_literal_boolean(
 SIRIUS_EXPORT sirius_status sirius_expression_compare(const sirius_expression* left,
                                                       sirius_comparison operation,
                                                       const sirius_expression* right,
-                                                      sirius_expression** out,
-                                                      sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                                      sirius_expression** out_expression,
+                                                      sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Create an explicit filter preserving the input schema. Only TRUE rows survive;
  * FALSE and NULL rows are discarded. predicate must be Boolean and either unscoped or
- * scoped to input. input, predicate, and out must not be NULL.
+ * scoped to input. input, predicate, and out_node must not be NULL.
  * @code{.c}
  * sirius_plan_node *filtered = NULL;
  * sirius_status status = sirius_plan_filter(scan, predicate, &filtered, NULL);
@@ -125,8 +124,8 @@ SIRIUS_EXPORT sirius_status sirius_expression_compare(const sirius_expression* l
  */
 SIRIUS_EXPORT sirius_status sirius_plan_filter(const sirius_plan_node* input,
                                                const sirius_expression* predicate,
-                                               sirius_plan_node** out,
-                                               sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                               sirius_plan_node** out_node,
+                                               sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Return the expression result type; zero for NULL.
  * @code{.c}
  * sirius_data_type type = sirius_expression_type(predicate);
@@ -165,15 +164,15 @@ SIRIUS_EXPORT sirius_plan_node* sirius_plan_node_input(const sirius_plan_node* n
 SIRIUS_EXPORT sirius_schema* sirius_plan_node_schema(const sirius_plan_node* node)
   SIRIUS_C_NOEXCEPT;
 /** Create a single-root physical plan without binding any runtime resources.
- * root and out must not be NULL. The result retains root independently.
+ * root and out_plan must not be NULL. The result retains root independently.
  * @code{.c}
  * sirius_plan *plan = NULL;
  * sirius_status status = sirius_plan_from_root(filtered, &plan, NULL);
  * @endcode
  */
 SIRIUS_EXPORT sirius_status sirius_plan_from_root(const sirius_plan_node* root,
-                                                  sirius_plan** out,
-                                                  sirius_error** error) SIRIUS_C_NOEXCEPT;
+                                                  sirius_plan** out_plan,
+                                                  sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Borrow the immutable root; NULL for a NULL plan. Retain it before releasing plan
  * if it is needed independently.
  * @code{.c}
