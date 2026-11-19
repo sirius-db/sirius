@@ -1,12 +1,23 @@
-//! Safe Rust bindings to the public Sirius C ABI.
+#![warn(missing_docs)]
+//! Configure Sirius and construct immutable query plans in Rust.
 //!
-//! Build immutable configurations with [`ContextConfigBuilder`] and physical plans with [`PlanNode`].
-//! These bindings require no C++ compilation.
-//! Existing execution and object-store bindings live in the `sirius-ffi` crate.
+//! Use [`ContextConfigBuilder`] to load a YAML configuration or select the built-in
+//! defaults. Use [`Schema`], [`PlanNode`], and [`Expression`] to describe a query,
+//! then call [`Plan::from_root`] to finish it. Plan construction requires no GPU or
+//! engine context. For a Parquet scan, supply the schema you expect to read.
 //!
-//! Build and inspect a local Parquet scan with a typed filter:
+//! This crate manages native handle lifetimes for you. It calls the public C ABI
+//! through `sirius-sys`. The [C reference](https://sirius-db.github.io/sirius/c/)
+//! describes the underlying handles, and the [C++ reference](https://sirius-db.github.io/sirius/cpp/)
+//! documents the corresponding C++ API. Rust applications can use these bindings
+//! without compiling C++. Execution and object-store bindings live in `sirius-ffi`.
 //!
-//! ```no_run
+//! # Example
+//!
+//! Construct a scan of `data.parquet` and keep rows where `id > 10`. The example
+//! prints the plan description without opening the file or executing the query.
+//!
+//! ```rust
 #![doc = include_str!("../examples/plan.rs")]
 //! ```
 

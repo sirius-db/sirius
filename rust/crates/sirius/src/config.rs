@@ -6,24 +6,52 @@ use crate::diagnostic::Diagnostic;
 use sirius_sys::c_api;
 use std::ptr::NonNull;
 
-/// A failure while constructing a configuration.
+/// A failure while loading settings or building a [`ContextConfig`].
+///
+/// Match variants to decide how to recover. Use [`Display`](std::fmt::Display)
+/// to show a diagnostic even when the native message is empty.
+///
+/// ```no_run
+/// use sirius::{ConfigError, ContextConfigBuilder};
+///
+/// let builder = match ContextConfigBuilder::from_yaml("sirius.yaml") {
+///     Ok(builder) => builder,
+///     Err(ConfigError::Io(_)) => ContextConfigBuilder::new()?,
+///     Err(error) => return Err(error),
+/// };
+/// let config = builder.build()?;
+/// # Ok::<(), ConfigError>(())
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigError {
     /// The native library reported allocation failure.
     AllocationFailure,
-    /// A configuration file could not be opened or read.
+    /// The file could not be opened or read. Carries the native I/O diagnostic.
     Io(String),
-    /// The input could not be parsed as YAML.
+    /// The file could not be parsed as YAML. Carries the parser diagnostic.
     MalformedYaml(String),
-    /// Settings are unknown, invalid, or conflicting.
+    /// The YAML parsed successfully, but its settings are unknown, invalid, or conflicting.
     InvalidConfiguration(String),
-    /// An unexpected native status was returned; diagnostics may be empty.
-    Unexpected { status: u32, message: String },
+    /// The library returned a status outside the recognized configuration errors.
+    Unexpected {
+        /// Numeric status returned by the Sirius C API.
+        status: u32,
+        /// Native diagnostic text, or an empty string when unavailable.
+        message: String,
+    },
     /// The path contains a NUL byte or cannot be represented on the platform.
     InvalidPath,
 }
 
+/// Formats a diagnostic for display, including its numeric status for unexpected errors.
+///
+/// ```
+/// use sirius::ConfigError;
+///
+/// let error = ConfigError::Io(String::new());
+/// assert_eq!(error.to_string(), "configuration I/O error");
+/// ```
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -69,7 +97,16 @@ fn configuration_error(status: u32, diagnostic: Diagnostic) -> ConfigError {
 ///
 /// Owns its native snapshot independently of its builder or source file. Hardware
 /// availability and capacity are checked when the engine is constructed.
-/// This type is `Send` and `Sync`: it may be moved or shared between threads.
+/// You can share it between threads and drop it on any thread.
+///
+/// ```
+/// use sirius::{ConfigError, ContextConfig, ContextConfigBuilder};
+///
+/// let config: ContextConfig = ContextConfigBuilder::new()?.build()?;
+/// let worker_config = config.clone();
+/// drop(config); // The clone still owns the settings.
+/// # Ok::<(), ConfigError>(())
+/// ```
 pub struct ContextConfig {
     inner: NonNull<c_api::SiriusContextConfig>,
 }
@@ -81,15 +118,14 @@ unsafe impl Send for ContextConfig {}
 unsafe impl Sync for ContextConfig {}
 
 impl Clone for ContextConfig {
-    /// Share the immutable settings through a new owned handle.
+    /// Acquires another reference to these settings without copying or allocating.
     ///
-    /// ```no_run
-    /// # use sirius::{ConfigError, ContextConfigBuilder};
-    /// # fn example() -> Result<(), ConfigError> {
+    /// ```
+    /// use sirius::{ConfigError, ContextConfigBuilder};
+    ///
     /// let config = ContextConfigBuilder::new()?.build()?;
     /// let copy = config.clone();
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ConfigError>(())
     /// ```
     fn clone(&self) -> Self {
         // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
@@ -102,8 +138,16 @@ impl Clone for ContextConfig {
 ///
 /// Parsing and validation are performed through the public C ABI. Loading and
 /// building do not initialize CUDA, discover hardware, or allocate engine resources.
-/// This type is `Send` and `Sync`: it may be moved or shared between threads.
-/// Building and cloning through shared references may run concurrently.
+/// You can share a builder across threads and call [`build`](Self::build)
+/// concurrently. Each configuration owns its settings independently of the builder.
+///
+/// ```no_run
+/// use sirius::{ConfigError, ContextConfigBuilder};
+///
+/// let settings = ContextConfigBuilder::from_yaml("sirius.yaml")?;
+/// let config = settings.build()?;
+/// # Ok::<(), ConfigError>(())
+/// ```
 pub struct ContextConfigBuilder {
     inner: NonNull<c_api::SiriusContextConfigBuilder>,
 }
@@ -115,15 +159,24 @@ unsafe impl Send for ContextConfigBuilder {}
 unsafe impl Sync for ContextConfigBuilder {}
 
 impl ContextConfigBuilder {
-    /// Start with built-in defaults. Native allocation failures are returned as
-    /// [`ConfigError::AllocationFailure`].
+    /// Starts a builder with Sirius's built-in defaults.
     ///
-    /// ```no_run
-    /// # use sirius::{ConfigError, ContextConfigBuilder};
-    /// # fn example() -> Result<(), ConfigError> {
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::AllocationFailure`] if Sirius cannot allocate the
+    /// builder, or [`ConfigError::Unexpected`] for an unrecognized status.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the linked library reports success with a null builder handle.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sirius::{ConfigError, ContextConfigBuilder};
+    ///
     /// let config = ContextConfigBuilder::new()?.build()?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ConfigError>(())
     /// ```
     pub fn new() -> Result<Self, ConfigError> {
         let mut value = std::ptr::null_mut();
@@ -143,14 +196,28 @@ impl ContextConfigBuilder {
     ///
     /// Subsequent edits or deletion of the file do not affect this builder.
     /// Uses the [Sirius YAML schema](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md).
-    /// Unix path bytes are preserved, including non-UTF-8 names. NUL bytes are rejected.
+    /// Relative paths resolve against the current working directory. On Unix the
+    /// path may contain non-UTF-8 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidPath`] for an unrepresentable path (such as
+    /// one containing a NUL byte), [`ConfigError::Io`] for a read failure,
+    /// [`ConfigError::MalformedYaml`] for a syntax error, or
+    /// [`ConfigError::InvalidConfiguration`] for invalid settings. Native
+    /// allocation failures and unexpected statuses also surface as [`ConfigError`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the linked library reports success with a null builder handle.
+    ///
+    /// # Examples
     ///
     /// ```no_run
-    /// # use sirius::{ConfigError, ContextConfigBuilder};
-    /// # fn example() -> Result<(), ConfigError> {
+    /// use sirius::{ConfigError, ContextConfigBuilder};
+    ///
     /// let config = ContextConfigBuilder::from_yaml("sirius.yaml")?.build()?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ConfigError>(())
     /// ```
     pub fn from_yaml(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -183,15 +250,26 @@ impl ContextConfigBuilder {
         })
     }
 
-    /// Produce an immutable configuration without rereading the file or accessing GPUs.
+    /// Produces an immutable snapshot using only the builder's retained settings.
+    /// You can call this method repeatedly on the same builder.
     ///
-    /// ```no_run
-    /// # use sirius::{ConfigError, ContextConfigBuilder};
-    /// # fn example() -> Result<(), ConfigError> {
-    /// let builder = ContextConfigBuilder::from_yaml("sirius.yaml")?;
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::AllocationFailure`] if Sirius cannot allocate the
+    /// snapshot, or [`ConfigError::Unexpected`] for an unrecognized status.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the linked library reports success with a null configuration handle.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sirius::{ConfigError, ContextConfigBuilder};
+    ///
+    /// let builder = ContextConfigBuilder::new()?;
     /// let config = builder.build()?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ConfigError>(())
     /// ```
     pub fn build(&self) -> Result<ContextConfig, ConfigError> {
         let mut value = std::ptr::null_mut();
@@ -214,17 +292,16 @@ impl ContextConfigBuilder {
 }
 
 impl Clone for ContextConfigBuilder {
-    /// Share the loaded settings through an independently owned builder handle.
+    /// Acquires an independently owned reference to the same settings without allocating.
     ///
-    /// ```no_run
-    /// # use sirius::{ConfigError, ContextConfigBuilder};
-    /// # fn example() -> Result<(), ConfigError> {
-    /// let builder = ContextConfigBuilder::from_yaml("sirius.yaml")?;
+    /// ```
+    /// use sirius::{ConfigError, ContextConfigBuilder};
+    ///
+    /// let builder = ContextConfigBuilder::new()?;
     /// let copy = builder.clone();
     /// drop(builder);
     /// let config = copy.build()?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ConfigError>(())
     /// ```
     fn clone(&self) -> Self {
         // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
