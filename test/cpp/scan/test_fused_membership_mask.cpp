@@ -82,7 +82,11 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_date_key_set(
                           cudaMemcpyHostToDevice,
                           stream.get()) == cudaSuccess);
   stream.sync();
-  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  auto filter =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  // The set builds asynchronously on `stream`; decodes probe it from non-blocking pool streams.
+  stream.sync();
+  return filter;
 }
 
 // DECIMAL64-built exact membership set (cudf scale -2) over the multiples of @p step in [0, 50) as
@@ -106,7 +110,11 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_decimal_key_set(
                           cudaMemcpyHostToDevice,
                           stream.get()) == cudaSuccess);
   stream.sync();
-  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  auto filter =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+  // The set builds asynchronously on `stream`; decodes probe it from non-blocking pool streams.
+  stream.sync();
+  return filter;
 }
 
 /// A membership directive on @p column whose probe declines every batch, as one does when the key
