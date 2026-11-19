@@ -21,6 +21,7 @@
  * `test_dynamic_filter_merge.cpp`.
  */
 
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/dynamic_filter/static_filter_selection.hpp"
 
@@ -160,6 +161,29 @@ TEST_CASE("facts of a filter that is no concrete Membership Filter",
   stub_filter approximate{op::sirius_dynamic_filter_kind::BLOOM};
   approximate.set_estimated_selectivity(0.25);
   CHECK(op::facts_of(approximate) == bloom(0.25));
+
+  SECTION("an estimate is proven only when set so")
+  {
+    CHECK_FALSE(approximate.estimate_proven());
+    approximate.set_estimated_selectivity(0.5, true);
+    auto proven            = bloom(0.5);
+    proven.estimate_proven = true;
+    CHECK(op::facts_of(approximate) == proven);
+    approximate.set_estimated_selectivity(0.75);
+    CHECK(op::facts_of(approximate) == bloom(0.75));
+  }
+}
+
+TEST_CASE("an admitted key estimates the kept share from its value domain",
+          "[dynamic_filter][static_selection]")
+{
+  op::dynamic_filter_publish_plan::admitted_key key{};
+  CHECK_FALSE(key.estimated_keep(10));
+  key.build_key_value_domain = 200;
+  CHECK(key.estimated_keep(0) == 0.0);
+  CHECK(key.estimated_keep(50) == 0.25);
+  CHECK(key.estimated_keep(200) == 1.0);
+  CHECK(key.estimated_keep(1000) == 1.0);
 }
 
 TEST_CASE(

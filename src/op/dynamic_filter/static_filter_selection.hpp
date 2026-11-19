@@ -62,6 +62,7 @@ struct static_filter_facts {
   std::uint64_t keys =
     std::numeric_limits<std::uint64_t>::max();  ///< IN-list key count; the maximum when unknown
   std::optional<double> estimated_keep;         ///< The Producing Join's estimate of the kept share
+  bool estimate_proven = false;                 ///< Whether `estimated_keep` is a Proven Estimate
 
   [[nodiscard]] bool operator==(static_filter_facts const&) const = default;
 };

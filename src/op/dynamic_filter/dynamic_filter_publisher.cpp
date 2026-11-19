@@ -230,16 +230,6 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
   });
 }
 
-/// The share of the key's value domain that @p build_rows build keys cover, a static estimate of
-/// the share of probe rows the filter keeps. Empty when the domain is unknown.
-std::optional<double> estimated_selectivity_of(dynamic_filter_publish_plan::admitted_key const& key,
-                                               std::size_t build_rows) noexcept
-{
-  if (key.build_key_value_domain == 0) { return std::nullopt; }
-  return std::min(
-    1.0, static_cast<double>(build_rows) / static_cast<double>(key.build_key_value_domain));
-}
-
 /**
  * @brief The filters one admitted key publishes; a null filter publishes nothing.
  */
@@ -957,7 +947,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(certified_build_
       }
       if (rows == 0) { continue; }
       active_keys.push_back(index);
-      estimated_selectivity.push_back(estimated_selectivity_of(key, rows));
+      estimated_selectivity.push_back(key.estimated_keep(rows));
       keys.push_back({key.build_key_ordinal, key.storage_type});
     }
     if (keys.empty()) { return false; }
@@ -1617,7 +1607,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
       if (filters.membership) {
         ++outcome.membership_filters_built;
-        if (auto const selectivity = estimated_selectivity_of(admitted_key, valid_rows)) {
+        if (auto const selectivity = admitted_key.estimated_keep(valid_rows)) {
           filters.membership->set_estimated_selectivity(*selectivity);
         }
       }

@@ -26,7 +26,8 @@ namespace sirius::op {
 
 static_filter_facts facts_of(sirius_dynamic_filter const& filter)
 {
-  static_filter_facts facts{.estimated_keep = filter.estimated_selectivity()};
+  static_filter_facts facts{.estimated_keep  = filter.estimated_selectivity(),
+                            .estimate_proven = filter.estimate_proven()};
   if (auto const* small = dynamic_cast<sirius_dynamic_small_in_list_filter const*>(&filter)) {
     facts.kind = membership_filter_kind::small_in_list;
     facts.keys = small->size();

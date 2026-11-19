@@ -65,11 +65,18 @@ class sirius_dynamic_filter {
   [[nodiscard]] bool preserves_nulls() const noexcept { return _preserve_nulls; }
 
   // Set only before publication: a static estimate of the share of probe rows the filter keeps.
-  void set_estimated_selectivity(double value) noexcept { _estimated_selectivity = value; }
+  // `proven` marks a Proven Estimate: the build key is unique by proof or backed declaration and
+  // its null count is known, so the estimate is the exact share of the key's value domain.
+  void set_estimated_selectivity(double value, bool proven = false) noexcept
+  {
+    _estimated_selectivity = value;
+    _estimate_proven       = proven;
+  }
   [[nodiscard]] std::optional<double> estimated_selectivity() const noexcept
   {
     return _estimated_selectivity;
   }
+  [[nodiscard]] bool estimate_proven() const noexcept { return _estimate_proven; }
 
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
@@ -79,7 +86,8 @@ class sirius_dynamic_filter {
   }
 
  private:
-  bool _preserve_nulls = false;
+  bool _preserve_nulls  = false;
+  bool _estimate_proven = false;
   std::optional<double> _estimated_selectivity;
 };
 

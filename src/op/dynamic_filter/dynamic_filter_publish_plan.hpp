@@ -23,9 +23,11 @@
 
 #include <cudf/types.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace cucascade::memory {
@@ -104,6 +106,15 @@ class dynamic_filter_publish_plan final {
     [[nodiscard]] bool domain_gate_eligible() const noexcept
     {
       return build_key_proven_unique || build_key_domain.has_backed_declaration();
+    }
+    /// The share of the key's value domain that @p build_keys build keys cover: a static estimate
+    /// of the share of probe rows the key's membership filter keeps. Empty when the domain is
+    /// unknown.
+    [[nodiscard]] std::optional<double> estimated_keep(std::size_t build_keys) const noexcept
+    {
+      if (build_key_value_domain == 0) { return std::nullopt; }
+      return std::min(
+        1.0, static_cast<double>(build_keys) / static_cast<double>(build_key_value_domain));
     }
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
