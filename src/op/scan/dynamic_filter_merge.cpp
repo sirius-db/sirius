@@ -36,6 +36,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
+#include <op/dynamic_filter/static_filter_selection.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <telemetry/nvtx.hpp>
@@ -51,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -88,9 +90,6 @@ constexpr std::size_t k_deferred_minimum_row_width       = 64;
 constexpr double k_deferred_selective_keep_ratio         = 0.35;
 constexpr double k_gather_once_minimum_narrow_keep_ratio = 0.40;
 constexpr double k_wide_row_skip_keep_ratio              = 0.60;
-/// A later filter that removes less than this share of the batch is skipped at any row width: its
-/// probe covers every row, and no per-removed-row cost makes up for so few removed rows.
-constexpr double k_negligible_removed_share = 0.10;
 
 }  // namespace
 
@@ -412,39 +411,12 @@ bool accepts_carrier(sirius::op::sirius_dynamic_filter const& filter, cudf::data
          accepts_carrier<sirius::op::sirius_dynamic_bloom_filter>(filter, type);
 }
 
-/// @brief Expected strength of a membership filter before any measurement, strongest first.
-///
-/// Follows the `sirius::membership_probe` ordering signal: exact set forms keep fewer rows than a
-/// Bloom filter over the same keys, and fewer build keys keep fewer rows.
-struct static_selectivity {
-  /// 0 for a small IN-list, 1 for a hash IN-list, 2 for Bloom; other kinds sort last.
-  std::uint8_t kind_rank = std::numeric_limits<std::uint8_t>::max();
-  /// Build-side key count; an unknown count sorts last.
-  std::uint64_t num_keys = std::numeric_limits<std::uint64_t>::max();
-
-  [[nodiscard]] auto operator<=>(static_selectivity const&) const = default;
-};
-
-[[nodiscard]] static_selectivity static_selectivity_of(
-  sirius::op::sirius_dynamic_filter const& filter)
-{
-  if (auto const* small =
-        dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(&filter)) {
-    return {0, small->size()};
-  }
-  if (auto const* set = dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(&filter)) {
-    return {1, set->size()};
-  }
-  if (filter.kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) { return {.kind_rank = 2}; }
-  return {};
-}
-
 struct candidate {
   applied_entry identity;
   cudf::size_type column_index;
   std::optional<double> expected_keep;
   std::size_t snapshot_index;
-  static_selectivity prior = {};  ///< Filled only for decode selection.
+  sirius::op::static_filter_facts prior = {};  ///< Filled only for decode selection.
 };
 
 std::vector<candidate> capture_candidates(sirius::op::dynamic_filter_snapshot const& snapshot,
@@ -487,12 +459,13 @@ bool in_normal_order(Step const& a, Step const& b)
   return a.identity.output_ordinal < b.identity.output_ordinal;
 }
 
-/// @brief Decode order: measured keep ratios first, then the static signal for ties and unmeasured
-/// filters.
+/// @brief Decode order: measured keep ratios first, then `sirius::op::decode_preference` for ties
+/// and unmeasured filters.
 bool in_decode_order(candidate const& a, candidate const& b)
 {
-  if (a.expected_keep != b.expected_keep || a.prior == b.prior) { return in_normal_order(a, b); }
-  return a.prior < b.prior;
+  auto const preference = sirius::op::decode_preference(a.prior, b.prior);
+  if (a.expected_keep != b.expected_keep || preference == 0) { return in_normal_order(a, b); }
+  return preference < 0;
 }
 
 bool same_value(candidate const& a, candidate const& b)
@@ -597,23 +570,16 @@ std::unique_ptr<application_program_state> prepare_state(
   }
   std::stable_sort(
     program->membership.begin(), program->membership.end(), in_normal_order<selected_step>);
-  // A fused or gathered-once probe runs on every row, so a filter that removes a negligible share
-  // of the batch does not repay it, however selective it is on the rows earlier filters kept. Judge
-  // each filter by the publisher's estimate, after the stronger ones, so the first batch need not
-  // learn it. The combined sample then covers only the filters that stay, which could read as a
-  // channel that removes nothing, so a batch that skips one records no combined sample.
+  // The Negligible-Share Rule (`sirius::op::negligible_after_stronger`) judges each filter by the
+  // publisher's estimate, after the stronger ones, so the first batch need not learn it. The
+  // combined sample then covers only the filters that stay, which could read as a channel that
+  // removes nothing, so a batch that skips one records no combined sample.
   {
     std::vector<selected_step> kept;
     for (auto const& step : program->membership) {
-      double survival = 1.0;
-      for (auto const& other : program->membership) {
-        if (other.estimated_selectivity && step.estimated_selectivity &&
-            *other.estimated_selectivity < *step.estimated_selectivity) {
-          survival *= *other.estimated_selectivity;
-        }
-      }
-      if (step.estimated_selectivity && survival < 1.0 &&
-          survival * (1.0 - *step.estimated_selectivity) < k_negligible_removed_share) {
+      if (sirius::op::negligible_after_stronger(
+            step.estimated_selectivity,
+            program->membership | std::views::transform(&selected_step::estimated_selectivity))) {
         program->sample_combined = false;
         continue;
       }
@@ -1301,7 +1267,7 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
   }
   auto const bound_entries = candidates.size();
   for (auto& current : candidates) {
-    current.prior = static_selectivity_of(*current.identity.filter);
+    current.prior = sirius::op::facts_of(*current.identity.filter);
   }
   std::stable_sort(candidates.begin(), candidates.end(), in_decode_order);
   std::erase_if(candidates, [](candidate const& current) {

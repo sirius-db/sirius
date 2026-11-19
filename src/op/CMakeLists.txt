@@ -69,6 +69,7 @@ target_sources(
           dynamic_filter/complete_build_inventory.cpp
           dynamic_filter/build_input_certification.cpp
           dynamic_filter/construction_plan.cpp
+          dynamic_filter/static_filter_selection.cpp
           dynamic_filter/build_filter_construction.cpp
           dynamic_filter/detail/restore_scalar.cpp
           dynamic_filter/dynamic_filter_publisher.cpp

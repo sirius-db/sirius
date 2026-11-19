@@ -297,6 +297,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_complete_build_inventory.cpp
     test/cpp/operator/test_build_input_certification.cpp
     test/cpp/operator/test_dynamic_filter_construction_plan.cpp
+    test/cpp/operator/test_static_filter_selection.cpp
     test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_accumulated_bloom_key_types.cpp
