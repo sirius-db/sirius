@@ -148,7 +148,7 @@ queries/second and latency, as well as elapsed time.
 | `--profile hot/lukewarm` | Cache settings apply; their serial query ordering does not. Both retain a shared LRU cache, and neither guarantees residency under contention. |
 | `--pin gpu/host/parquet` | One union pin of the selected queries' columns before timing; unpin after all streams finish. Per-query pin/unpin is disallowed. The union can need more memory than serial per-query pinning. |
 | `--pin-after-iteration` | Nonzero values rejected. No maintenance transitions during the measured workload. |
-| `--pin-compression` | Supported for GPU/HOST pins during untimed preparation. |
+| `--compression-plan-dir` | Supported for GPU/HOST pins during untimed preparation. |
 | `--precmd nsys/gdb`, `--nsys-profile` | Rejected: their per-query subprocess model does not share a runtime. |
 | `--duckdb-profiling` | Unique per-stream/query/iteration profiles. Adds instrumentation overhead. |
 | `--query-timeout` | Seconds from request submission through result fetch, including admission waiting. Default 90; 0 disables. |
