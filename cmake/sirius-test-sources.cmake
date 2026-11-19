@@ -85,6 +85,7 @@ set(TEST_SOURCES
     test/cpp/object_store_scope/test_registry.cpp
     test/cpp/object_store_scope/test_scope.cpp
     test/cpp/object_store_scope/test_validation.cpp
+    test/cpp/object_store_scope/test_c_object_store_config.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
