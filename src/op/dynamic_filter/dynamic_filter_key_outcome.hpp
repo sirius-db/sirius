@@ -60,8 +60,9 @@ enum class dynamic_filter_key_reason : std::uint8_t {
   TYPE_MISMATCH,     ///< The build column's type cannot carry the recorded key type
   UNSUPPORTED_TYPE,  ///< No filter kind supports the key type
   UNREADABLE_PROBE,  ///< No binding can read the key's membership filter
-  BLOOM_CAP,  ///< The accumulated Bloom arrays exceed `max_dynamic_filter_bloom_bytes_per_gpu`
-  SHADOWED,   ///< No Consumer would select the key's membership filter (a Shadowed Key)
+  BLOOM_CAP,      ///< The accumulated Bloom arrays exceed `max_dynamic_filter_bloom_bytes_per_gpu`
+  SHADOWED,       ///< No Consumer would select the key's membership filter (a Shadowed Key)
+  SHADOWED_LATE,  ///< Every key of the plan became a Shadowed Key while Construction ran
   DECIMAL128_UNFIT,        ///< A DECIMAL128 build value lies outside the int64 membership rep
   CONSTRUCTION_ADMISSION,  ///< The root GPU refused the memory to build the filter
   CONSTRUCTION_INVARIANT,  ///< Construction found more valid rows than the inventory recorded

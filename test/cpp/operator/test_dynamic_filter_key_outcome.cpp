@@ -106,6 +106,7 @@ TEST_CASE("a key line spells unknown values and attempt reasons", "[dynamic_filt
   CHECK(reason_of(UNREADABLE_PROBE) == "unreadable_probe");
   CHECK(reason_of(BLOOM_CAP) == "bloom_cap");
   CHECK(reason_of(SHADOWED) == "shadowed");
+  CHECK(reason_of(SHADOWED_LATE) == "shadowed_late");
   CHECK(reason_of(DECIMAL128_UNFIT) == "decimal128_unfit");
   CHECK(reason_of(NOT_CONSTRUCTED) == "not_constructed");
   CHECK(reason_of(ATTEMPT_FAIL, "publications_failed") == "attempt_fail_publications_failed");

@@ -56,13 +56,13 @@ namespace sirius::op {
  * @brief The limits `plan_construction` applies
  */
 struct construction_limits {
-  std::size_t l2_bytes;                   ///< Smallest replica GPU's L2 size; 0 means unknown
-  double inlist_max_l2_fraction;          ///< Largest share of L2 a hash IN-list may take
-  bool emit_zone_map_filters;             ///< Whether zone maps are enabled
-  double domain_coverage_threshold;       ///< The domain gate's coverage threshold
-  std::uint64_t max_bloom_bytes_per_gpu;  ///< Cap on the sum of every Bloom key's aligned array
-  bool bloom_only              = false;   ///< Membership filters are Bloom filters only
-  std::size_t fixed_bloom_keys = 0;       ///< Non-zero: every Bloom filter's key count, uncapped
+  std::size_t l2_bytes;                       ///< Smallest replica GPU's L2 size; 0 means unknown
+  double inlist_max_l2_fraction;              ///< Largest share of L2 a hash IN-list may take
+  bool emit_zone_map_filters;                 ///< Whether zone maps are enabled
+  double domain_coverage_threshold;           ///< The domain gate's coverage threshold
+  std::uint64_t max_bloom_bytes_per_gpu;      ///< Cap on the sum of every Bloom key's aligned array
+  bool bloom_only                   = false;  ///< Membership filters are Bloom filters only
+  std::size_t fixed_bloom_keys      = 0;  ///< Non-zero: every Bloom filter's key count, uncapped
   std::size_t decode_membership_cap = 1;  ///< Membership Filters one Filtered Decode carries
 };
 
@@ -179,6 +179,23 @@ struct construction_plan {
   std::vector<dynamic_filter_key_line> outcomes;  ///< One line per admitted key with a binding
   dynamic_filter_stats_snapshot selection;        ///< Selection counts for `dynamic_filter_stats`
 };
+
+/**
+ * @brief Whether a planned Construction has nothing left worth finishing: every planned key has
+ * become a Shadowed Key since `plan_construction` and none needs its bounds
+ *
+ * The same judgement as `is_shadowed`, against bindings read again after the plan was made. A plan
+ * that still holds one key a Consumer could select, or one key with bounds to publish, is not
+ * shadowed: it finishes all of its keys.
+ *
+ * @throw std::out_of_range if @p bindings does not cover every planned key
+ * @param planned The plan Construction was begun with
+ * @param bindings Each admitted key's bindings, with `binding_facts::published` read anew
+ * @param decode_membership_cap `construction_limits::decode_membership_cap`
+ */
+[[nodiscard]] bool construction_shadowed(construction_plan const& planned,
+                                         std::span<std::vector<binding_facts> const> bindings,
+                                         std::size_t decode_membership_cap);
 
 /**
  * @brief Plans each admitted key's filters

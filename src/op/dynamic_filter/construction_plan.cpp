@@ -182,7 +182,8 @@ struct shadow_judgement {
 /**
  * @brief Logs one `[dynamic_filter_shadow]` line for a judged key.
  *
- * @param at Where the key was judged: `begin` when Construction is planned
+ * @param at Where the key was judged: `begin` when Construction is planned, `finish` just before
+ * it finishes
  * @param build_keys The valid build rows the candidate holds
  */
 void log_shadow_judgement(std::string_view at,
@@ -266,6 +267,34 @@ bool is_shadowed(key_plan const& key,
                  std::size_t decode_membership_cap) noexcept
 {
   return judge_shadow(key.candidate, bindings, decode_membership_cap).shadowed;
+}
+
+bool construction_shadowed(construction_plan const& planned,
+                           std::span<std::vector<binding_facts> const> bindings,
+                           std::size_t decode_membership_cap)
+{
+  bool shadowed = !planned.keys.empty();
+  for (auto const& key : planned.keys) {
+    if (key.admitted_key_index >= bindings.size()) {
+      throw std::out_of_range("[construction_shadowed] a planned key has no binding list");
+    }
+    auto const& key_bindings = bindings[key.admitted_key_index];
+    auto const judgement     = judge_shadow(key.candidate, key_bindings, decode_membership_cap);
+    if (judged(key.candidate)) {
+      auto const line = std::ranges::find(
+        planned.outcomes, key.admitted_key_index, &dynamic_filter_key_line::admitted_key_index);
+      if (line != planned.outcomes.end()) {
+        log_shadow_judgement("finish",
+                             line->planner_condition_index,
+                             key.candidate,
+                             line->outcome.valid_rows.value_or(line->outcome.rows),
+                             key_bindings.size(),
+                             judgement);
+      }
+    }
+    shadowed = shadowed && judgement.shadowed && !key.needs_bounds();
+  }
+  return shadowed;
 }
 
 construction_plan plan_construction(

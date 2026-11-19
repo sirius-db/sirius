@@ -609,6 +609,34 @@ struct dynamic_filter_publication_session::state {
   };
 
   /**
+   * @brief Ends the attempt without publishing when every planned key has become a Shadowed Key
+   * since `begin`, and returns whether it did.
+   *
+   * The Channels are read again and judged by `construction_shadowed`. The planned keys' lines end
+   * `SHADOWED_LATE`; the leased storage is released as for any attempt that ends before it
+   * finishes.
+   */
+  [[nodiscard]] bool end_if_shadowed()
+  {
+    auto bindings = binding_facts_of(plan);
+    read_published_filters(plan, bindings);
+    auto const& planned = construction->plan();
+    if (!construction_shadowed(planned, bindings, plan.decode_membership_cap())) { return false; }
+    std::scoped_lock lock(mutex);
+    for (auto const& key : planned.keys) {
+      auto const line = std::ranges::find(
+        key_lines, key.admitted_key_index, &dynamic_filter_key_line::admitted_key_index);
+      if (line != key_lines.end() &&
+          line->outcome.reason == dynamic_filter_key_reason::NOT_CONSTRUCTED) {
+        line->outcome.reason = dynamic_filter_key_reason::SHADOWED_LATE;
+      }
+    }
+    outcome.keys_skipped_shadowed_late = planned.keys.size();
+    end_attempt(completion::SKIPPED);
+    return true;
+  }
+
+  /**
    * @brief Constructs every planned filter on the Publishing GPU, replicates the exact filters and
    * zone maps, then fans out.
    *
@@ -625,6 +653,9 @@ struct dynamic_filter_publication_session::state {
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
+      // Finishing merges and replicates every filter, so it is not worth doing for filters that a
+      // stronger one, published since `begin`, now keeps every Consumer from selecting.
+      if (end_if_shadowed()) { return; }
       auto constructed = construction->finish(
         {.space = task_space, .stream = stream, .scratch = task_space.get_default_allocator()});
       if (!constructed) {

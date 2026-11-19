@@ -385,3 +385,69 @@ TEST_CASE("a session on two GPUs is shadowed only by a filter with a Replica on 
   }
   fixture.session->finalize_input();
 }
+
+TEST_CASE("a construction shadowed before it finishes is abandoned",
+          "[dynamic_filter][construction][shadow]")
+{
+  acc::fixture fixture;
+  sirius::test::scoped_recording_log_sink sink{"debug"};
+  auto const batches = std::vector{fixture.make_batch(0, 0, 300), fixture.make_batch(0, 1000, 200)};
+  auto const baseline = fixture.allocated_bytes();
+  auto other          = std::make_unique<other_join>(fixture);
+  open_session(fixture);
+  REQUIRE(begin(*fixture.session, batches));
+
+  SECTION("the stronger filter is published while the build is partitioned")
+  {
+    fixture.contribute(batches[0]);
+    other->publish(fixture);
+    fixture.contribute(batches[1]);
+    fixture.publish(0, batches[1]->get_batch_id());
+
+    // The Publishing Task ended the attempt before finishing: nothing was merged or replicated.
+    CHECK(fixture.session->terminal());
+    CHECK(fixture.channel->snapshot().terminal());
+    CHECK(fixture.channel->snapshot().entries().size() == 1);
+    auto const counts = fixture.stats.snapshot();
+    CHECK(counts.keys_skipped_shadowed_late == 2);
+    CHECK(counts.keys_skipped_shadowed == 0);
+    CHECK(counts.accumulations_started == 1);
+    CHECK(counts.membership_filters_built == 0);
+    CHECK(counts.accumulation_publications_finished == 0);
+    CHECK(counts.publications_finished == 1);
+    CHECK(key_reasons(sink) == std::vector<std::string>{"shadowed_late", "shadowed_late"});
+    fixture.session->finalize_input();
+    other.reset();
+    fixture.require_storage_returned(baseline);
+  }
+  SECTION("a stronger filter published after the session published leaves both on the Channel")
+  {
+    construct(fixture, batches);
+    other->publish(fixture);
+    fixture.session->finalize_input();
+    CHECK(built_on(fixture, 0).size() == 1);
+    CHECK(built_on(fixture, 1).size() == 1);
+    CHECK(fixture.channel->snapshot().entries().size() == 3);
+    CHECK(fixture.stats.snapshot().keys_skipped_shadowed_late == 0);
+    CHECK(key_reasons(sink) == std::vector<std::string>{"-", "-"});
+  }
+}
+
+TEST_CASE("a construction with one key a Consumer could select finishes every key",
+          "[dynamic_filter][construction][shadow]")
+{
+  acc::fixture fixture;
+  other_join const other{fixture};
+  auto const batches = std::vector{fixture.make_batch(0, 0, k_rows)};
+  // Only the first key has a Proven Estimate, so the second is never shadowed.
+  open_session(fixture, {.proven_unique = {true, false}});
+  REQUIRE(begin(*fixture.session, batches));
+  other.publish(fixture);
+  construct(fixture, batches);
+  fixture.session->finalize_input();
+
+  CHECK(built_on(fixture, 0).size() == 1);
+  CHECK(built_on(fixture, 1).size() == 1);
+  CHECK(fixture.stats.snapshot().keys_skipped_shadowed_late == 0);
+  CHECK(fixture.stats.snapshot().membership_filters_built == 2);
+}

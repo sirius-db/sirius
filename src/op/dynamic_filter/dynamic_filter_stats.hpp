@@ -75,6 +75,9 @@ namespace sirius::op {
  *   plan's Bloom arrays together exceed `max_bloom_bytes_per_gpu` and no fixed Bloom size is set.
  * - `keys_skipped_shadowed`: a Shadowed Key, planned without a membership filter because no
  *   Consumer would select it over the filters already on its Channels.
+ * - `keys_skipped_shadowed_late`: a key of a Construction abandoned before it finished because
+ *   every one of its keys had become a Shadowed Key since `begin`: a stronger filter was published
+ *   while the build was partitioned. Non-zero means the two joins' publication order flipped.
  * - `keys_sized_on_total_rows`: a key whose null count was unknown, so its Bloom filter was sized
  *   on every row and no exact IN-list was considered.
  * - `filters_skipped_construction_invariant`: an exact filter dropped because staging found more
@@ -152,6 +155,7 @@ struct dynamic_filter_counters {
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_shadowed{};
+  Counter keys_skipped_shadowed_late{};
   Counter keys_sized_on_total_rows{};
   Counter filters_skipped_construction_invariant{};
   Counter filters_skipped_construction_admission{};
@@ -207,6 +211,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_shadowed,
+  &dynamic_filter_counters<Counter>::keys_skipped_shadowed_late,
   &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_invariant,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_admission,
