@@ -88,6 +88,12 @@ void io_stats::record_encode_wait(std::uint64_t micros, bool granted) noexcept
   add(_c.encode_wait_micros, micros);
 }
 
+void io_stats::record_encode_plans(bool reused, std::uint64_t micros) noexcept
+{
+  add(reused ? _c.encode_plans_reused : _c.encode_plans_sampled, 1);
+  add(_c.encode_plan_micros, micros);
+}
+
 void io_stats::record_reload(cucascade::memory::Tier source,
                              std::size_t stored_bytes,
                              std::size_t device_bytes,
@@ -158,6 +164,9 @@ io_totals io_stats::read() noexcept
   t.encode_waits                      = value(_c.encode_waits);
   t.encode_waits_granted              = value(_c.encode_waits_granted);
   t.encode_wait_micros                = value(_c.encode_wait_micros);
+  t.encode_plans_sampled              = value(_c.encode_plans_sampled);
+  t.encode_plans_reused               = value(_c.encode_plans_reused);
+  t.encode_plan_micros                = value(_c.encode_plan_micros);
   t.from_host_batches                 = value(_c.from_host_batches);
   t.from_host_stored_bytes            = value(_c.from_host_stored_bytes);
   t.from_host_device_bytes            = value(_c.from_host_device_bytes);
@@ -192,7 +201,8 @@ std::string format_io_totals(const io_totals& t)
     "declined_no_headroom={} declined_small_saving={} encode_failed={} "
     "uncompressed_fallback_bytes={} fallback_micros={} encodes={} encode_reserved_bytes={} "
     "encode_peak_bytes={} encodes_over_reservation={} encode_waits={} encode_waits_granted={} "
-    "encode_wait_micros={} from_host_batches={} "
+    "encode_wait_micros={} encode_plans_sampled={} encode_plans_reused={} "
+    "encode_plan_micros={} from_host_batches={} "
     "from_host_stored_bytes={} from_host_device_bytes={} from_host_micros={} "
     "from_disk_batches={} from_disk_stored_bytes={} from_disk_device_bytes={} "
     "from_disk_micros={} from_host_compressed_batches={} from_host_compressed_stored_bytes={} "
@@ -221,6 +231,9 @@ std::string format_io_totals(const io_totals& t)
     t.encode_waits,
     t.encode_waits_granted,
     t.encode_wait_micros,
+    t.encode_plans_sampled,
+    t.encode_plans_reused,
+    t.encode_plan_micros,
     t.from_host_batches,
     t.from_host_stored_bytes,
     t.from_host_device_bytes,

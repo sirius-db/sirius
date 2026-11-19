@@ -656,6 +656,12 @@ struct compression_config {
   /// GPU, wait up to this many milliseconds for one of them to end and try again, instead of
   /// spilling the batch uncompressed at once. 0 never waits.
   std::uint64_t spill_encode_wait_ms{1000};
+
+  /// Spilled batches of the same column types that one set of sampled per-column plans
+  /// encodes before the columns are sampled again. Plans are dropped early when a batch
+  /// compresses clearly worse with them than the batch they were sampled on. 1 samples every
+  /// batch. At least 1.
+  std::uint64_t spill_plan_reuse_batches{8};
 };
 
 class configuration_input_error : public std::runtime_error {

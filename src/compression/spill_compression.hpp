@@ -71,6 +71,13 @@ struct spill_compression_settings {
   /// GPU to give its headroom back before the batch spills uncompressed, in milliseconds;
   /// 0 never waits (compression.spill_encode_wait_ms).
   std::uint64_t encode_wait_ms{1000};
+  /// Batches of the same column types that one set of sampled plans encodes before the
+  /// columns are sampled again, the sampled batch included. Sampling reads a prefix of every
+  /// column back to the host, which costs a spilled batch more than the launches that encode
+  /// it. The plans of a batch are dropped early when a later batch compresses clearly worse
+  /// with them, and a batch that would be declined with them is encoded again with its own.
+  /// 1 samples every batch (compression.spill_plan_reuse_batches).
+  std::uint64_t plan_reuse_batches{8};
 };
 
 /// Install the process-wide settings. The converters run on downgrade threads with no
@@ -97,6 +104,9 @@ void apply_spill_compression_config(compression_config const& config);
  * column of at least 4096 rows is dictionary-encoded, with bitpacked indices, when a
  * sample of it has few distinct values; otherwise it is split into ans-coded chars and
  * delta-bitpacked offsets. Shorter string columns and every other type are stored as is.
+ *
+ * Always samples @p column. The spill converters call it through a per-schema memory of the
+ * last sampled plans instead (spill_compression_settings::plan_reuse_batches).
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              ::cuda::stream_ref stream);

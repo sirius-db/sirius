@@ -65,6 +65,11 @@ struct io_totals {
   std::uint64_t encode_waits{0};
   std::uint64_t encode_waits_granted{0};
   std::uint64_t encode_wait_micros{0};
+  // How encodes got their per-column plans: sampled from the batch, or reused from an earlier
+  // batch of the same column types; and the time both took.
+  std::uint64_t encode_plans_sampled{0};
+  std::uint64_t encode_plans_reused{0};
+  std::uint64_t encode_plan_micros{0};
   // Whole batches converted back to the GPU tier: the bytes read from the tier they were in
   // and the device bytes they decoded to.
   std::uint64_t from_host_batches{0};
@@ -129,6 +134,9 @@ class io_stats {
   /// An encode waited @p micros for headroom and got it, or not.
   void record_encode_wait(std::uint64_t micros, bool granted) noexcept;
 
+  /// An encode chose its plans in @p micros, by reusing an earlier batch's or by sampling.
+  void record_encode_plans(bool reused, std::uint64_t micros) noexcept;
+
   /// A whole batch held in @p source (HOST or DISK) as @p stored_bytes was converted to a GPU
   /// table of @p device_bytes, in @p micros. @p compressed marks a batch that was decoded.
   void record_reload(cucascade::memory::Tier source,
@@ -171,6 +179,9 @@ class io_stats {
     std::atomic<std::uint64_t> encode_waits{0};
     std::atomic<std::uint64_t> encode_waits_granted{0};
     std::atomic<std::uint64_t> encode_wait_micros{0};
+    std::atomic<std::uint64_t> encode_plans_sampled{0};
+    std::atomic<std::uint64_t> encode_plans_reused{0};
+    std::atomic<std::uint64_t> encode_plan_micros{0};
     std::atomic<std::uint64_t> from_host_batches{0};
     std::atomic<std::uint64_t> from_host_stored_bytes{0};
     std::atomic<std::uint64_t> from_host_device_bytes{0};

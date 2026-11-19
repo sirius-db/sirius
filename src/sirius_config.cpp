@@ -931,6 +931,8 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("spill_read_cache_max_bytes", yaml::bytes(opt.spill_read_cache_max_bytes));
   r.optional("spill_whole_decode_max_bytes", yaml::bytes(opt.spill_whole_decode_max_bytes));
   r.optional("spill_encode_wait_ms", opt.spill_encode_wait_ms);
+  r.optional(
+    "spill_plan_reuse_batches", opt.spill_plan_reuse_batches, yaml::greater_than<std::uint64_t>{0});
   r.reject_unknown();
 }
 

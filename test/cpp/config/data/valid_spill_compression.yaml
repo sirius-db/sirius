@@ -7,3 +7,4 @@ sirius:
     spill_read_cache_max_bytes: 4MiB
     spill_whole_decode_max_bytes: 8MiB
     spill_encode_wait_ms: 250
+    spill_plan_reuse_batches: 3

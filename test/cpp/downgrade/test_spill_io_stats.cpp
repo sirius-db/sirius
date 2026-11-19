@@ -55,6 +55,9 @@ TEST_CASE("spill io stats count encodes, fallbacks, reloads and payload copies",
   stats.record_uncompressed_fallback(encode_outcome::failed, 40);
   stats.record_encode(100, 60);
   stats.record_encode(100, 130);
+  stats.record_encode_plans(false, 40);
+  stats.record_encode_plans(true, 2);
+  stats.record_encode_plans(true, 3);
   stats.record_reload(Tier::HOST, 5, 50);
   stats.record_reload(Tier::DISK, 7, 70);
   stats.record_reload(Tier::DISK, 9, 90, 300, true);
@@ -71,6 +74,9 @@ TEST_CASE("spill io stats count encodes, fallbacks, reloads and payload copies",
   CHECK(after.encode_reserved_bytes - before.encode_reserved_bytes == 200);
   CHECK(after.encode_peak_bytes - before.encode_peak_bytes == 190);
   CHECK(after.encodes_over_reservation - before.encodes_over_reservation == 1);
+  CHECK(after.encode_plans_sampled - before.encode_plans_sampled == 1);
+  CHECK(after.encode_plans_reused - before.encode_plans_reused == 2);
+  CHECK(after.encode_plan_micros - before.encode_plan_micros == 45);
   CHECK(after.from_host_batches - before.from_host_batches == 1);
   CHECK(after.from_host_stored_bytes - before.from_host_stored_bytes == 5);
   CHECK(after.from_host_device_bytes - before.from_host_device_bytes == 50);

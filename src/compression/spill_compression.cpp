@@ -43,6 +43,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <log/logging.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <util/host_observation.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +54,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -68,13 +70,38 @@ spill_compression_settings g_settings;
 // Read on every spill; the struct behind it changes only on (re)configuration.
 std::atomic<bool> g_enabled{false};
 
+/// The plans the columns of a batch were last sampled to, kept for the next batches of the
+/// same column types (see spill_compression_settings::plan_reuse_batches).
+struct sampled_plans {
+  /// One plan per column of the batch.
+  std::vector<std::string> plans;
+  /// Compressed over device size of the batch they were sampled on.
+  double fraction{0.0};
+  /// Batches that may still reuse them.
+  std::uint64_t uses_left{0};
+};
+
+/// A batch whose compressed fraction exceeds that of the batch its plans were sampled on by
+/// this factor ends their reuse: its values no longer look like the sample.
+constexpr double kPlanDriftFactor = 1.25;
+/// Schemas remembered; the map is emptied when it would grow past this.
+constexpr std::size_t kMaxRememberedSchemas = 256;
+
+std::mutex g_plans_mutex;
+/// Keyed by the column type ids of a batch.
+std::unordered_map<std::string, sampled_plans> g_plans;
+
 }  // namespace
 
 void set_spill_compression_settings(spill_compression_settings const& settings)
 {
-  std::lock_guard lock(g_settings_mutex);
-  g_settings = settings;
-  g_enabled.store(settings.enabled, std::memory_order_release);
+  {
+    std::lock_guard lock(g_settings_mutex);
+    g_settings = settings;
+    g_enabled.store(settings.enabled, std::memory_order_release);
+  }
+  std::lock_guard lock(g_plans_mutex);
+  g_plans.clear();
 }
 
 void apply_spill_compression_config(compression_config const& config)
@@ -87,6 +114,7 @@ void apply_spill_compression_config(compression_config const& config)
     .read_cache_max_bytes    = config.spill_read_cache_max_bytes,
     .whole_decode_max_bytes  = config.spill_whole_decode_max_bytes,
     .encode_wait_ms          = config.spill_encode_wait_ms,
+    .plan_reuse_batches      = config.spill_plan_reuse_batches,
   });
 }
 
@@ -188,23 +216,33 @@ class bitpack_size_estimate {
   double bytes_{0};
 };
 
+/// Whether @p column is integer-valued (an integer, a decimal up to 64 bits, a date or a
+/// time) and so chooses its plan with integer_spill_plan().
+bool samples_as_integer(cudf::column_view const& column)
+{
+  auto const type = column.type();
+  bool const integer_valued =
+    cudf::is_integral_not_bool(type) || cudf::is_chrono(type) || cudf::is_fixed_point(type);
+  return integer_valued && cudf::size_of(type) <= sizeof(std::int64_t) && column.size() > 0;
+}
+
+/// Bytes of the prefix of @p column that integer_spill_plan() estimates on.
+std::size_t integer_sample_bytes(cudf::column_view const& column)
+{
+  return static_cast<std::size_t>(plan_sample_rows(column.size(), kIntegerSampleRows)) *
+         cudf::size_of(column.type());
+}
+
 /// Integer-valued columns (integers, decimals up to 64 bits, dates and times) choose
 /// between bitpack, delta -> bitpack and delta -> rle -> bitpack by estimating each one's
-/// size on a prefix sample. Sorted keys, which often reach a spill still in order, pack
-/// far smaller as differences, and runs of equal keys smaller still as runs. The sample
-/// is bounded (kIntegerSampleRows), so estimating it on the host costs little next to
-/// the GPU encode that follows.
-std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+/// size on a prefix sample: @p raw, the first integer_sample_bytes() of the column's values.
+/// Sorted keys, which often reach a spill still in order, pack far smaller as differences,
+/// and runs of equal keys smaller still as runs. The sample is bounded (kIntegerSampleRows),
+/// so estimating it on the host costs little next to the GPU encode that follows.
+std::string integer_spill_plan(cudf::column_view const& column, std::span<std::uint8_t const> raw)
 {
   auto const width = cudf::size_of(column.type());
-  auto const rows  = static_cast<std::size_t>(plan_sample_rows(column.size(), kIntegerSampleRows));
-  std::vector<std::uint8_t> raw(rows * width);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(raw.data(),
-                                column.head<std::uint8_t>() + column.offset() * width,
-                                raw.size(),
-                                cudaMemcpyDeviceToHost,
-                                stream.get()));
-  stream.sync();
+  auto const rows  = raw.size() / width;
 
   bool const is_unsigned = cudf::is_unsigned(column.type());
   auto const shift       = 64 - 8 * static_cast<int>(width);
@@ -250,30 +288,140 @@ std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_r
 
 }  // namespace
 
-std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+namespace {
+
+/// The plan of @p column when its type and size settle it, or null when it takes a sample.
+char const* unsampled_spill_plan(cudf::column_view const& column)
 {
   if (column.type().id() == cudf::type_id::STRING) {
-    if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
-    // A prefix is a cheap and, for batches built from scans and joins, representative
-    // sample; a wrong guess costs ratio, never correctness.
-    auto const sample_rows = plan_sample_rows(column.size(), kDictionarySampleRows);
-    auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
-    auto const distinct    = cudf::distinct_count(
-      sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
-    return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
-             ? kDictionaryPlan
-             : kStringSplitPlan;
+    return column.size() < kMinDictionaryRows ? kStoredPlan : nullptr;
   }
   if (!cudf::is_fixed_width(column.type())) { return kStoredPlan; }
-  auto const type  = column.type();
-  auto const bytes = static_cast<std::size_t>(column.size()) * cudf::size_of(type);
+  auto const bytes = static_cast<std::size_t>(column.size()) * cudf::size_of(column.type());
   if (bytes > kMaxBitpackColumnBytes) { return kStoredPlan; }
-  bool const integer_valued =
-    cudf::is_integral_not_bool(type) || cudf::is_chrono(type) || cudf::is_fixed_point(type);
-  if (integer_valued && cudf::size_of(type) <= sizeof(std::int64_t) && column.size() > 0) {
-    return integer_spill_plan(column, stream);
+  return samples_as_integer(column) ? nullptr : kBitpackPlan;
+}
+
+/// The plan of a string column of at least kMinDictionaryRows rows.
+std::string string_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  // A prefix is a cheap and, for batches built from scans and joins, representative
+  // sample; a wrong guess costs ratio, never correctness.
+  auto const sample_rows = plan_sample_rows(column.size(), kDictionarySampleRows);
+  auto const sample      = cudf::slice(column, {0, sample_rows}, stream).front();
+  auto const distinct    = cudf::distinct_count(
+    sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
+  return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
+           ? kDictionaryPlan
+           : kStringSplitPlan;
+}
+
+/// One plan per column of @p view, sampling every column whose type and size do not settle
+/// it. The integer samples of all columns are read back together, with one wait for
+/// @p stream.
+std::vector<std::string> sample_spill_plans(cudf::table_view const& view, ::cuda::stream_ref stream)
+{
+  std::vector<std::string> plans(static_cast<std::size_t>(view.num_columns()));
+  std::vector<std::vector<std::uint8_t>> samples(plans.size());
+  std::vector<simpatico::device_read> reads;
+  for (std::size_t i = 0; i < plans.size(); ++i) {
+    auto const& column = view.column(static_cast<cudf::size_type>(i));
+    if (auto const* plan = unsampled_spill_plan(column)) {
+      plans[i] = plan;
+    } else if (samples_as_integer(column)) {
+      samples[i].resize(integer_sample_bytes(column));
+      reads.push_back({samples[i].data(),
+                       column.head<std::uint8_t>() + column.offset() * cudf::size_of(column.type()),
+                       samples[i].size()});
+    }
   }
-  return kBitpackPlan;
+  if (!reads.empty()) { simpatico::read_device_bytes_completed(reads, stream); }
+  for (std::size_t i = 0; i < plans.size(); ++i) {
+    if (!plans[i].empty()) { continue; }
+    auto const& column = view.column(static_cast<cudf::size_type>(i));
+    plans[i]           = samples_as_integer(column) ? integer_spill_plan(column, samples[i])
+                                                    : string_spill_plan(column, stream);
+  }
+  return plans;
+}
+
+/// The key of @p view in the remembered plans: its column type ids.
+std::string schema_key(cudf::table_view const& view)
+{
+  std::string key;
+  key.reserve(static_cast<std::size_t>(view.num_columns()) * sizeof(std::int32_t));
+  for (auto const& column : view) {
+    auto const id = static_cast<std::int32_t>(column.type().id());
+    key.append(reinterpret_cast<char const*>(&id), sizeof id);
+  }
+  return key;
+}
+
+/// The plans of a batch and where they came from.
+struct batch_plans {
+  std::vector<std::string> plans;
+  /// Taken from an earlier batch of the same column types instead of sampled.
+  bool reused{false};
+  /// The compressed fraction of the batch the reused plans were sampled on.
+  double sampled_fraction{0.0};
+};
+
+/// The plans to encode @p view with: those remembered for its column types while they may be
+/// reused, else sampled. A column whose type and size settle its plan gets that plan either
+/// way, so a remembered plan is never applied to a column it does not fit.
+batch_plans choose_spill_plans(cudf::table_view const& view,
+                               std::string const& key,
+                               bool may_reuse,
+                               ::cuda::stream_ref stream)
+{
+  batch_plans out;
+  if (may_reuse) {
+    std::lock_guard lock(g_plans_mutex);
+    auto const it = g_plans.find(key);
+    if (it != g_plans.end() && it->second.uses_left > 0 &&
+        it->second.plans.size() == static_cast<std::size_t>(view.num_columns())) {
+      --it->second.uses_left;
+      out.plans            = it->second.plans;
+      out.reused           = true;
+      out.sampled_fraction = it->second.fraction;
+    }
+  }
+  if (!out.reused) {
+    out.plans = sample_spill_plans(view, stream);
+    return out;
+  }
+  for (std::size_t i = 0; i < out.plans.size(); ++i) {
+    if (auto const* plan = unsampled_spill_plan(view.column(static_cast<cudf::size_type>(i)))) {
+      out.plans[i] = plan;
+    }
+  }
+  return out;
+}
+
+/// Remember the sampled @p plans of a batch that compressed to @p fraction of its size, for
+/// the next @p reuse_batches - 1 batches of the same column types.
+void remember_spill_plans(std::string const& key,
+                          std::vector<std::string> plans,
+                          double fraction,
+                          std::uint64_t reuse_batches)
+{
+  std::lock_guard lock(g_plans_mutex);
+  if (g_plans.size() >= kMaxRememberedSchemas && !g_plans.contains(key)) { g_plans.clear(); }
+  g_plans[key] = {std::move(plans), fraction, reuse_batches - 1};
+}
+
+/// Have the next batch of these column types sampled again.
+void forget_spill_plans(std::string const& key)
+{
+  std::lock_guard lock(g_plans_mutex);
+  g_plans.erase(key);
+}
+
+}  // namespace
+
+std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  return sample_spill_plans(cudf::table_view{{column}}, stream).front();
 }
 
 namespace {
@@ -428,38 +576,66 @@ encoded_batch encode_for_spill(const cucascade::gpu_table_representation& source
     compression::detail::note_encode_finished(space.get_device_id());
   };
 
-  std::string plan;
-  bool all_stored = true;
-  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    if (i > 0) { plan += "---\n"; }
-    auto column_plan = compression::default_spill_plan(view.column(i), stream);
-    all_stored       = all_stored && column_plan == compression::kStoredPlan;
-    plan += column_plan;
+  auto const mr          = rmm::device_async_resource_ref{*gpu_mr};
+  auto const key         = compression::schema_key(view);
+  bool const remembering = settings.plan_reuse_batches > 1;
+  // A batch that saves too little with plans sampled on an earlier batch is encoded once
+  // more with its own.
+  for (bool may_reuse = remembering;; may_reuse = false) {
+    auto const plan_started = std::chrono::steady_clock::now();
+    auto chosen             = compression::choose_spill_plans(view, key, may_reuse, stream);
+    spill::io_stats::get().record_encode_plans(chosen.reused, spill::micros_since(plan_started));
+    std::string plan;
+    bool all_stored = true;
+    for (std::size_t i = 0; i < chosen.plans.size(); ++i) {
+      if (i > 0) { plan += "---\n"; }
+      all_stored = all_stored && chosen.plans[i] == compression::kStoredPlan;
+      plan += chosen.plans[i];
+    }
+    // Storing every column as is saves nothing, and the encode would still copy the batch.
+    if (all_stored) { throw spill_compression_declined("no column of the batch compresses"); }
+
+    if (per_thread) {
+      // The pool streams are not ordered after `stream`, which the batch and the plan
+      // sampling ran on.
+      stream.sync();
+      out.table = simpatico::compress_with_plan(
+        view, plan, simpatico::thread_device_stream_pool(kEncodeStreams), mr, {});
+    } else {
+      out.table = simpatico::compress_with_plan(view, plan, stream, mr, {});
+    }
+
+    out.header.clear();
+    out.buffers.clear();
+    out.payload_bytes = 0;
+    auto const error  = simpatico::build_compressed_table_header(
+      out.table, out.header, out.buffers, out.payload_bytes, stream);
+    if (!error.empty()) { throw std::runtime_error("build_compressed_table_header: " + error); }
+
+    auto const compressed_bytes = out.header.size() + out.payload_bytes;
+    auto const fraction =
+      static_cast<double>(compressed_bytes) / static_cast<double>(out.uncompressed_bytes);
+    if (fraction > settings.max_compressed_fraction) {
+      if (chosen.reused) {
+        compression::forget_spill_plans(key);
+        out.buffers.clear();
+        out.table = simpatico::compressed_table{};
+        continue;
+      }
+      throw spill_compression_declined("compressed " + std::to_string(compressed_bytes) +
+                                       " bytes of " + std::to_string(out.uncompressed_bytes));
+    }
+    if (chosen.reused) {
+      if (fraction > compression::kPlanDriftFactor * chosen.sampled_fraction) {
+        compression::forget_spill_plans(key);
+      }
+    } else if (remembering) {
+      compression::remember_spill_plans(
+        key, std::move(chosen.plans), fraction, settings.plan_reuse_batches);
+    }
+    break;
   }
-  // Storing every column as is saves nothing, and the encode would still copy the batch.
-  if (all_stored) { throw spill_compression_declined("no column of the batch compresses"); }
-
-  auto const mr = rmm::device_async_resource_ref{*gpu_mr};
-  if (per_thread) {
-    // The pool streams are not ordered after `stream`, which the batch and the plan
-    // sampling ran on.
-    stream.sync();
-    out.table = simpatico::compress_with_plan(
-      view, plan, simpatico::thread_device_stream_pool(kEncodeStreams), mr, {});
-  } else {
-    out.table = simpatico::compress_with_plan(view, plan, stream, mr, {});
-  }
-
-  auto const error = simpatico::build_compressed_table_header(
-    out.table, out.header, out.buffers, out.payload_bytes, stream);
-  if (!error.empty()) { throw std::runtime_error("build_compressed_table_header: " + error); }
-
   auto const compressed_bytes = out.header.size() + out.payload_bytes;
-  if (static_cast<double>(compressed_bytes) >
-      settings.max_compressed_fraction * static_cast<double>(out.uncompressed_bytes)) {
-    throw spill_compression_declined("compressed " + std::to_string(compressed_bytes) +
-                                     " bytes of " + std::to_string(out.uncompressed_bytes));
-  }
   SIRIUS_LOG_DEBUG("[spill_compression] compressed {} bytes to {} ({} rows, {} columns)",
                    out.uncompressed_bytes,
                    compressed_bytes,

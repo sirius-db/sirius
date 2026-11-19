@@ -627,6 +627,116 @@ TEST_CASE("spill compression: the spill counters report stored bytes and reloads
   }
 }
 
+namespace {
+
+/// A single-column INT64 batch of @p rows values produced by @p value.
+template <typename Value>
+std::shared_ptr<cucascade::data_batch> int64_batch(std::size_t rows, Value value)
+{
+  std::vector<std::int64_t> values(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    values[i] = value(i);
+  }
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    numeric_column(cudf::data_type{cudf::type_id::INT64}, values, utils::default_stream()));
+  return gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+}
+
+}  // namespace
+
+TEST_CASE("spill compression: sampled plans encode the next batches of the same column types",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  auto& stats = sirius::spill::io_stats::get();
+
+  SECTION("a batch is sampled once per plan_reuse_batches and decodes the same either way")
+  {
+    auto s               = enabled_settings();
+    s.plan_reuse_batches = 3;
+    scoped_settings settings(s);
+    auto const before = stats.snapshot();
+    for (int i = 0; i < 4; ++i) {
+      auto batch          = gpu_batch(compressible_table());
+      auto const expected = digest(*batch);
+      move_to(batch, env().host);
+      REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+      move_to(batch, env().gpu);
+      CHECK(digest(*batch) == expected);
+    }
+    auto const after = stats.snapshot();
+    // Batches 1 and 4 are sampled; 2 and 3 reuse the plans of batch 1.
+    CHECK(after.encode_plans_sampled - before.encode_plans_sampled == 2);
+    CHECK(after.encode_plans_reused - before.encode_plans_reused == 2);
+  }
+
+  SECTION("plan_reuse_batches = 1 samples every batch")
+  {
+    auto s               = enabled_settings();
+    s.plan_reuse_batches = 1;
+    scoped_settings settings(s);
+    auto const before = stats.snapshot();
+    for (int i = 0; i < 3; ++i) {
+      move_to(gpu_batch(compressible_table()), env().host);
+    }
+    auto const after = stats.snapshot();
+    CHECK(after.encode_plans_sampled - before.encode_plans_sampled == 3);
+    CHECK(after.encode_plans_reused == before.encode_plans_reused);
+  }
+
+  SECTION("a batch that compresses clearly worse with the remembered plans ends their reuse")
+  {
+    scoped_settings settings(enabled_settings());
+    constexpr std::size_t rows = 1 << 18;
+    // Sorted keys take a delta plan and pack to a few bits a value.
+    auto sorted = int64_batch(rows, [](std::size_t i) { return static_cast<std::int64_t>(i * 3); });
+    // 20-bit noise packs far worse, with any plan.
+    std::mt19937_64 rng{11};
+    auto const noise = [&](std::size_t) { return static_cast<std::int64_t>(rng() & 0xfffff); };
+    auto noisy       = int64_batch(rows, noise);
+    auto const noisy_expected = digest(*noisy);
+    auto after_noise          = int64_batch(rows, noise);
+
+    auto const before = stats.snapshot();
+    move_to(sorted, env().host);       // sampled
+    move_to(noisy, env().host);        // reuses the delta plan, and ends its reuse
+    move_to(after_noise, env().host);  // sampled again
+    auto const after = stats.snapshot();
+    CHECK(after.encode_plans_sampled - before.encode_plans_sampled == 2);
+    CHECK(after.encode_plans_reused - before.encode_plans_reused == 1);
+    REQUIRE(holds<sirius::compressed_host_representation>(*noisy));
+    move_to(noisy, env().gpu);
+    CHECK(digest(*noisy) == noisy_expected);
+  }
+
+  SECTION("a batch the remembered plans would leave uncompressed is encoded with its own")
+  {
+    auto s                    = enabled_settings();
+    s.max_compressed_fraction = 0.3;
+    scoped_settings settings(s);
+    constexpr std::size_t rows = 1 << 18;
+    // Small values in no order: bitpack stores 8 bits a value, a delta plan 9 with the sign.
+    std::mt19937_64 rng{5};
+    auto small =
+      int64_batch(rows, [&](std::size_t) { return static_cast<std::int64_t>(rng() & 0xff); });
+    // A wide ramp of steps of 2^16: 17 bits a value as differences, 27 as bitpack.
+    auto ramp = int64_batch(rows, [](std::size_t i) { return static_cast<std::int64_t>(i) << 16; });
+    auto const ramp_expected = digest(*ramp);
+
+    auto const before = stats.snapshot();
+    move_to(small, env().host);  // sampled: bitpack
+    move_to(ramp, env().host);   // bitpack would exceed the fraction; sampled again: delta
+    auto const after = stats.snapshot();
+    CHECK(after.encode_plans_sampled - before.encode_plans_sampled == 2);
+    CHECK(after.encode_plans_reused - before.encode_plans_reused == 1);
+    CHECK(after.compressed_batches - before.compressed_batches == 2);
+    REQUIRE(holds<sirius::compressed_host_representation>(*ramp));
+    move_to(ramp, env().gpu);
+    CHECK(digest(*ramp) == ramp_expected);
+  }
+}
+
 TEST_CASE("spill compression: an encode without headroom waits only for another encode",
           "[compression][spill]")
 {
