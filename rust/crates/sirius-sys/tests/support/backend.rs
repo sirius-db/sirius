@@ -2,7 +2,7 @@
 //! These model ownership and output slots, not YAML parsing or engine behavior.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use sirius_sys::c_api::*;
+use crate::c_api::*;
 use std::{cell::RefCell, ffi::c_char, ptr, sync::Arc};
 
 thread_local! {

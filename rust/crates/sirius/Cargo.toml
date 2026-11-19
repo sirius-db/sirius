@@ -15,5 +15,9 @@ static = ["sirius-sys/static"]
 [dependencies]
 sirius-sys.workspace = true
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [dev-dependencies]
+sirius-sys = { workspace = true, features = ["miri-test-backend"] }
 tempfile = "3"

@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+#![doc(test(attr(forbid(unsafe_code))))]
 //! Safe Rust bindings to the public Sirius C ABI.
 //!
 //! Build immutable configurations with [`ContextConfigBuilder`].
@@ -5,5 +7,4 @@
 //! Existing execution and object-store bindings live in the `sirius-ffi` crate.
 
 mod config;
-mod diagnostic;
 pub use config::{ConfigError, ContextConfig, ContextConfigBuilder};
