@@ -1,3 +1,12 @@
+# Ports recording vendored components use the engine's component helper.
+if(PORT MATCHES "^(cudf|cuvs|raft|rmm)$")
+  get_filename_component(
+    sirius_component_helper
+    "${CMAKE_CURRENT_LIST_DIR}/../../../cmake/sirius-third-party-component.cmake"
+    ABSOLUTE)
+  list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${sirius_component_helper}")
+endif()
+
 # Only Sirius depends on the local checkout; other ports retain their cache
 # keys.
 if(NOT PORT STREQUAL "sirius")
@@ -15,7 +24,14 @@ foreach(repository . duckdb cucascade substrait)
   endif()
   set(paths .)
   if(repository STREQUAL ".")
-    set(paths CMakeLists.txt LICENSE cmake include src rust)
+    set(paths
+        CMakeLists.txt
+        LICENSE
+        cmake
+        include
+        licenses
+        src
+        rust)
   endif()
   execute_process(
     COMMAND

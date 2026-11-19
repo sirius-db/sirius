@@ -1,5 +1,8 @@
 @PACKAGE_INIT@
 
+# Third-party components compiled into Sirius, see sirius-third-party.cmake.
+set_and_check(SIRIUS_THIRD_PARTY_DIR "@PACKAGE_SIRIUS_THIRD_PARTY_INSTALL_DIR@")
+
 include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake" OPTIONAL)
 if("static" IN_LIST sirius_FIND_COMPONENTS OR NOT TARGET sirius::sirius)
   if(NOT TARGET sirius::sirius_static AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/sirius-static-targets.cmake")

@@ -122,6 +122,12 @@ jobs:
           pattern: sirius-*-extension-linux_amd64-cuda${{ matrix.cuda.version }}
           merge-multiple: true
           path: build/bundled
+      - name: Check embedded third-party notices
+        run: |
+          python3 scripts/extract_third_party_notices.py build/bundled/sirius.duckdb_extension \
+            -o /dev/null --require Sirius --require DuckDB --require cudf --require nvcomp \
+            --require "GCC runtime libraries (libstdc++, libgcc)"
+
       - name: Smoke-test bundled GPU execution
         env:
           SIRIUS_CONFIG_FILE: ${{ github.workspace }}/test/cpp/integration/integration.yaml

@@ -85,6 +85,25 @@ Run the wrapper's SQL tests from the root:
 pixi run make -C sirius-duckdb test_release
 ```
 
+## Third-party notices
+
+Each extension binary embeds the notices of the third-party code it bundles.
+`sirius_licenses()` lists them, and
+`scripts/extract_third_party_notices.py` extracts the same document from a
+binary without loading it. The build collects them from:
+
+- DuckDB and the libraries it vendors, read from the host DuckDB tree.
+- Sirius's own vendored code and Rust crates, installed by the engine under
+  `share/sirius/third_party` (`cmake/sirius-third-party.cmake`).
+- In static builds, every port in the vcpkg installed tree (its `copyright`
+  file and SPDX document), plus the components a port installs under
+  `share/<port>/third_party`.
+
+An overlay port that compiles in sources fetched outside its main archive
+records them with `sirius_third_party_component` from
+`cmake/sirius-third-party-component.cmake`. The loader embeds only Sirius and
+DuckDB, and registers `sirius_licenses()` only while no backend is loaded.
+
 ## CUDA-selecting core extensions
 
 The core-extension layout has three artifacts:
