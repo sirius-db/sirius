@@ -174,10 +174,11 @@ TEST_CASE("Sort ranges keep a heavy key together (current behaviour, #2579)", "[
   }
   auto batches = int_batches(values);
   auto result  = run_checked(batches, one_order(), 100000, 80);
-  CHECK(result.sample.repeated_boundaries > 0);
+  REQUIRE(result.sample.repeated_boundaries.has_value());
+  CHECK(*result.sample.repeated_boundaries > 0);
   auto empty = std::count_if(
     result.counted.begin(), result.counted.end(), [](auto const& r) { return r.rows == 0; });
-  CHECK(empty >= result.sample.repeated_boundaries);
+  CHECK(empty >= *result.sample.repeated_boundaries);
   auto ranges_with_key =
     std::count_if(result.keys.begin(), result.keys.end(), [](auto const& rows) {
       return std::any_of(rows.begin(), rows.end(), [](auto const& row) {

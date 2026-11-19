@@ -31,6 +31,7 @@
 #include <format>
 #include <numeric>
 #include <sstream>
+#include <string>
 
 namespace sirius {
 namespace op {
@@ -271,7 +272,7 @@ void sirius_physical_sort_partition::on_finalize_operator()
       sample.sample_rows,
       sample.sample_key_rows,
       sample.sample_stride,
-      sample.repeated_boundaries,
+      sample.repeated_boundaries ? std::to_string(*sample.repeated_boundaries) : "unavailable",
       rows_min,
       median(rows),
       rows_max,

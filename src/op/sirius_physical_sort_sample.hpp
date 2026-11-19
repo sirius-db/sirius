@@ -51,7 +51,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     std::string_view est_source       = "planner";
     std::size_t target_range_bytes    = 0;
     std::size_t num_ranges            = 1;
-    std::size_t repeated_boundaries   = 0;
+    // Unavailable if the diagnostic ran out of GPU memory.
+    std::optional<std::size_t> repeated_boundaries = 0;
   };
 
   [[nodiscard]] range_sample_stats const& get_range_sample_stats() const noexcept

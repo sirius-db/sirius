@@ -632,6 +632,7 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE â†
 - `get_next_task_input_data()` (overridden) claims the accumulated sample batches and moves the state to `SCHEDULED`, handing them to `execute()` as a single multi-batch input.
 - `execute()` gathers regularly spaced key rows from each pre-sorted sample batch, merges those keys, computes boundaries, and moves to `DONE`. Range sizing uses measured input when upstream is finished, otherwise the runtime byte estimate when available, then the planner estimate. It also caps expected rows per range at half cuDF's column limit. If a GPU allocation throws (e.g. OOM), the state stays `SCHEDULED` and the rescheduled task retries with the same input, preventing a duplicate boundary task.
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
+- Counting repeated boundaries is best-effort: a GPU allocation failure records `repeated_boundaries=unavailable` and retains the completed boundaries, without retrying the distributed exchange.
 
 ### `sirius_physical_sort_partition` â€” `SORT_PARTITION`
 **File:** `src/op/sirius_physical_sort_partition.hpp`

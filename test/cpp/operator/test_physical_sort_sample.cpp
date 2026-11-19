@@ -16,9 +16,11 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/scan_resource_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime.h>
 
@@ -529,4 +531,74 @@ TEST_CASE("Sort range count respects bytes, rows, and sample size", "[physical_s
   CHECK(choose_sort_range_count(10, 6000000000ULL, 100, 6000000000ULL) == 6);
   CHECK(choose_sort_range_count(10, 6000000000ULL, 0, 6000000000ULL) == 6);
   CHECK(choose_sort_range_count(1000, 100, 100, 3) == 3);
+}
+
+TEST_CASE("Sort boundary diagnostic OOM preserves completed distributed boundaries",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const stream      = cudf::get_default_stream();
+  bool const empty_input = GENERATE(false, true);
+
+  // Arm the allocator only after the hook succeeds, so the failure is in the diagnostic,
+  // not in sampling or boundary construction. Like the real collective, the hook is one-shot.
+  sirius::test::tracked_scan_resource resource(cudf::get_current_device_resource_ref(), stream);
+  class one_shot_boundaries final : public cross_rank_sort_boundaries {
+   public:
+    one_shot_boundaries(std::unique_ptr<cudf::table> boundaries,
+                        std::shared_ptr<sirius::test::tracked_scan_resource::counters> counters)
+      : boundaries_(std::move(boundaries)), counters_(std::move(counters))
+    {
+    }
+    sort_boundaries make(request const&, ::cuda::stream_ref) override
+    {
+      if (++calls != 1) { throw std::logic_error("boundary collective repeated"); }
+      counters_->fail_at = counters_->attempts;
+      return {3, std::move(boundaries_)};
+    }
+    std::size_t calls = 0;
+
+   private:
+    std::unique_ptr<cudf::table> boundaries_;
+    std::shared_ptr<sirius::test::tracked_scan_resource::counters> counters_;
+  };
+
+  auto boundary_batch = make_numeric_batch<int32_t>(*space, {10, 20}, cudf::type_id::INT32);
+  auto hook           = std::make_shared<one_shot_boundaries>(
+    std::make_unique<cudf::table>(
+      sirius::get_cudf_table_view(*boundary_batch), stream, space->get_default_allocator()),
+    resource.state);
+  auto sample = make_sort_sample(1024, 40);
+  sample.set_cross_rank_boundaries(hook);
+  cucascade::shared_data_repository repo;
+  if (!empty_input) { add_int_batches(repo, *space, 1, 30); }
+  auto source =
+    std::make_shared<mock_gpu_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
+  source->set_finished(true);
+  attach_port(sample, repo, source);
+  auto input = sample.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+
+  // Restore the process-wide resource even if a REQUIRE fails.
+  struct resource_guard {
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible> previous;
+    ~resource_guard() { (void)cudf::set_current_device_resource(std::move(previous)); }
+  } guard{cudf::set_current_device_resource(
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource})};
+
+  std::unique_ptr<operator_data> output;
+  REQUIRE_NOTHROW(output = sample.execute(*input, stream));
+  CHECK(resource.state->attempts > resource.state->fail_at);
+  REQUIRE(sample.boundaries_computed());
+  CHECK(sample.get_num_partitions() == 3);
+  CHECK_FALSE(sample.get_range_sample_stats().repeated_boundaries.has_value());
+  REQUIRE(sample.get_partition_boundaries().num_rows() == 2);
+  CHECK(read_int32_column(sample.get_partition_boundaries().view().column(0), 0) == 10);
+  CHECK(read_int32_column(sample.get_partition_boundaries().view().column(0), 1) == 20);
+  CHECK(batch_count(*output) == (empty_input ? 0 : 1));
+
+  // Completed operators pass through on subsequent execution without invoking the hook again.
+  REQUIRE_NOTHROW(sample.execute(*input, stream));
+  CHECK(hook->calls == 1);
 }
