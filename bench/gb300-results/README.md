@@ -113,6 +113,12 @@ bytes entered host and disk memory during the original SF1000, SF3000, and
 SF10000 query executions. Those trace counts have not been refreshed for the
 newer SF1000 pin, SF3000, or SF10000 cold/hot timings.
 
+The separate [host-cap spill sweep](../gb300-spill-sweep/README.md) runs each
+query in a fresh process at 32, 64, 128, 256, and 450 GiB of host capacity.
+It includes the runner, per-query CSVs, totals, and measurement notes for
+SF1000, SF3000, and SF10000. These runs use Sirius main `26b5caba` and are
+separate from the selected cold/hot/pin timing snapshots above.
+
 ## Host-pinned Parquet concurrency
 
 The [concurrency results](concurrency/summary.csv) add SF100, SF300, and SF1000
