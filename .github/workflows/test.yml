@@ -64,6 +64,13 @@ jobs:
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
+      - name: Test concurrent benchmark harness without a GPU
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
+            -s test/tpch_performance -p 'test_concurrent_benchmark.py'
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
+            -s test/tpch_performance -p 'test_throughput_validation.py'
+
       - name: Test Simpatico cache identity without a GPU
         run: |
           pixi run -e ${{ matrix.cuda.pixi-environment }} cmake \

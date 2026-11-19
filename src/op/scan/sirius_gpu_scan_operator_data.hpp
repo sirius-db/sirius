@@ -94,6 +94,8 @@ struct membership_snapshot {
  * split's own state.
  */
 struct membership_attach_options {
+  bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   /// The scan latched decode-time compaction as unprofitable, so offer no probes.
   bool selection_unprofitable = false;
   /// The split carries an MVCC keep-mask that the representation does not compose into the decode.
@@ -338,6 +340,9 @@ class scan_operator_input : public op::operator_data {
   }
 
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
+  /// Immutable query policy, set before estimating or preparing this split.
+  bool enable_fused_scan_filter = true;
+  sirius::codegen::fused_scan_policy fused_scan;
   std::variant<std::monostate, std::shared_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
   /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =
@@ -372,6 +377,24 @@ class scan_operator_input : public op::operator_data {
   /// again. False whenever the answers came from the plain predicated decode,
   /// which drops no rows.
   bool pushdown_predicates_enforced{false};
+  /// True when the decode DROPPED rows (pushdown_outcome::compacted), whether
+  /// or not it carried the whole filter. A deferral's rowid addresses the
+  /// pinned chunk by position, so a compacted batch is only addressable
+  /// together with @ref pushdown_survivors.
+  bool pushdown_compacted{false};
+  /// Chunk-local positions of the rows the decode kept, ascending INT32, one
+  /// per row of the decoded batch (pushdown_outcome::survivor_rows). Requested
+  /// only by a split carrying a deferral (@ref late_mat_wants_survivors) and
+  /// only produced when the decode compacted; null otherwise. Composed with the
+  /// post-decode residual filter's own survivors in
+  /// sirius_gpu_scan_operator::execute.
+  std::shared_ptr<cudf::column const> pushdown_survivors;
+  /// Whether this split's scan carries a late-materialization deferral, so the
+  /// decode must be asked to report which rows it kept, and the freshly decoded
+  /// table must stay in the wrapper until substitution commits. Stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data, which is the only
+  /// place that knows. False leaves the decode exactly as it was.
+  bool late_mat_wants_survivors{false};
   /// The scan's decode consumer (`sirius_gpu_scan_operator::decode_consumer`), which selects
   /// membership probes for this split's decode through its decode bindings; null when no decode
   /// attachment is permitted.
@@ -442,8 +465,20 @@ class scan_operator_input : public op::operator_data {
   void report_membership_keep(
     std::optional<pushdown_outcome::membership_keep_observation> const& observation) const noexcept;
 
+  /// Whether this split's own decoded table stays in the cached batch beside the scan output: a
+  /// deferring split skips the steal, so the decode's allocation and the output's copy of the
+  /// columns it keeps coexist at peak. Before preparation this is forecast from the batch still
+  /// needing conversion.
+  [[nodiscard]] bool keeps_decoded_table() const;
+
+  /// Bytes of the rowid column a deferral substitutes into this split's output, at the full rowid
+  /// width: one per reported survivor, or per row of the split's origin before decode.
+  [[nodiscard]] std::size_t deferred_rowid_bytes() const;
+
   /// Whether the input has already been decoded for a retry (preserve dynamic filter history)
   bool _decoded_input_reused{false};
+  /// Set by prepare_for_processing when a deferral kept the converted table in the cached batch.
+  bool _decoded_table_kept{false};
   /// Per-query readahead bookkeeping this split reports into; null when the
   /// producer does not track readahead.
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;

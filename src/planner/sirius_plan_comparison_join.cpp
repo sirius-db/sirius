@@ -49,19 +49,23 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <algorithm>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace sirius::planner {
@@ -530,11 +534,24 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
-  bool const build_evidence = build_filtered || build_opaque;
+  bool const build_join_filtered =
+    dynamic_filter_enabled && build_subtree_has_filtering_join(*op.children[1]);
+  bool const build_evidence = build_filtered || build_opaque || build_join_filtered;
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
-    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
+    build_evidence ? build_key_domain_evidence_for(op, context, sirius_context->get_scan_manager())
+                   : std::vector<sirius::op::dynamic_filter_domain_evidence>{};
+  // The coverage gate needs a domain that bounds rows. A filter's keep-ratio estimate needs only a
+  // bound on the values, which survive any join, and can use a Parquet scan's footer row count.
+  auto condition_value_domains =
+    build_evidence ? build_key_domain_cardinalities(
+                       op,
+                       [&](duckdb::LogicalGet const& get) {
+                         auto const rows = transparent::parquet_scan_row_count(get);
+                         return rows ? rows : duckdb_base_table_cardinality{context}(get);
+                       },
+                       origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
   // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
@@ -625,9 +642,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    auto options          = duckdb::query_operator_options(context);
-    const auto& op_params = *options;
-    auto* const stats     = &sirius_context->get_dynamic_filter_stats();
+    auto options               = duckdb::query_operator_options(context);
+    const auto& op_params      = *options;
+    auto* const stats          = &sirius_context->get_dynamic_filter_stats();
+    bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -645,8 +663,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         break;
       }
     }
-    auto admitted_keys = admit_dynamic_filter_keys(
-      conditions, condition_key_shapes, condition_domains, build_side_unique_column);
+    auto admitted_keys = admit_dynamic_filter_keys(conditions,
+                                                   condition_key_shapes,
+                                                   condition_domains,
+                                                   build_side_unique_column,
+                                                   condition_value_domains);
 
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
@@ -656,8 +677,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     bool const discovery_runs =
       build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       !gpu_spaces.empty() && !host_spaces.empty() &&
-      (!needs_early_publication || (op_params.enable_dynamic_filter_multi_partition &&
-                                    op_params.max_dynamic_filter_bloom_bytes_per_gpu() > 0));
+      (!needs_early_publication || right_family_publication_enabled(op_params));
     if (discovery_runs) {
       bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
@@ -711,7 +731,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
              .channel_push_ordinal = terminal.ordinal,
              .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
-          scan_bound = true;
+          // A body scan is an addition to the reader's endpoint, not a replacement for it.
+          scan_bound = scan_bound || !terminal.in_cte_body;
         }
         if (scan_bound) { continue; }
         // Admission proves build-block safety; placement preserves the reported site ordinal.
@@ -762,13 +783,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       }
     }
     if (!targets.empty()) {
+      std::string evidence;
+      for (auto const& [present, name] : {std::pair{build_filtered, "filtered"},
+                                          std::pair{build_opaque, "opaque"},
+                                          std::pair{build_join_filtered, "semi-join"}}) {
+        if (!present) { continue; }
+        if (!evidence.empty()) { evidence += '+'; }
+        evidence += name;
+      }
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
         "target(s) ({} scan-bound, {} join-edge; evidence={}; build est {} rows).",
         targets.size(),
         scan_target_count,
         targets.size() - scan_target_count,
-        build_filtered ? (build_opaque ? "filtered+opaque" : "filtered") : "opaque",
+        evidence,
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
@@ -780,7 +809,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "neither filter nor opaque-build evidence (build est {} rows).",
+        "no filter, opaque-build or semi-join evidence (build est {} rows).",
         rhs_cardinality);
     }
 
@@ -819,7 +848,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
-       .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
+       .enable_multi_partition    = multi_partition,
        .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu()}};
 
     auto join = make_hash_join(op,
@@ -834,6 +863,37 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                 .dynamic_filter_plan       = std::move(filter_plan),
                                 .dynamic_filter_stats_sink = stats});
     auto& hj  = *join;
+    if (op.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        op.join_type == duckdb::JoinType::RIGHT_ANTI) {
+      // Every partition keeps its build rows resident until the whole probe is read, and that
+      // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
+      // when all of it fits the per-GPU BUILD_PROBE residency budget across the GPUs.
+      auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
+      auto const kept_bytes = sirius::memory::saturating_mul(
+        rhs_cardinality,
+        sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
+                                                op_params.avg_variable_column_bytes));
+      auto const budget =
+        sirius::memory::saturating_mul(num_gpus, op_params.max_build_probe_resident_bytes);
+      if (kept_bytes < budget) {
+        hj.set_kept_build_streaming(true);
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe "
+          "est {} rows, build est {} rows, {} bytes).",
+          duckdb::JoinTypeToString(op.join_type),
+          lhs_cardinality,
+          rhs_cardinality,
+          kept_bytes);
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} keeps the STANDARD build: its kept side, est {} "
+          "bytes, exceeds the {} GPU(s)' residency budget of {} bytes.",
+          duckdb::JoinTypeToString(op.join_type),
+          kept_bytes,
+          num_gpus,
+          budget);
+      }
+    }
     hj.set_single_join_error_on_multiple_rows(
       duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 

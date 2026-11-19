@@ -1,0 +1,3 @@
+sirius:
+  telemetry:
+    enable_quent: false

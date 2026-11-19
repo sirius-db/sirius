@@ -23,7 +23,6 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
@@ -34,7 +33,7 @@
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/scan_resource_test_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
-#include <utils/tracking_kvikio_context.hpp>
+#include <utils/tracking_local_ioctx.hpp>
 
 #include <array>
 #include <atomic>
@@ -296,7 +295,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   info->projected_output_count = 1;
   info->resolved_file_paths    = {dir.file("a.parquet")};
   auto reader                  = std::make_shared<relay_ingestible>(std::move(info));
-  auto ioctx                   = std::make_shared<sirius::test::tracking_kvikio_context>();
+  auto ioctx                   = std::make_shared<sirius::test::tracking_local_ioctx>();
   auto task                    = reader->next_split_provider(
     [ioctx](auto) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
@@ -822,7 +821,7 @@ TEST_CASE_METHOD(
       sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_GREATERTHAN,
                                     duckdb::Value::INTEGER(100)));
   parquet_scan_core core(std::move(info));
-  auto ioctx    = std::make_shared<sirius::test::tracking_kvikio_context>();
+  auto ioctx    = std::make_shared<sirius::test::tracking_local_ioctx>();
   auto resolver = [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
     return ioctx;
   };
@@ -1788,7 +1787,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   info->column_ids             = {duckdb::ColumnIndex(0)};
   info->projected_output_count = 1;
   parquet_scan_core core(std::move(info));
-  auto ioctx     = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx     = sirius::test::make_test_local_ioctx();
   auto prepare   = core.next_split_provider([ioctx](std::string_view) { return ioctx; });
   auto coalescer = core.create_batch_coalescer();
   auto splits    = coalescer->push(prepare({}));
@@ -1927,7 +1926,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
          " file_path, pos FROM (VALUES (-1::BIGINT), (11::BIGINT)" +
          (duplicates ? ",(11::BIGINT)" : "") + ") t(pos)) TO " +
          dir.file_literal("deletes.parquet") + " (FORMAT PARQUET)");
-  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   iceberg_delete_discovery discovery;
   discovery.positional_delete_files = {dir.file("deletes.parquet")};
   auto payload = load_delete_payload(*con->context, "lineage-eager", ioctx, discovery);

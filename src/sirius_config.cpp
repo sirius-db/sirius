@@ -17,25 +17,36 @@
 #include "sirius_config.hpp"
 
 #include "exec/config.hpp"
+#include "exec/thread_defaults.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/exec/thread_util.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/tls/config.hpp>
 #include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -67,6 +78,12 @@ uint64_t derived_default_batch_size()
 }
 
 }  // namespace config
+
+#ifdef SIRIUS_DISTRIBUTION_DEFAULTS
+bool const telemetry_config::default_enable_quent = false;
+#else
+bool const telemetry_config::default_enable_quent = true;
+#endif
 
 namespace {
 
@@ -193,8 +210,135 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
+// Read counts signed first, so negative YAML values cannot wrap into an unsigned field.
+template <typename T>
+static void read_count(yaml::reader& r,
+                       char const* key,
+                       T& out,
+                       bool positive     = false,
+                       std::uint64_t max = std::numeric_limits<T>::max())
+{
+  std::int64_t value{};
+  r.optional(key, value, [=](auto v) {
+    if (v < 0 || (positive && v == 0) || static_cast<std::uint64_t>(v) > max) {
+      std::string text = positive ? "must be a positive integer" : "must be a nonnegative integer";
+      if (max < static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+        text += " <= " + std::to_string(max);
+      }
+      throw std::runtime_error(text);
+    }
+    return true;
+  });
+  if (r.has_value(key)) { out = static_cast<T>(value); }
+}
+
+// Read one of a closed set of spellings; anything else names the accepted ones.
+template <typename T>
+static void read_choice(yaml::reader& r,
+                        char const* key,
+                        T& out,
+                        std::initializer_list<std::pair<std::string_view, T>> choices)
+{
+  std::string value;
+  r.optional(key, value, [&](auto const& spelling) {
+    std::string expected;
+    for (auto const& [name, choice] : choices) {
+      if (spelling == name) {
+        out = choice;
+        return true;
+      }
+      expected += (expected.empty() ? "" : ", ") + std::string{name};
+    }
+    throw std::runtime_error("invalid enum value '" + spelling + "' (expected " + expected + ")");
+  });
+}
+
+static void from_yaml(const YAML::Node& node, cucascade::io::tls::config& opt)
+{
+  namespace tls = cucascade::io::tls;
+  yaml::reader r(node, "rest.tls");
+  if (r.has("verify")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.rest.tls.verify': trust is owned by object_store; set "
+      "VERIFY_SSL on the selected CREATE SECRET (TYPE SIRIUS_S3, ...) or tls_verify through "
+      "sirius_config::set_object_store_config() instead");
+  }
+  for (auto const* key : {"ca_file", "ca_dir", "ca_blob"}) {
+    if (r.has(key)) {
+      throw std::runtime_error(
+        "'sirius.executor.scan_manager.rest.tls." + std::string(key) +
+        "': trust is owned by object_store; set ca_bundle_path through "
+        "sirius_config::set_object_store_config() (kept when a SQL secret is selected), or "
+        "NIX_SSL_CERT_FILE / SSL_CERT_FILE / SSL_CERT_DIR in the process environment "
+        "(a usable NIX_SSL_CERT_FILE takes precedence over SSL_CERT_FILE); SQL secrets carry no "
+        "CA");
+    }
+  }
+  read_choice(r,
+              "ktls",
+              opt.ktls,
+              {{"prefer", tls::ktls_mode::prefer},
+               {"require", tls::ktls_mode::require},
+               {"disable", tls::ktls_mode::disable}});
+  read_choice(
+    r,
+    "user_space_rx",
+    opt.fallback_rx,
+    {{"record_layer", tls::user_space_rx::record_layer}, {"library", tls::user_space_rx::library}});
+  read_choice(r,
+              "recv_placement",
+              opt.placement,
+              {{"automatic", tls::recv_placement::automatic},
+               {"inline", tls::recv_placement::inline_},
+               {"iowq", tls::recv_placement::iowq}});
+  read_choice(r,
+              "min_version",
+              opt.min_version,
+              {{"tls1.2", tls::version_bound::tls1_2}, {"tls1.3", tls::version_bound::tls1_3}});
+  std::optional<tls::version_bound> max_version = opt.max_version;
+  read_choice(r,
+              "max_version",
+              max_version,
+              {{"auto", std::optional<tls::version_bound>{}},
+               {"tls1.2", std::optional{tls::version_bound::tls1_2}},
+               {"tls1.3", std::optional{tls::version_bound::tls1_3}}});
+  opt.max_version = max_version;
+  r.optional("expect_no_pad", opt.expect_no_pad);
+  r.optional("session_cache", opt.session_cache);
+  // Ranges and cross-field rules (0 only with the cache off, version ordering) are checked by
+  // the rest reader through rest::config::validate().
+  read_count(r, "session_cache_per_endpoint", opt.session_cache_per_endpoint);
+  r.optional("max_connection_bytes", yaml::bytes(opt.max_connection_bytes));
+  r.optional("ciphersuites", opt.ciphersuites);
+  r.optional("cipher_list", opt.cipher_list);
+  r.optional("groups", opt.groups);
+  r.optional("sni_override", opt.sni_override);
+  r.optional("allow_tls13_without_rekey", opt.allow_tls13_without_rekey);
+  r.reject_unknown();
+}
+
+// cuCascade's rest::config::validate() names struct fields; report them under their YAML keys.
+static std::string rest_yaml_key(std::string_view field)
+{
+  static constexpr std::pair<std::string_view, std::string_view> renamed[] = {
+    {"upkeep_interval", "upkeep_interval_ms"},
+    {"conn_max_age", "conn_max_age_s"},
+    {"retry_backoff_base", "retry_backoff_base_ms"},
+    {"retry_jitter", "retry_jitter_ms"},
+    {"connect_timeout", "connect_timeout_ms"},
+    {"dns_ttl", "dns_ttl_s"},
+    {"tls.fallback_rx", "tls.user_space_rx"},
+    {"tls.placement", "tls.recv_placement"},
+  };
+  for (auto const& [from, to] : renamed) {
+    if (field == from) { return std::string{to}; }
+  }
+  return std::string{field};
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
+  namespace rest = cucascade::io::rest;
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
     if (r.has(key)) {
@@ -202,31 +346,88 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
                                "': removed; use sirius_config::set_object_store_config() instead");
     }
   }
-  {
-    // Read through an optional so "set to the struct default" is distinguishable
-    // from "not set" -- see config::n_max_concurrent_scans_explicit.
-    std::optional<std::size_t> n_max;
-    r.optional("n_max_concurrent_scans", n_max);
-    if (n_max.has_value()) {
-      opt.n_max_concurrent_scans          = *n_max;
-      opt.n_max_concurrent_scans_explicit = true;
-    }
-  }
+  // This reader owns the YAML surface: names, types (signed reads, so a negative value cannot
+  // wrap into an unsigned field), enum spellings and the trust rejections. Value ranges and
+  // cross-field rules belong to cuCascade and are enforced once, by validate() below.
+
+  // -- scans and requests ------------------------------------------------------
+  read_count(r, "n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  // Naming even the struct default must prevent pipeline-width default derivation.
+  if (r.has_value("n_max_concurrent_scans")) { opt.n_max_concurrent_scans_explicit = true; }
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
   r.optional("stall_time_s", opt.stall_time_s);
+  // Consumed by the logical range planner, independently of physical GET sizing.
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
-  r.optional("upkeep_interval_ms", opt.upkeep_interval);
-  r.optional("conn_max_age_s", opt.conn_max_age);
+  r.optional("min_segment_bytes", yaml::bytes(opt.min_segment_bytes));
+  r.optional("max_segment_bytes", yaml::bytes(opt.max_segment_bytes));
+  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
+  read_count(r, "list_max_matches", opt.list_max_matches);
+  read_count(r, "list_max_scanned", opt.list_max_scanned);
+
+  // -- retry policy --------------------------------------------------------------
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
   r.optional("retry_jitter_ms", opt.retry_jitter);
-  r.optional("max_retry_attempts", opt.max_retry_attempts);
-  r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
+  read_count(
+    r, "max_retry_attempts", opt.max_retry_attempts, false, std::numeric_limits<unsigned>::max());
+  read_count(r,
+             "max_auth_retry_attempts",
+             opt.max_auth_retry_attempts,
+             false,
+             std::numeric_limits<unsigned>::max());
   r.optional("honor_retry_after", opt.honor_retry_after);
-  r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
-  r.optional("list_max_matches", opt.list_max_matches);
-  r.optional("list_max_scanned", opt.list_max_scanned);
+
+  // -- connection pool -------------------------------------------------------------
+  read_count(r, "max_connections", opt.max_connections);
+  r.optional("conn_max_age_s", opt.conn_max_age);
+  r.optional("upkeep_interval_ms", opt.upkeep_interval);
+  r.optional("upkeep_http1", opt.upkeep_http1);
+  r.optional("connect_timeout_ms", opt.connect_timeout);
+  r.optional("dns_ttl_s", opt.dns_ttl);
+  r.optional("dns_accumulate", opt.dns_accumulate);
+  read_count(r, "dns_max_addresses", opt.dns_max_addresses);
+  r.optional("keepalive_idle_s", opt.keepalive_idle_s);
+  r.optional("keepalive_interval_s", opt.keepalive_interval_s);
+  r.optional("keepalive_count", opt.keepalive_count);
+  r.optional("min_mtu", yaml::bytes(opt.min_mtu));
+  read_count(r, "mtu_reject_max_attempts", opt.mtu_reject_max_attempts);
+  r.optional("close_with_rst", opt.close_with_rst);
+
+  // -- transport -----------------------------------------------------------------
+  r.optional("receive_buffer_bytes", yaml::bytes(opt.receive_buffer_bytes));
+  read_count(r, "queue_depth", opt.queue_depth);
+  read_choice(
+    r,
+    "wait_mode",
+    opt.wait_mode,
+    {{"epoll", rest::reactor_wait_mode::epoll}, {"uring", rest::reactor_wait_mode::uring}});
+  read_count(r, "iowq_max_unbound", opt.iowq_max_unbound);
+
+  // -- placement -------------------------------------------------------------------
+  // fan_out vs. rest_n_reactors is checked by the scan_manager reader, which owns the count.
+  read_count(r, "fan_out", opt.fan_out);
+  r.optional("interface", opt.interface);
+  r.optional("pin_to_irq_cpus", opt.pin_to_irq_cpus);
+  r.optional("raise_reactor_priority", opt.raise_reactor_priority);
+
+  if (auto n = r.optional_node("tls")) sirius::from_yaml(*n, opt.tls);
   r.reject_unknown();
+
+  // cuCascade's validate() enforces every range and cross-field rule exactly as the reactors
+  // will; its errors name struct fields, reported here under their YAML keys.
+  try {
+    opt.validate();
+  } catch (std::invalid_argument const& e) {
+    std::string_view what = e.what();
+    constexpr std::string_view prefix{"rest::config::"};
+    if (what.starts_with(prefix)) { what.remove_prefix(prefix.size()); }
+    auto const colon = what.find(": ");
+    if (colon == std::string_view::npos) {
+      throw std::runtime_error("'rest': " + std::string{what});
+    }
+    throw std::runtime_error("'rest." + rest_yaml_key(what.substr(0, colon)) +
+                             "': " + std::string{what.substr(colon + 2)});
+  }
 }
 
 // cuCascade does not validate slices_per_pass (a value above the slot count merely acts
@@ -243,17 +444,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
     if (n_max.has_value()) {
       opt.n_max_concurrent_scans          = *n_max;
       opt.n_max_concurrent_scans_explicit = true;
-    }
-  }
-  {
-    // Deprecated: the reactor priority tiers replaced prefetch-reactor
-    // partitioning. Consume any value (including null) without deserializing,
-    // always warn, then ignore it so configs that still name it keep loading.
-    if (r.has("prefetch_reactors")) {
-      std::ignore = r.optional_node("prefetch_reactors");
-      SIRIUS_LOG_WARN(
-        "'uring.prefetch_reactors' is deprecated and ignored: the reactor priority tiers replaced "
-        "prefetch-reactor partitioning; remove the key from the config");
     }
   }
   {
@@ -281,33 +471,6 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
           std::to_string(*batch));
       }
       opt.range_batch_slices = static_cast<std::size_t>(*batch);
-    }
-  }
-  r.reject_unknown();
-}
-
-static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
-{
-  yaml::reader r(node, "kvikio");
-  r.optional("nthreads", opt.nthreads);
-  r.optional("task_size", yaml::bytes(opt.task_size));
-  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
-  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
-  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
-  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
-  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
-  std::string compat;
-  r.optional("compat_mode", compat);
-  if (!compat.empty()) {
-    if (compat == "auto") {
-      opt.compat_mode = kvikio::CompatMode::AUTO;
-    } else if (compat == "on") {
-      opt.compat_mode = kvikio::CompatMode::ON;
-    } else if (compat == "off") {
-      opt.compat_mode = kvikio::CompatMode::OFF;
-    } else {
-      throw std::runtime_error("'kvikio.compat_mode': invalid enum value '" + compat +
-                               "' (expected auto, on or off)");
     }
   }
   r.reject_unknown();
@@ -395,6 +558,15 @@ static void from_yaml(const YAML::Node& node, scan_manager::preparation_config& 
   r.reject_unknown();
 }
 
+static void validate_rest_fan_out(scan_manager::scan_manager_config const& opt)
+{
+  if (opt.rest_n_reactors > 0 && opt.rest.fan_out > opt.rest_n_reactors &&
+      opt.rest.fan_out != cucascade::io::rest::config{}.fan_out) {
+    throw std::runtime_error("'rest.fan_out': must be at most rest_n_reactors (" +
+                             std::to_string(opt.rest_n_reactors) + ")");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -405,14 +577,34 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("backend", opt.backend);
+  std::optional<std::string> backend;
+  r.optional("backend", backend);
+  if (backend) {
+    if (*backend == "kvikio") {
+      throw std::runtime_error(
+        "'scan_manager.backend': backend: kvikio has been removed; "
+        "use backend: native instead");
+    }
+    if (!scan_manager::string_to_enum(*backend, opt.backend)) {
+      throw std::runtime_error("'scan_manager.backend': invalid enum value '" + *backend + "'");
+    }
+  }
+  if (r.has("kvikio")) {
+    throw std::runtime_error(
+      "'scan_manager.kvikio': removed; remove this block and use "
+      "backend: native instead");
+  }
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
+  // Per routed REST context, shared by all GPUs; 0 sizes each pool from the egress NIC's IRQs.
+  read_count(r, "rest_n_reactors", opt.rest_n_reactors);
+  r.optional("reserve_rest_reactor_cpus", opt.reserve_rest_reactor_cpus);
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
-  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  // Same rule as rest_ioctx: the default fan-out is clamped to a smaller pool, any other value
+  // must fit it.  An auto-sized pool (0) is only known when the REST ioctx is built.
+  if (r.has_value("rest_n_reactors")) { validate_rest_fan_out(opt); }
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   if (auto n = r.optional_node("preparation")) from_yaml(*n, opt.preparation);
@@ -425,6 +617,33 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
+  r.optional("enable_late_materialization", opt.enable_late_materialization);
+  r.optional("enable_fused_scan_filter", opt.enable_fused_scan_filter);
+  r.optional("enable_low_cardinality_groupby", opt.enable_low_cardinality_groupby);
+  r.optional("late_materialization_min_boundaries",
+             opt.late_materialization_min_boundaries,
+             [](int value) { return value >= 0; });
+  r.optional("late_materialization_min_value_x_boundaries",
+             opt.late_materialization_min_value_x_boundaries,
+             [](std::int64_t value) { return value >= 0; });
+  r.optional("late_materialization_count_defer", opt.late_materialization_count_defer);
+  r.optional("late_materialization_min_value_compressed",
+             opt.late_materialization_min_value_compressed,
+             [](std::int64_t value) { return value >= 0; });
+  r.optional("fused_scan_diagnostics", opt.fused_scan.diagnostics);
+  auto const positive_finite = [](double value) { return std::isfinite(value) && value > 0.0; };
+  r.optional("fused_scan_max_selectivity", opt.fused_scan.max_selectivity, positive_finite);
+  r.optional("fused_scan_full_route_max_selectivity",
+             opt.fused_scan.full_route_max_selectivity,
+             positive_finite);
+  r.optional("fused_scan_index_walk_max_selectivity",
+             opt.fused_scan.index_walk_max_selectivity,
+             positive_finite);
+  r.optional("fused_scan_max_membership_sources",
+             opt.fused_scan.max_membership_sources,
+             [](std::size_t value) {
+               return value <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+             });
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
   if (opt.scan_task_batch_size == 0) {
     throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
@@ -478,6 +697,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   // 0 is meaningful here: it selects the share of GPU memory space capacity.
   r.optional("pin_table_unique_exact_max_bytes", yaml::bytes(opt.unique_exact_max_bytes));
   r.optional("enable_exists_minmax_rewrite", opt.enable_exists_minmax_rewrite);
+  r.optional("enable_partial_aggregate_below_join", opt.enable_partial_aggregate_below_join);
+  r.optional("enable_subquery_key_carry", opt.enable_subquery_key_carry);
+  r.optional("enable_exists_from_aggregate", opt.enable_exists_from_aggregate);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
@@ -502,10 +724,6 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_nvtx", opt.enable_nvtx);
-  r.optional("exporter", opt.exporter, [](std::string const& value) {
-    if (value == QUENT_NDJSON_EXPORTER) { return true; }
-    throw std::runtime_error("must be ndjson");
-  });
   r.optional("output_directory", opt.output_directory, [](std::string const& value) {
     if (!value.empty()) return true;
     throw std::runtime_error("must not be empty");
@@ -524,6 +742,9 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
   r.optional("max_compressed_fraction", opt.max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
+  r.optional("min_table_device_fraction", opt.min_table_device_fraction, [](double value) {
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
@@ -658,7 +879,7 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
+  // Default to 90% of each backing NUMA node's RAM, or explicit bytes per NUMA node.
   std::variant<double, std::uint64_t> capacity{0.9};
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
@@ -667,7 +888,8 @@ struct host_mem_config {
   double downgrade_stop_fraction{0.8};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
-  std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
+  // Omitted: 10% of NUMA RAM in whole pools, capped by the host capacity.
+  std::optional<std::size_t> initial_number_pools;
 
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
@@ -726,14 +948,10 @@ struct host_mem_config {
     } else {
       builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
     }
-    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
-    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
-    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
-    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
-    // initial_number_pools} positionally therefore lands each value in the correctly-named
-    // cucascade config field — the names line up with the resulting config struct, not with the
-    // setter's parameter names.
-    builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
+    // cuCascade maps (chunk_size, block_size, initial_block_count) onto the host config's
+    // (block_size, pool_size, initial_number_pools). Its setter requires a positive count.
+    // build() only creates configs; resolve() replaces this temporary count before allocation.
+    builder.set_host_pool_features(block_size, pool_size, 1);
   }
 };
 
@@ -811,6 +1029,13 @@ struct parsed_sirius_config::Impl {
   disk_mem_config disk_cfg;
   std::filesystem::path source_path;
   bool use_effective_gpu_capacity = false;
+  struct {
+    bool pipeline{}, task_creator{}, downgrade{}, scan_manager{}, uring{}, rest{};
+  } explicit_threads;
+  /// Whether the YAML named scan_manager.rest.min_mtu, an explicit 0 included.
+  bool explicit_rest_min_mtu = false;
+  /// Whether the YAML named scan_manager.rest.max_connections.
+  bool explicit_rest_max_connections = false;
   std::vector<uint64_t operator_params::*> explicit_batch_settings;
 };
 
@@ -823,6 +1048,10 @@ parsed_sirius_config::parsed_sirius_config(std::shared_ptr<const Impl> impl)
 const operator_params& parsed_sirius_config::get_operator_params() const noexcept
 {
   return impl_->settings.get_operator_params();
+}
+output::parquet_compression parsed_sirius_config::parquet_output_compression() const noexcept
+{
+  return impl_->settings.parquet_output_compression();
 }
 const compression_config& parsed_sirius_config::get_compression_config() const noexcept
 {
@@ -934,11 +1163,30 @@ try {
   // Executors
   if (auto exec_node = r.optional_node("executor")) {
     yaml::reader er(*exec_node, "sirius.executor");
-    if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
-    if (auto n = er.optional_node("pipeline"))
+    if (auto n = er.optional_node("task_creator")) {
+      impl->explicit_threads.task_creator = yaml::reader(*n).has_value("num_threads");
+      from_yaml(*n, settings._task_creator_config);
+    }
+    if (auto n = er.optional_node("scan_manager")) {
+      yaml::reader counts(*n);
+      impl->explicit_threads.scan_manager = counts.has_value("num_threads");
+      impl->explicit_threads.uring        = counts.has_value("uring_n_reactors");
+      impl->explicit_threads.rest         = counts.has_value("rest_n_reactors");
+      if (auto rest = counts.optional_node("rest")) {
+        yaml::reader rest_keys(*rest);
+        impl->explicit_rest_min_mtu         = rest_keys.has_value("min_mtu");
+        impl->explicit_rest_max_connections = rest_keys.has_value("max_connections");
+      }
+      from_yaml(*n, settings._scan_manager_config);
+    }
+    if (auto n = er.optional_node("pipeline")) {
+      impl->explicit_threads.pipeline = yaml::reader(*n).has_value("num_threads");
       from_yaml(*n, settings._gpu_pipeline_executor_config);
-    if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
+    }
+    if (auto n = er.optional_node("downgrade")) {
+      impl->explicit_threads.downgrade = yaml::reader(*n).has_value("num_threads");
+      from_yaml(*n, settings._downgrade_executor_config);
+    }
     er.reject_unknown();
   }
 
@@ -950,6 +1198,17 @@ try {
   if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, settings._telemetry_config); }
 
   // Compression
+  if (auto output_node = r.optional_node("output")) {
+    yaml::reader output_reader(*output_node, "sirius.output");
+    if (auto parquet_node = output_reader.optional_node("parquet")) {
+      yaml::reader parquet_reader(*parquet_node, "sirius.output.parquet");
+      std::string codec = "snappy";
+      parquet_reader.optional("compression", codec);
+      settings._parquet_output_compression = output::parse_compression(codec);
+      parquet_reader.reject_unknown();
+    }
+    output_reader.reject_unknown();
+  }
   if (auto n = r.optional_node("compression")) {
     sirius::from_yaml(*n, settings._compression_config);
   }
@@ -1004,8 +1263,55 @@ try {
                                                       : source_path.string() + ": " + e.what());
 }
 
+std::optional<cucascade::memory::nic_topology> discover_egress_nic(
+  std::string_view configured_interface)
+{
+  try {
+    if (auto const iface = cucascade::memory::select_egress_interface(configured_interface);
+        iface.has_value()) {
+      return cucascade::memory::discover_nic(*iface);
+    }
+  } catch (...) {
+    // No NIC information: the caller falls back to the CPU-count default.
+  }
+  return std::nullopt;
+}
+
+bool rest_reactors_sized_from_nic(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  return kernel_tls.loaded && egress_nic.has_value() && egress_nic->irqs_steered();
+}
+
+std::size_t rest_reactor_irq_cpus(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  return rest_reactors_sized_from_nic(kernel_tls, egress_nic) ? egress_nic->irq_cpus.size()
+                                                              : std::size_t{0};
+}
+
+std::size_t default_rest_max_connections(cucascade::memory::kernel_tls_info const& kernel_tls,
+                                         std::size_t queue_depth) noexcept
+{
+  constexpr std::size_t kernel_tls_connections = 128;
+  constexpr std::size_t user_tls_connections   = 64;
+  auto const wanted = kernel_tls.loaded ? kernel_tls_connections : user_tls_connections;
+  return std::clamp<std::size_t>(queue_depth / 2, 1, wanted);
+}
+
+std::size_t default_rest_min_mtu(
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept
+{
+  constexpr int standard_ethernet_mtu = 1500;
+  return egress_nic.has_value() && egress_nic->mtu > standard_ethernet_mtu
+           ? static_cast<std::size_t>(egress_nic->mtu)
+           : std::size_t{0};
+}
+
 sirius_config parsed_sirius_config::resolve(
-  const cucascade::memory::system_topology_info& hw_topology) const
+  const cucascade::memory::system_topology_info& hw_topology, const egress_nic_probe& probe) const
 try {
   auto settings         = impl_->settings;
   settings._hw_topology = hw_topology;
@@ -1039,6 +1345,34 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+    for (auto& space : settings._memory_space_configs) {
+      auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space);
+      if (!host) { continue; }
+      if (host_cfg.initial_number_pools.has_value()) {
+        host->initial_number_pools = *host_cfg.initial_number_pools;
+        continue;
+      }
+      auto const* node = hw_topology.find_numa_node(host->numa_id);
+      if (!node || node->memory_capacity == 0 || node->is_device_memory) {
+        throw configuration_input_error(
+          "memory.host: default initial pool sizing requires host RAM capacity for NUMA node " +
+          std::to_string(host->numa_id) + "; set initial_number_pools explicitly");
+      }
+      // Match the allocator's per-block alignment, then round the 10% target down to
+      // whole pools without exceeding the configured host capacity.
+      constexpr auto alignment = alignof(std::max_align_t);
+      constexpr auto max_size  = std::numeric_limits<std::size_t>::max();
+      if (host->block_size == 0 || host->pool_size == 0 ||
+          host->block_size > max_size - (alignment - 1)) {
+        throw configuration_input_error("memory.host: invalid block_size or pool_size");
+      }
+      auto const aligned_block_size = (host->block_size + alignment - 1) / alignment * alignment;
+      if (host->pool_size > max_size / aligned_block_size) {
+        throw configuration_input_error("memory.host: pool size in bytes overflows");
+      }
+      host->initial_number_pools = std::min(node->memory_capacity / 10, host->memory_capacity) /
+                                   (aligned_block_size * host->pool_size);
+    }
   }
 
   const auto defaults =
@@ -1061,6 +1395,44 @@ try {
     settings._operator_params.max_build_hash_table_bytes =
       sirius::memory::saturating_mul(8, settings._operator_params.hash_partition_bytes);
   }
+  // Pool widths depend on configured GPU executors, not the per-query GPU subset.
+  auto const gpu_count = static_cast<std::size_t>(std::count_if(
+    settings._memory_space_configs.begin(),
+    settings._memory_space_configs.end(),
+    [](auto const& space) {
+      return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+    }));
+  auto const& named    = impl_->explicit_threads;
+  // The egress NIC is looked up once, and only when a value derived from it is unnamed: the REST
+  // reactor count (which loaded kernel TLS must also allow) or rest.min_mtu.
+  std::optional<cucascade::memory::nic_topology> egress_nic;
+  if ((!named.rest && hw_topology.kernel_tls.loaded) || !impl_->explicit_rest_min_mtu) {
+    egress_nic = probe(settings._scan_manager_config.rest.interface);
+  }
+  auto const nic_irq_cpus =
+    named.rest ? std::size_t{0} : rest_reactor_irq_cpus(hw_topology.kernel_tls, egress_nic);
+  auto const threads = exec::derive_thread_defaults(
+    std::thread::hardware_concurrency(), gpu_count, hw_topology.kernel_tls.loaded, nic_irq_cpus);
+  if (!named.pipeline) { settings._gpu_pipeline_executor_config.num_threads = threads.pipeline; }
+  if (!named.task_creator) {
+    settings._task_creator_config.thread_pool.num_threads = threads.task_creator;
+  }
+  if (!named.downgrade) {
+    settings._downgrade_executor_config.thread_pool.num_threads = threads.downgrade;
+  }
+  if (!named.scan_manager) {
+    settings._scan_manager_config.thread_pool.num_threads = threads.scan_manager;
+  }
+  if (!named.uring) { settings._scan_manager_config.uring_n_reactors = threads.uring_reactors; }
+  if (!named.rest) { settings._scan_manager_config.rest_n_reactors = threads.rest_reactors; }
+  if (!impl_->explicit_rest_min_mtu) {
+    settings._scan_manager_config.rest.min_mtu = default_rest_min_mtu(egress_nic);
+  }
+  if (!impl_->explicit_rest_max_connections) {
+    auto& rest           = settings._scan_manager_config.rest;
+    rest.max_connections = default_rest_max_connections(hw_topology.kernel_tls, rest.queue_depth);
+  }
+  validate_rest_fan_out(settings._scan_manager_config);
   settings.finalize_derived_config();
   return settings;
 } catch (const std::bad_alloc&) {
@@ -1072,14 +1444,83 @@ try {
 
 void sirius_config::finalize_derived_config()
 {
-  // The uring (local-disk) readahead budget keeps its default of 0: on local
-  // NVMe a prefetch competes with the executor's own reads for the same device.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
+  derive_uring_scan_budget();
   enforce_native_backend_for_multi_gpu();
+  reserve_rest_reactor_cpus();
+}
+
+std::vector<int> reserve_cpus_for_rest_reactors(
+  scan_manager::scan_manager_config const& scan_manager,
+  rest_reactor_cpu_planner const& plan,
+  std::vector<int> const& allowed,
+  std::span<exec::thread_pool_config* const> pools)
+{
+  if (!scan_manager.reserve_rest_reactor_cpus) { return {}; }
+  std::vector<int> reactor_cpus;
+  try {
+    reactor_cpus = plan(scan_manager.rest_n_reactors, scan_manager.rest);
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: cannot plan the REST reactor CPUs ({}); thread pools keep "
+      "their affinity",
+      e.what());
+    return {};
+  }
+  if (reactor_cpus.empty()) { return {}; }
+  std::ranges::sort(reactor_cpus);
+
+  auto const without_reactors = [&](std::vector<int> const& cpus) {
+    std::vector<int> kept;
+    for (int const cpu : cpus) {
+      if (!std::binary_search(reactor_cpus.begin(), reactor_cpus.end(), cpu)) {
+        kept.push_back(cpu);
+      }
+    }
+    return kept;
+  };
+  auto const pool_cpus = without_reactors(allowed);
+  if (pool_cpus.empty()) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: the REST reactors would take every allowed CPU ({}); thread "
+      "pools keep their affinity",
+      cucascade::memory::format_cpu_list(allowed));
+    return {};
+  }
+  for (auto* pool : pools) {
+    auto kept =
+      without_reactors(pool->cpu_affinity_list.empty() ? allowed : pool->cpu_affinity_list);
+    // A pool configured onto reactor CPUs only keeps its configuration rather than losing all
+    // its CPUs.
+    if (!kept.empty()) { pool->cpu_affinity_list = std::move(kept); }
+  }
+  SIRIUS_LOG_INFO(
+    "sirius_config: REST reactors pin to CPUs {}; Sirius thread pools restricted to CPUs {}",
+    cucascade::memory::format_cpu_list(reactor_cpus),
+    cucascade::memory::format_cpu_list(pool_cpus));
+  return reactor_cpus;
+}
+
+void sirius_config::reserve_rest_reactor_cpus()
+{
+  // Pinned REST reactors share their CPUs with the NIC's interrupt handling (they are pinned to
+  // the steered IRQ CPUs).  Every other Sirius thread placed there competes with both, so the
+  // pools are restricted to the remaining CPUs.  The REST pool is built lazily, after the pools,
+  // so the CPUs come from cuCascade's planning rather than from the pool.
+  exec::thread_pool_config* const pools[] = {&_gpu_pipeline_executor_config,
+                                             &_scan_manager_config.thread_pool,
+                                             &_task_creator_config.thread_pool,
+                                             &_downgrade_executor_config.thread_pool};
+  auto allowed       = cucascade::exec::thread_util::get_current_thread_affinity();
+  _rest_reactor_cpus = reserve_cpus_for_rest_reactors(
+    _scan_manager_config, cucascade::io::rest::planned_reactor_cpus, allowed, pools);
+  // A REST context built later on a restricted pool thread must plan from this mask, not its own.
+  _scan_manager_config.rest_placement_cpus =
+    _rest_reactor_cpus.empty() ? std::vector<int>{} : std::move(allowed);
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -1089,8 +1530,8 @@ void sirius_config::derive_rest_scan_budget()
   // per pipeline thread the readahead has no lead — every split a thread picks
   // up is the split whose prefetch only just started, so the read blocks on it.
   // Several splits per thread give the prefetch time to land.  Local disk has no
-  // such round trip to hide, so uring keeps its own default (0, readahead off)
-  // unless the config names a budget.
+  // such round trip to hide, so its budget is derived separately
+  // (derive_uring_scan_budget).
   //
   // Only the untouched default is replaced, so an explicit
   // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
@@ -1114,6 +1555,31 @@ void sirius_config::derive_rest_scan_budget()
     derived,
     _scan_manager_config.rest.n_max_concurrent_scans);
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
+}
+
+void sirius_config::derive_uring_scan_budget()
+{
+  // One scan per pipeline thread.  The opportunistic readahead issues only while
+  // a pipeline thread is off computing rather than reading, so the scans it can
+  // usefully keep in flight are bounded by the pool's width; publishing that
+  // width keeps the backend's budget in step with what the strategy schedules
+  // against (and is the budget an `eager` override would run with).
+  //
+  // Only the untouched default is replaced, so an explicit
+  // uring.n_max_concurrent_scans in the config still wins, an explicit 0 (which
+  // keeps the local readahead off) included.
+  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
+
+  auto const derived =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  if (derived == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size = "
+    "{}, replacing the built-in default of {}",
+    derived,
+    _scan_manager_config.uring.n_max_concurrent_scans);
+  _scan_manager_config.uring.n_max_concurrent_scans = derived;
 }
 
 void sirius_config::enforce_native_backend_for_multi_gpu()

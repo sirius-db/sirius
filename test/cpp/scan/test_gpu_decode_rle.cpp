@@ -536,6 +536,8 @@ auto build_uniform_runs_column(uint32_t n_runs,
                     i * seg_rows,
                     seg_rows});
   }
+  // The copies above read `seg_bytes`, which is freed when this function returns.
+  stream.synchronize();
   gpu_column_decode_input col;
   col.out_type   = type;
   col.total_rows = n_segs * seg_rows;
@@ -613,6 +615,8 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify", "[scan][decod
   for (uint32_t s = 0; s < N_SEGS; ++s) {
     auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/s + 1, 400.0);
     bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
+    // `seg_bytes` is freed at the end of this iteration; the copy must land first.
+    stream.synchronize();
     segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
                     static_cast<uint32_t>(bufs.back().size()),
                     s * SEG_ROWS,

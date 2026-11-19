@@ -18,7 +18,6 @@
 
 #include <catch.hpp>
 #include <cucascade/exec/semi_future.hpp>
-#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
@@ -36,6 +35,7 @@
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <operator/operator_test_utils.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/table_filter_test_utils.hpp>
 
@@ -104,7 +104,7 @@ struct scan_estimates {
 scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto task       = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
@@ -211,8 +211,7 @@ void check_unmapped_carrier(scan::scan_plan const& plan,
 
 struct carrier_file_fixture {
   sirius::test::scratch_dir scratch{"parquet_carrier_sizing"};
-  std::shared_ptr<cucascade::io::kvikio_context> ioctx =
-    std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::ioctx> ioctx = sirius::test::make_test_local_ioctx();
 
   carrier_file_fixture()
   {
@@ -371,7 +370,7 @@ TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
-  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   REQUIRE_FALSE(ioctx->uses_fs_cache());
   auto task = ingestible->next_split_provider(
     [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
@@ -1760,7 +1759,7 @@ TEST_CASE_METHOD(carrier_file_fixture,
     ~counted_ioctx() override { pre_destroy(); }
     cucascade::io::io_context_type type() const noexcept override
     {
-      return cucascade::io::io_context_type::kvikio;
+      return cucascade::io::io_context_type::uring;
     }
     void shutdown() noexcept override {}
     bool supports(std::string_view) const noexcept override { return true; }

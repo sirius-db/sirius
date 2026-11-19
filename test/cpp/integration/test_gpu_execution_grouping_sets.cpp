@@ -24,7 +24,9 @@
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/log_test_utils.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 using GroupingSetsFixture = sirius::test::GpuExecutionFixture;
@@ -195,6 +197,57 @@ TEST_CASE_METHOD(GroupingSetsFixture,
     "SELECT g, GROUPING(g), stddev_samp(v), count(DISTINCT v), avg(v), count(v) "
     "FROM gs_sd GROUP BY ROLLUP(g) HAVING GROUPING(g) = 1 OR g IS NULL OR g <> 0;",
     {2, 4});
+}
+
+TEST_CASE_METHOD(GroupingSetsFixture,
+                 "grouping sets - long, low-cardinality string keys match the CPU",
+                 "[integration][gpu_execution][grouping_sets]")
+{
+  // `k1` and `k2` are long enough (8+ bytes on average) and have few enough distinct values
+  // (under 10% of rows) that the grouped aggregate groups them on dictionary codes. `k1` has
+  // NULLs, so a NULL key of a leaf group and a NULL of a rolled-up key both occur.
+  run_ok(
+    "CREATE TABLE gs_long AS SELECT "
+    "CASE WHEN i % 11 = 0 THEN NULL ELSE 'long_category_name_' || (i % 5)::VARCHAR END k1, "
+    "'another_long_key_value_' || (i % 3)::VARCHAR k2, "
+    "(i % 2)::INTEGER a, "
+    "i::BIGINT v "
+    "FROM range(1000) r(i);");
+  run_ok("CHECKPOINT;");
+  // Compare with the CPU, and check (when DEBUG logging is compiled in) that the GPU run took the
+  // dictionary-encoded path rather than grouping on the strings.
+  auto const compare = [this](std::string const& query) {
+    sirius::test::scoped_recording_log_sink logs;
+    compare_gpu_vs_cpu(query);
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_DEBUG
+    auto encoded = std::ranges::any_of(logs.records(), [](auto const& record) {
+      return record.message.find("local_grouped_agg: dict-encoding key col") != std::string::npos;
+    });
+    CHECK(encoded);
+#endif
+  };
+  SECTION("ROLLUP")
+  {
+    compare("SELECT k1, a, count(*) n, sum(v) s, min(k2) lo FROM gs_long GROUP BY ROLLUP(k1, a);");
+  }
+  SECTION("ROLLUP with the string key last")
+  {
+    compare("SELECT a, k1, count(*) n, sum(v) s FROM gs_long GROUP BY ROLLUP(a, k1);");
+  }
+  SECTION("CUBE with GROUPING()")
+  {
+    compare(
+      "SELECT k1, k2, a, GROUPING(k1, k2, a) g, count(*) n, sum(v) s "
+      "FROM gs_long GROUP BY CUBE(k1, k2, a);");
+  }
+  SECTION("GROUPING SETS without the set over all keys")
+  {
+    compare("SELECT k1, k2, sum(v) s FROM gs_long GROUP BY GROUPING SETS ((k1), (k2), ());");
+  }
+  SECTION("ordinary GROUP BY on two string keys")
+  {
+    compare("SELECT k1, k2, count(*) n, sum(v) s FROM gs_long GROUP BY k1, k2;");
+  }
 }
 
 TEST_CASE_METHOD(GroupingSetsFixture,

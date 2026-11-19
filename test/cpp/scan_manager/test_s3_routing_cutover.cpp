@@ -24,6 +24,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -33,7 +34,6 @@
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/config.hpp>
-#include <cucascade/io/rest/curl_handle.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -56,6 +56,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -128,7 +129,7 @@ std::string strip_file_scheme_for_registry(std::string const& path)
 
 bool is_local_backend(std::optional<io_context_type> type)
 {
-  return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
+  return type.has_value() && *type == io_context_type::uring;
 }
 
 scan_manager_config make_s3_scan_config(std::string endpoint,
@@ -238,6 +239,10 @@ struct range_fault_policy {
   std::string etag;
   /// Held before every GET response is sent, so a read stays in flight that long.
   std::chrono::milliseconds response_delay{0};
+  /// Serve every connection on its own thread and keep it open across requests
+  /// (`Connection: keep-alive`), so a client can reuse it. Off: one request per
+  /// connection, served serially on the accept thread.
+  bool keep_alive{false};
 };
 
 class range_s3_server {
@@ -275,12 +280,24 @@ class range_s3_server {
   ~range_s3_server()
   {
     _stop.store(true);
+    // Shutting the listener down wakes a blocked accept(). accept_loop() still reads
+    // _listen_fd until it sees _stop, so close and invalidate it only after the join.
+    if (_listen_fd >= 0) { ::shutdown(_listen_fd, SHUT_RDWR); }
+    if (_thread.joinable()) { _thread.join(); }
     if (_listen_fd >= 0) {
-      ::shutdown(_listen_fd, SHUT_RDWR);
       ::close(_listen_fd);
       _listen_fd = -1;
     }
-    if (_thread.joinable()) { _thread.join(); }
+    {
+      // Wake keep-alive connection threads blocked waiting for a next request.
+      std::lock_guard lock{_connections_mutex};
+      for (int const fd : _open_fds) {
+        ::shutdown(fd, SHUT_RDWR);
+      }
+    }
+    for (auto& connection : _connections) {
+      connection.join();
+    }
   }
 
   range_s3_server(range_s3_server const&)            = delete;
@@ -290,6 +307,11 @@ class range_s3_server {
 
   /// Every request the server has served, of any method.
   [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
+  /// Accepted TCP connections.
+  [[nodiscard]] int connection_count() const
+  {
+    return _connection_count.load(std::memory_order_relaxed);
+  }
 
   [[nodiscard]] std::size_t head_count() const { return _head_count.load(); }
   [[nodiscard]] std::size_t get_count() const { return _get_count.load(); }
@@ -311,22 +333,57 @@ class range_s3_server {
         if (_stop.load()) { return; }
         continue;
       }
-      handle_client(fd);
-      ::close(fd);
+      _connection_count.fetch_add(1, std::memory_order_relaxed);
+      if (!_fault.keep_alive) {
+        serve_connection(fd);
+        ::close(fd);
+        continue;
+      }
+      std::lock_guard lock{_connections_mutex};
+      _open_fds.push_back(fd);
+      _connections.emplace_back([this, fd] {
+        serve_connection(fd);
+        std::lock_guard fds_lock{_connections_mutex};
+        std::erase(_open_fds, fd);
+        ::close(fd);
+      });
     }
   }
 
-  void handle_client(int fd)
+  /// Serve requests on @p fd until the peer closes it, it idles past the timeout, or (without
+  /// keep-alive) after the first one.
+  void serve_connection(int fd)
   {
     timeval timeout{};
-    timeout.tv_sec = 2;
+    timeout.tv_sec = _fault.keep_alive ? 30 : 2;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    do {
+      auto request = read_request(fd);
+      if (!request) { return; }
+      handle_request(fd, *request);
+    } while (_fault.keep_alive && !_stop.load());
+  }
 
+  /// One request's head (these requests carry no body), or nothing once the peer stops sending.
+  static std::optional<std::string> read_request(int fd)
+  {
     std::string request;
-    request.resize(4096);
-    ssize_t n = ::recv(fd, request.data(), request.size(), 0);
-    if (n <= 0) { return; }
-    request.resize(static_cast<std::size_t>(n));
+    std::array<char, 4096> chunk{};
+    while (request.find("\r\n\r\n") == std::string::npos) {
+      ssize_t n = ::recv(fd, chunk.data(), chunk.size(), 0);
+      if (n <= 0) { return std::nullopt; }
+      request.append(chunk.data(), static_cast<std::size_t>(n));
+    }
+    return request;
+  }
+
+  [[nodiscard]] std::string connection_header() const
+  {
+    return _fault.keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+  }
+
+  void handle_request(int fd, std::string const& request)
+  {
     ++_request_count;
 
     bool const is_head = request.rfind("HEAD ", 0) == 0;
@@ -335,39 +392,38 @@ class range_s3_server {
     if (is_head) {
       _head_count.fetch_add(1, std::memory_order_relaxed);
       response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
-                 etag_header() + "Connection: close\r\n\r\n";
+                 etag_header() + connection_header();
       send_all(fd, response);
     } else if (is_get) {
       auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
       if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
       if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
         response = "HTTP/1.1 " + std::to_string(_fault.fail_status) +
-                   " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                   " Service Unavailable\r\nContent-Length: 0\r\n" + connection_header();
         send_all(fd, response);
         return;
       }
       if (auto range = parse_range(request)) {
         auto const [start, end, requested_end, suffix] = *range;
         if (suffix) { _suffix_get_count.fetch_add(1, std::memory_order_relaxed); }
-        // Single writer: requests are served one at a time on the accept thread.
-        if (requested_end > _max_requested_end.load()) { _max_requested_end.store(requested_end); }
+        auto seen = _max_requested_end.load();
+        while (requested_end > seen &&
+               !_max_requested_end.compare_exchange_weak(seen, requested_end)) {}
         auto const len = end - start + 1;
         response       = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
                    "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) +
                    "/" + std::to_string(_object.size()) + "\r\n" + etag_header() +
-                   "Connection: close\r\n\r\n";
+                   connection_header();
         send_all(fd, response);
         send_all(fd, _object.data() + start, len);
       } else {
         response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) + "\r\n" +
-                   etag_header() + "Connection: close\r\n\r\n";
+                   etag_header() + connection_header();
         send_all(fd, response);
         send_all(fd, _object.data(), _object.size());
       }
     } else {
-      response =
-        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n"
-        "Connection: close\r\n\r\n";
+      response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n" + connection_header();
       send_all(fd, response);
     }
   }
@@ -443,16 +499,20 @@ class range_s3_server {
   range_fault_policy _fault;
   std::atomic<bool> _stop{false};
   std::atomic<int> _request_count{0};
+  std::atomic<int> _connection_count{0};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _suffix_get_count{0};
   std::atomic<std::size_t> _max_requested_end{0};
   std::thread _thread;
+  std::mutex _connections_mutex;
+  std::vector<std::thread> _connections;  ///< keep-alive mode: one per accepted connection
+  std::vector<int> _open_fds;             ///< keep-alive connections still being served
 };
 
 }  // namespace
 
-TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "[s3][routing]")
+TEST_CASE("io_context_registry routes full paths to their own backends", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native);
@@ -467,11 +527,12 @@ TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "
   auto stripped = strip_file_scheme_for_registry(file_uri);
   CHECK(is_local_backend(registry.lookup_path(stripped)));
   CHECK(registry.lookup_path(stripped) != io_context_type::restful);
+  CHECK_FALSE(registry.lookup_path("http://localhost/key.parquet").has_value());
+  CHECK_FALSE(registry.lookup_path("https://localhost/key.parquet").has_value());
+  CHECK_FALSE(registry.lookup_path("unsupported://bucket/key.parquet").has_value());
 }
 
-TEST_CASE(
-  "io_context_registry routes local paths by backend and S3 reads to kvikio under backend=kvikio",
-  "[s3][routing]")
+TEST_CASE("io_context_registry routes local paths to uring under backend=native", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   auto const local_path = make_regular_file();
@@ -481,17 +542,6 @@ TEST_CASE(
       .to_io_config(),
     *fixture.memory};
   CHECK(native_registry.lookup_path(local_path.string()) == io_context_type::uring);
-
-  io_context_registry fallback_registry{
-    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::kvikio)
-      .to_io_config(),
-    *fixture.memory};
-  CHECK(fallback_registry.lookup_path(local_path.string()) == io_context_type::kvikio);
-  CHECK(fallback_registry.lookup_path(local_path.string()) != io_context_type::uring);
-  // backend=kvikio also takes s3:// READS off the REST backend — kvikIO's
-  // RemoteHandle serves them; LIST/glob still uses the REST ioctx, obtained by
-  // type rather than by path.
-  CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
 TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3][routing]")
@@ -580,6 +630,36 @@ TEST_CASE("scan_manager planning backend lookup does not open remote objects", "
         io_context_type::restful);
 }
 
+TEST_CASE("scan_manager rejects raw HTTP and HTTPS URLs with S3 URI guidance", "[s3][routing]")
+{
+  auto const uri          = GENERATE("http://127.0.0.1:1/routing-bucket/data.parquet",
+                            "https://127.0.0.1:1/routing-bucket/data.parquet");
+  auto const footer_probe = GENERATE(false, true);
+  CAPTURE(uri, footer_probe);
+  scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle,
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::native),
+    *fixture.memory,
+    fixture.topology};
+
+  // Both public entry points reach ioctx_for_path. Even with an object store
+  // configured, raw web URLs must be rejected before any HEAD or footer read.
+  try {
+    if (footer_probe) {
+      (void)manager.describe_parquet(uri);
+    } else {
+      (void)manager.create_datasource(uri);
+    }
+    FAIL("raw HTTP(S) URL unexpectedly accepted");
+  } catch (std::invalid_argument const& error) {
+    CHECK_THAT(std::string{error.what()},
+               Catch::Matchers::ContainsSubstring("unsupported URL scheme") &&
+                 Catch::Matchers::ContainsSubstring("s3://"));
+  }
+}
+
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
           "[s3][routing]")
 {
@@ -598,28 +678,6 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
-}
-
-TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][routing]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
-  scan_manager_fixture fixture;
-  sirius::exec::query_lifecycle_registry scan_lifecycle;
-  sirius_scan_manager manager{
-    scan_lifecycle,
-    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
-    *fixture.memory,
-    fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::kvikio);
-  CHECK(datasource->size() == 4096);
-
-  std::vector<std::uint8_t> buffer(128, std::uint8_t{0xAB});
-  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
 TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing]")
@@ -679,12 +737,14 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
 
 TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket", "[s3][routing]")
 {
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  // Keep-alive, so the client could reuse its connections: the warm-up's fresh connections are
+  // then its own policy, not a server that closes after every response.
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}),
+                         range_fault_policy{.keep_alive = true});
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
-  // One connection per reactor over two reactors: small enough for the serial
-  // test server to serve the burst, but still per-reactor rather than global
-  // (each reactor owns its own, thread-confined connection pool).
+  // One connection per reactor over two reactors: still per-reactor rather than
+  // global (each reactor owns its own, thread-confined connection pool).
   cfg.rest.max_connections = 1;
   cfg.rest_n_reactors      = 2;
   sirius::exec::query_lifecycle_registry scan_lifecycle;
@@ -705,12 +765,33 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
     return server.request_count();
   };
 
-  int const baseline          = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+  // Reads reuse the pools' open connections: once both reactors have connected, more reads
+  // send more requests over the same connections.
+  std::vector<std::uint8_t> buffer(64);
+  auto const read_some = [&](std::size_t offset) {
+    for (std::size_t i = 0; i < 4; ++i) {
+      REQUIRE(datasource->host_read(offset + i * 128, buffer.size(), buffer.data()) ==
+              buffer.size());
+    }
+  };
+  read_some(0);
+  int const reused_connections = server.connection_count();
+  int const before_reuse       = server.request_count();
+  read_some(1024);
+  CHECK(server.request_count() > before_reuse);
+  REQUIRE(server.connection_count() == reused_connections);
+
+  int const baseline             = server.request_count();
+  int const baseline_connections = server.connection_count();
+  constexpr int expected_warm    = 2;  // rest_n_reactors * max_connections
 
   // A bucket URL, with no object in it: warm-up traffic never names a data file.
+  // Each idle slot sends one zero-key LIST on a fresh connection, so TCP, TLS
+  // and HTTP are all exercised before the reads arrive.
   io_ctx->warmup("s3://warm-bucket");
   CHECK(wait_for_requests(baseline + expected_warm) >= baseline + expected_warm);
+  // Every warm-up request replaced a reusable idle connection with a new one.
+  CHECK(server.connection_count() >= baseline_connections + expected_warm);
   int const after_warm = server.request_count();
 
   // Warming the same bucket again well inside conn_max_age is redundant — the
@@ -723,6 +804,33 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   io_ctx->warmup("s3://warm-bucket/some/deep/key.parquet");
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(server.request_count() == after_warm);
+}
+
+TEST_CASE("rest_n_reactors 0 sizes the REST pool from the egress NIC", "[s3][routing]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{5}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  // Loopback has no queue IRQs to size or place the pool from, so the auto pool
+  // falls back to the default count (2), unpinned, whatever this host's real NIC
+  // looks like.  An explicit fan-out is only clamped to an auto-sized pool, so
+  // the clamped value exposes the pool size.
+  cfg.rest_n_reactors = 0;
+  cfg.rest.interface  = "lo";
+  cfg.rest.fan_out    = 64;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://auto-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto rest = std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(datasource->io_ctx());
+  REQUIRE(rest != nullptr);
+  CHECK(rest->dispatch_fanout() == 2);
+
+  CHECK(datasource->size() == 4096);
+  std::vector<std::uint8_t> buffer(256, std::uint8_t{0});
+  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
+  CHECK(std::ranges::all_of(buffer, [](std::uint8_t b) { return b == 5; }));
 }
 
 TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")
@@ -994,12 +1102,11 @@ TEST_CASE("scan_manager teardown resolves an in-flight S3 read", "[s3][routing]"
   CHECK(weak_ctx.expired());
 }
 
-TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear error",
-          "[s3][routing]")
+TEST_CASE("backend=native without an object store declines s3 paths and says why", "[s3][routing]")
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
+  cfg.backend                 = sirius::scan_manager::io_backend::native;
   cfg.thread_pool.num_threads = 1;
   cfg.uring_n_reactors        = 1;
   cfg.cache.mode              = cucascade::io::cache::cache_mode::none;
@@ -1008,15 +1115,24 @@ TEST_CASE("backend=kvikio without an object store rejects s3 paths with a clear 
   sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
-  REQUIRE_THROWS_WITH(manager.create_datasource("s3://unconfigured-bucket/key.parquet"),
-                      Catch::Matchers::ContainsSubstring("object store not configured"));
+  // No backend can serve the path, so the datasource is null (callers map that
+  // to their own error); the cause is logged once, as a WARN.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    CHECK(manager.create_datasource("s3://unconfigured-bucket/key.parquet") == nullptr);
+    auto const records = logs.records();
+    CHECK(std::ranges::any_of(records, [](auto const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.find("object store not configured") != std::string::npos;
+    }));
+  }
 
-  // Local paths are still served by kvikIO on the same manager.
+  // Local paths are still served by uring on the same manager.
   auto const local_path = make_regular_file();
   auto local            = manager.create_datasource(local_path.string());
   REQUIRE(local != nullptr);
   REQUIRE(local->io_ctx() != nullptr);
-  CHECK(local->io_ctx()->type() == io_context_type::kvikio);
+  CHECK(local->io_ctx()->type() == io_context_type::uring);
 }
 
 namespace {
@@ -1062,10 +1178,7 @@ TEST_CASE("scan_manager retries a routed S3 ioctx after a transient construction
 
   // The REST reactor creates its wakeup eventfd in its constructor. With no
   // descriptor available that throws, cuCascade's factory reports a null
-  // context, and the manager has no backend for the path. curl's process-wide
-  // state is initialized outside the window so only the reactor sees the
-  // shortage.
-  cucascade::io::rest::global_curl_context::instance();
+  // context, and the manager has no backend for the path.
   {
     scoped_descriptor_exhaustion no_descriptors;
     CHECK(manager.create_datasource(uri) == nullptr);

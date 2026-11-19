@@ -46,6 +46,7 @@ mold = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 croaring = "*"
+boto3 = ">=1.44.1,<2"
 
 [pypi-dependencies]
 rumdl = ">=0.2.44"
@@ -57,6 +58,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
+libutf8proc = "*"
 # Fixture/data-generation Python client; the engine and LOAD tests use the pinned v2 source.
 duckdb = "=2.0.0"
 spdlog = "1.*"

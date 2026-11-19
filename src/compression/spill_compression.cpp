@@ -114,6 +114,10 @@ constexpr char const* kStringSplitPlan =
   "str_split.chars -> ans\n"
   "str_split.offsets -> delta -> differences\n"
   "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+constexpr char const* kStringSplitRawCharsPlan =
+  "input -> str_split -> offsets, chars\n"
+  "str_split.offsets -> delta -> differences\n"
+  "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 constexpr char const* kStoredPlan = "input -> identity\n";
 
 /// Rows a string column needs before a dictionary can pay for its key table.
@@ -131,6 +135,13 @@ constexpr cudf::size_type kIntegerSampleRows = 64 * 1024;
 constexpr std::size_t kBitpackChunk = 1024;
 /// A delta plan replaces plain bitpack only when it is estimated this much smaller.
 constexpr double kMinDeltaSaving = 0.9;
+/// A pinned column takes delta -> rle -> bitpack over the best plan a filtered scan can decode
+/// in place only when rle saves at least this fraction of the column's uncompressed size more.
+/// rle decodes in full on every scan, so a gain that is large as a ratio but small in bytes (a
+/// sorted key whose differences already pack to almost nothing) does not pay for it.
+constexpr double kMinPinRleSavingOfColumn = 0.25;
+
+enum class plan_use { spill, pin };
 
 /// Estimated bitpack size of a stream of values pushed one at a time: each chunk at the
 /// bit width of its range, plus its min/count/width header.
@@ -175,7 +186,7 @@ class bitpack_size_estimate {
 /// far smaller as differences, and runs of equal keys smaller still as runs. The sample
 /// is bounded (kIntegerSampleRows), so estimating it on the host costs little next to
 /// the GPU encode that follows.
-std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+std::string integer_plan(cudf::column_view const& column, ::cuda::stream_ref stream, plan_use use)
 {
   auto const width = cudf::size_of(column.type());
   auto const rows  = static_cast<std::size_t>(std::min(column.size(), kIntegerSampleRows));
@@ -224,14 +235,19 @@ std::string integer_spill_plan(cudf::column_view const& column, ::cuda::stream_r
   auto const bitpack = values.finish();
   auto const delta   = deltas.finish();
   auto const rle     = run_lengths.finish() + run_values.finish();
+  if (use == plan_use::pin) {
+    bool const take_delta = delta < kMinDeltaSaving * bitpack;
+    auto const filterable = take_delta ? delta : bitpack;
+    auto const sample     = static_cast<double>(rows * width);
+    if (filterable - rle >= kMinPinRleSavingOfColumn * sample) { return kDeltaRleBitpackPlan; }
+    return take_delta ? kDeltaBitpackPlan : kBitpackPlan;
+  }
   if (rle < kMinDeltaSaving * std::min(bitpack, delta)) { return kDeltaRleBitpackPlan; }
   if (delta < kMinDeltaSaving * bitpack) { return kDeltaBitpackPlan; }
   return kBitpackPlan;
 }
 
-}  // namespace
-
-std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+std::string default_plan(cudf::column_view const& column, ::cuda::stream_ref stream, plan_use use)
 {
   if (column.type().id() == cudf::type_id::STRING) {
     if (column.size() < kMinDictionaryRows) { return kStoredPlan; }
@@ -243,7 +259,8 @@ std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_r
       sample, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID, stream);
     return static_cast<double>(distinct) <= kMaxDictionaryDistinctFraction * sample_rows
              ? kDictionaryPlan
-             : kStringSplitPlan;
+           : use == plan_use::pin ? kStringSplitRawCharsPlan
+                                  : kStringSplitPlan;
   }
   if (!cudf::is_fixed_width(column.type())) { return kStoredPlan; }
   auto const type  = column.type();
@@ -252,9 +269,21 @@ std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_r
   bool const integer_valued =
     cudf::is_integral_not_bool(type) || cudf::is_chrono(type) || cudf::is_fixed_point(type);
   if (integer_valued && cudf::size_of(type) <= sizeof(std::int64_t) && column.size() > 0) {
-    return integer_spill_plan(column, stream);
+    return integer_plan(column, stream, use);
   }
   return kBitpackPlan;
+}
+
+}  // namespace
+
+std::string default_spill_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  return default_plan(column, stream, plan_use::spill);
+}
+
+std::string default_pin_plan(cudf::column_view const& column, ::cuda::stream_ref stream)
+{
+  return default_plan(column, stream, plan_use::pin);
 }
 
 }  // namespace sirius::compression

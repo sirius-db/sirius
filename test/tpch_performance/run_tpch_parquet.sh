@@ -46,16 +46,24 @@ SIRIUS_DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 
 PARQUET_DIR=""
 SETUP_SQL=""
+RESULT_FORMAT="${TPCH_RESULT_FORMAT:-rows}"
+PARQUET_COMPRESSION="${TPCH_PARQUET_COMPRESSION:-snappy}"
 NUM_ITERATIONS=2
 SESSION_TIMEOUT=1200
 DROP_OS_CACHE=false
 MULTI_SESSION=false
 PINNING_MODE="none"
 PIN_AFTER_ITERATION=0
-while [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--setup-sql" ] ||
+while [ "${1:-}" = "--result-format" ] || [ "${1:-}" = "--parquet-compression" ] || [ "${1:-}" = "--parquet-dir" ] || [ "${1:-}" = "--setup-sql" ] ||
       [ "${1:-}" = "--iterations" ] || [ "${1:-}" = "--timeout" ] || [ "${1:-}" = "--drop-os-cache" ] ||
       [ "${1:-}" = "--multi-session" ] || [ "${1:-}" = "--pinning-mode" ] || [ "${1:-}" = "--pin-after-iteration" ]; do
-    if [ "$1" = "--parquet-dir" ]; then
+    if [ "$1" = "--result-format" ]; then
+        RESULT_FORMAT="$2"
+        shift 2
+    elif [ "$1" = "--parquet-compression" ]; then
+        PARQUET_COMPRESSION="$2"
+        shift 2
+    elif [ "$1" = "--parquet-dir" ]; then
         PARQUET_DIR="$2"
         shift 2
     elif [ "$1" = "--setup-sql" ]; then
@@ -153,10 +161,35 @@ if [ "$ENGINE" = "sirius" ]; then
     SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
     DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
     export SIRIUS_DISABLE=0
+    if [ "$RESULT_FORMAT" = "parquet" ]; then
+        DUCKDB_ARGS+=(-cmd "SET enable_duckdb_fallback=false;")
+    fi
 fi
 # Both engines use the same plain SQL queries — transparent execution
 # routes queries through GPU when SiriusContext is initialized.
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+
+
+case "$RESULT_FORMAT" in rows|parquet) ;; *) echo "Invalid --result-format: $RESULT_FORMAT" >&2; exit 1;; esac
+EXPORT_SEQUENCE=0
+emit_result_query() {
+    if [ "$RESULT_FORMAT" = "rows" ]; then
+        cat "$QUERY_FILE"
+    else
+        local root="${OUTPUT_DIR:-$PWD/tpch-parquet-output/$ENGINE}"
+        local destination="$root/q${q}/parquet_iter${EXPORT_SEQUENCE}"
+        if [ -e "$destination" ] || [ -L "$destination" ]; then
+            echo "Export destination exists: $destination" >&2
+            return 1
+        fi
+        mkdir -p "$(dirname "$destination")"
+        if [ "$ENGINE" = "sirius" ]; then
+            printf '.timer off\nSET gpu_execution=true;\nSET enable_duckdb_fallback=false;\n'
+        fi
+        python3 "$SCRIPT_DIR/parquet_output.py" "$QUERY_FILE" "$destination" --compression "$PARQUET_COMPRESSION" || return 1
+        EXPORT_SEQUENCE=$((EXPORT_SEQUENCE + 1))
+    fi
+}
 
 VIEW_SQL=""
 if [ -n "$SETUP_SQL" ]; then
@@ -285,7 +318,7 @@ run_single_session() {
         # Unpinned iterations first (0 of them when PIN_POINT is 0 — the old
         # "pin from the start" behavior).
         for ((iter = 0; iter < PIN_POINT; iter++)); do
-            cat "$QUERY_FILE" >> "$TEMP_SQL"
+            emit_result_query >> "$TEMP_SQL" || return 1
             printf '\n' >> "$TEMP_SQL"
         done
 
@@ -299,7 +332,7 @@ run_single_session() {
 
         # Remaining iterations (pinned, if pinning is on and any are left).
         for ((iter = PIN_POINT; iter < NUM_ITERATIONS; iter++)); do
-            cat "$QUERY_FILE" >> "$TEMP_SQL"
+            emit_result_query >> "$TEMP_SQL" || return 1
             printf '\n' >> "$TEMP_SQL"
         done
 
@@ -527,7 +560,7 @@ run_multi_session() {
                 printf ".print __TPCH_PIN_END__ %s\n" "$q"
             fi
             for ((iter = 0; iter < NUM_ITERATIONS; iter++)); do
-                cat "$QUERY_FILE"
+                emit_result_query || return 1
                 printf '\n'
             done
             if [ "$PIN_ENABLED" = true ]; then
@@ -536,6 +569,10 @@ run_multi_session() {
                 printf ".print __TPCH_UNPIN_END__ %s\n" "$q"
             fi
         } > "$TEMP_SQL"
+        if [ "$RESULT_FORMAT" = "parquet" ] && [ -n "${Q_DIR:-}" ]; then
+            cp "$TEMP_SQL" "$Q_DIR/query.sql"
+        fi
+
 
         # Run in a fresh DuckDB process.
         # For sirius, set SIRIUS_LOG_DIR to the per-query directory so logs are isolated.
@@ -710,4 +747,12 @@ else
     echo "Results saved as result_${ENGINE}_sf${SF}_q*.txt"
     echo "Timings saved as timings_${ENGINE}_sf${SF}_q*.csv"
 fi
+
+# File readback and metadata collection are outside all query timing windows.
+if [ "$RESULT_FORMAT" = "parquet" ] && [ "$RUN_STATUS" -eq 0 ]; then
+    INSPECT_ARGS=()
+    if [ "$ENGINE" = "sirius" ]; then INSPECT_ARGS+=(--require-gpu); fi
+    python3 "$SCRIPT_DIR/parquet_output.py" --inspect-root "${OUTPUT_DIR:-$PWD/tpch-parquet-output/$ENGINE}" --compression "$PARQUET_COMPRESSION" "${INSPECT_ARGS[@]}" || exit 1
+fi
+
 exit "$RUN_STATUS"

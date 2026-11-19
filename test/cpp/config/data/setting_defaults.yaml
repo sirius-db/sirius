@@ -18,6 +18,18 @@ sirius:
       # deliberately small host pool; the production default is 4.
       uring_n_reactors: 1
   operator_params:
+    enable_late_materialization: false
+    enable_fused_scan_filter: false
+    enable_low_cardinality_groupby: false
+    late_materialization_min_boundaries: 2
+    late_materialization_min_value_x_boundaries: 64
+    late_materialization_count_defer: true
+    late_materialization_min_value_compressed: 3
+    fused_scan_diagnostics: true
+    fused_scan_max_selectivity: 0.25
+    fused_scan_full_route_max_selectivity: 0.05
+    fused_scan_index_walk_max_selectivity: 0.08
+    fused_scan_max_membership_sources: 4
     pin_table_prove_unique_keys: false
     pin_table_unique_exact_max_bytes: 9MiB
     scan_task_batch_size: 1MiB

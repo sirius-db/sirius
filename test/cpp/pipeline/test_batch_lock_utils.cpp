@@ -22,9 +22,11 @@
 // vector to the (possibly cloned) batches underlying the read-only accessors, and the
 // target-space-aware bytes_to_materialize_input estimator.
 
+#include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
 #include "catch.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/compression_converters.hpp"
 #include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -35,8 +37,8 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
-#include "utils/scoped_temp_directory.hpp"
 #include "transparent/replay_admission.hpp"
+#include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
@@ -59,9 +61,14 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+<<<<<<< HEAD
 #include <filesystem>
 #include <fstream>
+  =======
+#include <exception>
+  >>>>>>> upstream/main
 #include <future>
 #include <memory>
 #include <numeric>
@@ -70,158 +77,159 @@
 #include <utility>
 #include <vector>
 
-namespace {
+  namespace
+{
+  bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
 
-bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
+  /// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
+  struct batch_lock_utils_fixture {
+    std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+    cucascade::memory::memory_space* gpu0  = nullptr;
+    cucascade::memory::memory_space* gpu1  = nullptr;  // null on single-GPU fixtures
+    cucascade::memory::memory_space* host0 = nullptr;
 
-/// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
-struct batch_lock_utils_fixture {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu0  = nullptr;
-  cucascade::memory::memory_space* gpu1  = nullptr;  // null on single-GPU fixtures
-  cucascade::memory::memory_space* host0 = nullptr;
-
-  bool setup(int num_gpus)
-  {
-    sirius::converter_registry::reset_for_testing();
-    try {
-      cucascade::memory::reservation_manager_configurator builder;
-      builder.set_number_of_gpus(num_gpus)
-        .set_gpu_usage_limit(256ULL << 20)
-        .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
-        .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
-      auto space_configs = builder.build();
-      manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-        std::move(space_configs));
-    } catch (cucascade::cuda_error const&) {
-      throw;
-    } catch (const std::exception&) {
-      return false;
-    }
-    sirius::converter_registry::initialize();
-
-    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    if (gpu_spaces.size() < static_cast<std::size_t>(num_gpus)) { return false; }
-    gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-    if (num_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
-    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) { return false; }
-    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    return true;
-  }
-
-  ~batch_lock_utils_fixture()
-  {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-  }
-
-  /// Single INT64 column of random data, resident on `space`.
-  std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
-                                                        cucascade::memory::memory_space& space,
-                                                        ::cuda::stream_ref stream)
-  {
-    auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                            {cudf::data_type{cudf::type_id::INT64}},
-                                                            {std::make_pair(0, 1000000)},
-                                                            stream,
-                                                            space.get_default_allocator());
-    stream.sync();
-    return sirius::make_data_batch(
-      std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
-  }
-
-  /// GPU batch converted in place to the host representation (spilled-batch shape).
-  std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
-                                                         ::cuda::stream_ref stream)
-  {
-    auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
-    auto& registry = sirius::converter_registry::get();
+    bool setup(int num_gpus)
     {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
+      sirius::converter_registry::reset_for_testing();
+      try {
+        cucascade::memory::reservation_manager_configurator builder;
+        builder.set_number_of_gpus(num_gpus)
+          .set_gpu_usage_limit(256ULL << 20)
+          .set_reservation_fraction_per_gpu(0.75)
+          .set_per_numa_region_capacity(1ULL << 30)
+          .use_numa_id_as_host_id()
+          .track_reservation_per_stream(false)
+          .set_reservation_fraction_per_numa_region(0.75);
+        auto space_configs = builder.build();
+        manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+          std::move(space_configs));
+      } catch (cucascade::cuda_error const&) {
+        throw;
+      } catch (const std::exception&) {
+        return false;
+      }
+      sirius::converter_registry::initialize();
+
+      auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      if (gpu_spaces.size() < static_cast<std::size_t>(num_gpus)) { return false; }
+      gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+      if (num_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
+      auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      if (host_spaces.empty()) { return false; }
+      host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+      return true;
     }
+
+    ~batch_lock_utils_fixture()
+    {
+      // The registry is initialized right after the manager is built, so both exist or neither.
+      if (manager) {
+        manager->shutdown();
+        sirius::converter_registry::shutdown();
+      }
+    }
+
+    /// Single INT64 column of random data, resident on `space`.
+    std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
+                                                          cucascade::memory::memory_space& space,
+                                                          ::cuda::stream_ref stream)
+    {
+      auto table =
+        sirius::create_cudf_table_with_random_data(num_rows,
+                                                   {cudf::data_type{cudf::type_id::INT64}},
+                                                   {std::make_pair(0, 1000000)},
+                                                   stream,
+                                                   space.get_default_allocator());
+      stream.sync();
+      return sirius::make_data_batch(
+        std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
+    }
+
+    /// GPU batch converted in place to the host representation (spilled-batch shape).
+    std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
+                                                           ::cuda::stream_ref stream)
+    {
+      auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
+      auto& registry = sirius::converter_registry::get();
+      {
+        auto mut = batch->to_mutable();
+        mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
+      }
+      stream.sync();
+      return batch;
+    }
+  };
+
+  /// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
+  /// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
+  /// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
+  /// return the zero-initialized vector.
+  template <typename T>
+  std::vector<T> column_values_to_host(const cudf::column_view& col, ::cuda::stream_ref stream)
+  {
+    std::vector<T> out(static_cast<std::size_t>(col.size()));
+    if (out.empty()) { return out; }
     stream.sync();
-    return batch;
+    cudaPointerAttributes attrs{};
+    REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
+    int prev = -1;
+    REQUIRE(cudaGetDevice(&prev) == cudaSuccess);
+    const bool switch_device = attrs.type == cudaMemoryTypeDevice && attrs.device != prev;
+    if (switch_device) { REQUIRE(cudaSetDevice(attrs.device) == cudaSuccess); }
+    const cudaError_t copy_err =
+      cudaMemcpy(out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost);
+    if (switch_device) { REQUIRE(cudaSetDevice(prev) == cudaSuccess); }
+    REQUIRE(copy_err == cudaSuccess);
+    return out;
   }
-};
 
-/// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
-/// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
-/// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
-/// return the zero-initialized vector.
-template <typename T>
-std::vector<T> column_values_to_host(const cudf::column_view& col, ::cuda::stream_ref stream)
-{
-  std::vector<T> out(static_cast<std::size_t>(col.size()));
-  if (out.empty()) { return out; }
-  stream.sync();
-  cudaPointerAttributes attrs{};
-  REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
-  int prev = -1;
-  REQUIRE(cudaGetDevice(&prev) == cudaSuccess);
-  const bool switch_device = attrs.type == cudaMemoryTypeDevice && attrs.device != prev;
-  if (switch_device) { REQUIRE(cudaSetDevice(attrs.device) == cudaSuccess); }
-  const cudaError_t copy_err =
-    cudaMemcpy(out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost);
-  if (switch_device) { REQUIRE(cudaSetDevice(prev) == cudaSuccess); }
-  REQUIRE(copy_err == cudaSuccess);
-  return out;
-}
+  /// One LIST<INT32> column with `num_lists` two-element lists [2i, 2i+1], on `space`.
+  std::unique_ptr<cudf::table> make_list_table(
+    std::size_t num_lists, cucascade::memory::memory_space& space, ::cuda::stream_ref stream)
+  {
+    auto mr = space.get_default_allocator();
 
-/// One LIST<INT32> column with `num_lists` two-element lists [2i, 2i+1], on `space`.
-std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
-                                             cucascade::memory::memory_space& space,
-                                             ::cuda::stream_ref stream)
-{
-  auto mr = space.get_default_allocator();
+    std::vector<int32_t> offsets_host(num_lists + 1);
+    for (std::size_t i = 0; i <= num_lists; ++i) {
+      offsets_host[i] = static_cast<int32_t>(2 * i);
+    }
+    std::vector<int32_t> values_host(2 * num_lists);
+    std::iota(values_host.begin(), values_host.end(), 0);
 
-  std::vector<int32_t> offsets_host(num_lists + 1);
-  for (std::size_t i = 0; i <= num_lists; ++i) {
-    offsets_host[i] = static_cast<int32_t>(2 * i);
+    auto offsets = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                             static_cast<cudf::size_type>(num_lists + 1),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             mr);
+    cudaMemcpyAsync(offsets->mutable_view().data<int32_t>(),
+                    offsets_host.data(),
+                    offsets_host.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
+    auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(values_host.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+    cudaMemcpyAsync(values->mutable_view().data<int32_t>(),
+                    values_host.data(),
+                    values_host.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
+    stream.sync();
+
+    auto list_col =
+      cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
+                              std::move(offsets),
+                              std::move(values),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::move(list_col));
+    return std::make_unique<cudf::table>(std::move(cols));
   }
-  std::vector<int32_t> values_host(2 * num_lists);
-  std::iota(values_host.begin(), values_host.end(), 0);
 
-  auto offsets = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                           static_cast<cudf::size_type>(num_lists + 1),
-                                           cudf::mask_state::UNALLOCATED,
-                                           stream,
-                                           mr);
-  cudaMemcpyAsync(offsets->mutable_view().data<int32_t>(),
-                  offsets_host.data(),
-                  offsets_host.size() * sizeof(int32_t),
-                  cudaMemcpyHostToDevice,
-                  stream.get());
-  auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          static_cast<cudf::size_type>(values_host.size()),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mr);
-  cudaMemcpyAsync(values->mutable_view().data<int32_t>(),
-                  values_host.data(),
-                  values_host.size() * sizeof(int32_t),
-                  cudaMemcpyHostToDevice,
-                  stream.get());
-  stream.sync();
-
-  auto list_col = cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
-                                          std::move(offsets),
-                                          std::move(values),
-                                          0,
-                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(list_col));
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
-constexpr std::size_t kNumRows = 4096;
+  constexpr std::size_t kNumRows = 4096;
 
 }  // namespace
 
@@ -761,6 +769,7 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   target_stream.synchronize();
 }
 
+<<<<<<< HEAD
 TEST_CASE("cross-GPU preparation traces destination batches",
           "[batch_lock_utils][multi_gpu][clone_telemetry]")
 {
@@ -842,6 +851,67 @@ TEST_CASE("cross-GPU preparation traces destination batches",
 // when the pools have peer access (this test then fails because nothing is refused) and an
 // illegal address when they do not (the process loses its CUDA context).
 TEST_CASE("compressed cached scan assigned away from its pin is refused before decoding",
+=======
+namespace {
+
+/// One bitpacked INT64 column compressed on @p space, held the way pin_table(tier='gpu') holds
+/// a chunk. With @p relocatable the chunk also carries its header and the place of each payload
+/// buffer, which is what lets another GPU copy and decode it.
+std::shared_ptr<sirius::compressed_device_representation> make_compressed_pin_chunk(
+  cudf::table_view const& input,
+  cucascade::memory::memory_space& space,
+  ::cuda::stream_ref stream,
+  bool relocatable)
+{
+  auto blob   = std::make_shared<sirius::compressed_device_blob>();
+  blob->table = simpatico::compress_with_plan(
+    input,
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    stream,
+    space.get_default_allocator());
+  stream.sync();
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  REQUIRE(
+    simpatico::build_compressed_table_header(blob->table, header, buffers, payload_bytes, stream)
+      .empty());
+  stream.sync();
+  if (relocatable) {
+    for (auto const& buffer : buffers) {
+      if (buffer.size_bytes == 0) { continue; }
+      blob->slices.push_back(sirius::compressed_payload_slice{
+        buffer.offset, static_cast<std::byte const*>(buffer.device_ptr), buffer.size_bytes});
+    }
+    blob->header = std::move(header);
+  }
+  return std::make_shared<sirius::compressed_device_representation>(
+    space,
+    std::move(blob),
+    std::vector<std::string>{"k"},
+    static_cast<std::size_t>(payload_bytes),
+    static_cast<std::size_t>(input.num_rows()) * sizeof(std::int64_t),
+    static_cast<std::int64_t>(input.num_rows()));
+}
+
+/// The batch a query scans a pinned chunk through: its own projection, sharing the chunk.
+std::shared_ptr<cucascade::data_batch> project_pin_chunk(
+  sirius::compressed_device_representation const& pinned)
+{
+  std::vector<std::size_t> const all_columns{0};
+  return cucascade::data_batch::make(sirius::get_next_batch_id(),
+                                     pinned.select_columns(all_columns));
+}
+
+}  // namespace
+
+// Admission can assign the scan of a compressed pinned chunk to a GPU other than the one that
+// holds it. The decoder cannot read the owner's buffers from there (an illegal address when
+// the two GPUs have no peer access), so the compressed bytes are copied to the assigned GPU
+// and decoded there.
+TEST_CASE("compressed cached scan assigned away from its pin is copied and decoded there",
+>>>>>>> upstream/main
           "[batch_lock_utils][cached_scan_placement][multi_gpu]")
 {
   if (skip_if_not_mgpu()) return;
@@ -851,44 +921,93 @@ TEST_CASE("compressed cached scan assigned away from its pin is refused before d
   rmm::cuda_stream source_stream;
   ::cuda::stream_ref const source_stream_ref{source_stream};
 
-  // One bitpacked INT64 column compressed on gpu0, the shape pin_table(tier='gpu') stores.
   auto table = sirius::create_cudf_table_with_random_data(kNumRows,
                                                           {cudf::data_type{cudf::type_id::INT64}},
                                                           {std::make_pair(0, 1000000)},
                                                           source_stream_ref,
                                                           f.gpu0->get_default_allocator());
   source_stream.synchronize();
-  auto blob   = std::make_shared<sirius::compressed_device_blob>();
-  blob->table = simpatico::compress_with_plan(
-    table->view(),
-    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
-    source_stream_ref,
-    f.gpu0->get_default_allocator());
-  source_stream.synchronize();
-  auto batch =
-    cucascade::data_batch::make(sirius::get_next_batch_id(),
-                                std::make_unique<sirius::compressed_device_representation>(
-                                  *f.gpu0,
-                                  std::move(blob),
-                                  std::vector<std::string>{"k"},
-                                  /*compressed_bytes=*/64,
-                                  /*uncompressed_bytes=*/kNumRows * sizeof(std::int64_t),
-                                  /*num_rows=*/static_cast<std::int64_t>(kNumRows)));
-  auto scan = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  auto const values = column_values_to_host<int64_t>(table->view().column(0), source_stream_ref);
+  auto pinned       = make_compressed_pin_chunk(table->view(), *f.gpu0, source_stream_ref, true);
+  table.reset();
+  auto const compressed_bytes   = pinned->get_size_in_bytes();
+  auto const uncompressed_bytes = pinned->get_uncompressed_data_size_in_bytes();
 
-  std::optional<sirius::transparent::late_failure_cause> refusal;
+  {
+    rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream target_stream;
+    auto input =
+      std::make_unique<sirius::op::scan::scan_operator_input>(project_pin_chunk(*pinned));
+    auto* scan = input.get();
+    sirius::pipeline::gpu_pipeline_task_local_state state(std::move(input));
+    CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu0) == 0);
+    // On another GPU the copied compressed bytes and the decoded output are live together.
+    CHECK(state.get_estimated_bytes_to_materialize_input(f.gpu1) ==
+          compressed_bytes + uncompressed_bytes);
+
+    auto const copied_before = sirius::compressed_chunks_decoded_on_another_gpu();
+    scan->prepare_for_processing(f.gpu1, target_stream);
+    CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_before + 1);
+    CHECK(scan->gpu_memory_space == f.gpu1);
+    // A scan without a filter takes the decoded table out of its batch.
+    REQUIRE(scan->stolen_table);
+    CHECK(column_values_to_host<int64_t>(scan->stolen_table->view().column(0), target_stream) ==
+          values);
+    // An out-of-memory retry reuses the decoded input.
+    scan->prepare_for_processing(f.gpu1, target_stream);
+    CHECK(scan->stolen_table);
+    CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_before + 1);
+    target_stream.synchronize();
+  }
+
+  // The pinned chunk was only read: it is still on its owner, which decodes it in place.
+  CHECK(pinned->get_memory_space().get_id() == f.gpu0->get_id());
+  sirius::op::scan::scan_operator_input local_scan{project_pin_chunk(*pinned)};
+  auto const copied_after = sirius::compressed_chunks_decoded_on_another_gpu();
+  local_scan.prepare_for_processing(f.gpu0, source_stream);
+  CHECK(sirius::compressed_chunks_decoded_on_another_gpu() == copied_after);
+  CHECK(local_scan.gpu_memory_space == f.gpu0);
+  REQUIRE(local_scan.stolen_table);
+  CHECK(column_values_to_host<int64_t>(local_scan.stolen_table->view().column(0),
+                                       source_stream_ref) == values);
+  source_stream.synchronize();
+}
+
+// A chunk without the layout cannot be copied. Decoding its cached table from another GPU
+// would read the owner's memory, so the scan fails before anything runs on the GPU.
+TEST_CASE("compressed cached scan without a copy layout is refused on another GPU",
+          "[batch_lock_utils][cached_scan_placement][multi_gpu]")
+{
+  if (skip_if_not_mgpu()) return;
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream source_stream;
+  ::cuda::stream_ref const source_stream_ref{source_stream};
+
+  auto table = sirius::create_cudf_table_with_random_data(kNumRows,
+                                                          {cudf::data_type{cudf::type_id::INT64}},
+                                                          {std::make_pair(0, 1000000)},
+                                                          source_stream_ref,
+                                                          f.gpu0->get_default_allocator());
+  source_stream.synchronize();
+  auto pinned = make_compressed_pin_chunk(table->view(), *f.gpu0, source_stream_ref, false);
+  table.reset();
+  auto batch = project_pin_chunk(*pinned);
+  auto scan  = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+
+  std::string refusal;
   {
     rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
     rmm::cuda_stream target_stream;
     try {
       scan->prepare_for_processing(f.gpu1, target_stream);
-    } catch (sirius::transparent::classified_execution_error const& refused) {
-      refusal = refused.cause;
+    } catch (std::exception const& refused) {
+      refusal = refused.what();
     }
     target_stream.synchronize();
   }
-  REQUIRE(refusal.has_value());
-  CHECK(*refusal == sirius::transparent::late_failure_cause::gpu_error);
+  CHECK(refusal.find("carries no layout to copy it") != std::string::npos);
 
   // The refusal touched nothing: the chunk is still compressed and still on its owner.
   {

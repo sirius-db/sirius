@@ -8,7 +8,7 @@
     "nixl",
     "yaml-cpp",
     "abseil",
-    "numactl",
+    "utf8proc",
     "liburing",
     "openssl",
     "xxhash",
