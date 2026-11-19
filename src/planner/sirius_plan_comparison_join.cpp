@@ -849,7 +849,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
-       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu()}};
+       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu(),
+       .decode_membership_cap =
+         op_params.enable_fused_scan_filter ? op_params.fused_scan.max_membership_sources : 0}};
 
     auto join = make_hash_join(op,
                                std::move(left),

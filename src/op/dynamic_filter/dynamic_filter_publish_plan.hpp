@@ -66,6 +66,9 @@ struct dynamic_filter_publication_policy {
   double domain_coverage_threshold      = default_dynamic_filter_domain_coverage_threshold;
   double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
   std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
+  //! Membership Filters one Filtered Decode of a consuming scan carries, 0 when scans do not run
+  //! Filtered Decode. A Shadowed Key is judged with it (`construction_limits`).
+  std::size_t decode_membership_cap = 1;
   //! Membership filters are Blooms only, never IN-lists.
   bool bloom_only = false;
   //! Non-zero: every Bloom, whole-build or accumulated, is sized for this many keys whatever the
@@ -184,6 +187,10 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
   {
     return _policy.max_bloom_bytes_per_gpu;
+  }
+  [[nodiscard]] std::size_t decode_membership_cap() const noexcept
+  {
+    return _policy.decode_membership_cap;
   }
   [[nodiscard]] dynamic_filter_publication_policy const& policy() const noexcept { return _policy; }
 

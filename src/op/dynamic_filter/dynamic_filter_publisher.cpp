@@ -658,22 +658,21 @@ struct dynamic_filter_publication_session::state {
           key.zone_map_type     = planned[index].recorded_type;
           key.membership        = built.membership;
           key.membership_domain = built.domain;
-          std::size_t key_rows  = 0;
           if (auto const* exact = std::get_if<exact_membership>(&planned[index].membership)) {
             key.membership_kind = exact->kind;
             key.membership_size = exact->valid_rows;
-            key_rows            = exact->valid_rows;
           } else if (auto const* bloom =
                        std::get_if<bloom_membership>(&planned[index].membership)) {
             key.membership_kind = membership_filter_kind::bloom;
             key.membership_size = sirius_dynamic_bloom_filter::estimated_bytes(bloom->sized_rows);
-            key_rows            = bloom->rows;
           }
-          if (built.membership) {
-            if (auto const selectivity =
-                  plan.admitted_keys()[built.admitted_key_index].estimated_keep(key_rows)) {
-              built.membership->set_estimated_selectivity(*selectivity);
-            }
+          // The filter carries the estimate its key was planned and judged with. A cross-rank merge
+          // adds the other processes' keys, so this process's estimate is not proven for it.
+          auto const& candidate = planned[index].candidate;
+          if (built.membership && candidate.estimated_keep) {
+            built.membership->set_estimated_selectivity(
+              *candidate.estimated_keep,
+              candidate.estimate_proven && plan.cross_rank_merge() == nullptr);
           }
         }
       }
@@ -971,16 +970,21 @@ bool dynamic_filter_publication_session::begin(complete_build_inventory inventor
   };
   construction_plan planned;
   try {
+    // A key whose membership filter no Consumer would select over what its Channels already hold
+    // is planned without it; the Channels are read here, before any lease is taken.
+    auto bindings = binding_facts_of(plan);
+    read_published_filters(plan, bindings);
     planned = plan_construction(inventory.facts(),
                                 plan.admitted_keys(),
-                                binding_facts_of(plan),
+                                bindings,
                                 {.l2_bytes                  = device_l2_cache_bytes(replicas),
                                  .inlist_max_l2_fraction    = plan.inlist_max_l2_fraction(),
                                  .emit_zone_map_filters     = plan.emit_zone_map_filters(),
                                  .domain_coverage_threshold = plan.domain_coverage_threshold(),
                                  .max_bloom_bytes_per_gpu   = plan.max_bloom_bytes_per_gpu(),
                                  .bloom_only                = plan.policy().bloom_only,
-                                 .fixed_bloom_keys          = plan.policy().fixed_bloom_keys});
+                                 .fixed_bloom_keys          = plan.policy().fixed_bloom_keys,
+                                 .decode_membership_cap     = plan.decode_membership_cap()});
     // An empty build publishes nothing, so no filter is planned for it, unless a cross-rank merge
     // waits on this process's part
     // (`dynamic_filter_publication_policy::publish_when_empty_or_drained`).
