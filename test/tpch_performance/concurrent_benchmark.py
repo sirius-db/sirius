@@ -108,8 +108,8 @@ def check_arguments(args):
         raise SystemExit(
             "--queries must select unique TPC-H query numbers between 1 and 22"
         )
-    if args.pin_compression and args.pin not in ("gpu", "host"):
-        raise SystemExit("--pin-compression requires --pin gpu or host")
+    if args.compression_plan_dir and args.pin not in ("gpu", "host"):
+        raise SystemExit("--compression-plan-dir requires --pin gpu or host")
     if args.pin == "parquet" and args.data_source != "parquet":
         raise SystemExit("--pin parquet requires --data-source parquet")
 
@@ -862,7 +862,6 @@ def run(spec):
             try:
                 if gpu and args.pin != "none":
                     if spec["compression_plan"]:
-                        root.execute("SET pin_table_compression=true")
                         plan = spec["compression_plan"].replace("'", "''")
                         root.execute(
                             f"SET pin_table_input_compression_plan_dir='{plan}'"

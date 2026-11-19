@@ -1,5 +1,5 @@
 # Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
-"""Benchmark compression options must override the extension/session default."""
+"""Benchmark runners' compression options and their interaction with the engine default."""
 
 import os
 from pathlib import Path
@@ -12,7 +12,7 @@ import tpch_power_throughput as power
 
 
 class PinCompressionTests(unittest.TestCase):
-    def test_python_connection_sets_both_compression_states(self):
+    def test_python_connection_leaves_compression_to_the_engine(self):
         for plan_dir in (None, "/plans"):
             with self.subTest(plan_dir=plan_dir):
                 con = Mock()
@@ -25,17 +25,19 @@ class PinCompressionTests(unittest.TestCase):
                         "/tpch.duckdb", gpu_execution=True, data_source="duckdb"
                     )
                 statements = [call.args[0] for call in con.execute.call_args_list]
-                intended = (
-                    f"SET pin_table_compression = {'true' if plan_dir else 'false'};"
+                self.assertFalse(
+                    any(s.startswith("SET pin_table_compression ") for s in statements)
                 )
-                self.assertIn(intended, statements)
-                self.assertLess(
-                    next(
-                        i
-                        for i, statement in enumerate(statements)
-                        if statement.startswith("LOAD ")
+                plan_sets = [
+                    s for s in statements if "pin_table_input_compression_plan_dir" in s
+                ]
+                self.assertEqual(
+                    plan_sets,
+                    (
+                        [f"SET pin_table_input_compression_plan_dir = '{plan_dir}';"]
+                        if plan_dir
+                        else []
                     ),
-                    statements.index(intended),
                 )
 
     def test_power_runner_sets_compression_before_pinning(self):
@@ -90,7 +92,7 @@ class PinCompressionTests(unittest.TestCase):
                 )
             self.assertEqual(power.pin_compression_counts(log_dir, timeout_s=0), (1, 0))
 
-    def test_external_runner_script_sets_compression_before_pinning(self):
+    def test_external_runner_script_sets_only_the_plan_dir_before_pinning(self):
         for plan_dir in (None, "/plans"):
             with (
                 self.subTest(plan_dir=plan_dir),
@@ -111,13 +113,14 @@ class PinCompressionTests(unittest.TestCase):
                         "duckdb",
                     )
                 statements = Path(path).read_text()
-                intended = (
-                    f"SET pin_table_compression = {'true' if plan_dir else 'false'};"
-                )
-                self.assertIn(intended, statements)
-                self.assertLess(
-                    statements.index(intended), statements.index("CALL pin_table(")
-                )
+                self.assertNotIn("SET pin_table_compression ", statements)
+                plan_set = "SET pin_table_input_compression_plan_dir = '/plans';"
+                if plan_dir:
+                    self.assertLess(
+                        statements.index(plan_set), statements.index("CALL pin_table(")
+                    )
+                else:
+                    self.assertNotIn("pin_table_input_compression_plan_dir", statements)
 
 
 if __name__ == "__main__":
