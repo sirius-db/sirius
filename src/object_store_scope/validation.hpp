@@ -54,9 +54,10 @@ struct violation {
 [[nodiscard]] std::optional<violation> check_settings(const settings& value,
                                                       const capabilities& backend);
 
-/// The checks of `check_settings()` that depend on @p value alone, in the same relative order:
-/// endpoint, region, access_key, secret_key, transport, signing_mode, uri_prefix. The filesystem
-/// is not accessed and no backend is consulted, so `ca_bundle_path` is not examined.
+/// The checks of `check_settings()` on a store's own settings, in the same relative order:
+/// endpoint, region, access_key, secret_key, transport, signing_mode. The filesystem is not
+/// accessed and no backend is consulted, so `ca_bundle_path` is not examined. The scope key is
+/// not examined either: `uri_prefix` is `check_uri_prefix()`'s.
 [[nodiscard]] std::optional<violation> check_settings_intrinsic(const settings& value);
 
 /// Shape of a scope key: empty (the default scope), `s3://bucket/` or `s3://bucket/prefix/`.

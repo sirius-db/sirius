@@ -49,7 +49,7 @@ struct text_field {
   char const* sentinel;
 };
 
-std::array<text_field, 7> const text_fields{{
+std::array<text_field, 6> const text_fields{{
   {&settings::endpoint, sirius_object_store_config_builder_with_endpoint, "C_ENDPOINT_SENTINEL"},
   {&settings::region, sirius_object_store_config_builder_with_region, "C_REGION_SENTINEL"},
   {&settings::access_key, sirius_object_store_config_builder_with_access_key, "C_ACCESS_SENTINEL"},
@@ -60,7 +60,6 @@ std::array<text_field, 7> const text_fields{{
   {&settings::ca_bundle_path,
    sirius_object_store_config_builder_with_ca_bundle_path,
    "C_CA_SENTINEL"},
-  {&settings::uri_prefix, sirius_object_store_config_builder_with_uri_prefix, "C_PREFIX_SENTINEL"},
 }};
 
 template <typename T>
@@ -77,7 +76,7 @@ settings const original{.endpoint       = "https://C_ENDPOINT_SENTINEL.example.i
                         .transport      = 1,
                         .signing_mode   = 1,
                         .ca_bundle_path = "/missing/C_CA_SENTINEL.pem",
-                        .uri_prefix     = "s3://bucket/C_PREFIX_SENTINEL/"};
+                        .uri_prefix     = ""};
 
 settings const replacement{.endpoint       = "http://replacement.example.invalid:9000",
                            .region         = "replacement-region",
@@ -87,14 +86,15 @@ settings const replacement{.endpoint       = "http://replacement.example.invalid
                            .transport      = 2,
                            .signing_mode   = 0,
                            .ca_bundle_path = "/missing/replacement.pem",
-                           .uri_prefix     = "s3://other-bucket/replacement/"};
+                           .uri_prefix     = ""};
 
 bool equal_fields(settings const& actual, settings const& expected)
 {
   for (auto const& field : text_fields) {
     if (actual.*field.member != expected.*field.member) { return false; }
   }
-  return actual.transport == expected.transport && actual.signing_mode == expected.signing_mode;
+  return actual.transport == expected.transport && actual.signing_mode == expected.signing_mode &&
+         actual.uri_prefix == expected.uri_prefix;
 }
 
 void replace_field(settings& value, std::size_t field, settings const& replacement)
@@ -102,8 +102,8 @@ void replace_field(settings& value, std::size_t field, settings const& replaceme
   if (field < text_fields.size()) {
     value.*text_fields[field].member = replacement.*text_fields[field].member;
   } else {
-    (field == 7 ? value.transport : value.signing_mode) =
-      field == 7 ? replacement.transport : replacement.signing_mode;
+    (field == text_fields.size() ? value.transport : value.signing_mode) =
+      field == text_fields.size() ? replacement.transport : replacement.signing_mode;
   }
 }
 
@@ -117,7 +117,7 @@ sirius_status derive(const builder* input,
     auto const& bytes = value.*text_fields[field].member;
     return text_fields[field].derive(input, bytes.data(), bytes.size(), out, error);
   }
-  if (field == 7) {
+  if (field == text_fields.size()) {
     return sirius_object_store_config_builder_with_transport(input, value.transport, out, error);
   }
   return sirius_object_store_config_builder_with_signing_mode(
@@ -164,7 +164,7 @@ builder_ptr derived(const builder* input, std::size_t field, settings const& val
 builder_ptr make_builder(settings const& value)
 {
   auto result = checked_call(sirius_object_store_config_builder_create, release_builder);
-  for (std::size_t field = 0; field < 9; ++field) {
+  for (std::size_t field = 0; field < text_fields.size() + 2; ++field) {
     result = derived(result.get(), field, value);
   }
   return result;
@@ -222,7 +222,7 @@ TEST_CASE("C object-store text derivations preserve byte spans and other fields"
   auto input = make_builder(original);
   for (auto const& field : text_fields) {
     INFO(field.sentinel);
-    std::string bytes = "  " + std::string(field.sentinel) + std::string("\0\xff tail  ", 9);
+    std::string bytes = "  " + std::string(field.sentinel) + std::string("\xff tail  ", 8);
     for (unsigned mode = 0; mode < 3; ++mode) {
       auto expected          = original;
       expected.*field.member = mode == 0 ? bytes : "";
@@ -241,13 +241,55 @@ TEST_CASE("C object-store text derivations preserve byte spans and other fields"
   }
 }
 
+TEST_CASE("C object-store text derivations reject embedded NUL bytes", "[object_store_c_config]")
+{
+  auto input = make_builder(original);
+  for (std::size_t field = 0; field < text_fields.size(); ++field) {
+    auto const& item = text_fields[field];
+    for (unsigned position = 0; position < 3; ++position) {
+      DYNAMIC_SECTION(item.sentinel << " NUL position " << position)
+      {
+        std::string bytes = std::string(item.sentinel) + "::" + item.sentinel;
+        auto const offset = position == 0 ? 0 : position == 1 ? bytes.size() / 2 : bytes.size();
+        bytes.insert(offset, 1, '\0');
+        invalid_derivation(input.get(), field, [&](auto out, auto err) {
+          return item.derive(input.get(), bytes.data(), bytes.size(), out, err);
+        });
+      }
+    }
+  }
+}
+
+TEST_CASE("C object-store text checks follow output-slot clearing", "[object_store_c_config]")
+{
+  auto input = make_builder(original);
+  for (auto const& field : text_fields) {
+    INFO(field.sentinel);
+    for (bool const error_slot : {false, true}) {
+      INFO("text in " << (error_slot ? "error slot" : "builder slot"));
+      builder* raw            = nullptr;
+      sirius_error* raw_error = nullptr;
+      auto* text = error_slot ? reinterpret_cast<char*>(&raw_error) : reinterpret_cast<char*>(&raw);
+      *text      = 'R';
+      // Even a forbidden overlap must not store bytes that were never checked.
+      auto const status = field.derive(input.get(), text, 1, &raw, &raw_error);
+      builder_ptr result(raw, release_builder);
+      error_ptr error(raw_error, sirius_error_destroy);
+      CHECK(status == SIRIUS_INVALID_ARGUMENT);
+      CHECK(raw == nullptr);
+      if (result) { CHECK((result->value.*field.member != std::string(1, '\0'))); }
+      check_rebuild(input.get(), original);
+    }
+  }
+}
+
 TEST_CASE("C object-store declared selectors keep their full value", "[object_store_c_config]")
 {
   auto input = make_builder(original);
-  for (std::size_t field : {7U, 8U}) {
-    for (std::uint32_t value = 0; value < (field == 7 ? 3U : 2U); ++value) {
-      auto expected                                             = original;
-      (field == 7 ? expected.transport : expected.signing_mode) = value;
+  for (std::size_t field : {text_fields.size(), text_fields.size() + 1}) {
+    for (std::uint32_t value = 0; value < (field == text_fields.size() ? 3U : 2U); ++value) {
+      auto expected                                                              = original;
+      (field == text_fields.size() ? expected.transport : expected.signing_mode) = value;
       auto result = derived(input.get(), field, expected);
       check_rebuild(result.get(), expected);
       check_rebuild(input.get(), original);
@@ -258,7 +300,7 @@ TEST_CASE("C object-store declared selectors keep their full value", "[object_st
 TEST_CASE("C object-store derivation preserves prior builders and built snapshots",
           "[object_store_c_config]")
 {
-  for (std::size_t field = 0; field < 9; ++field) {
+  for (std::size_t field = 0; field < text_fields.size() + 2; ++field) {
     INFO("field " << field);
     auto buffers = original, supplied = replacement, expected = original;
     replace_field(expected, field, replacement);
@@ -285,11 +327,11 @@ TEST_CASE("C object-store undeclared selectors fail without narrowing or mutatio
           "[object_store_c_config]")
 {
   auto input = make_builder(original);
-  for (std::size_t field : {std::size_t{7}, std::size_t{8}}) {
-    for (std::uint32_t value : {field == 7 ? 3U : 2U, 256U, UINT32_MAX}) {
+  for (std::size_t field : {text_fields.size(), text_fields.size() + 1}) {
+    for (std::uint32_t value : {field == text_fields.size() ? 3U : 2U, 256U, UINT32_MAX}) {
       INFO("field " << field << ", value " << value);
-      auto invalid                                            = original;
-      (field == 7 ? invalid.transport : invalid.signing_mode) = value;
+      auto invalid                                                             = original;
+      (field == text_fields.size() ? invalid.transport : invalid.signing_mode) = value;
       invalid_derivation(input.get(), field, [&](auto out, auto err) {
         return derive(input.get(), field, invalid, out, err);
       });
@@ -310,9 +352,6 @@ TEST_CASE("C object-store build reports field refusals in order", "[object_store
     row{1, "", "region: required"},
     row{2, "", "access_key: required"},
     row{3, "", "secret_key: required"},
-    row{6,
-        "http://bucket/C_PREFIX_SENTINEL/",
-        "uri_prefix: must be s3://bucket/ or s3://bucket/prefix/"},
   };
   for (std::size_t i = 0; i < rows.size(); ++i) {
     for (std::size_t j = i; j < rows.size(); ++j) {
@@ -357,7 +396,7 @@ TEST_CASE("C object-store build defers CA files and backend support", "[object_s
 TEST_CASE("C object-store required pointers fail atomically", "[object_store_c_config]")
 {
   auto input = make_builder(original);
-  for (std::size_t field = 0; field < 9; ++field) {
+  for (std::size_t field = 0; field < text_fields.size() + 2; ++field) {
     INFO("field " << field);
     for (bool const null_input : {false, true}) {
       invalid_derivation(

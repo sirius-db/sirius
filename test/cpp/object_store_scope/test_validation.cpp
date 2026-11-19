@@ -185,14 +185,21 @@ TEST_CASE("Object-store intrinsic checks share field rules but defer environment
     CHECK(core::is_declared_signing_mode(selector) == (selector < 2));
   }
   for (auto const& row : intrinsic_rows) {
+    INFO(row.field);
     auto value           = valid_settings();
     value.*row.member    = row.value;
     auto const intrinsic = core::check_settings_intrinsic(value);
     auto const full      = core::check_settings(value, {});
-    REQUIRE(intrinsic);
     REQUIRE(full);
-    CHECK(intrinsic->field == full->field);
-    CHECK(intrinsic->why == full->why);
+    if (row.member == &core::settings::uri_prefix) {
+      CHECK_FALSE(intrinsic);
+      CHECK(full->field == row.field);
+      CHECK(full->why == row.why);
+    } else {
+      REQUIRE(intrinsic);
+      CHECK(intrinsic->field == full->field);
+      CHECK(intrinsic->why == full->why);
+    }
   }
   temporary_files files;
   auto value           = valid_settings();
@@ -203,10 +210,7 @@ TEST_CASE("Object-store intrinsic checks share field rules but defer environment
                    reason::ca_bundle_not_regular_file,
                    "is not a regular file");
   value.uri_prefix = "http://invalid/";
-  expect_violation(core::check_settings_intrinsic(value),
-                   "uri_prefix",
-                   reason::prefix_shape,
-                   "must be s3://bucket/ or s3://bucket/prefix/");
+  CHECK_FALSE(core::check_settings_intrinsic(value));
   expect_violation(core::check_settings(value, {}),
                    "ca_bundle_path",
                    reason::ca_bundle_not_regular_file,

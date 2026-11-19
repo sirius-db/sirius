@@ -5,6 +5,7 @@
 
 #include <sirius-c/object_store/config_builder.h>
 
+#include <cstring>
 #include <new>
 #include <string>
 #include <utility>
@@ -12,6 +13,13 @@
 namespace {
 namespace scope = sirius::object_store_scope;
 using sirius::c_api::fail;
+
+// A selector is stored as given, so the public constants must be the core's.
+static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_AUTO == scope::transport_auto);
+static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_HTTP == scope::transport_http);
+static_assert(SIRIUS_OBJECT_STORE_TRANSPORT_RDMA == scope::transport_rdma);
+static_assert(SIRIUS_OBJECT_STORE_SIGNING_PRESIGNED == scope::signing_presigned);
+static_assert(SIRIUS_OBJECT_STORE_SIGNING_HEADER == scope::signing_header);
 
 template <typename T>
 void retain(T* value) noexcept
@@ -39,13 +47,13 @@ sirius_status guarded(sirius_error** error, F&& operation) noexcept
   }
 }
 
-// A copy of `builder` with one field changed by `change`. `invalid_argument`, when not null,
-// refuses the argument before anything is copied.
-template <typename Change>
+// A copy of `builder` with one field changed by `change`. `refusal` runs once the output slots
+// are cleared and before anything is copied; a text it returns refuses the argument.
+template <typename Refusal, typename Change>
 sirius_status derive(const sirius_object_store_config_builder* builder,
                      sirius_object_store_config_builder** out,
                      sirius_error** error,
-                     const char* invalid_argument,
+                     Refusal&& refusal,
                      Change&& change) noexcept
 {
   if (out) { *out = nullptr; }
@@ -53,7 +61,9 @@ sirius_status derive(const sirius_object_store_config_builder* builder,
     if (!builder || !out) {
       return fail(SIRIUS_INVALID_ARGUMENT, "Builder or output pointer is NULL", error);
     }
-    if (invalid_argument) { return fail(SIRIUS_INVALID_ARGUMENT, invalid_argument, error); }
+    if (const char* invalid_argument = refusal()) {
+      return fail(SIRIUS_INVALID_ARGUMENT, invalid_argument, error);
+    }
     auto next = builder->value;
     change(next);
     *out = new sirius_object_store_config_builder{.value = std::move(next)};
@@ -68,16 +78,23 @@ sirius_status with_text(const sirius_object_store_config_builder* builder,
                         sirius_object_store_config_builder** out,
                         sirius_error** error) noexcept
 {
-  return derive(builder,
-                out,
-                error,
-                !data && size != 0 ? "data is NULL with a nonzero size" : nullptr,
-                [&](scope::settings& next) { (next.*field).assign(data ? data : "", size); });
+  // The range is checked and copied with no write to the caller's storage in between, so the
+  // bytes stored are the bytes checked even when the range overlaps an output slot.
+  return derive(
+    builder,
+    out,
+    error,
+    [&]() -> const char* {
+      if (!data && size != 0) { return "Text is NULL with a nonzero size"; }
+      if (size != 0 && std::memchr(data, '\0', size)) { return "Text contains a NUL byte"; }
+      return nullptr;
+    },
+    [&](scope::settings& next) { (next.*field).assign(data ? data : "", size); });
 }
 
 // Expected field refusals from build. Undeclared selectors cannot enter through derivation;
-// CA-file and backend reasons cannot come from intrinsic validation. Any such reason is an
-// internal invariant failure.
+// CA-file, scope-key and backend reasons cannot come from intrinsic validation. Any such reason
+// is an internal invariant failure.
 bool refuses_build(scope::reason why) noexcept
 {
   using scope::reason;
@@ -91,15 +108,15 @@ bool refuses_build(scope::reason why) noexcept
     case reason::endpoint_has_user_info:
     case reason::endpoint_unterminated_ipv6:
     case reason::endpoint_malformed:
-    case reason::endpoint_bad_port:
-    case reason::prefix_shape:
-    case reason::prefix_no_trailing_slash:
-    case reason::prefix_query_or_fragment:
-    case reason::prefix_unmatchable_segment: return true;
+    case reason::endpoint_bad_port: return true;
     case reason::transport_unknown:
     case reason::signing_mode_unknown:
     case reason::ca_bundle_not_regular_file:
     case reason::ca_bundle_unreadable:
+    case reason::prefix_shape:
+    case reason::prefix_no_trailing_slash:
+    case reason::prefix_query_or_fragment:
+    case reason::prefix_unmatchable_segment:
     case reason::transport_unavailable: return false;
   }
   return false;
@@ -137,66 +154,59 @@ sirius_status sirius_object_store_config_builder_create(sirius_object_store_conf
 
 sirius_status sirius_object_store_config_builder_with_endpoint(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* endpoint,
+  size_t endpoint_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::endpoint, data, size, out, error);
+  return with_text(builder, &scope::settings::endpoint, endpoint, endpoint_size, out, error);
 }
 sirius_status sirius_object_store_config_builder_with_region(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* region,
+  size_t region_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::region, data, size, out, error);
+  return with_text(builder, &scope::settings::region, region, region_size, out, error);
 }
 sirius_status sirius_object_store_config_builder_with_access_key(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* access_key,
+  size_t access_key_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::access_key, data, size, out, error);
+  return with_text(builder, &scope::settings::access_key, access_key, access_key_size, out, error);
 }
 sirius_status sirius_object_store_config_builder_with_secret_key(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* secret_key,
+  size_t secret_key_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::secret_key, data, size, out, error);
+  return with_text(builder, &scope::settings::secret_key, secret_key, secret_key_size, out, error);
 }
 sirius_status sirius_object_store_config_builder_with_session_token(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* session_token,
+  size_t session_token_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::session_token, data, size, out, error);
+  return with_text(
+    builder, &scope::settings::session_token, session_token, session_token_size, out, error);
 }
 sirius_status sirius_object_store_config_builder_with_ca_bundle_path(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* ca_bundle_path,
+  size_t ca_bundle_path_size,
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return with_text(builder, &scope::settings::ca_bundle_path, data, size, out, error);
-}
-sirius_status sirius_object_store_config_builder_with_uri_prefix(
-  const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
-  sirius_object_store_config_builder** out,
-  sirius_error** error) noexcept
-{
-  return with_text(builder, &scope::settings::uri_prefix, data, size, out, error);
+  return with_text(
+    builder, &scope::settings::ca_bundle_path, ca_bundle_path, ca_bundle_path_size, out, error);
 }
 
 sirius_status sirius_object_store_config_builder_with_transport(
@@ -206,13 +216,16 @@ sirius_status sirius_object_store_config_builder_with_transport(
   sirius_error** error) noexcept
 {
   // The core decides membership. The text is this unit's: the core's names the C++ enumerators.
-  return derive(builder,
-                out,
-                error,
-                scope::is_declared_transport(transport)
-                  ? nullptr
-                  : "transport: must be one of SIRIUS_OBJECT_STORE_TRANSPORT_AUTO, _HTTP, _RDMA",
-                [&](scope::settings& next) { next.transport = transport; });
+  return derive(
+    builder,
+    out,
+    error,
+    [&]() -> const char* {
+      return scope::is_declared_transport(transport)
+               ? nullptr
+               : "transport: must be one of SIRIUS_OBJECT_STORE_TRANSPORT_AUTO, _HTTP, _RDMA";
+    },
+    [&](scope::settings& next) { next.transport = transport; });
 }
 sirius_status sirius_object_store_config_builder_with_signing_mode(
   const sirius_object_store_config_builder* builder,
@@ -220,13 +233,16 @@ sirius_status sirius_object_store_config_builder_with_signing_mode(
   sirius_object_store_config_builder** out,
   sirius_error** error) noexcept
 {
-  return derive(builder,
-                out,
-                error,
-                scope::is_declared_signing_mode(signing_mode)
-                  ? nullptr
-                  : "signing_mode: must be one of SIRIUS_OBJECT_STORE_SIGNING_PRESIGNED, _HEADER",
-                [&](scope::settings& next) { next.signing_mode = signing_mode; });
+  return derive(
+    builder,
+    out,
+    error,
+    [&]() -> const char* {
+      return scope::is_declared_signing_mode(signing_mode)
+               ? nullptr
+               : "signing_mode: must be one of SIRIUS_OBJECT_STORE_SIGNING_PRESIGNED, _HEADER";
+    },
+    [&](scope::settings& next) { next.signing_mode = signing_mode; });
 }
 
 sirius_status sirius_object_store_config_builder_build(

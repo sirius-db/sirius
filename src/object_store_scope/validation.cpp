@@ -161,8 +161,7 @@ std::optional<violation> check_settings(const settings& value, const capabilitie
 
 std::optional<violation> check_settings_intrinsic(const settings& value)
 {
-  if (auto refused = check_leading_fields(value)) { return refused; }
-  return check_uri_prefix(value.uri_prefix);
+  return check_leading_fields(value);
 }
 
 std::string describe(const violation& refused)

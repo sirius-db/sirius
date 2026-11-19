@@ -46,7 +46,6 @@ int main(void)
   DERIVE_TEXT(secret_key, "consumer-secret");
   DERIVE_TEXT(session_token, "consumer-session");
   DERIVE_TEXT(ca_bundle_path, "/missing/consumer-ca.pem");
-  DERIVE_TEXT(uri_prefix, "s3://consumer-bucket/prefix/");
   CHECK(sirius_object_store_config_builder_with_transport(
           builder, SIRIUS_OBJECT_STORE_TRANSPORT_RDMA, &next, &error) == SIRIUS_SUCCESS);
   CHECK(next != NULL && error == NULL);

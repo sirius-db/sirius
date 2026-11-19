@@ -7,9 +7,9 @@
 extern "C" {
 #endif
 /** Object-store (S3 API) settings that passed sirius_object_store_config_builder_build():
- * an endpoint, a region, credentials, transport options, a CA bundle path and the URI
- * prefix they apply to. Its values outlive its builder and the buffers they were copied
- * from, and never change. No function returns a field.
+ * an endpoint, a region, credentials, transport options and a CA bundle path. Its values
+ * outlive its builder and the buffers they were copied from, and never change. No
+ * function returns a field.
  *
  * Building checks the settings themselves. It does not open the CA bundle path, contact
  * the endpoint or consult an I/O backend.

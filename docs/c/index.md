@@ -62,9 +62,9 @@ Hardware availability and capacity are checked when initializing an engine.
 ## Object-store configuration
 
 Describe an S3-compatible object store without contacting it: an endpoint, a region,
-credentials, a transport, a signing mode, a CA bundle path and the URI prefix the settings
-apply to. Builders are immutable. Each `with` function returns a new builder with one field
-replaced; release the input once the result replaces it:
+credentials, a transport, a signing mode and a CA bundle path. Builders are immutable. Each
+`with` function returns a new builder with one field replaced; release the input once the
+result replaces it:
 
 ```c
 #include <sirius-c/object_store/config_builder.h>
@@ -84,10 +84,11 @@ static sirius_status set_region(sirius_object_store_config_builder **builder,
 }
 ```
 
-Text fields are byte ranges: they are copied as given and need no terminator.
-sirius_object_store_config_builder_build() checks the endpoint, the region, the keys and the
-URI prefix, and returns SIRIUS_INVALID_CONFIGURATION for the first one it refuses. It reads no
-file and consults no I/O backend: the CA bundle path is not opened, and every declared
+Text fields are byte ranges: they are copied as given, without trimming, and need no
+terminator; a size of zero means empty. A range that contains a NUL byte is
+SIRIUS_INVALID_ARGUMENT. sirius_object_store_config_builder_build() checks the endpoint, the
+region and the keys, and returns SIRIUS_INVALID_CONFIGURATION for the first one it refuses. It
+reads no file and consults no I/O backend: the CA bundle path is not opened, and every declared
 transport and signing mode is accepted. Diagnostics never contain a field's value; a
 diagnostic for SIRIUS_INVALID_CONFIGURATION names the field and the reason. No function
 returns a field. See the

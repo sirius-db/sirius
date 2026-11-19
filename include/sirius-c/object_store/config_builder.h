@@ -30,16 +30,18 @@ enum {
  * with one field replaced; the input is unchanged and stays usable. No function
  * returns a field.
  *
- * A text field is given as size bytes at data. The bytes are copied before the call
- * returns and kept as given: no terminator is needed, nothing is trimmed, and embedded
- * NUL bytes are kept. A size of zero means empty, whether or not data is NULL; NULL with
- * a nonzero size is SIRIUS_INVALID_ARGUMENT. Text is checked by
- * sirius_object_store_config_builder_build(), not when it is supplied.
+ * A text field is a range of bytes: a pointer and a size. The bytes are copied before
+ * the call returns and kept as given: no terminator is needed and nothing is trimmed. A
+ * size of zero means empty, whether or not the pointer is NULL. A NULL pointer with a
+ * nonzero size, or a range that contains a NUL byte, is SIRIUS_INVALID_ARGUMENT. The text
+ * is otherwise checked by sirius_object_store_config_builder_build(), not when it is
+ * supplied.
  *
  * Release every owning reference exactly once. Borrowed handles must remain alive
  * throughout a call. Output slots must not contain unreleased owning references: a
  * slot is overwritten, not released. Do not pass the address of the variable that holds
- * the input builder; derive into another variable, then release the input.
+ * the input builder; derive into another variable, then release the input. A text range
+ * must not overlap an output slot: the slots are cleared before the range is read.
  *
  * Fallible functions clear their output slots before work begins. On failure the slot
  * stays NULL and the input builder is unchanged. An optional out_error receives an owned
@@ -97,8 +99,8 @@ SIRIUS_EXPORT void sirius_object_store_config_builder_release(
  */
 SIRIUS_EXPORT sirius_status
 sirius_object_store_config_builder_with_endpoint(const sirius_object_store_config_builder* builder,
-                                                 const char* data,
-                                                 size_t size,
+                                                 const char* endpoint,
+                                                 size_t endpoint_size,
                                                  sirius_object_store_config_builder** out_builder,
                                                  sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the SigV4 signing region replaced.
@@ -111,8 +113,8 @@ sirius_object_store_config_builder_with_endpoint(const sirius_object_store_confi
  */
 SIRIUS_EXPORT sirius_status
 sirius_object_store_config_builder_with_region(const sirius_object_store_config_builder* builder,
-                                               const char* data,
-                                               size_t size,
+                                               const char* region,
+                                               size_t region_size,
                                                sirius_object_store_config_builder** out_builder,
                                                sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the access key replaced.
@@ -125,8 +127,8 @@ sirius_object_store_config_builder_with_region(const sirius_object_store_config_
  */
 SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_access_key(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* access_key,
+  size_t access_key_size,
   sirius_object_store_config_builder** out_builder,
   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the secret key replaced.
@@ -139,8 +141,8 @@ SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_access_key(
  */
 SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_secret_key(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* secret_key,
+  size_t secret_key_size,
   sirius_object_store_config_builder** out_builder,
   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the session token of temporary credentials replaced.
@@ -153,8 +155,8 @@ SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_secret_key(
  */
 SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_session_token(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* session_token,
+  size_t session_token_size,
   sirius_object_store_config_builder** out_builder,
   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the path of the PEM CA bundle replaced.
@@ -168,24 +170,8 @@ SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_session_toke
  */
 SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_ca_bundle_path(
   const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
-  sirius_object_store_config_builder** out_builder,
-  sirius_error** out_error) SIRIUS_C_NOEXCEPT;
-/** Derive a builder with the URI prefix the settings apply to replaced.
- * builder and out_builder must not be NULL. At build it must be empty, `s3://bucket/` or
- * `s3://bucket/prefix/`: a bucket, a trailing slash, no query or fragment, and no segment
- * an object key cannot match byte for byte (empty, `.`, `..`, or containing `%`).
- * @code{.c}
- * sirius_object_store_config_builder *next = NULL;
- * sirius_status status = sirius_object_store_config_builder_with_uri_prefix(
- *   builder, "s3://bucket/data/", sizeof("s3://bucket/data/") - 1, &next, NULL);
- * @endcode
- */
-SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_uri_prefix(
-  const sirius_object_store_config_builder* builder,
-  const char* data,
-  size_t size,
+  const char* ca_bundle_path,
+  size_t ca_bundle_path_size,
   sirius_object_store_config_builder** out_builder,
   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Derive a builder with the transport replaced.
@@ -218,7 +204,7 @@ SIRIUS_EXPORT sirius_status sirius_object_store_config_builder_with_signing_mode
   sirius_error** out_error) SIRIUS_C_NOEXCEPT;
 /** Check the settings and produce a configuration without reading files, contacting
  * the endpoint or consulting an I/O backend. builder and out_config must not be NULL.
- * The endpoint, region, access key, secret key and URI prefix are checked in that order;
+ * The endpoint, region, access key and secret key are checked in that order;
  * the first failure is SIRIUS_INVALID_CONFIGURATION. The builder is not consumed, and
  * the configuration outlives it.
  * @code{.c}
