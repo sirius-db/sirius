@@ -123,6 +123,14 @@ generate_report() {
             ! has_valid_timings "$SIRIUS_TIMING" || ! has_valid_timings "$DUCKDB_TIMING"; then
             status="error"
             (( errors++ ))
+        elif [ "${TPCH_RESULT_FORMAT:-rows}" = "parquet" ] || [ -n "$(find "$RUN_DIR/sirius/q${q}" -maxdepth 1 -type d -name 'parquet_iter*' -print -quit)" ]; then
+            if python3 "$SCRIPT_DIR/parquet_output.py" --compare "$RUN_DIR/sirius/q${q}" "$RUN_DIR/duckdb/q${q}"; then
+                status="success"
+                (( ok++ ))
+            else
+                status="validation"
+                (( validate++ ))
+            fi
         elif diff -q "$SIRIUS_FILE" "$DUCKDB_FILE" >/dev/null 2>&1; then
             status="success"
             (( ok++ ))
@@ -318,6 +326,21 @@ PIN_AFTER_ITERATION=0
 FLOAT_TOL="1e-10"
 while [ $# -gt 1 ]; do
     case "$1" in
+        --result-format)
+            case "$2" in
+                rows|parquet) export TPCH_RESULT_FORMAT="$2" ;;
+                *) echo "ERROR: --result-format must be 'rows' or 'parquet'"; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        --parquet-compression)
+            case "${2,,}" in
+                none|uncompressed|snappy|gzip|brotli|zstd|lz4|lz4_raw)
+                    export TPCH_PARQUET_COMPRESSION="${2,,}" ;;
+                *) echo "ERROR: unsupported --parquet-compression: $2"; exit 1 ;;
+            esac
+            shift 2
+            ;;
         --config)
             export SIRIUS_CONFIG_FILE="$2"
             shift 2
@@ -404,6 +427,7 @@ if [ $# -ne 1 ]; then
     echo "          [--parquet-dir <path>] [--iceberg-dir <path>] [--duckdb-file <path>]"
     echo "          [--engines 'sirius duckdb'] [--iterations N] [--timeout <seconds>] [--duckdb-results <run_dir>]"
     echo "          [--multi-session] [--drop-os-cache] [--pinning-mode none|per-query|pinned-hot] [--pin-after-iteration <N>]"
+    echo "          [--result-format rows|parquet] [--parquet-compression <codec>]"
     echo "          [--float-tolerance <value>] <scale_factor>"
     echo "       $0 --report [--float-tolerance <value>] <run_dir>"
     echo "  --data-source parquet       (default) → run_tpch_parquet.sh + test_datasets/tpch_parquet_sf<SF> or --parquet-dir"

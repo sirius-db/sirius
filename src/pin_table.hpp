@@ -214,6 +214,10 @@ struct compression_pin_config {
   /// compression_config::max_compressed_fraction.
   double max_compressed_fraction{0.95};
   std::vector<std::string> column_names;
+  /// Automatic plans only: pin uncompressed when the first chunk's bytes per row, times
+  /// table_rows, come to less than this. 0 (or an unknown table_rows of 0) disables the check.
+  std::size_t min_pin_bytes{0};
+  std::size_t table_rows{0};
 };
 
 #ifdef SIRIUS_TEST_PIN_STAGING_OVERRIDES

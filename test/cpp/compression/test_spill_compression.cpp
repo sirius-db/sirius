@@ -318,6 +318,55 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
         std::string::npos);
 }
 
+TEST_CASE("pin compression: default plans favor what a filtered scan can decode in place",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  auto stream   = utils::default_stream();
+  auto mr       = utils::get_resource_ref(*env().gpu);
+  auto pin_plan = [&](cudf::column_view const& c) {
+    return sirius::compression::default_pin_plan(c, stream);
+  };
+  auto spill_plan = [&](cudf::column_view const& c) {
+    return sirius::compression::default_spill_plan(c, stream);
+  };
+  auto const contains = [](std::string const& plan, char const* op) {
+    return plan.find(op) != std::string::npos;
+  };
+
+  std::mt19937_64 rng{11};
+  std::vector<std::int64_t> repeated_keys(100'000), long_runs(100'000);
+  for (std::size_t i = 0; i < repeated_keys.size(); ++i) {
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+  }
+  std::int64_t run_value = 0;
+  for (std::size_t i = 0; i < long_runs.size(); ++i) {
+    if (i % 1000 == 0) { run_value = static_cast<std::int64_t>(rng() % 1'000'000'000); }
+    long_runs[i] = run_value;
+  }
+  auto const int64 = cudf::data_type{cudf::type_id::INT64};
+
+  // Short runs of sorted keys: rle is smaller than delta -> bitpack, but by little of the column.
+  auto const repeated = numeric_column(int64, repeated_keys, stream);
+  CHECK(contains(spill_plan(repeated->view()), "rle"));
+  auto const repeated_pin = pin_plan(repeated->view());
+  CHECK(contains(repeated_pin, "delta"));
+  CHECK_FALSE(contains(repeated_pin, "rle"));
+
+  // Long runs of unrelated values: only rle packs them, saving most of the column.
+  CHECK(contains(pin_plan(numeric_column(int64, long_runs, stream)->view()), "rle"));
+
+  std::vector<std::string> unique(10'000);
+  for (std::size_t i = 0; i < unique.size(); ++i) {
+    unique[i] = "value_" + std::to_string(i);
+  }
+  auto const strings   = utils::make_string_column(unique, stream, mr);
+  auto const pin_split = pin_plan(strings->view());
+  CHECK(contains(pin_split, "str_split"));
+  CHECK_FALSE(contains(pin_split, "ans"));
+  CHECK(contains(spill_plan(strings->view()), "ans"));
+}
+
 TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spill]")
 {
   if (!has_gpu()) { return; }

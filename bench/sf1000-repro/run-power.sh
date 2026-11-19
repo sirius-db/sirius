@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # TPC-H OFFICIAL power + throughput run (RF1/RF2 refresh functions) with the
 # same performance stack as run.sh: optional patched libcudf, ast_jit, fused scan-filter
-# + late materialization gates, and Simpatico-compressed pins from this kit's
-# plans. Reports Power@Size / Throughput@Size / QphH@Size.
+# + late materialization gates, and Simpatico-compressed pins with automatically
+# selected plans. Reports Power@Size / Throughput@Size / QphH@Size.
 #
 # Measured 2026-08-11 on pmgb300ws-0163 (GB300), SF1000, 7 streams, exit 0,
 # validation PASS after RF1 and RF2, zero CPU fallbacks:
@@ -42,7 +42,6 @@ SF="${SF:-1000}"
 DB="${DB:-$HOME/tpch_sf${SF}.duckdb}"              # native TPC-H .duckdb
 REFRESH="${REFRESH:-$REPO/test_datasets/tpch_refresh_sf${SF}}"
 CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-provided libcudf
-PLANS="${PLANS:-$HERE/plans}"
 LAYOUT="${LAYOUT:-$HERE/pin-layout-sf1000.json}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 MODE="${MODE:-both}"                               # power | throughput | both
@@ -79,7 +78,7 @@ if [ "$QUENT" = "1" ]; then
 fi
 
 # ast_jit: -4.17% suite for zero code. Compression settings ride the runner's
-# own --pin-compression/--compression-plan-dir flags, not PRE_SQL.
+# own --pin-compression flag, not PRE_SQL.
 # Overridable from the environment (diagnosis runs append e.g. a log-level SET).
 export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'ast_jit'}"
 
@@ -91,7 +90,6 @@ export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'as
 echo "db        : $DB"
 echo "refresh   : $REFRESH"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
-echo "plans     : $PLANS"
 echo "layout    : $LAYOUT"
 echo "config    : $CFG"
 echo "mode      : $MODE"
@@ -181,7 +179,6 @@ RC=0
 "${LAUNCHER[@]}" python3 test/tpch_performance/tpch_power_throughput.py \
   --sf "$SF" --input "$DB" --refresh-dir "$REFRESH" \
   --mode "$MODE" --pin gpu --pin-compression \
-  --compression-plan-dir "$PLANS" \
   --pin-layout "$LAYOUT" \
   --config "$CFG" \
   --warmup-pass "${EXTRA_ARGS[@]}" "$@" || RC=$?

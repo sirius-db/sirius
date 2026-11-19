@@ -1,0 +1,7 @@
+# Single-GPU workstation config (RTX 4500 Ada / RTX PRO 6000 class) for bench/q21-compare.
+# Everything not set here keeps the Sirius defaults, which size GPU and host memory from the device.
+sirius:
+  topology:
+    num_gpus: 1
+  operator_params:
+    scan_task_batch_size: 1GB

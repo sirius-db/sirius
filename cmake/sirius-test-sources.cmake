@@ -1,5 +1,7 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/output/test_parquet_session.cpp
+    test/cpp/integration/test_parquet_output.cpp
     test/cpp/scan/test_parquet_delete_reader.cpp
     test/cpp/scan/bench_parquet_footer_cache.cpp
     test/cpp/io/test_parquet_metadata_retention.cpp
@@ -144,6 +146,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_hugeint.cpp
     test/cpp/integration/test_gpu_execution_integer_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
+    test/cpp/integration/test_gpu_execution_semi_build_left.cpp
     test/cpp/integration/test_gpu_execution_single_join.cpp
     test/cpp/integration/test_gpu_execution_unsigned_narrowing.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -197,10 +200,12 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_column_origin.cpp
     test/cpp/late_mat/test_prepared_selection.cpp
     test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_materialize_compressed.cpp
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/integration/test_pin_unique_join.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/integration/test_late_mat_compressed_filter.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
     test/cpp/late_mat/test_late_mat_plan_pass.cpp
