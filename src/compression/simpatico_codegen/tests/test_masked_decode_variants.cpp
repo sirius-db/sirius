@@ -690,6 +690,76 @@ bool run_ballot_edges(
   return true;
 }
 
+// The divisor-aware ballot where the chunk's domain spans almost all of int64. The values
+// INT64_MIN + k * 5 * 2^60 fold the divisor 5 * 2^60 into two-bit residuals, so a lower
+// bound's distance from the chunk minimum is close to 2^64 and rounding it up to a whole
+// number of divisors must not wrap.
+bool run_ballot_divisor_edges(int arch)
+{
+  const std::int64_t n = kChunk;
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+  constexpr std::int64_t kMin64 = std::numeric_limits<std::int64_t>::min();
+  constexpr std::int64_t kMax64 = std::numeric_limits<std::int64_t>::max();
+  constexpr std::int64_t kStep  = std::int64_t{5} << 60;
+  const auto value              = [&](std::int64_t k) {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(kMin64) +
+                                     static_cast<std::uint64_t>(k) *
+                                       static_cast<std::uint64_t>(kStep));
+  };
+
+  std::vector<std::int64_t> data(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    data[static_cast<std::size_t>(i)] = value(i % 4);
+  }
+  auto tree         = jit::FusedTree::make(OpKind::Bitpack);
+  tree->bitpack_gcd = true;
+  GpuEncoded enc =
+    codegen_test::gpu_encode_tree<std::int64_t>(*tree, "int64_t", data.data(), n, arch);
+  if (!compact_packed_on_host(enc, 1)) return false;
+  std::int64_t divisor = 0;
+  cudaMemcpy(&divisor,
+             device_ptr<std::int64_t>(enc, 0, "chunk_divisors"),
+             sizeof(divisor),
+             cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(divisor == kStep, "[ballot-divisor] divisor %lld", static_cast<long long>(divisor));
+
+  struct Case {
+    const char* name;
+    range_predicate pred;
+  };
+  const Case cases[] = {
+    {"at_top_value", {value(3), kMax64}},
+    {"just_above_top", {value(3) + 1, kMax64}},
+    {"just_above_second", {value(2) + 1, kMax64}},
+    {"just_above_minimum", {kMin64 + 1, kMax64}},
+    {"below_top", {kMin64, value(3) - 1}},
+    {"all_INT64", {kMin64, kMax64}},
+    {"between_values", {value(1) + 1, value(2) - 1}},
+  };
+  const std::size_t nwords = kWordsPerChunk;
+  for (const Case& c : cases) {
+    CUdeviceptr d_mask = enc.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                  stream, *tree, enc.buffers, "int64_t", n, c.pred, sm),
+                "[ballot-divisor/%s] mask_out launch failed",
+                c.name);
+    std::vector<std::uint32_t> got(nwords);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got == host_mask(data, 1, c.pred),
+                "[ballot-divisor/%s] ballot mask != host reference for [%lld, %lld]",
+                c.name,
+                static_cast<long long>(c.pred.lo),
+                static_cast<long long>(c.pred.hi));
+  }
+  std::printf("PASS: ballot-divisor/int64 near-full-range divisor\n");
+  return true;
+}
+
 // The index walk across its operating range of selectivities. The batch's
 // chunk count is deliberately not a multiple of the chunks a block serves, so
 // the last block's trailing warps address chunks past the batch and must
@@ -1687,6 +1757,7 @@ int main()
                                    std::numeric_limits<std::int64_t>::min() + 5,
                                    1LL << 13,
                                    arch);
+    run_ballot_divisor_edges(arch);
     // The index walk from 0.1% to 50% selectivity on 38 chunks (not a multiple of the chunks a
     // block serves), then the full-width int32 unpack and the int64 wide select at one selectivity.
     const auto index_walk_selectivities = {10u, 180u, 1400u, 5000u};

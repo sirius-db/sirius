@@ -1396,8 +1396,9 @@ void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
     << "            ? kInt64Max : static_cast<int64_t>(static_cast<uint64_t>(minv) + span_max);\n"
     << "    const int64_t lo_eff = pred_lo > minv ? pred_lo : minv;\n"
     << "    const int64_t hi_eff = pred_hi < dom_hi ? pred_hi : dom_hi;\n"
-    << "    const uint64_t lo_q  = (static_cast<uint64_t>(lo_eff) - static_cast<uint64_t>(minv) +\n"
-    << "                            divu - 1) / divu;\n"
+    // A ceiling without adding divu - 1, which wraps for a distance near 2^64.
+    << "    const uint64_t lo_d  = static_cast<uint64_t>(lo_eff) - static_cast<uint64_t>(minv);\n"
+    << "    const uint64_t lo_q  = lo_d / divu + (lo_d % divu != 0 ? 1ull : 0ull);\n"
     << "    const uint64_t hi_q  =\n"
     << "        (static_cast<uint64_t>(hi_eff) - static_cast<uint64_t>(minv)) / divu;\n"
     // A predicate can also fall strictly between two multiples of the divisor.
