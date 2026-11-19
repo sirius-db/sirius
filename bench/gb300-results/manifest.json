@@ -14,9 +14,9 @@
     "bench/gb300-results/sf300/cold-per-query.csv": "a75db73e433ee5daac272c8e0da554183e4b80efe45afd43d59c8c07eee2b1c5",
     "bench/gb300-results/sf300/hot-per-query.csv": "f3679782c76c1a08038b5f519608e5f66ef0207ad92c65a444097d2eae21b6ab",
     "bench/gb300-results/sf300/pin-per-query.csv": "cbcaa4de7c27607cff6087c9b01a616a80d29e3146f8f0effd4e10209d60933c",
-    "bench/gb300-results/sf3000/cold-per-query.csv": "23c01e5752884e1bd3c9a969ab34c9ee971e8285cef275f1e35a81a3a32a0c68",
-    "bench/gb300-results/sf3000/hot-per-query.csv": "39cef565a40e48964bf968e98207a55e8256a0f8c4161d78c2487c77c22714a4",
-    "bench/gb300-results/sf3000/pin-per-query.csv": "31162db0a84b3391a1d10fe61f1376823d4e9e63d68459da0abe907b34887161",
+    "bench/gb300-results/sf3000/cold-per-query.csv": "408058d62bf6c6fdeecb0178dce318e53c8e6b82c880f09a5ead5b445e94c83a",
+    "bench/gb300-results/sf3000/hot-per-query.csv": "1fb1488befc5dcf15b98f4ceeb7e932d26b639cd76570bd6fb01f6525145282e",
+    "bench/gb300-results/sf3000/pin-per-query.csv": "42285500d4be193a6d4fceb691d848e41e5347103412813dda013653ff4e791a",
     "bench/gb300-sf10k-q10-cold/config.yaml": "4882706ad8b3e937b4c45681b2671b1a894a9ed459dab4e581d0c48e39e44887",
     "bench/gb300-sf10k-q10-hot/config.yaml": "31f5f84dfad4f635b1aaa11c4c835903e254154f6c80f585496513595e9a8b18",
     "src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
@@ -212,28 +212,42 @@
     },
     "sf3000": {
       "cold": {
+        "binary_sha256": "f7706ea8dd22405e32cf2bb8c11d22048bca5fbfc709ed0fdf410f5fa834f636",
         "config": "bench/gb300-cold/config.yaml",
         "gpu_executions": 44,
         "iterations": 2,
         "per_query_csv": "bench/gb300-results/sf3000/cold-per-query.csv",
         "q10_separate_config": null,
         "query_time_s": [
+          187.667521,
+          185.830695
+        ],
+        "selected_at_utc": "2026-11-19T06:38:40Z",
+        "source_commit": "dd588a0bc731304a92db86684bf4e8535d4f10a8",
+        "status": "complete",
+        "supersedes_query_time_s": [
           195.735568,
           195.548362
-        ],
-        "status": "complete"
+        ]
       },
       "hot": {
+        "binary_sha256": "f7706ea8dd22405e32cf2bb8c11d22048bca5fbfc709ed0fdf410f5fa834f636",
         "config": "bench/gb300-hot/config.yaml",
         "gpu_executions": 44,
         "iterations": 2,
         "per_query_csv": "bench/gb300-results/sf3000/hot-per-query.csv",
         "q10_separate_config": null,
         "query_time_s": [
+          146.418729,
+          118.72097
+        ],
+        "selected_at_utc": "2026-11-19T06:38:40Z",
+        "source_commit": "dd588a0bc731304a92db86684bf4e8535d4f10a8",
+        "status": "complete",
+        "supersedes_query_time_s": [
           149.854237,
           119.086231
-        ],
-        "status": "complete"
+        ]
       },
       "pin": {
         "config": "bench/gb300-pin/config.yaml",
@@ -241,12 +255,22 @@
         "input_compression": "simpatico",
         "iterations": 1,
         "per_query_csv": "bench/gb300-results/sf3000/pin-per-query.csv",
+        "pin_compression_tables": [
+          "lineitem",
+          "orders"
+        ],
         "pin_strategy": "per-query",
         "pin_tier": "host",
         "query_time_s": [
-          28.740439
+          21.92666
         ],
-        "status": "complete"
+        "runner_commit": "56f49801607afbf1353ebded286e562c64012fe4",
+        "selected_at_utc": "2026-11-19T06:38:40Z",
+        "source_commit": "56f49801607afbf1353ebded286e562c64012fe4",
+        "status": "complete",
+        "supersedes_query_time_s": [
+          28.740439
+        ]
       }
     }
   },
