@@ -69,6 +69,16 @@ struct deflate {
   std::uint64_t uncompressed_size = 0;
   std::int32_t original_type_id   = 0;
 };
+// OnPair: bitpacked codes over a pruned dictionary, whose planes are laid out for w-byte
+// first reads (8 or 16).
+struct onpair {
+  std::uint64_t uncompressed_size = 0;
+  std::int32_t original_type_id   = 0;
+  std::uint64_t n_tokens          = 0;
+  std::uint8_t code_bits          = 0;
+  std::uint8_t w                  = 0;
+  std::uint8_t string_aligned     = 0;  ///< Each string parsed on its own (onpair_strings).
+};
 
 }  // namespace leaf_meta
 
@@ -79,7 +89,8 @@ using leaf_meta_v = std::variant<leaf_meta::none,
                                  leaf_meta::nvcomp_cascaded,
                                  leaf_meta::snappy,
                                  leaf_meta::lz4,
-                                 leaf_meta::deflate>;
+                                 leaf_meta::deflate,
+                                 leaf_meta::onpair>;
 
 // ---------------------------------------------------------------------------
 // Per-buffer descriptor used by compressed_table::describe() and the IO layer.
