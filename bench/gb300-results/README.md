@@ -1,5 +1,37 @@
 # GB300 TPC-H benchmark snapshots
 
+## Replay from this PR
+
+Build the Sirius extension from this checkout with Pixi 0.78 or newer
+(`pixi run make`), and provide the TPC-H Parquet datasets at
+`/mnt/datasets/tpch_parquet_sf<SF>` (or set
+`DATASET_ROOT` to their parent directory). From the repository root, run:
+
+```bash
+bash bench/gb300-results/replay.sh 1000 cold
+bash bench/gb300-results/replay.sh 1000 hot
+bash bench/gb300-results/replay.sh 1000 pin
+```
+
+The script accepts SF100, SF300, SF1000, SF3000, and SF10000 for cold/hot and
+SF100 through SF3000 for host pin. It requires GB300 CDMM (`driver`) mode for
+Sirius and refuses to run in NUMA mode. Cold/hot execute all 22 queries twice
+with their saved YAMLs. Host pin executes all 22 queries once, per-query, with
+`--profile hot --pin host --pin-compression`; only `lineitem` and `orders` use
+the explicit Simpatico plans, matching the selected results. For SF10000, the
+script runs Q1–Q9 and Q11–Q22 with the regular config and Q10 separately with
+the saved 8 GiB hash-table config. This matches the composite saved totals.
+Output is timestamped under `test_datasets/gb300-replay-output/`; set
+`GB300_REPLAY_OUTPUT` to change that directory. Add `--dry-run` to print the
+commands without executing them. The replay script uses
+the local `test_datasets/.generation-tools/pixi` when present on this machine; set
+`PIXI_BIN` to select another Pixi installation.
+
+The Parquet datasets and historical Sirius binaries are not stored in this PR.
+The manifest records the source commits and binary checksums used for the saved
+measurements. Rebuilding this PR verifies the benchmark setup, but exact timings
+depend on the source revision, dataset layout, machine state, and driver mode.
+
 These are the selected GB300 measurements, primarily at Sirius commit
 `1dbb366baaf7bd26325ede685346ecb6d5fe7692`. The SF1000 host-pin result
 was updated from a run on commit `220d1447a60f443745f53196fc6c4bbd85478075`.
