@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "helper/cuda_launch_error.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 #include "utils/scan_resource_test_utils.hpp"
@@ -23,6 +24,8 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime.h>
+#include <thrust/system/cuda/error.h>
+#include <thrust/system_error.h>
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -533,17 +536,29 @@ TEST_CASE("Sort range count respects bytes, rows, and sample size", "[physical_s
   CHECK(choose_sort_range_count(1000, 100, 100, 3) == 3);
 }
 
-TEST_CASE("Sort boundary diagnostic OOM preserves completed distributed boundaries",
+TEST_CASE("Sort boundary diagnostic failure preserves completed distributed boundaries",
           "[physical_sort_sample]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
   auto const stream      = cudf::get_default_stream();
   bool const empty_input = GENERATE(false, true);
+  // What the diagnostic's allocation throws: cudaSuccess stands for rmm::out_of_memory, any
+  // other status for a thrust::system_error with that code.
+  auto const status = GENERATE(
+    cudaSuccess, cudaErrorLaunchOutOfResources, cudaErrorInvalidValue, cudaErrorIllegalAddress);
+  // A task retries on out-of-memory and on retryable launch errors.
+  bool const task_would_retry = status == cudaSuccess || sirius::is_retryable_launch_error(status);
 
   // Arm the allocator only after the hook succeeds, so the failure is in the diagnostic,
   // not in sampling or boundary construction. Like the real collective, the hook is one-shot.
-  sirius::test::tracked_scan_resource resource(cudf::get_current_device_resource_ref(), stream);
+  // The upstream is the space's allocator: a reference to the current resource would point
+  // into the slot that the guard below replaces.
+  sirius::test::tracked_scan_resource resource(space->get_default_allocator(), stream);
+  if (status != cudaSuccess) {
+    resource.state->failure = std::make_exception_ptr(
+      thrust::system_error(status, thrust::cuda_category(), "injected diagnostic failure"));
+  }
   class one_shot_boundaries final : public cross_rank_sort_boundaries {
    public:
     one_shot_boundaries(std::unique_ptr<cudf::table> boundaries,
@@ -586,6 +601,14 @@ TEST_CASE("Sort boundary diagnostic OOM preserves completed distributed boundari
     ~resource_guard() { (void)cudf::set_current_device_resource(std::move(previous)); }
   } guard{cudf::set_current_device_resource(
     ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource})};
+
+  if (!task_would_retry) {
+    // Any other error still propagates.
+    REQUIRE_THROWS_AS(sample.execute(*input, stream), thrust::system_error);
+    CHECK(resource.state->attempts > resource.state->fail_at);
+    CHECK_FALSE(sample.boundaries_computed());
+    return;
+  }
 
   std::unique_ptr<operator_data> output;
   REQUIRE_NOTHROW(output = sample.execute(*input, stream));
