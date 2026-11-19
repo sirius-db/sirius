@@ -16,6 +16,9 @@ name = "sirius_sys"
 # linked separately. Point SIRIUS_BUILD_DIR at the build tree with that archive.
 static = []
 
+# Provide C ABI stand-ins to integration tests only when interpreted by Miri.
+miri-test-backend = []
+
 # Maintainer-only: ordinary builds use the checked-in declarations.
 generate-bindings = ["dep:bindgen"]
 

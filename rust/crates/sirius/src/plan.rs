@@ -5,13 +5,11 @@
 //! Construction checks types and input scopes. Binding the file and checking engine
 //! support belong to preparation.
 
-use crate::diagnostic::Diagnostic;
-use sirius_sys::c_api as ffi;
-use std::{
-    ffi::CStr,
-    path::Path,
-    ptr::{self, NonNull},
+use sirius_sys::{
+    c_api as ffi,
+    handles::{self, plan as native},
 };
+use std::path::Path;
 
 /// An error from plan construction or inspection. Errors own their diagnostic text
 /// and can be sent or shared between threads. Match the variant to handle a category
@@ -71,131 +69,92 @@ impl std::fmt::Display for PlanError {
 }
 impl std::error::Error for PlanError {}
 
-fn check(status: u32, error: Diagnostic) -> Result<(), PlanError> {
-    match status {
-        ffi::SIRIUS_SUCCESS => Ok(()),
-        ffi::SIRIUS_INVALID_ARGUMENT => {
-            Err(PlanError::InvalidArgument(error.best_effort_message()))
+impl PlanError {
+    fn from_native(error: handles::Error) -> Self {
+        match error.status {
+            ffi::SIRIUS_INVALID_ARGUMENT => Self::InvalidArgument(error.message),
+            ffi::SIRIUS_ALLOCATION_FAILURE => Self::AllocationFailure(error.message),
+            ffi::SIRIUS_INTERNAL_ERROR => Self::Internal(error.message),
+            status => Self::Unexpected {
+                status,
+                message: error.message,
+            },
         }
-        ffi::SIRIUS_ALLOCATION_FAILURE => {
-            Err(PlanError::AllocationFailure(error.best_effort_message()))
-        }
-        ffi::SIRIUS_INTERNAL_ERROR => Err(PlanError::Internal(error.best_effort_message())),
-        status => Err(PlanError::Unexpected {
-            status,
-            message: error.best_effort_message(),
-        }),
     }
 }
 
-// All factories clear the output slot before work and transfer one live reference on success.
-fn create<T>(
-    call: impl FnOnce(*mut *mut T, *mut *mut ffi::SiriusError) -> u32,
-) -> Result<NonNull<T>, PlanError> {
-    let mut out = ptr::null_mut();
-    let mut error = Diagnostic(ptr::null_mut());
-    let status = call(&mut out, &mut error.0);
-    check(status, error)?;
-    Ok(NonNull::new(out).expect("successful Sirius factory returned a null handle"))
-}
-
-macro_rules! immutable_handle {
-    ($(#[$doc:meta])* $name:ident, $raw:ident, $retain:ident, $release:ident) => {
-        $(#[$doc])*
-        #[derive(Debug)]
-        pub struct $name(NonNull<ffi::$raw>);
-        // SAFETY: the C API permits transferring references and final destruction on any thread.
-        unsafe impl Send for $name {}
-        // SAFETY: concurrent reads and retains on a live immutable handle are supported.
-        unsafe impl Sync for $name {}
-        impl Clone for $name {
-            fn clone(&self) -> Self {
-                // SAFETY: self owns the live reference being retained.
-                unsafe { ffi::$retain(self.0.as_ptr()) };
-                Self(self.0)
-            }
-        }
-        impl Drop for $name {
-            fn drop(&mut self) {
-                // SAFETY: each wrapper releases its single owned reference once.
-                unsafe { ffi::$release(self.0.as_ptr()) };
-            }
-        }
-    };
-}
-
-immutable_handle!(
-    /// The ordered, named fields produced by a plan node. A schema owns its field names.
-    /// Cloning retains the same immutable schema. Threads may share and inspect it concurrently.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use sirius::{DataType, Field, Schema};
-    ///
-    /// let schema = Schema::new(&[Field {
-    ///     name: "id",
-    ///     data_type: DataType::Int64,
-    ///     nullable: false,
-    /// }])?;
-    /// assert_eq!(schema.field(0)?.name, "id");
-    /// # Ok::<(), sirius::PlanError>(())
-    /// ```
-    Schema, SiriusSchema, sirius_schema_retain, sirius_schema_release);
-immutable_handle!(
-    /// One physical operator with an output schema and its inputs. Build a scan first,
-    /// then attach filters. Each node owns the inputs it needs. Clones share the same
-    /// operator and can be used to construct plans concurrently across threads.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use sirius::{Expression, PlanNode, PlanNodeKind};
-    /// # use sirius::{DataType, Field, Schema};
-    ///
-    /// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
-    /// let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
-    /// let filtered = scan.filter(&Expression::literal_boolean(true)?)?;
-    /// assert_eq!(filtered.kind(), PlanNodeKind::Filter);
-    /// # Ok::<(), sirius::PlanError>(())
-    /// ```
-    PlanNode, SiriusPlanNode, sirius_plan_node_retain, sirius_plan_node_release);
-immutable_handle!(
-    /// A typed scalar expression. Literals can be used with any input. A column
-    /// retains the particular node it came from, even if another node has an identical
-    /// schema. Clones share immutable data that may be used concurrently across threads.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use sirius::{Comparison, Expression};
-    /// # use sirius::{DataType, Field, PlanNode, Schema};
-    ///
-    /// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
-    /// # let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
-    /// let id = scan.column(0)?;
-    /// let positive = id.compare(Comparison::Greater, &Expression::literal_int64(0)?)?;
-    /// let filtered = scan.filter(&positive)?;
-    /// # Ok::<(), sirius::PlanError>(())
-    /// ```
-    Expression, SiriusExpression, sirius_expression_retain, sirius_expression_release);
-immutable_handle!(
-    /// A single-root physical plan. The plan retains its operators, expressions, and
-    /// metadata. Clones may be inspected concurrently on different threads.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use sirius::{Plan, PlanNodeKind};
-    /// # use sirius::{DataType, Field, PlanNode, Schema};
-    ///
-    /// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
-    /// # let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
-    /// let plan = Plan::from_root(&scan)?;
-    /// assert_eq!(plan.root().kind(), PlanNodeKind::ParquetScan);
-    /// # Ok::<(), sirius::PlanError>(())
-    /// ```
-    Plan, SiriusPlan, sirius_plan_retain, sirius_plan_release);
+/// The ordered, named fields produced by a plan node. A schema owns its field names.
+/// Cloning retains the same immutable schema. Threads may share and inspect it concurrently.
+///
+/// # Examples
+///
+/// ```
+/// use sirius::{DataType, Field, Schema};
+///
+/// let schema = Schema::new(&[Field {
+///     name: "id",
+///     data_type: DataType::Int64,
+///     nullable: false,
+/// }])?;
+/// assert_eq!(schema.field(0)?.name, "id");
+/// # Ok::<(), sirius::PlanError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct Schema(native::Schema);
+/// One physical operator with an output schema and its inputs. Build a scan first,
+/// then attach filters. Each node owns the inputs it needs. Clones share the same
+/// operator and can be used to construct plans concurrently across threads.
+///
+/// # Examples
+///
+/// ```
+/// use sirius::{Expression, PlanNode, PlanNodeKind};
+/// # use sirius::{DataType, Field, Schema};
+///
+/// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
+/// let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
+/// let filtered = scan.filter(&Expression::literal_boolean(true)?)?;
+/// assert_eq!(filtered.kind(), PlanNodeKind::Filter);
+/// # Ok::<(), sirius::PlanError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct PlanNode(native::PlanNode);
+/// A typed scalar expression. Literals can be used with any input. A column
+/// retains the particular node it came from, even if another node has an identical
+/// schema. Clones share immutable data that may be used concurrently across threads.
+///
+/// # Examples
+///
+/// ```
+/// use sirius::{Comparison, Expression};
+/// # use sirius::{DataType, Field, PlanNode, Schema};
+///
+/// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
+/// # let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
+/// let id = scan.column(0)?;
+/// let positive = id.compare(Comparison::Greater, &Expression::literal_int64(0)?)?;
+/// let filtered = scan.filter(&positive)?;
+/// # Ok::<(), sirius::PlanError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct Expression(native::Expression);
+/// A single-root physical plan. The plan retains its operators, expressions, and
+/// metadata. Clones may be inspected concurrently on different threads.
+///
+/// # Examples
+///
+/// ```
+/// use sirius::{Plan, PlanNodeKind};
+/// # use sirius::{DataType, Field, PlanNode, Schema};
+///
+/// # let schema = Schema::new(&[Field { name: "id", data_type: DataType::Int64, nullable: false }])?;
+/// # let scan = PlanNode::scan_parquet("orders.parquet", &schema)?;
+/// let plan = Plan::from_root(&scan)?;
+/// assert_eq!(plan.root().kind(), PlanNodeKind::ParquetScan);
+/// # Ok::<(), sirius::PlanError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct Plan(native::Plan);
 
 /// Primitive type of a field or expression. Nullability is specified separately
 /// by [`Field::nullable`] or [`Expression::nullable`]. Safe to send and share.
@@ -280,21 +239,14 @@ impl Schema {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn new(fields: &[Field<'_>]) -> Result<Self, PlanError> {
-        let mut descriptors = Vec::new();
-        descriptors
-            .try_reserve_exact(fields.len())
-            .map_err(|_| PlanError::AllocationFailure(String::new()))?;
-        descriptors.extend(fields.iter().map(|f| ffi::sirius_field {
-            name: f.name.as_ptr().cast(),
-            name_size: f.name.len(),
-            type_: f.data_type as u32,
-            nullable: f.nullable.into(),
-        }));
-        // SAFETY: descriptors and borrowed names remain readable throughout the call.
-        create(|out, err| unsafe {
-            ffi::sirius_schema_create(descriptors.as_ptr(), descriptors.len(), out, err)
-        })
-        .map(Self)
+        let descriptors = fields.iter().map(|field| native::Field {
+            name: field.name,
+            data_type: field.data_type as u32,
+            nullable: field.nullable,
+        });
+        native::Schema::new(descriptors)
+            .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Return the number of fields in declaration order.
     ///
@@ -312,8 +264,7 @@ impl Schema {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn field_count(&self) -> usize {
-        // SAFETY: self holds a live schema.
-        unsafe { ffi::sirius_schema_field_count(self.0.as_ptr()) }
+        self.0.field_count()
     }
     /// Borrow the field at a zero-based index. Its name is valid for the duration of
     /// the schema borrow.
@@ -338,20 +289,11 @@ impl Schema {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn field(&self, index: usize) -> Result<Field<'_>, PlanError> {
-        let mut field = std::mem::MaybeUninit::uninit();
-        let mut error = Diagnostic(ptr::null_mut());
-        // SAFETY: the native function initializes the exclusive output on success.
-        let status = unsafe {
-            ffi::sirius_schema_field(self.0.as_ptr(), index, field.as_mut_ptr(), &mut error.0)
-        };
-        check(status, error)?;
-        // SAFETY: the call succeeded and self retains the nonempty field name's storage.
-        let field = unsafe { field.assume_init() };
-        let bytes = unsafe { std::slice::from_raw_parts(field.name.cast(), field.name_size) };
+        let field = self.0.field(index).map_err(PlanError::from_native)?;
         Ok(Field {
-            name: std::str::from_utf8(bytes).expect("Sirius guarantees UTF-8 field names"),
-            data_type: DataType::from_native(field.type_),
-            nullable: field.nullable != 0,
+            name: field.name,
+            data_type: DataType::from_native(field.data_type),
+            nullable: field.nullable,
         })
     }
 }
@@ -421,17 +363,9 @@ impl PlanNode {
             .to_str()
             .ok_or_else(|| PlanError::InvalidArgument("path is not UTF-8".into()))?
             .as_bytes();
-        // SAFETY: the immutable borrowed bytes and schema live through the call.
-        create(|out, err| unsafe {
-            ffi::sirius_plan_scan_parquet(
-                path.as_ptr().cast(),
-                path.len(),
-                schema.0.as_ptr(),
-                out,
-                err,
-            )
-        })
-        .map(Self)
+        native::PlanNode::scan_parquet(path, &schema.0)
+            .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Reference a zero-based output column of this node. The expression carries the
     /// column's type, nullability and input node identity.
@@ -458,11 +392,10 @@ impl PlanNode {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn column(&self, index: usize) -> Result<Expression, PlanError> {
-        // SAFETY: self remains live while the C factory retains its scope.
-        create(|out, err| unsafe {
-            ffi::sirius_expression_column(self.0.as_ptr(), index, out, err)
-        })
-        .map(Expression)
+        self.0
+            .column(index)
+            .map(Expression)
+            .map_err(PlanError::from_native)
     }
     /// Keep rows for which the predicate is SQL TRUE. FALSE and NULL rows are
     /// discarded. The resulting node retains this input and preserves its schema.
@@ -491,11 +424,10 @@ impl PlanNode {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn filter(&self, predicate: &Expression) -> Result<Self, PlanError> {
-        // SAFETY: both borrowed inputs remain live during construction.
-        create(|out, err| unsafe {
-            ffi::sirius_plan_filter(self.0.as_ptr(), predicate.0.as_ptr(), out, err)
-        })
-        .map(Self)
+        self.0
+            .filter(&predicate.0)
+            .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Return the physical operator represented by this node.
     ///
@@ -515,8 +447,7 @@ impl PlanNode {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn kind(&self) -> PlanNodeKind {
-        // SAFETY: self holds a live plan node.
-        match unsafe { ffi::sirius_plan_node_get_kind(self.0.as_ptr()) } {
+        match self.0.kind() {
             ffi::SIRIUS_NODE_PARQUET_SCAN => PlanNodeKind::ParquetScan,
             ffi::SIRIUS_NODE_FILTER => PlanNodeKind::Filter,
             _ => unreachable!("unexpected node in a plan constructed by these bindings"),
@@ -539,13 +470,7 @@ impl PlanNode {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn input(&self) -> Option<Self> {
-        // SAFETY: self keeps the borrowed input alive through retain.
-        unsafe {
-            NonNull::new(ffi::sirius_plan_node_input(self.0.as_ptr())).map(|p| {
-                ffi::sirius_plan_node_retain(p.as_ptr());
-                Self(p)
-            })
-        }
+        self.0.input().map(Self)
     }
     /// Return an owning reference to this node's output schema. The schema remains
     /// available after the node is dropped.
@@ -566,13 +491,7 @@ impl PlanNode {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn schema(&self) -> Schema {
-        // SAFETY: a live node owns its schema, which we retain before returning.
-        unsafe {
-            let p = NonNull::new(ffi::sirius_plan_node_schema(self.0.as_ptr()))
-                .expect("node has a schema");
-            ffi::sirius_schema_retain(p.as_ptr());
-            Schema(p)
-        }
+        Schema(self.0.schema())
     }
 }
 
@@ -629,9 +548,9 @@ impl Expression {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn literal_int64(value: i64) -> Result<Self, PlanError> {
-        // SAFETY: create supplies exclusive writable outputs.
-        create(|out, err| unsafe { ffi::sirius_expression_literal_int64(value, out, err) })
+        native::Expression::literal_int64(value)
             .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Construct a non-null Boolean literal that can be used with any input.
     ///
@@ -653,9 +572,9 @@ impl Expression {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn literal_boolean(value: bool) -> Result<Self, PlanError> {
-        // SAFETY: create supplies exclusive writable outputs.
-        create(|out, err| unsafe { ffi::sirius_expression_literal_boolean(value.into(), out, err) })
+        native::Expression::literal_boolean(value)
             .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Compare this expression (the left operand) with `right`. The result has
     /// Boolean type and evaluates to NULL if either operand is NULL. A literal can
@@ -686,11 +605,10 @@ impl Expression {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn compare(&self, op: Comparison, right: &Self) -> Result<Self, PlanError> {
-        // SAFETY: both expression references remain live throughout the call.
-        create(|out, err| unsafe {
-            ffi::sirius_expression_compare(self.0.as_ptr(), op as u32, right.0.as_ptr(), out, err)
-        })
-        .map(Self)
+        self.0
+            .compare(op as u32, &right.0)
+            .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Return the type produced by evaluating the expression.
     ///
@@ -708,8 +626,7 @@ impl Expression {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn data_type(&self) -> DataType {
-        // SAFETY: self holds a live expression.
-        DataType::from_native(unsafe { ffi::sirius_expression_type(self.0.as_ptr()) })
+        DataType::from_native(self.0.data_type())
     }
     /// Return whether this expression may produce SQL NULL. A column inherits the
     /// nullability declared in its input schema.
@@ -723,8 +640,7 @@ impl Expression {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn nullable(&self) -> bool {
-        // SAFETY: self holds a live expression.
-        unsafe { ffi::sirius_expression_nullable(self.0.as_ptr()) != 0 }
+        self.0.nullable()
     }
 }
 
@@ -754,9 +670,9 @@ impl Plan {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn from_root(root: &PlanNode) -> Result<Self, PlanError> {
-        // SAFETY: root remains live throughout construction.
-        create(|out, err| unsafe { ffi::sirius_plan_from_root(root.0.as_ptr(), out, err) })
+        native::Plan::from_root(&root.0)
             .map(Self)
+            .map_err(PlanError::from_native)
     }
     /// Return an owning reference to the root operator, which remains valid after
     /// the plan is dropped.
@@ -780,12 +696,7 @@ impl Plan {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn root(&self) -> PlanNode {
-        // SAFETY: self keeps the borrowed root alive through retain.
-        unsafe {
-            let p = NonNull::new(ffi::sirius_plan_root(self.0.as_ptr())).expect("plan has a root");
-            ffi::sirius_plan_node_retain(p.as_ptr());
-            PlanNode(p)
-        }
+        PlanNode(self.0.root())
     }
     /// Borrow the plan's human-readable diagnostic text. Names and paths are escaped.
     /// The format can change between releases. Use [`Self::root`] for structured inspection.
@@ -807,9 +718,6 @@ impl Plan {
     /// # Ok::<(), sirius::PlanError>(())
     /// ```
     pub fn describe(&self) -> &str {
-        // SAFETY: self owns the NUL-terminated description until the borrow ends.
-        unsafe { CStr::from_ptr(ffi::sirius_plan_describe(self.0.as_ptr())) }
-            .to_str()
-            .expect("plan descriptions escape names and paths")
+        self.0.describe()
     }
 }

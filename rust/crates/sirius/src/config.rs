@@ -2,9 +2,8 @@
 
 use std::path::Path;
 
-use crate::diagnostic::Diagnostic;
 use sirius_sys::c_api;
-use std::ptr::NonNull;
+use sirius_sys::handles::{ConfigBuilderHandle, ConfigHandle, Error};
 
 /// A failure while loading settings or building a [`ContextConfig`].
 ///
@@ -78,17 +77,15 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-fn configuration_error(status: u32, diagnostic: Diagnostic) -> ConfigError {
-    match status {
+fn configuration_error(error: Error) -> ConfigError {
+    match error.status {
         c_api::SIRIUS_ALLOCATION_FAILURE => ConfigError::AllocationFailure,
-        c_api::SIRIUS_CONFIGURATION_IO => ConfigError::Io(diagnostic.message()),
-        c_api::SIRIUS_MALFORMED_YAML => ConfigError::MalformedYaml(diagnostic.message()),
-        c_api::SIRIUS_INVALID_CONFIGURATION => {
-            ConfigError::InvalidConfiguration(diagnostic.message())
-        }
-        _ => ConfigError::Unexpected {
+        c_api::SIRIUS_CONFIGURATION_IO => ConfigError::Io(error.message),
+        c_api::SIRIUS_MALFORMED_YAML => ConfigError::MalformedYaml(error.message),
+        c_api::SIRIUS_INVALID_CONFIGURATION => ConfigError::InvalidConfiguration(error.message),
+        status => ConfigError::Unexpected {
             status,
-            message: diagnostic.message(),
+            message: error.message,
         },
     }
 }
@@ -108,14 +105,8 @@ fn configuration_error(status: u32, diagnostic: Diagnostic) -> ConfigError {
 /// # Ok::<(), ConfigError>(())
 /// ```
 pub struct ContextConfig {
-    inner: NonNull<c_api::SiriusContextConfig>,
+    inner: ConfigHandle,
 }
-
-// SAFETY: the C contract permits transferring owning references, including final release.
-unsafe impl Send for ContextConfig {}
-// SAFETY: settings are immutable; concurrent retain is allowed by the C contract.
-// Atomic reference counts and Rust borrows keep the handle live during use.
-unsafe impl Sync for ContextConfig {}
 
 impl Clone for ContextConfig {
     /// Acquires another reference to these settings without copying or allocating.
@@ -128,9 +119,9 @@ impl Clone for ContextConfig {
     /// # Ok::<(), ConfigError>(())
     /// ```
     fn clone(&self) -> Self {
-        // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
-        unsafe { c_api::sirius_context_config_retain(self.inner.as_ptr()) };
-        Self { inner: self.inner }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -149,14 +140,8 @@ impl Clone for ContextConfig {
 /// # Ok::<(), ConfigError>(())
 /// ```
 pub struct ContextConfigBuilder {
-    inner: NonNull<c_api::SiriusContextConfigBuilder>,
+    inner: ConfigBuilderHandle,
 }
-
-// SAFETY: the C contract permits transferring owning references, including final release.
-unsafe impl Send for ContextConfigBuilder {}
-// SAFETY: settings are immutable; shared operations retain/build concurrently under the
-// C contract. Atomic reference counts and Rust borrows keep each handle live during use.
-unsafe impl Sync for ContextConfigBuilder {}
 
 impl ContextConfigBuilder {
     /// Starts a builder with Sirius's built-in defaults.
@@ -179,17 +164,9 @@ impl ContextConfigBuilder {
     /// # Ok::<(), ConfigError>(())
     /// ```
     pub fn new() -> Result<Self, ConfigError> {
-        let mut value = std::ptr::null_mut();
-        let mut diagnostic = Diagnostic(std::ptr::null_mut());
-        // SAFETY: both output slots are writable and empty.
-        let status =
-            unsafe { c_api::sirius_context_config_builder_create(&mut value, &mut diagnostic.0) };
-        if status != c_api::SIRIUS_SUCCESS {
-            return Err(configuration_error(status, diagnostic));
-        }
-        Ok(Self {
-            inner: NonNull::new(value).expect("successful builder creation"),
-        })
+        ConfigBuilderHandle::new()
+            .map(|inner| Self { inner })
+            .map_err(configuration_error)
     }
 
     /// Read and validate a YAML file, retaining its settings for later builds.
@@ -228,26 +205,15 @@ impl ContextConfigBuilder {
         };
         #[cfg(not(unix))]
         let bytes = path.to_str().ok_or(ConfigError::InvalidPath)?.as_bytes();
-        let mut value = std::ptr::null_mut();
-        let mut diagnostic = Diagnostic(std::ptr::null_mut());
-        // SAFETY: the path slice remains live, and output slots are writable and empty.
-        let status = unsafe {
-            c_api::sirius_context_config_builder_from_yaml(
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                &mut value,
-                &mut diagnostic.0,
-            )
-        };
-        if status == c_api::SIRIUS_INVALID_ARGUMENT {
-            return Err(ConfigError::InvalidPath);
-        }
-        if status != c_api::SIRIUS_SUCCESS {
-            return Err(configuration_error(status, diagnostic));
-        }
-        Ok(Self {
-            inner: NonNull::new(value).expect("successful YAML loading"),
-        })
+        ConfigBuilderHandle::from_yaml(bytes)
+            .map(|inner| Self { inner })
+            .map_err(|error| {
+                if error.status == c_api::SIRIUS_INVALID_ARGUMENT {
+                    ConfigError::InvalidPath
+                } else {
+                    configuration_error(error)
+                }
+            })
     }
 
     /// Produces an immutable snapshot using only the builder's retained settings.
@@ -272,22 +238,10 @@ impl ContextConfigBuilder {
     /// # Ok::<(), ConfigError>(())
     /// ```
     pub fn build(&self) -> Result<ContextConfig, ConfigError> {
-        let mut value = std::ptr::null_mut();
-        let mut diagnostic = Diagnostic(std::ptr::null_mut());
-        // SAFETY: self keeps the builder live; output slots are writable and empty.
-        let status = unsafe {
-            c_api::sirius_context_config_builder_build(
-                self.inner.as_ptr(),
-                &mut value,
-                &mut diagnostic.0,
-            )
-        };
-        if status != c_api::SIRIUS_SUCCESS {
-            return Err(configuration_error(status, diagnostic));
-        }
-        Ok(ContextConfig {
-            inner: NonNull::new(value).expect("successful configuration build"),
-        })
+        self.inner
+            .build()
+            .map(|inner| ContextConfig { inner })
+            .map_err(configuration_error)
     }
 }
 
@@ -304,9 +258,9 @@ impl Clone for ContextConfigBuilder {
     /// # Ok::<(), ConfigError>(())
     /// ```
     fn clone(&self) -> Self {
-        // SAFETY: self keeps the immutable handle live; the new owner releases the added reference.
-        unsafe { c_api::sirius_context_config_builder_retain(self.inner.as_ptr()) };
-        Self { inner: self.inner }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -323,17 +277,13 @@ impl std::fmt::Debug for ContextConfigBuilder {
     }
 }
 
+// Keep the public Drop implementations. Each owning field performs the native release.
 impl Drop for ContextConfig {
-    fn drop(&mut self) {
-        // SAFETY: this owner holds one live reference, with no outstanding Rust borrows.
-        unsafe { c_api::sirius_context_config_release(self.inner.as_ptr()) }
-    }
+    fn drop(&mut self) {}
 }
+
 impl Drop for ContextConfigBuilder {
-    fn drop(&mut self) {
-        // SAFETY: this owner holds one live reference, with no outstanding Rust borrows.
-        unsafe { c_api::sirius_context_config_builder_release(self.inner.as_ptr()) }
-    }
+    fn drop(&mut self) {}
 }
 
 #[cfg(all(test, not(miri)))]
@@ -440,14 +390,14 @@ mod tests {
     #[test]
     fn missing_diagnostics_and_unknown_statuses_are_supported() {
         assert!(matches!(
-            configuration_error(
-                c_api::SIRIUS_ALLOCATION_FAILURE,
-                Diagnostic(std::ptr::null_mut())
-            ),
+            configuration_error(Error {
+                status: c_api::SIRIUS_ALLOCATION_FAILURE,
+                message: String::new()
+            }),
             ConfigError::AllocationFailure
         ));
         assert!(
-            matches!(configuration_error(999, Diagnostic(std::ptr::null_mut())),
+            matches!(configuration_error(Error { status: 999, message: String::new() }),
             ConfigError::Unexpected { status: 999, message } if message.is_empty())
         );
     }
