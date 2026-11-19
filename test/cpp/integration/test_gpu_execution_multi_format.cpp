@@ -2361,6 +2361,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE_FALSE(probe->HasError());
   bool const verified = probe->Collection().GetValue(0, 0).GetValue<int64_t>() > 0;
   CAPTURE(fallback, pinned, replaced_after, verified);
+  // A build named by SIRIUS_TEST_ICEBERG_EXTENSION is there to cover the verified lookup.
+  if (auto const* named = std::getenv("SIRIUS_TEST_ICEBERG_EXTENSION"); named && *named) {
+    INFO("the named Iceberg build does not accept expected_table_uuid on iceberg_metadata()");
+    REQUIRE(verified);
+  }
 
   auto const query = "SELECT fruit, count FROM iceberg_scan(" + scratch.file_literal("") +
                      (pinned ? ", snapshot_from_id = " + std::to_string(selected) : std::string()) +
