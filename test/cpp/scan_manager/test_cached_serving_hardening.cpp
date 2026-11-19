@@ -380,7 +380,8 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
     std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
-    sirius::expression_query_policy /*policy*/) override
+    sirius::expression_query_policy /*policy*/,
+    sirius::op::scan::scan_execution_context /*execution*/) override
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
   }
@@ -1930,11 +1931,7 @@ TEST_CASE("transactional steal serves decode-row-filtered splits but refuses pre
 TEST_CASE("a compressed split decoded with a join filter keeps the drop and the steal",
           "[cached_serving][transactional_steal]")
 {
-  namespace fsf = sirius::test::fused_scan_filter;
-  if (!sirius::decompression_pushdown_enabled()) {
-    WARN("filtered-decode env gate off in this process; skipping");
-    return;
-  }
+  namespace fsf                   = sirius::test::fused_scan_filter;
   auto& e                         = env();
   ::cuda::stream_ref const stream = e.stream();
   using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
@@ -1982,6 +1979,27 @@ TEST_CASE("a compressed split decoded with a join filter keeps the drop and the 
 
   stub_ingestible ingestible;
   ingestible.prefix_width = fsf::kOutputWidth;
+
+  SECTION("a dynamic-only request keeps this query's thresholds and diagnostics")
+  {
+    auto const split = make_split(fsf::make_key_set(stream));
+    sirius::codegen::fused_scan_policy const policy{.diagnostics                = true,
+                                                    .max_selectivity            = 0.22,
+                                                    .full_route_max_selectivity = 0.04,
+                                                    .index_walk_max_selectivity = 0.08,
+                                                    .max_membership_sources     = 3};
+    auto const refreshed = sirius::op::scan::detail::refresh_membership_probes(
+      {}, fsf::kSelected.size(), split->consumer.get(), {.fused_scan = policy});
+    REQUIRE(refreshed.has_value());
+    REQUIRE(refreshed->request != nullptr);
+    auto const& actual = refreshed->request->request().fused_scan;
+    CHECK(actual.diagnostics);
+    CHECK(actual.max_selectivity == policy.max_selectivity);
+    CHECK(actual.full_route_max_selectivity == policy.full_route_max_selectivity);
+    CHECK(actual.index_walk_max_selectivity == policy.index_walk_max_selectivity);
+    CHECK(actual.max_membership_sources == policy.max_membership_sources);
+    REQUIRE_FALSE(refreshed->attached.empty());
+  }
 
   SECTION("an accepting join filter, no carrier conversion")
   {
@@ -2333,7 +2351,7 @@ TEST_CASE("a dynamic-filter consumer reserves decode headroom only when it can a
   split.consumer = std::make_shared<sirius::op::scan::dynamic_filter_consumer>(
     channel, sirius::op::scan::consumer_config{}, sirius::op::scan::identity_bindings(1));
   auto const expected =
-    sirius::decompression_pushdown_enabled() ? batch_bytes + batch_bytes / 4 : batch_bytes;
+    split.enable_fused_scan_filter ? batch_bytes + batch_bytes / 4 : batch_bytes;
   REQUIRE(split.get_estimated_working_set_size_in_bytes() == expected);
 }
 
@@ -2441,8 +2459,8 @@ TEST_CASE("a resident split reserves the cached gather only when it can reach th
   REQUIRE(batch_bytes > 0);
   // Without the checkpoint, the decode envelope applies when pushdown can attach probes; otherwise
   // the zero-copy view estimate stands.
-  auto const decode_probes = sirius::decompression_pushdown_enabled() && split.consumer &&
-                             !split.consumer->decode_bindings().empty();
+  auto const decode_probes =
+    split.enable_fused_scan_filter && split.consumer && !split.consumer->decode_bindings().empty();
   auto const ordinary = decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
         (reaches_checkpoint ? 2 * batch_bytes : ordinary));
@@ -2590,13 +2608,20 @@ TEST_CASE(
   auto& split = dynamic_cast<scan_operator_input&>(*handed);
   REQUIRE(split.cached_view_possible);
   split.needs_carrier_conversion = converting;
-  auto const decode_probes       = sirius::decompression_pushdown_enabled() && split.consumer &&
-                             !split.consumer->decode_bindings().empty();
+  if (deferring) {
+    auto origin   = std::make_shared<sirius::late_mat::scan_batch_origin>();
+    origin->range = {0, 64};
+    split.origin  = std::move(origin);
+  }
+  // The deferral's rowid column rides on every envelope.
+  std::size_t const rowid_bytes = deferring ? 64 * sizeof(std::uint64_t) : 0;
+  auto const decode_probes =
+    split.enable_fused_scan_filter && split.consumer && !split.consumer->decode_bindings().empty();
   auto const ordinary = [&] {
     auto const batch_bytes = split.get_estimated_size_in_bytes();
-    return decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes;
+    return (decode_probes ? batch_bytes + batch_bytes / 4 : batch_bytes) + rowid_bytes;
   };
-  auto const envelope = [&] { return 2 * split.get_estimated_size_in_bytes(); };
+  auto const envelope = [&] { return 2 * split.get_estimated_size_in_bytes() + rowid_bytes; };
   REQUIRE(split.get_estimated_size_in_bytes() > 0);
 
   // Before preparation every split the checkpoint could borrow reserves its gather.
@@ -2608,11 +2633,6 @@ TEST_CASE(
   CHECK(split.get_estimated_working_set_size_in_bytes() ==
         (exit == table_exit::prepare ? ordinary() : envelope()));
 
-  if (deferring) {
-    auto origin   = std::make_shared<sirius::late_mat::scan_batch_origin>();
-    origin->range = {0, 64};
-    split.origin  = std::move(origin);
-  }
   auto const output = scan.execute(split, e.stream());
   REQUIRE(output);
   CHECK(split.cached_checkpoint_possible() == (exit == table_exit::never));
@@ -2643,23 +2663,30 @@ TEST_CASE("a statically filtered compressed split keeps its compaction forecast 
     nullptr,
     nullptr,
     consumer);
-  sirius::pushdown_request request;
-  request.columns.resize(2);
-  request.columns[0].range          = sirius::decode_range{.lo = 0, .hi = 8};
-  request.ranges_cover_whole_filter = true;
-  auto handed = serve_pinned(scan, make_compressed_entry(e, 1024), true, std::move(request));
-  auto& split = dynamic_cast<scan_operator_input&>(*handed);
-  // The pending static filter keeps a full-width decode in the batch for the checkpoint.
-  REQUIRE(split.cached_checkpoint_possible());
-  auto const batch_bytes = split.get_estimated_size_in_bytes();
-  REQUIRE(batch_bytes > 0);
-  // With decompression pushdown, the decode is forecast to compact and steal its table; the
-  // checkpoint could see only that compacted table.
-  auto const forecast =
-    batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) *
-                                               sirius::decompression_pushdown_max_selectivity());
-  CHECK(split.get_estimated_working_set_size_in_bytes() ==
-        (sirius::decompression_pushdown_enabled() ? forecast : 2 * batch_bytes));
+  auto const entry = make_compressed_entry(e, 1024);
+  for (bool const enabled : {true, false}) {
+    for (double const cap : {0.20, 0.80, 2.0}) {
+      CAPTURE(enabled, cap);
+      sirius::pushdown_request request;
+      request.enable_fused_scan_filter   = enabled;
+      request.fused_scan.max_selectivity = cap;
+      request.columns.resize(2);
+      request.columns[0].range          = sirius::decode_range{.lo = 0, .hi = 8};
+      request.ranges_cover_whole_filter = true;
+      auto handed                       = serve_pinned(scan, entry, true, std::move(request));
+      auto& split                       = dynamic_cast<scan_operator_input&>(*handed);
+      split.enable_fused_scan_filter    = enabled;
+      REQUIRE(split.cached_checkpoint_possible());
+      auto const batch_bytes = split.get_estimated_size_in_bytes();
+      REQUIRE(batch_bytes > 0);
+      // Mask workspace plus outputs, capped at full width; disabled decoding needs a copy.
+      auto const forecast =
+        batch_bytes / 4 +
+        static_cast<std::size_t>(static_cast<double>(batch_bytes) * std::min(cap, 1.0));
+      CHECK(split.get_estimated_working_set_size_in_bytes() ==
+            (enabled ? forecast : 2 * batch_bytes));
+    }
+  }
 }
 
 TEST_CASE("Cached workers reject a returned batch when connection interruption is observed",

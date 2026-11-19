@@ -227,6 +227,22 @@ TEST_CASE_METHOD(WindowFixture,
 }
 
 TEST_CASE_METHOD(WindowFixture,
+                 "whole-partition DECIMAL AVG of equal values is one value",
+                 "[integration][gpu_execution][window_sql]")
+{
+  // Partition g holds g copies of one value, so every partition's average is that value. The
+  // DISTINCT catches a last-bit difference that the tolerant comparison would accept.
+  run_ok(
+    "CREATE TABLE eq AS SELECT g::INTEGER g, 626554.3479::DECIMAL(18,4) v "
+    "FROM range(1, 21) a(g), range(20) b(i) WHERE i < g");
+  run_ok("CHECKPOINT");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  compare_window("SELECT DISTINCT a FROM (SELECT avg(v) OVER (PARTITION BY g) a FROM eq)");
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.fallbacks == before.fallbacks);
+}
+
+TEST_CASE_METHOD(WindowFixture,
                  "empty whole-partition SQL windows return zero rows",
                  "[integration][gpu_execution][window_sql]")
 {
@@ -370,6 +386,17 @@ TEST_CASE_METHOD(WindowFixture,
                  "),min(d) OVER (PARTITION BY p ORDER BY id" + frame +
                  "),max(d) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
   compare_window("SELECT id,sum(f) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  compare_window("SELECT id,min(f) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(f::FLOAT) OVER (PARTITION BY p ORDER BY id" + frame + ") FROM w");
+  // NaN orders above every other value, and NULL rows keep the running value.
+  compare_window("SELECT id,min(x) OVER (PARTITION BY p ORDER BY id" + frame +
+                 "),max(x) OVER (PARTITION BY p ORDER BY id" + frame +
+                 ") FROM (SELECT id,p,CASE WHEN id%11=0 THEN 'nan'::DOUBLE WHEN id%13=0 THEN NULL "
+                 "ELSE f END x FROM w)");
+  // Q51 over floating point sales: a running max of a running sum.
+  compare_window("SELECT p,q,max(r) OVER (PARTITION BY p ORDER BY q" + frame +
+                 ") FROM (SELECT p,q,sum(sum(f)) OVER (PARTITION BY p ORDER BY q" + frame +
+                 ") r FROM w WHERE q IS NOT NULL GROUP BY p,q)");
   compare_window("SELECT id,min(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
                  "),max(DATE '2020-01-01'+v) OVER (PARTITION BY p ORDER BY id" + frame +
                  ") FROM w");
@@ -403,7 +430,7 @@ TEST_CASE_METHOD(WindowFixture,
   expect_plan_fallback_matches_cpu(
     "SELECT id,avg(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
-    "SELECT id,min(f) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
+    "SELECT id,max(s) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w");
   expect_plan_fallback_matches_cpu(
     "SELECT id,percent_rank() OVER (PARTITION BY p ORDER BY v) FROM w");
   expect_plan_fallback_matches_cpu("SELECT id,sum(DISTINCT v) OVER () FROM w");

@@ -393,9 +393,10 @@ Two consequences are worth stating plainly. A chunk pinned narrow and queried at
 target — the stacking happy path — issues no cast and is charged no conversion destination, where
 charging by "storage is narrow" would have reserved a full native destination for a conversion
 that never runs. And the estimate no longer consults the zone-map sidecar at all, so a table
-pinned with `enable_pinned_zone_map_pruning = false`, or a GPU-tier compression-enabled pin (which
-stores no zone-map sidecar), uses the same carrier-based sizing path as any other pin. The former
-8×-bound limitation on those pins is gone.
+pinned with `enable_pinned_zone_map_pruning = false`, or with types for which capture provides no
+usable statistics, uses the same carrier-based sizing path as any other pin. Compressed GPU pins
+retain supported native statistics when capture is enabled; compression itself does not make a
+pin statless. The former 8×-bound limitation on those pins is gone.
 
 Rows come from whichever form stores the chunk — a Simpatico-compressed chunk reports its row
 count from the representation and always contributes the validity-mask term, since per-column
@@ -517,8 +518,9 @@ basis unchanged.
 
 - Compression on, narrowing off: native blobs, all-native metadata, no sidecars — compression-only
   behavior unchanged.
-- Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or
-  compression is disabled): narrow carriers use uncompressed storage.
+- Narrowing on, compression off (compression is disabled, a selected explicit plan does not cover
+  the pinned columns, or compression is declined): narrow carriers use uncompressed storage.
+  A missing plan file selects plans automatically rather than disabling compression.
 - Both on: narrow, then compress; the gate reads the recorded carriers and the serve decompresses
   straight into them. Chunks stored at the plan target need no normalization cast; narrower chunks
   widen to it.

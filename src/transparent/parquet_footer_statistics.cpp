@@ -47,6 +47,7 @@ namespace sirius::transparent {
 namespace {
 
 struct file_statistics {
+  std::size_t num_rows = 0;
   std::vector<std::pair<duckdb::Identifier, duckdb::unique_ptr<duckdb::BaseStatistics>>> columns;
 };
 
@@ -110,6 +111,12 @@ struct cache_entry {
 std::mutex cache_mutex;
 std::unordered_map<std::string, cache_entry> cache;
 
+/// Total rows of the files of each scan add_statistics last covered, keyed like the merged
+/// statistics and bounded like them. Rewritten by every query that plans the scan, so a changed
+/// file shows up next time.
+std::mutex row_count_mutex;
+std::unordered_map<std::string, std::size_t> row_counts;
+
 std::string cache_key(std::string const& options_identity, std::string const& path)
 {
   auto key = options_identity;
@@ -147,6 +154,7 @@ std::shared_ptr<file_statistics const> statistics_of(
   }
   auto result = std::make_shared<file_statistics>();
   duckdb::ParquetReader reader(context, file, options);
+  result->num_rows = reader.NumRows();
   for (auto const& column : reader.columns) {
     auto stats = reader.GetStatistics(context, column.name);
     if (stats) { result->columns.emplace_back(column.name, std::move(stats)); }
@@ -339,10 +347,13 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   if (!bind || !bind->file_list || !bind->initial_reader) { return false; }
   auto& options = bind->file_options;
   // DuckDB reads the statistics itself for one file or with union_by_name; a schema or bound
-  // schema renames columns, so the footers' names need not be the scan's.
-  if (bind->file_list->GetExpandResult() != duckdb::FileExpandResult::MULTIPLE_FILES ||
-      options.union_by_name || !options.column_statistics.IsNull() || !options.schema.empty() ||
-      !options.bound_schema.empty()) {
+  // schema renames columns, so the footers' names need not be the scan's. A one-file scan still
+  // gets its footer read, for the row count.
+  auto const expand      = bind->file_list->GetExpandResult();
+  bool const single_file = expand == duckdb::FileExpandResult::SINGLE_FILE;
+  if ((expand != duckdb::FileExpandResult::MULTIPLE_FILES && !single_file) ||
+      options.union_by_name || (!single_file && !options.column_statistics.IsNull()) ||
+      !options.schema.empty() || !options.bound_schema.empty()) {
     return false;
   }
   auto const* reader =
@@ -351,7 +362,21 @@ bool add_statistics(duckdb::ClientContext& context, duckdb::LogicalGet& get)
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
   auto const files            = statistics_of_all(context, all_files, parquet_options);
-  auto const merge_key        = merge_cache_key(get);
+  std::size_t total_rows      = 0;
+  for (auto const& file : files) {
+    total_rows += file->num_rows;
+  }
+  {
+    std::lock_guard guard(row_count_mutex);
+    auto const key = merge_cache_key(get);
+    if (!row_counts.contains(key) &&
+        row_counts.size() >= detail::merged_statistics_cache_capacity) {
+      row_counts.erase(row_counts.begin());
+    }
+    row_counts[key] = total_rows;
+  }
+  if (single_file) { return false; }
+  auto const merge_key = merge_cache_key(get);
   if (auto const hit = cached_merge(merge_key, files, *bind)) {
     options.column_statistics = *hit;
   } else {
@@ -392,6 +417,18 @@ std::size_t add_parquet_footer_statistics(duckdb::ClientContext& context,
   return added;
 }
 
+std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
+{
+  auto const& name = get.function.GetName().GetIdentifierName();
+  if (name != "read_parquet" && name != "parquet_scan") { return std::nullopt; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (!bind || !bind->file_list) { return std::nullopt; }
+  std::lock_guard guard(row_count_mutex);
+  auto const found = row_counts.find(merge_cache_key(get));
+  if (found == row_counts.end()) { return std::nullopt; }
+  return found->second;
+}
+
 std::size_t read_parquet_footer_statistics(duckdb::ClientContext& context,
                                            std::vector<std::string> const& paths)
 {
@@ -404,6 +441,12 @@ std::size_t detail::merged_statistics_cache_size()
 {
   std::lock_guard guard(merge_mutex);
   return merges.size();
+}
+
+std::size_t detail::row_count_cache_size()
+{
+  std::lock_guard guard(row_count_mutex);
+  return row_counts.size();
 }
 
 }  // namespace sirius::transparent

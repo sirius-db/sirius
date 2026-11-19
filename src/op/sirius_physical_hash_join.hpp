@@ -31,13 +31,15 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/join_cross_schedule.hpp"
 #include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
-#include "utils.hpp"
 
 #include <cudf/join/hash_join.hpp>
 #include <cudf/types.hpp>
+
+#include <rmm/device_uvector.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -65,7 +67,16 @@ class sirius_dynamic_filter_set;
 // for better pipelining with other operators, and allows reusing the hash table. MIXED_JOIN uses
 // cudf's mixed_join API for joins with both equality and inequality conditions.
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
-enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
+// EMIT_SCHEDULED is used only by kept-build joins: the slot's final task, which emits the kept rows
+// from the accumulated matched flags, has been issued.
+enum class BUILD_HASH_TABLE_STATE {
+  NOT_BUILT,
+  SCHEDULING,
+  SCHEDULED,
+  BUILT,
+  EMIT_SCHEDULED,
+  DESTROYED
+};
 
 //===----------------------------------------------------------------------===//
 // BUILD_PROBE scheduling helpers - BUILD_PROBE keeps one hash table per partition.
@@ -75,6 +86,7 @@ enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DES
 enum class build_probe_action {
   schedule_build,  ///< Build the hash table for `partition` (and probe its first batch).
   schedule_probe,  ///< Probe an already-built `partition` with its next probe batch.
+  schedule_emit,   ///< Kept-build joins: emit `partition`'s kept rows; its probe stream is done.
   wait_for_build,  ///< No schedulable work; a partition is still awaiting its build batch.
   wait_for_probe,  ///< No schedulable work; awaiting probe batches (or the op is draining).
   none             ///< No partitions exist / all are destroyed.
@@ -85,6 +97,7 @@ struct build_probe_slot_view {
   BUILD_HASH_TABLE_STATE state = BUILD_HASH_TABLE_STATE::NOT_BUILT;
   bool has_build_batch         = false;  ///< The build repo holds this partition's build batch.
   bool has_probe_batch         = false;  ///< The probe repo holds >=1 batch for this partition.
+  bool probe_in_flight = false;  ///< Kept-build joins: a probe task for this slot has not finished.
 };
 
 struct build_probe_decision {
@@ -104,6 +117,14 @@ struct build_probe_decision {
 /// has nothing left to do, whether or not it has been torn down yet (teardown is a resource-release
 /// side effect, not a precondition for completion).
 [[nodiscard]] build_probe_decision select_build_probe_action(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
+/// Kept-build (RIGHT_SEMI / RIGHT_ANTI streaming) counterpart of select_build_probe_action. Builds
+/// and probes like BUILD_PROBE, but a slot's output is decided only after its whole probe stream:
+/// once @p probe_finished, a BUILT slot with no queued and no in-flight probe, or a NOT_BUILT slot
+/// that still holds its never-probed build, is scheduled to emit. Emitted slots are not complete
+/// until their task finishes (EMIT_SCHEDULED counts as in flight).
+[[nodiscard]] build_probe_decision select_kept_build_action(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
 
 /// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
@@ -134,6 +155,10 @@ struct build_probe_decision {
 /// query spread across GPUs; a single STANDARD partition is unpinned, and multiple partitions
 /// use `round_robin` over `active_gpu_ids`. An empty
 /// `active_gpu_ids` yields unpinned placements.
+///
+/// A kept-build join (@p kept_build_streaming) streams its probe, which only BUILD_PROBE does, so
+/// it always takes BUILD_PROBE, never broadcast (a replica would see only its GPU's probe rows),
+/// and uses the natural partition count when the build exceeds either BUILD_PROBE budget.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   std::optional<uint64_t> total_rows,
@@ -148,110 +173,14 @@ struct build_probe_decision {
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio,
-  std::optional<uint64_t> resident_bytes = std::nullopt);
+  std::optional<uint64_t> resident_bytes = std::nullopt,
+  bool kept_build_streaming              = false);
 
 /**
  * @brief Select never-probed build slots that can be reclaimed after the probe producer closes.
  */
 [[nodiscard]] std::vector<std::size_t> build_probe_slots_to_reclaim(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
-
-//===----------------------------------------------------------------------===//
-// STANDARD / MIXED_JOIN partial-barrier scheduling helpers.
-//
-// Under a partial barrier the build and probe batches for a partition arrive progressively. For a
-// partition we must join every build batch against every probe batch. The upstream concat operator
-// folds whichever side must be seen whole (LEFT/SEMI/ANTI -> build; RIGHT-family -> probe; OUTER ->
-// both) down to a single batch, so this per-partition cross product is correct for every join type
-// (see docs/super-sirius/operators.md). This structure tracks, per partition, the batch IDs
-// discovered on each side and which (probe,build) pairs have already been scheduled, so scheduling
-// tolerates the ID lists growing across calls and each batch is freed once it can no longer be
-// needed. probe = "default"/left, build = "build"/right.
-//===----------------------------------------------------------------------===//
-struct partition_cross_schedule {
-  std::vector<uint64_t> probe_ids;               ///< probe batch IDs, first-seen order
-  std::vector<uint64_t> build_ids;               ///< build batch IDs, first-seen order
-  std::unordered_set<uint64_t> probe_id_seen;    ///< dedup guard while re-polling
-  std::unordered_set<uint64_t> build_id_seen;    ///< dedup guard while re-polling
-  std::unordered_set<uint64_t> scheduled_pairs;  ///< key = (probe_idx << 32) | build_idx
-  std::vector<uint32_t> probe_paired_count;      ///< parallel to probe_ids: #build batches paired
-  std::vector<uint32_t> build_paired_count;      ///< parallel to build_ids: #probe batches paired
-  std::unordered_set<uint64_t> probe_popped;     ///< probe IDs already freed from the repo
-  std::unordered_set<uint64_t> build_popped;     ///< build IDs already freed from the repo
-};
-
-/// A fully-consumed batch that can be freed from its repository.
-struct cross_schedule_discard {
-  std::size_t partition = 0;
-  bool is_build         = false;  ///< true: "build" port; false: "default"/probe port
-  uint64_t batch_id     = 0;
-};
-
-enum class cross_schedule_kind : std::uint8_t { emit_pair, wait_build, wait_probe, done };
-
-/// The next (probe,build) pair to schedule, or why none is schedulable.
-struct cross_schedule_pair {
-  cross_schedule_kind kind = cross_schedule_kind::done;
-  std::size_t partition    = 0;  ///< valid iff kind == emit_pair
-  std::size_t probe_idx    = 0;  ///< index into partition's probe_ids; valid iff emit_pair
-  std::size_t build_idx    = 0;  ///< index into partition's build_ids; valid iff emit_pair
-};
-
-/// Encode / decode a (probe_idx, build_idx) pair into the `scheduled_pairs` key. Per-partition
-/// batch counts are far below 2^32, so a single uint64_t key is safe.
-[[nodiscard]] inline uint64_t encode_cross_pair(std::size_t probe_idx, std::size_t build_idx)
-{
-  return (static_cast<uint64_t>(probe_idx) << 32) | static_cast<uint64_t>(build_idx);
-}
-
-/// Collect (and mark popped) every batch that is now fully consumed: a probe batch once the build
-/// producer is finished and the batch has been paired with every known build batch (build side has
-/// >= 1 batch), and symmetrically for build batches. Idempotent.
-[[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
-  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
-
-/// Reference arithmetic for a pairing-weighted probe-byte denominator: sum
-/// `probe bytes * completed pairings / build batches`. Unused — the STANDARD/MIXED estimate is
-/// withheld — but kept with its tests for the eventual fix. See
-/// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
-[[nodiscard]] std::size_t pairing_weighted_probe_bytes(
-  std::vector<partition_cross_schedule> const& cross,
-  std::unordered_map<uint64_t, std::size_t> const& probe_bytes);
-
-/// Find and claim the next unscheduled (probe,build) pair across partitions, marking it scheduled
-/// and bumping the paired counts. If none is schedulable now, reports whether to wait on the build
-/// or probe producer, or that the operator is done. Pure over `cross`.
-[[nodiscard]] cross_schedule_pair next_cross_schedule_pair(
-  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
-
-/// A surviving batch of a partition whose OPPOSITE side finished with zero batches (empty table).
-/// It is emitted as a single-side "orphan" task so execute() can produce the correct NULL-padded /
-/// passthrough output, and popping it drains the repository so the pipeline can complete.
-struct cross_schedule_orphan {
-  bool found            = false;
-  std::size_t partition = 0;
-  bool present_is_build = false;  ///< the surviving side is the build side (opposite probe empty)
-  uint64_t batch_id     = 0;
-};
-
-/// Find and claim (mark popped) the next surviving batch whose opposite side finished empty, once
-/// BOTH producers are finished. Returns `{found=false}` when no such batch remains. Only fires when
-/// the opposite side truly has zero batches, so it never races the normal pair scheduler (which
-/// covers partitions with data on both sides). Pure over `cross`.
-[[nodiscard]] cross_schedule_orphan next_cross_schedule_orphan(
-  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
-
-/// True when a partition has a surviving batch whose opposite side finished empty and that batch
-/// has not yet been emitted/popped. Used by peek_cross_schedule_kind and by get_next_task_hint.
-/// Pure.
-[[nodiscard]] bool has_pending_cross_orphan(std::vector<partition_cross_schedule> const& cross,
-                                            bool probe_finished,
-                                            bool build_finished);
-
-/// Non-mutating classification for get_next_task_hint: READY (emit_pair, including pending orphan
-/// work), WAITING (wait_build / wait_probe), or complete (done).
-[[nodiscard]] cross_schedule_kind peek_cross_schedule_kind(
-  std::vector<partition_cross_schedule> const& cross, bool probe_finished, bool build_finished);
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -366,6 +295,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
            join_type == duckdb::JoinType::RIGHT_ANTI;
   }
 
+  /// RIGHT_SEMI / RIGHT_ANTI keep build rows. A kept-build join builds one hash table per partition
+  /// on the build side, streams every probe batch through it while OR-ing per-build-row matched
+  /// flags, and emits the matched (SEMI) or unmatched (ANTI) build rows once its probe is done.
+  /// Otherwise the probe side is folded whole per partition. Set by the planner before wrapping.
+  void set_kept_build_streaming(bool enabled) noexcept { _kept_build_streaming = enabled; }
+  [[nodiscard]] bool kept_build_streaming() const noexcept
+  {
+    return _kept_build_streaming && !_is_delim_join_inner &&
+           (join_type == duckdb::JoinType::RIGHT_SEMI || join_type == duckdb::JoinType::RIGHT_ANTI);
+  }
+
   /// SINGLE is a LEFT join that keeps one right match per probe row (DuckDB's join for
   /// correlated scalar subqueries). It shares every LEFT path and adds a dedupe at the output
   /// tail. Static so the free gather helpers can use it.
@@ -417,6 +357,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  /// A kept-build join holds each partition's build in its slot after the ports drain, so the
+  /// operator stays nonempty until every slot has issued its emit task.
+  [[nodiscard]] bool all_ports_empty() override;
 
   /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs, extend
   /// `_cross`, enforce the non-INNER whole-side invariant (the must-be-whole side stays a single
@@ -565,6 +509,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     std::vector<std::unique_ptr<cudf::column>>
       built_table_cast_columns;  // scope holder for columns cast for the build table's lifetime
     int device_id = -1;          // GPU this slot's table was built on; guards teardown frees
+    // Kept-build joins: one byte per build row, set once any probe row matches it.
+    std::unique_ptr<rmm::device_uvector<std::uint8_t>> kept_matched;
+    // Kept-build joins: the prepared kept keys, over build_table and built_table_cast_columns.
+    cudf::table_view kept_keys;
+    // Kept-build joins: the folded build batch, handed to the emit task so it carries input.
+    std::shared_ptr<cucascade::data_batch> kept_build_batch;
+    // Kept-build joins: probe tasks issued for this slot whose execute() has not completed. The
+    // emit task waits for zero so it reads every probe batch's flags.
+    std::atomic<int> probes_in_flight{0};
   };
   // Sized to num_partitions when BUILD_PROBE is entered (see get_partition_strategy). Elements are
   // non-movable (atomic member), so the vector is default-constructed at the target size and only
@@ -660,7 +613,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void on_finalize_operator() override;
 
  protected:
-  bool _is_delim_join_inner = false;
+  bool _is_delim_join_inner  = false;
+  bool _kept_build_streaming = false;
+
+  /// Kept-build BUILD_PROBE task for one slot: build (SCHEDULED) and probe, or emit
+  /// (EMIT_SCHEDULED).
+  std::unique_ptr<operator_data> execute_kept_build(
+    std::vector<cucascade::read_only_data_batch> const& input_batches,
+    per_partition_build_state& slot,
+    ::cuda::stream_ref stream);
+
+  /// Kept-build: issue the emit task for the first slot whose probe stream is complete. Must be
+  /// called with op_state_mutex held.
+  std::unique_ptr<operator_data> next_kept_build_emit_task();
 };
 
 }  // namespace op

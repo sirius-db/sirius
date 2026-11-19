@@ -76,6 +76,32 @@ target_sources(sirius_unittest
 target_compile_definitions(sirius_unittest
                            PRIVATE SIRIUS_TEST_CONNECTOR_OVERRIDES)
 
+# Compile the pin driver with a calling-thread-only staging failure hook for
+# regression tests. Production libraries keep the hook-free archive object.
+add_library(sirius_pin_table_test OBJECT src/pin_table.cpp)
+target_compile_definitions(
+  sirius_pin_table_test
+  PRIVATE SIRIUS_TEST_PIN_STAGING_OVERRIDES CCCL_DISABLE_WARPSPEED_SCAN
+          CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(
+  sirius_pin_table_test
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON)
+target_include_directories(
+  sirius_pin_table_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+          ${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src)
+target_link_libraries(sirius_pin_table_test PRIVATE sirius_core duckdb_static)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_pin_table_test PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                         ON)
+  target_include_directories(sirius_pin_table_test BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest PRIVATE $<TARGET_OBJECTS:sirius_pin_table_test>)
+target_compile_definitions(sirius_unittest
+                           PRIVATE SIRIUS_TEST_PIN_STAGING_OVERRIDES)
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
@@ -146,6 +172,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     test/cpp/operator/test_dynamic_filter_readiness_fault.cpp
     test/cpp/operator/test_dynamic_filter_replica_cuda_fault.cpp
     test/cpp/memory/test_device_transfer_fault.cpp
+    test/cpp/scan/test_arrow_discard_fault.cpp
+    test/cpp/compression/test_compressed_cross_gpu_fault.cpp
     test/cpp/scan_manager/test_memory_prefetcher_health.cpp
     test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
     test/cpp/utils/cuda_status_fault.cpp
@@ -170,6 +198,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--allow-multiple-definition"
     "LINKER:--wrap=cudaStreamWaitEvent"
     "LINKER:--wrap=cudaDeviceSynchronize"
+    "LINKER:--wrap=cudaEventSynchronize"
     "LINKER:--wrap=cudaMemPoolGetAccess"
     "LINKER:--wrap=cudaMemcpyAsync"
     "LINKER:--wrap=cudaMemcpyBatchAsync"
@@ -252,8 +281,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(parquet_benchmark)
 
 target_link_options(parquet_benchmark PRIVATE
@@ -292,8 +320,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(prefetch_benchmark)
 
 target_link_options(prefetch_benchmark PRIVATE
@@ -335,8 +362,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(prefetch_hybrid_scan_benchmark)
 
 target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
@@ -375,8 +401,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(columnar_parquet_poc)
 
 target_link_options(columnar_parquet_poc PRIVATE
@@ -415,8 +440,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(retirer_benchmark)
 
 target_link_options(retirer_benchmark PRIVATE
@@ -456,8 +480,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(s3_throughput_test)
 
 target_link_options(s3_throughput_test PRIVATE
@@ -499,8 +522,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(s3_autotune_throughput_bench)
 
 target_link_options(s3_autotune_throughput_bench PRIVATE
@@ -540,8 +562,7 @@ target_link_libraries(
   cuCascade::cucascade
   cuCascade::cucascade_cudf
   cuCascade::cucascade_io
-  PkgConfig::LIBURING
-  PkgConfig::NUMA)
+  PkgConfig::LIBURING)
 sirius_link_duckdb_extensions(range_prefetch_benchmark)
 
 target_link_options(range_prefetch_benchmark PRIVATE
@@ -553,3 +574,16 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# Export cleanup/ordering tests need neither a CUDA driver nor a DuckDB runtime.
+add_executable(
+  sirius_parquet_session_test src/output/parquet_session.cpp
+                              test/cpp/output/test_parquet_session.cpp)
+target_compile_features(sirius_parquet_session_test PRIVATE cxx_std_20)
+set_target_properties(sirius_parquet_session_test
+                      PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(
+  sirius_parquet_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp)
+target_link_libraries(sirius_parquet_session_test PRIVATE Catch2::Catch2WithMain
+                                                          pthread)

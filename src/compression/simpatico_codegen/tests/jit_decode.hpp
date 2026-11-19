@@ -114,7 +114,8 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   }
 
   cu_check(cuLaunchKernel(fn_dec,
-                          static_cast<unsigned>(num_chunks),
+                          static_cast<unsigned>((num_chunks + spec.chunks_per_block - 1) /
+                                                spec.chunks_per_block),
                           1,
                           1,
                           static_cast<unsigned>(spec.block_x),

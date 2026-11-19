@@ -27,8 +27,11 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/logical_type.hpp"
+#include "op/cte_reader_role.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
+#include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -43,9 +46,11 @@
 #include <catch.hpp>
 #include <duckdb/common/enums/join_type.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -899,4 +904,135 @@ TEST_CASE("NULL-safe routing follows preserved values and stops at NULL-generati
                                  2,
                                  {.descend_build_blocks = false, .preserve_nulls = true})
                 .has_value());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delim CTE bodies
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+using sirius::op::cte_reader_role;
+
+constexpr std::size_t kDelimCte = 7;
+
+duckdb::unique_ptr<sirius::op::sirius_physical_column_data_scan> make_cte_read(cte_reader_role role)
+{
+  duckdb::vector<sirius::logical_type> types(2, int_type());
+  auto read = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
+    std::move(types),
+    sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
+    /*estimated_cardinality=*/0,
+    kDelimCte);
+  read->reader_role = role;
+  return read;
+}
+
+struct delim_cte_tree {
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> root;  // the CTE node
+  sirius::op::sirius_physical_operator* body_leaf  = nullptr;
+  sirius::op::sirius_physical_operator* outer_read = nullptr;
+  sirius::op::sirius_physical_operator* rest       = nullptr;
+};
+
+// CTE kDelimCte whose body swaps the two columns of its leaf, so a body terminal's ordinal is
+// remapped, and whose rest is a UNION of @p read_roles reads (it reaches every read at the same
+// ordinal, which is all the walk needs).
+delim_cte_tree make_delim_cte(std::vector<cte_reader_role> const& read_roles,
+                              bool body_ends_in_table_scan = true)
+{
+  delim_cte_tree tree;
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
+  if (body_ends_in_table_scan) {
+    leaf = make_typed_double(sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, /*width=*/2);
+  } else {
+    leaf = make_scan(/*width=*/2);
+  }
+  tree.body_leaf = leaf.get();
+  auto body      = make_projection(make_select_list(make_reference(1), make_reference(0)));
+  body->children.push_back(std::move(leaf));
+
+  auto rest = make_typed_double(sirius::op::SiriusPhysicalOperatorType::UNION, /*width=*/2);
+  for (auto const role : read_roles) {
+    auto read = make_cte_read(role);
+    if (tree.outer_read == nullptr && role == cte_reader_role::outer_row) {
+      tree.outer_read = read.get();
+    }
+    rest->children.push_back(std::move(read));
+  }
+  tree.rest = rest.get();
+  duckdb::vector<sirius::logical_type> types(2, int_type());
+  tree.root = duckdb::make_uniq<sirius::op::sirius_physical_cte>("__duckdb_delim_7",
+                                                                 kDelimCte,
+                                                                 std::move(types),
+                                                                 std::move(body),
+                                                                 std::move(rest),
+                                                                 /*estimated_cardinality=*/0);
+  return tree;
+}
+
+std::vector<sirius::planner::route_terminal> in_body(
+  std::vector<sirius::planner::route_terminal> const& terminals)
+{
+  std::vector<sirius::planner::route_terminal> body;
+  std::copy_if(terminals.begin(), terminals.end(), std::back_inserter(body), [](auto const& t) {
+    return t.in_cte_body;
+  });
+  return body;
+}
+
+}  // namespace
+
+TEST_CASE("a proven outer-row read takes the walk into its delim CTE's body",
+          "[dynamic_filter][placement][discovery][cte_body]")
+{
+  auto tree = make_delim_cte({cte_reader_role::outer_row, cte_reader_role::key});
+
+  auto const terminals = trace_probe_key(*tree.root, /*a0=*/0, kSipOn);
+  auto const body      = in_body(terminals);
+  REQUIRE(body.size() == 1);
+  CHECK(body[0].node == tree.body_leaf);
+  CHECK(body[0].ordinal == 1);  // remapped by the body's projection
+  // The read keeps its own terminal, so an endpoint still filters it.
+  CHECK(std::any_of(terminals.begin(), terminals.end(), [&](auto const& t) {
+    return t.node == tree.outer_read && !t.in_cte_body && t.ordinal == 0;
+  }));
+}
+
+TEST_CASE("a delim CTE read without both proven roles keeps the walk out of the body",
+          "[dynamic_filter][placement][discovery][cte_body]")
+{
+  auto const roles = GENERATE(
+    // No proof at all (a plan replanned from SQL).
+    std::vector<cte_reader_role>{cte_reader_role::unknown, cte_reader_role::unknown},
+    // The other read is not the key read.
+    std::vector<cte_reader_role>{cte_reader_role::outer_row, cte_reader_role::unknown},
+    std::vector<cte_reader_role>{cte_reader_role::outer_row, cte_reader_role::outer_row},
+    // A third read appeared after the proof.
+    std::vector<cte_reader_role>{
+      cte_reader_role::outer_row, cte_reader_role::key, cte_reader_role::unknown});
+  auto tree = make_delim_cte(roles);
+
+  CHECK(in_body(trace_probe_key(*tree.root, /*a0=*/0, kSipOn)).empty());
+}
+
+TEST_CASE("a walk that starts below the delim CTE node never enters its body",
+          "[dynamic_filter][placement][discovery][cte_body]")
+{
+  // A join inside the CTE's rest, such as the join-back whose build reads the CTE, starts below the
+  // CTE node: the walk has not passed the CTE, so the read is only a terminal.
+  auto tree = make_delim_cte({cte_reader_role::outer_row, cte_reader_role::key});
+
+  auto const terminals = trace_probe_key(*tree.rest, /*a0=*/0, kSipOn);
+  REQUIRE(terminals.size() == 2);
+  CHECK(in_body(terminals).empty());
+}
+
+TEST_CASE("a delim CTE body that does not end in table scans gets no targets",
+          "[dynamic_filter][placement][discovery][cte_body]")
+{
+  auto tree = make_delim_cte({cte_reader_role::outer_row, cte_reader_role::key},
+                             /*body_ends_in_table_scan=*/false);
+
+  CHECK(in_body(trace_probe_key(*tree.root, /*a0=*/0, kSipOn)).empty());
 }

@@ -10,10 +10,10 @@ instead, and puts the values back at the far end by gathering them out of the pi
 works only for a **GPU-tier pinned** table — the values have to still exist somewhere
 addressable when the far end asks for them, and that is what the pin guarantees.
 
-## Turning it on (experimental)
+## Configuration
 
-```bash
-SIRIUS_EXP_LATE_MAT=1   # the gate; off = nothing below exists
+```sql
+SET enable_late_materialization = true; -- enabled by default; false disables deferrals
 ```
 
 The group-by-rowid ride and the riders need a key proven distinct over the pinned table. The pin
@@ -24,17 +24,22 @@ named: on TPC-H SF1000, q10's ride is admitted through `c_custkey`, and q5's and
 `nation.n_name`, with no further configuration.
 With `pin_table_prove_unique_keys = false` no column is proven and no ride or rider is admitted.
 
-Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
+Enabled by default and inert when disabled for the query. The census goes to the log under the `[late-mat]` tag, and
 every refusal says which refusal it was — a deferral that silently did not happen looks exactly
 like one that did nothing.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. |
-| `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
-| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
-| `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
-| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | = the ordinary floor | Separate floor for compressed origins. Inert until the decode-skip exists to measure. |
+| `enable_late_materialization` | true | Connection-local SQL master setting; also YAML `sirius.operator_params`. |
+| `late_materialization_min_boundaries` | 4 | Port crossings a ride must save. |
+| `late_materialization_min_value_x_boundaries` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
+| `late_materialization_count_defer` | false | Count-on-deferred (below). |
+| `late_materialization_min_value_compressed` | 1 | Separate floor for compressed origins; matches the ordinary floor by default. |
+
+All entries are connection-local SQL settings, also accepted under YAML
+`sirius.operator_params`. Integer thresholds must be nonnegative. Each query retains its own
+immutable snapshot; `RESET` restores the startup default and `SET GLOBAL` is rejected. The
+former `SIRIUS_EXP_LATE_MAT_*` environment controls in this table are no longer read.
 
 ## What a deferral is
 
@@ -68,9 +73,7 @@ hoping schemas differ: `install_rider` (`late_mat_plan_pass.cpp`) requires the m
 `expected_schema` to match the existing one at every position except the new rider's own, and
 `port_materialize_directive::valid()` re-checks self-consistency and position collisions before
 the merge is accepted. Two scans converging at one port get ONE directive with each side's rowid
-at its own fixed position — disambiguated structurally, not by a runtime schema coincidence. No
-code change identified as necessary; recorded here because the reasoning isn't obvious from the
-"schema equality is the entire identity check" statement alone.
+at its own fixed position — disambiguated structurally, not by a runtime schema coincidence.
 
 ## Which columns, and how far
 
@@ -163,11 +166,48 @@ NAME, since a re-pin that merges columns would make a positional attach mark the
 ## Filtered scans, and count-on-deferred
 
 A filtered batch is no longer the chunk's rows in order, so the rowid comes from the surviving
-row positions, taken from the same mask the scan filters with. It is refused where the survivors
-are decided somewhere this path cannot see them — a compressed pin filters inside the fused
-decode (see [Compressed Pinning](compressed-pinning.md)).
+row positions, taken from the same mask the scan filters with.
 
-Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
+**A batch off a compressed pin can be restricted twice.** The fused decode drops rows while
+decoding (see [Compressed Pinning](compressed-pinning.md)), and whatever conjuncts it could not
+carry are evaluated again on what it kept. Each stage reports positions in ITS OWN input, so the
+second stage's positions index the first stage's output rather than the chunk, and the pin-order
+rowid is only right once the two are composed — `compose_survivors`
+(`sirius_gpu_scan_operator.cpp`) gathers the decode's list by the residual's.
+
+The decode reports its half because it is asked to: a split carrying a deferral sets
+`late_mat_wants_survivors`, which `prepare_for_processing` turns into
+`decompression_pushdown_scan::with_survivor_reporting()`, and the decode then expands the
+selection mask it already balloted into an ascending INT32 index list
+(`pushdown_outcome::survivor_rows`). Off a deferring scan the decode does neither, so the cost is
+one index-list expansion plus 4 bytes per surviving row, paid only where a ride uses it.
+
+Admitting the shape is not the same as it paying. On TPC-H SF1000 (`bench/sf1000-repro`) it
+turns 84 structural refusals into ordinary policy decisions, and most of the newly reachable
+candidates are still withheld because a partition hashes them or refused on the
+value-times-crossings floor. The one that pays is q10's `customer` scan: it now defers five
+columns to the result collector on the group-by-rowid ride keyed by `c_custkey`, and q10 drops
+from 0.382 s to 0.215 s. Every other query is within noise, and suite time goes from 3.938 s /
+3.924 s to 3.771 s / 3.759 s (−4.3%, same build and machine, alternating runs).
+
+Both directions fail closed. A decode that compacted without accounting for its survivors throws
+rather than emit a rowid, at `prepare_for_processing` and again at substitution; a survivor list
+whose length does not match the rows handed on throws too. A scan whose INGESTIBLE cannot report
+survivors (the duckdb-native one filters with a plain select) is still refused at install, since
+the residual half would have nothing to say.
+
+Admission asks the port's own resolver (`resolve_pinned_layout` / `resolve_pinned_column`) about
+every deferred origin, primary bundle and riders alike, before it installs anything. Pinning
+narrows each chunk from its own range, so one column can be INT8 in one chunk and INT32 in the
+next; the port reads a deferred column at one width, so such a column is declined at plan time
+rather than failing at the port after the scan gave its values up.
+
+A deferring split never hands its freshly decoded table straight out of the cached wrapper.
+Substitution allocates the rowid after that point, so a direct steal would leave an
+out-of-memory retry nothing to re-read; the split takes the view-backed path and the wrapper keeps
+the decoded table until substitution commits.
+
+Dynamic membership filters do not meet a deferral during decode: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint applies those filters after substitution instead. Should a deferring scan's decode remove rows without reporting its survivors, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
 
 With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
 
@@ -180,17 +220,20 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 
 - A column an outer join could null is withheld: a null rowid must materialize a null, which the
   materializer does not do yet.
-- A nullable PINNED SOURCE column is admitted for any uncompressed origin (single-batch,
-  multi-batch fixed-width, or multi-batch variable-width — every such gather path propagates
-  validity). A compressed origin is refused UNCONDITIONALLY, whether or not it actually has any
-  nulls: per-column nullability inside a Simpatico-compressed blob is opaque (see
-  [Compressed Materialization](compressed-materialization.md)), so nothing upstream of the
-  install-time gate can tell "no nulls" apart from "unknown," and the gate treats both as unsafe.
-  `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
-  output validity buffer — but that is a secondary reason and moot in practice, since a compressed
-  origin never reaches them today.
-- Admitting compressed origins would not make them pay on their own: the scan substitutes on the FINISHED output, so a deferred column from a compressed pin would be decompressed and then discarded. A deferring scan's decode would also give up dynamic membership compaction (`decode_consumer` withholds the probes).
-- Filtered scans of compressed pins are refused (above). Lifting that refusal, and the lost membership compaction above, both need a decode that reports its survivor positions (or a cached-view checkpoint that gathers a row-index sequence with its residual mask); that one capability would lift both limits together.
+- A nullable PINNED SOURCE column is admitted for any origin whose gather path propagates
+  validity, which is now every one of them. The uncompressed shapes (single-batch, multi-batch
+  fixed-width, multi-batch variable-width) do it natively. A COMPRESSED origin does it through
+  the validity sidecar compression stores beside each column's plan tree: the count is readable
+  from the `.hpln` header without decoding (`simpatico::column_null_count`), so the install gate
+  can tell "no nulls" apart from "unknown", and the decode routes reattach the mask
+  (`materialize.cpp`'s `attach_selected_validity`). The two COMPACTING routes gather the stored
+  bitmask by the same rows they selected the values by — the mask describes the whole chunk while
+  a compacted output holds only the selection, so copying it verbatim would pair each value with
+  another row's validity. A chunk carrying no blob still answers nothing and is refused.
+- A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
+  deferred column from a compressed pin is decompressed and then discarded. A deferring scan's
+  decode also gives up dynamic membership compaction (`decode_consumer` withholds the probes),
+  although the decode's survivor reporting above is what lifting that would need.
 - Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
   both ways: underestimating a wide column can refuse a bundle that would have qualified, but
   overestimating a short one can just as easily admit a bundle that does not actually repay (a

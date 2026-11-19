@@ -22,6 +22,7 @@
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "memory/device_transfer.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
@@ -175,7 +176,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
 }
 
 /// Put a deferred bundle's values back, just before the operator that reads
-/// them runs (env gate: SIRIUS_EXP_LATE_MAT, via the directive being installed).
+/// them runs (query setting: enable_late_materialization, via the directive being installed).
 ///
 /// Null means "use the input as it is": this operator carries no consuming half,
 /// or the batches are not the ones the directive was installed for. A port can
@@ -260,10 +261,11 @@ void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipelin
 
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
-  const op::operator_data& operator_input_data,
+  op::operator_data& operator_input_data,
   ::cuda::stream_ref stream,
   const sirius_pipeline* pipeline,
   uint64_t task_id,
+  op::delivery_metadata delivery,
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator,
   cucascade::memory::memory_space const* host_staging_space)
@@ -280,8 +282,11 @@ std::unique_ptr<op::operator_data> run_one_operator(
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
     materialized = materialize_deferred_input(op, operator_input_data, stream, host_staging_space);
-    auto const& effective_input = materialized ? *materialized : operator_input_data;
-    operator_output_data        = op.execute(effective_input, stream);
+    auto& effective_input = materialized ? *materialized : operator_input_data;
+    // Stamp after materialization: a replacement payload need not copy metadata
+    // from its source. Never trust metadata inherited from an upstream task.
+    effective_input.set_delivery(delivery);
+    operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
     // Both the original input and any restored deferred input are still alive here. Quiesce the
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
@@ -455,6 +460,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
   if (not pipeline) { throw std::invalid_argument("task global state has null pipeline"); }
+  op::delivery_metadata const delivery{local_state.original_task_id.value_or(get_task_id()),
+                                       local_state.retry_count};
   auto operators   = pipeline->get_operators();
   auto start_index = local_state._start_operator_index;
 
@@ -510,12 +517,23 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
                                      thrust::cuda_category(),
                                      "injected GPU task launch failure");
       }
+      if (auto* scan_input =
+            dynamic_cast<op::scan::scan_operator_input*>(operator_input_output_data.get())) {
+        scan_input->execution.attempt = uint64_t{local_state.retry_count} + 1;
+        // Retry tasks retain the original task identity; allocator addresses
+        // can be reused by a later input in the same scan.
+        scan_input->execution.logical_input =
+          local_state.original_task_id.value_or(get_task_id()) + 1;
+        if (auto completion = get_completion_handler())
+          scan_input->execution.stop = completion->execution_stop_token();
+      }
       operator_input_output_data = run_one_operator(
         op,
         *operator_input_output_data,
         stream,
         pipeline,
-        _task_id,
+        get_task_id(),
+        delivery,
         operators.size(),
         _allocator,
         _global_state->cast<gpu_pipeline_task_global_state>().get_host_staging_space());
@@ -736,6 +754,18 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();
+  } catch (const memory::host_staging_out_of_memory& oom) {
+    // A copy from another GPU ran out of pinned HOST staging, not of this task's GPU memory: a
+    // larger GPU reservation would not help, and the attempt's peak says nothing about the
+    // input's GPU needs. Retry once other copies have returned their staging, leaving the retry
+    // floor and the memory history as they are.
+    SIRIUS_LOG_WARN("Pipeline {}: HOST staging exhausted preparing batches for processing: {}",
+                    pipeline->get_pipeline_id(),
+                    oom.what());
+    throw oom_reschedule_exception(
+      std::move(local_state._input_data),
+      local_state._start_operator_index,
+      std::string("HOST staging exhausted while preparing batches for processing: ") + oom.what());
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
