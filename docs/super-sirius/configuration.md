@@ -376,7 +376,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built from the startup mask the CPUs were planned from, so it pins the same way. |
-| `httpfs_external_file_cache` | bool | true | Whether DuckDB's external file cache (EFC) may keep what DuckDB reads through Sirius's S3 file system: bind-time footer reads and the CPU Parquet delete reader. DuckDB may fetch an object no larger than its remote cache block (`external_file_cache_remote_max_block_size`, 2 MiB by default) whole; after a footer probe this requires another data GET when the whole-file range is not already in the stash. With `false`, DuckDB requests the needed ranges and retains no EFC byte blocks; the probe stash and metadata caches remain separate. ETag and size checks are unaffected, and so is DuckDB's `enable_external_file_cache` for other file systems. Taken when a file is opened: set it in the configuration the database starts with. GPU Parquet column-data reads use cuCascade directly and are not affected. |
+| `httpfs_external_file_cache` | bool | true | Whether DuckDB's external file cache (EFC) may keep what DuckDB reads through Sirius's S3 file system: bind-time footer reads, the footer-statistics pass with `sirius_analyze_parquet` and `pin_table` warming, and the CPU Parquet delete reader. DuckDB may fetch an object no larger than its remote cache block (`external_file_cache_remote_max_block_size`, 2 MiB by default) whole; after a footer probe this requires another data GET when the whole-file range is not already in the stash. With `false`, DuckDB requests the needed ranges and retains no EFC byte blocks; the probe stash and metadata caches remain separate. ETag and size checks are unaffected, and so is DuckDB's `enable_external_file_cache` for other file systems. Taken when a file is opened: set it in the configuration the database starts with. GPU Parquet column-data reads use cuCascade directly and are not affected. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -1031,15 +1031,17 @@ size, inode and modification time are unchanged, but never while that time is le
 old (the rule DuckDB's own file caches use), and while an S3 object's size and strong ETag are
 unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
 these, so checking costs no request; a local file listed without them (an explicit file list) costs
-one `stat`. A scan's merged statistics are kept with the per-file statistics they were made from and
-reused until one of those files changes, one entry per set of paths a scan is given (at most 128),
+one `stat`. A scan's merged statistics are kept with the ids of the per-file statistics they were
+made from and reused while the cache still answers every file with those statistics,
+one entry per set of paths a scan is given (at most 128),
 so a glob that gains files replaces its entry; footers that must be read are read in parallel on DuckDB's
 worker threads. Scans with
 `union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
 `delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
 to 0.50 s).
 
-The footers are read when a query first scans the files, unless they were read ahead:
+The footers are read when a query scans files whose statistics are not cached, unless they were
+read ahead or a read limit skips the scan:
 `pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads
 those of any path or glob, including `s3://` globs, returning the number of files read (an error when nothing matches).
 Reading ahead moves the cost, about 0.2 s for the 60 `lineitem` files at SF1000, from the first
@@ -1053,21 +1055,21 @@ files apart. If either count is over its limit the scan is planned as DuckDB bou
 read and the scan gets neither statistics nor a footer row count. It is all or nothing because the
 statistics of some files are not statistics of the scan. A remote file named in an explicit list,
 which the listing did not describe, counts as a read even when cached, since checking it takes a
-request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file, and
-only the records that fit the cache remain cached. The two SQL settings are per connection;
-`SET GLOBAL` and `RESET GLOBAL` are refused, and the engine-wide values come from the YAML.
+request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file. The
+two SQL settings are per connection; `SET GLOBAL` and `RESET GLOBAL` are refused, and the
+engine-wide values come from the YAML.
 
-The cache keeps the statistics of at most 16,384 files, least recently used first out, and merged
-statistics made from at most 16,384 files in all. A read limit bounds misses, not the total scan
-size or future cache residency. An oversized scan can still be admitted through partial hits and
-need repeated reads and merging. A scan's footer row count belongs to the plan whose planning
+The statistics of every file read stay cached, for each set of reader options, so the cache grows
+with the number of distinct files scanned. They have no capacity limit: with the default
+unlimited read limits, a limit would make scans that together use more files than it holds read
+the excess again at every planning. A read limit bounds misses, not the total scan size. A scan's
+footer row count belongs to the plan whose planning
 covered the scan, and to the copies Sirius makes of that plan; another statement over the same
 paths does not supply it. It is unknown when `parquet_footer_statistics` is off, when a limit is
 exceeded, when a footer cannot be read, and when DuckDB replaces the scan's file list while
-optimizing, as partition pruning does. A successfully collected count is retained for its owning
-scan and propagated Sirius copies without capacity eviction, while their file-list bindings remain
-valid. The documented opt-out, failure and optimizer replacement/copy cases still yield an unknown
-count; expired association metadata is reclaimed lazily.
+optimizing, as partition pruning does. A collected count is kept, without a capacity limit, while
+the plan or a Sirius copy holding the scan's file list exists; it is also missing when DuckDB
+copies a scan while optimizing. Entries of file lists that are gone are dropped lazily.
 
 ```sql
 SELECT files FROM sirius_analyze_parquet('/data/tpch_sf1000/lineitem/*.parquet');

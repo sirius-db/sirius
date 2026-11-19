@@ -37,8 +37,10 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/planner.hpp>
 #include <duckdb/storage/external_file_cache/external_file_cache.hpp>
 #include <unistd.h>
 
@@ -950,7 +952,8 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
   FooterAdmissionFixture,
-  "Footer admission withdraws an old row total after growth disable or failure",
+  "Footer admission: a later plan does not inherit an earlier row total after growth, disable or "
+  "failure",
   "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]")
 {
   auto const transition = std::string(GENERATE("growth", "disabled", "failure"));
@@ -2016,4 +2019,112 @@ TEST_CASE_METHOD(
   CHECK(observed->visits == 1);
   sirius::test::require_transparent_execution_delta(
     before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
+}
+
+namespace {
+
+std::vector<duckdb::LogicalGet const*> footer_parquet_gets(duckdb::LogicalOperator const& plan)
+{
+  std::vector<duckdb::LogicalGet const*> gets;
+  auto visit = [&](auto const& self, duckdb::LogicalOperator const& op) -> void {
+    if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+      auto const& get  = op.Cast<duckdb::LogicalGet>();
+      auto const& name = get.function.GetName().GetIdentifierName();
+      if (name == "read_parquet" || name == "parquet_scan") { gets.push_back(&get); }
+    }
+    for (auto const& child : op.children) {
+      self(self, *child);
+    }
+  };
+  visit(visit, plan);
+  return gets;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(
+  FooterAdmissionFixture,
+  "Footer admission at the default capacities plans two multi-file scans again "
+  "without a footer read",
+  "[integration][gpu_execution][parquet_footer_statistics][footer_admission_feature]")
+{
+  add_files(4);
+  auto const query = "SELECT a.x, b.x FROM read_parquet(['" + file(0) + "', '" + file(1) +
+                     "']) a CROSS JOIN read_parquet(['" + file(2) + "', '" + file(3) +
+                     "']) b WHERE a.y IS NOT NULL";
+  footer_detail::clear_caches_for_testing();
+  auto before = footer_detail::footer_read_count();
+  auto first  = plan(query);
+  CHECK(footer_detail::footer_read_count() - before == 4);
+  auto const first_scans = footer_parquet_gets(*first);
+  REQUIRE(first_scans.size() == 2);
+  before      = footer_detail::footer_read_count();
+  auto second = plan(query);
+  CHECK(footer_detail::footer_read_count() == before);
+  auto const second_scans = footer_parquet_gets(*second);
+  REQUIRE(second_scans.size() == 2);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CAPTURE(i);
+    auto const& bind = second_scans[i]->bind_data->Cast<duckdb::MultiFileBindData>();
+    CHECK_FALSE(bind.file_options.column_statistics.IsNull());
+    auto const& earlier = first_scans[i]->bind_data->Cast<duckdb::MultiFileBindData>();
+    CHECK(bind.file_options.column_statistics == earlier.file_options.column_statistics);
+    CHECK(sirius::transparent::parquet_scan_row_count(*second_scans[i]) ==
+          std::optional<std::size_t>{200});
+  }
+  CHECK(footer_detail::statistics_cache_size() == 4);
+  CHECK(footer_detail::merged_statistics_cache_size() == 2);
+  CHECK(footer_detail::merged_reference_count() == 4);
+}
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer fix evicts the least recently used statistics, not the oldest",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]")
+{
+  add_files(3);
+  (void)footer_detail::set_cache_capacities_for_testing({2, 128, 2});
+  auto reads = [&](int index) {
+    auto const before = footer_detail::footer_read_count();
+    auto result       = plan("SELECT x FROM read_parquet('" + file(index) + "')");
+    check_footer_scan(*result, 1, 100);
+    return footer_detail::footer_read_count() - before;
+  };
+  warm({0});
+  warm({1});
+  CHECK(reads(0) == 0);
+  // f1 is now the least recently used and f0 the oldest entry.
+  warm({2});
+  CHECK(footer_detail::statistics_cache_size() == 2);
+  CHECK(reads(0) == 0);
+  CHECK(reads(1) == 1);
+}
+
+TEST_CASE_METHOD(FooterAdmissionFixture,
+                 "Footer fix withdraws the row total of a planned scan when it is collected again",
+                 "[integration][gpu_execution][parquet_footer_statistics][footer_admission_fix]")
+{
+  auto const second_pass = std::string(GENERATE("limited", "disabled"));
+  CAPTURE(second_pass);
+  auto covered = plan();
+  REQUIRE(footer_fix_rows(*covered) == std::optional<std::size_t>{200});
+  auto const reads = footer_detail::footer_read_count();
+  if (second_pass == "limited") {
+    // No cached statistics, so both files are misses over the limit.
+    (void)footer_detail::set_cache_capacities_for_testing({0, 128, 0});
+    local_limit(0);
+    CHECK(footer_fix_collect(*con, *covered) == 0);
+  } else {
+    run_ok("SET gpu_execution=false");
+    run_ok("SET parquet_footer_statistics=false");
+    con->BeginTransaction();
+    duckdb::Planner planner(*con->context);
+    duckdb::Optimizer optimizer(*planner.binder, *con->context);
+    duckdb::OptimizerExtensionInput input{*con->context, optimizer, nullptr};
+    sirius::transparent::sirius_pre_optimizer_hook(input, covered);
+    con->Commit();
+    run_ok("SET gpu_execution=true");
+  }
+  REQUIRE(covered);
+  CHECK(footer_detail::footer_read_count() == reads);
+  CHECK_FALSE(footer_fix_rows(*covered));
 }

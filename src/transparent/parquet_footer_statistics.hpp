@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -76,10 +77,9 @@ struct footer_read_limits {
 /// does a scan whose file list DuckDB replaced while optimizing. A copy of the plan has it only
 /// through copy_parquet_scan_row_count.
 ///
-/// A successfully collected count is retained for its owning scan and propagated Sirius copies
-/// without capacity eviction, while their file-list bindings remain valid. The documented opt-out,
-/// failure and optimizer replacement/copy cases still yield an unknown count; expired association
-/// metadata is reclaimed lazily.
+/// A count is kept, without a capacity limit, while the scan's file list, or the list of a copy
+/// that received it through copy_parquet_scan_row_count, is alive; entries of lists that are gone
+/// are dropped lazily.
 [[nodiscard]] std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get);
 
 /// \brief Make the row count of every Parquet scan in \p plan unknown.
@@ -107,7 +107,12 @@ struct cache_capacities {
   std::size_t merges;      ///< Merged statistics kept.
   std::size_t merge_references;  ///< Files all kept merged statistics were merged from, together.
 };
-inline constexpr cache_capacities default_cache_capacities{16'384, 128, 16'384};
+/// No capacity limit.
+inline constexpr std::size_t unbounded = std::numeric_limits<std::size_t>::max();
+/// No limit on per-file statistics or on the files merged statistics refer to: with the read
+/// limits unlimited by default, scans that together exceed a limit would read or merge the excess
+/// again at every planning.
+inline constexpr cache_capacities default_cache_capacities{unbounded, 128, unbounded};
 /// The most sets of scan paths whose merged statistics are kept.
 inline constexpr std::size_t merged_statistics_cache_capacity = default_cache_capacities.merges;
 /// The number of scans whose merged statistics are cached, for tests.

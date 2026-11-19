@@ -5,10 +5,12 @@
 # See the LICENSE file at the repo root for the full text.
 """Run hidden footer-cache allocation tests with the existing opt-in new helper.
 
-The x86 GCC build inlines the insertions. Select the return PC of the allocation
-before the LRU hook, and of the merged-map and row-count nodes before their rehash
-checks. Require the named containers at those sites; fail on missing or ambiguous
-matches. No node sizes, private layouts, or fixed binary addresses are assumed.
+The sites are selected in x86-64 GCC code, where the build inlines the insertions:
+the return PC of the allocation before the LRU hook, and of the merged-map and
+row-count nodes before their rehash checks. On any other machine the script exits
+with an error before it reads the binary. It requires the named containers at those
+sites and fails on missing or ambiguous matches. No node sizes, private layouts, or
+fixed binary addresses are assumed.
 """
 
 import argparse
@@ -16,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import subprocess
 
@@ -78,6 +81,12 @@ def main():
     parser.add_argument("--helper", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if platform.machine() != "x86_64":
+        parser.exit(
+            2,
+            f"{parser.prog}: the allocation sites are selected in x86-64 GCC code; "
+            f"this machine is {platform.machine()}\n",
+        )
     binary = args.binary.resolve()
     helper = (
         args.helper or binary.parents[2] / "libsirius_host_allocation_fault.so"

@@ -67,16 +67,18 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * params.scan_task_batch_size);
 }
 
-TEST_CASE("Footer admission starts unlimited with joint cache retention defaults",
+TEST_CASE("Footer admission starts unlimited with no per-file or reference cache capacity",
           "[config_opt][parquet_footer_statistics][footer_admission_feature]")
 {
   operator_params const params;
   CHECK(params.parquet_footer_statistics_max_remote_reads == -1);
   CHECK(params.parquet_footer_statistics_max_local_reads == -1);
+  using sirius::transparent::detail::unbounded;
+  CHECK(unbounded == std::numeric_limits<std::size_t>::max());
   auto const capacities = sirius::transparent::detail::default_cache_capacities;
-  CHECK(capacities.statistics == 16'384);
+  CHECK(capacities.statistics == unbounded);
   CHECK(capacities.merges == 128);
-  CHECK(capacities.merge_references == 16'384);
+  CHECK(capacities.merge_references == unbounded);
 }
 
 TEST_CASE("Footer admission YAML loads limits and rejects unsupported negative values",

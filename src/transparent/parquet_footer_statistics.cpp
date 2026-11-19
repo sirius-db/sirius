@@ -616,8 +616,10 @@ std::optional<std::size_t> parquet_scan_row_count(duckdb::LogicalGet const& get)
       return found->second.rows;
     }
   }
-  SIRIUS_LOG_DEBUG("No footer row count for the Parquet scan at table index {}",
-                   get.table_index.index);
+  sirius::log::log_noexcept([&] {
+    SIRIUS_LOG_DEBUG("No footer row count for the Parquet scan at table index {}",
+                     get.table_index.index);
+  });
   return std::nullopt;
 }
 

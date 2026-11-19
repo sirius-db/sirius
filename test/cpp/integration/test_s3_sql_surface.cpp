@@ -1811,6 +1811,33 @@ TEST_CASE("Footer admission treats weak and missing remote validators as repeate
   check_remote_footer(*skipped, 2, std::nullopt);
 }
 
+TEST_CASE("Footer admission counts cached remote files of an explicit list as reads",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  set_gpu_execution(fixture.con, true);
+  for (auto const& path : files.remote) {
+    auto analyzed = require_query_ok(
+      fixture.con, "SELECT files FROM sirius_analyze_parquet(" + sql_quote(path) + ")");
+    CHECK(analyzed->Collection().GetValue(0, 0).GetValue<uint64_t>() == 1);
+  }
+  REQUIRE(remote_footer_detail::statistics_cache_size() == 2);
+  auto const before = remote_footer_detail::footer_read_count();
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=1");
+  auto skipped = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(skipped);
+  check_remote_footer(*skipped, 2, std::nullopt);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  auto admitted = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(admitted);
+  check_remote_footer(*admitted, 2, 200);
+  CHECK(remote_footer_detail::footer_read_count() == before);
+}
+
 TEST_CASE("Footer admission inherits the remote engine cap until a connection overrides it",
           "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
 {
