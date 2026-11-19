@@ -1,7 +1,9 @@
 # GB300 TPC-H benchmark snapshots
 
-These are the selected GB300 measurements at Sirius commit
-`1dbb366baaf7bd26325ede685346ecb6d5fe7692`. The cold/hot/per-query-pin
+These are the selected GB300 measurements, primarily at Sirius commit
+`1dbb366baaf7bd26325ede685346ecb6d5fe7692`. The SF1000 host-pin result
+was updated from a run on commit `220d1447a60f443745f53196fc6c4bbd85478075`.
+The cold/hot/per-query-pin
 snapshot uses one GPU and TPC-H Parquet at SF100, SF300, SF1000, SF3000, and SF10000; the
 concurrency snapshot below covers SF100, SF300, and SF1000. The configs are in
 `bench/gb300-cold/`,
@@ -27,7 +29,7 @@ enabled. These config updates do not constitute a benchmark rerun.
 | ---: | ---: | ---: | ---: |
 | SF100 | 7.862 / 7.777 | 6.484 / 5.532 | 1.612 |
 | SF300 | 20.477 / 20.386 | 15.258 / 13.389 | 3.273 |
-| SF1000 | 65.080 / 65.099 | 47.432 / 40.771 | 9.376 |
+| SF1000 | 65.080 / 65.099 | 47.432 / 40.771 | 7.017 |
 | SF3000 | 195.736 / 195.548 | 149.854 / 119.086 | 28.740 |
 | SF10000 | 767.324 / 783.834 | 777.722 / 740.332 | Unavailable: Q13 host pin failed |
 
@@ -46,18 +48,21 @@ The SF100, SF300, SF1000, and SF3000 pin results use `bench/gb300-pin/config.yam
 iteration, per-query host pinning, and Simpatico input compression. The pinned
 `lineitem` and `orders` plans are the repository's
 `src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt` and
-`orders.txt`. To replay that explicit-plan-only setup on current Sirius, set
+`orders.txt`. To replay the explicit-plan-only setup on current Sirius, set
 `SIRIUS_PIN_COMPRESSION_TABLES=lineitem,orders` when running `performance_test.py`;
 the other six tables then pin uncompressed instead of using newly available
-automatic plans. All 22 queries completed on Sirius without CPU fallback in those
+automatic plans. The updated SF1000 run used that allowlist and the saved pin
+config; its 22 query times sum to 7.017410 s. All 22 queries completed on Sirius
+without CPU fallback in the four
 four selected runs. At SF10000, per-query host pinning failed before Q13 executed:
 the 450 GiB host pool ran out of blocks after a 448.12 GiB lifetime peak. There
 is no selected SF10000 pin timing to report.
 
 Each `sf*/` directory contains the selected per-query CSVs. `manifest.json`
 records the exact totals, config paths, checksums, and the SF10000 pin failure.
-CSV line endings were normalized from CRLF to LF without changing the values;
-the manifest retains both the original and repository checksums.
+CSV line endings were normalized from CRLF to LF; the manifest retains both the
+original snapshot and current checksums. The SF1000 pin CSV is the selected
+replacement, with its source, runner, and binary hashes recorded separately.
 The later SF10000 fresh-instance cold rerun remains outside this snapshot.
 SF100 and SF300 were copied to the same RAID dataset mount as the larger scales
 before their six runs. They used the same Sirius source commit, binary, configs,
