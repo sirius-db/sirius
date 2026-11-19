@@ -56,6 +56,8 @@ namespace sirius::op {
  * `accumulations_declined_port_directive` (a late-materialization directive),
  * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
  * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
+ * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because
+ * no Consumer would select it over the filters already on its Channels.
  * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was
  * sized on every row and no exact IN-list was considered. `filters_skipped_construction_invariant`
  * counts filters dropped because staging found more valid rows than the inventory recorded;
@@ -95,6 +97,7 @@ struct dynamic_filter_counters {
   Counter accumulation_publications_host_staged{};
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
+  Counter keys_skipped_shadowed{};
   Counter keys_skipped_bloom_unsupported{};
   Counter keys_sized_on_total_rows{};
   Counter filters_skipped_construction_invariant{};
@@ -152,6 +155,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
+  &dynamic_filter_counters<Counter>::keys_skipped_shadowed,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
   &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
   &dynamic_filter_counters<Counter>::filters_skipped_construction_invariant,

@@ -55,6 +55,7 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <expression/ast/utils.hpp>
+#include <op/dynamic_filter/construction_plan.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
 #include <op/dynamic_filter/detail/accumulation_failure.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
@@ -5316,4 +5317,76 @@ TEST_CASE("cached fusion retires submitted residual reads on host preflight fail
       consumer_test_access::gate(consumer), {first.get(), 0}, 2));
   }
   REQUIRE(allocations.get_bytes_counter().value == 0);
+}
+
+TEST_CASE("the Consumer passes over the filter of a key the Construction Plan calls shadowed",
+          "[dynamic_filter][scan_merge][shadow]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  namespace op              = sirius::op;
+
+  // `published` is on the Channel; `candidate` is the filter a later Construction would add. Both
+  // carry Proven Estimates, as `read_published_filters` requires of anything that shadows.
+  auto const judge = [&](std::shared_ptr<op::sirius_dynamic_in_list_filter> const& published,
+                         std::shared_ptr<op::sirius_dynamic_in_list_filter> const& candidate,
+                         std::size_t decode_cap) {
+    op::key_plan planned{};
+    planned.candidate = op::facts_of(*candidate);
+    std::vector<op::binding_facts> const bindings{
+      {.probe_type       = cudf::data_type{cudf::type_id::INT64},
+       .accepts_zone_map = true,
+       .published        = {op::facts_of(*published)}}};
+    return op::is_shadowed(planned, bindings, decode_cap);
+  };
+  auto filters = std::make_shared<sirius_dynamic_filter_set>();
+  std::vector<binding> const decode_bindings{{0, 0}, {1, 1}};
+  dynamic_filter_consumer decode(filters, {}, decode_bindings);
+  dynamic_filter_consumer endpoint(
+    filters, {.mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS}, {});
+  auto producer = filters->register_producer({0, 1});
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_sequence_column<int64_t>(100, stream));
+  columns.push_back(make_sequence_column<int64_t>(100, stream, 99, -1));
+  auto table = std::make_shared<cudf::table>(std::move(columns));
+
+  SECTION("shadowed: the decode prefers the published filter and the endpoint skips the other")
+  {
+    // The published filter keeps rows 0..9; the candidate keeps rows 9..99 of the reversed column
+    // and so would remove 9% of a batch at most.
+    auto published = make_in_list_prefix(10, stream);
+    auto candidate = make_in_list_prefix(91, stream);
+    published->set_estimated_selectivity(0.10, true);
+    candidate->set_estimated_selectivity(0.91, true);
+    REQUIRE(judge(published, candidate, 1));
+    REQUIRE_FALSE(judge(published, candidate, 2));
+
+    REQUIRE(producer.push_filter(0, published));
+    REQUIRE(producer.push_filter(1, candidate));
+    auto const selection = decode.select_for_decode(decode_bindings);
+    REQUIRE(selection.steps.size() == 2);
+    // One Filtered Decode slot goes to the published filter, a second would carry the candidate.
+    CHECK(selection.steps[0].representative.filter == published);
+    CHECK(selection.steps[1].representative.filter == candidate);
+    // Applying both filters would keep row 9 only.
+    auto out = apply_consumer(endpoint, table, stream);
+    stream.sync();
+    REQUIRE(out != nullptr);
+    CHECK(out->num_rows() == 10);
+  }
+  SECTION("not shadowed: the decode prefers the candidate although the published one is stronger")
+  {
+    // The published filter has more keys but the stronger estimate; the decode orders by key count.
+    auto published = make_in_list_prefix(91, stream);
+    auto candidate = make_in_list_prefix(10, stream);
+    published->set_estimated_selectivity(0.01, true);
+    candidate->set_estimated_selectivity(0.50, true);
+    REQUIRE_FALSE(judge(published, candidate, 1));
+
+    REQUIRE(producer.push_filter(1, published));
+    REQUIRE(producer.push_filter(0, candidate));
+    auto const selection = decode.select_for_decode(decode_bindings);
+    REQUIRE(selection.steps.size() == 2);
+    CHECK(selection.steps[0].representative.filter == candidate);
+  }
 }

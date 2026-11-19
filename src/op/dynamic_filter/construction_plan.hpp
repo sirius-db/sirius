@@ -26,6 +26,12 @@
  * `membership_same_family`), so a key gets the filter the whole-build path would choose for the
  * same rows. Building the planned filters is the mechanism's job; the policy touches no GPU, memory
  * space, or channel.
+ *
+ * The policy also plans no membership filter for a Shadowed Key (`is_shadowed`): a key whose filter
+ * no Consumer would select over the Membership Filters already published on its Channels. It judges
+ * with the Consumer's own Static Selection (`static_filter_selection.hpp`). What is already
+ * published reaches the policy as plain values too: `read_published_filters` is the one function
+ * that reads Channels, and a caller that does not call it gets the plan without the rule.
  */
 
 #pragma once
@@ -35,6 +41,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/dynamic_filter/static_filter_selection.hpp"
 
 #include <cudf/types.hpp>
 
@@ -55,6 +62,7 @@ struct construction_limits {
   bool emit_zone_map_filters;             ///< Whether zone maps are enabled
   double domain_coverage_threshold;       ///< The domain gate's coverage threshold
   std::uint64_t max_bloom_bytes_per_gpu;  ///< Cap on the sum of every Bloom key's aligned array
+  std::size_t decode_membership_cap = 1;  ///< Membership Filters one Filtered Decode carries
 };
 
 /**
@@ -63,13 +71,39 @@ struct construction_limits {
 struct binding_facts {
   cudf::data_type probe_type;  ///< The binding's recorded probe type; EMPTY when unknown
   bool accepts_zone_map;       ///< Whether the binding's target accepts zone maps
+  std::vector<static_filter_facts>
+    published;  ///< Membership Filters already on the binding's Channel, in no particular order
 };
 
 /**
  * @brief The facts of every binding of every admitted key of `plan`, by admitted-key index
+ *
+ * `binding_facts::published` is left empty; `read_published_filters` fills it.
  */
 [[nodiscard]] std::vector<std::vector<binding_facts>> binding_facts_of(
   dynamic_filter_publish_plan const& plan);
+
+/**
+ * @brief Fills each binding's `binding_facts::published` from one snapshot of its Channel
+ *
+ * A filter counts when a Consumer on any of the plan's replica GPUs is certain to hold it, so that
+ * a key shadowed by it is never left with neither filter:
+ * - only Membership Filters count, each filter object once per Channel;
+ * - only filters with a Replica on every GPU of `plan.replica_spaces()`: on a GPU that lacks the
+ * published filter a Consumer would use the new one;
+ * - an estimate that is not a Proven Estimate is dropped, so its filter can take a Filtered Decode
+ * slot but cannot make another filter negligible.
+ *
+ * A filter that is only planned or announced never counts: it may still fail, whereas a Channel is
+ * append-only and a published filter stays. Under a cross-rank merge nothing counts, because this
+ * process's rows are not the merged filter's keys and the ranks must plan the same filters.
+ *
+ * @throw std::logic_error if @p bindings was not taken from `binding_facts_of(plan)`
+ * @param plan The plan whose Channels are read
+ * @param bindings The plan's `binding_facts_of`, updated in place
+ */
+void read_published_filters(dynamic_filter_publish_plan const& plan,
+                            std::span<std::vector<binding_facts>> bindings);
 
 /**
  * @brief An exact IN-list over the key's valid rows.
@@ -107,12 +141,29 @@ struct key_plan {
   bool zone_map;                      ///< Whether a zone map is planned
   bool zone_map_deliverable;          ///< Whether some binding accepts the planned zone map
   bool fit_pending;                   ///< DECIMAL128 membership publishes only if bounds fit int64
+  static_filter_facts candidate{};    ///< The planned membership filter as Consumers will see it
 
   /**
    * @brief Whether the key's bounds must be accumulated
    */
   [[nodiscard]] bool needs_bounds() const noexcept { return zone_map || fit_pending; }
 };
+
+/**
+ * @brief Whether @p key is a Shadowed Key: no Consumer would select its planned membership filter
+ * on any of its bindings
+ *
+ * Only a key whose `key_plan::candidate` carries a Proven Estimate is judged, and it is shadowed
+ * only when `statically_selected` is false on every binding. One binding whose Consumer could
+ * select the filter builds it for all.
+ *
+ * @param key The key, with its planned membership filter
+ * @param bindings The key's bindings, with `binding_facts::published` filled
+ * @param decode_membership_cap `construction_limits::decode_membership_cap`
+ */
+[[nodiscard]] bool is_shadowed(key_plan const& key,
+                               std::span<binding_facts const> bindings,
+                               std::size_t decode_membership_cap) noexcept;
 
 /**
  * @brief The plan for every admitted key with a binding
@@ -144,7 +195,10 @@ struct construction_plan {
  * 5. Membership follows `choose_membership_filter` over the valid rows. With an unknown null count
  * only a Bloom filter sized on every row is planned (`keys_sized_on_total_rows`). DECIMAL128 plans
  * as if it fits, with `fit_pending`.
- * 6. When the Bloom keys' aligned arrays exceed `construction_limits::max_bloom_bytes_per_gpu`,
+ * 6. A Shadowed Key (`is_shadowed`) drops its membership (`keys_skipped_shadowed`) and keeps its
+ * zone map. It is judged before the Bloom cap, so its array never pushes the other keys over the
+ * cap.
+ * 7. When the Bloom keys' aligned arrays exceed `construction_limits::max_bloom_bytes_per_gpu`,
  * every Bloom key drops its membership (`keys_skipped_bloom_size_gate`).
  *
  * Keys left with neither membership nor bounds are omitted from `construction_plan::keys` but keep

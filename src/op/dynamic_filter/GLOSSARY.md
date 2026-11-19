@@ -53,6 +53,21 @@ A Consumer's learned verdict (unknown, active, or disabled) on whether applying 
 off, judged from the fraction of rows they keep.
 _Avoid_: keep-ratio gate, consumer gate, gate
 
+**Static Selection**:
+A Consumer's choice among a Channel's Membership Filters before it has measured them: which ones
+Filtered Decode carries, and which of the rest the Negligible-Share Rule skips.
+_Avoid_: static gate, prior
+
+**Negligible-Share Rule**:
+The part of Static Selection that skips a Membership Filter estimated to remove less than a tenth of
+a batch once the filters estimated stronger have been applied.
+_Avoid_: negligible removed share (as the rule's name), weak-filter skip
+
+**Proven Estimate**:
+A Membership Filter's estimated kept share that is the exact share of its key's value domain: the
+build key is unique by proof or backed declaration and its null count is known.
+_Avoid_: reliable estimate
+
 ### Keys
 
 **Admitted Key**:
@@ -166,6 +181,12 @@ _Avoid_: accumulation (for the process), one-shot, whole build
 
 **Construction Plan**:
 The choice, from the Complete Build Inventory, of each Admitted Key's filter kinds and sizes.
+
+**Shadowed Key**:
+An Admitted Key whose Membership Filter no Consumer's Static Selection would take over the filters
+already published on its Channels, judged on Proven Estimates only; its Construction Plan holds no
+Membership Filter.
+_Avoid_: dead filter, policy-dead, shadow rule (for the key)
 
 **Contribution**:
 One task adding its certified batch to Construction.

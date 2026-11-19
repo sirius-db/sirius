@@ -46,17 +46,6 @@ constexpr void fnv1a(std::uint64_t& hash, std::string_view bytes) noexcept
   }
 }
 
-[[nodiscard]] constexpr std::string_view to_token(membership_filter_kind kind) noexcept
-{
-  switch (kind) {
-    case membership_filter_kind::none: return "none";
-    case membership_filter_kind::small_in_list: return "small_in_list";
-    case membership_filter_kind::hash_in_list: return "hash_in_list";
-    case membership_filter_kind::bloom: return "bloom";
-  }
-  return "invalid";
-}
-
 [[nodiscard]] constexpr std::string_view to_token(dynamic_filter_key_reason reason) noexcept
 {
   switch (reason) {
@@ -66,6 +55,7 @@ constexpr void fnv1a(std::uint64_t& hash, std::string_view bytes) noexcept
     case dynamic_filter_key_reason::UNSUPPORTED_TYPE: return "unsupported_type";
     case dynamic_filter_key_reason::UNREADABLE_PROBE: return "unreadable_probe";
     case dynamic_filter_key_reason::BLOOM_CAP: return "bloom_cap";
+    case dynamic_filter_key_reason::SHADOWED: return "shadowed";
     case dynamic_filter_key_reason::DECIMAL128_UNFIT: return "decimal128_unfit";
     case dynamic_filter_key_reason::CONSTRUCTION_ADMISSION: return "construction_admission";
     case dynamic_filter_key_reason::CONSTRUCTION_INVARIANT: return "construction_invariant";
@@ -111,7 +101,7 @@ std::string to_string(dynamic_filter_key_line const& line)
   }
   std::format_to(out,
                  " kind={} size={} zone_map={} pushed={} reason={}{}",
-                 to_token(outcome.kind),
+                 to_string(outcome.kind),
                  outcome.size,
                  outcome.zone_map ? 1 : 0,
                  outcome.pushed,

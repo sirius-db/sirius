@@ -79,7 +79,8 @@ struct key_case {
   std::vector<op::binding_facts> bindings;
   bool preserve_nulls = false;
   op::dynamic_filter_domain_evidence domain{};
-  bool proven_unique = false;
+  bool proven_unique       = false;
+  std::size_t value_domain = 0;
 };
 
 /**
@@ -87,7 +88,7 @@ struct key_case {
  */
 op::binding_facts scan_binding(cudf::data_type probe)
 {
-  return {.probe_type = probe, .accepts_zone_map = true};
+  return {.probe_type = probe, .accepts_zone_map = true, .published = {}};
 }
 
 key_case plain_key(cudf::data_type recorded, std::optional<std::size_t> null_rows = 0)
@@ -128,6 +129,7 @@ planned plan_for(std::vector<key_case> const& cases,
                     .build_key_ordinal       = static_cast<cudf::size_type>(index),
                     .storage_type            = c.recorded,
                     .build_key_domain        = c.domain,
+                    .build_key_value_domain  = c.value_domain,
                     .build_key_proven_unique = c.proven_unique,
                     .preserve_nulls          = c.preserve_nulls});
     bindings.push_back(c.bindings);
@@ -476,4 +478,219 @@ TEST_CASE("every restorable carrier is a probe carrier of its recorded key",
   CHECK(restorable > 0);
   CHECK(failures.empty());
   CAPTURE(failures);
+}
+
+namespace {
+
+/**
+ * @brief A published filter with a Proven Estimate of `keep`.
+ */
+op::static_filter_facts proven(membership_filter_kind kind, std::uint64_t keys, double keep)
+{
+  return {.kind = kind, .keys = keys, .estimated_keep = keep, .estimate_proven = true};
+}
+
+constexpr std::size_t k_shadow_rows = 100'000;
+
+/**
+ * @brief A unique INT64 key of `k_shadow_rows` rows keeping 1/16 of its value domain, bound to one
+ * Channel that already holds `published`.
+ */
+key_case shadow_candidate(std::vector<op::static_filter_facts> published)
+{
+  auto key                  = plain_key(k_int64);
+  key.proven_unique         = true;
+  key.value_domain          = 16 * k_shadow_rows;
+  key.bindings[0].published = std::move(published);
+  return key;
+}
+
+/// An IN-list keeping 0.67% of its rows: behind it the candidate removes under 1% of a batch.
+auto const k_strong_in_list = proven(membership_filter_kind::hash_in_list, 1'000'000, 0.0067);
+
+}  // namespace
+
+TEST_CASE("a key whose membership filter no Consumer would select is planned without it",
+          "[dynamic_filter][construction_plan][shadow]")
+{
+  auto const limit = limits(0);  // No L2: the candidate plans a Bloom filter.
+
+  SECTION("an empty Channel plans the filter and records what Consumers will see")
+  {
+    auto const result = plan_for({shadow_candidate({})}, k_shadow_rows, limit).plan;
+    REQUIRE(planned_kind(result, 0) == membership_filter_kind::bloom);
+    auto const& candidate = key_of(result, 0)->candidate;
+    CHECK(candidate.kind == membership_filter_kind::bloom);
+    CHECK(candidate.keys == std::numeric_limits<std::uint64_t>::max());
+    CHECK(candidate.estimated_keep == 1.0 / 16);
+    CHECK(candidate.estimate_proven);
+    CHECK(result.selection.keys_skipped_shadowed == 0);
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::NOT_CONSTRUCTED);
+  }
+  SECTION("a stronger published IN-list shadows it")
+  {
+    auto const result = plan_for({shadow_candidate({k_strong_in_list})}, k_shadow_rows, limit).plan;
+    CHECK(result.keys.empty());
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::SHADOWED);
+    CHECK(outcome_of(result, 0).valid_rows == k_shadow_rows);
+    CHECK(result.selection.keys_skipped_shadowed == 1);
+  }
+  SECTION("a second Filtered Decode slot carries it")
+  {
+    auto two_slots                  = limit;
+    two_slots.decode_membership_cap = 2;
+    auto const result =
+      plan_for({shadow_candidate({k_strong_in_list})}, k_shadow_rows, two_slots).plan;
+    CHECK(planned_kind(result, 0) == membership_filter_kind::bloom);
+    CHECK(result.selection.keys_skipped_shadowed == 0);
+  }
+  SECTION("a published filter that leaves it a tenth of the batch does not shadow it")
+  {
+    auto const weak   = proven(membership_filter_kind::hash_in_list, 1'000'000, 0.5);
+    auto const result = plan_for({shadow_candidate({weak})}, k_shadow_rows, limit).plan;
+    CHECK(planned_kind(result, 0) == membership_filter_kind::bloom);
+  }
+  SECTION("a published estimate that is not proven shadows nothing")
+  {
+    auto unproven            = k_strong_in_list;
+    unproven.estimate_proven = false;
+    unproven.estimated_keep.reset();
+    auto const result = plan_for({shadow_candidate({unproven})}, k_shadow_rows, limit).plan;
+    CHECK(planned_kind(result, 0) == membership_filter_kind::bloom);
+  }
+  SECTION("an IN-list is planned behind a stronger Bloom filter: the decode prefers it")
+  {
+    constexpr std::size_t rows = 5000;  // Few enough for a hash IN-list within the L2 budget.
+    auto const bloom           = proven(membership_filter_kind::bloom, 0, 0.001);
+    auto const result          = plan_for({shadow_candidate({bloom})}, rows, limits()).plan;
+    REQUIRE(planned_kind(result, 0) == membership_filter_kind::hash_in_list);
+    CHECK(key_of(result, 0)->candidate.keys == rows);
+    CHECK(result.selection.keys_skipped_shadowed == 0);
+  }
+}
+
+TEST_CASE("only a Proven Estimate lets a key be shadowed",
+          "[dynamic_filter][construction_plan][shadow]")
+{
+  auto const limit = limits(0);
+  auto key         = shadow_candidate({k_strong_in_list});
+
+  SECTION("a key that is not unique is never judged")
+  {
+    key.proven_unique = false;
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    REQUIRE(planned_kind(result, 0) == membership_filter_kind::bloom);
+    CHECK(key_of(result, 0)->candidate.estimated_keep == 1.0 / 16);
+    CHECK_FALSE(key_of(result, 0)->candidate.estimate_proven);
+  }
+  SECTION("a backed uniqueness declaration is as good as a proof")
+  {
+    key.proven_unique = false;
+    key.domain        = {.cardinality     = 16 * k_shadow_rows,
+                         .source          = op::dynamic_filter_domain_source::pinned_parquet_exact,
+                         .declared_unique = true};
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::SHADOWED);
+  }
+  SECTION("an unknown value domain leaves no estimate")
+  {
+    key.value_domain  = 0;
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    REQUIRE(planned_kind(result, 0) == membership_filter_kind::bloom);
+    CHECK_FALSE(key_of(result, 0)->candidate.estimated_keep);
+  }
+  SECTION("an unknown null count is never judged")
+  {
+    key.column.null_rows = std::nullopt;
+    auto const result    = plan_for({key}, k_shadow_rows, limit).plan;
+    REQUIRE(planned_kind(result, 0) == membership_filter_kind::bloom);
+    CHECK_FALSE(key_of(result, 0)->candidate.estimate_proven);
+    CHECK(result.selection.keys_sized_on_total_rows == 1);
+  }
+  SECTION("the estimate counts valid rows only")
+  {
+    key.column.null_rows = k_shadow_rows / 2;
+    key.bindings[0].published.clear();
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    REQUIRE(key_of(result, 0) != nullptr);
+    CHECK(key_of(result, 0)->candidate.estimated_keep == 1.0 / 32);
+  }
+}
+
+TEST_CASE("a key is shadowed only when every binding is dead",
+          "[dynamic_filter][construction_plan][shadow]")
+{
+  auto const limit = limits(0);
+  auto key         = shadow_candidate({k_strong_in_list});
+  key.bindings.push_back(scan_binding(k_int64));
+
+  SECTION("one binding on an empty Channel builds the filter for all")
+  {
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    CHECK(planned_kind(result, 0) == membership_filter_kind::bloom);
+    CHECK(result.selection.keys_skipped_shadowed == 0);
+  }
+  SECTION("both bindings dead")
+  {
+    key.bindings[1].published = {k_strong_in_list};
+    auto const result         = plan_for({key}, k_shadow_rows, limit).plan;
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::SHADOWED);
+  }
+  SECTION("is_shadowed judges a planned key against any bindings")
+  {
+    auto const result = plan_for({key}, k_shadow_rows, limit).plan;
+    auto const* built = key_of(result, 0);
+    REQUIRE(built != nullptr);
+    std::vector<op::binding_facts> dead{scan_binding(k_int64)};
+    dead[0].published = {k_strong_in_list};
+    CHECK(op::is_shadowed(*built, dead, 1));
+    CHECK_FALSE(op::is_shadowed(*built, key.bindings, 1));
+    CHECK_FALSE(op::is_shadowed(*built, {}, 1));
+    CHECK_FALSE(op::is_shadowed(*built, dead, 2));
+    CHECK(op::is_shadowed(*built, dead, 0));
+  }
+}
+
+TEST_CASE("a shadowed key leaves the rest of the plan as it was",
+          "[dynamic_filter][construction_plan][shadow]")
+{
+  auto limit = limits(0);
+
+  SECTION("the other key of the join keeps its filter")
+  {
+    auto const result =
+      plan_for({shadow_candidate({k_strong_in_list}), shadow_candidate({})}, k_shadow_rows, limit)
+        .plan;
+    REQUIRE(result.keys.size() == 1);
+    CHECK(result.keys.front().admitted_key_index == 1);
+    CHECK(planned_kind(result, 1) == membership_filter_kind::bloom);
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::SHADOWED);
+    CHECK(outcome_of(result, 1).reason == dynamic_filter_key_reason::NOT_CONSTRUCTED);
+    CHECK(result.selection.keys_skipped_shadowed == 1);
+  }
+  SECTION("it keeps its zone map")
+  {
+    limit.emit_zone_map_filters = true;
+    auto const result = plan_for({shadow_candidate({k_strong_in_list})}, k_shadow_rows, limit).plan;
+    auto const* key   = key_of(result, 0);
+    REQUIRE(key != nullptr);
+    CHECK(std::holds_alternative<std::monostate>(key->membership));
+    CHECK(key->candidate == op::static_filter_facts{});
+    CHECK(key->zone_map);
+    CHECK_FALSE(key->fit_pending);
+    CHECK(outcome_of(result, 0).reason == dynamic_filter_key_reason::SHADOWED);
+  }
+  SECTION("its Bloom array does not count toward the cap")
+  {
+    auto const array_bytes =
+      rmm::align_up(op::bloom_blocks_for(k_shadow_rows) * op::bloom_bytes_per_block,
+                    rmm::CUDA_ALLOCATION_ALIGNMENT);
+    limit.max_bloom_bytes_per_gpu = array_bytes;
+    auto const result =
+      plan_for({shadow_candidate({k_strong_in_list}), shadow_candidate({})}, k_shadow_rows, limit)
+        .plan;
+    CHECK(planned_kind(result, 1) == membership_filter_kind::bloom);
+    CHECK(result.selection.keys_skipped_bloom_size_gate == 0);
+    CHECK(result.selection.keys_skipped_shadowed == 1);
+  }
 }

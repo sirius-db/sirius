@@ -59,6 +59,18 @@ struct dynamic_filter_domain_evidence {
 
 enum class membership_filter_kind : std::uint8_t { none, small_in_list, hash_in_list, bloom };
 
+/// Spelling used by dynamic-filter diagnostics.
+[[nodiscard]] constexpr char const* to_string(membership_filter_kind kind) noexcept
+{
+  switch (kind) {
+    case membership_filter_kind::none: return "none";
+    case membership_filter_kind::small_in_list: return "small_in_list";
+    case membership_filter_kind::hash_in_list: return "hash_in_list";
+    case membership_filter_kind::bloom: return "bloom";
+  }
+  return "invalid";
+}
+
 struct membership_choice_inputs {
   std::size_t build_rows               = 0;
   std::size_t l2_cache_bytes           = 0;  // 0 means unknown.
