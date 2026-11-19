@@ -67,10 +67,14 @@ class convertible_data_batch : public convertible_data {
    *                     fail inside cuCascade ("stream belongs to CUDA device N but this
    *                     representation's memory lives on device M"). Leave null to allow
    *                     conversion from any space.
+   * @param spill_source The query-graph edge the batch is held for, which spill compression
+   *                     keys per-column state by; unknown when empty.
    */
-  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                                  cucascade::memory::memory_space const* source_space = nullptr)
-    : _batch(std::move(batch)), _source_space(source_space)
+  explicit convertible_data_batch(
+    std::shared_ptr<cucascade::data_batch> batch,
+    cucascade::memory::memory_space const* source_space   = nullptr,
+    std::optional<compression::spill_source> spill_source = std::nullopt)
+    : _batch(std::move(batch)), _source_space(source_space), _spill_source(spill_source)
   {
   }
 
@@ -232,9 +236,9 @@ class convertible_data_batch : public convertible_data {
    *         batch is unchanged and the caller spills it uncompressed.
    */
   template <typename Compressed>
-  static bool try_spill_compressed(cucascade::mutable_data_batch& mut,
-                                   cucascade::memory::reservation& reservation,
-                                   ::cuda::stream_ref stream)
+  bool try_spill_compressed(cucascade::mutable_data_batch& mut,
+                            cucascade::memory::reservation& reservation,
+                            ::cuda::stream_ref stream) const
   {
     auto* data = mut.get_data();
     if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr ||
@@ -242,10 +246,13 @@ class convertible_data_batch : public convertible_data {
       return false;
     }
     try {
+      compression::scoped_spill_source const source(_spill_source);
       mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
       return true;
     } catch (compression::spill_compression_declined const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] spilling uncompressed: {}", e.what());
+    } catch (compression::spill_source_released const&) {
+      throw;
     } catch (std::exception const& e) {
       SIRIUS_LOG_DEBUG("[spill_compression] encode failed, spilling uncompressed: {}", e.what());
     }
@@ -255,6 +262,7 @@ class convertible_data_batch : public convertible_data {
   std::shared_ptr<cucascade::data_batch> _batch;
   /// Non-owning; null converts the batch from any space.
   cucascade::memory::memory_space const* _source_space{nullptr};
+  std::optional<compression::spill_source> _spill_source;
 };
 
 /**
@@ -270,9 +278,15 @@ class convertible_data_batch_provider : public convertible_data_provider {
  public:
   /**
    * @brief Construct from a raw pointer to a shared_data_repository.
-   * @param repo The repository to iterate (non-owning; caller ensures lifetime).
+   * @param repo  The repository to iterate (non-owning; caller ensures lifetime).
+   * @param query The query @p repo belongs to, when known; its batches then carry their
+   *              spill_source.
    */
-  explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo) : _repo(repo) {}
+  explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo,
+                                           std::optional<query_id_t> query = std::nullopt)
+    : _repo(repo), _query(query)
+  {
+  }
 
   /**
    * @brief Get the next convertible batch matching the given memory space.
@@ -414,13 +428,16 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch), space);
+      std::optional<compression::spill_source> source;
+      if (_query) { source = compression::spill_source{*_query, _repo}; }
+      return std::make_unique<convertible_data_batch>(std::move(batch), space, source);
     }
 
     return nullptr;
   }
 
   cucascade::shared_data_repository* _repo;
+  std::optional<query_id_t> _query;
 };
 
 }  // namespace sirius

@@ -754,8 +754,10 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction, [](double value) {
-    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+    return std::isfinite(value) && value >= 0.0;
   });
+  r.optional("spill_onpair_strings", opt.spill_onpair_strings);
+  r.optional("spill_release_columns_early", opt.spill_release_columns_early);
   r.reject_unknown();
 }
 

@@ -11,6 +11,7 @@
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
 #include "decode/decode_session.hpp"
+#include "operators/onpair_representation.hpp"
 #include "util/host_observation.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -248,6 +249,22 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
     case OpId::Snappy:
       return make_simple_payload<snappy_compressed_representation, leaf_meta::snappy>(
         "snappy", names, channels, meta);
+    case OpId::OnPair: {
+      require_channels("onpair", names, {"codes", "sidecar", "dict", "lens"});
+      if (channels[0]->type().id() != cudf::type_id::UINT32 ||
+          channels[1]->type().id() != cudf::type_id::UINT32 ||
+          channels[2]->type().id() != cudf::type_id::UINT8 ||
+          channels[3]->type().id() != cudf::type_id::UINT8) {
+        reject("onpair: invalid channel types");
+      }
+      auto const* m = std::get_if<leaf_meta::onpair>(&meta);
+      if (!m) reject("onpair: missing leaf metadata");
+      return onpair_compressed_representation::from_channels(*m,
+                                                             std::move(channels[0]),
+                                                             std::move(channels[1]),
+                                                             std::move(channels[2]),
+                                                             std::move(channels[3]));
+    }
     case OpId::Lz4:
       return make_simple_payload<lz4_compressed_representation, leaf_meta::lz4>(
         "lz4", names, channels, meta);
