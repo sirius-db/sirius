@@ -25,6 +25,7 @@ use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, try_to_secs_
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
 
+mod batch_clone;
 mod channel;
 mod data_batch;
 mod engine;
@@ -42,6 +43,8 @@ mod task_queue;
 mod thread_group;
 mod worker;
 
+pub use batch_clone::BatchClone;
+pub(crate) use batch_clone::CHANNEL_BYTES;
 pub(crate) use channel::Channel;
 pub(crate) use data_batch::DataBatchBuilder;
 pub use data_batch::{DataBatch, DataBatchExt};

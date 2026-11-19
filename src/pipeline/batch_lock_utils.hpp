@@ -17,6 +17,7 @@
 #pragma once
 
 #include "log/logging.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cuda/stream>
 
@@ -74,6 +75,7 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
  * @param stream                  CUDA stream used for any data-movement kernels.
+ * @param clone_telemetry         Attribution for newly cloned batches.
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
@@ -81,7 +83,8 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  ::cuda::stream_ref stream)
+  ::cuda::stream_ref stream,
+  const telemetry::batch_telemetry_info& clone_telemetry = {})
 {
   if (!batch) { return std::nullopt; }
 
@@ -133,9 +136,13 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // INT64 offsets promotion of host->GPU reconstruction, and a GPU->GPU copy preserves the
         // source's column types (a GPU-resident source is already normalized — the same-space
         // fast path above depends on that invariant).
-        // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
-        auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
-          registry, get_next_batch_id(), target_space, stream);
+        const auto clone_batch_id = get_next_batch_id();
+        auto clone                = read_accessor.clone_to<cucascade::gpu_table_representation>(
+          registry,
+          clone_batch_id,
+          target_space,
+          stream,
+          telemetry::quent_data_batch_probe::create(clone_telemetry, clone_batch_id));
         return lock_to_new_batch{
           .new_batch = clone,
           .ro_lock   = clone->to_read_only(),
@@ -167,9 +174,13 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           // (that would steal it from the device that just materialized it) — clone instead. The
           // clone happens under the exclusive lock we already hold; pinning the state here avoids
           // yet another non-atomic lock transition.
-          // TODO(dhruv9vats): attach a DataBatch probe so compute IDs resolve to a traced clone.
-          auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
-            registry, sirius::get_next_batch_id(), target_space, stream);
+          const auto clone_batch_id = sirius::get_next_batch_id();
+          auto clone                = mut_accessor.clone_to<cucascade::gpu_table_representation>(
+            registry,
+            clone_batch_id,
+            target_space,
+            stream,
+            telemetry::quent_data_batch_probe::create(clone_telemetry, clone_batch_id));
           return lock_to_new_batch{
             .new_batch = clone,
             .ro_lock   = clone->to_read_only(),

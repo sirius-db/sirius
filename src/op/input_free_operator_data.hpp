@@ -42,8 +42,10 @@ class input_free_operator_data final : public operator_data {
     return operator_data_type::INPUT_FREE;
   }
 
+  using operator_data::prepare_for_processing;
   void prepare_for_processing(cucascade::memory::memory_space const* requested_memory_space,
-                              ::cuda::stream_ref) override
+                              ::cuda::stream_ref,
+                              const telemetry::batch_telemetry_info& /*clone_telemetry*/) override
   {
     _gpu_memory_space = const_cast<cucascade::memory::memory_space*>(requested_memory_space);
   }

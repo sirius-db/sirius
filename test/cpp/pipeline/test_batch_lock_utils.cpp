@@ -37,6 +37,8 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "transparent/replay_admission.hpp"
+#include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
@@ -61,7 +63,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+<<<<<<< HEAD
+#include <filesystem>
+#include <fstream>
+  =======
 #include <exception>
+  >>>>>>> upstream/main
 #include <future>
 #include <memory>
 #include <numeric>
@@ -70,158 +77,159 @@
 #include <utility>
 #include <vector>
 
-namespace {
+  namespace
+{
+  bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
 
-bool skip_if_not_mgpu() { return !sirius::test::has_gpus(2); }
+  /// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
+  struct batch_lock_utils_fixture {
+    std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+    cucascade::memory::memory_space* gpu0  = nullptr;
+    cucascade::memory::memory_space* gpu1  = nullptr;  // null on single-GPU fixtures
+    cucascade::memory::memory_space* host0 = nullptr;
 
-/// Memory manager fixture over `num_gpus` GPU spaces plus NUMA host spaces.
-struct batch_lock_utils_fixture {
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
-  cucascade::memory::memory_space* gpu0  = nullptr;
-  cucascade::memory::memory_space* gpu1  = nullptr;  // null on single-GPU fixtures
-  cucascade::memory::memory_space* host0 = nullptr;
-
-  bool setup(int num_gpus)
-  {
-    sirius::converter_registry::reset_for_testing();
-    try {
-      cucascade::memory::reservation_manager_configurator builder;
-      builder.set_number_of_gpus(num_gpus)
-        .set_gpu_usage_limit(256ULL << 20)
-        .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
-        .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
-      auto space_configs = builder.build();
-      manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-        std::move(space_configs));
-    } catch (cucascade::cuda_error const&) {
-      throw;
-    } catch (const std::exception&) {
-      return false;
-    }
-    sirius::converter_registry::initialize();
-
-    auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-    if (gpu_spaces.size() < static_cast<std::size_t>(num_gpus)) { return false; }
-    gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
-    if (num_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
-    auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) { return false; }
-    host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    return true;
-  }
-
-  ~batch_lock_utils_fixture()
-  {
-    // The registry is initialized right after the manager is built, so both exist or neither.
-    if (manager) {
-      manager->shutdown();
-      sirius::converter_registry::shutdown();
-    }
-  }
-
-  /// Single INT64 column of random data, resident on `space`.
-  std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
-                                                        cucascade::memory::memory_space& space,
-                                                        ::cuda::stream_ref stream)
-  {
-    auto table = sirius::create_cudf_table_with_random_data(num_rows,
-                                                            {cudf::data_type{cudf::type_id::INT64}},
-                                                            {std::make_pair(0, 1000000)},
-                                                            stream,
-                                                            space.get_default_allocator());
-    stream.sync();
-    return sirius::make_data_batch(
-      std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
-  }
-
-  /// GPU batch converted in place to the host representation (spilled-batch shape).
-  std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
-                                                         ::cuda::stream_ref stream)
-  {
-    auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
-    auto& registry = sirius::converter_registry::get();
+    bool setup(int num_gpus)
     {
-      auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
+      sirius::converter_registry::reset_for_testing();
+      try {
+        cucascade::memory::reservation_manager_configurator builder;
+        builder.set_number_of_gpus(num_gpus)
+          .set_gpu_usage_limit(256ULL << 20)
+          .set_reservation_fraction_per_gpu(0.75)
+          .set_per_numa_region_capacity(1ULL << 30)
+          .use_numa_id_as_host_id()
+          .track_reservation_per_stream(false)
+          .set_reservation_fraction_per_numa_region(0.75);
+        auto space_configs = builder.build();
+        manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+          std::move(space_configs));
+      } catch (cucascade::cuda_error const&) {
+        throw;
+      } catch (const std::exception&) {
+        return false;
+      }
+      sirius::converter_registry::initialize();
+
+      auto gpu_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      if (gpu_spaces.size() < static_cast<std::size_t>(num_gpus)) { return false; }
+      gpu0 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+      if (num_gpus > 1) { gpu1 = const_cast<cucascade::memory::memory_space*>(gpu_spaces[1]); }
+      auto host_spaces = manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      if (host_spaces.empty()) { return false; }
+      host0 = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+      return true;
     }
+
+    ~batch_lock_utils_fixture()
+    {
+      // The registry is initialized right after the manager is built, so both exist or neither.
+      if (manager) {
+        manager->shutdown();
+        sirius::converter_registry::shutdown();
+      }
+    }
+
+    /// Single INT64 column of random data, resident on `space`.
+    std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
+                                                          cucascade::memory::memory_space& space,
+                                                          ::cuda::stream_ref stream)
+    {
+      auto table =
+        sirius::create_cudf_table_with_random_data(num_rows,
+                                                   {cudf::data_type{cudf::type_id::INT64}},
+                                                   {std::make_pair(0, 1000000)},
+                                                   stream,
+                                                   space.get_default_allocator());
+      stream.sync();
+      return sirius::make_data_batch(
+        std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
+    }
+
+    /// GPU batch converted in place to the host representation (spilled-batch shape).
+    std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
+                                                           ::cuda::stream_ref stream)
+    {
+      auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
+      auto& registry = sirius::converter_registry::get();
+      {
+        auto mut = batch->to_mutable();
+        mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
+      }
+      stream.sync();
+      return batch;
+    }
+  };
+
+  /// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
+  /// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
+  /// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
+  /// return the zero-initialized vector.
+  template <typename T>
+  std::vector<T> column_values_to_host(const cudf::column_view& col, ::cuda::stream_ref stream)
+  {
+    std::vector<T> out(static_cast<std::size_t>(col.size()));
+    if (out.empty()) { return out; }
     stream.sync();
-    return batch;
+    cudaPointerAttributes attrs{};
+    REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
+    int prev = -1;
+    REQUIRE(cudaGetDevice(&prev) == cudaSuccess);
+    const bool switch_device = attrs.type == cudaMemoryTypeDevice && attrs.device != prev;
+    if (switch_device) { REQUIRE(cudaSetDevice(attrs.device) == cudaSuccess); }
+    const cudaError_t copy_err =
+      cudaMemcpy(out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost);
+    if (switch_device) { REQUIRE(cudaSetDevice(prev) == cudaSuccess); }
+    REQUIRE(copy_err == cudaSuccess);
+    return out;
   }
-};
 
-/// Copy a fixed-width column's payload to host for value comparison. The copy is issued with
-/// the payload's owning device current: without P2P, a cudaMemcpyAsync of another device's
-/// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
-/// return the zero-initialized vector.
-template <typename T>
-std::vector<T> column_values_to_host(const cudf::column_view& col, ::cuda::stream_ref stream)
-{
-  std::vector<T> out(static_cast<std::size_t>(col.size()));
-  if (out.empty()) { return out; }
-  stream.sync();
-  cudaPointerAttributes attrs{};
-  REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
-  int prev = -1;
-  REQUIRE(cudaGetDevice(&prev) == cudaSuccess);
-  const bool switch_device = attrs.type == cudaMemoryTypeDevice && attrs.device != prev;
-  if (switch_device) { REQUIRE(cudaSetDevice(attrs.device) == cudaSuccess); }
-  const cudaError_t copy_err =
-    cudaMemcpy(out.data(), col.data<T>(), out.size() * sizeof(T), cudaMemcpyDeviceToHost);
-  if (switch_device) { REQUIRE(cudaSetDevice(prev) == cudaSuccess); }
-  REQUIRE(copy_err == cudaSuccess);
-  return out;
-}
+  /// One LIST<INT32> column with `num_lists` two-element lists [2i, 2i+1], on `space`.
+  std::unique_ptr<cudf::table> make_list_table(
+    std::size_t num_lists, cucascade::memory::memory_space& space, ::cuda::stream_ref stream)
+  {
+    auto mr = space.get_default_allocator();
 
-/// One LIST<INT32> column with `num_lists` two-element lists [2i, 2i+1], on `space`.
-std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
-                                             cucascade::memory::memory_space& space,
-                                             ::cuda::stream_ref stream)
-{
-  auto mr = space.get_default_allocator();
+    std::vector<int32_t> offsets_host(num_lists + 1);
+    for (std::size_t i = 0; i <= num_lists; ++i) {
+      offsets_host[i] = static_cast<int32_t>(2 * i);
+    }
+    std::vector<int32_t> values_host(2 * num_lists);
+    std::iota(values_host.begin(), values_host.end(), 0);
 
-  std::vector<int32_t> offsets_host(num_lists + 1);
-  for (std::size_t i = 0; i <= num_lists; ++i) {
-    offsets_host[i] = static_cast<int32_t>(2 * i);
+    auto offsets = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                             static_cast<cudf::size_type>(num_lists + 1),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             mr);
+    cudaMemcpyAsync(offsets->mutable_view().data<int32_t>(),
+                    offsets_host.data(),
+                    offsets_host.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
+    auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(values_host.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+    cudaMemcpyAsync(values->mutable_view().data<int32_t>(),
+                    values_host.data(),
+                    values_host.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    stream.get());
+    stream.sync();
+
+    auto list_col =
+      cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
+                              std::move(offsets),
+                              std::move(values),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::move(list_col));
+    return std::make_unique<cudf::table>(std::move(cols));
   }
-  std::vector<int32_t> values_host(2 * num_lists);
-  std::iota(values_host.begin(), values_host.end(), 0);
 
-  auto offsets = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                           static_cast<cudf::size_type>(num_lists + 1),
-                                           cudf::mask_state::UNALLOCATED,
-                                           stream,
-                                           mr);
-  cudaMemcpyAsync(offsets->mutable_view().data<int32_t>(),
-                  offsets_host.data(),
-                  offsets_host.size() * sizeof(int32_t),
-                  cudaMemcpyHostToDevice,
-                  stream.get());
-  auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          static_cast<cudf::size_type>(values_host.size()),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mr);
-  cudaMemcpyAsync(values->mutable_view().data<int32_t>(),
-                  values_host.data(),
-                  values_host.size() * sizeof(int32_t),
-                  cudaMemcpyHostToDevice,
-                  stream.get());
-  stream.sync();
-
-  auto list_col = cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
-                                          std::move(offsets),
-                                          std::move(values),
-                                          0,
-                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(list_col));
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
-constexpr std::size_t kNumRows = 4096;
+  constexpr std::size_t kNumRows = 4096;
 
 }  // namespace
 
@@ -761,6 +769,89 @@ TEST_CASE("cached scan assigned away from its pin clones and reserves on the tar
   target_stream.synchronize();
 }
 
+<<<<<<< HEAD
+TEST_CASE("cross-GPU preparation traces destination batches",
+          "[batch_lock_utils][multi_gpu][clone_telemetry]")
+{
+  if (skip_if_not_mgpu()) { return; }
+  enum class prepare_kind { direct, pipeline, cached_scan };
+  const auto kind =
+    GENERATE(prepare_kind::direct, prepare_kind::pipeline, prepare_kind::cached_scan);
+  CAPTURE(kind);
+
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  sirius::test::scoped_temp_directory output;
+  sirius::telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = output.directory;
+  uint64_t clone_id       = 0;
+  std::string producer_id;
+  {
+    auto context = sirius::telemetry::telemetry_context::create(
+      sirius::telemetry::make_quent_context(config), config, f.manager.get());
+    auto producer = context->context().operator_observer()->handle();
+    producer_id   = quent::to_string(producer.id().raw());
+    const sirius::telemetry::batch_telemetry_info telemetry{
+      .context = context.get(), .producer_pipeline_uuid = producer.id().raw()};
+
+    rmm::cuda_set_device_raii source_device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+    rmm::cuda_stream source_stream;
+    auto source = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+    rmm::cuda_set_device_raii target_device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream target_stream;
+    std::shared_ptr<cucascade::data_batch> clone;
+    if (kind == prepare_kind::direct) {
+      auto prepared =
+        sirius::pipeline::lock_and_prepare_batch(source, f.gpu1, target_stream, telemetry);
+      REQUIRE(prepared.has_value());
+      clone = std::get<sirius::pipeline::lock_to_new_batch>(*prepared).new_batch;
+    } else if (kind == prepare_kind::pipeline) {
+      sirius::op::pipelineable_operator_data input({source});
+      sirius::op::operator_data& base = input;
+      base.prepare_for_processing(f.gpu1, target_stream, telemetry);
+      clone = input.get_data_batches().front();
+    } else {
+      sirius::op::scan::scan_operator_input input(source);
+      sirius::op::operator_data& base = input;
+      base.prepare_for_processing(f.gpu1, target_stream, telemetry);
+      clone = input.get_cached_batch();
+    }
+    REQUIRE(clone != source);
+    clone_id = clone->get_batch_id();
+    REQUIRE(clone->to_read_only().get_memory_space() == f.gpu1);
+  }
+
+  // Context destruction flushes events; inspect the destination lifecycle, not just the copy call.
+  bool traced         = false;
+  const auto batch_id = "\"data_batch_id\":" + std::to_string(clone_id);
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(output.directory)) {
+    if (entry.path().extension() != ".ndjson" ||
+        entry.path().parent_path().filename() != "DataBatch") {
+      continue;
+    }
+    std::ifstream file(entry.path());
+    std::string line;
+    bool constructed = false;
+    bool stationary  = false;
+    bool destructed  = false;
+    while (std::getline(file, line)) {
+      constructed |=
+        line.find(batch_id) != std::string::npos && line.find(producer_id) != std::string::npos;
+      stationary |= line.find("\"Stationary\"") != std::string::npos;
+      destructed |= line.find("\"Destructed\"") != std::string::npos;
+    }
+    traced |= constructed && stationary && destructed;
+  }
+  REQUIRE(traced);
+}
+
+// A Simpatico-compressed pinned chunk has no cross-GPU copy step: its decoder reads the
+// compressed buffers where pin time left them. Decoding it from another GPU is a remote read
+// when the pools have peer access (this test then fails because nothing is refused) and an
+// illegal address when they do not (the process loses its CUDA context).
+TEST_CASE("compressed cached scan assigned away from its pin is refused before decoding",
+=======
 namespace {
 
 /// One bitpacked INT64 column compressed on @p space, held the way pin_table(tier='gpu') holds
@@ -820,6 +911,7 @@ std::shared_ptr<cucascade::data_batch> project_pin_chunk(
 // the two GPUs have no peer access), so the compressed bytes are copied to the assigned GPU
 // and decoded there.
 TEST_CASE("compressed cached scan assigned away from its pin is copied and decoded there",
+>>>>>>> upstream/main
           "[batch_lock_utils][cached_scan_placement][multi_gpu]")
 {
   if (skip_if_not_mgpu()) return;

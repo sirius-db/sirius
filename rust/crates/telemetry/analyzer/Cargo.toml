@@ -16,7 +16,7 @@ quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b
 quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "396add06a1b1976ecb97a9ac4ff93462cad8e0fb" }
 rustc-hash = "2"
 tracing = "0.1"
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v5"] }
 
 [dev-dependencies]
 sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model" }

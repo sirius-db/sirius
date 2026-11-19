@@ -427,14 +427,20 @@ class observed_build_repository final : public cucascade::shared_data_repository
  public:
   explicit observed_build_repository(dynamic_filter_stats const& counters) : stats{counters} {}
 
+  dynamic_filter_stats const& stats;
+  mutable std::atomic<std::size_t> lookups{0};
+  std::atomic<bool> popped_before_decision{false};
+
+ private:
+  // Observe the locked repository hooks without reacquiring its mutex.
   cucascade::positioned_data_batch get_data_batch_by_id_unlocked(
-    std::uint64_t id, std::size_t partition = 0) const override
+    std::uint64_t id, std::size_t partition) const override
   {
     ++lookups;
     return data_repository::get_data_batch_by_id_unlocked(id, partition);
   }
 
-  cucascade::positioned_data_batch pop_next_data_batch_unlocked(std::size_t partition = 0) override
+  cucascade::positioned_data_batch pop_next_data_batch_unlocked(std::size_t partition) override
   {
     auto const counters = stats.snapshot();
     if (counters.accumulations_started == 0 && counters.accumulations_skipped_inventory == 0) {
@@ -442,10 +448,6 @@ class observed_build_repository final : public cucascade::shared_data_repository
     }
     return data_repository::pop_next_data_batch_unlocked(partition);
   }
-
-  dynamic_filter_stats const& stats;
-  mutable std::atomic<std::size_t> lookups{0};
-  std::atomic<bool> popped_before_decision{false};
 };
 
 /// Inputs to `partition_accumulation_fixture`.
