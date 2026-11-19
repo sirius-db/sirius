@@ -79,6 +79,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 
 import duckdb
@@ -903,11 +904,15 @@ def close_benchmark_db(con, pin_tier, pin_layout=None, close=True):
             con.close()
 
 
-_PIN_COVERAGE = re.compile(r"\] pin '.*': (\d+)/\d+ chunk\(s\) compressed")
+_PIN_COVERAGE = re.compile(r"\] pin '(.*)': (\d+)/(\d+) chunk\(s\) compressed")
+_PIN_SIZE_SKIP = re.compile(
+    r"\[pin_table\] '(.*)': about \d+ bytes uncompressed, below the \d+ bytes "
+    r"automatic compression needs; pinning uncompressed"
+)
 
 
-def compressed_pin_count(log_dir, timeout_s=10.0):
-    """Count pins with at least one compressed chunk, via pin_table's INFO coverage records.
+def pin_compression_counts(log_dir, timeout_s=10.0):
+    """Count compressed pins and completed pins skipped by the automatic table-size gate.
 
     Each record is written when its CALL pin_table finishes materializing, but the
     log sink may flush late; poll briefly before concluding zero.
@@ -915,21 +920,30 @@ def compressed_pin_count(log_dir, timeout_s=10.0):
 
     def scan():
         found = 0
+        size_skips = Counter()
+        uncompressed = Counter()
         for name in os.listdir(log_dir):
             if not name.endswith(".log"):
                 continue
             with open(os.path.join(log_dir, name), errors="replace") as f:
                 for line in f:
                     match = _PIN_COVERAGE.search(line)
-                    found += bool(match and int(match.group(1)) > 0)
-        return found
+                    if match:
+                        name, compressed, total = match.groups()
+                        found += int(compressed) > 0
+                        if int(compressed) == 0 and int(total) > 0:
+                            uncompressed[name] += 1
+                    skip = _PIN_SIZE_SKIP.search(line)
+                    if skip:
+                        size_skips[skip.group(1)] += 1
+        return found, sum((size_skips & uncompressed).values())
 
     deadline = time.time() + timeout_s
-    count = scan()
-    while count == 0 and time.time() < deadline:
+    counts = scan()
+    while counts[0] == 0 and time.time() < deadline:
         time.sleep(0.5)
-        count = scan()
-    return count
+        counts = scan()
+    return counts
 
 
 # Connections deliberately kept open by --rollback-scratch (see benchmark_db);
@@ -1026,14 +1040,25 @@ def benchmark_db(args, run_dir, filename):
         log("Rollback scratch armed: WAL-only mutations, restore = delete .wal")
     try:
         if args.pin_compression:
-            compressed = compressed_pin_count(os.environ["SIRIUS_LOG_DIR"])
-            if compressed == 0:
+            compressed, skipped = pin_compression_counts(os.environ["SIRIUS_LOG_DIR"])
+            expected = (
+                len(args.pin_layout_entries)
+                if args.pin_layout_entries is not None
+                else len(union_columns_by_table())
+            )
+            if compressed:
+                log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
+            elif skipped == expected and expected > 0:
+                log(
+                    f"Simpatico: all {skipped} pins skipped by the automatic table-size gate; "
+                    "continuing with uncompressed pins"
+                )
+            else:
                 raise SystemExit(
                     "--pin-compression was requested but no pinned table was "
                     "compressed; the run would silently measure uncompressed "
                     "data. Check the sirius log for '[pin_table]' warnings."
                 )
-            log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
         yield con
     finally:
         # Cleanup must not destroy results already earned: if the database died

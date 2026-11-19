@@ -446,9 +446,11 @@ points `pin_table_input_compression_plan_dir` at a directory of per-table plan o
 the explore-generated TPC-H plans under `src/compression/simpatico_codegen/plans/tpch_sf1000`.
 Compression happens at pin time, so the flag requires a pinned tier.
 A table whose plan file does not cover the pinned columns degrades to uncompressed with
-a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` and
-`automatically selecting compression plans` INFO markers after pinning and aborts if nothing
-compressed, so a misconfigured run cannot silently measure uncompressed data. Refreshed rows live in the uncompressed insert delta / delete mask on top of
+a `[pin_table]` WARN in the log; the runner counts pins with compressed chunks from the final
+compression coverage records. If none compressed, it continues only when every expected pin
+has both an automatic table-size skip record and a completed, uncompressed coverage record.
+It reports that the run uses uncompressed pins; other zero-compression outcomes still abort.
+Refreshed rows live in the uncompressed insert delta / delete mask on top of
 the compressed base, which is exactly the recurring cost the post-RF passes measure.
 
 Power@Size is a geometric mean, so one very fast query would otherwise pull it up without bound;

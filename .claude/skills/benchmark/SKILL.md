@@ -242,8 +242,9 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 **Flags** (full reference in `test/tpch_performance/README.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
 `--pin gpu|host` (always one of these), `--pin-compression/--no-pin-compression`
-(Simpatico-compressed pins; plan dir defaults to the shipped TPC-H plans),
-`--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates` (default fixed;
+(Simpatico compression with automatic plans; runs where every pin is skipped by the automatic
+table-size gate continue uncompressed), `--compression-plan-dir <dir>` (optional per-table
+plan overrides), `--vary-predicates/--no-vary-predicates` (default fixed;
 varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir <dir>`,
 `--validation/--no-validation` (fixed predicates only, default on; the power run's post-RF1 and
 post-RF2 GPU rows are diffed against pure DuckDB in a child process after every pinned phase
