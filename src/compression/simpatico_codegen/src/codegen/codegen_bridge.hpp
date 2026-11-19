@@ -32,6 +32,41 @@ struct CodegenHead {
   std::vector<FusedNodeOrigin> preorder;
 };
 
+/// A fused region between its two launches: begin_fused_encode() queued the launch that
+/// measures it, and encode_fused_subtree() packs it. Owns the device buffers of the measure
+/// launch, which it releases in stream order.
+struct pending_fused_encode;
+
+struct pending_fused_encode_deleter {
+  void operator()(pending_fused_encode* pending) const noexcept;
+};
+
+using pending_fused_encode_ptr =
+  std::unique_ptr<pending_fused_encode, pending_fused_encode_deleter>;
+
+/// How encode_fused_subtree() runs a region.
+struct fused_encode_options {
+  /// The region as begin_fused_encode() left it for the same tree, node, column, stream and
+  /// allocator, or null to measure it now.
+  pending_fused_encode* pending{nullptr};
+  /// Return with the region's last launch still queued on the stream. The caller waits for the
+  /// stream before the encoded buffers are read on another stream or from the host. Only a
+  /// region that is measured and then packed honours this; any other returns complete.
+  bool defer_completion{false};
+};
+
+/// Queue the first launch of the fused region rooted at ``start_node`` on ``stream`` and return
+/// without waiting for it, so the caller can queue or run other work before
+/// encode_fused_subtree() reads the measurements back and packs. Returns null, with nothing
+/// left queued that the caller has to wait for, when the node roots no region that is measured
+/// and then packed or when anything fails; encode_fused_subtree() without a pending region then
+/// encodes the node, or reports why it cannot.
+pending_fused_encode_ptr begin_fused_encode(PlanTree const& tree,
+                                            NodeId start_node,
+                                            cudf::column_view input_col,
+                                            ::cuda::stream_ref stream,
+                                            rmm::device_async_resource_ref mr);
+
 /// JIT-encode the maximal {delta,rle,bitpack,FOR,zigzag} subtree rooted at
 /// PlanTree node ``start_node`` from a contiguous int32/int64 column. Extracts
 /// the fusable region, then writes its reps into ``builder`` (NodeId-keyed in
@@ -49,7 +84,8 @@ bool encode_fused_subtree(PlanTree const& tree,
                           rmm::device_async_resource_ref mr,
                           fused_leaf_builder& builder,
                           std::string* error_out,
-                          CodegenHead* head_out = nullptr);
+                          CodegenHead* head_out        = nullptr,
+                          fused_encode_options options = {});
 
 /// Launch an already-built encode head for ``input_col`` and assemble its
 /// compressed leaves in ``builder``.
@@ -58,7 +94,8 @@ bool launch_encode_fused_tree(CodegenHead const& head,
                               ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref const& mr,
                               fused_leaf_builder& builder,
-                              std::string* error_out);
+                              std::string* error_out,
+                              bool defer_completion = false);
 
 /// Launch an already-prepared fused decode tree. ``labeled`` must contain all persisted buffers;
 /// decode-only scratch is allocated and released on the frame's stream, and the frame keeps the
