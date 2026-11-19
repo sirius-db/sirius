@@ -9,9 +9,26 @@ from unittest.mock import Mock, patch
 
 import performance_test as benchmark
 import tpch_power_throughput as power
+from tpch_pin_columns import emit_pin_all
 
 
 class PinCompressionTests(unittest.TestCase):
+    def test_pin_compression_table_allowlist(self):
+        with patch.dict(
+            os.environ, {"SIRIUS_PIN_COMPRESSION_TABLES": "lineitem,orders"}
+        ):
+            statements = emit_pin_all("/tpch.duckdb", data_source="duckdb")
+        for table in ("lineitem", "orders"):
+            self.assertRegex(
+                statements,
+                rf"name='{table}'[^;]*compression=true\);",
+            )
+        for table in ("customer", "nation", "part", "partsupp", "region", "supplier"):
+            self.assertRegex(
+                statements,
+                rf"name='{table}'[^;]*compression=false\);",
+            )
+
     def test_python_connection_sets_both_compression_states(self):
         for plan_dir in (None, "/plans"):
             with self.subTest(plan_dir=plan_dir):

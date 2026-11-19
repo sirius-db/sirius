@@ -46,7 +46,10 @@ The SF100, SF300, SF1000, and SF3000 pin results use `bench/gb300-pin/config.yam
 iteration, per-query host pinning, and Simpatico input compression. The pinned
 `lineitem` and `orders` plans are the repository's
 `src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt` and
-`orders.txt`. All 22 queries completed on Sirius without CPU fallback in those
+`orders.txt`. To replay that explicit-plan-only setup on current Sirius, set
+`SIRIUS_PIN_COMPRESSION_TABLES=lineitem,orders` when running `performance_test.py`;
+the other six tables then pin uncompressed instead of using newly available
+automatic plans. All 22 queries completed on Sirius without CPU fallback in those
 four selected runs. At SF10000, per-query host pinning failed before Q13 executed:
 the 450 GiB host pool ran out of blocks after a 448.12 GiB lifetime peak. There
 is no selected SF10000 pin timing to report.

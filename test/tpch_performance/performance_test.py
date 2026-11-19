@@ -274,6 +274,7 @@ def setup_benchmark_dir(
         "pin": pin,
         "pin_compression": PIN_COMPRESSION_PLAN_DIR is not None,
         "compression_plan_dir": PIN_COMPRESSION_PLAN_DIR,
+        "pin_compression_tables": os.environ.get("SIRIUS_PIN_COMPRESSION_TABLES"),
         "precmd": precmd,
         # Keep this field while downstream report scripts migrate to `precmd`.
         "nsys_profile": precmd == "nsys",
