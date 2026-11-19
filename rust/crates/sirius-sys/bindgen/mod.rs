@@ -23,9 +23,9 @@ pub fn run(manifest: &Path) {
         .allowlist_type("sirius_.*")
         .allowlist_var("SIRIUS_.*")
         // Preserve the handwritten opaque handles' thread-safety and pinning markers.
-        .blocklist_type("sirius_(context_config|context_config_builder|error)")
+        .blocklist_type("sirius_(context_config|context_config_builder|error|schema|expression|plan_node|plan)")
         .raw_line(
-            "use super::{sirius_context_config, sirius_context_config_builder, sirius_error};",
+            "use super::{sirius_context_config, sirius_context_config_builder, sirius_error, sirius_schema, sirius_expression, sirius_plan_node, sirius_plan};",
         )
         .derive_copy(false)
         .derive_debug(false)

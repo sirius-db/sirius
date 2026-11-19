@@ -5,7 +5,7 @@ Crates for driving [Sirius](https://github.com/sirius-db/sirius) from Rust.
 | Crate | Role |
 |-------|------|
 | [`sirius-sys`](crates/sirius-sys) | Raw bindings and native library linking for the public C ABI. |
-| [`sirius`](crates/sirius) | Safe configuration wrappers over `sirius-sys`. |
+| [`sirius`](crates/sirius) | Safe configuration and physical plan wrappers over `sirius-sys`. |
 | [`sirius-ffi`](crates/sirius-ffi) | Existing C++ FFI bridge, execution wrappers, and object-store bindings. |
 
 Before [#2436](https://github.com/sirius-db/sirius/pull/2436), `sirius` and
@@ -13,6 +13,12 @@ Before [#2436](https://github.com/sirius-db/sirius/pull/2436), `sirius` and
 crates; the existing C++ bridge lives in `sirius-ffi`.
 
 The `telemetry/*` crates are unrelated: CMake links those into the engine.
+
+## Plan construction
+
+The [plan example](crates/sirius/examples/plan.rs) builds a local Parquet scan with
+a caller-supplied schema, filters rows where `id > 10`, and prints the plan.
+Construction checks expression types and scopes without opening the file or initializing a GPU.
 
 ## Configuration
 
@@ -62,7 +68,7 @@ pixi run make                       # builds the Sirius extension (+ artifact + 
 pixi run cargo test --locked --no-run --manifest-path rust/Cargo.toml -p sirius -p sirius-sys -p sirius-ffi
 ```
 
-The `sirius-ffi` execution tests need a GPU; the public configuration tests do not
+The `sirius-ffi` execution tests need a GPU; the public configuration and plan tests do not
 initialize the engine. Point the runtime loader at the build-tree library:
 
 ```bash
@@ -99,7 +105,7 @@ and `sirius-sys` references without native compilation or linking. The
 
 `sirius-sys/build.rs` supplies library linking for both API paths.
 `sirius-ffi/build.rs` compiles the execution bridge against the public `include`
-directory. Configuration uses the C declarations in
+directory. Configuration and plan construction use the C declarations in
 `sirius-sys/src/c_api.rs`. Neither path includes internal engine headers.
 
 ## Environment
@@ -143,6 +149,6 @@ cargo +nightly miri test --locked --manifest-path rust/Cargo.toml -p sirius -p s
 CI runs these tests for `sirius` and `sirius-sys` without a GPU or native library.
 The test executables supply Rust-owned C ABI stand-ins so Miri can inspect pointer
 access, ownership, diagnostic lifetimes, and failure cleanup. They do not model
-YAML parsing or validate C++/CUDA behavior. The existing native configuration and
+YAML parsing or validate C++/CUDA behavior. The native configuration, plan and
 GPU suites continue to check the real library. Legacy `sirius-ffi` is outside
 this Miri suite.

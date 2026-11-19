@@ -130,3 +130,67 @@ unsafe extern "C" fn sirius_error_destroy(error: *mut SiriusError) {
 extern "C" fn sirius_abi_version() -> u32 {
     SIRIUS_ABI_VERSION
 }
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_literal_int64(
+    _value: i64,
+    out: *mut *mut SiriusExpression,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    create::<_, i64>(out, error)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_retain(value: *mut SiriusExpression) {
+    retain::<_, i64>(value);
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_release(value: *mut SiriusExpression) {
+    release::<_, i64>(value);
+}
+
+// A single-field schema stand-in stores the name in the allocation retained by the wrapper.
+// Borrowing that name lets Miri check both the input copy and output lifetime.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_create(
+    fields: *const sirius_field,
+    count: usize,
+    out: *mut *mut SiriusSchema,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    assert_eq!(count, 1);
+    let field = &*fields;
+    let name = std::slice::from_raw_parts(field.name.cast::<u8>(), field.name_size);
+    *error = ptr::null_mut();
+    *out = Arc::into_raw(Arc::new(name.to_vec())).cast_mut().cast();
+    SIRIUS_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_field(
+    schema: *const SiriusSchema,
+    index: usize,
+    out: *mut sirius_field,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    assert_eq!(index, 0);
+    let name = &*schema.cast::<Vec<u8>>();
+    *error = ptr::null_mut();
+    *out = sirius_field {
+        name: name.as_ptr().cast(),
+        name_size: name.len(),
+        type_: SIRIUS_TYPE_INT64,
+        nullable: 1,
+    };
+    SIRIUS_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_retain(value: *mut SiriusSchema) {
+    retain::<_, Vec<u8>>(value)
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_release(value: *mut SiriusSchema) {
+    release::<_, Vec<u8>>(value)
+}
