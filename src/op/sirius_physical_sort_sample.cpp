@@ -32,6 +32,8 @@
 #include <cudf/merge.hpp>
 #include <cudf/reduction/unique_count.hpp>
 
+#include <rmm/error.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -53,11 +55,19 @@ std::size_t capped_product(std::size_t a, std::size_t b)
                                                : std::min(a * b, max_sample_key_rows);
 }
 
-std::size_t count_repeated_boundaries(cudf::table const* boundaries, ::cuda::stream_ref stream)
+std::optional<std::size_t> count_repeated_boundaries(cudf::table const* boundaries,
+                                                     ::cuda::stream_ref stream)
 {
   if (!boundaries || boundaries->num_rows() == 0) { return 0; }
   auto const view = boundaries->view();
-  return view.num_rows() - cudf::unique_count(view, cudf::null_equality::EQUAL, stream);
+  try {
+    return view.num_rows() - cudf::unique_count(view, cudf::null_equality::EQUAL, stream);
+  } catch (rmm::out_of_memory const&) {
+    // This is only a diagnostic. The distributed hook has already released its gathered
+    // sample, so retrying boundary computation here would repeat a completed collective.
+    // Keep the valid boundaries and distinguish an unavailable count from zero repeats.
+    return std::nullopt;
+  }
 }
 
 uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
