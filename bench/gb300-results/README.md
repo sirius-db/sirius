@@ -119,6 +119,11 @@ It includes the runner, per-query CSVs, totals, and measurement notes for
 SF1000, SF3000, and SF10000. These runs use Sirius main `26b5caba` and are
 separate from the selected cold/hot/pin timing snapshots above.
 
+The [SF1000 host-pin cumulative ablation](../gb300-ablation/RESULTS.md) starts
+with type narrowing, compressed pinning, fused decode filtering, BUILD_PROBE,
+and dynamic filters all disabled, then enables them in that order. It includes
+the runner, six-stage and per-query results, and untimed path checks.
+
 ## Host-pinned Parquet concurrency
 
 The [concurrency results](concurrency/summary.csv) add SF100, SF300, and SF1000

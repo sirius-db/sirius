@@ -1,0 +1,38 @@
+{
+  "all_query_results_match_baseline": true,
+  "all_stage_exit_codes_zero": true,
+  "compressed_pin_tables": [
+    "lineitem",
+    "orders"
+  ],
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "extension_sha256": "7ed19c6e8530c18a99303e381e85f67d4b33f029107f5dfba693936b298091a0",
+  "gb300_pin_config_sha256": "b671547162bcdda552607662901c0cfdebf7f71c6a6bee5be0fe91b9d20fa191",
+  "iterations_per_query": 1,
+  "machine": "NVIDIA GB300, one GPU, CDMM driver mode",
+  "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-20261120T150732Z-3132936",
+  "pin_tier": "host",
+  "profile": "hot",
+  "q11_result_comparison": "Rows sorted before comparison because equal ORDER BY keys may appear in either order; all other query result text matches exactly.",
+  "queries": "Q1-Q22",
+  "run_started_utc": "2026-11-20T15:07:32Z",
+  "runtime_excludes": "pin and unpin",
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "source_commit": "c082bf10014cc005867ec64e048477b0df848279",
+  "stage_config_sha256": {
+    "stage0-all_off": "9f4a961d29832b71fdf60e8f29710b8bc4b4db70bc66562a80900b9b24fcf933",
+    "stage1-type_narrow": "ba986cd484b365d00c772a95e198d757be901fb78098701dc9b4c8d2e9d027bd",
+    "stage2-compressed_pin": "ba986cd484b365d00c772a95e198d757be901fb78098701dc9b4c8d2e9d027bd",
+    "stage3-fused_decode": "46ec192152e4c1d4d61c77c7db8018c0ed7ef574ab8916c2c5f51ebb2be2a947",
+    "stage4-build_probe": "ce02323bb7c51965832bd6edfc820ca1b5c357f49d1b93e11524268719a38ddc",
+    "stage5-dynamic_filter": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e"
+  },
+  "untimed_diagnostics": {
+    "build_probe_selections_q3": 2,
+    "dynamic_filter_publications_q3": 2,
+    "fused_filtered_decodes_q6": 32
+  }
+}
