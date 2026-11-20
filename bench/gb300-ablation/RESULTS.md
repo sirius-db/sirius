@@ -186,35 +186,3 @@ with the [run manifest](results/join-first-corrected-manifest.json). Untimed
 diagnostics for each corrected order found two BUILD_PROBE selections and two
 dynamic-filter publications for Q3, plus 32 filtered decodes for Q6. These
 diagnostic runs do not contribute to the timing tables.
-
-## Memory prefetching with all five optimizations on
-
-Two paired SF1000 host-pin runs compared background host-to-GPU memory
-prefetching off and on, reversing the run order in the second pair. Type
-narrowing, BUILD_PROBE admission, dynamic filters, Simpatico compression for
-`lineitem` and `orders`, and fused filtering during decode were enabled in
-every stage. The [prefetch-off YAML](results/prefetch-off-config.yaml) differs
-from the [prefetch-on YAML](results/prefetch-on-config.yaml) only in
-`memory_prefetcher.enable`; the enabled setting uses three worker threads.
-Each stage ran Q1–Q22 once in a fresh Sirius process with the hot profile.
-Query totals exclude pinning and unpinning.
-
-| Run order | Prefetch off | Prefetch on | On versus off |
-| :--- | ---: | ---: | ---: |
-| Off, then on | 6.717 s | 6.971 s | +0.254 s (+3.8%) |
-| On, then off | 6.663 s | 6.999 s | +0.336 s (+5.0%) |
-| Mean | 6.690 s | 6.985 s | +0.295 s (+4.4%) |
-
-All four stages completed, and query result rows matched within each pair.
-Q11 reordered rows with equal sort keys. Sirius logged 22 prefetcher starts
-in each enabled stage and none in the disabled stages. The enabled stages
-prefetched 487 batches / 799.1 GB and 463 batches / 765.7 GB, respectively. Thus the
-comparison did exercise prefetching; on this workload, it was slower in both
-paired passes. These are two measurements per setting, so the size of the
-difference is still subject to run-to-run variation.
-
-The [paired totals](results/prefetch-comparison.csv), per-query timings for
-[off-then-on](results/prefetch-off-then-on-per-query.csv) and
-[on-then-off](results/prefetch-on-then-off-per-query.csv), and
-[run manifest](results/prefetch-manifest.json) are saved here. The runner's
-`--memory-prefetcher-pair` and `--reverse-pair` switches reproduce both orders.

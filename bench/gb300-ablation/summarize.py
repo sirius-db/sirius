@@ -66,11 +66,6 @@ def main() -> None:
         action="store_true",
         help="summarize the narrowing, BUILD_PROBE, dynamic filter, compression, fused-decode order",
     )
-    comparison.add_argument(
-        "--memory-prefetcher-pair",
-        action="store_true",
-        help="summarize all-five-on runs with memory prefetching off and on",
-    )
     args = parser.parse_args()
     root = args.output.resolve()
     if not root.is_dir():
@@ -98,8 +93,6 @@ def main() -> None:
             (19, "compressed_pin"),
             (20, "fused_decode"),
         )
-    elif args.memory_prefetcher_pair:
-        stages = ((21, "prefetch_off"), (22, "prefetch_on"))
     else:
         stages = tuple(enumerate(STAGES))
     all_times = [read_stage(root, stage, label) for stage, label in stages]

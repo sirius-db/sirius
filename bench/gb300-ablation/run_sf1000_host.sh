@@ -8,8 +8,6 @@ comparison=false
 all_on_comparison=false
 join_first_order=false
 narrow_first_order=false
-prefetch_pair=false
-reverse_pair=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
@@ -17,21 +15,15 @@ for arg in "$@"; do
     --all-on-vs-simpatico) all_on_comparison=true ;;
     --join-first-order) join_first_order=true ;;
     --narrow-first-order) narrow_first_order=true ;;
-    --memory-prefetcher-pair) prefetch_pair=true ;;
-    --reverse-pair) reverse_pair=true ;;
-    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico|--join-first-order|--narrow-first-order|--memory-prefetcher-pair [--reverse-pair]] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
+    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico|--join-first-order|--narrow-first-order] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
   esac
 done
 selected_modes=0
-for selected in "$comparison" "$all_on_comparison" "$join_first_order" "$narrow_first_order" "$prefetch_pair"; do
+for selected in "$comparison" "$all_on_comparison" "$join_first_order" "$narrow_first_order"; do
   if [[ "$selected" == true ]]; then ((selected_modes+=1)); fi
 done
 if (( selected_modes > 1 )); then
   echo "Choose only one run mode" >&2
-  exit 2
-fi
-if [[ "$reverse_pair" == true && "$prefetch_pair" != true ]]; then
-  echo "--reverse-pair requires --memory-prefetcher-pair" >&2
   exit 2
 fi
 dataset="${DATASET_ROOT:-/mnt/datasets}/tpch_parquet_sf1000"
@@ -82,10 +74,7 @@ if [[ "$comparison" == true ]]; then stages=(0 6); fi
 if [[ "$all_on_comparison" == true ]]; then stages=(7 8); fi
 if [[ "$join_first_order" == true ]]; then stages=(9 10 11 12 13 14); fi
 if [[ "$narrow_first_order" == true ]]; then stages=(15 16 17 18 19 20); fi
-if [[ "$prefetch_pair" == true ]]; then stages=(21 22); fi
-if [[ "$reverse_pair" == true ]]; then stages=(22 21); fi
 for stage in "${stages[@]}"; do
-  prefetch=default
   case "$stage" in
     0) label=all_off;       narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
     1) label=type_narrow;   narrow=true;  compress=false; fused=false; build_probe=false; dynamic=false ;;
@@ -108,8 +97,6 @@ for stage in "${stages[@]}"; do
     18) label=dynamic_filter; narrow=true;  compress=false; fused=false; build_probe=true;  dynamic=true ;;
     19) label=compressed_pin; narrow=true;  compress=true;  fused=false; build_probe=true;  dynamic=true ;;
     20) label=fused_decode;   narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true ;;
-    21) label=prefetch_off;   narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true; prefetch=false ;;
-    22) label=prefetch_on;    narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true; prefetch=true ;;
   esac
   stage_dir="$output/stage${stage}-${label}"
   sql="SET enable_duckdb_fallback = false;"
@@ -126,7 +113,7 @@ for stage in "${stages[@]}"; do
     --input "$dataset" --scale-factor 1000 --engine gpu --profile hot
     --iterations 1 --queries 1-22 --config "$stage_dir/config.yaml" --pin host
     "$pin_option" --output "$stage_dir" --name "sf1000_host_ablation_stage${stage}")
-  echo "Stage $stage ($label): narrowing=$narrow compressed_pin=$compress fused_decode=$fused BUILD_PROBE=$build_probe dynamic_filter=$dynamic memory_prefetcher=$prefetch pin_compression_tables=${stage_compression_tables:-none}"
+  echo "Stage $stage ($label): narrowing=$narrow compressed_pin=$compress fused_decode=$fused BUILD_PROBE=$build_probe dynamic_filter=$dynamic pin_compression_tables=${stage_compression_tables:-none}"
   if [[ "$dry_run" == true ]]; then
     printf 'SIRIUS_PRE_SQL=%q ' "$sql"
     printf '%q ' "${command[@]}"
@@ -135,23 +122,6 @@ for stage in "${stages[@]}"; do
   fi
   mkdir -p "$stage_dir"
   cp "$config" "$stage_dir/config.yaml"
-  if [[ "$prefetch" != default ]]; then
-    python3 - "$stage_dir/config.yaml" "$prefetch" <<'PY'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text, count = re.subn(
-    r"(?m)^(      memory_prefetcher:\n        enable: )(true|false)(\n)",
-    lambda match: f"{match.group(1)}{sys.argv[2]}{match.group(3)}",
-    path.read_text(),
-)
-if count != 1:
-    raise SystemExit("expected exactly one memory_prefetcher.enable setting")
-path.write_text(text)
-PY
-  fi
   {
     printf '\n  operator_params:\n'
     printf '    enable_compressed_materialization: %s\n' "$narrow"
