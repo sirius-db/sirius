@@ -66,7 +66,7 @@ librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=2.0.0"
+duckdb = "=2.0.1"
 spdlog = "1.*"
 sqlite = "3.*"
 liburing = "*"
@@ -86,7 +86,7 @@ mysql-client = "*"
 # builds the substrait extension against (DUCKDB_TAG), or the extension refuses to load.
 [feature.check.dependencies]
 python = "3.12.*"
-python-duckdb = "=2.0.0"
+python-duckdb = "=2.0.1"
 # For scripts/build-duckdb-substrait.sh; the C++ compiler stays the system one (as in CI).
 cmake = ">=3.28"
 ninja = "1.*"
