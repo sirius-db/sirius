@@ -1013,6 +1013,12 @@ results preserve physical-check evidence and diagnostics, and distinguish field
 correspondence from the reader projection, including cardinality carriers and
 natural-read fallback. Preparation still reads and certifies each footer once.
 
+Source columns are named by what the table function bound (`scan_source_names`,
+`src/planner/scan_source_names.hpp`), never by `LogicalGet::names`: a column alias
+list such as `AS t(b, a)` renames the query's columns and must not change which file
+column is read, which pinned column proves a key distinct, or whose footer statistics
+are consulted.
+
 ## Key Files
 
 | File | Purpose |

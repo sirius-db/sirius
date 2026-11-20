@@ -48,6 +48,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_returned_types.hpp"
+#include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -91,15 +92,6 @@ bool names_remote_object(std::string const& path)
     // A bare relative path is not a URI; only an explicit scheme marker makes one remote.
     return path.find("://") != std::string::npos;
   }
-}
-
-// The column names the table function bound, in LogicalGet order. LogicalGet::names carries the
-// query's column aliases (`AS t(b, a)`), which name no column of the source.
-duckdb::vector<std::string> scan_source_names(duckdb::LogicalGet const& op)
-{
-  auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
-  return duckdb::IdentifiersToStrings(
-    multi_file && multi_file->names.size() == op.names.size() ? multi_file->names : op.names);
 }
 
 // Plans the live equality deletes of a snapshot into @p inventory, or says why the GPU path

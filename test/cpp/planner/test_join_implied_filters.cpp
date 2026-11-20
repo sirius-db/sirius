@@ -107,6 +107,20 @@ TEST_CASE("join implied filters - the join's own range filter on the other side 
   }
 }
 
+TEST_CASE("join implied filters - a column alias does not hide the footer statistics",
+          "[planner][join_implied_filters]")
+{
+  // `AS t(renamed)` changes LogicalGet::names only; the statistics stay under the bound name.
+  auto customer = make_scan(1, 1, k_customers, k_customers - 1);
+  customer->bind_data->Cast<duckdb::MultiFileBindData>().names = {duckdb::Identifier("k")};
+  customer->names                                              = {duckdb::Identifier("renamed")};
+  auto const* raw                                              = customer.get();
+  auto join =
+    make_join(duckdb::JoinType::INNER, make_scan(0, 1, k_customers - 1), std::move(customer));
+  drop_join_implied_filters(*join);
+  CHECK_FALSE(has_filter(*raw));
+}
+
 TEST_CASE("join implied filters - filters that can remove matching rows stay",
           "[planner][join_implied_filters]")
 {

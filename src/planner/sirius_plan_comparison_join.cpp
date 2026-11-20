@@ -52,6 +52,7 @@
 #include "planner/gpu_admission.hpp"
 #include "planner/join_implied_filters.hpp"
 #include "planner/join_key_nullability.hpp"
+#include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
@@ -204,7 +205,7 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
     // Virtual columns (row ids and the like) have no pinned counterpart.
     if (primary_column_index >= get.names.size()) { continue; }
     if (hive_partition_columns.contains(primary_column_index)) { continue; }
-    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
+    auto const column_name = scan_source_names(get)[primary_column_index];
     if (proven_unique(column_name)) {
       SIRIUS_LOG_DEBUG("[join] column '{}' proven distinct by the pinned table", column_name);
       keys.push_back({output_idx});
