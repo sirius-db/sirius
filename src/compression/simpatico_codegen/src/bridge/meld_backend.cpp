@@ -146,18 +146,19 @@ class SchemeWriter {
 std::atomic<std::uint64_t> g_meld_compiles{0};
 std::atomic<std::uint64_t> g_meld_compile_us{0};
 std::atomic<std::uint64_t> g_meld_link_us{0};
-std::atomic<std::uint64_t> g_meld_kernels{0};
+std::atomic<std::uint64_t> g_meld_kernel_requests{0};
 struct MeldStatsReporter {
   ~MeldStatsReporter()
   {
     if (std::getenv("SIMPATICO_JIT_STATS") == nullptr) return;
-    std::fprintf(stderr,
-                 "[meld-stats pid=%d] kernels=%llu compiles=%llu compile_ms=%.0f link_ms=%.0f\n",
-                 static_cast<int>(::getpid()),
-                 static_cast<unsigned long long>(g_meld_kernels.load()),
-                 static_cast<unsigned long long>(g_meld_compiles.load()),
-                 g_meld_compile_us.load() / 1000.0,
-                 g_meld_link_us.load() / 1000.0);
+    std::fprintf(
+      stderr,
+      "[meld-stats pid=%d] kernel_requests=%llu compiles=%llu compile_ms=%.0f link_ms=%.0f\n",
+      static_cast<int>(::getpid()),
+      static_cast<unsigned long long>(g_meld_kernel_requests.load()),
+      static_cast<unsigned long long>(g_meld_compiles.load()),
+      g_meld_compile_us.load() / 1000.0,
+      g_meld_link_us.load() / 1000.0);
   }
 };
 MeldStatsReporter g_meld_stats_reporter;
@@ -371,7 +372,7 @@ std::optional<DecodeKernel> plain_decode_kernel(jit::FusedTree const& tree, char
   if (!launch.kernel || !launch.kernel->kern) {
     throw std::runtime_error("simpatico meld: null compiled kernel");
   }
-  g_meld_kernels.fetch_add(1, std::memory_order_relaxed);
+  g_meld_kernel_requests.fetch_add(1, std::memory_order_relaxed);
   launch.parameters       = decoder->parameters;
   launch.block_threads    = decoder->block_threads;
   launch.shared_bytes     = decoder->shared_bytes;
