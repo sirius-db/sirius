@@ -1249,6 +1249,7 @@ bool measurable(const simpatico::CodegenHead& head,
   auto const nc = static_cast<std::size_t>(num_chunks);
   for (auto const& buffer : spec.buffers) {
     if (buffer.field == "packed" || buffer.field == "lw_shards" || buffer.field == "data") continue;
+    if (buffer.field == "chunk_divisors" && buffer.length == 0) continue;  // plain bitpack
     bool const offsets = buffer.field == "rle_runs_offsets" || buffer.field == "offsets";
     if (buffer.length != (offsets ? nc + 1 : nc)) return false;
   }

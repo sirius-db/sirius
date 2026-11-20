@@ -1077,6 +1077,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("uint32_t*", p_lws);
   const bool measure      = mode_ == EncodeRenderMode::measure;
   const bool pack         = mode_ == EncodeRenderMode::pack;
+  const bool gcd          = node.bitpack_gcd;
   const std::string p_off = "bp_offsets_" + idstr;
   if (pack) { add_param("const int32_t*", p_off); }
   // Trailing: `chunk_divisors` is appended after every pre-existing channel so a
@@ -1104,8 +1105,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   // pack: the dense word offset of each chunk, an input the caller scans from the measure
   // pass's chunk_bits x chunk_count.
   if (pack) { add_buffer(id, "bp_offsets", sizeof(std::int32_t), nc + 1, /*no_pre_zero=*/true); }
-  // Trailing, matching the param order above.
-  add_buffer(id, "chunk_divisors", op_dt->elem_size, nc);
+  // Trailing, matching the param order above; empty unless the divisor is detected.
+  add_buffer(id, "chunk_divisors", op_dt->elem_size, gcd ? nc : 0);
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
   // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
@@ -1135,11 +1136,10 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << "        if (" << bp_len << " <= 0) {\n"
         << (pack ? std::string{}
                  : "            if (tid == 0) { " + p_min + "[chunk_id] = " + in.elem_type +
-                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; " + p_divs +
-                     "[chunk_id] = " + in.elem_type + "{1}; }\n")
+                     "{0}; " + p_cnt + "[chunk_id] = 0; " + p_bits + "[chunk_id] = 1; " +
+                     (gcd ? p_divs + "[chunk_id] = " + in.elem_type + "{1}; " : "") + "}\n")
         << "            break;\n"
         << "        }\n";
-  const bool gcd = node.bitpack_gcd;
   // Block-wide min and max of _lmin / _lmax into sh_min_b / sh_max_b, and cmin.
   const auto emit_range_reduce = [&] {
     body_ << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
@@ -1318,8 +1318,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
           << "        if (tid == 0) {\n"
           << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
-          << "            " << p_divs << "[chunk_id] = " << v_div << ";\n"
-          << (gcd ? "            if (" + v_div + " != " + in.elem_type + "{1}) " + p_lws + "[" +
+          << (gcd ? "            " + p_divs + "[chunk_id] = " + v_div + ";\n" + "            if (" +
+                      v_div + " != " + in.elem_type + "{1}) " + p_lws + "[" +
                       std::to_string(::codegen::kBitpackDivisorFlagWord) + "] = 1u;\n"
                   : std::string{})
           << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
