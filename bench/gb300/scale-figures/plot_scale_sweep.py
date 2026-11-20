@@ -150,7 +150,7 @@ def plot(measurements: list[Measurement], output: Path) -> None:
             marker=marker,
             markersize=6.5,
             linewidth=2.1,
-            label=f"{engine} {'host pin' if profile == 'pin' else profile}",
+            label="Sirius pinned (host)" if profile == "pin" else f"{engine} {profile}",
             zorder=3,
         )
     ax.set_xscale("log")
@@ -179,7 +179,7 @@ def plot(measurements: list[Measurement], output: Path) -> None:
     fig.text(
         0.10,
         0.075,
-        "Cold: first iteration   ·   Hot: second iteration   ·   Host pin: one iteration; pin/unpin excluded",
+        "Cold: first iteration   ·   Hot: second iteration   ·   Pinned (host): one iteration; pin/unpin excluded",
         ha="left",
         fontsize=9,
         color="#444444",
@@ -187,7 +187,7 @@ def plot(measurements: list[Measurement], output: Path) -> None:
     fig.text(
         0.10,
         0.035,
-        "DuckDB 2.0: SF100–SF3k; SF3k cold/hot caps 300/150 GiB. SF10k Sirius host pin unavailable.",
+        "DuckDB 2.0: SF100–SF3k; SF3k cold/hot caps 300/150 GiB. SF10k Sirius pinned (host) unavailable.",
         ha="left",
         fontsize=9,
         color="#444444",

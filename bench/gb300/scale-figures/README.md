@@ -3,11 +3,11 @@
 The [landscape paper figure](gb300-scale-sweep.pdf) plots the sum of all 22
 TPC-H query times against scale factor. [SVG](gb300-scale-sweep.svg) and
 [600-dpi PNG](gb300-scale-sweep.png) exports are provided. The figure uses log
-scales on both axes so the SF100 host-pin and SF10000 unpinned results remain
+scales on both axes so the SF100 pinned (host) and SF10000 unpinned results remain
 legible in one panel. The [selected values](gb300-scale-sweep-data.csv) give
 the exact measurements and source CSV for every point.
 
-| Scale | Sirius cold (s) | Sirius hot (s) | Sirius host pin (s) | DuckDB cold (s) | DuckDB hot (s) |
+| Scale | Sirius cold (s) | Sirius hot (s) | Sirius pinned (host) (s) | DuckDB cold (s) | DuckDB hot (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 100 | 7.862 | 5.532 | 1.612 | 16.112 | 12.067 |
 | 300 | 20.477 | 13.389 | 3.273 | 48.333 | 37.986 |
@@ -15,13 +15,13 @@ the exact measurements and source CSV for every point.
 | 3000 | 187.668 | 118.721 | 21.927 | 634.874 | 942.654 |
 | 10000 | 779.923 | 810.056 | — | — | — |
 
-Cold is iteration 0 and hot is iteration 1 of each saved run. Sirius host pin
+Cold is iteration 0 and hot is iteration 1 of each saved run. Sirius pinned (host)
 has one iteration and excludes pin/unpin time. Every plotted point represents
 all 22 queries, with setup and result fetch excluded. Sirius's selected
 [benchmark manifest](../results/manifest.json) and per-query CSVs are
 the source for its points. Its SF10000 cold/hot totals combine the 21-query
 run with a separate Q10 run using the saved 8 GiB build-hash-table config.
-SF10000 host pin failed before Q13, so no complete pin total is plotted.
+SF10000 pinned (host) failed before Q13, so no complete pin total is plotted.
 
 The DuckDB 2.0 baseline ran on the same machine and Parquet datasets, without
 loading Sirius, with external-file and Parquet-metadata caching enabled. The
