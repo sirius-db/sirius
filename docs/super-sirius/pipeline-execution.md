@@ -122,6 +122,9 @@ pipeline->get_sink()->sink(output_data, stream);
 4. Processing handles released automatically on scope exit
 
 The **destructor** calls `pipeline->mark_task_completed()` to update pipeline completion tracking.
+Completing the last task finalizes the pipeline's operators, which can throw. The destructor
+cannot propagate that, so it reports the exception to the query's completion handler: the query
+fails and the process keeps running.
 
 **`get_output_consumers()`** returns the first operator of each parent pipeline — these downstream operators are scheduled next by the GPU executor.
 
@@ -399,6 +402,12 @@ parent-cascade paths can finish a pipeline without returning through the GPU epi
 as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
+
+`pipeline_finished` is set before the operators are finalized. If `finalize_operator()` throws, the
+pipeline records the failure under `_status_mutex` and rethrows to its caller, which reports the
+error. From then on the pipeline never signals completion. The GPU epilogue therefore reads
+`finished_successfully()`, which takes the lock, instead of the lock-free `is_pipeline_finished()`,
+so a finalize failure on another thread is not reported as success.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
