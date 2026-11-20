@@ -1,0 +1,70 @@
+{
+  "all_five_optimizations_enabled": true,
+  "base_config_sha256": "b671547162bcdda552607662901c0cfdebf7f71c6a6bee5be0fe91b9d20fa191",
+  "compressed_pin_tables": [
+    "lineitem",
+    "orders"
+  ],
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "extension_sha256": "7ed19c6e8530c18a99303e381e85f67d4b33f029107f5dfba693936b298091a0",
+  "iterations_per_query": 1,
+  "machine": "NVIDIA GB300, one GPU, CDMM driver mode",
+  "memory_prefetcher_threads_when_enabled": 3,
+  "pin_tier": "host",
+  "profile": "hot",
+  "queries": "Q1-Q22",
+  "runs": [
+    {
+      "all_query_result_rows_match": true,
+      "label": "off-then-on",
+      "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-prefetch-pair-20261120",
+      "stage_info": {
+        "off": {
+          "batches_prefetched": 0,
+          "bytes_prefetched": 0,
+          "compression_true_pin_calls": 29,
+          "exit_code": 0,
+          "prefetch_starts": 0,
+          "prefetch_stops": 0,
+          "stage_config_sha256": "1738427bf7e5aba5b1e251b3bb20144f288960098156b4aa20e24edf90150883"
+        },
+        "on": {
+          "batches_prefetched": 487,
+          "bytes_prefetched": 799129788833,
+          "compression_true_pin_calls": 29,
+          "exit_code": 0,
+          "prefetch_starts": 22,
+          "prefetch_stops": 22,
+          "stage_config_sha256": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e"
+        }
+      }
+    },
+    {
+      "all_query_result_rows_match": true,
+      "label": "on-then-off",
+      "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-prefetch-pair-reverse-20261120",
+      "stage_info": {
+        "off": {
+          "batches_prefetched": 0,
+          "bytes_prefetched": 0,
+          "compression_true_pin_calls": 29,
+          "exit_code": 0,
+          "prefetch_starts": 0,
+          "prefetch_stops": 0,
+          "stage_config_sha256": "1738427bf7e5aba5b1e251b3bb20144f288960098156b4aa20e24edf90150883"
+        },
+        "on": {
+          "batches_prefetched": 463,
+          "bytes_prefetched": 765669119935,
+          "compression_true_pin_calls": 29,
+          "exit_code": 0,
+          "prefetch_starts": 22,
+          "prefetch_stops": 22,
+          "stage_config_sha256": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e"
+        }
+      }
+    }
+  ],
+  "runtime_excludes": "pin and unpin",
+  "source_commit": "7341328ea06c028074995aa8d536b4ec918e0556"
+}

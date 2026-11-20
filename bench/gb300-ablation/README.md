@@ -77,6 +77,18 @@ dynamic filters, compressed pinning, and fused filtering during decode after a
 fresh all-off baseline. Pass the same switch to `summarize.py` and the untimed
 path checks.
 
+To compare background host-to-GPU memory prefetching, use
+`--memory-prefetcher-pair`. Both stages keep all five optimizations enabled,
+including Simpatico compression for `lineitem` and `orders`. Stage 21 sets
+`memory_prefetcher.enable: false`; stage 22 sets it to `true` with three
+prefetch threads. The generated YAMLs differ only in that setting. Summarize
+with `summarize.py --memory-prefetcher-pair <output-directory>`. Query runtime
+still excludes pin and unpin time. The Sirius logs record the number of batches
+and bytes actually prefetched in stage 22.
+Pass `--reverse-pair` alongside `--memory-prefetcher-pair` to run the two stages
+in the opposite order, which helps check whether ordering affects a small
+timing difference.
+
 After the run, generate a six-stage total and a per-query comparison with:
 
 ```bash
