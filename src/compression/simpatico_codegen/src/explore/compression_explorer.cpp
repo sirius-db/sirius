@@ -692,7 +692,9 @@ exploration_result explore_column_compression(cudf::column_view input,
               (pend.path == "input") ? op_name + "." + out.name : pend.path + "." + out.name;
             size_t out_sz = column_size_bytes_ex(out.view, stream);
             pending_item po{out_path, out.view, out_sz};
-            if (is_term)
+            // An empty channel (bitpack's chunk_divisors without a divisor) has nothing to
+            // compress, so it would only take beam slots.
+            if (is_term || out.view.size() == 0)
               child->leaves.push_back(po);
             else
               child->pending.push_back(po);

@@ -160,8 +160,16 @@ struct bitpack_estimate {
 /// bit width of its range, plus its min/count/width header. Alongside, the size with the
 /// divisor bitpack_gcd would fold into each chunk: the 2^a * 5^b dividing every v - v0,
 /// for the chunk's first value v0, which is exactly the one dividing every v - min.
+/// Like the encoder, it caps the divisor to fit the stream's signed lane, whose width is
+/// also that of each stored divisor.
 class bitpack_size_estimate {
  public:
+  explicit bitpack_size_estimate(std::size_t lane_bytes)
+    : lane_bytes_{lane_bytes},
+      max_divisor_{(static_cast<unsigned __int128>(1) << (8 * lane_bytes - 1)) - 1}
+  {
+  }
+
   void push(__int128 value)
   {
     if (count_ == 0) {
@@ -184,8 +192,8 @@ class bitpack_size_estimate {
   bitpack_estimate finish()
   {
     close_chunk();
-    // The divisor channel is stored, one 8-byte slot per chunk, once any chunk has one.
-    return {plain_, any_divisor_ ? gcd_ + 8.0 * static_cast<double>(chunks_) : plain_};
+    // The divisor channel is stored, one lane-wide slot per chunk, once any chunk has one.
+    return {plain_, any_divisor_ ? gcd_ + static_cast<double>(lane_bytes_ * chunks_) : plain_};
   }
 
  private:
@@ -204,13 +212,14 @@ class bitpack_size_estimate {
     auto const range = static_cast<unsigned __int128>(hi_ - lo_);
     auto const rows  = static_cast<double>(count_);
     plain_ += rows * bit_width(range) / 8 + 16;
+    // The encoder's order: the powers of 5, then of 2, each while the product still fits.
     unsigned __int128 divisor = 1;
     if (diff_or_ != 0) {
-      for (auto v = diff_or_; (v & 1) == 0; v >>= 1) {
-        divisor <<= 1;
-      }
-      for (int e = 0; e < pow5_; ++e) {
+      for (int e = 0; e < pow5_ && divisor <= max_divisor_ / 5; ++e) {
         divisor *= 5;
+      }
+      for (auto v = diff_or_; (v & 1) == 0 && divisor <= max_divisor_ / 2; v >>= 1) {
+        divisor <<= 1;
       }
     }
     any_divisor_ = any_divisor_ || divisor != 1;
@@ -219,6 +228,8 @@ class bitpack_size_estimate {
     count_ = 0;
   }
 
+  std::size_t lane_bytes_;
+  unsigned __int128 max_divisor_;
   __int128 lo_{0};
   __int128 hi_{0};
   __int128 first_{0};
@@ -252,10 +263,10 @@ std::string integer_plan(cudf::column_view const& column, ::cuda::stream_ref str
 
   bool const is_unsigned = cudf::is_unsigned(column.type());
   auto const shift       = 64 - 8 * static_cast<int>(width);
-  bitpack_size_estimate values;
-  bitpack_size_estimate deltas;
-  bitpack_size_estimate run_lengths;
-  bitpack_size_estimate run_values;
+  bitpack_size_estimate values{width};
+  bitpack_size_estimate deltas{width};
+  bitpack_size_estimate run_lengths{sizeof(std::int32_t)};  // rle stores its run counts as int32
+  bitpack_size_estimate run_values{width};
   __int128 previous      = 0;
   __int128 run_value     = 0;
   std::size_t run_length = 0;

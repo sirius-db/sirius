@@ -420,6 +420,44 @@ TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spi
   CHECK(digest(*batch) == expected);
 }
 
+TEST_CASE("spill compression: bitpack_gcd leaves round-trip", "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  scoped_settings settings(enabled_settings());
+  auto stream = utils::default_stream();
+
+  // 2500 runs: two full bitpack chunks of run lengths alternating 3 and 1, and a partial one.
+  std::vector<std::int64_t> repeated_keys(10'000);
+  for (std::size_t i = 0; i < repeated_keys.size(); ++i) {
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
+  }
+  // Values 128 apart, a power of 2 an int8 divisor cannot hold, so it is capped to 64.
+  std::vector<std::int8_t> alternating(10'000);
+  for (std::size_t i = 0; i < alternating.size(); ++i) {
+    alternating[i] = static_cast<std::int8_t>(i % 2 == 0 ? -128 : 0);
+  }
+  auto keys  = numeric_column(cudf::data_type{cudf::type_id::INT64}, repeated_keys, stream);
+  auto bytes = numeric_column(cudf::data_type{cudf::type_id::INT8}, alternating, stream);
+  auto const keys_plan = sirius::compression::default_spill_plan(keys->view(), stream);
+  INFO(keys_plan);
+  REQUIRE(keys_plan.find("delta.differences.runs -> bitpack_gcd") != std::string::npos);
+  auto const bytes_plan = sirius::compression::default_spill_plan(bytes->view(), stream);
+  INFO(bytes_plan);
+  REQUIRE(bytes_plan.find("bitpack_gcd") != std::string::npos);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(keys));
+  columns.push_back(std::move(bytes));
+  auto batch          = gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+  auto const expected = digest(*batch);
+
+  move_to(batch, env().host);
+  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
+  move_to(batch, env().gpu);
+  REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
+  CHECK(digest(*batch) == expected);
+}
+
 TEST_CASE("spill compression: GPU -> compressed disk -> GPU, and the file goes with the batch",
           "[compression][spill]")
 {
