@@ -14,19 +14,25 @@
  * limitations under the License.
  */
 
+#include "helper/cuda_launch_error.hpp"
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/scan_resource_test_utils.hpp"
 #include "utils/test_physical_operator.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime.h>
+#include <thrust/system/cuda/error.h>
+#include <thrust/system_error.h>
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_sort_sample.hpp>
+#include <op/sort_range_count.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_config.hpp>
 
@@ -420,7 +426,7 @@ TEST_CASE("sirius_physical_sort_sample sizes a complete input from its actual by
   CHECK(sample_op.get_partition_boundaries().num_rows() == 1);
 }
 
-TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplicate boundaries",
+TEST_CASE("sirius_physical_sort_sample sizes partial input without duplicate boundaries",
           "[physical_sort_sample]")
 {
   auto* space = get_default_gpu_space();
@@ -469,6 +475,153 @@ TEST_CASE("sirius_physical_sort_sample extrapolates partial input without duplic
   REQUIRE(repo->all_empty() == expect_repo_empty);
 
   (void)sample_op.execute(*input, cudf::get_default_stream());
-  CHECK(sample_op.get_num_partitions() == rows_per_batch);
-  CHECK(sample_op.get_partition_boundaries().num_rows() == rows_per_batch - 1);
+  auto const expected_ranges = upstream_finished ? 3 : rows_per_batch;
+  CHECK(sample_op.get_num_partitions() == expected_ranges);
+  CHECK(sample_op.get_partition_boundaries().num_rows() == expected_ranges - 1);
+}
+
+TEST_CASE("sirius_physical_sort_sample scales planner bytes by sampled rows",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t rows_per_batch = 30;
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::LogicalType::INTEGER));
+  auto sample_op = sirius_physical_sort_sample(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    std::move(orders),
+    /*estimated_cardinality=*/75,
+    /*sort_sample_bytes=*/rows_per_batch * sizeof(int32_t),
+    /*max_partition_bytes=*/100);
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 1, rows_per_batch);
+
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  auto src_pipeline = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  src_pipeline->set_finished(false);
+  attach_port(sample_op, *repo, src_pipeline);
+
+  REQUIRE(sample_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  CHECK(sample_op.get_num_partitions() == 3);
+  CHECK(sample_op.get_range_sample_stats().est_source == "planner");
+}
+
+TEST_CASE("sirius_physical_sort_sample records key-row stride", "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto sample_op = make_sort_sample(1000000, 30000);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  add_int_batches(*repo, *space, 3, 20000);
+  attach_port(sample_op, *repo);
+  auto input = sample_op.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  (void)sample_op.execute(*input, cudf::get_default_stream());
+  auto const& stats = sample_op.get_range_sample_stats();
+  CHECK(stats.sample_rows == 60000);
+  CHECK(stats.sample_stride == 15);
+  CHECK(stats.sample_key_rows == 3999);
+}
+
+TEST_CASE("Sort range count respects bytes, rows, and sample size", "[physical_sort_sample]")
+{
+  CHECK(choose_sort_range_count(800, 100, 100, 100) == 8);
+  CHECK(choose_sort_range_count(10, 6000000000ULL, 100, 6000000000ULL) == 6);
+  CHECK(choose_sort_range_count(10, 6000000000ULL, 0, 6000000000ULL) == 6);
+  CHECK(choose_sort_range_count(1000, 100, 100, 3) == 3);
+}
+
+TEST_CASE("Sort boundary diagnostic failure preserves completed distributed boundaries",
+          "[physical_sort_sample]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const stream      = cudf::get_default_stream();
+  bool const empty_input = GENERATE(false, true);
+  // What the diagnostic's allocation throws: cudaSuccess stands for rmm::out_of_memory, any
+  // other status for a thrust::system_error with that code.
+  auto const status = GENERATE(
+    cudaSuccess, cudaErrorLaunchOutOfResources, cudaErrorInvalidValue, cudaErrorIllegalAddress);
+  // A task retries on out-of-memory and on retryable launch errors.
+  bool const task_would_retry = status == cudaSuccess || sirius::is_retryable_launch_error(status);
+
+  // Arm the allocator only after the hook succeeds, so the failure is in the diagnostic,
+  // not in sampling or boundary construction. Like the real collective, the hook is one-shot.
+  // The upstream is the space's allocator: a reference to the current resource would point
+  // into the slot that the guard below replaces.
+  sirius::test::tracked_scan_resource resource(space->get_default_allocator(), stream);
+  if (status != cudaSuccess) {
+    resource.state->failure = std::make_exception_ptr(
+      thrust::system_error(status, thrust::cuda_category(), "injected diagnostic failure"));
+  }
+  class one_shot_boundaries final : public cross_rank_sort_boundaries {
+   public:
+    one_shot_boundaries(std::unique_ptr<cudf::table> boundaries,
+                        std::shared_ptr<sirius::test::tracked_scan_resource::counters> counters)
+      : boundaries_(std::move(boundaries)), counters_(std::move(counters))
+    {
+    }
+    sort_boundaries make(request const&, ::cuda::stream_ref) override
+    {
+      if (++calls != 1) { throw std::logic_error("boundary collective repeated"); }
+      counters_->fail_at = counters_->attempts;
+      return {3, std::move(boundaries_)};
+    }
+    std::size_t calls = 0;
+
+   private:
+    std::unique_ptr<cudf::table> boundaries_;
+    std::shared_ptr<sirius::test::tracked_scan_resource::counters> counters_;
+  };
+
+  auto boundary_batch = make_numeric_batch<int32_t>(*space, {10, 20}, cudf::type_id::INT32);
+  auto hook           = std::make_shared<one_shot_boundaries>(
+    std::make_unique<cudf::table>(
+      sirius::get_cudf_table_view(*boundary_batch), stream, space->get_default_allocator()),
+    resource.state);
+  auto sample = make_sort_sample(1024, 40);
+  sample.set_cross_rank_boundaries(hook);
+  cucascade::shared_data_repository repo;
+  if (!empty_input) { add_int_batches(repo, *space, 1, 30); }
+  auto source =
+    std::make_shared<mock_gpu_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
+  source->set_finished(true);
+  attach_port(sample, repo, source);
+  auto input = sample.get_next_task_input_data();
+  REQUIRE(input != nullptr);
+
+  // Restore the process-wide resource even if a REQUIRE fails.
+  struct resource_guard {
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible> previous;
+    ~resource_guard() { (void)cudf::set_current_device_resource(std::move(previous)); }
+  } guard{cudf::set_current_device_resource(
+    ::cuda::mr::any_resource<::cuda::mr::device_accessible>{resource})};
+
+  if (!task_would_retry) {
+    // Any other error still propagates.
+    REQUIRE_THROWS_AS(sample.execute(*input, stream), thrust::system_error);
+    CHECK(resource.state->attempts > resource.state->fail_at);
+    CHECK_FALSE(sample.boundaries_computed());
+    return;
+  }
+
+  std::unique_ptr<operator_data> output;
+  REQUIRE_NOTHROW(output = sample.execute(*input, stream));
+  CHECK(resource.state->attempts > resource.state->fail_at);
+  REQUIRE(sample.boundaries_computed());
+  CHECK(sample.get_num_partitions() == 3);
+  CHECK_FALSE(sample.get_range_sample_stats().repeated_boundaries.has_value());
+  REQUIRE(sample.get_partition_boundaries().num_rows() == 2);
+  CHECK(read_int32_column(sample.get_partition_boundaries().view().column(0), 0) == 10);
+  CHECK(read_int32_column(sample.get_partition_boundaries().view().column(0), 1) == 20);
+  CHECK(batch_count(*output) == (empty_input ? 0 : 1));
+
+  // Completed operators pass through on subsequent execution without invoking the hook again.
+  REQUIRE_NOTHROW(sample.execute(*input, stream));
+  CHECK(hook->calls == 1);
 }

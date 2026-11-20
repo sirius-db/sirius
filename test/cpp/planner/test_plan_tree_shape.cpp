@@ -47,6 +47,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"  // IWYU pragma: keep
 #include "planner/delim_cte_proof.hpp"
@@ -2932,6 +2933,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(sort_partition->children.size() == 1);
     auto* sort_sample = sort_partition->children[0].get();
     REQUIRE(sort_sample->type == SiriusPhysicalOperatorType::SORT_SAMPLE);
+    CHECK(sort_sample->Cast<sirius::op::sirius_physical_sort_sample>().split_equal_keys());
     REQUIRE(sort_sample->children.size() == 1);
     CHECK(sort_sample->children[0]->type == SiriusPhysicalOperatorType::ORDER_BY);
   }
