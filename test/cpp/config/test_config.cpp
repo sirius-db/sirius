@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "sirius_config.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "yaml_reader.hpp"
 
 #include <yaml-cpp/yaml.h>  // IWYU pragma: keep
@@ -64,6 +65,64 @@ TEST_CASE("operator parameters start with hardware-independent defaults", "[conf
   CHECK(params.max_build_hash_table_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_build_probe_resident_bytes == 8 * config::DEFAULT_BATCH_SIZE);
   CHECK(params.max_dynamic_filter_bloom_bytes_per_gpu() == 4 * params.scan_task_batch_size);
+}
+
+TEST_CASE("Footer admission starts unlimited with no per-file or reference cache capacity",
+          "[config_opt][parquet_footer_statistics][footer_admission_feature]")
+{
+  operator_params const params;
+  CHECK(params.parquet_footer_statistics_max_remote_reads == -1);
+  CHECK(params.parquet_footer_statistics_max_local_reads == -1);
+  using sirius::transparent::detail::unbounded;
+  CHECK(unbounded == std::numeric_limits<std::size_t>::max());
+  auto const capacities = sirius::transparent::detail::default_cache_capacities;
+  CHECK(capacities.statistics == unbounded);
+  CHECK(capacities.merges == 128);
+  CHECK(capacities.merge_references == unbounded);
+}
+
+TEST_CASE("Footer admission YAML loads limits and rejects unsupported negative values",
+          "[config_opt][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() /
+    ("sirius_footer_limits_" +
+     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".yaml");
+  struct cleanup {
+    std::filesystem::path path;
+    ~cleanup()
+    {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  } remove_file{path};
+  auto write = [&](std::string const& remote, std::string const& local) {
+    std::ofstream output(path);
+    output << "sirius:\n  operator_params:\n"
+           << "    parquet_footer_statistics_max_remote_reads: " << remote << '\n'
+           << "    parquet_footer_statistics_max_local_reads: " << local << '\n';
+    REQUIRE(output.good());
+  };
+  for (auto const value : {-1, 0, 3}) {
+    write(std::to_string(value), std::to_string(value + 1));
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().parquet_footer_statistics_max_remote_reads == value);
+    CHECK(cfg.get_operator_params().parquet_footer_statistics_max_local_reads == value + 1);
+  }
+  write("0", "-1");
+  sirius_config unlimited_local;
+  unlimited_local.load_from_file(path);
+  CHECK(unlimited_local.get_operator_params().parquet_footer_statistics_max_remote_reads == 0);
+  CHECK(unlimited_local.get_operator_params().parquet_footer_statistics_max_local_reads == -1);
+  for (auto const* invalid : {"-2", "-9223372036854775808", "not_an_integer", "1.5"}) {
+    for (bool remote : {false, true}) {
+      CAPTURE(invalid, remote);
+      write(remote ? invalid : "2", remote ? "2" : invalid);
+      sirius_config cfg;
+      CHECK_THROWS(cfg.load_from_file(path));
+    }
+  }
 }
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")

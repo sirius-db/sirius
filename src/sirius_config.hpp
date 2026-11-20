@@ -390,6 +390,11 @@ struct operator_params {
   /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
   /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
   uint64_t avg_variable_column_bytes = 32;
+
+  /// Most uncached footers the footer-statistics pass reads for one scan, remote and local files
+  /// apart: -1 no limit, 0 cached only. Explicit analysis and pin warming are exempt.
+  std::int64_t parquet_footer_statistics_max_remote_reads = -1;
+  std::int64_t parquet_footer_statistics_max_local_reads  = -1;
 };
 
 struct telemetry_config {

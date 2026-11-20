@@ -14,6 +14,7 @@
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"
@@ -33,6 +34,8 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/common/multi_file/table_function_multi_file.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
@@ -305,6 +308,8 @@ struct sirius_memory_limits {
   std::optional<sirius::scan_manager::io_backend> backend;
   std::optional<std::string> rest_footer_probe_bytes;
   std::optional<std::size_t> rest_list_max_matches;
+  std::optional<std::int64_t> footer_remote_reads;
+  std::optional<std::int64_t> footer_local_reads;
 };
 
 sirius_memory_limits large_sirius_memory_limits(std::string cache_mode)
@@ -399,6 +404,17 @@ class sirius_config_env_guard {
     }
     if (limits.rest_list_max_matches.has_value()) {
       out << "        list_max_matches: " << *limits.rest_list_max_matches << "\n";
+    }
+    if (limits.footer_remote_reads || limits.footer_local_reads) {
+      out << "  operator_params:\n";
+      if (limits.footer_remote_reads) {
+        out << "    parquet_footer_statistics_max_remote_reads: " << *limits.footer_remote_reads
+            << '\n';
+      }
+      if (limits.footer_local_reads) {
+        out << "    parquet_footer_statistics_max_local_reads: " << *limits.footer_local_reads
+            << '\n';
+      }
     }
     out.close();
     REQUIRE(out);
@@ -1546,6 +1562,319 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+namespace {
+
+duckdb::LogicalGet const* footer_admission_scan(duckdb::LogicalOperator const& plan)
+{
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& get  = plan.Cast<duckdb::LogicalGet>();
+    auto const& name = get.function.GetName().GetIdentifierName();
+    if (name == "read_parquet" || name == "parquet_scan") { return &get; }
+  }
+  for (auto const& child : plan.children) {
+    if (auto const* get = footer_admission_scan(*child)) { return get; }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("Footer admission preflight binds a mixed local and SeaweedFS scan",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_probe]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env.has_value());
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics=true");
+  sirius::test::scratch_dir directory("footer_admission_probe");
+  duckdb::DuckDB writer_db(nullptr);
+  duckdb::Connection writer(writer_db);
+  require_query_ok(writer,
+                   "COPY (SELECT range AS x FROM range(10)) TO " +
+                     directory.file_literal("local.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(writer,
+                   "COPY (SELECT range AS x FROM range(100, 110)) TO " +
+                     directory.file_literal("remote.parquet") + " (FORMAT PARQUET)");
+  auto const key = "footer-admission-probe/" + std::to_string(::getpid()) + "/remote.parquet";
+  REQUIRE(
+    sirius::test::put_s3_test_object(key, read_binary_file(directory.file("remote.parquet"))));
+  auto const remote = s3_uri(env->bucket, key);
+  REQUIRE(duckdb::FileSystem::IsRemoteFile(remote));
+  auto plan = fixture.con.ExtractPlan("SELECT x FROM read_parquet([" +
+                                      directory.file_literal("local.parquet") + ", " +
+                                      sql_quote(remote) + "])");
+  REQUIRE(plan);
+  auto const* get = footer_admission_scan(*plan);
+  REQUIRE(get != nullptr);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get->bind_data.get());
+  REQUIRE(bind != nullptr);
+  REQUIRE(bind->file_list->GetAllFiles().size() == 2);
+  CHECK_FALSE(bind->file_options.column_statistics.IsNull());
+  CHECK(sirius::transparent::parquet_scan_row_count(*get) == std::optional<std::size_t>{20});
+}
+
+namespace {
+
+namespace remote_footer_detail = sirius::transparent::detail;
+
+struct remote_footer_cache_scope {
+  remote_footer_detail::cache_capacities previous =
+    remote_footer_detail::set_cache_capacities_for_testing(
+      remote_footer_detail::default_cache_capacities);
+  remote_footer_cache_scope() { remote_footer_detail::clear_caches_for_testing(); }
+  ~remote_footer_cache_scope()
+  {
+    remote_footer_detail::clear_caches_for_testing();
+    (void)remote_footer_detail::set_cache_capacities_for_testing(previous);
+  }
+};
+
+struct footer_remote_files {
+  sirius::test::scratch_dir directory{"footer_admission"};
+  std::string glob;
+  std::vector<std::string> remote;
+  std::vector<std::string> local;
+
+  footer_remote_files(s3_test_env const& env, int remote_count, int local_count = 0)
+  {
+    static std::atomic<unsigned> sequence{0};
+    auto const prefix =
+      "footer-admission-" + std::to_string(::getpid()) + "-" + std::to_string(sequence++) + "/";
+    glob = s3_uri(env.bucket, prefix + "*.parquet");
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    for (int index = 0; index < remote_count + local_count; ++index) {
+      bool const upload = index < remote_count;
+      auto const first  = upload ? 1000 + index * 100 : (index - remote_count) * 100;
+      auto const name   = "part-" + std::to_string(index) + ".parquet";
+      require_query_ok(writer,
+                       "COPY (SELECT range AS x FROM range(" + std::to_string(first) + ", " +
+                         std::to_string(first + 100) + ")) TO " + directory.file_literal(name) +
+                         " (FORMAT PARQUET)");
+      if (upload) {
+        REQUIRE(
+          sirius::test::put_s3_test_object(prefix + name, read_binary_file(directory.file(name))));
+        remote.push_back(s3_uri(env.bucket, prefix + name));
+        REQUIRE(duckdb::FileSystem::IsRemoteFile(remote.back()));
+      } else {
+        local.push_back(directory.file(name));
+        fs::last_write_time(local.back(), fs::file_time_type::clock::now() - std::chrono::hours(1));
+        REQUIRE_FALSE(duckdb::FileSystem::IsRemoteFile(local.back()));
+      }
+    }
+  }
+
+  std::string relation(bool mixed = false) const
+  {
+    if (!mixed) { return "read_parquet(" + sql_quote(glob) + ")"; }
+    std::string paths;
+    for (auto const* list : {&local, &remote}) {
+      for (auto const& path : *list) {
+        if (!paths.empty()) { paths += ", "; }
+        paths += sql_quote(path);
+      }
+    }
+    return "read_parquet([" + paths + "])";
+  }
+};
+
+void check_remote_footer(duckdb::LogicalOperator const& plan,
+                         std::size_t files,
+                         std::optional<std::size_t> rows)
+{
+  auto const* get = footer_admission_scan(plan);
+  REQUIRE(get != nullptr);
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get->bind_data.get());
+  REQUIRE(bind != nullptr);
+  CHECK(bind->file_list->GetAllFiles().size() == files);
+  CHECK(bind->file_options.column_statistics.IsNull() == !rows.has_value());
+  CHECK(sirius::transparent::parquet_scan_row_count(*get) == rows);
+}
+
+class footer_version_mask final : public sirius::io::s3::sirius_httpfs {
+ public:
+  explicit footer_version_mask(bool weak) : weak_(weak) {}
+  std::string GetVersionTag(duckdb::FileHandle& handle) override
+  {
+    auto const tag = sirius::io::s3::sirius_httpfs::GetVersionTag(handle);
+    return weak_ ? "W/" + tag : "";
+  }
+  duckdb::vector<duckdb::OpenFileInfo> Glob(std::string const& path,
+                                            duckdb::FileOpener* opener) override
+  {
+    auto files = sirius::io::s3::sirius_httpfs::Glob(path, opener);
+    for (auto& file : files) {
+      if (!file.extended_info) { continue; }
+      auto& options    = file.extended_info->options;
+      auto const found = options.find("etag");
+      if (found == options.end()) { continue; }
+      if (weak_) {
+        found->second = duckdb::Value("W/" + found->second.GetValue<std::string>());
+      } else {
+        options.erase(found);
+      }
+    }
+    return files;
+  }
+
+ private:
+  bool weak_;
+};
+
+}  // namespace
+
+TEST_CASE("Footer admission counts remote misses at both sides of the boundary",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const count = GENERATE(2, 3, 4);
+  CAPTURE(count);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, count);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=3");
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_local_reads=0");
+  auto const before = remote_footer_detail::footer_read_count();
+  auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+  REQUIRE(plan);
+  bool const admitted = count <= 3;
+  CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? count : 0));
+  check_remote_footer(
+    *plan, count, admitted ? std::optional<std::size_t>{count * 100} : std::nullopt);
+  auto result = require_query_ok(
+    fixture.con, "SELECT count(*)::BIGINT, sum(x)::BIGINT FROM " + files.relation());
+  auto const rows = count * 100;
+  std::vector<std::vector<std::string>> expected{
+    {std::to_string(rows), std::to_string(rows * (2000 + rows - 1) / 2)}};
+  CHECK(collect_rows(*result) == expected);
+}
+
+TEST_CASE("Footer admission skips a mixed scan when either independent cap is exceeded",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const exceeded = std::string(GENERATE("local", "remote", "neither"));
+  CAPTURE(exceeded);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2, 2);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "SET parquet_footer_statistics_max_remote_reads=" +
+                     std::string(exceeded == "remote" ? "1" : "2"));
+  require_query_ok(fixture.con,
+                   "SET parquet_footer_statistics_max_local_reads=" +
+                     std::string(exceeded == "local" ? "1" : "2"));
+  auto const before = remote_footer_detail::footer_read_count();
+  auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(plan);
+  auto const admitted = exceeded == "neither";
+  CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? 4 : 0));
+  check_remote_footer(*plan, 4, admitted ? std::optional<std::size_t>{400} : std::nullopt);
+  auto result = require_query_ok(
+    fixture.con, "SELECT count(*)::BIGINT, sum(x)::BIGINT FROM " + files.relation(true));
+  CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{{"400", "239800"}});
+}
+
+TEST_CASE("Footer admission treats weak and missing remote validators as repeated misses",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  auto const weak = GENERATE(false, true);
+  CAPTURE(weak);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  set_gpu_execution(fixture.con, true);
+  fixture.db.GetFileSystem().UnregisterSubSystem("SiriusHttpFS");
+  fixture.db.GetFileSystem().RegisterSubSystem(duckdb::make_uniq<footer_version_mask>(weak));
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    auto const before = remote_footer_detail::footer_read_count();
+    auto plan         = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+    REQUIRE(plan);
+    CHECK(remote_footer_detail::footer_read_count() - before == 2);
+    check_remote_footer(*plan, 2, 200);
+  }
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=1");
+  auto const before = remote_footer_detail::footer_read_count();
+  auto skipped      = fixture.con.ExtractPlan("SELECT x FROM " + files.relation());
+  REQUIRE(skipped);
+  CHECK(remote_footer_detail::footer_read_count() == before);
+  check_remote_footer(*skipped, 2, std::nullopt);
+}
+
+TEST_CASE("Footer admission counts cached remote files of an explicit list as reads",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  s3_sql_fixture fixture(*env);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  set_gpu_execution(fixture.con, true);
+  for (auto const& path : files.remote) {
+    auto analyzed = require_query_ok(
+      fixture.con, "SELECT files FROM sirius_analyze_parquet(" + sql_quote(path) + ")");
+    CHECK(analyzed->Collection().GetValue(0, 0).GetValue<uint64_t>() == 1);
+  }
+  REQUIRE(remote_footer_detail::statistics_cache_size() == 2);
+  auto const before = remote_footer_detail::footer_read_count();
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=1");
+  auto skipped = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(skipped);
+  check_remote_footer(*skipped, 2, std::nullopt);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  auto admitted = fixture.con.ExtractPlan("SELECT x FROM " + files.relation(true));
+  REQUIRE(admitted);
+  check_remote_footer(*admitted, 2, 200);
+  CHECK(remote_footer_detail::footer_read_count() == before);
+}
+
+TEST_CASE("Footer admission inherits the remote engine cap until a connection overrides it",
+          "[.][s3][integration][parquet_footer_statistics][footer_admission_feature]")
+{
+  auto env = load_s3_test_env();
+  REQUIRE(env);
+  sirius_memory_limits limits;
+  limits.footer_remote_reads = 1;
+  limits.footer_local_reads  = 3;
+  s3_sql_fixture fixture(*env, limits);
+  remote_footer_cache_scope caches;
+  footer_remote_files files(*env, 2);
+  duckdb::Connection second(fixture.db);
+  set_gpu_execution(fixture.con, true);
+  set_gpu_execution(second, true);
+  auto expect = [&](duckdb::Connection& connection, bool admitted) {
+    remote_footer_detail::clear_caches_for_testing();
+    auto const before = remote_footer_detail::footer_read_count();
+    auto plan         = connection.ExtractPlan("SELECT x FROM " + files.relation());
+    REQUIRE(plan);
+    check_remote_footer(*plan, 2, admitted ? std::optional<std::size_t>{200} : std::nullopt);
+    CHECK(remote_footer_detail::footer_read_count() - before == (admitted ? 2 : 0));
+  };
+  auto initial = require_query_ok(
+    fixture.con, "SELECT current_setting('parquet_footer_statistics_max_remote_reads')");
+  CHECK(initial->Collection().GetValue(0, 0).IsNull());
+  expect(fixture.con, false);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  expect(fixture.con, true);
+  expect(second, false);
+  auto other = require_query_ok(
+    second, "SELECT current_setting('parquet_footer_statistics_max_remote_reads')");
+  CHECK(other->Collection().GetValue(0, 0).IsNull());
+  require_query_ok(fixture.con, "RESET parquet_footer_statistics_max_remote_reads");
+  expect(fixture.con, false);
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=2");
+  require_query_ok(fixture.con, "SET parquet_footer_statistics_max_remote_reads=NULL");
+  expect(fixture.con, false);
 }
 
 TEST_CASE("transparent S3 footer statistics follow an equal-size overwrite",
