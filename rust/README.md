@@ -4,7 +4,7 @@ Crates for driving [Sirius](https://github.com/sirius-db/sirius) from Rust.
 
 | Crate | Role |
 |-------|------|
-| [`sirius-sys`](crates/sirius-sys) | Raw bindings and native library linking for the public C ABI. |
+| [`sirius-sys`](crates/sirius-sys) | Raw C ABI declarations, owning handles, and native library linking. |
 | [`sirius`](crates/sirius) | Safe configuration wrappers over `sirius-sys`. |
 | [`sirius-ffi`](crates/sirius-ffi) | Existing C++ FFI bridge, execution wrappers, and object-store bindings. |
 
@@ -32,7 +32,9 @@ sharing immutable settings. The file is read only by `from_yaml()`; later file
 changes do not affect a loaded builder. Configuration errors retain their
 I/O, YAML syntax, or invalid-setting category in `ConfigError`.
 
-Configuration construction calls the C ABI directly. Building `sirius`
+The `sirius` crate forbids unsafe Rust. It uses owning handles in
+`sirius_sys::handles` to call the C ABI. Those handles manage native reference
+counts and copy diagnostics before releasing them. Building `sirius`
 and `sirius-sys` requires no C++ compilation. The configuration types
 implement `Send` and `Sync`: they may be moved or shared between threads,
 including concurrent building and cloning.
@@ -140,7 +142,8 @@ rustup toolchain install nightly --profile minimal --component miri --component 
 cargo +nightly miri test --locked --manifest-path rust/Cargo.toml -p sirius -p sirius-sys --test miri
 ```
 
-CI runs these tests for `sirius` and `sirius-sys` without a GPU or native library.
+Select `--test miri` to run the ownership tests without a GPU or native library.
+Run the doctests with ordinary `cargo test` against the native implementation.
 The test executables supply Rust-owned C ABI stand-ins so Miri can inspect pointer
 access, ownership, diagnostic lifetimes, and failure cleanup. They do not model
 YAML parsing or validate C++/CUDA behavior. The existing native configuration and

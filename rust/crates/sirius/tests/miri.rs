@@ -1,7 +1,6 @@
 //! Exercise safe wrappers against Rust-owned C ABI stand-ins under Miri.
 #![cfg(miri)]
-#[path = "../../sirius-sys/tests/support/backend.rs"]
-mod backend;
+use sirius_sys::miri_test_backend as backend;
 
 use sirius::{ConfigError, ContextConfigBuilder};
 use sirius_sys::c_api::*;
