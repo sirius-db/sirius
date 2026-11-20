@@ -31,12 +31,24 @@ are skipped on rerun; use `--retry-failed` to retry recorded failures. The
 runner continues after a failed query so any query-specific config can be
 decided and saved separately once the failure is understood.
 
-`moved_into_host_bytes` counts successful GPU→HOST DataBatch conversions.
-`moved_into_disk_bytes` counts successful HOST→DISK and GPU→DISK conversions.
-Bytes are destination representation sizes, so compression affects them.
-These are cumulative one-way movements during query execution, not peak
-occupancy. Failures have null counts and are excluded from totals; use the
-success and requested-query columns before comparing caps.
+`gpu_to_host_bytes`, `host_to_disk_bytes`, and `gpu_to_disk_bytes` count
+successful DataBatch conversions for those three logical transitions. A
+GPU→DISK conversion can physically use temporary pinned host buffers; those
+buffers are not a HOST-tier placement and do not increment GPU→HOST. Bytes
+are destination representation sizes, so compression affects them. These are
+cumulative movements during query execution, not physical bus traffic or
+peak occupancy. Failures have null counts and are excluded from totals; use
+the success and requested-query columns before comparing caps.
+
+To rebuild the three counters from preserved Quent traces without rerunning
+queries, use:
+
+```bash
+pixi run python bench/gb300-spill-sweep/run.py --sf 1000 --recount-from-traces
+```
+
+Repeat for SF3000 and SF10000. Recounting checks that any older two-counter
+results match the sum of the new transitions.
 
 The checked-in [results](results/) contain `per-query.csv` and `totals.csv`
 for SF1000, SF3000, and SF10000. [RESULTS.md](RESULTS.md) summarizes them.

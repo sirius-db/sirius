@@ -20,8 +20,9 @@ TIER = re.compile(r"tier=(GPU|HOST|DISK)")
 GIB = 1024**3
 FIELDS = (
     "scale_factor", "host_cap_gib", "query", "status", "runtime_s",
-    "moved_into_host_bytes", "moved_into_disk_bytes", "error",
+    "gpu_to_host_bytes", "host_to_disk_bytes", "gpu_to_disk_bytes", "error",
 )
+MOVE_FIELDS = ("gpu_to_host_bytes", "host_to_disk_bytes", "gpu_to_disk_bytes")
 
 
 def parse_numbers(value, *, maximum=None):
@@ -97,7 +98,7 @@ def measure_moves(trace_dir, runtime_csv, query):
     if not {"GPU", "HOST", "DISK"}.issubset(tiers.values()):
         raise ValueError("Quent trace lacks a GPU, HOST, or DISK memory space")
     pending = {}
-    host_bytes = disk_bytes = 0
+    moves = {("GPU", "HOST"): 0, ("HOST", "DISK"): 0, ("GPU", "DISK"): 0}
     for event in records(session, "DataBatch"):
         batch, state = event["id"], event["data"]
         if "InTransit" in state:
@@ -111,19 +112,15 @@ def measure_moves(trace_dir, runtime_csv, query):
             if stationary["target"] != dest:
                 continue  # Failed conversion returned to its source.
             direction = (tiers[source], tiers[dest])
-            if direction not in {("GPU", "HOST"), ("HOST", "DISK"),
-                                 ("GPU", "DISK")}:
+            if direction not in moves:
                 continue
             if started < window["Init"] or event["timestamp"] > window["Finished"]:
                 raise ValueError("completed tier move falls outside query window")
             size = stationary["data"]["bytes"]
-            if direction[1] == "HOST":
-                host_bytes += size
-            else:
-                disk_bytes += size
+            moves[direction] += size
     if pending:
         raise ValueError(f"{len(pending)} unfinished batch conversions")
-    return runtime_s, host_bytes, disk_bytes
+    return runtime_s, *(moves[direction] for direction in moves)
 
 
 def find_runtime_csv(benchmark_root):
@@ -166,8 +163,7 @@ def write_reports(output, sf, caps, queries):
             "completed_queries": len(cap_rows),
             "successful_queries": len(successes),
             "requested_queries": len(queries),
-            "moved_into_host_bytes": sum(row["moved_into_host_bytes"] for row in successes),
-            "moved_into_disk_bytes": sum(row["moved_into_disk_bytes"] for row in successes),
+            **{field: sum(row[field] for row in successes) for field in MOVE_FIELDS},
         })
     temporary = report_dir / "totals.csv.tmp"
     with temporary.open("w", newline="") as stream:
@@ -199,7 +195,7 @@ def run_query(sf, cap, query, output, timeout):
     result = {
         "scale_factor": sf, "host_cap_gib": cap, "query": f"q{query}",
         "status": "benchmark_failed", "runtime_s": None,
-        "moved_into_host_bytes": None, "moved_into_disk_bytes": None, "error": "",
+        **{field: None for field in MOVE_FIELDS}, "error": "",
     }
     with (query_dir / "runner.log").open("w") as log:
         try:
@@ -211,17 +207,46 @@ def run_query(sf, cap, query, output, timeout):
             else:
                 try:
                     confirm_gpu_plan(benchmark_root, query)
-                    runtime, host, disk = measure_moves(
+                    runtime, gpu_host, host_disk, gpu_disk = measure_moves(
                         trace_dir, find_runtime_csv(benchmark_root), query)
                     result.update(status="success", runtime_s=runtime,
-                                  moved_into_host_bytes=host,
-                                  moved_into_disk_bytes=disk)
+                                  gpu_to_host_bytes=gpu_host,
+                                  host_to_disk_bytes=host_disk,
+                                  gpu_to_disk_bytes=gpu_disk)
                 except (ValueError, KeyError, OSError) as exc:
                     result.update(status="telemetry_failed", error=str(exc))
         except subprocess.TimeoutExpired:
             result["error"] = f"benchmark exceeded {timeout}s timeout"
     (query_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
+
+
+def recount_from_traces(output, sf, caps, queries):
+    """Rebuild saved counts from Quent traces, verifying any older totals."""
+    for cap in caps:
+        for query in queries:
+            query_dir = output / f"sf{sf}" / f"host{cap}Gi" / f"q{query:02}"
+            path = query_dir / "result.json"
+            result = json.loads(path.read_text())
+            if result["status"] != "success":
+                raise ValueError(f"cannot recount unsuccessful {path}")
+            runtime, gpu_host, host_disk, gpu_disk = measure_moves(
+                query_dir / "quent", find_runtime_csv(query_dir / "benchmark"), query)
+            if abs(runtime - result["runtime_s"]) > 1e-6:
+                raise ValueError(f"runtime changed for {path}")
+            if "moved_into_host_bytes" in result:
+                if (result["moved_into_host_bytes"] != gpu_host or
+                        result["moved_into_disk_bytes"] != host_disk + gpu_disk):
+                    raise ValueError(f"old totals do not reconcile for {path}")
+            result.pop("moved_into_host_bytes", None)
+            result.pop("moved_into_disk_bytes", None)
+            result.update(gpu_to_host_bytes=gpu_host,
+                          host_to_disk_bytes=host_disk, gpu_to_disk_bytes=gpu_disk)
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(result, indent=2) + "\n")
+            temporary.replace(path)
+        print(f"SF{sf} host={cap}Gi: recounted {len(queries)} queries", flush=True)
+    write_reports(output, sf, caps, queries)
 
 
 def main():
@@ -234,10 +259,14 @@ def main():
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--recount-from-traces", action="store_true")
     args = parser.parse_args()
     caps = parse_numbers(args.caps)
     queries = parse_numbers(args.queries, maximum=22)
     output = args.output.resolve()
+    if args.recount_from_traces:
+        recount_from_traces(output, args.sf, caps, queries)
+        return
     dataset = ROOT / f"test_datasets/tpch_parquet_sf{args.sf}"
     if not dataset.is_dir():
         parser.error(f"dataset missing: {dataset}")
@@ -262,7 +291,9 @@ def main():
             write_reports(output, args.sf, caps, queries)
             print(f"{datetime.now(timezone.utc).isoformat()} done host={cap}Gi q{query} "
                   f"{result['status']} runtime={result['runtime_s']} "
-                  f"host={result['moved_into_host_bytes']} disk={result['moved_into_disk_bytes']} "
+                  f"GPU→HOST={result['gpu_to_host_bytes']} "
+                  f"HOST→DISK={result['host_to_disk_bytes']} "
+                  f"GPU→DISK={result['gpu_to_disk_bytes']} "
                   f"{result['error']}", flush=True)
 
 
