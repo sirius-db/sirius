@@ -143,6 +143,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     if (fid == sirius::aggregate_id::stddev_samp && aggr.distinct()) {
       throw_unsupported_aggregate(fid, "with DISTINCT");
     }
+    if (!aggr.order().empty()) { throw_unsupported_aggregate(fid, "with an ORDER BY"); }
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
     if (fid == sirius::aggregate_id::avg) {

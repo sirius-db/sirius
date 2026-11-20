@@ -3219,7 +3219,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_wrap_grou
     sirius::ast::aggregate{sirius::aggregate_id::sum,
                            std::move(sum_arguments),
                            sirius::logical_type::make(sirius::type_id::BIGINT),
-                           /*distinct=*/false}));
+                           /*distinct=*/false,
+                           /*order=*/{}}));
   auto aggregate =
     duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(std::move(output_types),
                                                                      std::move(expressions),

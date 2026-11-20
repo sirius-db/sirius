@@ -297,7 +297,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sum_tags_per_group(
     std::vector<std::unique_ptr<sirius::ast::node>> arguments;
     arguments.push_back(column_reference(key_count + tag, tinyint));
     sum_list.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
-      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
+      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false, /*order=*/{}}));
   }
   auto aggregate_types = key_types;
   aggregate_types.insert(aggregate_types.end(), tag_count, bigint);

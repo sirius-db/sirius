@@ -168,6 +168,11 @@ aggregate_layout build_aggregate_layout(
   for (size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg = sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
     auto const& children = agg.arguments();
+    // FIRST here is NTH_ELEMENT(0) in row order, which no ORDER BY can steer.
+    if (!agg.order().empty()) {
+      throw not_implemented_exception(
+        "Aggregates with an ORDER BY are not supported in the ungrouped GPU aggregate");
+    }
     if (children.size() > 1) {
       throw not_implemented_exception("Aggregates with multiple children not supported yet");
     }

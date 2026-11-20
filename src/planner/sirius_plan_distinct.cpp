@@ -254,7 +254,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       std::make_unique<sirius::ast::node>(sirius::ast::aggregate{sirius::aggregate_id::first,
                                                                  std::move(first_arguments),
                                                                  child_types[index],
-                                                                 /*distinct=*/false}));
+                                                                 /*distinct=*/false,
+                                                                 /*order=*/{}}));
   }
 
   auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,

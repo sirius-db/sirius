@@ -223,7 +223,7 @@ set_operation_all_plan make_set_operation_all(std::size_t tag_count)
     std::vector<std::unique_ptr<sirius::ast::node>> arguments;
     arguments.push_back(make_reference(static_cast<std::uint32_t>(kSetOpAllKeyCount + tag)));
     sums.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
-      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
+      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false, /*order=*/{}}));
   }
   duckdb::vector<sirius::logical_type> aggregate_types(kSetOpAllKeyCount, int_type());
   aggregate_types.insert(aggregate_types.end(), tag_count, bigint);
