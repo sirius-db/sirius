@@ -21,7 +21,7 @@
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
-#include "expression/ast/aggregate.hpp"
+#include "expression/ast/order_modifier.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/delim_cte_proof.hpp"

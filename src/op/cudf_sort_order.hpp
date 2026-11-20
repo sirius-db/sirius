@@ -17,7 +17,7 @@
 #pragma once
 
 #include "duckdb/common/enums/order_type.hpp"
-#include "expression/ast/aggregate.hpp"
+#include "expression/ast/order_modifier.hpp"
 
 #include <cudf/types.hpp>
 

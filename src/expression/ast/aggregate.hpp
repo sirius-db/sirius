@@ -17,32 +17,18 @@
 #pragma once
 
 // sirius
-#include "expression/aggregate_id.hpp"  // sirius::aggregate_id
-#include "helper/logical_type.hpp"      // sirius::logical_type
-#include "sirius/exception.hpp"         // sirius::internal_exception
+#include "expression/aggregate_id.hpp"        // sirius::aggregate_id
+#include "expression/ast/order_modifier.hpp"  // sirius::ast::order_modifier
+#include "helper/logical_type.hpp"            // sirius::logical_type
+#include "sirius/exception.hpp"               // sirius::internal_exception
 
 // standard library
-#include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace sirius::ast {
 
 struct node;
-
-enum class sort_direction : std::uint8_t { ascending, descending };
-enum class null_placement : std::uint8_t { first, last };
-
-/**
- * @brief Direction and NULL placement of one ORDER BY key
- *
- * `nulls` is an absolute position: `first` puts NULL keys before every value in both directions.
- */
-struct order_modifier {
-  sort_direction direction{sort_direction::ascending};  ///< Direction of the key's values
-  null_placement nulls{null_placement::last};           ///< Where NULL keys sort
-  bool operator==(order_modifier const&) const = default;
-};
 
 /**
  * @brief Sirius-native mirror of duckdb::BoundAggregateExpression.
