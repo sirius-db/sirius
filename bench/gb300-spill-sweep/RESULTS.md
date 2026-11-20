@@ -1,6 +1,6 @@
 # GB300 host-memory spill sweep
 
-Measured on GB300 on 2026-11-19 at Sirius main `26b5caba`. Each of the 22
+Initially measured on GB300 on 2026-11-19 at Sirius main `26b5caba`. Each of the 22
 TPC-H queries ran once, unpinned and in a fresh Sirius process, at each of
 the 32, 64, 128, 256, and 450 GiB host caps. The base was
 `bench/gb300-cold/config.yaml` with spill compression enabled. Only the host
@@ -18,8 +18,8 @@ Exact byte counts and per-query values are in the linked CSVs.
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | SF1000 | 32 GiB | 8 GiB | 22/22 | 12.324 | 10.820 | 16.764 |
 | SF1000 | 64 GiB | 16 GiB | 22/22 | 26.125 | 16.998 | 0.000 |
-| SF1000 | 128 GiB | 32 GiB | 22/22 | 29.520 | 0.000 | 0.000 |
-| SF1000 | 256 GiB | 64 GiB | 22/22 | 27.106 | 0.000 | 0.000 |
+| SF1000 | 128 GiB | 32 GiB | 22/22 | 26.139 | 0.000 | 0.000 |
+| SF1000 | 256 GiB | 64 GiB | 22/22 | 29.532 | 0.000 | 0.000 |
 | SF1000 | 450 GiB | 112.5 GiB | 22/22 | 29.548 | 0.000 | 0.000 |
 | SF3000 | 32 GiB | 8 GiB | 22/22 | 62.758 | 38.565 | 67.280 |
 | SF3000 | 64 GiB | 16 GiB | 22/22 | 99.005 | 39.598 | 0.000 |
@@ -44,6 +44,13 @@ At SF1000, disk movement stops at the 128 GiB host cap. At SF3000 it stops
 at 256 GiB. At SF10000, disk movement remains at 450 GiB; all 63.135 GiB of
 HOST→DISK at that cap is from Q9. The runner did not clear the OS page cache,
 since this sweep measures spilling rather than cold-I/O timing.
+
+The SF1000 128 and 256 GiB rows were rerun on November 19, 2026 (CST), with
+the same Sirius main commit, built extension, and config. All 44 rerun queries
+completed on GPU, and their counts were checked against their Quent traces.
+The prior GPU→HOST totals were 29.520 and 27.106 GiB, respectively. The prior
+query records remain archived alongside the selected rerun records as
+`q<NN>.previous-20261120/` on the GB300 machine.
 
 Exact results: [SF1000](results/sf1000/per-query.csv),
 [SF3000](results/sf3000/per-query.csv), and

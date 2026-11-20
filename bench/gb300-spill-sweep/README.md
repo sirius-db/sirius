@@ -53,4 +53,6 @@ results match the sum of the new transitions.
 The checked-in [results](results/) contain `per-query.csv` and `totals.csv`
 for SF1000, SF3000, and SF10000. [RESULTS.md](RESULTS.md) summarizes them.
 Raw Quent traces remain under `test_datasets/gb300-spill-sweep/` on the GB300
-machine; the SF10000 directory alone is about 2 GiB.
+machine; the SF10000 directory alone is about 2 GiB. The selected SF1000
+128 and 256 GiB rows were rerun; their prior query directories remain there
+as `q<NN>.previous-20261120/` alongside the selected records.
