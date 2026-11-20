@@ -4,6 +4,7 @@
 
 #include "io/s3/scope_policy.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace sirius::object_store_scope {
@@ -21,6 +22,19 @@ std::string_view token_of(refusal_kind kind) noexcept
     case refusal_kind::route_unavailable: return "object_store_route_unavailable";
   }
   return {};
+}
+
+std::shared_ptr<const scope_set> with_entry(const scope_set& current,
+                                            std::string_view key,
+                                            std::shared_ptr<const entry> replacement)
+{
+  auto next = std::make_shared<scope_set>(current);
+  std::erase_if(*next, [&](const auto& e) { return e->value->uri_prefix == key; });
+  if (replacement) { next->push_back(std::move(replacement)); }
+  std::stable_sort(next->begin(), next->end(), [](const auto& a, const auto& b) {
+    return a->value->uri_prefix.size() > b->value->uri_prefix.size();
+  });
+  return next;
 }
 
 resolution resolve(const scope_set& set, std::string_view uri)

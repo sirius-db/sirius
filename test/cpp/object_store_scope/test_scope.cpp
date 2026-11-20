@@ -148,3 +148,27 @@ TEST_CASE("Object-store scope refusal tokens are stable and nonthrowing", "[obje
   CHECK(core::token_of(refusal_kind::route_unavailable) == "object_store_route_unavailable");
   CHECK(core::token_of(static_cast<refusal_kind>(255)).empty());
 }
+
+TEST_CASE("Object-store scope derives ordered sets without changing earlier sets",
+          "[object_store_scope]")
+{
+  auto const root        = entry_for("");
+  auto const before      = entry_for("s3://bucket/data/");
+  auto const replacement = entry_for("s3://bucket/data/");
+  auto const nested      = entry_for("s3://bucket/data/nested/");
+  core::scope_set const original{before, root};
+  auto added = core::with_entry(original, nested->value->uri_prefix, nested);
+  REQUIRE(added);
+  auto replaced = core::with_entry(*added, before->value->uri_prefix, replacement);
+  REQUIRE(replaced);
+  auto removed = core::with_entry(*replaced, before->value->uri_prefix, nullptr);
+  REQUIRE(removed);
+  auto absent = core::with_entry(*removed, before->value->uri_prefix, nullptr);
+  REQUIRE(absent);
+
+  CHECK((original == core::scope_set{before, root}));
+  CHECK((*added == core::scope_set{nested, before, root}));
+  CHECK((*replaced == core::scope_set{nested, replacement, root}));
+  CHECK((*removed == core::scope_set{nested, root}));
+  CHECK(*absent == *removed);
+}

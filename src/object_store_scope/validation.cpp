@@ -132,7 +132,7 @@ std::optional<violation> check_uri_prefix(std::string_view uri_prefix)
   // classify the remaining segments ("s3://bucket/" has no key and is always fine).
   auto const bucket_end = uri_prefix.find('/', kScheme.size());
   if (bucket_end != std::string_view::npos && bucket_end + 1 < uri_prefix.size()) {
-    std::string const as_key{uri_prefix.substr(0, uri_prefix.size() - 1)};
+    auto const as_key = uri_prefix.substr(0, uri_prefix.size() - 1);
     if (sirius::io::s3::key_defeats_prefix_match(as_key)) {
       return refuse(field, reason::prefix_unmatchable_segment);
     }

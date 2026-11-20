@@ -8,6 +8,7 @@ The public C API provides a C ABI for embedding Sirius. Include the headers unde
 - `<sirius-c/export.h>` defines visibility and C/C++ declaration helpers.
 - `<sirius-c/context/config_builder.h>` builds immutable context configurations.
 - `<sirius-c/object_store/config_builder.h>` builds immutable object-store configurations.
+- `<sirius-c/object_store/registry.h>` maps URI prefixes to object-store configurations.
 - `<sirius-c/context/context.h>` creates and owns an engine context.
 - `<sirius-c/schema.h>` constructs and inspects immutable typed schemas.
 - `<sirius-c/plan/plan.h>` constructs and inspects immutable physical plans.
@@ -96,7 +97,24 @@ diagnostic for SIRIUS_INVALID_CONFIGURATION names the field and the reason. No f
 returns a field. See the
 [complete C example](https://github.com/sirius-db/sirius/blob/main/test/cmake/installed_consumer/object_store.c).
 
-Nothing in the engine consumes these configurations yet.
+## Object-store registry
+
+A registry lists the stores a caller may read from: each store is a URI prefix and the
+configuration that serves the URIs under it. Registries are immutable.
+sirius_object_store_registry_with_store() returns a new registry with one store added, or
+replaced when the prefix is already present; release the input once the result replaces it.
+One configuration can serve several prefixes.
+
+A prefix is empty, `s3://bucket/` or `s3://bucket/prefix/`. An unmatchable object key is refused
+before any store is selected. Otherwise the longest matching prefix wins; only the URI scheme is
+case-folded. The empty prefix is the fallback when no nonempty prefix matches.
+
+A NULL pointer with nonzero size or a NUL byte in the range is SIRIUS_INVALID_ARGUMENT. A prefix
+that fails the shape or segment checks is SIRIUS_INVALID_CONFIGURATION; an available diagnostic
+names the reason, not the supplied value. Building a registry reads no file and consults no I/O
+backend.
+
+No engine API consumes a registry yet.
 
 ## Engine context
 
