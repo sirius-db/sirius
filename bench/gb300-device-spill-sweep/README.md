@@ -6,7 +6,13 @@ The requested GPU caps are **decimal GB**: 16, 32, 64, 128, and 256 billion
 bytes. Decimal units allow the 256 GB point to fit on the GB300's approximately
 250.7 GiB of physical device memory; 256 GiB would exceed it. The GPU
 reservation fraction remains 0.9, downgrade trigger/stop remain 0.8/0.6,
-host cap remains 450 GiB, and spill compression remains enabled. No
+and spill compression remains enabled. The host cap is fixed at **384 GiB**
+for all GPU caps. An initial attempt with the original 450 GiB host cap
+drove physical host RAM near exhaustion at GPU 16 GB Q3, and the tmux session
+disappeared twice;
+384 GiB leaves headroom while keeping the GPU cap as the swept variable. The
+host initial pool count scales from 225 to 192 to retain the same preallocation
+ratio. No
 `--profile` override is used.
 
 From the repository root:
@@ -16,13 +22,15 @@ tmux new-session -d -s gb300-device-spill-sf10k \
   'bash bench/gb300-device-spill-sweep/run_sf.sh 10000'
 ```
 
-Progress is in `test_datasets/gb300-device-spill-sweep/sf10000/progress.log`.
+Progress is in
+`test_datasets/gb300-device-spill-sweep/host384Gi/sf10000/progress.log`.
 An `exit-code` file is written at completion. The runner saves each effective
 YAML, command, benchmark output, runner log, raw Quent trace, and result under
-`test_datasets/gb300-device-spill-sweep/sf10000/gpu<CAP>GB/q<NN>/`.
+`test_datasets/gb300-device-spill-sweep/host384Gi/sf10000/gpu<CAP>GB/q<NN>/`.
 It updates `per-query.csv` and `totals.csv` after every query, skips completed
 queries on rerun, and accepts `--retry-failed` to retry failures. Each process
-starts with an empty Sirius cache, but this sweep does not control OS page cache.
+starts with an empty Sirius cache. The benchmark requests that the OS discard
+cached dataset pages, but a fully cold page cache is not guaranteed.
 
 The three counters are cumulative one-way DataBatch conversions during each
 query: GPU→HOST, HOST→DISK, and GPU→DISK. A move is counted at the destination's
