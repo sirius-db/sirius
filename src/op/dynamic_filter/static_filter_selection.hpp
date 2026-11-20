@@ -26,8 +26,11 @@
  *
  * `sirius::op::scan::dynamic_filter_consumer` applies these rules to every batch
  * (`src/op/scan/dynamic_filter_merge.cpp`). They are defined here, below the Consumer, so that code
- * deciding whether a filter is worth building judges it exactly as the Consumer will. Every
- * function is pure and takes no lock.
+ * deciding whether a filter is worth building (`is_shadowed` in `construction_plan.hpp`) judges it
+ * by the same rules. What the Consumer decides for one batch or from its measurements stays in the
+ * Consumer and is not predicted here: the order among filters it has measured, the Usefulness Gate,
+ * the Carrier Type a filter accepts, and the filters a batch has already met. Every function is
+ * pure and takes no lock.
  */
 
 #pragma once

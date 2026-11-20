@@ -461,6 +461,11 @@ bool in_normal_order(Step const& a, Step const& b)
 
 /// @brief Decode order: measured keep ratios first, then `sirius::op::decode_preference` for ties
 /// and unmeasured filters.
+///
+/// `sirius::op::statically_selected` predicts this order for unmeasured filters, and counts a tie
+/// in `decode_preference` as undecided because `in_normal_order` then orders by snapshot position.
+/// A change to either order must keep that prediction true, or `sirius::op::is_shadowed` skips a
+/// filter this decode would have carried.
 bool in_decode_order(candidate const& a, candidate const& b)
 {
   auto const preference = sirius::op::decode_preference(a.prior, b.prior);
@@ -574,6 +579,9 @@ std::unique_ptr<application_program_state> prepare_state(
   // publisher's estimate, after the stronger ones, so the first batch need not learn it. The
   // combined sample then covers only the filters that stay, which could read as a channel that
   // removes nothing, so a batch that skips one records no combined sample.
+  // `sirius::op::is_shadowed` plans no filter for a key whose filter this loop would skip, so a
+  // filter must not start passing this loop without `sirius::op::statically_selected` saying so
+  // too.
   {
     std::vector<selected_step> kept;
     for (auto const& step : program->membership) {
