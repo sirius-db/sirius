@@ -228,7 +228,7 @@ DuckDB's own `PARTIAL_AGGREGATE_PUSHDOWN` optimizer stays disabled (`unsupported
 
 **When it applies:**
 - Aggregates are `SUM` (or `sum_no_overflow`) over a DECIMAL stored in at most 64 bits, `MIN` or `MAX`, without DISTINCT, FILTER or ORDER BY. A sum of such sums is the same DECIMAL(38) total. COUNT and AVG would need a cast above the aggregate, integer sums combine through a 128-bit sum that is range-checked on every merge, and floating-point sums depend on the order of addition.
-- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row, as it can with DuckDB's own pushdown.
+- Arguments read only `S`, are not volatile, and use only columns, constants, `+`, `-`, `*` and sub-expressions that cannot throw, because they now run on rows a join above might have removed. Arithmetic can still overflow on such a row. Accepting it is Sirius's own rule: DuckDB's pushdown declines an argument that can throw unless column statistics prove it cannot.
 - Only INNER comparison joins lie between the aggregate and `S`. Projections directly under the aggregate are inlined.
 - The new group keys are fixed-width, fewer than the aggregate's own, and at most one more than the join's keys.
 - Every other side on the way up consists of scans estimated to keep at least 70% of their unfiltered rows, joined to each other. A join against a filtered side discards rows, and aggregating them first would be wasted. This leaves alone q10 when `lineitem` is joined last, and TPC-H q18, whose other side is restricted by its `IN` subquery.

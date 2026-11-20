@@ -265,6 +265,9 @@ TEST_CASE_METHOD(pushdown_fixture,
   // Two aggregates share an expression, which DuckDB computes in a projection under them.
   CHECK(pushed(per_customer("sum(o_totalprice * (1 - o_totalprice)), "
                             "min(o_totalprice * (1 - o_totalprice))")) == 1);
+  // Under the default settings a floating-point division by zero yields inf or NaN, so it
+  // cannot fail.
+  CHECK(pushed(per_customer("min(o_units / o_shippriority)")) == 1);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
@@ -283,7 +286,7 @@ TEST_CASE_METHOD(pushdown_fixture,
   // An argument that reads both sides, and ones that can fail on a row the join would drop.
   CHECK(pushed(per_customer("sum(o_totalprice * c_acctbal)")) == 0);
   CHECK(pushed(per_customer("max(CAST(o_clerk AS INTEGER))")) == 0);
-  CHECK(pushed(per_customer("min(o_units / o_shippriority)")) == 0);
+  CHECK(pushed(per_customer("min(o_units // o_shippriority)")) == 0);
 }
 
 TEST_CASE_METHOD(pushdown_fixture,
