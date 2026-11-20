@@ -329,17 +329,22 @@ The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` a
 normalize their temporal values to this representation before using these helpers;
 the helpers do not depend on DuckDB types or a frontend identity.
 
-`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
-columns to microseconds. It checks finite values before multiplying, preserves
-infinity, and truncates nanoseconds toward zero. Overflow raises
-`sirius::invalid_input_exception`; reading the overflow result synchronizes the
-supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+`cast_timestamp_checked()` converts a timestamp column to every finer precision
+(seconds to milliseconds, microseconds, or nanoseconds; milliseconds to
+microseconds or nanoseconds; microseconds to nanoseconds) and nanoseconds to
+microseconds. It checks finite values before multiplying, preserves infinity, and
+rounds nanoseconds to the nearest microsecond with ties away from the epoch.
+Overflow raises `sirius::invalid_input_exception`; reading the overflow result
+synchronizes the supplied stream. `has_checked_timestamp_cast()` names the casts it
+implements, and the cast evaluator dispatches to this helper for semantic casts
+among them. The other casts to a coarser precision use `cudf::cast`, which
+neither applies DuckDB's rounding nor preserves infinity.
 
 `finite_mask()` returns a nullable boolean column for DATE or any timestamp
 precision. Both checked conversion and millisecond/microsecond extraction use it,
 so sentinel handling has one implementation. The evaluator boundary regressions
-are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
-tagged `[timestamp_extraction]`.
+are tagged `[timestamp_bounds]`; SQL comparisons against DuckDB are tagged
+`[timestamp_extraction]` for extraction and `[timestamp_cast]` for precision casts.
 
 ### HUGEINT
 
