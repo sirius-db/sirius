@@ -28,6 +28,11 @@
 #include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/limiting_resource_adaptor.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -493,6 +498,15 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
                  "[integration][scan][parquet][gpu][carrier]")
 {
   compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("strings.parquet"));
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet columns keep their values under column aliases",
+                 "[integration][scan][parquet][gpu]")
+{
+  // The aliases trade the names of two same-typed columns. A scan that reads its columns by the
+  // aliased names returns each one's values under the other's name.
+  compare_gpu_vs_cpu("SELECT * FROM " + scan("strings.parquet") + " AS t(b, a)");
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,
@@ -1770,6 +1784,34 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          2);
     expect_equality_rows("SELECT v FROM " + scan + " ORDER BY v;", {{"30"}, {"50"}, {"60"}}, 2);
     expect_equality_rows("SELECT count(*) FROM " + scan + ";", {{"3"}}, 2);
+    // Column aliases trade the names of `id` and `v`, which have one type. Resolving the key or
+    // the columns by the aliased names reads `v` where `id` is meant.
+    expect_equality_rows("SELECT * FROM " + scan + " AS t(v, region, id) ORDER BY id;",
+                         {{"1", "B", "30"}, {"3", "A", "50"}, {"3", "B", "60"}},
+                         2);
+  }
+  {
+    INFO("equality deletes stay inside their partition spec and tuple");
+    // Five data files hold ids 1..5 with v = 10 * file + id. Deletes of id 1, 2 and 3 are stored
+    // under an older spec, under a two-field spec with an int value, and under that spec with a
+    // NULL value: each reaches one file. Deletes of id 4 and 5 are stored under a spec whose
+    // only field is void and under an unpartitioned spec: both reach every file.
+    auto path = table("iceberg_v2_eq_partition_shapes");
+    require_delete_files(path, 5);
+    expect_equality_rows("SELECT v FROM " + pinned_scan(path) + " ORDER BY v;",
+                         {{"12"},
+                          {"13"},
+                          {"21"},
+                          {"22"},
+                          {"23"},
+                          {"31"},
+                          {"33"},
+                          {"41"},
+                          {"42"},
+                          {"43"},
+                          {"51"},
+                          {"52"}},
+                         5);
   }
   {
     INFO("upsert within one commit");
@@ -1783,6 +1825,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          2);
     expect_equality_rows(
       "SELECT v FROM " + pinned_scan(path) + " ORDER BY v;", {{"a"}, {"c"}, {"d"}, {"y"}}, 2);
+  }
+  {
+    INFO("a V3 table without row lineage");
+    // Deletes do not depend on first-row-id or next-row-id, which older V3 writers left out.
+    auto path = table("iceberg_v3_eq_no_row_lineage");
+    require_delete_files(path, 1);
+    expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}});
   }
   {
     INFO("equality keys are matched by field id");
@@ -1912,6 +1962,70 @@ TEST_CASE_METHOD(
 
   counters->equality_gpu_count_for_testing = 1;
   expect_equality_rows(query, {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE("iceberg equality deletes are built on the configured GPU rather than the planning one",
+          "[iceberg][multi_gpu][isolated_context]")
+{
+  if (!sirius::test::has_gpus(2)) SKIP("Requires two visible GPUs for subset [1]");
+  rmm::cuda_set_device_raii const caller_guard{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir scratch{"iceberg_equality_gpu1"};
+  {
+    std::ofstream config(scratch.path() / "gpu1.yaml");
+    config << R"(sirius:
+  topology:
+    gpu_ids: [1]
+  memory:
+    gpu:
+      usage_limit_fraction: 0.2
+    host:
+      capacity_bytes: 32000000000
+      initial_number_pools: 2
+      pool_size: 128
+      block_size: 1048576
+)";
+  }
+  auto db = sirius::test::open_sirius_db(nullptr, scratch.path() / "gpu1.yaml");
+  duckdb::Connection con(*db);
+  auto run = [&](std::string const& sql) {
+    auto result = con.Query(sql);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+  run("LOAD iceberg");
+  auto spaces = sirius::test::get_registered_sirius_context(con)
+                  ->get_memory_manager()
+                  .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE(spaces.size() == 1);
+  REQUIRE(spaces.front()->get_device_id() == 1);
+
+  // Installed after runtime initialization, which may probe every visible GPU. From here on any
+  // RMM allocation on the excluded GPU 0, the planning thread's device, fails.
+  rmm::mr::limiting_resource_adaptor reject_excluded{
+    cuda::mr::any_resource<cuda::mr::device_accessible>{
+      rmm::mr::get_per_device_resource_ref(rmm::cuda_device_id{0})},
+    0};
+  auto previous =
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0},
+                                     cuda::mr::any_resource<cuda::mr::device_accessible>{
+                                       rmm::device_async_resource_ref{reject_excluded}});
+  absl::Cleanup restore_resource = [&] {
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{0}, std::move(previous));
+  };
+
+  run("SET gpu_execution=true");
+  run("SET enable_duckdb_fallback=false");
+  auto const before = sirius::test::get_transparent_execution_stats(con);
+  auto result       = run("SELECT fruit, count FROM iceberg_scan('" +
+                    equality_fixture("iceberg_v2_eq_wide_delete_file") + "') ORDER BY count");
+  auto const after  = sirius::test::get_transparent_execution_stats(con);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
+  CHECK(
+    MultiFormatFixtureBase::collect_rows(*result) ==
+    std::vector<std::vector<std::string>>{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  REQUIRE(rmm::get_current_cuda_device() == rmm::cuda_device_id{0});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
@@ -3997,13 +4111,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
-                 "Iceberg equality plan agrees with the inventory or is refused",
+                 "Iceberg equality deletes are planned from the inventory's manifests",
                  "[integration][iceberg][verdict]")
 {
   using namespace sirius::op::scan;
   auto path      = equality_fixture("iceberg_v2_eq_manifest_rewrite");
-  auto sid       = current_snapshot_id(path);
-  auto inventory = read_delete_inventory(*con->context, path, sid);
+  auto inventory = read_delete_inventory(*con->context, path, current_snapshot_id(path));
   REQUIRE(inventory.inventory);
 
   // The manifest's sequence number is 3 for both data files; only the inherited one separates
@@ -4016,39 +4129,63 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   CHECK(sequences.at("data-3.parquet") == std::pair<int64_t, int64_t>{3, 3});
   CHECK(sequences.at("delete-eq-2.parquet") == std::pair<int64_t, int64_t>{2, 2});
 
-  auto plan = read_equality_plan(*con->context, path, sid, *inventory.inventory);
+  auto plan = read_equality_plan(*con->context, *inventory.inventory, 64);
   REQUIRE(plan.files.size() == 1);
   CHECK(plan.files[0].equality_ids == std::vector<int32_t>{1});
   CHECK(plan.files[0].data_sequence_number == 2);
+  CHECK(plan.files[0].record_count == 1);
   REQUIRE(plan.by_data_file.size() == 2);
   for (auto const& [data_file, files] : plan.by_data_file) {
     auto const older = fs::path(data_file).filename() == "data-1.parquet";
     CHECK(files == (older ? std::vector<uint32_t>{0} : std::vector<uint32_t>{}));
   }
 
-  // Each mutation makes the inventory contradict the plan; none may be resolved by guessing.
   auto mutated = [&](auto const& change) {
     auto copy = *inventory.inventory;
     for (auto& entry : copy.entries)
       change(entry);
     return copy;
   };
-  // The data file is as new as the delete: applying it would delete an upsert's own row.
-  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, mutated([](auto& entry) {
-                    if (entry.content == "DATA") entry.data_sequence_number = 2;
-                  })),
+  // A data file as new as the delete keeps its rows: an upsert must not delete what it writes.
+  // The delete then applies to nothing and is not planned at all.
+  auto const upsert = read_equality_plan(*con->context,
+                                         mutated([](auto& entry) {
+                                           if (entry.content == "DATA")
+                                             entry.data_sequence_number = 2;
+                                         }),
+                                         64);
+  CHECK(upsert.files.empty());
+  for (auto const& [data_file, files] : upsert.by_data_file)
+    CHECK(files.empty());
+  // A file without an inherited sequence number cannot be ordered against the others.
+  CHECK_THROWS_AS(read_equality_plan(*con->context,
+                                     mutated([](auto& entry) {
+                                       if (entry.content == "DATA") entry.data_sequence_number = -1;
+                                     }),
+                                     64),
                   equality_plan_error);
-  // The inventory does not list the delete the plan applies.
-  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, mutated([](auto& entry) {
-                    if (entry.content == "EQUALITY_DELETES") entry.content = "POSITION_DELETES";
-                  })),
+  // The manifest lists a live equality delete the inventory does not.
+  CHECK_THROWS_AS(read_equality_plan(*con->context,
+                                     mutated([](auto& entry) {
+                                       if (entry.content == "EQUALITY_DELETES")
+                                         entry.file_path += ".other";
+                                     }),
+                                     64),
                   equality_plan_error);
-  // The inventory lists a data file the plan never mentions.
-  auto extra = *inventory.inventory;
-  extra.entries.push_back({"DATA", "unplanned.parquet", 1, "PARQUET", "m.avro", 1});
-  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid, extra), equality_plan_error);
-  // A snapshot the table does not have.
-  CHECK_THROWS_AS(read_equality_plan(*con->context, path, sid + 12345, *inventory.inventory),
+  // The inventory lists an equality delete in a manifest that does not hold it.
+  auto elsewhere = *inventory.inventory;
+  for (auto& entry : elsewhere.entries)
+    if (entry.content == "EQUALITY_DELETES")
+      for (auto const& other : inventory.inventory->entries)
+        if (other.content == "DATA") entry.manifest_path = other.manifest_path;
+  CHECK_THROWS_AS(read_equality_plan(*con->context, elsewhere, 64), equality_plan_error);
+  // A manifest that cannot be read.
+  CHECK_THROWS_AS(read_equality_plan(*con->context,
+                                     mutated([](auto& entry) {
+                                       if (entry.content == "EQUALITY_DELETES")
+                                         entry.manifest_path += ".missing";
+                                     }),
+                                     64),
                   equality_plan_error);
 }
 
@@ -4340,16 +4477,19 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto path = inventory_fixture("equality_bad_dv");
   auto scan = pinned_scan(path);
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  auto result = con->Query("SELECT fruit, count FROM " + scan);
+  // The equality delete beside the vector is refused at the plan gate, here as on a multi-GPU
+  // configuration. That happens before the vector's manifest is expanded and its descriptor read.
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  auto reset    = reset_after_test(counters->equality_gpu_count_for_testing);
+  counters->equality_gpu_count_for_testing = 2;
+  auto before                              = sirius::test::get_transparent_execution_stats(*con);
+  auto result                              = con->Query("SELECT fruit, count FROM " + scan);
   REQUIRE(result);
   REQUIRE(result->HasError());
-  // This V3 fixture carries no row-lineage fields, so the extension cannot plan it. The scan is
-  // refused while planning its equality deletes -- still before the malformed vector is read.
-  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("iceberg_scan_plan failed"));
+  CHECK_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("on a single GPU only"));
   auto after = sirius::test::get_transparent_execution_stats(*con);
   auto reason =
-    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_plan_unproven);
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_multi_gpu);
   CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
   CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);

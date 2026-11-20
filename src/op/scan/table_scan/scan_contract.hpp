@@ -207,7 +207,7 @@ enum class verdict_reason : uint16_t {
   iceberg_puffin_remote_eager,
   iceberg_delete_corrupt,
   // Equality deletes the GPU path can read in principle but not in this shape.
-  iceberg_equality_plan_unproven,    // scan plan unreadable, or it contradicts the inventory
+  iceberg_equality_plan_unproven,  // delete manifests unreadable, or they contradict the inventory
   iceberg_equality_key_unsupported,  // key is dropped, nested, or of an unsupported type
   iceberg_equality_budget,           // delete set above the plan-time budget
   iceberg_equality_multi_gpu,        // delete tables are built on one device only
@@ -463,7 +463,7 @@ struct pre_decline {
   std::string text;
 };
 
-// One live equality-delete file, as the Iceberg extension's scan plan describes it.
+// One live equality-delete file that applies to at least one data file.
 struct iceberg_equality_delete_file {
   std::string file_path;
   // Field IDs that decide row equality, in manifest order. Never the delete file's column list:
@@ -474,8 +474,7 @@ struct iceberg_equality_delete_file {
   int64_t data_sequence_number = 0;  // Inherited value, from the inventory.
 };
 
-// Which equality-delete files apply to which data file. Applicability is resolved by the Iceberg
-// extension, the reader the CPU path uses, and cross-checked against inventory sequence numbers.
+// Which equality-delete files apply to which data file, by data sequence number and partition.
 struct iceberg_equality_plan {
   std::vector<iceberg_equality_delete_file> files;
   // Every data file of the snapshot, keyed as the manifest wrote its path, to the sorted indices

@@ -18,6 +18,10 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v2_eq_partitioned         One delete stored in partition A, one stored under an
                                     unpartitioned spec. The first must not reach partition B;
                                     the second must reach both.
+  iceberg_v2_eq_partition_shapes    Deletes stored under an older spec, a two-field spec with an
+                                    int and a NULL partition value, a spec whose only field is
+                                    void, and an unpartitioned spec. The first two stay inside
+                                    their spec and partition; the last two reach every file.
   iceberg_v2_eq_upsert_same_commit  One commit rewrites key 2 twice: the equality delete removes
                                     the OLDER commit's row, a position delete removes this
                                     commit's first version. Applying the equality delete to its
@@ -37,6 +41,9 @@ are listed beside the right ones, so a failure says which rule broke:
   iceberg_v2_eq_unsupported_keys    The same layout for the keys the GPU path declines: decimal,
                                     float, a struct member and a column the table has since
                                     dropped.
+  iceberg_v3_eq_no_row_lineage      A V3 table without first-row-id and next-row-id, as older
+                                    writers left them. Deletes do not depend on row lineage, so
+                                    the table is read like any other.
   iceberg_v2_eq_remote_delete       The equality delete is recorded under an s3:// URI; data and
                                     metadata are local. The GPU path reads equality deletes from
                                     local files only and must decline before opening it.
@@ -70,9 +77,20 @@ def _avro(path):
 class Table:
     """One fixture: accumulates commits, then writes metadata that describes all of them."""
 
-    def __init__(self, name, schemas, partition_specs=None, format_version=2):
+    def __init__(
+        self,
+        name,
+        schemas,
+        partition_specs=None,
+        format_version=2,
+        row_lineage=True,
+        partition_types=None,
+    ):
+        # partition_types: Avro type of a partition field by name, where it is not a string.
+        self.partition_types = partition_types or {}
         self.name, self.root, self.rel = name, DATA / name, REL / name
         self.format_version, self.next_row_id = format_version, 0
+        self.row_lineage = row_lineage and format_version >= 3
         self.schemas = schemas  # list of [(field_id, name, iceberg_type)]
         self.specs = partition_specs or [[]]
         self.snapshots, self.manifests, self.seq = [], [], 0
@@ -118,7 +136,10 @@ class Table:
                         {
                             "field-id": f["field-id"],
                             "name": f["name"],
-                            "type": ["null", "string"],
+                            "type": [
+                                "null",
+                                self.partition_types.get(f["name"], "string"),
+                            ],
                             "default": None,
                         }
                         for f in spec
@@ -161,7 +182,21 @@ class Table:
             fastavro.writer(fh, schema, rows, codec="null", metadata=meta)
         added = sum(1 for r in rows if r["status"] == 1)
         existing = sum(1 for r in rows if r["status"] == 0)
-        values = sorted({p[f["name"]] for *_, p, _ in entries if p for f in spec})
+
+        def summary(field):
+            values = [p[field["name"]] for *_, p, _ in entries if p]
+            present = sorted(v for v in values if v is not None)
+
+            def bound(v):
+                return v.encode() if isinstance(v, str) else v.to_bytes(4, "little")
+
+            return {
+                "contains_null": len(present) != len(values),
+                "contains_nan": False,
+                "lower_bound": bound(present[0]) if present else None,
+                "upper_bound": bound(present[-1]) if present else None,
+            }
+
         row = dict(self.list_row)
         row.update(
             manifest_path=str(self.rel / "metadata" / name),
@@ -184,17 +219,7 @@ class Table:
             ),
             deleted_rows_count=0,
             partitions=(
-                [
-                    {
-                        "contains_null": False,
-                        "contains_nan": False,
-                        "lower_bound": values[0].encode(),
-                        "upper_bound": values[-1].encode(),
-                    }
-                    for _ in spec
-                ]
-                if values
-                else []
+                [summary(f) for f in spec] if any(p for *_, p, _ in entries) else []
             ),
         )
         return row
@@ -233,7 +258,7 @@ class Table:
                 "manifest-list": str(self.rel / "metadata" / name),
                 "summary": {"operation": operation},
                 "schema-id": len(self.schemas) - 1,
-                **(lineage if self.format_version >= 3 else {}),
+                **(lineage if self.row_lineage else {}),
                 **(
                     {"parent-snapshot-id": self.snapshot_id(self.seq - 1)}
                     if self.seq > 1
@@ -286,7 +311,9 @@ class Table:
             }
         )
         if self.format_version >= 3:
-            meta.update({"format-version": 3, "next-row-id": self.next_row_id})
+            meta["format-version"] = 3
+        if self.row_lineage:
+            meta["next-row-id"] = self.next_row_id
         # A fixed UUID per fixture: hash() is salted per process.
         meta["table-uuid"] = "e0e0e0e0-0000-4000-8000-%012x" % (
             sum(ord(c) * 131**k for k, c in enumerate(self.name)) % 16**12
@@ -439,6 +466,118 @@ def build_partitioned():
     everywhere = t.parquet("delete-eq-3-global.parquet", [(1, "id", pa.int64(), [2])])
     t.commit(
         "delete", [("m-delete-3.avro", 1, 1, [(1, None, everywhere, 2, None, [1])])]
+    )
+    t.finish()
+
+
+def build_partition_shapes():
+    import pyarrow as pa
+
+    region = {"name": "region", "source-id": 2, "field-id": 1000}
+    t = Table(
+        "iceberg_v2_eq_partition_shapes",
+        [
+            [
+                (1, "id", "long"),
+                (2, "region", "string"),
+                (3, "k", "int"),
+                (4, "v", "long"),
+            ]
+        ],
+        [
+            [{**region, "transform": "identity"}],
+            [
+                {**region, "transform": "identity"},
+                {
+                    "name": "k",
+                    "transform": "identity",
+                    "source-id": 3,
+                    "field-id": 1001,
+                },
+            ],
+            [{**region, "transform": "void"}],
+            [],
+        ],
+        partition_types={"k": "int"},
+    )
+
+    def data(n, region, k):
+        return t.parquet(
+            f"data-{n}.parquet",
+            [
+                (1, "id", pa.int64(), [1, 2, 3, 4, 5]),
+                (2, "region", pa.string(), [region] * 5),
+                (3, "k", pa.int32(), [k] * 5),
+                (4, "v", pa.int64(), [10 * n + i for i in range(1, 6)]),
+            ],
+        )
+
+    def delete(name, key):
+        return t.parquet(f"delete-eq-{name}.parquet", [(1, "id", pa.int64(), [key])])
+
+    def added(file, kind, partition, ids=None):
+        return (1, None, file, kind, partition, ids)
+
+    # Files 1 and 2 are written under the first spec, files 3 to 5 under the second.
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-1.avro",
+                0,
+                0,
+                [
+                    added(data(1, "A", 1), 0, {"region": "A"}),
+                    added(data(2, "B", 1), 0, {"region": "B"}),
+                ],
+            )
+        ],
+    )
+    t.commit(
+        "append",
+        [
+            (
+                "m-data-2.avro",
+                0,
+                1,
+                [
+                    added(data(3, "A", 1), 0, {"region": "A", "k": 1}),
+                    added(data(4, "A", 2), 0, {"region": "A", "k": 2}),
+                    added(data(5, None, 1), 0, {"region": None, "k": 1}),
+                ],
+            )
+        ],
+    )
+    t.commit(
+        "delete",
+        [
+            # region=A under the first spec: file 1 only, not the second spec's region A.
+            (
+                "m-delete-3a.avro",
+                1,
+                0,
+                [added(delete("3a", 1), 2, {"region": "A"}, [1])],
+            ),
+            # (A, 1) and (NULL, 1) under the second spec: files 3 and 5.
+            (
+                "m-delete-3b.avro",
+                1,
+                1,
+                [
+                    added(delete("3b", 2), 2, {"region": "A", "k": 1}, [1]),
+                    added(delete("3c", 3), 2, {"region": None, "k": 1}, [1]),
+                ],
+            ),
+            # A spec whose only field is void does not partition: every file.
+            (
+                "m-delete-3d.avro",
+                1,
+                2,
+                [added(delete("3d", 4), 2, {"region": None}, [1])],
+            ),
+            # An unpartitioned spec: every file.
+            ("m-delete-3e.avro", 1, 3, [added(delete("3e", 5), 2, None, [1])]),
+        ],
     )
     t.finish()
 
@@ -713,6 +852,37 @@ def build_remote_delete():
     t.finish()
 
 
+def build_no_row_lineage():
+    import pyarrow as pa
+
+    t = Table(
+        "iceberg_v3_eq_no_row_lineage",
+        fruit_schema(),
+        format_version=3,
+        row_lineage=False,
+    )
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (1, "fruit", pa.string(), ["apple", "banana", "cherry"]),
+            (2, "count", pa.int64(), [1, 2, 3]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    delete = t.parquet("delete-eq-2.parquet", [(1, "fruit", pa.string(), ["banana"])])
+    t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t.finish()
+
+
+# (file number, region, k, the id its partition-scoped delete removes); ids 4 and 5 go everywhere.
+PARTITION_SHAPES = [
+    (1, "A", 1, 1),
+    (2, "B", 1, None),
+    (3, "A", 1, 2),
+    (4, "A", 2, None),
+    (5, None, 1, 3),
+]
+
 # name -> (builder, expectation). The expectation is the rows a correct reader returns for the
 # current snapshot, a {snapshot sequence: rows} map for a table of sibling snapshots, or None
 # for a table DuckDB cannot read from this machine.
@@ -733,6 +903,15 @@ FIXTURES = {
         build_partitioned,
         [(1, "B", 30), (3, "A", 50), (3, "B", 60)],
     ),
+    "iceberg_v2_eq_partition_shapes": (
+        build_partition_shapes,
+        [
+            (i, r, k, 10 * n + i)
+            for n, r, k, gone in PARTITION_SHAPES
+            for i in (1, 2, 3)
+            if i != gone
+        ],
+    ),
     "iceberg_v2_eq_upsert_same_commit": (
         build_upsert_same_commit,
         [(1, "a"), (2, "y"), (3, "c"), (4, "d")],
@@ -751,6 +930,10 @@ FIXTURES = {
     "iceberg_v2_eq_unsupported_keys": (
         build_unsupported_keys,
         {seq: [(1,), (3,)] for seq in UNSUPPORTED_KEYS},
+    ),
+    "iceberg_v3_eq_no_row_lineage": (
+        build_no_row_lineage,
+        [("apple", 1), ("cherry", 3)],
     ),
     "iceberg_v2_eq_remote_delete": (build_remote_delete, None),
 }
