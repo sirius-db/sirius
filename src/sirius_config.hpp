@@ -577,6 +577,17 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
+  /// Rank CPU boundary shared by pool startup, metadata placement and lazy I/O/exchange.
+  [[nodiscard]] const std::vector<int>& get_startup_cpus() const noexcept
+  {
+    return _scan_manager_config.startup_cpus;
+  }
+
+  /// Startup CPUs for unconfigured worker/management and exchange threads, excluding
+  /// reserved reactor CPUs when any were reserved. Explicit pool masks remain authoritative
+  /// within the rank boundary.
+  [[nodiscard]] std::vector<int> get_worker_startup_cpus() const;
+
   /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
   /// thread pool's affinity; empty when nothing is reserved.
   [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept

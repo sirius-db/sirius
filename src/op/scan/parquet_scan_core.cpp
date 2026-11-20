@@ -420,6 +420,7 @@ std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
  */
 class parquet_batch_coalescer : public batch_coalescer {
  public:
+  bool asynchronous_preparation() const noexcept override { return true; }
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
