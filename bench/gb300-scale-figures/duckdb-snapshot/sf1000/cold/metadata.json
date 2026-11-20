@@ -1,0 +1,23 @@
+{
+  "cold_connection_scope": "fresh in-memory DuckDB database per query",
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "duckdb_version": "2.0.0",
+  "finished_at_utc": "2026-11-19T15:47:25.300856+00:00",
+  "iterations": 1,
+  "os_cache_eviction": "sync + POSIX_FADV_DONTNEED on every dataset Parquet file",
+  "parquet_file_count": 90,
+  "profile": "cold",
+  "query_time_s": [
+    175.1537
+  ],
+  "settings": {
+    "autoinstall_known_extensions": false,
+    "autoload_known_extensions": false,
+    "cache_local_files": true,
+    "enable_external_file_cache": true,
+    "parquet_metadata_cache": true
+  },
+  "sirius_loaded": false,
+  "started_at_utc": "2026-11-19T15:40:04.294199+00:00",
+  "timing": "connection.execute(sql), excluding view setup and result fetch"
+}
