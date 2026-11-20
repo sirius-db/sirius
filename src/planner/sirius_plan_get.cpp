@@ -157,8 +157,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::optional<int64_t> snapshot_id;
   auto const sid_it          = op.named_parameters.find("snapshot_from_id");
   bool const has_explicit_id = sid_it != op.named_parameters.end() && !sid_it->second.IsNull();
+  auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
   if (!has_explicit_id) {
-    auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
     if (!bound) {
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
@@ -219,7 +219,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
-    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto result = op::scan::read_delete_inventory(
+      context,
+      table_path,
+      snapshot_id,
+      injection,
+      bound ? std::string_view(bound->table_uuid) : std::string_view{});
     auto const n_delete_files = result.equality_count;
     timer.stop();
     if (n_delete_files > 0) {
