@@ -7,6 +7,8 @@
 
 #include "io/s3/duckdb_secret_config.hpp"
 
+#include "sirius_context.hpp"
+
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -97,6 +99,18 @@ duckdb::CatalogTransaction secret_catalog_transaction(duckdb::ClientContext& con
     duckdb::DatabaseInstance::GetDatabase(context));
 }
 
+duckdb::SecretMatch lookup_s3_secret(duckdb::ClientContext& context, std::string const& path)
+{
+  // File-system callbacks can also run outside query execution (for example a
+  // direct FileSystem::OpenFile in an embedding). In that case there is no
+  // ClientContext transaction to borrow, so use DuckDB's committed system view.
+  auto transaction = secret_catalog_transaction(context);
+  auto& manager    = duckdb::SecretManager::Get(context);
+  auto match       = manager.LookupSecret(transaction, path, "sirius_s3");
+  if (!match.HasMatch()) { match = manager.LookupSecret(transaction, path, "s3"); }
+  return match;
+}
+
 }  // namespace
 
 void register_sirius_s3_secret(duckdb::SecretManager& manager)
@@ -145,19 +159,29 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
   // every bind/open, so replacement affects future work. Sirius keeps the
   // resolved config snapshot needed by its REST signer, but does not retain the
   // DuckDB secret object or its catalog name in bind data.
-  // File-system callbacks can also run outside query execution (for example a
-  // direct FileSystem::OpenFile in an embedding). In that case there is no
-  // ClientContext transaction to borrow, so use DuckDB's committed system view.
-  auto transaction = secret_catalog_transaction(context);
-  auto& manager    = duckdb::SecretManager::Get(context);
   // URI schemes are case-insensitive, but DuckDB secret scopes use case-sensitive prefix
   // matching. Canonicalize only the scheme so SCOPE 's3://bucket/' also covers
   // 'S3://bucket/object' without changing case-sensitive bucket or object-key bytes.
   auto const secret_path = canonicalize_s3_scheme(path);
-  auto match             = manager.LookupSecret(transaction, secret_path, "sirius_s3");
-  if (!match.HasMatch()) { match = manager.LookupSecret(transaction, secret_path, "s3"); }
+  auto match             = lookup_s3_secret(context, secret_path);
+  // A Sirius internal connection reads for the statement that opened it. Credentials an Iceberg
+  // catalog vends live in that statement's transaction, so consult it too and keep the more
+  // specific secret.
+  duckdb::shared_ptr<duckdb::ClientContext> outer;
+  if (auto const state = duckdb::get_sirius_connection_state(context)) {
+    outer = state->internal_outer();
+  }
+  if (outer) {
+    auto outer_match = lookup_s3_secret(*outer, secret_path);
+    if (outer_match.HasMatch() && (!match.HasMatch() || outer_match.score > match.score)) {
+      match = std::move(outer_match);
+    }
+  }
   if (!match.HasMatch()) { return defaults; }
-  if (!(match.GetSecret().GetProvider() == "config")) {
+  // The Iceberg extension stores credentials vended by a catalog under its own provider.
+  // Sirius reads that secret as a static snapshot and never refreshes it.
+  bool const vended = match.GetSecret().GetProvider() == "iceberg";
+  if (!vended && !(match.GetSecret().GetProvider() == "config")) {
     throw duckdb::NotImplementedException(
       "Sirius S3 currently supports only static TYPE SIRIUS_S3 or TYPE S3 PROVIDER CONFIG secrets");
   }
@@ -167,7 +191,7 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
     throw duckdb::InvalidInputException("The selected Sirius S3 secret has an unsupported format");
   }
   auto const& secret = *secret_ptr;
-  reject_present_option(secret, "refresh_info");
+  if (!vended) { reject_present_option(secret, "refresh_info"); }
   reject_nonempty_string_option(secret, "refresh");
   reject_true_bool_option(secret, "requester_pays");
   reject_true_bool_option(secret, "url_compatibility_mode");
@@ -227,6 +251,14 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
     auto const suffix = defaults.region.rfind("cn-", 0) == 0 ? "amazonaws.com.cn" : "amazonaws.com";
     defaults.endpoint =
       std::string(use_ssl ? "https://" : "http://") + "s3." + defaults.region + "." + suffix;
+  }
+  // A secret cannot always carry a signing option: the Iceberg extension builds its own. An
+  // internal connection signs the way its statement does.
+  auto& session = outer ? *outer : context;
+  duckdb::Value header_signing;
+  if (session.TryGetCurrentSetting("sirius_s3_header_signing", header_signing) &&
+      !header_signing.IsNull() && header_signing.GetValue<bool>()) {
+    defaults.s3_signing_mode = object_store_config::signing_mode::header;
   }
   return defaults;
 }

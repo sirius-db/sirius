@@ -263,6 +263,7 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   if (!meta_result) throw inventory_query_error("", true);
   if (meta_result->HasError()) throw inventory_query_error(meta_result->GetError(), false);
   inventory_result result{iceberg_delete_inventory{}, 0};
+  result.inventory->table = table_path;
   std::vector<duckdb::unique_ptr<duckdb::DataChunk>> chunks;
   uint64_t bytes      = sizeof(iceberg_delete_inventory);
   uint64_t peak_bytes = bytes;
@@ -368,7 +369,8 @@ iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext& context,
 
     if (content == kPositionDeletes) {
       auto const& file_format = row.file_format;
-      if (file_format == kFormatPuffin) {
+      // Writers disagree on the case: DuckDB records "puffin".
+      if (duckdb::StringUtil::CIEquals(file_format, kFormatPuffin)) {
         // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
         auto const& manifest_path = row.manifest_path;
         ++puffin_rows_from_metadata[{manifest_path, sirius::io::strip_file_scheme(filepath)}];

@@ -237,13 +237,13 @@ jobs:
         # Tests LOAD without INSTALL so they never reach the network; provision them here.
         run: |
           for attempt in 1 2 3; do
-            if ./sirius-duckdb/build/release/duckdb -c "INSTALL avro; INSTALL iceberg; INSTALL ducklake;"; then
+            if ./sirius-duckdb/build/release/duckdb -c "INSTALL avro; INSTALL iceberg; INSTALL ducklake; INSTALL httpfs;"; then
               exit 0
             fi
             echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
-          echo "::error::Could not install the avro, iceberg and ducklake extensions after 3 attempts." >&2
+          echo "::error::Could not install the avro, iceberg, ducklake and httpfs extensions after 3 attempts." >&2
           exit 1
 
       - name: Test Simpatico cache across processes

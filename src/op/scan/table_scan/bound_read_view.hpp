@@ -176,7 +176,7 @@ struct iceberg_snapshot_binding {
   int32_t schema_id;
 };
 
-/// The committed snapshot selected by a verified Iceberg filesystem scan.
+/// The committed snapshot selected by a verified Iceberg scan of a path or a catalog table.
 std::optional<iceberg_snapshot_binding> capture_iceberg_snapshot(
   duckdb::BoundTableFunction const& function,
   duckdb::FunctionData const* bind_data,

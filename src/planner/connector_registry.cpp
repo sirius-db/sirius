@@ -152,6 +152,19 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
   return result;
 }
 
+// A path scan carries no function_info, like the registered function. A catalog table's scan
+// carries the extension's scan info: accept it only on a binding the extension reports as a
+// catalog table. Lookup still compares the callbacks with the reference definition.
+bool verify_iceberg_binding(duckdb::BaseTableFunction const& function,
+                            duckdb::FunctionData const* bind,
+                            duckdb::ClientContext& context)
+{
+  if (!function.function_info) return true;
+  if (!function.get_bind_info || !bind) return false;
+  duckdb::TableFunctionGetBindInfoInput input(context, const_cast<duckdb::FunctionData*>(bind));
+  return function.get_bind_info(input).type == duckdb::ScanType::TABLE;
+}
+
 op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
                                                 op::sirius_physical_table_scan const& scan,
                                                 duckdb::ClientContext&,
@@ -338,7 +351,8 @@ connector make_iceberg_scan_connector()
           .selector_outside_bind_data = true,
           .decline_reason             = registered_iceberg_decline_reason,
           .provider                   = std::nullopt,
-          .certify                    = supported_iceberg};
+          .certify                    = supported_iceberg,
+          .verify_binding             = verify_iceberg_binding};
 }
 
 connector make_sirius_stream_source_connector()
@@ -518,6 +532,7 @@ struct verified_callbacks {
                     reference.pushdown_expression,
                     reference.get_partition_data,
                     reference.get_bind_info,
+                    reference.get_table_entry,
                     reference.projection_expression_pushdown,
                     reference.get_multi_file_reader,
                     reference.supports_pushdown_type,
@@ -555,6 +570,7 @@ struct verified_callbacks {
                                                        candidate.pushdown_expression,
                                                        candidate.get_partition_data,
                                                        candidate.get_bind_info,
+                                                       candidate.get_table_entry,
                                                        candidate.projection_expression_pushdown,
                                                        candidate.get_multi_file_reader,
                                                        candidate.supports_pushdown_type,

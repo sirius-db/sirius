@@ -145,6 +145,7 @@ for variant, names in (
     ("dv_unsupported_uri", ("a",)),
     ("dv_supported_s3_uri", ("a",)),
     ("dv_unused_unsupported_uri", ("a",)),
+    ("dv_lowercase_format", ("a",)),
 ):
     dest = out / variant
     (dest / "metadata").mkdir(parents=True, exist_ok=True)
@@ -214,6 +215,9 @@ for variant, names in (
                         df["file_path"] = str(sidecar)
                         df["referenced_data_file"] = str(data)
                         df["file_size_in_bytes"] = sidecar.stat().st_size
+                        if variant == "dv_lowercase_format":
+                            # DuckDB's Iceberg writer records the format in lower case.
+                            df["file_format"] = "puffin"
                         if variant == "dv_unsupported_uri":
                             # Keep metadata, manifests, and data local while making only the
                             # Puffin sidecar a remote URI with no registered Sirius backend.

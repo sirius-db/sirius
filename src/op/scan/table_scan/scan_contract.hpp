@@ -464,6 +464,8 @@ struct iceberg_delete_inventory {
     std::string manifest_path;
   };
   std::vector<entry> entries;
+  /// What iceberg_metadata() read these entries by: a path, or a quoted catalog table name.
+  std::string table;
 };
 
 struct pre_capture_result {

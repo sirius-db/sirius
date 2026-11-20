@@ -19,6 +19,7 @@ import glob
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -167,7 +168,7 @@ PARQUET_PIN_CACHE = {
 
 ENGINE_CHOICES = ("gpu", "cpu", "both")
 PIN_CHOICES = ("none", "gpu", "host", "parquet")
-DATA_SOURCE_CHOICES = ("parquet", "duckdb")
+DATA_SOURCE_CHOICES = ("parquet", "duckdb", "iceberg")
 PRECMD_CHOICES = ("none", "nsys", "gdb")
 TPCH_TABLES = (
     "customer",
@@ -521,6 +522,8 @@ DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # points pin_table at those plan files. Whether pins are compressed at all is the
 # engine's setting (pin_table_compression, on by default).
 PIN_COMPRESSION_PLAN_DIR = None
+# SQL file that attaches the Iceberg catalog for --data-source iceberg. Never logged.
+CATALOG_SETUP_PATH = None
 
 
 def _load_yaml(path):
@@ -692,8 +695,10 @@ def drop_os_cache(source, data_source="parquet"):
     only covers the benchmark's own files (not dentries/inodes or unrelated
     cached files), and filesystems that ignore the hint will stay warm.
     """
-    if is_s3_input(source):
-        log("Skipping OS cache drop for S3 input (remote objects are not local files)")
+    if is_s3_input(source) or data_source == "iceberg":
+        log(
+            "Skipping OS cache drop for remote input (remote objects are not local files)"
+        )
         return
 
     if data_source == "duckdb":
@@ -763,6 +768,14 @@ def _build_views_sql(parquet_dir, s3_input=None):
     return "\n".join(parts) + "\n"
 
 
+def _build_catalog_views_sql(schema):
+    """Return CREATE OR REPLACE VIEW SQL over the 8 TPC-H tables of an attached catalog schema."""
+    return "".join(
+        f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM {schema}.{table};\n"
+        for table in TPCH_TABLES
+    )
+
+
 def open_connection(source, gpu_execution=False, data_source="parquet", s3_input=None):
     """Open a DuckDB connection over the benchmark source, optionally LOAD Sirius.
 
@@ -771,6 +784,9 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
              are already present in the `main` schema, so no views are registered.
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
+    iceberg: `source` is the catalog.schema of an Iceberg REST catalog. The SQL in
+             CATALOG_SETUP_PATH attaches it on every connection; httpfs supplies the
+             catalog client, and Sirius still reads the s3:// bytes itself.
     """
     config = {"allow_unsigned_extensions": "true"}
     s3_source = data_source != "duckdb" and is_s3_source(source)
@@ -800,7 +816,14 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
     if s3_input is not None:
         s3_input.refresh_secret(con, gpu_execution)
 
-    if data_source != "duckdb":
+    if data_source == "iceberg":
+        for extension in ("httpfs", "avro", "iceberg"):
+            con.execute(f"LOAD {extension}")
+        with open(CATALOG_SETUP_PATH) as f:
+            _execute_multi(con, f.read())
+        log(f"Registering TPC-H views over catalog schema {source}")
+        _execute_multi(con, _build_catalog_views_sql(source))
+    elif data_source != "duckdb":
         log("Registering TPC-H parquet views")
         for stmt in _build_views_sql(source, s3_input).split(";\n"):
             stmt = stmt.strip()
@@ -1928,6 +1951,16 @@ def parse_args():
         "or a single .duckdb file (--data-source duckdb)",
     )
     p.add_argument(
+        "--catalog-setup",
+        type=str,
+        default=None,
+        help=(
+            "--data-source iceberg: SQL file run on every connection to attach the "
+            "catalog (CREATE SECRET ...; ATTACH ...). It holds credentials: keep it "
+            "outside the repository."
+        ),
+    )
+    p.add_argument(
         "--scale-factor",
         type=str,
         default=None,
@@ -1945,7 +1978,10 @@ def parse_args():
             "Input data source/format: 'parquet' (a directory of TPC-H parquet "
             "files scanned via read_parquet -> GPU_PARQUET_SCAN) or 'duckdb' (a "
             "single .duckdb file whose native TPC-H tables are scanned via the "
-            "GPU-native seq_scan). Pinning works for both. NOTE: this is a 2-value "
+            "GPU-native seq_scan). Pinning works for both. 'iceberg' reads the TPC-H "
+            "tables of an attached Iceberg REST catalog: --input is its catalog.schema "
+            "and --catalog-setup attaches it; serial runs without pinning only. "
+            "NOTE: this is a "
             "flag, distinct from the legacy benchmark_and_validate.sh --data-source "
             "(which also has a redundant 'duckdb-native' alias). (default: parquet)"
         ),
@@ -2204,6 +2240,26 @@ def main():
                 f"--data-source duckdb requires --input to be a .duckdb file; "
                 f"got {source!r}"
             )
+    elif args.data_source == "iceberg":
+        global CATALOG_SETUP_PATH
+        if not args.catalog_setup or not os.path.isfile(args.catalog_setup):
+            raise SystemExit(
+                "--data-source iceberg requires --catalog-setup <sql file>"
+            )
+        if not re.fullmatch(r"\w+\.\w+", source):
+            raise SystemExit(
+                f"--data-source iceberg requires --input catalog.schema; got {source!r}"
+            )
+        if (
+            args.pin != "none"
+            or args.precmd != "none"
+            or args.nsys_profile
+            or uses_concurrent_runner(args)
+        ):
+            raise SystemExit(
+                "--data-source iceberg supports serial runs without --pin or --precmd"
+            )
+        CATALOG_SETUP_PATH = os.path.abspath(args.catalog_setup)
     elif is_s3_input(source):
         s3_input = S3Input(source)
     elif not os.path.isdir(source):
