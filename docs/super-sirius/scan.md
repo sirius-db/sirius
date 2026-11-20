@@ -725,9 +725,15 @@ host-observed. The lane slots (1032 MiB per GPU with the defaults) live outside 
 the staging cap, and `reserve_cufile_staging` reserves them first.
 [`cufile.host_batch`](configuration.md#cufilehost_batch--host-reads-through-the-cufile-batch-api-opt-in)
 adds batch reactors that serve aligned host reads through `cuFileBatchIOSubmit`. Fusion is
-per request: the cuDF reader the cuFile scan decodes through issues one `device_read_async`
-per contiguous run of column chunks, so runs are split into windows but never fused with
-each other.
+per request, so `scan_manager.cufile_bulk_read` (default `auto`: on exactly when fused reads
+are) sends cuFile scans down the bulk route of `materialize_parquet`: one vectored
+`device_read_ranges_async` per file per split, decoded by cuDF's hybrid scan reader, as REST
+scans are. The scan manager registers its cuFile context for that route
+(`sirius::io::bulk_read_registration`), and `sirius::io::prefers_bulk_read` is the one
+decision both `prefers_bulk_materialize` and the Iceberg reader-position eligibility read.
+With the knob `off` (or lanes off) the scan keeps cuDF's general reader, which issues one
+`device_read_async` per contiguous run of column chunks, so runs are split into windows but
+never fused with each other.
 
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future

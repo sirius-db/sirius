@@ -2320,3 +2320,47 @@ TEST_CASE("the documented GPFS fused-lanes recipe loads",
   CHECK(cfg.cufile.fused_reads == expected_fused);
   CHECK(cfg.cufile.host_batch == expected_batch);
 }
+
+TEST_CASE("sirius_config reads scan_manager.cufile_bulk_read",
+          "[scan_manager][config][cufile][bulk_read]")
+{
+  using mode = sirius::scan_manager::cufile_bulk_read_mode;
+  // Default: auto, which follows cufile.fused_reads.enabled.
+  scan_manager_config defaults{};
+  CHECK(defaults.cufile_bulk_read == mode::automatic);
+  CHECK_FALSE(defaults.reads_cufile_in_bulk());
+  defaults.cufile.fused_reads.enabled = true;
+  CHECK(defaults.reads_cufile_in_bulk());
+  CHECK(load_scan_manager("sirius_cufile_bulk_read_default.yaml",
+                          single_gpu_scan_manager_yaml("      backend: cufile\n"))
+          .cufile_bulk_read == mode::automatic);
+
+  for (auto const& [spelling, expected, lanes_off, lanes_on] :
+       {std::tuple{"auto", mode::automatic, false, true},
+        std::tuple{"on", mode::on, true, true},
+        std::tuple{"off", mode::off, false, false}}) {
+    CAPTURE(spelling);
+    auto const body =
+      std::string{"      backend: cufile\n      cufile_bulk_read: "} + spelling + "\n";
+    auto const without_lanes =
+      load_scan_manager("sirius_cufile_bulk_read.yaml", single_gpu_scan_manager_yaml(body));
+    CHECK(without_lanes.cufile_bulk_read == expected);
+    CHECK(without_lanes.reads_cufile_in_bulk() == lanes_off);
+    auto const with_lanes = load_scan_manager(
+      "sirius_cufile_bulk_read_lanes.yaml",
+      single_gpu_scan_manager_yaml(body + "      cufile:\n        fused_reads: {enabled: true}\n"));
+    CHECK(with_lanes.reads_cufile_in_bulk() == lanes_on);
+  }
+
+  for (auto const* bad : {"always", "true", "ON", "''"}) {
+    CAPTURE(bad);
+    scoped_yaml yaml(
+      "sirius_cufile_bulk_read_invalid.yaml",
+      single_gpu_scan_manager_yaml(std::string{"      cufile_bulk_read: "} + bad + "\n"));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(
+      cfg.load_from_file(yaml.path()),
+      Catch::Matchers::ContainsSubstring("'scan_manager.cufile_bulk_read': invalid enum value") &&
+        Catch::Matchers::ContainsSubstring("(expected auto, on, off)"));
+  }
+}

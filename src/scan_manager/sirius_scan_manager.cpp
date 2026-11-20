@@ -1528,6 +1528,17 @@ sirius_scan_manager::sirius_scan_manager(
         "[sirius_scan_manager] default io context: cufile n_reactors={}",
         static_cast<cucascade::io::cufile::cufile_ioctx const&>(*_io_ctx).plan().total_reactors());
 #endif
+      // cuCascade's cuFile backend does not ask for the bulk route (prefers_bulk_io is a
+      // compile-time false), but its fused lanes only fuse the slices of one request: read
+      // each file's column chunks of a split in one vectored request when configured.
+      if (_config.reads_cufile_in_bulk()) {
+        _cufile_bulk_read = sirius::io::bulk_read_registration{*_io_ctx};
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cuFile Parquet scans take the bulk route: one vectored read per "
+          "file per split (cufile_bulk_read {}, fused_reads {})",
+          _config.cufile_bulk_read == cufile_bulk_read_mode::automatic ? "auto" : "on",
+          _config.cufile.fused_reads.enabled ? "on" : "off");
+      }
       break;
   }
 

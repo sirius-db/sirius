@@ -21,6 +21,7 @@
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
+#include "io/bulk_read.hpp"
 #include "io/scoped_object_store_configs.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
@@ -1271,6 +1272,10 @@ class sirius_scan_manager {
   native_reader_executor _native_readers;
   coordinator_pool _coordinators;
   std::shared_ptr<cucascade::io::ioctx> _io_ctx;
+  /// Asks for the bulk Parquet read route on `_io_ctx` when it is the cuFile context and
+  /// `cufile_bulk_read` resolves to on (see sirius::io::prefers_bulk_read).  Declared after
+  /// `_io_ctx`, so it is withdrawn before the context is released.
+  sirius::io::bulk_read_registration _cufile_bulk_read;
   /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
   /// otherwise).  Stopped in @ref stop, before any ioctx is released.
   std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;

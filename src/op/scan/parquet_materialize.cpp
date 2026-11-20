@@ -16,6 +16,8 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
+#include "io/bulk_read.hpp"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/utilities/span.hpp>
@@ -79,9 +81,11 @@ bool prefers_bulk_materialize(std::span<parquet_source const> sources,
   // Every source has to qualify: the decode consumes one flattened chunk-data
   // span covering all of them, so a single file that cannot be read this way
   // takes the whole split to the general route.
+  // The backend's own preference (REST), or Sirius's request for it on the context (a cuFile
+  // context with cufile_bulk_read on, so its fused lanes see the whole split at once).
   return std::all_of(sources.begin(), sources.end(), [](parquet_source const& src) {
     return src.datasource && src.metadata && !src.row_group_indices.empty() &&
-           src.datasource->prefers_bulk_io();
+           sirius::io::prefers_bulk_read(*src.datasource);
   });
 }
 

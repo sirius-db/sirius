@@ -119,6 +119,19 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
   return false;
 }
 
+/// Whether cuFile-backed Parquet scans read each file's column chunks of a split in one
+/// vectored device request (the bulk route of @c materialize_parquet) instead of cuDF's
+/// general reader, which issues one request per contiguous run of chunks.  cuCascade's fused
+/// lanes only fuse the slices of one request, so the bulk route is what lets them fuse.
+enum class cufile_bulk_read_mode {
+  /// Bulk exactly when @c cufile.fused_reads.enabled (the default).
+  automatic,
+  /// Always bulk for cuFile scans, also without lanes.
+  on,
+  /// Never: cuFile scans keep cuDF's general reader.
+  off,
+};
+
 /// IO backend that serves managed reads.
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
@@ -288,6 +301,10 @@ struct scan_manager_config {
   /// flat, unpinned pool of that many reactors instead.
   std::size_t cufile_n_reactors{0};
 
+  /// Read route of cuFile-backed Parquet scans (see @ref cufile_bulk_read_mode and
+  /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c auto | @c on | @c off.
+  cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::automatic};
+
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
   /// with a cache on, the budget is the backend reactor's own
@@ -338,6 +355,18 @@ struct scan_manager_config {
   /// Background host->GPU memory prefetcher for queued pinned-cache scan
   /// splits. Disabled by default.
   memory_prefetcher_config memory_prefetcher{};
+
+  /// Whether cuFile-backed Parquet scans take the bulk route: @ref cufile_bulk_read resolved
+  /// against @c cufile.fused_reads.enabled.  Only meaningful with @c backend: cufile.
+  [[nodiscard]] bool reads_cufile_in_bulk() const noexcept
+  {
+    switch (cufile_bulk_read) {
+      case cufile_bulk_read_mode::on: return true;
+      case cufile_bulk_read_mode::off: return false;
+      case cufile_bulk_read_mode::automatic: break;
+    }
+    return cufile.fused_reads.enabled;
+  }
 
   /// Refresh the knobs derived from @ref cache.
   void apply_cache_mode() noexcept

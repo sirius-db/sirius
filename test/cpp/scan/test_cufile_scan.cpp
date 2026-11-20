@@ -18,6 +18,7 @@
 
 #ifdef CUCASCADE_HAS_CUFILE
 
+#include "io/bulk_read.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_materialize.hpp"
 #include "scan/test_utils.hpp"
@@ -630,19 +631,133 @@ TEST_CASE("fused lane reads serve the cuFile scan and decode the same rows",
   CHECK(vectored.lane_failures == 0);
   CHECK(vectored.cufile_failures == 0);
 
-  // Sirius's scan route for this backend: cuDF's reader, one device read per contiguous run.
+  // Sirius's scan route with lanes on: cufile_bulk_read auto takes the bulk route, one
+  // vectored request per file, so each row group's adjacent id and value chunks share a read.
+  std::array<parquet_source, 1> const sources{{{source, metadata, groups}}};
+  CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  auto table = sirius::op::scan::materialize_parquet(
+    sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+  REQUIRE(table);
+  auto const bulk     = host_columns(table->view(), decoder);
+  auto const expected = expected_rows(*metadata, groups);
+  CHECK(std::equal(bulk.begin(), bulk.end(), expected.begin(), expected.end()));
+  auto const scanned = ioctx->stats() - vectored;
+  CHECK(scanned.lane_reads > 0);
+  CHECK(scanned.lane_parts > scanned.lane_reads);  // fused across column chunks
+  CHECK(scanned.lane_failures == 0);
+  CHECK(scanned.cufile_failures == 0);
+}
+
+TEST_CASE("cufile_bulk_read off keeps cuDF's general reader on fused lanes",
+          "[cufile][scan][fused_reads][bulk_read]")
+{
+  // A separate case: lanes are budgeted per process and GPU, and a planned pool's lane quota
+  // bounds that budget, so a second lane-reading context alive next to the bulk one above
+  // would get no lanes at all.
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_fused_general");
+  write_parquet(directory);
+
+  auto config             = fused_reads_config();
+  config.cufile_bulk_read = sirius::scan_manager::cufile_bulk_read_mode::off;
+  auto memory             = initialize_memory_manager(1);
+  auto topology           = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager reader{lifecycle, config, *memory, topology};
+  sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+  auto const* ioctx = dynamic_cast<cufile::cufile_ioctx const*>(reader.io_ctx());
+  REQUIRE(ioctx != nullptr);
+
+  auto const path = directory.file("input.parquet");
+  auto source     = reader.create_datasource(path);
+  auto baseline   = native.create_datasource(path);
+  REQUIRE(source);
+  REQUIRE(baseline);
+  if (!ioctx->path_capability(source->get_io_object()).registered) {
+    SKIP("cuFile did not register the file here; its device reads use POSIX, not lanes");
+  }
+  auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+  auto footer  = cudf::io::parquet::fetch_footer_to_host(*baseline);
+  cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+  auto const metadata =
+    std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+  std::vector<cudf::size_type> groups(metadata->row_groups.size());
+  std::iota(groups.begin(), groups.end(), 0);
+
+  // One request per contiguous run of chunks: every lane read serves exactly one piece, and
+  // the rows are the ones the bulk route returns in the case above (both equal expected_rows).
   std::array<parquet_source, 1> const sources{{{source, metadata, groups}}};
   CHECK_FALSE(sirius::op::scan::prefers_bulk_materialize(sources, options));
-  auto table = sirius::op::scan::materialize_parquet(
+  rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+  auto const before = ioctx->stats();
+  auto table        = sirius::op::scan::materialize_parquet(
     sources, options, {}, decoder, cudf::get_current_device_resource_ref());
   REQUIRE(table);
   auto const actual   = host_columns(table->view(), decoder);
   auto const expected = expected_rows(*metadata, groups);
   CHECK(std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()));
-  auto const scanned = ioctx->stats() - vectored;
+  auto const scanned = ioctx->stats() - before;
   CHECK(scanned.lane_reads > 0);
+  CHECK(scanned.lane_parts == scanned.lane_reads);
   CHECK(scanned.lane_failures == 0);
   CHECK(scanned.cufile_failures == 0);
+}
+
+TEST_CASE("cufile_bulk_read picks the Parquet read route of cuFile scans",
+          "[cufile][scan][scan_manager][fused_reads][bulk_read]")
+{
+  using mode       = sirius::scan_manager::cufile_bulk_read_mode;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_bulk_route");
+  write_parquet(directory);
+  auto const path = directory.file("input.parquet");
+  auto memory     = initialize_memory_manager(1);
+  auto topology   = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+
+  // auto follows the lanes; on and off force the route either way.
+  auto const [bulk_mode, fused, expected] = GENERATE(table<mode, bool, bool>({
+    {mode::automatic, false, false},
+    {mode::automatic, true, true},
+    {mode::on, false, true},
+    {mode::on, true, true},
+    {mode::off, false, false},
+    {mode::off, true, false},
+  }));
+  CAPTURE(static_cast<int>(bulk_mode), fused);
+  auto config                       = reader_config(io_backend::cufile);  // flat, compat on
+  config.cufile_bulk_read           = bulk_mode;
+  config.cufile.fused_reads.enabled = fused;
+  CHECK(config.reads_cufile_in_bulk() == expected);
+
+  {
+    sirius_scan_manager reader{lifecycle, config, *memory, topology};
+    auto source = reader.create_datasource(path);
+    REQUIRE(source);
+    CHECK_FALSE(source->prefers_bulk_io());  // cuCascade's own answer for cuFile
+    CHECK(sirius::io::prefers_bulk_read(*source) == expected);
+    CHECK(sirius::io::prefers_bulk_read(*reader.io_ctx()) == expected);
+    std::array<parquet_source, 1> const sources{
+      {{source, std::make_shared<cudf::io::parquet::FileMetaData const>(), {0}}}};
+    CHECK(sirius::op::scan::prefers_bulk_materialize(
+            sources, cudf::io::parquet_reader_options::builder().build()) == expected);
+  }
+  // The registration ends with the scan manager that made it.
+  CHECK(sirius::io::detail::bulk_read_registry().count.load() == 0);
+
+  // The native backend is never affected (REST keeps its own compile-time preference).
+  sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+  auto local = native.create_datasource(path);
+  REQUIRE(local);
+  CHECK_FALSE(sirius::io::prefers_bulk_read(*local));
 }
 
 TEST_CASE("cuFile fused-read lane slots are reserved ahead of the pool",
@@ -771,6 +886,9 @@ TEST_CASE("a SQL scan through the cuFile backend reads on fused lanes",
   int device_count = 0;
   REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
   if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  // auto = the bulk route (lanes are on), off = cuDF's general reader.
+  auto const bulk_read = GENERATE(as<std::string>{}, "auto", "off");
+  CAPTURE(bulk_read);
   sirius::test::scratch_dir directory("cufile_fused_sql");
   write_parquet(directory);
   auto const config_path = directory.file("sirius_cufile_fused.yaml");
@@ -791,6 +909,9 @@ TEST_CASE("a SQL scan through the cuFile backend reads on fused lanes",
             "      backend: cufile\n"
             "      cufile_n_reactors: 0\n"
             "      uring_n_reactors: 1\n"
+            "      cufile_bulk_read: "
+         << bulk_read
+         << "\n"
             "      cufile:\n"
             "        fused_reads:\n"
             "          enabled: true\n"
@@ -851,9 +972,15 @@ TEST_CASE("a SQL scan through the cuFile backend reads on fused lanes",
     CHECK(read.cufile_failures == 0);
     CHECK(read.lane_failures == 0);
     if (registered) {
-      // The GPU scan read its column chunks through the lanes.
+      // The GPU scan read its column chunks through the lanes; on the bulk route each read
+      // served several column chunks, on the general route exactly one run.
       CHECK(read.lane_reads > 0);
       CHECK(read.lane_bytes > 0);
+      if (bulk_read == "auto") {
+        CHECK(read.lane_parts > read.lane_reads);
+      } else {
+        CHECK(read.lane_parts == read.lane_reads);
+      }
     } else {
       WARN("cuFile did not register the file here; the scan's device reads used POSIX");
     }

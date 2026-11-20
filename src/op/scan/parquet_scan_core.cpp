@@ -17,6 +17,7 @@
 
 // sirius
 #include "cudf/cudf_utils.hpp"
+#include "io/bulk_read.hpp"
 #include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
@@ -2060,7 +2061,9 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     _source_kind == parquet_source_kind::ICEBERG && _plan->has_user_virtual_columns() &&
     (_reader_pushdown_expression || _sirius_dynamic_filters) && !stats_filter_unsafe && !mapping &&
     !metadata_only && !_plan->has_partitions() &&
-    (!out->datasource || !out->datasource->prefers_bulk_io()) &&
+    // Reader positions need cuDF's general reader: not on a bulk-route context (the same
+    // decision prefers_bulk_materialize takes for the split).
+    (!out->datasource || !sirius::io::prefers_bulk_read(*out->datasource)) &&
     (!_duckdb_filter_expression || safe_before_file_visibility(*_duckdb_filter_expression));
   if (out->position_filter_eligible && _reader_pushdown_expression) {
     // Reuse the statistics translation when it is the same expression. Reader
