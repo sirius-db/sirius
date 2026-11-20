@@ -47,6 +47,12 @@ commit and extension checksum; each stage saves `config.yaml`, `settings.sql`, `
 10-minute timeout limits each stage if a disabled optimization leaves a query
 stalled. The saved GB300 pin YAML is not modified.
 
+To compare Simpatico pinning alone against the all-off baseline, run the same
+script with `--baseline-vs-simpatico`. This runs stages 0 and 6 in fresh
+processes. Stage 6 compresses only `lineitem` and `orders`, with type narrowing,
+fused filtering, BUILD_PROBE admission, and dynamic filters still off. Summarize
+that paired run with `summarize.py --baseline-vs-simpatico <output-directory>`.
+
 After the run, generate a six-stage total and a per-query comparison with:
 
 ```bash

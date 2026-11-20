@@ -3,11 +3,15 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if (( $# > 1 )) || { (( $# == 1 )) && [[ "$1" != --dry-run ]]; }; then
-  echo "usage: $0 [--dry-run] (set ABLATION_OUTPUT to choose the output directory)" >&2
-  exit 2
-fi
-dry_run="${1:-}"
+dry_run=false
+comparison=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    --baseline-vs-simpatico) comparison=true ;;
+    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
+  esac
+done
 dataset="${DATASET_ROOT:-/mnt/datasets}/tpch_parquet_sf1000"
 config="$repo/bench/gb300-pin/config.yaml"
 if [[ ! -d "$dataset" || ! -f "$config" ]]; then
@@ -31,7 +35,7 @@ fi
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 output="${ABLATION_OUTPUT:-$repo/test_datasets/gb300-ablation/sf1000-host-$run_id}"
-if [[ "$dry_run" != --dry-run ]]; then
+if [[ "$dry_run" == false ]]; then
   if [[ -e "$output" ]]; then
     echo "Output already exists: $output" >&2
     exit 1
@@ -52,7 +56,9 @@ echo "Extension SHA-256: $(sha256sum "$repo/sirius-duckdb/build/release/extensio
 echo "Output: $output"
 
 failed=0
-for stage in 0 1 2 3 4 5; do
+stages=(0 1 2 3 4 5)
+if [[ "$comparison" == true ]]; then stages=(0 6); fi
+for stage in "${stages[@]}"; do
   case "$stage" in
     0) label=all_off;       narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
     1) label=type_narrow;   narrow=true;  compress=false; fused=false; build_probe=false; dynamic=false ;;
@@ -60,6 +66,7 @@ for stage in 0 1 2 3 4 5; do
     3) label=fused_decode;  narrow=true;  compress=true;  fused=true;  build_probe=false; dynamic=false ;;
     4) label=build_probe;   narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=false ;;
     5) label=dynamic_filter;narrow=true;  compress=true;  fused=true;  build_probe=true;  dynamic=true ;;
+    6) label=simpatico_only;narrow=false; compress=true;  fused=false; build_probe=false; dynamic=false ;;
   esac
   stage_dir="$output/stage${stage}-${label}"
   sql="SET enable_duckdb_fallback = false;"
@@ -70,7 +77,7 @@ for stage in 0 1 2 3 4 5; do
     --iterations 1 --queries 1-22 --config "$stage_dir/config.yaml" --pin host
     "$pin_option" --output "$stage_dir" --name "sf1000_host_ablation_stage${stage}")
   echo "Stage $stage ($label): narrowing=$narrow compressed_pin=$compress fused_decode=$fused BUILD_PROBE=$build_probe dynamic_filter=$dynamic"
-  if [[ "$dry_run" == --dry-run ]]; then
+  if [[ "$dry_run" == true ]]; then
     printf 'SIRIUS_PRE_SQL=%q ' "$sql"
     printf '%q ' "${command[@]}"
     printf '\n'

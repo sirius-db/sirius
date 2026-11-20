@@ -1,0 +1,29 @@
+{
+  "all_query_results_match_baseline": true,
+  "baseline_config_sha256": "9f4a961d29832b71fdf60e8f29710b8bc4b4db70bc66562a80900b9b24fcf933",
+  "compressed_pin_tables": [
+    "lineitem",
+    "orders"
+  ],
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "extension_sha256": "7ed19c6e8530c18a99303e381e85f67d4b33f029107f5dfba693936b298091a0",
+  "iterations_per_query": 1,
+  "machine": "NVIDIA GB300, one GPU, CDMM driver mode",
+  "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-baseline-vs-simpatico-20261120",
+  "pin_tier": "host",
+  "profile": "hot",
+  "queries": "Q1-Q22",
+  "run_started_utc": "2026-11-20T16:17:44Z",
+  "runtime_excludes": "pin and unpin",
+  "simpatico_only_config_sha256": "9f4a961d29832b71fdf60e8f29710b8bc4b4db70bc66562a80900b9b24fcf933",
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "source_commit": "6af4c2e4955f59d1ace1fc7f956225e7d896ba96",
+  "stage_exit_codes": {
+    "all_off": 0,
+    "simpatico_only": 0
+  },
+  "validation": "21 exact result text matches; Q11 has the same rows in a different tied-row order. Baseline logged zero compression events; Simpatico-only logged 29 for lineitem and orders."
+}

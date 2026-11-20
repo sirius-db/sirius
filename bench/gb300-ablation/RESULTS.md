@@ -41,3 +41,26 @@ This is one pass per stage. The 2.9% compressed-pinning increment in particular
 needs repeated measurements before treating it as stable. The Parquet dataset,
 historical binary, and full benchmark logs remain on the GB300 machine rather
 than in this PR.
+
+## Simpatico pinning alone
+
+A separate paired run kept type narrowing, fused filtering, BUILD_PROBE admission,
+and dynamic filters off in both stages. The generated YAML files were identical;
+only `--pin-compression` differed. The same SF1000 host-pinned setup ran Q1–Q22
+once per stage in fresh Sirius processes, with compression explicitly limited to
+`lineitem` and `orders`.
+
+| Configuration | 22-query total | Change from all off |
+| :--- | ---: | ---: |
+| All five off | 12.400 s | — |
+| Simpatico pinning only | 11.849 s | −0.551 s (−4.44%) |
+
+The [paired totals](results/simpatico-only-summary.csv),
+[per-query times](results/simpatico-only-per-query.csv), and
+[run manifest](results/simpatico-only-manifest.json) are saved here. Both stages
+exited successfully. The result text matched exactly for 21 queries; Q11 had
+the same rows in a different tied-row order. The baseline logged no pin
+compression, while the Simpatico-only stage logged 29 compression events for
+`lineitem` and `orders`. Pinning and unpinning time is excluded from these
+totals. This is one paired pass, so the 4.44% gain should be repeated to assess
+its stability.

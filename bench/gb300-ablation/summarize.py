@@ -45,12 +45,22 @@ def read_stage(root: Path, stage: int, label: str) -> dict[str, float] | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--baseline-vs-simpatico",
+        action="store_true",
+        help="summarize the all-off versus Simpatico-only comparison",
+    )
     args = parser.parse_args()
     root = args.output.resolve()
     if not root.is_dir():
         parser.error(f"missing output directory: {root}")
 
-    all_times = [read_stage(root, stage, label) for stage, label in enumerate(STAGES)]
+    stages = (
+        ((0, "all_off"), (6, "simpatico_only"))
+        if args.baseline_vs_simpatico
+        else tuple(enumerate(STAGES))
+    )
+    all_times = [read_stage(root, stage, label) for stage, label in stages]
     summary = root / "summary.csv"
     with summary.open("w", newline="") as stream:
         writer = csv.writer(stream, lineterminator="\n")
@@ -64,12 +74,12 @@ def main() -> None:
                 "change_from_previous_pct",
             )
         )
-        for stage, (label, timings) in enumerate(zip(STAGES, all_times)):
+        for position, ((stage, label), timings) in enumerate(zip(stages, all_times)):
             if timings is None:
                 writer.writerow((stage, label, "incomplete", "", "", ""))
                 continue
             total = sum(timings.values())
-            previous = all_times[stage - 1] if stage else None
+            previous = all_times[position - 1] if position else None
             previous_total = sum(previous.values()) if previous else None
             delta = total - previous_total if previous_total is not None else None
             pct = 100 * delta / previous_total if delta is not None else None
@@ -94,7 +104,7 @@ def main() -> None:
         writer.writerow(
             (
                 "query",
-                *[f"stage{stage}_{label}_s" for stage, label in enumerate(STAGES)],
+                *[f"stage{stage}_{label}_s" for stage, label in stages],
             )
         )
         for query in QUERIES:

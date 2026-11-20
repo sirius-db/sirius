@@ -1,0 +1,3 @@
+stage,optimization_added,status,query_total_s,change_from_previous_s,change_from_previous_pct
+0,all_off,success,12.399574,,
+6,simpatico_only,success,11.848703,-0.550871,-4.443
