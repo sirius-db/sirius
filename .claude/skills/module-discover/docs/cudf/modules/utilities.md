@@ -27,7 +27,8 @@ rmm::cuda_stream_view get_default_stream();
 **Header**: `cudf/utilities/memory_resource.hpp`
 ```cpp
 rmm::device_async_resource_ref get_current_device_resource_ref();
-rmm::mr::device_memory_resource* set_current_device_resource(rmm::mr::device_memory_resource* new_mr);
+cuda::mr::any_resource<cuda::mr::device_accessible> set_current_device_resource(
+  cuda::mr::any_resource<cuda::mr::device_accessible> new_mr);  // returns the previous resource
 ```
 
 **Our usage**:

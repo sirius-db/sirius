@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  188c68787e667fe067cfacd29f57b03ed175afc8baa94b4a03efa93f19e8e5f15c23b2afdbf9589302d37a852eade9d6f982cfa180da1c24b0ea9d6790c7c292
+  0
   HEAD_REF
   main)
 
@@ -20,9 +20,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
+  0
   HEAD_REF
   main)
 
@@ -66,6 +66,10 @@ CUfileError_t cuFileReadAsync(...);
 CUfileError_t cuFileWriteAsync(...);
 CUfileError_t cuFileStreamRegister(...);
 CUfileError_t cuFileStreamDeregister(...);")
+
+# KvikIO only uses long-standing libcurl APIs; accept the vcpkg baseline's curl.
+vcpkg_replace_string("${SOURCE_PATH}/cpp/cmake/thirdparty/get_libcurl.cmake"
+                     "CURL 8.23.0" "CURL 8.21.0")
 
 vcpkg_cmake_configure(
   SOURCE_PATH

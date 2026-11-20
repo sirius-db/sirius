@@ -70,9 +70,9 @@ std::unique_ptr<table> scatter(table_view const& source, column_view const& scat
 
 ### `cudf::copy_bitmask`
 
-**Header**: `cudf/copying.hpp`
+**Header**: `cudf/null_mask.hpp`
 ```cpp
-rmm::device_buffer copy_bitmask(column_view const& view, ...);
+cuda::device_buffer<bitmask_type> copy_bitmask(column_view const& view, ...);
 ```
 
 **Our usage**:

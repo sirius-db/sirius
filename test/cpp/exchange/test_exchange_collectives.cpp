@@ -139,8 +139,7 @@ template <typename Pred>
 void null_rows(cudf::column& column, Pred is_null)
 {
   auto const rows = column.size();
-  std::vector<std::uint32_t> words(
-    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
+  std::vector<std::uint32_t> words(cudf::num_bitmask_words(rows), 0);
   cudf::size_type nulls = 0;
   for (cudf::size_type i = 0; i < rows; ++i) {
     if (is_null(i)) {
@@ -149,10 +148,15 @@ void null_rows(cudf::column& column, Pred is_null)
       words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
     }
   }
-  rmm::device_buffer mask(words.data(),
-                          words.size() * sizeof(std::uint32_t),
-                          utils::default_stream(),
-                          utils::get_resource_ref(*env().gpu));
+  auto stream = utils::default_stream();
+  auto mask   = cudf::create_null_mask(
+    rows, cudf::mask_state::ALL_NULL, stream, utils::get_resource_ref(*env().gpu));
+  RMM_CUDA_TRY(cudaMemcpyAsync(mask.data(),
+                               words.data(),
+                               words.size() * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice,
+                               stream.get()));
+  stream.sync();
   column.set_null_mask(std::move(mask), nulls);
 }
 

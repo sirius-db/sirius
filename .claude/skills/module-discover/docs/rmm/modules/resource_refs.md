@@ -14,11 +14,10 @@ Type-erased resource reference types based on CCCL's `cuda::mr::resource_ref`. T
 
 **Header**: `<rmm/resource_ref.hpp>`
 ```cpp
-using device_async_resource_ref =
-  detail::cccl_async_resource_ref<cuda::mr::resource_ref<cuda::mr::device_accessible>>;
+using device_async_resource_ref = cuda::mr::resource_ref<cuda::mr::device_accessible>;
 ```
 
-**Description**: Type-erased reference to an async device memory resource. Constructible from any `device_memory_resource*` or `device_memory_resource&`. This is the standard parameter type for passing allocators.
+**Description**: Type-erased reference to an async device memory resource. Constructible from a reference to any device-accessible resource (including `cuda::mr::any_resource`); it does not own the resource. This is the standard parameter type for passing allocators.
 
 **Our usage**:
 - `src/include/sirius_context.hpp:28` — Stored in `sirius_context` for operator access

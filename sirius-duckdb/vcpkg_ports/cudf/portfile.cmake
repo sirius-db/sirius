@@ -4,11 +4,11 @@ vcpkg_from_github(
   OUT_SOURCE_PATH
   SOURCE_PATH
   REPO
-  rapidsai/cudf
+  NVIDIA/cudf
   REF
   v${VERSION}
   SHA512
-  f6ff4e53fd5a627ae3c869e1ec729ff0e30b408ac7330502b9b0c4b7a7012fcb664a1d36ba430c9e8eebcc7a81394fc54e09c334a308a839d4a3728a834da119
+  0
   HEAD_REF
   main)
 
@@ -18,9 +18,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.10.00
+  v26.12.00
   SHA512
-  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
+  0
   HEAD_REF
   main)
 
@@ -50,16 +50,11 @@ vcpkg_from_github(
   REPO
   rapidsai/librtcx
   REF
-  a9f63f8cdd4b0b41a2d88a9f705576a61b4222ec
+  4895b97ed96dce0df7c55b6943ac62fee4c8582e
   SHA512
-  e6f27dda72aa183be9ed636926e01fdd9740162f24f4ad5bcf2ce7a17d48cde0c554c24cbbd0ad351845c2253d4d82e2333bbbc5e57d346772ba64e52789a998
+  7e0b2a301a4e4cd80493d0fd0bbb9204c879c6e9d11ff5b5f89fd1ab6bec5b90255dbf36dc806ac459ded3f3bc15d5fc574039d3d07f3cc47e98943ad20d46a8
   HEAD_REF
   main)
-
-# librtcx's embed helper uses std::variant without including its header.
-vcpkg_replace_string(
-  "${RTCX_PATH}/include/rtcx/embed.hpp" "#include <utility>\n#include <vector>"
-  "#include <utility>\n#include <variant>\n#include <vector>")
 
 # Use the static CUDA redistributables supplied by the overlay ports.
 vcpkg_replace_string(
@@ -69,11 +64,11 @@ vcpkg_replace_string("${RTCX_PATH}/CMakeLists.txt" "CUDA::nvJitLink_static"
                      "nvjitlink::nvjitlink_static")
 vcpkg_replace_string(
   "${RTCX_PATH}/CMakeLists.txt"
-  "add_library(rtcx STATIC\n            src/hash.cpp"
+  "add_library(rtcx STATIC\n            src/rtcx.cpp"
   [[rapids_find_package(nvrtc REQUIRED CONFIG BUILD_EXPORT_SET rtcx-exports INSTALL_EXPORT_SET rtcx-exports)
 rapids_find_package(nvjitlink REQUIRED CONFIG BUILD_EXPORT_SET rtcx-exports INSTALL_EXPORT_SET rtcx-exports)
 add_library(rtcx STATIC
-            src/hash.cpp]])
+            src/rtcx.cpp]])
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -137,13 +132,6 @@ vcpkg_replace_string(
   "${SOURCE_PATH}/cpp/cmake/thirdparty/get_dlpack.cmake"
   "find_and_configure_dlpack(\${CUDF_MIN_VERSION_dlpack} \${CUDF_EXCLUDE_DEPS_FROM_ALL})"
   "set(DLPACK_INCLUDE_DIR \"${CURRENT_INSTALLED_DIR}/include\")")
-
-# TODO: Remove with src/cudf/ast_compat.hpp once the release includes
-# cudf#24173. The 26.10 AST header uses std::variant without including its
-# header.
-vcpkg_replace_string(
-  "${SOURCE_PATH}/cpp/include/cudf/ast/expressions.hpp" "#include <vector>"
-  "#include <variant>\n#include <vector>")
 
 # cuDF asks CPM to download xxhash unconditionally. Use the installed vcpkg
 # package and its generated find module instead.

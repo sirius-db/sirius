@@ -45,10 +45,6 @@ namespace simpatico {
 
 namespace {
 
-// cuDF 26.08 joins RMM stream views; 26.10+ joins CUDA stream refs.
-using cudf_pool_stream =
-  decltype(cudf::detail::fork_streams(cudf::get_default_stream(), 0))::value_type;
-
 // ── Internal helpers for the public compress/decompress API ───────────────────
 // (Formerly compress_internals.hpp; this TU is the only consumer.)
 
@@ -541,13 +537,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
     // Lanes other than s0 that produced a source, which the combine on s0 must wait for.
-    std::vector<cudf_pool_stream> producer_lanes;
+    std::vector<::cuda::stream_ref> producer_lanes;
     decode_session wave1{streams, mr};
     auto next_destination = [&] {
       auto const lane = wave1.next_stream();
       if (lane.get() != s0.get() &&
-          std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](auto other) {
-            return static_cast<::cuda::stream_ref>(other).get() == lane.get();
+          std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](::cuda::stream_ref other) {
+            return other.get() == lane.get();
           }))
         producer_lanes.emplace_back(lane);
       auto* words =
@@ -837,7 +833,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const wait_for_indices = [&](::cuda::stream_ref lane) {
       if (!indices_needed || std::any_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
         return;
-      cudf_pool_stream const producer{s0};
+      ::cuda::stream_ref const producer{s0};
       cudf::detail::join_streams({&producer, 1}, lane);
       index_lanes.push_back(lane);
     };

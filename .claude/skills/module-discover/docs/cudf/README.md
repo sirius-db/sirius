@@ -1,6 +1,6 @@
 # cuDF (libcudf) — Module Reference
 
-**Version**: 26.10 (project pin)
+**Version**: 26.12
 **Location**: `/home/felipe/miniconda3/envs/libcudf-env/include/cudf/`
 **Namespace**: `cudf`
 **Build Integration**: Linked via CMake as `cudf::cudf`
@@ -50,8 +50,13 @@ We use **19 of 25** modules. Primary integration points:
 
 ## Version Compatibility
 
-The main Sirius build targets cuDF 26.10 and no longer carries 25.04 or 26.08 API fallbacks.
-Version checks are retained only where behavior or APIs differ in cuDF 26.12 and later.
+The main Sirius build targets cuDF 26.12 and carries no fallbacks for older releases.
+
+API notes for 26.12:
+- Null masks are `cuda::device_buffer<cudf::bitmask_type>` (CCCL), not `rmm::device_buffer`:
+  `create_null_mask`, `copy_bitmask`, `bitmask_and`/`bitmask_or`, `concatenate_masks`,
+  `bools_to_mask`, the `column` constructors and factories that take a null mask, and
+  `column::contents::null_mask`. The buffer size counts `bitmask_type` elements, not bytes.
 
 ## Files That Reference cuDF
 
