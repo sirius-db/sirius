@@ -28,6 +28,28 @@ else()
   message(FATAL_ERROR "SIRIUS_DUCKDB_LINKAGE must be static or shared")
 endif()
 
+# DuckDB's C++ ABI differs between revisions, and the metadata footer DuckDB
+# checks on load only names the tree this extension is configured in.
+set(duckdb_revision "")
+# Packages installed before the check existed cannot report a revision.
+if(COMMAND sirius_duckdb_revision)
+  sirius_duckdb_revision("${DuckDB_SOURCE_DIR}" duckdb_revision)
+endif()
+if(NOT "${sirius_DUCKDB_REVISION}" STREQUAL "" AND NOT "${duckdb_revision}"
+                                                   STREQUAL "")
+  if(NOT "${sirius_DUCKDB_REVISION}" STREQUAL "${duckdb_revision}")
+    message(
+      FATAL_ERROR
+        "Sirius was built from DuckDB ${sirius_DUCKDB_REVISION}, but this extension is built from DuckDB ${duckdb_revision}"
+    )
+  endif()
+elseif(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
+  message(
+    FATAL_ERROR
+      "Cannot verify that Sirius ('${sirius_DUCKDB_REVISION}') and this extension ('${duckdb_revision}') use one DuckDB revision: build both from git checkouts"
+  )
+endif()
+
 set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
 # DuckDB's linker options are directory-wide; this backend uses BFD. Keep the
