@@ -3,7 +3,7 @@
 The [paper figure](gb300-spill-sweeps.pdf) compares the saved host-memory and
 device-memory limit sweeps at SF1000, SF3000, and SF10000. The PDF and
 [SVG](gb300-spill-sweeps.svg) are vector exports with editable text; the
-[PNG](gb300-spill-sweeps.png) is 600 dpi at 7.2 inches wide. The
+[PNG](gb300-spill-sweeps.png) is 600 dpi at 11 inches wide in landscape format. The
 [aggregated data](gb300-spill-sweeps-data.csv) and [plotting script](plot_sweeps.py)
 are also saved here.
 
@@ -18,10 +18,10 @@ host pools with the cap; the device-limit sweep fixes host capacity at
 384 GiB. Host limits are binary GiB, while GPU limits are decimal GB. Each
 point is a single measurement, so no error bars are shown.*
 
-Read each column as its own sweep. The host sweep did not clear the OS page
+Read each row as its own sweep. The host sweep did not clear the OS page
 cache, while the device sweep requested that cached dataset pages be discarded;
 their runtimes should not be interpreted as a controlled comparison between
-columns. Within a row, both runtime axes use the same scale, while movement
+rows. Within a column, both runtime axes use the same scale, while movement
 axes adapt to the amount moved. The disk-directed bar stacks only the two
 transitions with a disk destination. It is shown beside GPU→HOST rather than
 added to it, because the transitions can count different representations of

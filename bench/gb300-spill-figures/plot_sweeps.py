@@ -123,33 +123,45 @@ def render(points: list[Point], output_dir: Path) -> None:
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
-            "font.size": 8.5,
-            "axes.titlesize": 9,
-            "axes.labelsize": 8,
-            "xtick.labelsize": 7.5,
-            "ytick.labelsize": 7.5,
+            "font.size": 11,
+            "axes.titlesize": 11,
+            "axes.labelsize": 10,
+            "xtick.labelsize": 9.5,
+            "ytick.labelsize": 9.5,
             "pdf.fonttype": 42,
             "svg.fonttype": "none",
             "axes.spines.top": False,
             "axes.spines.right": False,
         }
     )
-    fig = plt.figure(figsize=(7.2, 8.6), facecolor="white")
+    fig = plt.figure(figsize=(11.0, 6.3), facecolor="white")
     outer = GridSpec(
-        3,
         2,
+        3,
         figure=fig,
-        left=0.115,
-        right=0.975,
-        bottom=0.075,
-        top=0.88,
-        wspace=0.26,
-        hspace=0.40,
+        left=0.07,
+        right=0.99,
+        bottom=0.105,
+        top=0.82,
+        wspace=0.34,
+        hspace=0.72,
     )
-    fig.text(0.305, 0.93, "Host-memory limit", ha="center", weight="bold", fontsize=10)
-    fig.text(0.76, 0.93, "Device-memory limit", ha="center", weight="bold", fontsize=10)
-    fig.text(0.305, 0.908, "GPU: default; host pools scaled", ha="center", fontsize=7.5)
-    fig.text(0.76, 0.908, "Host cap: 384 GiB", ha="center", fontsize=7.5)
+    fig.text(
+        0.53,
+        0.905,
+        "Host-memory limit · GPU default; host pools scaled",
+        ha="center",
+        weight="bold",
+        fontsize=11,
+    )
+    fig.text(
+        0.53,
+        0.465,
+        "Device-memory limit · host fixed at 384 GiB",
+        ha="center",
+        weight="bold",
+        fontsize=11,
+    )
 
     legend_handles = [
         plt.Line2D(
@@ -175,15 +187,15 @@ def render(points: list[Point], output_dir: Path) -> None:
         bbox_to_anchor=(0.5, 0.995),
         ncol=4,
         frameon=False,
-        columnspacing=1.15,
+        columnspacing=1.5,
         handlelength=1.5,
-        fontsize=8,
+        fontsize=10,
     )
 
-    for row, scale in enumerate(SCALES):
-        row_points = [point for point in points if point.scale == scale]
-        time_max = max(point.runtime_s for point in row_points) * 1.20
-        for column, sweep in enumerate(("host", "gpu")):
+    for row, sweep in enumerate(("host", "gpu")):
+        for column, scale in enumerate(SCALES):
+            row_points = [point for point in points if point.scale == scale]
+            time_max = max(point.runtime_s for point in row_points) * 1.32
             selected = sorted(
                 (point for point in row_points if point.sweep == sweep),
                 key=lambda point: point.cap,
@@ -204,10 +216,10 @@ def render(points: list[Point], output_dir: Path) -> None:
             time_ax.grid(axis="y", color="#DDDDDD", linewidth=0.6)
             time_ax.tick_params(axis="x", bottom=False, labelbottom=False)
             time_ax.set_title(
-                f"{chr(65 + row * 2 + column)}   SF {scale:,}",
+                f"{chr(65 + row * 3 + column)}   SF {scale:,}",
                 loc="left",
                 pad=4,
-                fontsize=8.5,
+                fontsize=11,
                 weight="bold",
             )
             for xi, runtime in zip(x, times):
@@ -218,7 +230,7 @@ def render(points: list[Point], output_dir: Path) -> None:
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    fontsize=6.5,
+                    fontsize=8,
                 )
 
             width = 0.30
@@ -269,7 +281,7 @@ def render(points: list[Point], output_dir: Path) -> None:
                     ha="right",
                     va="top",
                     color="#555555",
-                    fontsize=7,
+                    fontsize=9,
                 )
     stem = output_dir / "gb300-spill-sweeps"
     for suffix in ("pdf", "svg"):
