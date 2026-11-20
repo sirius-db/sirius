@@ -30,23 +30,14 @@ endif()
 
 # DuckDB's C++ ABI differs between revisions, and the metadata footer DuckDB
 # checks on load only names the tree this extension is configured in.
-set(duckdb_revision "")
-# Packages installed before the check existed cannot report a revision.
-if(COMMAND sirius_duckdb_revision)
-  sirius_duckdb_revision("${DuckDB_SOURCE_DIR}" duckdb_revision)
-endif()
-if(NOT "${sirius_DUCKDB_REVISION}" STREQUAL "" AND NOT "${duckdb_revision}"
-                                                   STREQUAL "")
-  if(NOT "${sirius_DUCKDB_REVISION}" STREQUAL "${duckdb_revision}")
-    message(
-      FATAL_ERROR
-        "Sirius was built from DuckDB ${sirius_DUCKDB_REVISION}, but this extension is built from DuckDB ${duckdb_revision}"
-    )
-  endif()
+if(COMMAND sirius_require_duckdb_revision)
+  sirius_require_duckdb_revision(
+    "${sirius_DUCKDB_REVISION}" "${DuckDB_SOURCE_DIR}"
+    "${SIRIUS_DUCKDB_LINKAGE}")
 elseif(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
   message(
     FATAL_ERROR
-      "Cannot verify that Sirius ('${sirius_DUCKDB_REVISION}') and this extension ('${duckdb_revision}') use one DuckDB revision: build both from git checkouts"
+      "Cannot verify that Sirius and this extension use one DuckDB revision: the Sirius package predates the check"
   )
 endif()
 
