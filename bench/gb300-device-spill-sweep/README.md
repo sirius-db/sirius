@@ -1,0 +1,31 @@
+# GB300 device-memory spill sweep
+
+Run one unpinned TPC-H query per process using the saved GB300 cold config,
+changing only `sirius.memory.gpu.usage_limit_bytes` and the Quent output path.
+The requested GPU caps are **decimal GB**: 16, 32, 64, 128, and 256 billion
+bytes. Decimal units allow the 256 GB point to fit on the GB300's approximately
+250.7 GiB of physical device memory; 256 GiB would exceed it. The GPU
+reservation fraction remains 0.9, downgrade trigger/stop remain 0.8/0.6,
+host cap remains 450 GiB, and spill compression remains enabled. No
+`--profile` override is used.
+
+From the repository root:
+
+```bash
+tmux new-session -d -s gb300-device-spill-sf10k \
+  'bash bench/gb300-device-spill-sweep/run_sf.sh 10000'
+```
+
+Progress is in `test_datasets/gb300-device-spill-sweep/sf10000/progress.log`.
+An `exit-code` file is written at completion. The runner saves each effective
+YAML, command, benchmark output, runner log, raw Quent trace, and result under
+`test_datasets/gb300-device-spill-sweep/sf10000/gpu<CAP>GB/q<NN>/`.
+It updates `per-query.csv` and `totals.csv` after every query, skips completed
+queries on rerun, and accepts `--retry-failed` to retry failures. Each process
+starts with an empty Sirius cache, but this sweep does not control OS page cache.
+
+The three counters are cumulative one-way DataBatch conversions during each
+query: GPU→HOST, HOST→DISK, and GPU→DISK. A move is counted at the destination's
+representation size, so compression can change its byte count. They are not
+peak memory occupancy. Failed queries have no movement totals and are excluded
+from the aggregate; compare successful-query counts before comparing caps.
