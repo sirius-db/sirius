@@ -18,7 +18,7 @@
 
 #include "exchange/transport.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream_ref>
 
 #include <chrono>
 #include <memory>
@@ -53,7 +53,7 @@ class exchange_service;
   stream_id stream,
   std::shared_ptr<cucascade::data_batch> mine,
   cucascade::memory::memory_space& gpu,
-  rmm::cuda_stream_view cuda_stream,
+  ::cuda::stream_ref cuda_stream,
   std::chrono::milliseconds timeout = std::chrono::minutes{10});
 
 /**

@@ -291,7 +291,7 @@ bool is_sliced(cudf::table_view const& table)
 }
 
 std::vector<column_metadata> plan_stream(cudf::table_view const& table,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          std::size_t& stream_bytes)
 {
   if (is_sliced(table)) {
