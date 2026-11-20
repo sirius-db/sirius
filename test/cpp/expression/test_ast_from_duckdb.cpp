@@ -439,6 +439,77 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST honors try_cast = true", "[ast_from_duck
   REQUIRE(c.try_cast == true);
 }
 
+TEST_CASE("ast_from_duckdb - BOUND_CAST between equal types translates to its child",
+          "[ast_from_duckdb]")
+{
+  // AddCastToType compares a constant's literal type with the target, so casting it to its own
+  // type still adds a cast.
+  SECTION("VARCHAR constant")
+  {
+    for (bool try_cast : {false, true}) {
+      INFO("try_cast=" << try_cast);
+      auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+        duckdb::make_uniq<BoundConstantExpression>(Value("x%")), LogicalType::VARCHAR, try_cast);
+      REQUIRE(BoundCastExpression::IsCast(*cast_expr));
+      auto out = sirius::ast::from_duckdb(*cast_expr);
+      REQUIRE(out);
+      REQUIRE(out->holds<constant>());
+      auto const& c = out->get<constant>();
+      REQUIRE(c.return_type().id() == sirius::type_id::VARCHAR);
+      REQUIRE(std::holds_alternative<std::string>(c.payload));
+      REQUIRE(std::get<std::string>(c.payload) == "x%");
+    }
+  }
+
+  SECTION("INTEGER constant")
+  {
+    auto cast_expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_int_const(7), LogicalType::INTEGER);
+    REQUIRE(BoundCastExpression::IsCast(*cast_expr));
+    auto out = sirius::ast::from_duckdb(*cast_expr);
+    REQUIRE(out);
+    REQUIRE(out->holds<constant>());
+    auto const& c = out->get<constant>();
+    REQUIRE(c.return_type().id() == sirius::type_id::INTEGER);
+    REQUIRE(std::holds_alternative<int32_t>(c.payload));
+    REQUIRE(std::get<int32_t>(c.payload) == 7);
+  }
+
+  SECTION("a UHUGEINT constant stays declined: its carrier holds only 64 bits")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      duckdb::make_uniq<BoundConstantExpression>(Value::UHUGEINT(duckdb::uhugeint_t(7))),
+      LogicalType::UHUGEINT);
+    REQUIRE(BoundCastExpression::IsCast(*cast_expr));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(*cast_expr));
+  }
+
+  SECTION("a cast DuckDB bound to a function other than the no-op is declined")
+  {
+    // Type equality ignores the collation, which is how a COLLATE over a JSON parse reaches here.
+    auto cast_expr =
+      BoundCastExpression::Create(make_bound_ref(0, LogicalTypeId::VARCHAR),
+                                  LogicalType::VARCHAR_COLLATION("nocase"),
+                                  duckdb::BoundCastInfo(duckdb::DefaultCasts::TryVectorNullCast));
+    REQUIRE(BoundCastExpression::IsCast(*cast_expr));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(*cast_expr));
+  }
+
+  SECTION("a different precision of the same type id keeps the cast")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      duckdb::make_uniq<BoundReferenceExpression>(LogicalType::DECIMAL(10, 2), 0),
+      LogicalType::DECIMAL(12, 2));
+    auto out = sirius::ast::from_duckdb(*cast_expr);
+    REQUIRE(out);
+    REQUIRE(out->holds<cast>());
+    auto const& c = out->get<cast>();
+    REQUIRE(c.child);
+    REQUIRE(c.child->holds<reference>());
+    REQUIRE(c.target_type == sirius::logical_type::make_decimal(12, 2));
+  }
+}
+
 TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nullptr",
           "[ast_from_duckdb][narrow_domain]")
 {
@@ -1291,7 +1362,14 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
     } else if (n.holds<function_call>()) {
       auto const& fc = n.get<function_call>();
       if (fc.function() == sirius::function_id::add) saw_add = true;
-      if (fc.function() == sirius::function_id::like) saw_like = true;
+      if (fc.function() == sirius::function_id::like) {
+        saw_like = true;
+        // The binder can wrap the pattern literal in a VARCHAR -> VARCHAR cast. Translation drops
+        // it, so the pattern is the constant the string matching handlers read.
+        REQUIRE(fc.arguments().size() == 2);
+        REQUIRE(fc.arguments()[1]);
+        REQUIRE(fc.arguments()[1]->holds<constant>());
+      }
       for (auto const& a : fc.arguments()) {
         if (a) visit_node(*a);
       }
