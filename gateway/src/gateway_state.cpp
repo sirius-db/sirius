@@ -443,10 +443,20 @@ void read_settings(ClientContext& context, start_options& options)
   options.duckdb_binary    = setting(context, "sirius_gateway_duckdb_binary", "");
   options.sirius_extension = setting(context, "sirius_gateway_sirius_extension", "");
   options.rank_init        = setting(context, "sirius_gateway_rank_init", "");
-  options.log_dir          = setting(context, "sirius_gateway_log_dir", "");
-  options.boot_id_sql      = setting(context, "sirius_gateway_rank_boot_id_sql", "");
-  options.joined_sql       = setting(context, "sirius_gateway_rank_joined_sql", "");
-  options.exit_sql         = setting(context, "sirius_gateway_rank_exit_sql", "");
+  options.host_staging     = setting(context, "sirius_gateway_exchange_host_staging", "auto");
+  options.tcp_lanes =
+    static_cast<uint32_t>(std::stoull(setting(context, "sirius_gateway_exchange_tcp_lanes", "0")));
+  options.mnnvl = setting(context, "sirius_gateway_exchange_mnnvl", "auto");
+  options.frame_bytes =
+    std::stoull(setting(context, "sirius_gateway_exchange_frame_bytes", "16777216"));
+  options.send_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_send_frames", "32")));
+  options.recv_frames = static_cast<uint32_t>(
+    std::stoull(setting(context, "sirius_gateway_exchange_recv_frames_per_peer", "16")));
+  options.log_dir     = setting(context, "sirius_gateway_log_dir", "");
+  options.boot_id_sql = setting(context, "sirius_gateway_rank_boot_id_sql", "");
+  options.joined_sql  = setting(context, "sirius_gateway_rank_joined_sql", "");
+  options.exit_sql    = setting(context, "sirius_gateway_rank_exit_sql", "");
   if (options.log_dir.empty()) {
     options.log_dir =
       (std::filesystem::temp_directory_path() / ("sirius_gateway_" + std::to_string(getpid())))
@@ -705,17 +715,22 @@ void gateway_state::start_locked(ClientContext& context, start_options options, 
     if (give_up) { throw duckdb::InterruptException(); }
 
     // Each session's setup. With Sirius, SET sirius_exchange_rank connects NIXL and waits for
-    // every peer, so the ranks run it in parallel. Shared-memory staging reaches only processes
-    // on one host, and 'auto' can take a GPU on another host for one here, so ranks on several
-    // hosts never stage.
-    auto const several_hosts = std::any_of(
-      ranks_.begin(), ranks_.end(), [&](rank const& r) { return r.host != ranks_[0].host; });
+    // every peer, so the ranks run it in parallel. The exchange settings come first, the same on
+    // every rank: a rank refuses a peer that reaches it another way. With 'auto', ranks tell other
+    // hosts apart by boot id and reach them over TCP lanes, one frame in flight per lane.
     std::vector<std::vector<std::string>> setup(ranks_.size());
     for (auto& r : ranks_) {
       auto& sql = setup[r.index];
       if (!options_.sirius_extension.empty()) {
         sql.push_back("SET enable_duckdb_fallback = false");
-        if (several_hosts) { sql.push_back("SET sirius_exchange_host_staging = 'never'"); }
+        sql.push_back("SET sirius_exchange_host_staging = " +
+                      KeywordHelper::WriteQuoted(options_.host_staging));
+        sql.push_back("SET sirius_exchange_tcp_lanes = " + std::to_string(options_.tcp_lanes));
+        sql.push_back("SET sirius_exchange_mnnvl = " + KeywordHelper::WriteQuoted(options_.mnnvl));
+        sql.push_back("SET sirius_exchange_frame_bytes = " + std::to_string(options_.frame_bytes));
+        sql.push_back("SET sirius_exchange_send_frames = " + std::to_string(options_.send_frames));
+        sql.push_back("SET sirius_exchange_recv_frames_per_peer = " +
+                      std::to_string(options_.recv_frames));
         sql.push_back("SET sirius_exchange_peers = " + KeywordHelper::WriteQuoted(peers));
         sql.push_back("SET sirius_exchange_rank = " + std::to_string(r.index));
       }

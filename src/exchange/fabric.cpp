@@ -19,6 +19,7 @@
 #include "sirius/exception.hpp"
 
 #include <rmm/aligned.hpp>
+#include <rmm/detail/error.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -26,7 +27,7 @@
 
 namespace sirius::exchange {
 
-frame_ring::frame_ring(std::uint32_t frames, std::size_t frame_bytes)
+frame_ring::frame_ring(std::uint32_t frames, std::size_t frame_bytes, ring_memory memory)
   : _frames{frames}, _frame_bytes{frame_bytes}
 {
   if (frames == 0) { throw sirius::invalid_input_exception("frame ring: no frames"); }
@@ -40,6 +41,20 @@ frame_ring::frame_ring(std::uint32_t frames, std::size_t frame_bytes)
     throw sirius::invalid_input_exception(
       "frame ring: {} frames of {} bytes overflow", frames, frame_bytes);
   }
+  if (memory != ring_memory::plain) {
+    int device = 0;
+    RMM_CUDA_TRY(cudaGetDevice(&device));
+    _fabric = fabric_memory::try_allocate(device, bytes(), _why_not_fabric);
+    if (_fabric) {
+      _base = _fabric->base();
+      _why_not_fabric.clear();
+      return;
+    }
+    if (memory == ring_memory::fabric) {
+      throw sirius::internal_exception(
+        "frame ring: no fabric memory for {} bytes: {}", bytes(), _why_not_fabric);
+    }
+  }
   void* base        = nullptr;
   auto const status = cudaMalloc(&base, bytes());
   if (status != cudaSuccess) {
@@ -50,6 +65,9 @@ frame_ring::frame_ring(std::uint32_t frames, std::size_t frame_bytes)
   _base = static_cast<std::byte*>(base);
 }
 
-frame_ring::~frame_ring() { static_cast<void>(cudaFree(_base)); }
+frame_ring::~frame_ring()
+{
+  if (!_fabric) { static_cast<void>(cudaFree(_base)); }
+}
 
 }  // namespace sirius::exchange

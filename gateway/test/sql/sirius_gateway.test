@@ -19,6 +19,48 @@ SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
 statement ok
 SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway';
 
+# The exchange settings the gateway gives every Sirius rank; a value no rank takes fails here.
+statement error
+SET GLOBAL sirius_gateway_exchange_host_staging = 'sometimes';
+----
+must be auto, always, never or remote
+
+statement ok
+SET GLOBAL sirius_gateway_exchange_host_staging = 'remote';
+
+statement ok
+RESET GLOBAL sirius_gateway_exchange_host_staging;
+
+statement error
+SET GLOBAL sirius_gateway_exchange_tcp_lanes = 65;
+----
+must be 0 (automatic) to 64
+
+statement error
+SET GLOBAL sirius_gateway_exchange_mnnvl = 'sometimes';
+----
+must be auto, require or off
+
+statement error
+SET GLOBAL sirius_gateway_exchange_frame_bytes = 1000;
+----
+positive multiple of 256
+
+statement error
+SET GLOBAL sirius_gateway_exchange_recv_frames_per_peer = 0;
+----
+must be 1 to 1024
+
+query IIIIII
+SELECT current_setting('sirius_gateway_exchange_host_staging'),
+       current_setting('sirius_gateway_exchange_tcp_lanes'),
+       current_setting('sirius_gateway_exchange_mnnvl'),
+       current_setting('sirius_gateway_exchange_frame_bytes'),
+       current_setting('sirius_gateway_exchange_send_frames'),
+       current_setting('sirius_gateway_exchange_recv_frames_per_peer');
+----
+auto	0	auto	16777216	32	16
+
 # With no ranks, a statement waits sirius_gateway_join_wait seconds for some to register.
 statement ok
 SET GLOBAL sirius_gateway_join_wait = 0;
@@ -150,6 +192,21 @@ set on every rank by the gateway
 
 statement error con2
 SET sirius_exchange_host_staging = 'always';
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_mnnvl = 'off';
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_tcp_lanes = 4;
+----
+set on every rank by the gateway
+
+statement error con2
+SET sirius_exchange_recv_frames_per_peer = 16;
 ----
 set on every rank by the gateway
 

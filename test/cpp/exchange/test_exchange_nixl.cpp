@@ -24,11 +24,18 @@
 #include "exchange/transport_test_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +47,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -126,6 +134,13 @@ nixl_fabric::host_staging staging_from_env()
   return sirius::exchange::parse_host_staging(value != nullptr ? value : "auto");
 }
 
+/// The count in environment variable @p name for the hidden tests, or @p fallback when unset.
+std::uint32_t count_from_env(char const* name, std::uint32_t fallback)
+{
+  auto const* value = std::getenv(name);
+  return value != nullptr ? static_cast<std::uint32_t>(std::stoul(value)) : fallback;
+}
+
 /// Records what one stream's receiver is handed into @p got.
 struct recording_inbound : sirius::exchange::inbound {
   recording_inbound(received& got, stream_id stream) : got(got), stream(stream) {}
@@ -152,33 +167,51 @@ struct recording_inbound : sirius::exchange::inbound {
   stream_id stream;
 };
 
-/// Two ranks in this process, both on its GPU, connected with @p staging.
+/// Two ranks in this process, both on its GPU, connected with @p staging and @p lanes.
 std::pair<std::unique_ptr<nixl_rank>, std::unique_ptr<nixl_rank>> two_ranks(
-  nixl_fabric::host_staging staging)
+  nixl_fabric::host_staging staging, std::uint32_t lanes = 0)
 {
   auto const peers = two_free_peers();
   auto config      = [&](rank_t rank) {
     nixl_fabric::config cfg{rank, peers};
     cfg.staging = staging;
+    cfg.lanes   = lanes;
     return cfg;
   };
-  // Each constructor waits for the other's hello.
+  // Each constructor waits for the other's hello. A constructor can return with notifications
+  // to its peer still queued in NIXL, which only a poll sends, and nothing polls a rank before
+  // start(): so the rank that is up first polls until the other is up or has failed.
+  std::atomic<bool> r0_done{false};
+  std::atomic<bool> r1_done{false};
+  auto const poll_until = [](nixl_rank& r, std::atomic<bool> const& done) {
+    std::vector<sirius::exchange::fabric_notification> none;
+    while (!done.load()) {
+      r.fab->poll(none);
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  };
   std::unique_ptr<nixl_rank> r0;
   std::exception_ptr r0_error;
   std::thread other([&] {
     try {
       r0 = std::make_unique<nixl_rank>(config(0), 64 * KiB);
+      r0_done.store(true);
+      poll_until(*r0, r1_done);
     } catch (...) {
       r0_error = std::current_exception();
+      r0_done.store(true);
     }
   });
   std::unique_ptr<nixl_rank> r1;
   try {
     r1 = std::make_unique<nixl_rank>(config(1), 64 * KiB);
+    poll_until(*r1, r0_done);
   } catch (...) {
+    r1_done.store(true);
     other.join();
     throw;
   }
+  r1_done.store(true);
   other.join();
   if (r0_error) { std::rethrow_exception(r0_error); }
   return {std::move(r0), std::move(r1)};
@@ -197,6 +230,23 @@ TEST_CASE("two ranks in one process exchange batches over NIXL or through host s
   bool const staged = staging == nixl_fabric::host_staging::always;
   REQUIRE(r0->fab->host_staged(1) == staged);
   REQUIRE(r1->fab->host_staged(0) == staged);
+  r0->start();
+  r1->start();
+
+  send_all(*r0->t, {1, 2}, 2, 20'000);
+  send_all(*r1->t, {1, 2}, 2, 20'000);
+  check_all(r0->got, 0, 2, {1, 2}, 2, 20'000);
+  check_all(r1->got, 1, 2, {1, 2}, 2, 20'000);
+}
+
+TEST_CASE("two ranks in one process exchange batches over TCP lanes", "[exchange][nixl]")
+{
+  // Frames go device to host into a lane's send slot, host to host over the lane into the
+  // peer's mirror, then host to device: the path to a rank on another host.
+  auto [r0, r1] = two_ranks(nixl_fabric::host_staging::remote, 3);
+  REQUIRE(r0->fab->path_to(1) == sirius::exchange::path::tcp_lanes);
+  REQUIRE(r1->fab->path_to(0) == sirius::exchange::path::tcp_lanes);
+  REQUIRE(r0->fab->lanes_to(1) == 3);
   r0->start();
   r1->start();
 
@@ -320,6 +370,7 @@ TEST_CASE("one rank per process exchanges batches over NIXL", "[.][nixl_multipro
   }
   auto const world = static_cast<rank_t>(cfg.peers.size());
   cfg.staging      = staging_from_env();
+  cfg.lanes        = count_from_env("SIRIUS_EXCHANGE_TCP_LANES", 0);
 
   // 1 MiB frames; batches of about 7 MiB take several.
   nixl_rank r(cfg, MiB);
@@ -333,7 +384,11 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
 {
   // Every rank sends the same number of large batches to every other rank at once, as a shuffle
   // does, through the transport with the runtime's ring sizes, and reports what it received per
-  // second. SIRIUS_EXCHANGE_HOST_STAGING picks the path.
+  // second. SIRIUS_EXCHANGE_HOST_STAGING and SIRIUS_EXCHANGE_MNNVL (default auto) pick the path
+  // (as sirius_exchange_host_staging and sirius_exchange_mnnvl do), SIRIUS_EXCHANGE_TCP_LANES and
+  // SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER size it (as the settings sirius_exchange_tcp_lanes and
+  // sirius_exchange_recv_frames_per_peer do), and SIRIUS_EXCHANGE_BW_BATCHES (default 96) sets
+  // the batches to each peer.
   auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
   auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
   REQUIRE(rank != nullptr);
@@ -344,11 +399,17 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   for (std::string peer; std::getline(list, peer, ',');) {
     cfg.peers.push_back(peer);
   }
-  cfg.staging      = staging_from_env();
-  auto const world = static_cast<rank_t>(cfg.peers.size());
+  cfg.staging       = staging_from_env();
+  cfg.lanes         = count_from_env("SIRIUS_EXCHANGE_TCP_LANES", 0);
+  auto const* mnnvl = std::getenv("SIRIUS_EXCHANGE_MNNVL");
+  cfg.mnnvl         = sirius::exchange::parse_mnnvl(mnnvl != nullptr ? mnnvl : "auto");
+  auto const world  = static_cast<rank_t>(cfg.peers.size());
   sirius::exchange::nixl_exchange_options const ring_opts{};
-  frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes);
-  frame_ring recv(ring_opts.recv_frames_per_peer * (world - 1), ring_opts.frame_bytes);
+  auto const memory = sirius::exchange::ring_memory_for(cfg.mnnvl);
+  auto const recv_frames =
+    count_from_env("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", ring_opts.recv_frames_per_peer);
+  frame_ring send(ring_opts.send_frames, ring_opts.frame_bytes, memory);
+  frame_ring recv(recv_frames * (world - 1), ring_opts.frame_bytes, memory);
   nixl_fabric fab(cfg, send, recv);
 
   std::mutex mutex;
@@ -394,9 +455,19 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   // Sent to every peer, every time: the transport only reads it, and the timing then leaves out
   // building batches.
-  auto const batch   = gpu_batch(std::move(table));
-  int const per_peer = 96;
-  auto const start   = std::chrono::steady_clock::now();
+  auto const batch    = gpu_batch(std::move(table));
+  auto const per_peer = static_cast<int>(count_from_env("SIRIUS_EXCHANGE_BW_BATCHES", 96));
+  // Start the clocks together: a rank that starts first would count its wait for the others.
+  for (rank_t to = 0; to < world; ++to) {
+    t.close(98, to);
+  }
+  {
+    std::unique_lock lock{mutex};
+    REQUIRE(changed.wait_for(
+      lock, std::chrono::minutes{2}, [&] { return error != nullptr || ended[98] == world; }));
+    REQUIRE_FALSE(error);
+  }
+  auto const start = std::chrono::steady_clock::now();
   for (int i = 0; i < per_peer; ++i) {
     for (rank_t to = 0; to < world; ++to) {
       if (to == cfg.rank) { continue; }
@@ -415,14 +486,19 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   }
   auto const seconds =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  double const gb = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
+  double const gb       = static_cast<double>(batch_b) * per_peer * (world - 1) / 1e9;
+  auto const next       = (cfg.rank + 1) % world;
+  auto const route      = fab.path_to(next);
+  std::string const how = route == sirius::exchange::path::tcp_lanes
+                            ? std::to_string(fab.lanes_to(next)) + " TCP lanes"
+                            : sirius::exchange::describe(route);
   std::printf("BANDWIDTH rank %u: received %.2f GB from %u peers in %.2f s: %.2f GB/s (%s)\n",
               cfg.rank,
               gb,
               world - 1,
               seconds,
               gb / seconds,
-              fab.host_staged((cfg.rank + 1) % world) ? "host-staged" : "NIXL");
+              how.c_str());
   // Every rank must have taken its batches before any tears down its fabric.
   for (rank_t to = 0; to < world; ++to) {
     t.close(99, to);
@@ -431,4 +507,288 @@ TEST_CASE("one rank per process measures exchange bandwidth", "[.][nixl_bandwidt
   REQUIRE(changed.wait_for(
     lock, std::chrono::minutes{2}, [&] { return error != nullptr || ended[99] == world; }));
   REQUIRE_FALSE(error);
+  // The last end this rank sent may still be queued in UCX: tearing down now could drop it and
+  // leave a slower peer waiting.
+  lock.unlock();
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+}
+
+namespace {
+
+/// A setting for the hidden multi-process tests: the environment variable @p name, else
+/// @p fallback.
+std::string env_or(char const* name, std::string fallback)
+{
+  auto const* value = std::getenv(name);
+  return value != nullptr && *value != '\0' ? std::string{value} : std::move(fallback);
+}
+
+/// One GPU memory space of @p gpu_bytes, for batches far larger than env()'s.
+struct big_env {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
+  cucascade::memory::memory_space* gpu  = nullptr;
+  cucascade::memory::memory_space* host = nullptr;
+
+  explicit big_env(std::size_t gpu_bytes)
+  {
+    sirius::converter_registry::reset_for_testing();
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(gpu_bytes)
+      .set_reservation_fraction_per_gpu(0.9)
+      .set_per_numa_region_capacity(std::size_t{4} << 30)
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(0.9);
+    mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    sirius::converter_registry::initialize();
+    gpu  = mgr->get_memory_space(Tier::GPU, 0);
+    host = mgr->get_memory_space(Tier::HOST, 0);
+  }
+};
+
+/// A batch of one INT64 column of @p bytes / 8 values: @p first, @p first + 1, ...
+std::shared_ptr<cucascade::data_batch> sequence_batch(big_env& e,
+                                                      std::size_t bytes,
+                                                      std::int64_t first)
+{
+  auto stream = utils::default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::sequence(static_cast<cudf::size_type>(bytes / sizeof(std::int64_t)),
+                                   cudf::numeric_scalar<std::int64_t>(first, true, stream),
+                                   cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                   stream));
+  stream.sync();
+  return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
+                                 *e.gpu,
+                                 stream,
+                                 sirius::telemetry::batch_telemetry_info{});
+}
+
+/// How many values of @p batch differ from @p first, @p first + 1, ...
+std::int64_t bad_values(std::shared_ptr<cucascade::data_batch> const& batch, std::int64_t first)
+{
+  auto ro = batch->to_read_only();
+  REQUIRE(ro.get_current_tier() == Tier::GPU);
+  if (cudaEvent_t writer = ro.get_writer_event()) { cudaEventSynchronize(writer); }
+  auto const view     = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto stream         = utils::default_stream();
+  auto const expected = cudf::sequence(view.num_rows(),
+                                       cudf::numeric_scalar<std::int64_t>(first, true, stream),
+                                       cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                       stream);
+  auto const differ   = cudf::binary_operation(view.column(0),
+                                             expected->view(),
+                                             cudf::binary_operator::NOT_EQUAL,
+                                             cudf::data_type{cudf::type_id::BOOL8},
+                                             stream);
+  auto const sum      = cudf::reduce(differ->view(),
+                                *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+                                cudf::data_type{cudf::type_id::INT64},
+                                stream);
+  return static_cast<cudf::numeric_scalar<std::int64_t> const&>(*sum).value(stream);
+}
+
+}  // namespace
+
+TEST_CASE("pairs of ranks on two nodes move batches at NVLink speed", "[.][nixl_pairs]")
+{
+  // A raw NIXL bandwidth benchmark's phases, through the exchange: world / 2 ranks on each of two
+  // nodes, rank r paired with rank (r + world / 2) % world, one rank per GPU. Each phase
+  // sends one batch size for SIRIUS_EXCHANGE_PAIRS_SECONDS from the ranks that take part, and
+  // each receiver reports what it received per second. Last, every rank sends its peer distinct
+  // batches, and the peer checks every value. Ring sizes and sirius_exchange_mnnvl come from
+  // SIRIUS_EXCHANGE_{FRAME_BYTES, SEND_FRAMES, RECV_FRAMES_PER_PEER, MNNVL} (default require).
+  auto const* rank  = std::getenv("SIRIUS_EXCHANGE_RANK");
+  auto const* peers = std::getenv("SIRIUS_EXCHANGE_PEERS");
+  REQUIRE(rank != nullptr);
+  REQUIRE(peers != nullptr);
+  nixl_fabric::config cfg;
+  cfg.rank = static_cast<rank_t>(std::stoul(rank));
+  std::stringstream list{peers};
+  for (std::string peer; std::getline(list, peer, ',');) {
+    cfg.peers.push_back(peer);
+  }
+  auto const world = static_cast<rank_t>(cfg.peers.size());
+  REQUIRE((world >= 2 && world % 2 == 0));
+  rank_t const per_node = world / 2;
+  rank_t const me       = cfg.rank;
+  rank_t const peer     = (me + per_node) % world;
+  rank_t const node     = me / per_node;
+
+  sirius::exchange::nixl_exchange_options opts;
+  opts.mnnvl       = sirius::exchange::parse_mnnvl(env_or("SIRIUS_EXCHANGE_MNNVL", "require"));
+  opts.frame_bytes = std::stoull(env_or("SIRIUS_EXCHANGE_FRAME_BYTES", "16777216"));
+  opts.send_frames =
+    static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_SEND_FRAMES", "32")));
+  opts.recv_frames_per_peer =
+    static_cast<std::uint32_t>(std::stoul(env_or("SIRIUS_EXCHANGE_RECV_FRAMES_PER_PEER", "16")));
+  cfg.staging        = staging_from_env();
+  cfg.mnnvl          = opts.mnnvl;
+  auto const seconds = std::stod(env_or("SIRIUS_EXCHANGE_PAIRS_SECONDS", "1.5"));
+  big_env e(std::stoull(env_or("SIRIUS_EXCHANGE_PAIRS_GPU_GIB", "40")) << 30);
+
+  auto const memory = sirius::exchange::ring_memory_for(opts.mnnvl);
+  frame_ring send(opts.send_frames, opts.frame_bytes, memory);
+  frame_ring recv(opts.recv_frames_per_peer * (world - 1), opts.frame_bytes, memory);
+  nixl_fabric fab(cfg, send, recv);
+  std::printf("PAIRS rank %u peer %u: %s, rings %s, frame %zu MiB x %u send, %u per peer\n",
+              me,
+              peer,
+              sirius::exchange::describe(fab.path_to(peer)),
+              recv.in_fabric_memory() ? "in fabric memory" : "from cudaMalloc",
+              opts.frame_bytes >> 20,
+              opts.send_frames,
+              opts.recv_frames_per_peer);
+  if (opts.mnnvl == sirius::exchange::mnnvl_mode::require) {
+    REQUIRE(fab.path_to(peer) == sirius::exchange::path::nvlink_fabric);
+  }
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::map<stream_id, std::size_t> received_bytes;
+  std::map<stream_id, std::chrono::steady_clock::time_point> ended_at;
+  std::map<stream_id, std::size_t> ends;
+  std::vector<std::tuple<rank_t, std::uint64_t, std::shared_ptr<cucascade::data_batch>>> kept;
+  stream_id constexpr verify_stream = 900;
+  std::exception_ptr error;
+  transport t(fab,
+              send,
+              recv,
+              *e.gpu,
+              e.host,
+              {[&](stream_id stream,
+                   rank_t from,
+                   std::uint64_t index,
+                   std::shared_ptr<cucascade::data_batch> batch) {
+                 auto const bytes = batch->to_read_only().get_data()->get_size_in_bytes();
+                 std::lock_guard lock{mutex};
+                 received_bytes[stream] += bytes;
+                 if (stream == verify_stream) { kept.emplace_back(from, index, std::move(batch)); }
+                 changed.notify_all();
+               },
+               [&](stream_id stream, rank_t) {
+                 std::lock_guard lock{mutex};
+                 ++ends[stream];
+                 ended_at[stream] = std::chrono::steady_clock::now();
+                 changed.notify_all();
+               },
+               [&](std::exception_ptr err) {
+                 std::lock_guard lock{mutex};
+                 error = err;
+                 changed.notify_all();
+               },
+               [&](std::uint64_t, rank_t, std::string what) {
+                 std::lock_guard lock{mutex};
+                 error = std::make_exception_ptr(std::runtime_error(what));
+                 changed.notify_all();
+               }},
+              transport::options{.max_queued_bytes = std::size_t{2} << 30});
+
+  // Every rank closes @p stream to every rank and waits for every rank's close.
+  auto barrier = [&](stream_id stream) {
+    for (rank_t to = 0; to < world; ++to) {
+      t.close(stream, to);
+    }
+    std::unique_lock lock{mutex};
+    REQUIRE(changed.wait_for(
+      lock, std::chrono::minutes{5}, [&] { return error != nullptr || ends[stream] == world; }));
+    REQUIRE_FALSE(error);
+  };
+
+  struct phase {
+    std::string tag;
+    std::size_t batch_bytes;
+    bool both_ways;
+    bool all_pairs;
+  };
+  constexpr std::size_t KB = 1024, MB = KB * KB, GB = MB * KB;
+  std::vector<phase> phases;
+  for (auto const size : {GB, 128 * MB}) {
+    auto const s = size == GB ? std::string{"1G"} : std::string{"128M"};
+    phases.push_back({"uni_1pair_" + s, size, false, false});
+    phases.push_back({"bidi_1pair_" + s, size, true, false});
+    phases.push_back({"uni_4pair_" + s, size, false, true});
+    phases.push_back({"bidi_4pair_" + s, size, true, true});
+  }
+  for (auto const size : {64 * KB, 256 * KB, 1 * MB, 4 * MB, 16 * MB, 64 * MB}) {
+    auto const s = size >= MB ? std::to_string(size / MB) + "M" : std::to_string(size / KB) + "K";
+    phases.push_back({"batches_" + s, size, false, false});
+  }
+  phases.push_back({"bidi_4pair_1M", 1 * MB, true, true});
+
+  barrier(1);
+  for (std::size_t i = 0; i < phases.size(); ++i) {
+    auto const& p       = phases[i];
+    stream_id const s   = 100 + i;
+    bool const sender   = (p.all_pairs || me % per_node == 0) && (p.both_ways || node == 0);
+    bool const receiver = (p.all_pairs || peer % per_node == 0) && (p.both_ways || node == 1);
+    auto const batch    = sender ? sequence_batch(e, p.batch_bytes, me) : nullptr;
+    barrier(1000 + i);
+    auto const start = std::chrono::steady_clock::now();
+    std::size_t sent = 0;
+    if (sender) {
+      while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() <
+             seconds) {
+        t.send(s, peer, batch);
+        ++sent;
+      }
+    }
+    for (rank_t to = 0; to < world; ++to) {
+      t.close(s, to);
+    }
+    {
+      std::unique_lock lock{mutex};
+      REQUIRE(changed.wait_for(
+        lock, std::chrono::minutes{5}, [&] { return error != nullptr || ends[s] == world; }));
+      REQUIRE_FALSE(error);
+      if (receiver) {
+        auto const secs = std::chrono::duration<double>(ended_at[s] - start).count();
+        std::printf("PAIRS %-16s rank %u <- %u: %zu bytes in %.3f s: %.1f GB/s\n",
+                    p.tag.c_str(),
+                    me,
+                    peer,
+                    received_bytes[s],
+                    secs,
+                    static_cast<double>(received_bytes[s]) / secs / 1e9);
+      }
+    }
+    std::fflush(stdout);
+    static_cast<void>(sent);
+  }
+
+  // Every rank sends its peer distinct batches; the peer checks every value.
+  auto const verify_batches = 8;
+  auto const verify_bytes   = 256 * MB;
+  barrier(2);
+  for (int i = 0; i < verify_batches; ++i) {
+    auto const first = (static_cast<std::int64_t>(me) << 40) + (static_cast<std::int64_t>(i) << 32);
+    t.send(verify_stream, peer, sequence_batch(e, verify_bytes, first));
+  }
+  for (rank_t to = 0; to < world; ++to) {
+    t.close(verify_stream, to);
+  }
+  {
+    std::unique_lock lock{mutex};
+    REQUIRE(changed.wait_for(lock, std::chrono::minutes{5}, [&] {
+      return error != nullptr || ends[verify_stream] == world;
+    }));
+    REQUIRE_FALSE(error);
+  }
+  REQUIRE(kept.size() == static_cast<std::size_t>(verify_batches));
+  std::int64_t bad = 0;
+  for (auto const& [from, index, batch] : kept) {
+    REQUIRE(from == peer);
+    auto const first =
+      (static_cast<std::int64_t>(from) << 40) + (static_cast<std::int64_t>(index) << 32);
+    bad += bad_values(batch, first);
+  }
+  kept.clear();
+  std::printf("PAIRS verify rank %u <- %u: %d batches of %zu MiB, %lld bad values\n",
+              me,
+              peer,
+              verify_batches,
+              verify_bytes >> 20,
+              static_cast<long long>(bad));
+  CHECK(bad == 0);
+  barrier(3);
 }

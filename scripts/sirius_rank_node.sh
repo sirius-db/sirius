@@ -8,6 +8,7 @@
 # sirius_rank_node.conf.example) is sourced and may set every argument, as gpu, quack_port,
 # exchange_port, listen_host, dir; arguments given here win over it. It may also set:
 #   ucx_tls, ucx_net_devices  UCX_TLS, UCX_NET_DEVICES, unless exported
+#                      (defaults: scripts/launcher_env.sh)
 #   priority_networks  CIDRs, e.g. 10.87.140.0/24; this host's first address in them is the listen
 #                      host, and its interface UCX_NET_DEVICES, unless those are set. Default: the
 #                      gateway's networks
@@ -20,6 +21,9 @@
 # retrying until it succeeds, and again whenever gateway.conf names a new gateway_id; the gateway
 # must SET sirius_gateway_allow_join = true. Without one, it prints the call, for the gateway's
 # console.
+# SIRIUS_RANK_LOG_ROOT: each rank's Sirius log goes to <root>/<short hostname>-<quack port>/
+# (SIRIUS_LOG_DIR). Without it, ranks started from one directory share its log/ folder, and
+# ranks of several nodes on a shared file system lose lines appending to one file.
 # SIRIUS_RANK_TOKEN sets the rank's token; otherwise a random one is kept in <dir>/token. On a
 # listen host other than this machine's loopback, Quack serves TLS with a key pair kept in
 # <dir>/tls, whose fingerprint the gateway pins.
@@ -64,6 +68,8 @@ fi
 
 [ -n "${ucx_tls:-}" ] && export UCX_TLS=${UCX_TLS:-$ucx_tls}
 [ -n "${ucx_net_devices:-}" ] && export UCX_NET_DEVICES=${UCX_NET_DEVICES:-$ucx_net_devices}
+# Before priority_networks names an interface: the GPU rail NICs win where the host has them.
+source "$here/launcher_env.sh"
 priority_networks=${priority_networks:-${networks:-}}
 if [ -n "$priority_networks" ]; then
   source "$here/sirius_net.sh"
@@ -77,7 +83,6 @@ if [ -n "$priority_networks" ]; then
 fi
 host=${4:-${listen_host:-$(hostname -f)}}
 dir=${5:-${dir:-/tmp/sirius_rank_$port}}
-source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 duckdb="$build/duckdb"
 # Under Slurm the task's own binding is already in CUDA_VISIBLE_DEVICES.
@@ -225,6 +230,10 @@ stop()
   fi
   exit 0
 }
+if [ -n "${SIRIUS_RANK_LOG_ROOT:-}" ]; then
+  export SIRIUS_LOG_DIR=$SIRIUS_RANK_LOG_ROOT/$(hostname -s)-$port
+  mkdir -p "$SIRIUS_LOG_DIR"
+fi
 trap stop TERM INT
 backoff=1
 first=1

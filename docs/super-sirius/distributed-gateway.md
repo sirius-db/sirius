@@ -65,7 +65,8 @@ kept in `~/.sirius/gateways/<cluster>/tls`. A registered rank listens on its nod
 address in its `priority_networks`, by default the gateway's subnet from `gateway.conf`, and
 `UCX_NET_DEVICES` defaults to that address's interface. `scripts/launcher_env.sh` defaults
 `UCX_TLS` to `cuda_copy,cuda_ipc,tcp,self`: left to itself, UCX picks InfiniBand ports that GB200
-hosts cannot connect through.
+hosts cannot connect through. On a host with GPU rail NICs it defaults to those NICs with
+`UCX_TLS=all` instead, which the exchange over the NVLink fabric needs for its notifications.
 
 ## How a statement runs
 
@@ -216,7 +217,13 @@ On the ranks, Sirius adds `sirius_rank_info()`, which returns the process's `pid
 |---|---|---|
 | `sirius_gateway_duckdb_binary` | | DuckDB that runs each spawned rank |
 | `sirius_gateway_sirius_extension` | | Sirius extension the ranks load; empty runs CPU ranks, for tests |
-| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings |
+| `sirius_gateway_rank_init` | | SQL each rank's session runs after the exchange settings, so it cannot change them |
+| `sirius_gateway_exchange_host_staging` | `auto` | `sirius_exchange_host_staging` for every rank: `auto` (TCP lanes to ranks on other hosts), `always`, `never` or `remote` |
+| `sirius_gateway_exchange_tcp_lanes` | 0 | `sirius_exchange_tcp_lanes` for every rank, at most 64; 0 shares 16 lanes among the ranks of a host |
+| `sirius_gateway_exchange_mnnvl` | `auto` | `sirius_exchange_mnnvl` for every rank: `auto`, `require` or `off` put the rings in fabric memory, for NVLink between nodes |
+| `sirius_gateway_exchange_frame_bytes` | 16777216 | `sirius_exchange_frame_bytes` for every rank |
+| `sirius_gateway_exchange_send_frames` | 32 | `sirius_exchange_send_frames` for every rank |
+| `sirius_gateway_exchange_recv_frames_per_peer` | 16 | `sirius_exchange_recv_frames_per_peer` for every rank; over TCP lanes, one frame in flight per lane |
 | `sirius_gateway_log_dir` | temporary | Rank init files and logs |
 | `sirius_gateway_allow_join` | false | Lets clients call `sirius_gateway_add_rank` and `sirius_gateway_drop_rank`, for nodes to register their ranks |
 | `sirius_gateway_min_ranks` | 1 | Registered ranks the first statement waits for before it starts them |
