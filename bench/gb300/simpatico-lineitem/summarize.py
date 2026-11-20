@@ -3,11 +3,34 @@
 
 import argparse
 import csv
+import hashlib
 from pathlib import Path
 
 
 PARTITIONS = 60
 COLUMNS = 16
+PLAN = Path(__file__).resolve().parents[3] / "src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt"
+PLAN_SHA256 = "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555"
+# Schemes in the measured plan, including which string components are encoded.
+SCHEMES = {
+    "l_orderkey": "Delta → Bitpack",
+    "l_partkey": "Bitpack",
+    "l_suppkey": "Bitpack",
+    "l_linenumber": "Bitpack",
+    "l_quantity": "Bitpack",
+    "l_extendedprice": "Bitpack",
+    "l_discount": "Bitpack",
+    "l_tax": "Bitpack",
+    "l_returnflag": "Dictionary → Bitpack (indices)",
+    "l_linestatus": "Dictionary → Bitpack (indices)",
+    "l_shipdate": "Bitpack",
+    "l_commitdate": "Bitpack",
+    "l_receiptdate": "Bitpack",
+    "l_shipinstruct": "Dictionary → Bitpack (key offsets, indices)",
+    "l_shipmode": "String split → Bitpack (offsets)",
+    "l_comment": "String split; offsets: Delta → ANS; chars: Snappy",
+    "TOTAL": "—",
+}
 
 
 def main() -> None:
@@ -15,6 +38,8 @@ def main() -> None:
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()
+    if hashlib.sha256(PLAN.read_bytes()).hexdigest() != PLAN_SHA256:
+        raise ValueError("the Simpatico plan differs from the measured plan; review SCHEMES")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows = []
@@ -39,7 +64,10 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(all_rows)
 
-    fields = ("column", "rows", "input_bytes", "compressed_bytes", "ratio",
+    if set(order) != set(SCHEMES):
+        raise ValueError("the measured columns differ from the plan's scheme list")
+
+    fields = ("column", "compression_scheme", "rows", "input_bytes", "compressed_bytes", "ratio",
               "compress_ms_sum_of_partition_medians", "compress_gbps",
               "decompress_ms_sum_of_partition_medians", "decompress_gbps")
     with (args.output_dir / "summary.csv").open("w", newline="") as stream:
@@ -54,6 +82,7 @@ def main() -> None:
             decompress_ms = sum(float(row["decompress_ms_median"]) for row in selected)
             writer.writerow({
                 "column": name,
+                "compression_scheme": SCHEMES[name],
                 "rows": rows,
                 "input_bytes": input_bytes,
                 "compressed_bytes": compressed_bytes,

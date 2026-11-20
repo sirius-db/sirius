@@ -1,7 +1,8 @@
 # Simpatico on TPC-H SF1000 lineitem (GB300)
 
-The [summary](summary.csv) contains measured compression ratio and compression /
-decompression throughput for each of the 16 `lineitem` columns. The
+The [summary](summary.csv) contains the plan's compression scheme, measured
+compression ratio, and compression / decompression throughput for each of the
+16 `lineitem` columns. The
 [per-partition data](per-partition.csv) preserves the underlying measurements
 for all 60 Parquet files. Every column in every partition passed Simpatico's
 decompression round-trip check.
