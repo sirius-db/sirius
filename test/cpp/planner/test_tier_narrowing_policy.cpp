@@ -595,6 +595,21 @@ TEST_CASE("tier_narrowing_policy - transport outweighs evaluator restores above 
           std::vector<cudf::data_type>{k_int32, k_int16});
 }
 
+TEST_CASE("tier_narrowing_policy - a cast keeps its input only when the carrier proves it fits",
+          "[tier_narrowing_policy][integer_cast_bounds]")
+{
+  for (auto const target : {sirius::type_id::SMALLINT, sirius::type_id::USMALLINT}) {
+    auto type = sirius::logical_type::make(target);
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    select_list.push_back(
+      std::make_unique<sirius::ast::node>(sirius::ast::cast{make_reference(0), type}));
+    auto plan = make_projection({type}, std::move(select_list), make_integer_scan(1, {k_int8}));
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+    CHECK(retracted == (target == sirius::type_id::USMALLINT ? 1 : 0));
+    CHECK(plan->children[0]->has_physical_overrides() == (target == sirius::type_id::SMALLINT));
+  }
+}
+
 TEST_CASE("tier_narrowing_policy - narrow-domain comparisons rescue, ineligible shapes do not",
           "[tier_narrowing_policy]")
 {

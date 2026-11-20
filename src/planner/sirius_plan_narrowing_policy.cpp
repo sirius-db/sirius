@@ -18,6 +18,7 @@
 #include "expression/ast/constant_range.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "expression_evaluator/integer_cast.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
@@ -42,21 +43,21 @@
 // `propagate_compressed_schema`, tracing each candidate narrow scan column (a non-native sidecar
 // entry of a scan marked `sidecar_from_gpu_tier_pin`) upward and accumulating four use flags per
 // column: transport (survives into a hash-join payload output or an eligible grouped-aggregate key
-// output), narrow_comparison (engages a narrow-domain comparison or BETWEEN), evaluator_restore
-// (any other reference occurrence inside an expression), and boundary_restore (dies where
-// propagation would insert a restore projection: join keys, value-sensitive aggregate inputs,
-// ineligible or unmodeled operators, entry into a DELIM_JOIN sub-root, the plan root). The verdict
-// per column is `keep iff transport or (not boundary_restore and (narrow_comparison or not
+// output), narrow_use (engages a narrow-domain comparison, BETWEEN or lossless integer cast),
+// evaluator_restore (any other reference occurrence inside an expression), and boundary_restore
+// (dies where propagation would insert a restore projection: join keys, value-sensitive aggregate
+// inputs, ineligible or unmodeled operators, entry into a DELIM_JOIN sub-root, the plan root). The
+// verdict per column is `keep iff transport or (not boundary_restore and (narrow_use or not
 // evaluator_restore))`.
 //
-// narrow_comparison covers both comparison shapes the evaluator computes at the narrow width:
-// against constants, and between two references sharing a carrier. The reference pair is the
-// weaker of the two, because it holds only while BOTH carriers stay narrow and equal -- so in
-// principle one side retracting could strand the other. No verdict coupling enforces that,
-// because no reachable shape produces it: every modeled operator that boundaries one side either
-// boundaries the other or gives it transport, and transport keeps it on its own merits. Were a
-// stranded side to appear anyway, the evaluator simply declines the pair and restores both, which
-// costs a widening cast rather than correctness.
+// Besides a checked cast proven safe by its carrier, narrow_use covers both comparison shapes the
+// evaluator computes at the narrow width: against constants, and between two references sharing a
+// carrier. The reference pair is the weaker of the two, because it holds only while BOTH carriers
+// stay narrow and equal -- so in principle one side retracting could strand the other. No verdict
+// coupling enforces that, because no reachable shape produces it: every modeled operator that
+// boundaries one side either boundaries the other or gives it transport, and transport keeps it on
+// its own merits. Were a stranded side to appear anyway, the evaluator simply declines the pair and
+// restores both, which costs a widening cast rather than correctness.
 //
 // Retracted columns flip back to native in the scan sidecar before
 // propagation runs. Because every case mirrors the propagation case of the same operator, an
@@ -75,7 +76,7 @@ struct narrow_candidate {
   bool transport         = false;
   bool boundary_restore  = false;
   bool evaluator_restore = false;
-  bool narrow_comparison = false;
+  bool narrow_use        = false;
 };
 
 struct policy_state {
@@ -109,6 +110,14 @@ bool narrow_domain_engages(sirius::ast::reference const& ref,
   return sirius::ast::narrow_domain_carrier_eligible(ref.return_type(), carrier, constant_operands);
 }
 
+std::optional<std::size_t> reference_candidate(sirius::ast::node const* operand,
+                                               carried_columns const& inputs)
+{
+  if (!operand || !operand->holds<sirius::ast::reference>()) { return std::nullopt; }
+  auto const column = operand->get<sirius::ast::reference>().column_index;
+  return column < inputs.size() ? inputs[column] : std::nullopt;
+}
+
 // The candidate carried by @p column_operand when it is a bare carried reference and
 // @p constant_operands engage the narrow domain against its planned carrier.
 std::optional<std::size_t> narrow_comparison_candidate(
@@ -117,11 +126,10 @@ std::optional<std::size_t> narrow_comparison_candidate(
   carried_columns const& inputs,
   policy_state const& state)
 {
-  if (!column_operand || !column_operand->holds<sirius::ast::reference>()) { return std::nullopt; }
+  auto const candidate = reference_candidate(column_operand, inputs);
+  if (!candidate) { return std::nullopt; }
   auto const& ref = column_operand->get<sirius::ast::reference>();
-  if (ref.column_index >= inputs.size() || !inputs[ref.column_index]) { return std::nullopt; }
-  auto const candidate = *inputs[ref.column_index];
-  if (!narrow_domain_engages(ref, state.candidates[candidate].carrier, constant_operands)) {
+  if (!narrow_domain_engages(ref, state.candidates[*candidate].carrier, constant_operands)) {
     return std::nullopt;
   }
   return candidate;
@@ -170,11 +178,8 @@ void classify_child(std::unique_ptr<sirius::ast::node> const& child,
 }
 
 // Classify every reference occurrence in an evaluated expression against the child map @p inputs.
-// A comparison or BETWEEN whose shape engages the narrow domain marks its column
-// narrow_comparison and classifies nothing further (the evaluator computes it at the narrow width
-// with zero restoration); every other reference occurrence marks evaluator_restore, because
-// `evaluate(reference)` restores a narrowed column unconditionally. The static_assert keeps the
-// classification total: a new AST alternative fails to compile until it is given an arm here.
+// A comparison, BETWEEN or checked cast that can consume the narrow carrier marks narrow_use.
+// Other references require evaluator restoration. The static_assert keeps classification total.
 void classify_expression(sirius::ast::node const& expr,
                          carried_columns const& inputs,
                          policy_state& state)
@@ -193,12 +198,12 @@ void classify_expression(sirius::ast::node const& expr,
         // Either operand order, mirroring the evaluator's two-sided probe.
         if (auto const candidate =
               narrow_comparison_candidate(alt.left.get(), {alt.right.get()}, inputs, state)) {
-          state.candidates[*candidate].narrow_comparison = true;
+          state.candidates[*candidate].narrow_use = true;
           return;
         }
         if (auto const candidate =
               narrow_comparison_candidate(alt.right.get(), {alt.left.get()}, inputs, state)) {
-          state.candidates[*candidate].narrow_comparison = true;
+          state.candidates[*candidate].narrow_use = true;
           return;
         }
         // Both operands carried narrow at one shared carrier: the comparison needs no restore, so
@@ -209,8 +214,8 @@ void classify_expression(sirius::ast::node const& expr,
         // restores the remaining narrow input. That can miscost the keep decision, not the result.
         if (auto const pair =
               narrow_comparison_pair(alt.left.get(), alt.right.get(), inputs, state)) {
-          state.candidates[pair->first].narrow_comparison  = true;
-          state.candidates[pair->second].narrow_comparison = true;
+          state.candidates[pair->first].narrow_use  = true;
+          state.candidates[pair->second].narrow_use = true;
           return;
         }
         classify_child(alt.left, inputs, state);
@@ -218,7 +223,7 @@ void classify_expression(sirius::ast::node const& expr,
       } else if constexpr (std::is_same_v<T, sirius::ast::between>) {
         if (auto const candidate = narrow_comparison_candidate(
               alt.input.get(), {alt.lower.get(), alt.upper.get()}, inputs, state)) {
-          state.candidates[*candidate].narrow_comparison = true;
+          state.candidates[*candidate].narrow_use = true;
           return;
         }
         classify_child(alt.input, inputs, state);
@@ -235,6 +240,12 @@ void classify_expression(sirius::ast::node const& expr,
         }
         classify_child(alt.else_, inputs, state);
       } else if constexpr (std::is_same_v<T, sirius::ast::cast>) {
+        if (auto const candidate = reference_candidate(alt.child.get(), inputs);
+            candidate &&
+            checked_integer_cast_fits_carrier(alt, state.candidates[*candidate].carrier)) {
+          state.candidates[*candidate].narrow_use = true;
+          return;
+        }
         classify_child(alt.child, inputs, state);
       } else if constexpr (std::is_same_v<T, sirius::ast::unary_op>) {
         classify_child(alt.child, inputs, state);
@@ -557,8 +568,8 @@ std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& pl
     for (std::size_t i = begin; i < end; ++i) {
       auto const& candidate = state.candidates[i];
       bool const keep =
-        candidate.transport || (!candidate.boundary_restore &&
-                                (candidate.narrow_comparison || !candidate.evaluator_restore));
+        candidate.transport ||
+        (!candidate.boundary_restore && (candidate.narrow_use || !candidate.evaluator_restore));
       if (keep) { continue; }
       physical[candidate.column_index] = native[candidate.column_index];
       ++retracted;
