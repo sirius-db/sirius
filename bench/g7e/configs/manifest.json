@@ -1,0 +1,16 @@
+{
+  "checksums_sha256": {
+    "cold.yaml": "2ea66fda2273ee90a3a55a9815e015fcf65fa42bb58dcf4041c4c2e447da454e",
+    "hot.yaml": "67f74968c0b02bee9d7b846fca949550413d05944d06767bd5dc9e64699f9db6",
+    "pinned.yaml": "67f74968c0b02bee9d7b846fca949550413d05944d06767bd5dc9e64699f9db6"
+  },
+  "environment_flags": {},
+  "measured": false,
+  "operator_defaults": {
+    "enable_fused_scan_filter": true,
+    "enable_late_materialization": true,
+    "enable_low_cardinality_groupby": true
+  },
+  "pinning": "pinned.yaml is identical to hot.yaml; select host/GPU pinning separately in the runner.",
+  "source_commit": "6c53654c0498026d8b48daa7e1f19edd3c5ff988"
+}

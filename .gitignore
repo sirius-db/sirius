@@ -66,6 +66,9 @@ tools/log_analyzer/metrics/__pycache__/
 test/tpch_performance/__pycache__/
 test/tpch_performance/output/
 test/tpch_performance/log/
+bench/common/__pycache__/
+/test_datasets/gb300-replay-output/
+/test_datasets/g7e-replay-output/
 
 PR_digests/
 plans/

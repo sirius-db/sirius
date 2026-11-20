@@ -1,0 +1,155 @@
+# GB300 TPC-H benchmark snapshots
+
+## Replay from this PR
+
+Build the Sirius extension from this checkout with Pixi 0.78 or newer
+(`pixi run make`), and provide the TPC-H Parquet datasets at
+`/mnt/datasets/tpch_parquet_sf<SF>` (or set
+`DATASET_ROOT` to their parent directory). From the repository root, run:
+
+```bash
+bash bench/gb300/replay.sh 1000 cold
+bash bench/gb300/replay.sh 1000 hot
+bash bench/gb300/replay.sh 1000 pin
+```
+
+The script accepts SF100, SF300, SF1000, SF3000, and SF10000 for cold/hot and
+SF100 through SF3000 for host pin. It requires GB300 CDMM (`driver`) mode for
+Sirius and refuses to run in NUMA mode. Cold/hot execute all 22 queries twice
+with their saved YAMLs. Host pin executes all 22 queries once, per-query, with
+`--profile hot --pin host --pin-compression`; only `lineitem` and `orders` use
+the explicit Simpatico plans, matching the selected results. For SF10000, the
+script runs Q1–Q9 and Q11–Q22 with the regular config and Q10 separately with
+the saved 8 GiB hash-table config. This matches the composite saved totals.
+Output is timestamped under `test_datasets/gb300-replay-output/`; set
+`GB300_REPLAY_OUTPUT` to change that directory. Add `--dry-run` to print the
+commands without executing them. The replay script uses
+the local `test_datasets/.generation-tools/pixi` when present on this machine; set
+`PIXI_BIN` to select another Pixi installation.
+
+The Parquet datasets and historical Sirius binaries are not stored in this PR.
+The manifest records the source commits and binary checksums used for the saved
+measurements. Rebuilding this PR verifies the benchmark setup, but exact timings
+depend on the source revision, dataset layout, machine state, and driver mode.
+
+These are the selected GB300 measurements, primarily at Sirius commit
+`1dbb366baaf7bd26325ede685346ecb6d5fe7692`. The SF1000 host-pin result
+was updated from a run on commit `220d1447a60f443745f53196fc6c4bbd85478075`.
+The SF3000 cold and hot results were rerun on commit
+`dd588a0bc731304a92db86684bf4e8535d4f10a8`; its host-pin result was rerun
+on commit `56f49801607afbf1353ebded286e562c64012fe4`.
+The SF10000 cold and hot results were rerun on commit
+`6865c9dcf477c3948f944a0f9291f1fd68fc076f`.
+The cold/hot/per-query-pin
+snapshot uses one GPU and TPC-H Parquet at SF100, SF300, SF1000, SF3000, and SF10000; the
+concurrency snapshot below covers SF100, SF300, and SF1000. The configs are in
+`bench/gb300/configs/cold.yaml`,
+`hot.yaml`, `pinned.yaml`, and the two SF10k Q10 YAML files. The
+`--profile` option now preserves those YAML cache settings.
+
+The saved configs use the current names `scan_manager.backend: native` and
+`scan_manager.cache.mode: cucs`. The benchmarked versions spelled both values
+`sirius`; those spellings are aliases for the same backend and cache mode. The
+manifest retains the original config checksums separately from the checksums of
+the files in this PR. Sirius `main` now defaults to `native`, `cucs`, and LRU
+eviction; these configs keep the values explicit for reproducibility, including
+the cold config's intentional `idle` eviction. The old
+`SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`, and
+`SIRIUS_EXP_LOWCARD_GROUPBY` environment flags are no longer read; the matching
+SQL/YAML optimization settings default to enabled. The old
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` flag is also no longer read; eligible
+pinned Parquet columns are checked for uniqueness by default. Late
+materialization currently refuses host-tier pins, even though its setting is
+enabled. These config updates do not constitute a benchmark rerun.
+
+| Scale | Cold, iterations 0 / 1 (s) | Hot, iterations 0 / 1 (s) | Host pin (s) |
+| ---: | ---: | ---: | ---: |
+| SF100 | 7.862 / 7.777 | 6.484 / 5.532 | 1.612 |
+| SF300 | 20.477 / 20.386 | 15.258 / 13.389 | 3.273 |
+| SF1000 | 65.080 / 65.099 | 47.432 / 40.771 | 7.017 |
+| SF3000 | 187.668 / 185.831 | 146.419 / 118.721 | 21.927 |
+| SF10000 | 779.923 / 808.187 | 806.164 / 810.056 | Unavailable: Q13 host pin failed |
+
+Times sum the 22 query executions; setup, cache flushing, and pin/unpin time are
+excluded. Cold and hot use two iterations, spill compression, RA8, and no pinning.
+Cold drops the local dataset-file cache and resets the Sirius cache before each
+query. Hot groups iterations by query and uses LRU retention from its YAML.
+
+SF10000 cold and hot totals combine a 21-query run with a separate Q10 run using
+the saved 8 GiB build-hash-table limit. They are composite query-time sums, not
+uninterrupted 22-query session times. The regular cold and hot configs use the
+same settings at all five scales; the Q10 configs differ only by that hash
+limit. In the updated SF10000 runs, Q10 took 35.302984 / 32.995593 s cold and
+41.690828 / 31.833478 s hot.
+
+The SF100, SF300, SF1000, and SF3000 pin results use `bench/gb300/configs/pinned.yaml`, one hot-profile
+iteration, per-query host pinning, and Simpatico input compression. The pinned
+`lineitem` and `orders` plans are the repository's
+`src/compression/simpatico_codegen/plans/tpch_sf1000/lineitem.txt` and
+`orders.txt`. To replay the explicit-plan-only setup on current Sirius, set
+`SIRIUS_PIN_COMPRESSION_TABLES=lineitem,orders` when running `performance_test.py`;
+the other six tables then pin uncompressed instead of using newly available
+automatic plans. The updated SF1000 run used that allowlist and the saved pin
+config; its 22 query times sum to 7.017410 s. The updated SF3000 pin run used
+the same plan allowlist and summed to 21.926660 s. All 22 queries completed on
+Sirius without CPU fallback in these selected runs. At SF10000, per-query host
+pinning failed before Q13 executed:
+the 450 GiB host pool ran out of blocks after a 448.12 GiB lifetime peak. There
+is no selected SF10000 pin timing to report.
+
+Each `sf*/` directory contains the selected per-query CSVs. `manifest.json`
+records the exact totals, config paths, checksums, and the SF10000 pin failure.
+CSV line endings were normalized from CRLF to LF; the manifest retains both the
+original snapshot and current checksums. The SF1000 pin, SF3000, and SF10000
+cold/hot CSVs are selected replacements, with their source commits and
+superseded totals recorded separately in the manifest.
+The later SF10000 fresh-instance cold rerun remains outside this snapshot.
+SF100 and SF300 were copied to the same RAID dataset mount as the larger scales
+before their six runs. They used the same Sirius source commit, binary, configs,
+and Simpatico plans as the earlier selected runs.
+
+[Per-query Quent tier movements](quent-transfers/README.md) report how many
+bytes entered host and disk memory during the original SF1000, SF3000, and
+SF10000 query executions. Those trace counts have not been refreshed for the
+newer SF1000 pin, SF3000, or SF10000 cold/hot timings.
+
+The separate [host-cap spill sweep](../spill-sweep/README.md) runs each
+query in a fresh process at 32, 64, 128, 256, and 450 GiB of host capacity.
+It includes the runner, per-query CSVs, totals, and measurement notes for
+SF1000, SF3000, and SF10000. These runs use Sirius main `26b5caba` and are
+separate from the selected cold/hot/pin timing snapshots above.
+
+The [SF1000 host-pin cumulative ablation](../ablation/RESULTS.md) starts
+with type narrowing, compressed pinning, fused decode filtering, BUILD_PROBE,
+and dynamic filters all disabled, then enables them in that order. It includes
+the runner, six-stage and per-query results, and untimed path checks.
+
+## Host-pinned Parquet concurrency
+
+The [concurrency results](concurrency/summary.csv) add SF100, SF300, and SF1000
+with 1, 2, 4, 8, and 10 simultaneous query streams. Each stream executes all 22
+queries in its TPC-H throughput permutation with qgen-generated, stream-specific
+predicate values. This read-only test has no refresh stream and is not an
+official TPC-H throughput score. One run was measured per case.
+
+| Scale | 1 stream | 2 streams | 4 streams | 8 streams | 10 streams |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| SF100 | 12.416 | 18.096 | 22.509 | 25.371 | 25.473 |
+| SF300 | 5.725 | 7.415 | 8.508 | 8.807 | 8.619 |
+| SF1000 | 1.955 | 2.421 | 2.465 | 2.459 | 2.451 |
+
+Values are completed queries per second (`22 × streams / wall_seconds`), with
+upfront host pinning excluded. Before each case, a fresh Sirius process pins the
+union of all query columns in host memory using the Simpatico plans in
+`bench/sf1000-repro/plans/`, then runs its streams concurrently. Approximate pin
+times were 3.4 s at SF100, 10.0 s at SF300, and 39–40 s at SF1000. Throughput
+flattens by 8 streams in this single-pass sample.
+
+The [concurrency manifest](concurrency/manifest.json) records seed `1111221257`,
+the Sirius source commit and binary checksum, config and plan checksums, and the
+generated stream SQL checksums. Streams 1–8 in the 10-stream case were
+byte-identical to those in the earlier 1/2/4/8 cases. Each scale directory
+contains five per-query timing CSVs, one for each stream-count case.
+The initial run used a runner limited to 1/2/4/8 choices; the later 10-stream
+run used the same workload logic with 10 added as an option. Both runner hashes
+are recorded in the manifest.

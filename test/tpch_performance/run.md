@@ -419,7 +419,7 @@ result is not an official TPC-H throughput score.
 ```bash
 pixi run python test/tpch_performance/parquet_concurrency.py \
   --sf 100 --input test_datasets/tpch_parquet_sf100 \
-  --config bench/gb300-pin/config.yaml --output test_datasets/concurrency_sf100 \
+  --config bench/gb300/configs/pinned.yaml --output test_datasets/concurrency_sf100 \
   --concurrencies 1 2 4 8 10 --seed 1111221257
 ```
 
