@@ -19,8 +19,8 @@
 //
 // Round-trips every supported function_id through to_duckdb_function_name /
 // from_duckdb_function_name, verifies the substring/substr alias collapse
-// (D-SUB-1), the std::nullopt return on unknown names, and locks the 35-entry
-// ABI cardinality at compile time.
+// (D-SUB-1), the std::nullopt return on unknown names, and locks existing ABI
+// values plus the current cardinality at compile time.
 
 #include "catch.hpp"
 #include "expression/function_id.hpp"
@@ -42,8 +42,9 @@ using sirius::to_duckdb_function_name;
 static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
-static_assert(static_cast<uint16_t>(function_id::negate) + 1 == 35,
-              "sirius::function_id has exactly 35 entries (D-01 — locked ABI).");
+static_assert(static_cast<uint16_t>(function_id::negate) == 34,
+              "Existing function id values remain ABI-stable.");
+static_assert(static_cast<uint16_t>(function_id::array_extract) + 1 == 39);
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -426,6 +427,11 @@ TEST_CASE("ast_function_id - names resolve by argument count", "[ast_function_id
 
 TEST_CASE("ast_function_id - argument counts follow the GPU handlers", "[ast_function_id]")
 {
+  REQUIRE(from_duckdb_function_name("len", 1) == function_id::length);
+  REQUIRE(from_duckdb_function_name("list_aggr", 2) == function_id::list_aggr);
+  REQUIRE(from_duckdb_function_name("list_zip", 3) == function_id::list_zip);
+  REQUIRE(from_duckdb_function_name("list_transform", 2) == function_id::list_transform);
+  REQUIRE(from_duckdb_function_name("array_extract", 2) == function_id::array_extract);
   REQUIRE(sirius::accepts_argument_count(function_id::sub, 2));
   REQUIRE_FALSE(sirius::accepts_argument_count(function_id::sub, 1));
   REQUIRE_FALSE(sirius::accepts_argument_count(function_id::add, 1));
@@ -433,7 +439,7 @@ TEST_CASE("ast_function_id - argument counts follow the GPU handlers", "[ast_fun
   REQUIRE_FALSE(sirius::accepts_argument_count(function_id::negate, 2));
   REQUIRE(sirius::accepts_argument_count(function_id::abs, 1));
   REQUIRE(sirius::accepts_argument_count(function_id::concat, 5));
-  for (uint16_t raw = 0; raw <= static_cast<uint16_t>(function_id::negate); ++raw) {
+  for (uint16_t raw = 0; raw <= static_cast<uint16_t>(function_id::array_extract); ++raw) {
     auto const id = static_cast<function_id>(raw);
     CAPTURE(to_duckdb_function_name(id));
     REQUIRE_FALSE(sirius::accepts_argument_count(id, 0));
@@ -443,6 +449,7 @@ TEST_CASE("ast_function_id - argument counts follow the GPU handlers", "[ast_fun
 TEST_CASE("ast_function_id - to_duckdb_function_name rejects an id outside the enum",
           "[ast_function_id]")
 {
-  auto const past_end = static_cast<function_id>(static_cast<uint16_t>(function_id::negate) + 1);
+  auto const past_end =
+    static_cast<function_id>(static_cast<uint16_t>(function_id::array_extract) + 1);
   REQUIRE_THROWS_AS(to_duckdb_function_name(past_end), sirius::internal_exception);
 }

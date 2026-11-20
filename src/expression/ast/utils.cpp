@@ -90,6 +90,13 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
         return std::make_unique<node>(
           in_list{xform(alt.probe), rebuild_children(alt.values, xform), alt.negated});
       } else if constexpr (std::is_same_v<T, function_call>) {
+        if (alt.function() == function_id::list_transform) {
+          std::vector<std::unique_ptr<node>> children;
+          children.push_back(xform(alt.arguments()[0]));
+          children.push_back(clone(*alt.arguments()[1]));
+          return std::make_unique<node>(
+            function_call{alt.function(), std::move(children), alt.return_type()});
+        }
         return std::make_unique<node>(function_call{
           alt.function(), rebuild_children(alt.arguments(), xform), alt.return_type()});
       } else if constexpr (std::is_same_v<T, aggregate>) {

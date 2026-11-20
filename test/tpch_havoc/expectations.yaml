@@ -22,8 +22,3 @@ expectations:
     reason: "Unsupported window: only SUM, AVG, COUNT, MIN and MAX aggregates are planned"
     issue: 1745
     queries: [Q03_V09]
-
-  - outcome: plan_rejected
-    reason: "Unsupported expression in aggregate .*: list\\("
-    issue: 2290
-    queries: [Q01_V07]

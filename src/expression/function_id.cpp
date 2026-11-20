@@ -42,7 +42,7 @@ struct function_signature {
 
 constexpr std::size_t kVariadic = std::numeric_limits<std::size_t>::max();
 
-constexpr std::array<function_signature, 43> kSignatures = {{
+constexpr std::array<function_signature, 48> kSignatures = {{
   {"+", function_id::add, 2, 2},
   {"add", function_id::add, 2, 2},
   {"-", function_id::sub, 2, 2},
@@ -63,6 +63,7 @@ constexpr std::array<function_signature, 43> kSignatures = {{
   {"suffix", function_id::suffix, 2, 2},
   {"strlen", function_id::strlen, 1, 1},
   {"length", function_id::length, 1, 1},
+  {"len", function_id::length, 1, 1},
   // The GPU handler does not apply the optional fourth (options) argument.
   {"regexp_replace", function_id::regexp_replace, 3, 3},
   {"concat", function_id::concat, 1, kVariadic},  // concat() call — ignores NULL args
@@ -87,22 +88,57 @@ constexpr std::array<function_signature, 43> kSignatures = {{
   {"-", function_id::negate, 1, 1},
   {"subtract", function_id::negate, 1, 1},
   {"negate", function_id::negate, 1, 1},  // Substrait spelling
+  {"list_aggr", function_id::list_aggr, 2, 2},
+  {"list_zip", function_id::list_zip, 1, kVariadic},
+  {"list_transform", function_id::list_transform, 2, 2},
+  {"array_extract", function_id::array_extract, 2, 2},
 }};
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 35> kReverseTable = {
-  "+",          "-",         "*",           "/",           "//",
-  "%",          "substring", "~~",          "!~~",         "contains",
-  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
-  "concat",     "||",        "year",        "month",       "day",
-  "hour",       "minute",    "second",      "millisecond", "microsecond",
-  "date_trunc", "row",       "struct_pack", "error",       "constant_or_null",
-  "upper",      "lower",     "round",       "abs",         "-"};
+constexpr std::array<std::string_view, 39> kReverseTable = {"+",
+                                                            "-",
+                                                            "*",
+                                                            "/",
+                                                            "//",
+                                                            "%",
+                                                            "substring",
+                                                            "~~",
+                                                            "!~~",
+                                                            "contains",
+                                                            "prefix",
+                                                            "suffix",
+                                                            "strlen",
+                                                            "length",
+                                                            "regexp_replace",
+                                                            "concat",
+                                                            "||",
+                                                            "year",
+                                                            "month",
+                                                            "day",
+                                                            "hour",
+                                                            "minute",
+                                                            "second",
+                                                            "millisecond",
+                                                            "microsecond",
+                                                            "date_trunc",
+                                                            "row",
+                                                            "struct_pack",
+                                                            "error",
+                                                            "constant_or_null",
+                                                            "upper",
+                                                            "lower",
+                                                            "round",
+                                                            "abs",
+                                                            "-",
+                                                            "list_aggr",
+                                                            "list_zip",
+                                                            "list_transform",
+                                                            "array_extract"};
 
-static_assert(static_cast<std::size_t>(function_id::negate) + 1 == 35,
-              "function_id::negate must be the last entry; cardinality locked at 35.");
-static_assert(kReverseTable.size() == 35,
+static_assert(static_cast<std::size_t>(function_id::array_extract) + 1 == 39,
+              "New function ids must be appended to preserve the existing ABI.");
+static_assert(kReverseTable.size() == 39,
               "kReverseTable must have one slot per function_id value.");
 
 // Each id has exactly one row named as in kReverseTable, and rows sharing a name have disjoint

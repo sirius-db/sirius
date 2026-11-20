@@ -29,7 +29,7 @@ namespace sirius {
  *
  * Backing type uint16_t pinned as ABI (locked at compile time in
  * test_ast_aggregate.cpp). The integer values are part of the public ABI —
- * new entries go at the end, never in the middle. Cardinality is exactly 9.
+ * new entries go at the end, never in the middle. Cardinality is exactly 10.
  *
  * Mirrors the closed sirius::function_id enum precedent. See
  * https://github.com/sirius-db/sirius/issues/863.
@@ -44,6 +44,7 @@ enum class aggregate_id : uint16_t {
   avg,
   first,
   stddev_samp,
+  list,
 };
 
 /**

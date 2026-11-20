@@ -71,6 +71,7 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
     case sirius::aggregate_id::min: return cudf::aggregation::Kind::MIN;
     case sirius::aggregate_id::max: return cudf::aggregation::Kind::MAX;
     case sirius::aggregate_id::stddev_samp: return cudf::aggregation::Kind::M2;
+    case sirius::aggregate_id::list: return cudf::aggregation::Kind::COLLECT_LIST;
     case sirius::aggregate_id::avg:
     case sirius::aggregate_id::first: return std::nullopt;
   }
@@ -141,6 +142,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       children[0]->return_type().id() == sirius::type_id::HUGEINT;
 
     if (fid == sirius::aggregate_id::stddev_samp && aggr.distinct()) {
+      throw_unsupported_aggregate(fid, "with DISTINCT");
+    }
+    if (fid == sirius::aggregate_id::list && aggr.distinct()) {
       throw_unsupported_aggregate(fid, "with DISTINCT");
     }
 
