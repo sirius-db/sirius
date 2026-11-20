@@ -1,0 +1,4 @@
+-- Issue #2590; quarantine: mixed-type DECIMAL CASE arms; last failed: 1604e3fe.
+CREATE TABLE d (rid INTEGER, v DECIMAL(9,9));
+INSERT INTO d VALUES (0, -0.999999999), (1, 0.999999999);
+SELECT CASE WHEN rid = 0 THEN v ELSE CAST(0 AS DECIMAL(38,4)) END AS result FROM d ORDER BY rid;

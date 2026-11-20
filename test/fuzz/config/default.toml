@@ -11,12 +11,30 @@
 # passes the planner and still fails on the GPU: that is how to find checks worth
 # moving to plan time.
 
+[types]
+decimal_widths = ["DECIMAL(12,2)", "DECIMAL(18,4)", "DECIMAL(9,2)",
+                  "DECIMAL(9,9)", "DECIMAL(18,0)", "DECIMAL(18,18)"]
+hugeint = false
+uhugeint = false
+time = false
+timestamptz = false
+interval = false
+uuid = false
+blob = false
+enum = false
+array = true
+list = false
+struct = false
+
 [features]
-window_functions = false
+window_functions = true
+window_gaps = false
+window_cast_tiebreaks = true  # cast order keys for unsigned and narrow DECIMAL columns
+float_exact_keys = false
 distinct = true
-grouping_sets = false
-full_join = false
-cross_join = false
+grouping_sets = true
+full_join = false  # f564c820; join truth table also found FULL ON TRUE/OR/one-table planner declines
+cross_join = true  # 53/55 focused tagged queries OK; Cartesian input product is capped
 types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
          "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
          "FLOAT", "DOUBLE", "DECIMAL", "DATE",
@@ -25,22 +43,35 @@ types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
 [features.set_ops]
 union_all = true
 union = true
-except = false
-intersect = false
+except = true
+intersect = true
 
 [features.joins]
 types = ["inner", "left", "right", "semi", "anti"]
 inequality = true
 null_safe_keys = true     # IS NOT DISTINCT FROM keys
-max_tables = 4
+max_tables = 6
+cartesian_max_rows = 50000
+chain_max_rows = 200000  # worst-case rows from inner/left/right joins in a 4+ table chain
+any_join = true
+any_mixed = false
+any_join_share = 1.0  # bounded to small inputs; enough emissions for campaign coverage
+self_join = true
+self_join_share = 0.2
+grouped_inputs = true
+star_share = 0.3
+expression_keys = true
+mixed_integer_keys = false
+on_filters = false
 
 [features.subqueries]
 exists = true
 in = true
 scalar = true
 correlated = true
-uncorrelated_scalar = false   # plans as a cross product
-uncorrelated_exists = false
+correlated_in_share = 0.2   # preserve correlated IN without spending the default budget on one MARK gap
+uncorrelated_scalar = true
+uncorrelated_exists = true
 max_depth = 2
 
 [features.cte]
@@ -48,20 +79,32 @@ materialized = true
 
 [features.aggregates]
 functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nondeterministic
-distinct = "grouped_only"  # ungrouped COUNT(DISTINCT) runtime-falls-back (#1218)
+distinct = "on"  # off | grouped_only | on
+filter = true
+filter_subquery = false
+expression_args = false
+float_division_minmax = false
+hugeint_sum = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",
            "substring", "like", "contains", "prefix", "suffix", "strlen", "length",
            "regexp_replace", "concat", "concat_operator",
            "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
-           "date_trunc"]
+           "date_trunc", "upper", "round", "date_arith"]
+gap_enabled = []       # lower/abs/unary minus await the 95% admission gate
+variable_divisors = false  # avoid CPU division-by-zero skips in default runs
+regexp_backreferences = false  # #2650: repeated match backreference differs on GPU
+join_neighbours = false
+window_args = false
+date_trunc_units = ["day", "hour", "minute", "second"]  # year/quarter/month/week fall back
 [features.scalar_functions.weights]
 like = 2.0
 regexp_replace = 0.5
 
 [features.expressions]
 case = true
+simple_case = false
 coalesce = true
 in_list = true
 between = true
@@ -72,6 +115,18 @@ try = false
 [features.casts]
 enabled = true
 temporal_numeric = false  # declined in translate_cast
+float_to_int = false      # #2152: FLOAT -> BIGINT rounds negative half values differently
+integer_narrowing = false
+integer_sign_change = false
+integer_out_of_range = false  # gaps: unchecked overflow and signed-to-unsigned casts
+integer_to_varchar = true
+decimal_scale = false     # scale reduction rounds on CPU, truncates on GPU
+decimal_to_integer = true
+integer_to_decimal = true
+decimal_to_double = true
+date_timestamp = true
+timestamp_units = false   # second/millisecond casts truncate on GPU
+try_cast = true
 to_varchar = false        # runs on the GPU, but number formatting differs from DuckDB (mismatches)
 targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
 
@@ -101,18 +156,43 @@ tables = [3, 6]
 rows = [50, 2000]
 common_value_ratio = 0.4
 numeric_range = "small"   # DuckDB raises on integer overflow; keep values small
+null_density_extremes = true
 
 [data.strings]
-charset = "ascii"
+charset = "utf8"
 empty_string_ratio = 0.05
-max_len = 40
+max_len = 4095
 
 [data.edge_values]
 probability = 0.02
 int_extremes = true
-negative_zero = false
-nan_inf = false
-date_extremes = false
+negative_zero = true
+nan_inf = false   # nonfinite floating aggregates differ; gaps mode only
+rounding_ties = false
+date_extremes = true
+date_beyond_ns = false  # #2631: GPU date_trunc(minute) differs on 9999-12-31
+unicode_case = false
+long_string = false
+
+[data.pin]
+tables_fraction = 0.0
+tiers = ["gpu", "host"]
+compression = [false, true]
+
+[data.parquet]
+tables_fraction = 0.0
+row_group_size = 256
+timestamp_ms = false
+
+[data.large]
+fraction = 0.0
+fact_tables = [1, 2]
+fact_rows = [200000, 1000000]
+dims = [2, 4]
+null_fk_ratio = 0.03
+dangling_fk_ratio = 0.03
+skew = 0.35
+fact_bias = 0.5
 
 [oracle]
 float32_rel_tol = 1e-4
@@ -121,12 +201,15 @@ abs_tol = 1e-12
 ambiguity_filter = true
 known_issues = "known_issues.toml"
 query_timeout_seconds = 60
+cpu_timeout_seconds = 10
+tlp_share = 0.1
 reduce = true
 reduce_max_steps = 150
 reduce_sqlsmith = "auto"
 
 [variants]
 per_query = 2
+share = 1.0
 [variants.settings]
 expression_evaluator_strategy = ["materialize", "ast_interpret", "ast_jit"]
 hash_partition_bytes = [1048576, 8388608, 104857600]
@@ -136,5 +219,6 @@ max_sort_partition_bytes = [0, 1048576]
 [sirius]
 shell = "sirius-duckdb/build/release/duckdb"      # the DuckDB shell `pixi run make` builds
 extension = "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"   # loaded into the shell
-configs = ["test/cpp/integration/integration.yaml"]
+configs = ["test/cpp/integration/integration.yaml",     # alternated across workers
+           "test/fuzz/config/partition16k.yaml"]         # same, with 16 KiB hash partitions
 dataset_queries = 200

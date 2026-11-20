@@ -22,6 +22,10 @@ from .artifacts import write_json
 from .config import FuzzConfig, FUZZ_DIR
 
 
+# Verdicts of a query whose CPU and GPU results were both produced and compared.
+_COMPARED_VERDICTS = ("ok", "mismatch", "tlp_mismatch", "variant_mismatch", "ambiguous")
+
+
 @dataclass
 class QueryRecord:
     worker: int
@@ -32,6 +36,7 @@ class QueryRecord:
     reason: str = ""  # short classification text (error reason / setting name)
     detail: str = ""  # comparator detail or full error
     labels: list[str] = field(default_factory=list)
+    generator_tags: list[str] = field(default_factory=list)
     reduced_sql: str | None = None
     reduced_labels: list[str] = field(default_factory=list)
     reduced_reason: str = ""  # error reason reported by the reduced query
@@ -41,6 +46,8 @@ class QueryRecord:
     diffs: list[str] = field(default_factory=list)
     reduction_steps: int = 0
     comparison: str = "multiset"
+    tlp: dict[str, Any] = field(default_factory=dict)
+    phase_seconds: dict[str, float] = field(default_factory=dict)
     reduced_comparison: str = "multiset"  # mode the reducer accepted reduced_sql under
     evidence: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
@@ -106,7 +113,12 @@ EXTRA_REPRODUCERS = 5  # further query/dataset pairs kept under more/ per findin
 def signature(rec: QueryRecord) -> str:
     """Group errors by reason; keep each distinct mismatch or timeout input apart."""
     v = rec.verdict
-    if v in (Verdict.MISMATCH, Verdict.VARIANT_MISMATCH, Verdict.TIMEOUT):
+    if v in (
+        Verdict.MISMATCH,
+        Verdict.TLP_MISMATCH,
+        Verdict.VARIANT_MISMATCH,
+        Verdict.TIMEOUT,
+    ):
         variant = json.dumps(rec.variant, sort_keys=True) if rec.variant else ""
         key = f"{v}|{rec.dataset}|{rec.comparison}|{variant}|{rec.sql}"
     elif v in (
@@ -136,18 +148,31 @@ class Report:
         known_issues: list[KnownIssue],
         seed: int,
         mode: str = "correctness",
+        prior_signatures: set[str] | None = None,
     ):
         self.run_dir = run_dir
         self.cfg = config
         self.known = known_issues
         self.seed = seed
         self.mode = mode
+        self.prior_signatures = prior_signatures or set()
+        self.workers = 1
         self.counts: collections.Counter[str] = collections.Counter()
         self.cpu_error_reasons: collections.Counter[str] = collections.Counter()
         self.findings: dict[str, dict[str, Any]] = {}
         self.feature_stats: collections.Counter[str] = collections.Counter()
+        self.accounting: collections.Counter[str] = collections.Counter()
+        self.accounting_by_worker: dict[int, collections.Counter[str]] = {}
+        self.accounting_by_dataset: dict[str, collections.Counter[str]] = {}
+        self.coverage: dict[str, collections.Counter[str]] = {}
+        self.tlp_counts: collections.Counter[str] = collections.Counter()
+        self.loss_queries: collections.Counter[str] = collections.Counter()
+        self.loss_seconds: collections.Counter[str] = collections.Counter()
         self.started = time.time()
         self.queries = 0
+        self.generated = 0
+        self.restart_queries = 0
+        self.compared = 0
         self.status = "complete"
         self.stop_reason = "budget completed"
         self.worker_context: dict[int, dict[str, Any]] = {}
@@ -180,6 +205,30 @@ class Report:
                 verdict = Verdict.KNOWN_ISSUE
                 break
         self.counts[rec.verdict] += 1
+        # Judged as observed: a known mismatch still completed its comparison.
+        if observed.value in _COMPARED_VERDICTS:
+            self.compared += 1
+        else:
+            bucket = rec.verdict
+            self.loss_queries[bucket] += 1
+            self.loss_seconds[bucket] += rec.elapsed_cpu + rec.elapsed_gpu
+        self.accounting.update(rec.phase_seconds)
+        self.accounting_by_worker.setdefault(rec.worker, collections.Counter()).update(
+            rec.phase_seconds
+        )
+        self.accounting_by_dataset.setdefault(
+            rec.dataset, collections.Counter()
+        ).update(rec.phase_seconds)
+        if rec.phase_seconds.get("shell_restart", 0) > 0:
+            self.restart_queries += 1
+        if rec.tlp.get("eligible"):
+            self.tlp_counts["eligible"] += 1
+            if rec.tlp.get("checked"):
+                self.tlp_counts["checked"] += 1
+            elif rec.tlp.get("partition_status"):
+                self.tlp_counts["partition_failed"] += 1
+        for tag in set(rec.generator_tags):
+            self.coverage.setdefault(tag, collections.Counter())[rec.verdict] += 1
         if verdict == Verdict.CPU_ERROR:
             self.cpu_error_reasons[normalize_reason(rec.reason)] += 1
         self._log.write(json.dumps(asdict(rec), default=str) + "\n")
@@ -219,6 +268,18 @@ class Report:
 
     def add_feature_stats(self, stats: dict[str, int]) -> None:
         self.feature_stats.update(stats)
+
+    def add_accounting(
+        self, stats: dict[str, float], worker: int, dataset: str | None
+    ) -> None:
+        self.accounting.update(stats)
+        self.accounting_by_worker.setdefault(worker, collections.Counter()).update(
+            stats
+        )
+        if dataset:
+            self.accounting_by_dataset.setdefault(
+                dataset, collections.Counter()
+            ).update(stats)
 
     def dataset_path(self, stem: str) -> pathlib.Path:
         return self.run_dir / "datasets" / f"{stem}.sql"
@@ -439,6 +500,13 @@ class Report:
     def finish(self) -> dict[str, Any]:
         self._log.close()
         elapsed = time.time() - self.started
+        for worker in range(self.workers):
+            stats = self.accounting_by_worker.setdefault(worker, collections.Counter())
+            stats["idle_and_unattributed"] = max(0.0, elapsed - sum(stats.values()))
+        self.accounting["idle_and_unattributed"] = sum(
+            stats["idle_and_unattributed"]
+            for stats in self.accounting_by_worker.values()
+        )
         ordered = sorted(
             self.findings.values(),
             key=lambda f: (
@@ -463,9 +531,50 @@ class Report:
             "harness_errors": self.harness_errors,
             "counts": dict(self.counts),
             "findings": ordered,
+            "signatures": {
+                "total": len(ordered),
+                "known": sum(
+                    f["issue"] is not None
+                    or f["name"].rsplit("-", 1)[-1] in self.prior_signatures
+                    for f in ordered
+                ),
+                "new": sum(
+                    f["issue"] is None
+                    and f["name"].rsplit("-", 1)[-1] not in self.prior_signatures
+                    for f in ordered
+                ),
+            },
             "gaps": self.gaps(ordered),
             "cpu_error_reasons": self.cpu_error_reasons.most_common(20),
             "feature_stats": dict(sorted(self.feature_stats.items())),
+            "accounting": {k: round(v, 3) for k, v in sorted(self.accounting.items())},
+            "accounting_by_worker": {
+                str(w): {k: round(v, 3) for k, v in sorted(stats.items())}
+                for w, stats in sorted(self.accounting_by_worker.items())
+            },
+            "accounting_by_dataset": {
+                stem: {k: round(v, 3) for k, v in sorted(stats.items())}
+                for stem, stats in sorted(self.accounting_by_dataset.items())
+            },
+            "coverage": {
+                tag: {"queries": sum(counts.values()), "verdicts": dict(counts)}
+                for tag, counts in sorted(self.coverage.items())
+            },
+            "tlp": dict(self.tlp_counts),
+            "budget": {
+                "generated": self.generated,
+                "compared": self.compared,
+                "lost_queries": {
+                    **self.loss_queries,
+                    "interrupted": max(0, self.generated - self.queries),
+                    "restart": self.restart_queries,
+                },
+                "lost_seconds": {
+                    **{k: round(v, 3) for k, v in self.loss_seconds.items()},
+                    "interrupted": 0,
+                    "restart": round(self.accounting["shell_restart"], 3),
+                },
+            },
         }
         (self.run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, default=str)
@@ -568,6 +677,51 @@ class Report:
         lines.append(f"features emitted: {len(summary['feature_stats'])} distinct")
         if never and summary["queries"] >= 100:
             lines.append("WARNING enabled features never emitted: " + ", ".join(never))
+        lines.extend(["", "worker time accounting (seconds; summed across workers):"])
+        for name, seconds in summary["accounting"].items():
+            lines.append(f"  {name:24s} {seconds:9.2f}")
+        lines.append("per worker (CPU/GPU/load/other seconds):")
+        for worker, stats in summary["accounting_by_worker"].items():
+            lines.append(
+                f"  w{worker}: " + ", ".join(f"{k}={v:.2f}" for k, v in stats.items())
+            )
+        lines.append("per dataset (CPU/GPU/load/other seconds):")
+        for stem, stats in summary["accounting_by_dataset"].items():
+            lines.append(
+                f"  {stem}: " + ", ".join(f"{k}={v:.2f}" for k, v in stats.items())
+            )
+        lines.extend(["", "budget and yield:"])
+        budget = summary["budget"]
+        lines.append(f"  generated={budget['generated']} compared={budget['compared']}")
+        for name, n in sorted(budget["lost_queries"].items()):
+            lines.append(
+                f"  {name:24s} {n:6d} queries {budget['lost_seconds'][name]:9.2f}s"
+            )
+        sigs = summary["signatures"]
+        lines.append(
+            f"  signatures: {sigs['total']} total, {sigs['known']} known, {sigs['new']} new"
+        )
+        lines.append(
+            f"  TLP eligible={summary['tlp'].get('eligible', 0)} "
+            f"checked={summary['tlp'].get('checked', 0)} "
+            f"partition_failed={summary['tlp'].get('partition_failed', 0)}"
+        )
+        lines.extend(["", "coverage (queries, per 1000, OK/fallback/error %):"])
+        for tag in _CLAIMED_FEATURES(self.cfg):
+            entry = summary["coverage"].get(tag, {"queries": 0, "verdicts": {}})
+            n = entry["queries"]
+            verdicts = entry["verdicts"]
+            fallback = sum(
+                verdicts.get(k, 0)
+                for k in ("plan_fallback", "runtime_fallback", "known_issue")
+            )
+            error = n - verdicts.get("ok", 0) - fallback
+            denom = n or 1
+            lines.append(
+                f"  {tag:36s} {n:6d} {1000*n/max(summary['queries'],1):7.2f} "
+                f"{100*verdicts.get('ok',0)/denom:5.1f}/"
+                f"{100*fallback/denom:5.1f}/{100*error/denom:5.1f}"
+            )
         return "\n".join(lines) + "\n"
 
 
@@ -577,11 +731,24 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
     claimed = ["where"]
     if f.aggregates.functions:
         claimed += ["group_by", "ungrouped_aggregate"]
+    if f.aggregates.filter:
+        claimed.append("agg:filter")
     claimed += [f"join:{jt}" for jt in f.joins.types]
     if f.full_join:
         claimed.append("join:full")
     if f.cross_join:
         claimed.append("join:cross")
+    for switch, tag in (
+        (f.joins.any_join, "join:any"),
+        (f.joins.self_join, "join:self"),
+        (f.joins.grouped_inputs, "join:grouped_inputs"),
+        (f.joins.expression_keys, "join:expression_keys"),
+        (f.joins.on_filters, "join:on_filters"),
+        (f.joins.max_tables >= 5, "join:long_chain"),
+        (f.joins.star_share > 0, "join:star"),
+    ):
+        if switch:
+            claimed.append(tag)
     if f.grouping_sets:
         claimed.append("grouping_sets")
     if f.order_by.enabled:
@@ -594,20 +761,68 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
         ("UNION ALL", f.set_ops.union_all),
         ("UNION", f.set_ops.union),
         ("EXCEPT", f.set_ops.except_),
+        ("EXCEPT ALL", f.set_ops.except_),
         ("INTERSECT", f.set_ops.intersect),
+        ("INTERSECT ALL", f.set_ops.intersect),
     ):
         if on:
             claimed.append(f"setop:{op}")
     if f.subqueries.exists:
         claimed.append("subquery:exists")
+        claimed.append("subquery:not_exists")
     if f.subqueries.in_:
         claimed.append("subquery:in")
+        claimed.append("subquery:not_in")
     if f.subqueries.scalar:
         claimed.append("subquery:scalar")
     if f.window_functions:
         claimed.append("window")
     if f.distinct:
         claimed.append("distinct")
+    for name in ("upper", "round", "date_arith"):
+        if name in f.scalar_functions.enabled:
+            claimed.append(f"func:{name}")
+    if f.expressions.simple_case:
+        claimed.append("expr:simple_case")
+    for name in (
+        "integer_to_varchar",
+        "decimal_to_integer",
+        "integer_to_decimal",
+        "decimal_to_double",
+        "date_timestamp",
+        "try_cast",
+    ):
+        if getattr(f.casts, name):
+            claimed.append(f"cast_boundary:{name}")
+    if f.aggregates.expression_args:
+        claimed += [
+            "agg:expression:sum_case",
+            "agg:expression:count_case",
+            "agg:expression:cast_minmax",
+        ]
+    if f.aggregates.hugeint_sum:
+        claimed.append("agg:hugeint_sum")
+    accepted_widths = {
+        "DECIMAL(9,2)",
+        "DECIMAL(9,9)",
+        "DECIMAL(12,2)",
+        "DECIMAL(18,0)",
+        "DECIMAL(18,4)",
+        "DECIMAL(18,18)",
+    }
+    for width in cfg.types.decimal_widths:
+        if width not in accepted_widths:
+            continue
+        precision, scale = width.removeprefix("DECIMAL(").removesuffix(")").split(",")
+        claimed.append(f"type:decimal_{precision}_{scale}")
+    if cfg.data.strings.charset == "utf8":
+        claimed.append("type:varchar_utf8")
+    if cfg.data.strings.max_len > 40:
+        claimed.append("type:varchar_long_below_limit")
+    if cfg.data.null_density_extremes:
+        claimed += ["data:all_null_column", "data:no_null_column"]
+    if cfg.types.array:
+        claimed.append("type:array_projection")
     return claimed
 
 

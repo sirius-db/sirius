@@ -36,6 +36,8 @@ def gap_switch(default: Any, on: Any = True) -> Any:
 
     ``--mode gaps`` sets every such switch to ``on``.
     """
+    if isinstance(default, list):
+        return field(default_factory=lambda: list(default), metadata={"gaps": on})
     return field(default=default, metadata={"gaps": on})
 
 
@@ -43,8 +45,8 @@ def gap_switch(default: Any, on: Any = True) -> Any:
 class SetOps:
     union_all: bool = True
     union: bool = True
-    except_: bool = gap_switch(False)
-    intersect: bool = gap_switch(False)
+    except_: bool = True
+    intersect: bool = True
 
 
 @dataclass
@@ -54,7 +56,25 @@ class Joins:
     )
     inequality: bool = True
     null_safe_keys: bool = True
-    max_tables: int = 4
+    max_tables: int = 6
+    cartesian_max_rows: int = 50_000
+    # Worst-case rows a chain of four or more tables may produce through
+    # inner/left/right joins; further joins in the chain are semi/anti.
+    chain_max_rows: int = 200_000
+    any_join: bool = True
+    any_mixed: bool = gap_switch(
+        False
+    )  # #2153: mixed arithmetic ANY GPU AST type error
+    any_join_share: float = 1.0
+    self_join: bool = True
+    self_join_share: float = 0.2
+    grouped_inputs: bool = True
+    star_share: float = 0.3
+    expression_keys: bool = True
+    mixed_integer_keys: bool = gap_switch(False)
+    on_filters: bool = gap_switch(
+        False
+    )  # outer ON predicates hit arbitrary-join decline
 
 
 @dataclass
@@ -63,9 +83,9 @@ class Subqueries:
     in_: bool = True
     scalar: bool = True
     correlated: bool = True
-    # Uncorrelated scalar / EXISTS subqueries plan as cross products, which Sirius declines.
-    uncorrelated_scalar: bool = gap_switch(False)
-    uncorrelated_exists: bool = gap_switch(False)
+    correlated_in_share: float = gap_switch(0.2, 1.0)
+    uncorrelated_scalar: bool = True
+    uncorrelated_exists: bool = True
     max_depth: int = 2
 
 
@@ -79,7 +99,14 @@ class Aggregates:
     functions: list[str] = field(
         default_factory=lambda: ["sum", "count", "count_star", "min", "max", "avg"]
     )
-    distinct: str = gap_switch("grouped_only", "on")  # off | grouped_only | on
+    distinct: str = "on"  # off | grouped_only | on
+    filter: bool = True
+    filter_subquery: bool = gap_switch(False)
+    expression_args: bool = gap_switch(False)
+    float_division_minmax: bool = gap_switch(
+        False
+    )  # #2085/#2592: NaN from finite division
+    hugeint_sum: bool = gap_switch(False)
 
 
 @dataclass
@@ -111,16 +138,47 @@ class ScalarFunctions:
             "millisecond",
             "microsecond",
             "date_trunc",
+            "upper",
+            "round",
+            "date_arith",
         ]
     )
+    gap_enabled: list[str] = field(
+        default_factory=list, metadata={"gaps": ["lower", "abs", "negate"]}
+    )
+    variable_divisors: bool = gap_switch(
+        False
+    )  # default queries use nonzero integer divisors so DuckDB can evaluate them
+    regexp_backreferences: bool = gap_switch(
+        False
+    )  # #2650: regexp_replace \0\0 duplicates on CPU but not GPU
+    join_neighbours: bool = gap_switch(False)
+    window_args: bool = gap_switch(False)
     weights: dict[str, float] = field(
         default_factory=lambda: {"like": 2.0, "regexp_replace": 0.5}
+    )
+    # The GPU truncates to day and finer; year/quarter/month/week fall back.
+    date_trunc_units: list[str] = field(
+        default_factory=lambda: ["day", "hour", "minute", "second"],
+        metadata={
+            "gaps": [
+                "year",
+                "quarter",
+                "month",
+                "week",
+                "day",
+                "hour",
+                "minute",
+                "second",
+            ]
+        },
     )
 
 
 @dataclass
 class Expressions:
     case: bool = True
+    simple_case: bool = gap_switch(False)
     coalesce: bool = True
     in_list: bool = True
     between: bool = True
@@ -133,7 +191,25 @@ class Expressions:
 class Casts:
     enabled: bool = True
     temporal_numeric: bool = gap_switch(False)
-    to_varchar: bool = False  # runs on the GPU; number formatting differs (mismatches)
+    float_to_int: bool = gap_switch(False)  # #2152: FLOAT -> BIGINT rounds differently
+    integer_narrowing: bool = gap_switch(False)  # #2580: out-of-range wraps
+    integer_sign_change: bool = gap_switch(False)  # #2580: out-of-range wraps
+    integer_out_of_range: bool = gap_switch(False)  # #2580: out-of-range wraps
+    integer_to_varchar: bool = True
+    decimal_scale: bool = gap_switch(
+        False
+    )  # #2590: reducing scale rounds on CPU, truncates on GPU
+    decimal_to_integer: bool = True
+    integer_to_decimal: bool = True
+    decimal_to_double: bool = True
+    date_timestamp: bool = True
+    timestamp_units: bool = gap_switch(
+        False
+    )  # #2594: second/millisecond casts truncate on GPU
+    try_cast: bool = True
+    to_varchar: bool = gap_switch(
+        False
+    )  # float/decimal formatting or planner support differs
     targets: list[str] = field(
         default_factory=lambda: ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
     )
@@ -162,11 +238,16 @@ class Complexity:
 
 @dataclass
 class Features:
-    window_functions: bool = gap_switch(False)
+    window_functions: bool = True
+    window_gaps: bool = gap_switch(False)
+    # Cast unsigned and narrow DECIMAL columns into extra window order keys.
+    # Without it such scopes get rank().
+    window_cast_tiebreaks: bool = True
+    float_exact_keys: bool = gap_switch(False)
     distinct: bool = True
-    grouping_sets: bool = gap_switch(False)
+    grouping_sets: bool = True
     full_join: bool = gap_switch(False)
-    cross_join: bool = gap_switch(False)
+    cross_join: bool = True
     set_ops: SetOps = field(default_factory=SetOps)
     joins: Joins = field(default_factory=Joins)
     subqueries: Subqueries = field(default_factory=Subqueries)
@@ -212,18 +293,56 @@ class Nulls:
 
 @dataclass
 class Strings:
-    charset: str = "ascii"  # ascii | unicode
+    charset: str = "utf8"  # ascii | utf8 | unicode (case mapping gaps)
     empty_string_ratio: float = 0.05
-    max_len: int = 40
+    max_len: int = 4095
 
 
 @dataclass
 class EdgeValues:
     probability: float = 0.02
     int_extremes: bool = True
-    negative_zero: bool = False
-    nan_inf: bool = False
-    date_extremes: bool = False
+    negative_zero: bool = True
+    nan_inf: bool = gap_switch(
+        False
+    )  # #2085/#2592: nonfinite floating aggregates mismatch
+    rounding_ties: bool = gap_switch(False)
+    date_extremes: bool = True
+    date_beyond_ns: bool = gap_switch(
+        False
+    )  # #2631: GPU date_trunc(minute) differs on DATE 9999-12-31
+    unicode_case: bool = gap_switch(
+        False
+    )  # #2598: GPU case mapping differs for ß and İ
+    long_string: bool = gap_switch(False)
+
+
+@dataclass
+class Pin:
+    tables_fraction: float = 0.0
+    tiers: list[str] = field(default_factory=lambda: ["gpu", "host"])
+    compression: list[bool] = field(default_factory=lambda: [False, True])
+
+
+@dataclass
+class Parquet:
+    tables_fraction: float = 0.0
+    row_group_size: int = 256
+    timestamp_ms: bool = gap_switch(
+        False
+    )  # #2595: Parquet reads TIMESTAMP_MS as a drifting unit
+
+
+@dataclass
+class Large:
+    fraction: float = 0.0
+    fact_tables: list[int] = field(default_factory=lambda: [1, 2])
+    fact_rows: list[int] = field(default_factory=lambda: [200000, 1000000])
+    dims: list[int] = field(default_factory=lambda: [2, 4])
+    null_fk_ratio: float = 0.03
+    dangling_fk_ratio: float = 0.03
+    skew: float = 0.35
+    fact_bias: float = 0.5
 
 
 @dataclass
@@ -232,8 +351,12 @@ class Data:
     rows: list[int] = field(default_factory=lambda: [50, 2000])
     common_value_ratio: float = 0.4
     numeric_range: str = "small"  # small | medium | full
+    null_density_extremes: bool = True
     strings: Strings = field(default_factory=Strings)
     edge_values: EdgeValues = field(default_factory=EdgeValues)
+    pin: Pin = field(default_factory=Pin)
+    parquet: Parquet = field(default_factory=Parquet)
+    large: Large = field(default_factory=Large)
 
 
 @dataclass
@@ -244,6 +367,8 @@ class Oracle:
     ambiguity_filter: bool = True
     known_issues: str = "known_issues.toml"
     query_timeout_seconds: float = 60.0
+    cpu_timeout_seconds: float = 10.0
+    tlp_share: float = 0.1
     reduce: bool = True
     reduce_max_steps: int = 150
     reduce_sqlsmith: str = "auto"  # auto | off | on
@@ -252,6 +377,7 @@ class Oracle:
 @dataclass
 class Variants:
     per_query: int = 2
+    share: float = 1.0
     settings: dict[str, list[Any]] = field(
         default_factory=lambda: {
             "expression_evaluator_strategy": [
@@ -273,14 +399,56 @@ class Sirius:
         "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
     )
     configs: list[str] = field(
-        default_factory=lambda: ["test/cpp/integration/integration.yaml"]
+        default_factory=lambda: [
+            "test/cpp/integration/integration.yaml",
+            "test/fuzz/config/partition16k.yaml",
+        ]
     )
     dataset_queries: int = 200  # queries per generated dataset before regenerating
 
 
 @dataclass
+class TypeOptions:
+    # The truth table admits these widths for native scan, filter, group and join.
+    decimal_widths: list[str] = gap_switch(
+        [
+            "DECIMAL(12,2)",
+            "DECIMAL(18,4)",
+            "DECIMAL(9,2)",
+            "DECIMAL(9,9)",
+            "DECIMAL(18,0)",
+            "DECIMAL(18,18)",
+        ],
+        [
+            "DECIMAL(12,2)",
+            "DECIMAL(18,4)",
+            "DECIMAL(4,0)",
+            "DECIMAL(9,2)",
+            "DECIMAL(9,9)",
+            "DECIMAL(18,0)",
+            "DECIMAL(18,18)",
+            "DECIMAL(19,4)",
+            "DECIMAL(28,6)",
+            "DECIMAL(38,10)",
+        ],
+    )
+    hugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
+    uhugeint: bool = gap_switch(False)  # native scan rejects 128-bit storage
+    time: bool = False  # not generated: from_duckdb does not map TIME
+    timestamptz: bool = False  # not generated: from_duckdb does not map TIMESTAMPTZ
+    interval: bool = False  # not generated: from_duckdb does not map INTERVAL
+    uuid: bool = False  # not generated: from_duckdb does not map UUID
+    blob: bool = False  # not generated: from_duckdb does not map BLOB
+    enum: bool = False  # not generated: from_duckdb does not map ENUM
+    array: bool = True  # only simple scan/projection is generated
+    list: bool = False  # not generated: native scan rejects LIST
+    struct: bool = False  # not generated: native scan rejects STRUCT
+
+
+@dataclass
 class FuzzConfig:
     features: Features = field(default_factory=Features)
+    types: TypeOptions = field(default_factory=TypeOptions)
     nulls: Nulls = field(default_factory=Nulls)
     data: Data = field(default_factory=Data)
     oracle: Oracle = field(default_factory=Oracle)
@@ -302,6 +470,43 @@ class FuzzConfig:
 
     def validate(self) -> None:
         f = self.features
+        if not 0 <= f.subqueries.correlated_in_share <= 1:
+            raise ConfigError(
+                "features.subqueries.correlated_in_share must be between 0 and 1"
+            )
+        if f.joins.cartesian_max_rows < 1:
+            raise ConfigError("features.joins.cartesian_max_rows must be positive")
+        if f.joins.chain_max_rows < 1:
+            raise ConfigError("features.joins.chain_max_rows must be positive")
+        if not 0 <= f.joins.star_share <= 1:
+            raise ConfigError("features.joins.star_share must be between 0 and 1")
+        if not 0 <= f.joins.any_join_share <= 1:
+            raise ConfigError("features.joins.any_join_share must be between 0 and 1")
+        if not 0 <= f.joins.self_join_share <= 1:
+            raise ConfigError("features.joins.self_join_share must be between 0 and 1")
+        if not 1 <= f.joins.max_tables <= 6:
+            raise ConfigError("features.joins.max_tables must be between 1 and 6")
+        large = self.data.large
+        for name in (
+            "fraction",
+            "null_fk_ratio",
+            "dangling_fk_ratio",
+            "skew",
+            "fact_bias",
+        ):
+            value = getattr(large, name)
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ConfigError(f"data.large.{name} must be between 0 and 1")
+        if large.null_fk_ratio + large.dangling_fk_ratio >= 1:
+            raise ConfigError(
+                "data.large null and dangling FK ratios must sum to less than 1"
+            )
+        for name in ("fact_tables", "fact_rows", "dims"):
+            bounds = getattr(large, name)
+            if len(bounds) != 2 or bounds[0] < 1 or bounds[1] < bounds[0]:
+                raise ConfigError(
+                    f"data.large.{name} must be a positive [min, max] pair"
+                )
         if (
             not math.isfinite(self.oracle.query_timeout_seconds)
             or self.oracle.query_timeout_seconds <= 0
@@ -309,6 +514,13 @@ class FuzzConfig:
             raise ConfigError(
                 "oracle.query_timeout_seconds must be positive and finite"
             )
+        if (
+            not math.isfinite(self.oracle.cpu_timeout_seconds)
+            or self.oracle.cpu_timeout_seconds <= 0
+        ):
+            raise ConfigError("oracle.cpu_timeout_seconds must be positive and finite")
+        if not 0 <= self.oracle.tlp_share <= 1:
+            raise ConfigError("oracle.tlp_share must be between 0 and 1")
         if self.sirius.dataset_queries <= 0:
             raise ConfigError("sirius.dataset_queries must be positive")
         if f.aggregates.distinct not in ("off", "grouped_only", "on"):
@@ -317,6 +529,21 @@ class FuzzConfig:
             )
         if self.data.numeric_range not in ("small", "medium", "full"):
             raise ConfigError("data.numeric_range must be small | medium | full")
+        for name, fraction in (
+            ("data.pin.tables_fraction", self.data.pin.tables_fraction),
+            ("data.parquet.tables_fraction", self.data.parquet.tables_fraction),
+        ):
+            if not 0 <= fraction <= 1:
+                raise ConfigError(f"{name} must be between 0 and 1")
+        if self.data.pin.tables_fraction and (
+            not self.data.pin.tiers
+            or any(t not in ("gpu", "host") for t in self.data.pin.tiers)
+            or not self.data.pin.compression
+            or any(not isinstance(v, bool) for v in self.data.pin.compression)
+        ):
+            raise ConfigError("data.pin needs gpu/host tiers and compression choices")
+        if self.data.parquet.row_group_size < 1:
+            raise ConfigError("data.parquet.row_group_size must be positive")
         if self.oracle.reduce_sqlsmith not in ("auto", "off", "on"):
             raise ConfigError("oracle.reduce_sqlsmith must be auto | off | on")
         for name, rng in (
@@ -331,9 +558,23 @@ class FuzzConfig:
         from . import sqltypes
 
         sqltypes.types_from_names(f.types)
+        widths = sqltypes.types_from_names(self.types.decimal_widths)
+        if not widths or any(
+            t.kind != "decimal"
+            or not 1 <= t.precision <= 38
+            or not 0 <= t.scale <= t.precision
+            for t in widths
+        ):
+            raise ConfigError("types.decimal_widths needs valid DECIMAL(p,s) widths")
         sqltypes.types_from_names(f.casts.targets)
+        if self.data.strings.charset not in ("ascii", "utf8", "unicode"):
+            raise ConfigError("data.strings.charset must be ascii | utf8 | unicode")
+        if not 1 <= self.data.strings.max_len <= 65537:
+            raise ConfigError("data.strings.max_len must be between 1 and 65537")
         if self.variants.per_query < 0:
             raise ConfigError("variants.per_query must be >= 0")
+        if not 0 <= self.variants.share <= 1:
+            raise ConfigError("variants.share must be between 0 and 1")
 
 
 # Keys that are Python keywords carry a trailing underscore in the dataclasses.
@@ -377,6 +618,7 @@ _TYPE_NAMES: dict[str, type] = {
     "str": str,
     "list[str]": list,
     "list[int]": list,
+    "list[bool]": list,
     "list[Any]": list,
     "dict[str, float]": dict,
     "dict[str, list[Any]]": dict,

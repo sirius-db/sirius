@@ -50,6 +50,7 @@ SMALLINT = SqlType("SMALLINT", "int", True, 16)
 INTEGER = SqlType("INTEGER", "int", True, 32)
 BIGINT = SqlType("BIGINT", "int", True, 64)
 HUGEINT = SqlType("HUGEINT", "int", True, 128)
+UHUGEINT = SqlType("UHUGEINT", "int", False, 128)
 UTINYINT = SqlType("UTINYINT", "int", False, 8)
 USMALLINT = SqlType("USMALLINT", "int", False, 16)
 UINTEGER = SqlType("UINTEGER", "int", False, 32)
@@ -62,6 +63,7 @@ TIMESTAMP_S = SqlType("TIMESTAMP_S", "timestamp")
 TIMESTAMP_MS = SqlType("TIMESTAMP_MS", "timestamp")
 TIMESTAMP_NS = SqlType("TIMESTAMP_NS", "timestamp")
 VARCHAR = SqlType("VARCHAR", "varchar")
+INTEGER_ARRAY_3 = SqlType("INTEGER[3]", "array")
 
 
 def decimal_type(precision: int, scale: int) -> SqlType:
@@ -82,6 +84,7 @@ _BY_NAME: dict[str, tuple[SqlType, ...]] = {
     "INTEGER": (INTEGER,),
     "BIGINT": (BIGINT,),
     "HUGEINT": (HUGEINT,),
+    "UHUGEINT": (UHUGEINT,),
     "UTINYINT": (UTINYINT,),
     "USMALLINT": (USMALLINT,),
     "UINTEGER": (UINTEGER,),
@@ -95,14 +98,20 @@ _BY_NAME: dict[str, tuple[SqlType, ...]] = {
     "TIMESTAMP_MS": (TIMESTAMP_MS,),
     "TIMESTAMP_NS": (TIMESTAMP_NS,),
     "VARCHAR": (VARCHAR,),
+    "INTEGER[3]": (INTEGER_ARRAY_3,),
 }
 
 
-def types_from_names(names: list[str]) -> list[SqlType]:
+def types_from_names(
+    names: list[str], decimal_widths: list[str] | None = None
+) -> list[SqlType]:
     """Expand config type names; unknown names raise so a typo cannot silently drop coverage."""
     out: list[SqlType] = []
     for name in names:
         key = name.upper()
+        if key == "DECIMAL" and decimal_widths is not None:
+            out.extend(types_from_names(decimal_widths))
+            continue
         if key.startswith("DECIMAL(") and key.endswith(")"):
             p, s = key[8:-1].split(",")
             out.append(decimal_type(int(p), int(s)))
@@ -172,6 +181,8 @@ def render_literal(value: Any, typ: SqlType) -> str:
         return f"CAST(TIMESTAMP '{text}' AS {typ.name})"
     if typ.kind == "varchar":
         return sql_string(str(value))
+    if typ.kind == "array":
+        return "[" + ",".join("NULL" if v is None else str(v) for v in value) + "]"
     raise ValueError(f"cannot render literal of type {typ}")
 
 
@@ -197,4 +208,6 @@ def render_insert_value(value: Any, typ: SqlType) -> str:
         return "TIMESTAMP '" + value.strftime("%Y-%m-%d %H:%M:%S.%f") + "'"
     if typ.kind == "varchar":
         return sql_string(str(value))
+    if typ.kind == "array":
+        return "[" + ",".join("NULL" if v is None else str(v) for v in value) + "]"
     raise ValueError(f"cannot render value of type {typ}")

@@ -751,6 +751,68 @@ class ToolTests(unittest.TestCase):
                 validate_limits(argparse.Namespace(timeout=value))
 
 
+class DeadGpuRuntimeTests(unittest.TestCase):
+    """A shell whose GPU runtime has failed is replaced, not queried again."""
+
+    GONE = (
+        "Invalid Input Error: Sirius GPU runtime is unavailable after a mandatory cleanup "
+        "failure or fatal device error; CPU execution continues. Restart the process"
+    )
+
+    def _session(self, tmp, replies):
+        from siriusfuzz.session import ShellResult
+
+        class FakeShell:
+            alive = True
+            starts = 0
+
+            def execute(self, sql, timeout):
+                if sql.startswith("SET "):
+                    return ShellResult("ok")
+                status, error = replies.pop(0)
+                return ShellResult(status, error=error)
+
+            def kill(self):
+                self.alive = False
+
+        session = Session("shell", None, None, pathlib.Path(tmp), 0)
+        fake = session.shell = FakeShell()
+
+        def start():
+            fake.alive = True
+            fake.starts += 1
+
+        session._start = start
+        return session, fake
+
+    def test_stale_runtime_error_reruns_the_query_on_a_fresh_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, fake = self._session(tmp, [("error", self.GONE), ("ok", "")])
+            out = session.run("SELECT 1", gpu=True, timeout=60)
+            self.assertEqual(out.status, "ok")
+            self.assertEqual((fake.starts, session.restarts, fake.alive), (1, 1, True))
+
+    def test_fatal_error_costs_the_shell_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fatal = "Sirius GPU execution failed: Sirius CUDA context unavailable: x"
+            session, fake = self._session(tmp, [("error", fatal), ("ok", "")])
+            out = session.run("SELECT 1", gpu=True, timeout=60)
+            self.assertEqual(out.status, "error")
+            self.assertFalse(fake.alive)
+            self.assertEqual(session.run("SELECT 1", gpu=True, timeout=60).status, "ok")
+            self.assertEqual(fake.starts, 1)
+
+    def test_query_that_breaks_a_fresh_runtime_keeps_its_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, fake = self._session(
+                tmp, [("error", self.GONE), ("error", self.GONE)]
+            )
+            out = session.run("SELECT 1", gpu=True, timeout=60)
+            self.assertEqual(out.status, "error")
+            self.assertEqual(fake.starts, 1)
+            self.assertFalse(fake.alive)
+
+
 @unittest.skipUnless(SHELL, "no DuckDB shell available")
 class ShellTests(unittest.TestCase):
     def test_statements_results_errors_restarts_and_crashes(self):

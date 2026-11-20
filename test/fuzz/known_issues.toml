@@ -9,3 +9,27 @@ sql_pattern = "count\\(DISTINCT"
 issue = "sirius-db/sirius#1218"
 note = "ungrouped COUNT(DISTINCT) is not supported by the GPU runtime (thrown by sirius_physical_ungrouped_aggregate)"
 verdicts = ["runtime_fallback"]
+
+[[issue]]
+pattern = "^MARK join mixing a null-safe \\(IS NOT DISTINCT FROM\\) key with a plain key not supported in GPU$"
+issue = "sirius-db/sirius#1886"
+note = "correlated IN becomes a MARK join with mixed null-safe and plain keys"
+verdicts = ["plan_fallback"]
+
+[[issue]]
+pattern = "^Parquet (?:column '[^']+' has unqualified type drift from TIMESTAMP_MS to TIMESTAMP|pruning column '[^']+' has unqualified type drift)$"
+issue = "sirius-db/sirius#2595"
+note = "TIMESTAMP_MS Parquet unit drift"
+verdicts = ["gpu_error"]
+
+[[issue]]
+pattern = "gpu_decode_table: validity row_offset \\(\\d+\\) not byte-aligned"
+issue = "sirius-db/sirius#1667"
+note = "large-tier validity mask offset"
+verdicts = ["gpu_error"]
+
+[[issue]]
+pattern = "TopN expects a single input batch per execution"
+issue = "sirius-db/sirius#2596"
+note = "TopN batch contract"
+verdicts = ["gpu_error"]

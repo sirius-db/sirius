@@ -58,7 +58,7 @@ class FakeSession:
     def mark_auxiliary(self, operation, input_sql):
         self.auxiliary = {"operation": operation, "input_sql": input_sql}
 
-    def load_dataset(self, ds, alias, permutation_seed=None):
+    def load_dataset(self, ds, alias, permutation_seed=None, variants=None):
         pass
 
     def use(self, alias):
@@ -79,6 +79,100 @@ class FakeSession:
         if not gpu:
             return RunResult("ok", ResultSet(cols, list(cpu_rows)))
         return self.gpu_behaviour(sql, cols, cpu_rows, self)
+
+
+class TlpCheck(unittest.TestCase):
+    """The partition check on a query whose base comparison already passed."""
+
+    def check(self, gpu_behaviour):
+        from siriusfuzz.schema_gen import Column, Dataset, Table
+
+        cfg = load_config(None, ["oracle.tlp_share=1.0"])
+        ev = Evaluator(cfg, FakeSession(gpu_behaviour), lambda m: None)
+        table = Table("t0", [Column("k", st.INTEGER), Column("c0_i", st.INTEGER)])
+        ev.set_dataset(Dataset([table], 0), "main")
+        col = ColumnRef("a0", "c0_i", st.INTEGER)
+        query = Select([SelectItem(col, "c0")], TableRef("t0", "a0"))
+        cols = [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)]
+        rec = QueryRecord(0, "d", 0, query.sql(), Verdict.OK.value)
+        ev._check_tlp(rec, query, ResultSet(cols, [(1, 1.5), (2, 2.5)]))
+        return rec
+
+    def test_partitions_that_add_up_keep_ok(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows) if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part))
+
+        rec = self.check(gpu)
+        self.assertEqual(rec.verdict, Verdict.OK.value)
+        self.assertTrue(rec.tlp["checked"])
+
+    def test_lost_row_is_a_tlp_mismatch(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows)[:1] if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part))
+
+        self.assertEqual(self.check(gpu).verdict, Verdict.TLP_MISMATCH.value)
+
+    def test_declined_partition_leaves_the_verdict_alone(self):
+        rec = self.check(gpu_plan_fallback)
+        self.assertEqual(rec.verdict, Verdict.OK.value)
+        self.assertFalse(rec.tlp["checked"])
+        self.assertEqual(rec.tlp["partition_status"], "error")
+
+    def test_failed_partition_is_a_finding_on_the_partition_query(self):
+        outcomes = {
+            Verdict.CRASH: RunResult("crash", error="Segmentation fault", exitcode=-11),
+            Verdict.TIMEOUT: RunResult("timeout"),
+            Verdict.GPU_INTERNAL_ERROR: RunResult(
+                "error", error="Invalid Error: CUDA error: an illegal memory access"
+            ),
+        }
+        for verdict, outcome in outcomes.items():
+            with self.subTest(verdict=verdict):
+                rec = self.check(lambda sql, cols, rows, s: outcome)
+                self.assertEqual(rec.verdict, verdict.value)
+                self.assertTrue(verdict.is_finding())
+                self.assertIn('"c0_i" < ', rec.sql)
+                self.assertEqual(rec.sql, rec.tlp["partition_sql"][0])
+                self.assertNotIn("WHERE", rec.tlp["base_sql"])
+
+    def test_replay_reruns_the_saved_partitions(self):
+        def gpu(sql, cols, rows, s):
+            part = list(rows)[:1] if "NOT" in sql else []
+            return RunResult("ok", ResultSet(cols, part if "WHERE" in sql else rows))
+
+        found = self.check(gpu)
+        self.assertEqual(found.verdict, Verdict.TLP_MISMATCH.value)
+        ev = Evaluator(load_config(None), FakeSession(gpu), lambda m: None)
+        ev.variants = {}
+        ev.replay_mode = "multiset"
+        base = found.sql
+        self.assertEqual(ev.evaluate(None, base, 0, "replay", 0).verdict, "ok")
+        ev.forced_tlp = {k: found.tlp[k] for k in ("predicate", "partition_sql")}
+        self.assertEqual(
+            ev.evaluate(None, base, 0, "replay", 0).verdict,
+            Verdict.TLP_MISMATCH.value,
+        )
+
+
+class DropDataset(unittest.TestCase):
+    def test_parquet_copies_are_removed_with_the_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Session.__new__(Session)
+            session.db_dir = pathlib.Path(tmp) / "db"
+            session.db_dir.mkdir()
+            session.attached = {"d0": session.db_dir / "d0.duckdb"}
+            session.cpu_mirror_aliases = set()
+            session.dataset_pins = {}
+            session.shell = SimpleNamespace(alive=False)
+            folder = session._parquet_dir("d0")
+            folder.mkdir(parents=True)
+            (folder / "t0.parquet").write_bytes(b"x")
+            (folder.parent / "d0.sql").write_text("-- kept")
+            session.drop_dataset("d0")
+            self.assertFalse(folder.exists())
+            self.assertTrue((folder.parent / "d0.sql").exists())
 
 
 def gpu_ok(sql, cols, rows, s):
@@ -744,6 +838,9 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(untagged.verdict, Verdict.RUNTIME_FALLBACK.value)
             self.assertEqual(wrong.verdict, Verdict.KNOWN_ISSUE.value)
             summary = report.finish()
+            # The known mismatch was compared; the two fallbacks were not.
+            self.assertEqual(summary["budget"]["compared"], 1)
+            self.assertEqual(summary["budget"]["lost_queries"]["known_issue"], 1)
             runtime = summary["gaps"]["runtime"]
             self.assertEqual(len(runtime), 1)
             self.assertEqual(runtime[0]["count"], 2)

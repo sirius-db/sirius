@@ -34,7 +34,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(None)
         self.assertEqual(cfg.source_path, str(DEFAULT_CONFIG))
         self.assertEqual(cfg.to_dict(), load_config(DEFAULT_CONFIG).to_dict())
-        self.assertFalse(cfg.features.window_functions)
+        self.assertTrue(cfg.features.window_functions)
 
     def test_default_file_lists_every_key(self):
         # The shipped file is where a feature gets flipped on when Sirius supports it,
@@ -63,8 +63,11 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(switch)
         self.assertEqual(f.aggregates.distinct, "on")
         self.assertEqual(cfg.variants.per_query, 0)
-        # Correctness knobs, data shape and the CPU-vs-GPU oracle are untouched.
-        self.assertFalse(f.casts.to_varchar)
+        # Gaps mode also explores float/decimal formatting casts.
+        self.assertTrue(f.casts.to_varchar)
+        self.assertFalse(default.data.edge_values.nan_inf)
+        self.assertTrue(cfg.data.edge_values.nan_inf)
+        # Data shape and the CPU-vs-GPU oracle are untouched.
         self.assertEqual(f.types, default.features.types)
         self.assertEqual(cfg.oracle, default.oracle)
         # Every preset names a real key and changes it from the shipped default.
@@ -127,7 +130,7 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config(None, ["features.expressions.try=true"])
         again = tomllib.loads(cfg.to_toml())
         self.assertTrue(again["features"]["expressions"]["try"])
-        self.assertEqual(again["features"]["set_ops"]["except"], False)
+        self.assertEqual(again["features"]["set_ops"]["except"], True)
 
     def test_bad_type_name(self):
         with self.assertRaises(ValueError):
