@@ -946,6 +946,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "Grouping sets without GROUP BY keys are not supported in GPU aggregates");
   }
 
+  // An exported state is DuckDB's own intermediate, which the GPU kernels do not produce.
+  for (auto const& expression : op.expressions) {
+    if (expression->Cast<duckdb::BoundAggregateExpression>().StateExportMode() ==
+        duckdb::AggregateStateExportMode::STATE_EXPORT) {
+      throw duckdb::NotImplementedException(
+        "Aggregate EXPORT_STATE is not supported on the GPU (falling back to CPU)");
+    }
+  }
+
   // Validate FILTER lowering before child planning; DISTINCT remains supported only in COUNT.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();

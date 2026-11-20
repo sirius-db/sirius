@@ -2903,6 +2903,16 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                      "grouped FIRST is not supported over several grouping sets");
   }
 
+  SECTION("an exported aggregate state is refused")
+  {
+    auto const* query = GENERATE("SELECT id, first(val) EXPORT_STATE FROM big_left GROUP BY id",
+                                 "SELECT id, first(val ORDER BY val) EXPORT_STATE FROM big_left "
+                                 "GROUP BY id",
+                                 "SELECT id, sum(val) EXPORT_STATE FROM big_left GROUP BY id",
+                                 "SELECT sum(val) EXPORT_STATE FROM big_left");
+    require_rejected(query, "Aggregate EXPORT_STATE is not supported on the GPU");
+  }
+
   SECTION("an ordered FIRST is refused when both aggregate rewriters leave it in place")
   {
     // EXPRESSION_REWRITER and AGGREGATE_FUNCTION_REWRITER each turn this into arg_min_null, which

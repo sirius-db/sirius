@@ -408,6 +408,7 @@ std::unique_ptr<node> translate_aggregate(duckdb::BoundAggregateExpression const
 {
   // FILTERed aggregates have already been consumed and translated
   if (aggr.GetFilter()) { return nullptr; }
+  if (aggr.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT) { return nullptr; }
   auto agg_id_opt =
     sirius::from_duckdb_aggregate_name(aggr.Function().GetName().GetIdentifierName());
   if (!agg_id_opt.has_value()) { return nullptr; }

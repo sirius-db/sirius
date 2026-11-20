@@ -84,6 +84,7 @@ bool reusable_aggregate(Expression const& expression)
   if (expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) { return false; }
   auto const& aggregate = expression.Cast<duckdb::BoundAggregateExpression>();
   if (aggregate.IsDistinct() || aggregate.GetFilter() || aggregate.GetOrderBys() ||
+      aggregate.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT ||
       aggregate.GetChildren().size() != 1) {
     return false;
   }
