@@ -1,0 +1,7 @@
+run,host_cap_gib,successful_queries,gpu_to_host_bytes,host_to_disk_bytes,gpu_to_disk_bytes
+initial,128,22,110759374211,34712981196,0
+initial,256,22,93622288647,0,0
+repeat_1,128,22,113264853229,36667284114,0
+repeat_1,256,22,136667605767,0,0
+repeat_2,128,22,146292950203,35068292258,0
+repeat_2,256,22,136501947591,0,0

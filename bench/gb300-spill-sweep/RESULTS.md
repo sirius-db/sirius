@@ -5,7 +5,7 @@ TPC-H queries ran once, unpinned and in a fresh Sirius process, at each of
 the 32, 64, 128, 256, and 450 GiB host caps. The base was
 `bench/gb300-cold/config.yaml` with spill compression enabled. Only the host
 capacity, proportional initial pool count, and Quent output path changed.
-All 330 final query runs completed with confirmed GPU plans; no query-specific
+All 330 selected query runs completed with confirmed GPU plans; no query-specific
 config was needed. SF10000 needed a 65,536 soft open-file limit because of
 its many Parquet parts. An initial Q1 attempt at the OS default 1,024-file
 limit failed, was archived, and was rerun successfully.
@@ -23,8 +23,8 @@ Exact byte counts and per-query values are in the linked CSVs.
 | SF1000 | 450 GiB | 112.5 GiB | 22/22 | 29.548 | 0.000 | 0.000 |
 | SF3000 | 32 GiB | 8 GiB | 22/22 | 62.758 | 38.565 | 67.280 |
 | SF3000 | 64 GiB | 16 GiB | 22/22 | 99.005 | 39.598 | 0.000 |
-| SF3000 | 128 GiB | 32 GiB | 22/22 | 105.486 | 34.149 | 0.000 |
-| SF3000 | 256 GiB | 64 GiB | 22/22 | 127.282 | 0.000 | 0.000 |
+| SF3000 | 128 GiB | 32 GiB | 22/22 | 136.246 | 32.660 | 0.000 |
+| SF3000 | 256 GiB | 64 GiB | 22/22 | 127.127 | 0.000 | 0.000 |
 | SF3000 | 450 GiB | 112.5 GiB | 22/22 | 118.695 | 0.000 | 0.000 |
 | SF10000 | 32 GiB | 8 GiB | 22/22 | 533.031 | 411.147 | 349.675 |
 | SF10000 | 64 GiB | 16 GiB | 22/22 | 633.883 | 441.663 | 269.134 |
@@ -52,14 +52,26 @@ The prior GPU→HOST totals were 29.520 and 27.106 GiB, respectively. The prior
 query records remain archived alongside the selected rerun records as
 `q<NN>.previous-20261120/` on the GB300 machine.
 
-The SF3000 128 and 256 GiB rows were likewise rerun on November 19, 2026
-(CST), with the same Sirius main commit, built extension, and config. All 44
-queries completed on GPU; their three transition counts were checked against
-the Quent traces. The prior 128 GiB totals were 103.153 GiB GPU→HOST and
-32.329 GiB HOST→DISK; the prior 256 GiB GPU→HOST total was 87.193 GiB. The
-new 256 GiB GPU→HOST total is 127.282 GiB, with most of the increase in Q7,
-Q14, and Q18. The earlier query records are preserved as
-`q<NN>.previous-20261120/` alongside the selected reruns.
+The SF3000 128 and 256 GiB cases were each rerun twice on November 19, 2026
+(CST), with the same Sirius main commit, built extension, and config. All 88
+rerun queries completed on GPU. The latest 44 counts were checked against
+their Quent traces and are selected in the main table. The three measurements
+show material run-to-run variation in GPU→HOST movement:
+
+| SF3000 measurement | 128 GiB GPU→HOST | 128 GiB HOST→DISK | 256 GiB GPU→HOST | 256 GiB HOST→DISK |
+| --- | ---: | ---: | ---: | ---: |
+| Initial | 103.153 | 32.329 | 87.193 | 0 |
+| First repeat | 105.486 | 34.149 | 127.282 | 0 |
+| Second repeat (selected) | 136.246 | 32.660 | 127.127 | 0 |
+
+All values are GiB; GPU→DISK was zero in all six cases. Exact bytes are in
+[the repeat comparison CSV](results/sf3000/repeats-128-256.csv). The initial
+and first-repeat query records remain on the GB300 machine as
+`q<NN>.previous-20261120/` and `q<NN>.previous-repeat1-20261120/` alongside
+the selected records. Compared with the first repeat, most of the 128 GiB
+GPU→HOST increase came from Q7 (+18.510 GiB), Q3 (+8.387 GiB), and Q21
+(+4.472 GiB). At 256 GiB, Q21 rose by 10.480 GiB while Q18 fell by 10.301
+GiB, leaving the total nearly unchanged.
 
 Exact results: [SF1000](results/sf1000/per-query.csv),
 [SF3000](results/sf3000/per-query.csv), and
