@@ -35,12 +35,13 @@ namespace {
 
 constexpr int threads_per_block = 256;
 
-// Mirrors DuckDB's RoundOperatorPrecision, including its handling of non-finite results.
+// Mirrors DuckDB's RoundOperatorPrecision, including its handling of non-finite results. For a
+// precision of 1 to 22 the product x * modifier can round onto a midpoint that x itself is not on:
+// 2.675 * 100 becomes 267.5 while the stored 2.675 is below it. The sign of the product's rounding
+// error, which fma yields exactly, then decides the direction instead of the tie rule.
 template <typename T, bool NegativePrecision>
-__global__ void round_floating_point_kernel(T const* input,
-                                            T* output,
-                                            cudf::size_type num_rows,
-                                            double modifier)
+__global__ void round_floating_point_kernel(
+  T const* input, T* output, cudf::size_type num_rows, double modifier, int32_t precision)
 {
   auto const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   for (auto i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < num_rows;
@@ -55,7 +56,20 @@ __global__ void round_floating_point_kernel(T const* input,
       }
       if (!::isfinite(rounded)) { rounded = x; }
     } else {
-      rounded = ::round(x * modifier) / modifier;
+      // __dmul_rn is never contracted into a fused multiply-add, so the midpoint test sees the
+      // rounded product.
+      auto const scaled = __dmul_rn(x, modifier);
+      double error      = 0;
+      if (precision > 0 && precision <= 22 && ::fabs(scaled - ::trunc(scaled)) == 0.5) {
+        error = ::fma(x, modifier, -scaled);
+      }
+      double nearest;
+      if (error != 0) {
+        nearest = error < 0 ? ::floor(scaled) : ::ceil(scaled);
+      } else {
+        nearest = ::round(scaled);
+      }
+      rounded = nearest / modifier;
       if (!::isfinite(rounded)) { rounded = x; }
     }
     output[i] = static_cast<T>(rounded);
@@ -76,10 +90,10 @@ void launch_round(cudf::column_view const& input,
     (static_cast<int64_t>(input.size()) + threads_per_block - 1) / threads_per_block);
   if (negative_precision) {
     round_floating_point_kernel<T, true><<<num_blocks, threads_per_block, 0, stream.get()>>>(
-      input.data<T>(), output.data<T>(), input.size(), modifier);
+      input.data<T>(), output.data<T>(), input.size(), modifier, precision);
   } else {
     round_floating_point_kernel<T, false><<<num_blocks, threads_per_block, 0, stream.get()>>>(
-      input.data<T>(), output.data<T>(), input.size(), modifier);
+      input.data<T>(), output.data<T>(), input.size(), modifier, precision);
   }
   CUDF_CUDA_TRY(cudaGetLastError());
 }

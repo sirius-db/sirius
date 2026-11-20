@@ -412,8 +412,13 @@ from the operand's, stay on the CPU. `negate` is an AST breaker. Tests are tagge
 `round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
 reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
 `round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
-zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
-identical to DuckDB. The precision must be a constant INTEGER.
+zero. For `n` from 1 to 22 the product `x * 10^n` can round onto a midpoint that `x` itself is not
+on: `2.675 * 100` is `267.5` while the stored `2.675` is just below it. The kernel then takes the
+product's rounding error from `fma(x, 10^n, -product)` and rounds to the side the exact product
+lies on, so `round(2.675::DOUBLE, 2)` is `2.67`; a zero error is a true tie and rounds away from
+zero. The product is computed with `__dmul_rn` so that nvcc cannot contract it into a fused
+multiply-add. A non-finite result yields the input; a negative `n` whose `10^-n` overflows rounds
+finite values to 0. The output is bit identical to DuckDB. The precision must be a constant INTEGER.
 DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
 
 ### Absolute value
