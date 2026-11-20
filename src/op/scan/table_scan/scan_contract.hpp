@@ -502,6 +502,8 @@ struct iceberg_delete_inventory {
   std::vector<entry> entries;
   // Present only when the snapshot has live equality deletes and they were planned.
   std::optional<iceberg_equality_plan> equality;
+  /// What iceberg_metadata() read these entries by: a path, or a quoted catalog table name.
+  std::string table;
 };
 
 struct pre_capture_result {

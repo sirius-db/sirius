@@ -6,16 +6,19 @@
  */
 
 #include "catch.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"
 #include "op/scan/field_id_mapping.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "planner/connector_registry.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
+#include "utils/mock_iceberg_rest_catalog.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
@@ -4445,4 +4448,234 @@ TEST_CASE("S3 metadata-only provenance skips pruned sources and data readers",
   REQUIRE(output);
   CHECK(output->num_rows() == 8193);
   CHECK(reader->reader_calls() == 0);
+}
+
+TEST_CASE("S3 Iceberg catalog table runs on the GPU with catalog-vended credentials",
+          "[s3][integration][iceberg][catalog]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  // No programmatic or static S3 credential: every read must use what the catalog vends.
+  sirius_config_env_guard config_env(*env);
+  duckdb::DBConfig db_config{{{"allow_unsigned_extensions", duckdb::Value::BOOLEAN(true)}}, false};
+  duckdb::DuckDB db(nullptr, &db_config);
+  duckdb::Connection con(db);
+  load_sirius_extension(db);
+  setenv("SIRIUS_DISABLE", "1", 1);
+  for (auto const* extension : {"httpfs", "avro", "iceberg"}) {
+    auto loaded = con.Query(std::string("LOAD ") + extension);
+    if (sirius::test::s3::skip_or_fail_unless(
+          loaded && !loaded->HasError(),
+          "the httpfs, avro and iceberg extensions must be installed"))
+      return;
+  }
+
+  // The committed local table, relocated under the bucket by rewriting its paths.
+  auto const source = std::string{"test/cpp/integration/data/iceberg_v1"};
+  auto const prefix = std::string{"catalog-form/fruit"};
+  auto const remote = "s3://" + env->bucket + "/" + prefix;
+  sirius::test::scratch_dir directory("s3_catalog");
+  auto const command = "python3 -B test/cpp/integration/data/generate_remote_table_fixture.py " +
+                       source + " '" + directory.path().string() + "' '" + remote + "'";
+  REQUIRE(std::system(command.c_str()) == 0);
+  for (auto const& entry : fs::recursive_directory_iterator(directory.path())) {
+    if (!entry.is_regular_file()) continue;
+    auto const key = prefix + "/" + fs::relative(entry.path(), directory.path()).generic_string();
+    if (sirius::test::s3::skip_or_fail_unless(
+          sirius::test::put_s3_test_object(key, read_binary_file(entry.path())),
+          "managed S3 backend required for the catalog table upload"))
+      return;
+  }
+
+  std::map<std::string, std::string> vended{{"s3.access-key-id", env->access_key},
+                                            {"s3.secret-access-key", env->secret_key},
+                                            {"s3.endpoint", env->endpoint},
+                                            {"s3.path-style-access", "true"},
+                                            {"client.region", env->region}};
+  if (!env->session_token.empty()) vended["s3.session-token"] = env->session_token;
+  sirius::test::mock_iceberg_rest_catalog catalog(std::move(vended));
+  auto const metadata = [&](char const* name) {
+    return sirius::test::mock_iceberg_rest_catalog::table{
+      remote + "/metadata/" + name, read_text_file(directory.path() / "metadata" / name)};
+  };
+  catalog.put("ns", "fruit", metadata("v1.metadata.json"));
+  catalog.put("ns", "fruit_again", metadata("v1.metadata.json"));
+  catalog.put("ns", "empty", metadata("empty.metadata.json"));
+  require_query_ok(con,
+                   "ATTACH '' AS lake (TYPE ICEBERG, AUTHORIZATION_TYPE 'none', ENDPOINT '" +
+                     catalog.uri() + "')");
+  // A broader static secret with wrong credentials stays in place throughout: the vended secret
+  // is more specific and must win, for the statement and for connections reading on its behalf.
+  require_query_ok(con,
+                   "CREATE SECRET broad (TYPE S3, KEY_ID 'wrong', SECRET 'wrong', REGION " +
+                     sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) +
+                     ", URL_STYLE 'path', USE_SSL " +
+                     (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")");
+
+  using rows_t = std::vector<std::vector<std::string>>;
+  rows_t const fruit{{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}};
+  auto const query = std::string{"SELECT fruit, count FROM lake.ns.fruit ORDER BY count"};
+  auto const data_file =
+    remote + "/data/00000-0-a1b2c3d4-0001-0001-0001-000000000003-00001.parquet";
+  auto const no_snapshot =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_no_snapshot_id);
+  auto const stats = [&] { return sirius::test::get_transparent_execution_stats(con); };
+  // One GPU execution reading only @p file, with @p walks delete-discovery walks and no fallback.
+  auto const expect_gpu =
+    [&](std::string const& sql, rows_t const& expected, uint64_t walks, std::string const& file) {
+      INFO(sql);
+      auto const before = stats();
+      auto result       = require_query_ok(con, sql);
+      auto const after  = stats();
+      CHECK(collect_rows(*result) == expected);
+      CHECK(after.executions == before.executions + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + walks);
+      auto reads = after.parquet_reader_calls;
+      for (auto const& [file, count] : before.parquet_reader_calls)
+        reads[file] -= count;
+      std::erase_if(reads, [](auto const& entry) { return entry.second == 0; });
+      CHECK(reads.size() == 1);
+      CHECK(reads.count(file) == 1);
+    };
+  // DuckDB without Sirius reads the committed local table these fixtures were relocated from.
+  auto const cpu_rows = [&](std::string const& table) {
+    duckdb::DuckDB cpu_db(nullptr, &db_config);
+    duckdb::Connection cpu(cpu_db);
+    require_query_ok(cpu, "LOAD avro");
+    require_query_ok(cpu, "LOAD iceberg");
+    return collect_rows(*require_query_ok(cpu,
+                                          "SELECT fruit, count FROM iceberg_scan('" + table +
+                                            "/metadata/v1.metadata.json') ORDER BY count"));
+  };
+
+  set_gpu_execution(con, true);
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto const loads_before = catalog.load_table_requests();
+  expect_gpu(query, fruit, 1, data_file);
+  // The binding and the delete discovery each resolve the table through the catalog.
+  CHECK(catalog.load_table_requests() - loads_before >= 2);
+  CHECK(cpu_rows(source) == fruit);
+
+  // httpfs is loaded only for the catalog client and the secret type: s3:// stays GPU-only.
+  set_gpu_execution(con, false);
+  auto refused = con.Query(query);
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  CHECK(refused->GetError().find("S3 is GPU-only") != std::string::npos);
+  // The refusal leaves the connection usable, and each table vends its own secret.
+  set_gpu_execution(con, true);
+  expect_gpu("SELECT count(*) FROM lake.ns.fruit a JOIN lake.ns.fruit_again b USING (fruit)",
+             {{"3"}},
+             2,
+             data_file);
+  require_query_ok(con, "SET sirius_s3_header_signing=true");
+  expect_gpu(query, fruit, 1, data_file);
+  require_query_ok(con, "SET sirius_s3_header_signing=false");
+
+  // A V3 deletion-vector table: its manifests and its Puffin file are opened by path, after
+  // the binding, with the vended credentials.
+  {
+    sirius::test::scratch_dir dv_directory("s3_catalog_dv");
+    auto const dv_prefix = std::string{"catalog-form-dv"};
+    auto const dv_remote = "s3://" + env->bucket + "/" + dv_prefix + "/dv_bounded";
+    auto const generate  = "python3 -B test/cpp/integration/data/generate_inventory_fixtures.py '" +
+                          dv_directory.path().string() + "' 's3://" + env->bucket + "/" +
+                          dv_prefix + "'";
+    REQUIRE(std::system(generate.c_str()) == 0);
+    auto const local = dv_directory.path() / "dv_bounded";
+    for (auto const& entry : fs::recursive_directory_iterator(local)) {
+      if (!entry.is_regular_file()) continue;
+      auto const key =
+        dv_prefix + "/" + fs::relative(entry.path(), dv_directory.path()).generic_string();
+      REQUIRE(sirius::test::put_s3_test_object(key, read_binary_file(entry.path())));
+    }
+    catalog.put("ns",
+                "dv",
+                {dv_remote + "/metadata/v1.metadata.json",
+                 read_text_file(local / "metadata/v1.metadata.json")});
+    rows_t const kept{{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+    expect_gpu(
+      "SELECT fruit, count FROM lake.ns.dv ORDER BY count", kept, 1, dv_remote + "/data/a.parquet");
+    CHECK(cpu_rows("test/cpp/integration/data/iceberg_v3_deletion_vector") == kept);
+  }
+
+  // An internal connection reads by path with the secret of the statement that opened it; an
+  // ordinary second connection has no credential for the same path.
+  auto const manifest = remote + "/metadata/a1b2c3d4-0001-0001-0001-000000000002-m0.avro";
+  auto const by_path  = "SELECT count(*) FROM read_avro('" + manifest + "')";
+  require_query_ok(con, "BEGIN TRANSACTION");
+  expect_gpu(query, fruit, 1, data_file);
+  {
+    auto internal = duckdb::SiriusContext::open_internal_connection(*con.context);
+    auto read     = internal.Query(by_path);
+    REQUIRE(read);
+    INFO((read->HasError() ? read->GetError() : ""));
+    REQUIRE_FALSE(read->HasError());
+    CHECK(read->Fetch()->GetValue(0, 0).GetValue<int64_t>() == 1);
+    duckdb::Connection unrelated(db);
+    auto denied = unrelated.Query(by_path);
+    REQUIRE(denied);
+    CHECK(denied->HasError());
+  }
+  // A connection reading for this statement resolves its vended secret and signs the same way.
+  require_query_ok(con, "SET sirius_s3_header_signing=true");
+  {
+    duckdb::Connection reader(db);
+    auto const state = duckdb::get_sirius_connection_state(*reader.context);
+    REQUIRE(state);
+    state->set_internal_outer(con.context);
+    auto const resolved = sirius::io::s3::resolve_duckdb_s3_secret(*reader.context, manifest, {});
+    CHECK(resolved.access_key == env->access_key);
+    CHECK(resolved.s3_signing_mode == cucascade::io::object_store_config::signing_mode::header);
+  }
+  require_query_ok(con, "SET sirius_s3_header_signing=false");
+  require_query_ok(con, "COMMIT");
+
+  // The lookup accepts scan info only on a catalog table's binding, with the extension's callbacks.
+  con.BeginTransaction();
+  auto logical = con.ExtractPlan(query);
+  auto* node   = logical.get();
+  while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+    node = node->children.front().get();
+  auto& get = node->Cast<duckdb::LogicalGet>();
+  REQUIRE(get.function.function_info);
+  CHECK(sirius::planner::lookup_connector(get, *con.context) != nullptr);
+  auto const table_entry       = get.function.get_table_entry;
+  get.function.get_table_entry = nullptr;
+  CHECK(sirius::planner::lookup_connector(get, *con.context) == nullptr);
+  get.function.get_table_entry = table_entry;
+  logical.reset();
+  con.Rollback();
+  con.BeginTransaction();
+  auto by_path_plan =
+    con.ExtractPlan("SELECT fruit FROM iceberg_scan('" + source + "/metadata/v1.metadata.json')");
+  node = by_path_plan.get();
+  while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
+    node = node->children.front().get();
+  auto& path_get = node->Cast<duckdb::LogicalGet>();
+  CHECK(sirius::planner::lookup_connector(path_get, *con.context) != nullptr);
+  struct foreign_info : duckdb::TableFunctionInfo {};
+  path_get.function.function_info = duckdb::make_shared_ptr<foreign_info>();
+  CHECK(sirius::planner::lookup_connector(path_get, *con.context) == nullptr);
+  by_path_plan.reset();
+  con.Rollback();
+
+  // A table without a snapshot publishes no snapshot identity, so the GPU path declines it.
+  require_query_ok(con, "SET enable_duckdb_fallback=true");
+  auto const before_empty = stats();
+  auto empty             = require_query_ok(con, "SELECT fruit FROM lake.ns.empty WHERE count > 1");
+  auto const after_empty = stats();
+  CHECK(collect_rows(*empty).empty());
+  CHECK(after_empty.semantic_declines[no_snapshot] ==
+        before_empty.semantic_declines[no_snapshot] + 1);
+  CHECK(after_empty.executions == before_empty.executions);
+  // Without the fallback the refusal names the table, not arguments the query never wrote.
+  require_query_ok(con, "SET enable_duckdb_fallback=false");
+  auto unread = con.Query("SELECT fruit FROM lake.ns.empty WHERE count > 1");
+  REQUIRE(unread->HasError());
+  CHECK(unread->GetError().find(R"(Iceberg table "lake"."ns"."empty" has no committed snapshot)") !=
+        std::string::npos);
+  CHECK(unread->GetError().find("snapshot_from_id") == std::string::npos);
 }

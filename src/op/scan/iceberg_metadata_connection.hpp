@@ -28,7 +28,7 @@ namespace sirius::op::scan {
  * @brief The one place Sirius opens a DuckDB connection to read Iceberg metadata while planning.
  *
  * Iceberg's bind callback identifies the selected snapshot. The separate metadata
- * query reads its manifests by that ID, using the same table path. If the snapshot
+ * query reads its manifests by that ID, using the same table path or catalog name. If the snapshot
  * was expired before the metadata query, Iceberg reports the missing ID.
  * The path must keep identifying the same table during the query. When the loaded
  * extension accepts expected_table_uuid, the query passes the bound table UUID and
