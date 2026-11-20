@@ -19,8 +19,8 @@ ratio. No `--profile` override is used.
 From the repository root:
 
 ```bash
-tmux new-session -d -s gb300-device-spill-sf10k-32gb \
-  'bash bench/gb300-device-spill-sweep/run_sf.sh 10000 --caps 32'
+tmux new-session -d -s gb300-device-spill-sf10k \
+  'bash bench/gb300-device-spill-sweep/run_sf.sh 10000'
 ```
 
 Progress is in
@@ -38,3 +38,4 @@ query: GPU→HOST, HOST→DISK, and GPU→DISK. A move is counted at the destina
 representation size, so compression can change its byte count. They are not
 peak memory occupancy. Failed queries have no movement totals and are excluded
 from the aggregate; compare successful-query counts before comparing caps.
+The measured results and per-query files are linked from [RESULTS.md](RESULTS.md).
