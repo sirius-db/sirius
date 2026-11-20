@@ -706,19 +706,6 @@ struct TrailingArgStorage {
 
 // The tree's shape: op kinds and child port names, which (with the dtypes and decode shape) are
 // everything the decode renderer reads.
-void append_tree_shape(std::string& key, jit::FusedTree const& node)
-{
-  key += std::to_string(static_cast<int>(node.op));
-  key += '(';
-  for (auto const& [port, child] : node.children) {
-    key += port;
-    key += '=';
-    append_tree_shape(key, *child);
-    key += ';';
-  }
-  key += ')';
-}
-
 // The rendered decode kernel for a tree shape, rendered once per process. The source is invariant
 // in the row count (chunk_id comes from blockIdx.x), so it is rendered for one chunk.
 std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
@@ -729,7 +716,7 @@ std::shared_ptr<cdj::DecodeKernelSpec const> rendered_decode_spec(
   std::vector<std::int32_t> const& undivided)
 {
   std::string key;
-  append_tree_shape(key, tree);
+  jit::append_tree_shape(key, tree);
   key += '|';
   key += cxx_dtype;
   key += '|';
