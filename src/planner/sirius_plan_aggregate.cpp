@@ -277,10 +277,11 @@ void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
     // Rewriting the column would change what any other reader sees.
     if (uses != aggregates.size()) { continue; }
 
-    auto& sort_key     = projection.expressions[index]->Cast<duckdb::BoundFunctionExpression>();
-    auto& terms        = sort_key.GetChildrenMutable();
-    auto inline_key    = sort_key.Copy();
-    auto& inline_terms = inline_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+    // Owns the sort key until the iteration ends, so `terms` never outlives its node.
+    auto const sort_key = std::move(projection.expressions[index]);
+    auto& terms         = sort_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+    auto inline_key     = sort_key->Copy();
+    auto& inline_terms  = inline_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
     for (std::size_t term = 0; term < terms.size(); term += 2) {
       auto const column = term == 0 ? index : projection.expressions.size();
       inline_terms[term] =

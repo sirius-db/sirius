@@ -17,7 +17,8 @@
 #pragma once
 
 // sirius
-#include "expression/ast/node.hpp"  // sirius::ast::node
+#include "expression/ast/node.hpp"            // sirius::ast::node
+#include "expression/ast/order_modifier.hpp"  // sirius::ast::order_modifier
 
 // standard library
 #include <memory>
