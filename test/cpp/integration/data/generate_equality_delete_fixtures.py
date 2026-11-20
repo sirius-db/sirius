@@ -11,6 +11,12 @@ are listed beside the right ones, so a failure says which rule broke:
 
   iceberg_v2_eq_wide_delete_file    The delete file stores the whole row; equality_ids=[1].
                                     Matching on every column deletes nothing.
+  iceberg_v2_eq_with_positional     A position delete (row 3, date) and an equality delete
+                                    (banana) apply to the same data file. Positions name rows
+                                    by where they sit in the file, so they must be applied
+                                    before the equality delete removes a row above them: a
+                                    reader that runs them the other way round deletes
+                                    elderberry instead of date.
   iceberg_v2_eq_manifest_rewrite    A rewritten manifest: its own sequence number is 3, but one
                                     entry keeps data sequence number 1. Comparing the MANIFEST
                                     number skips a delete that applies.
@@ -355,6 +361,49 @@ def build_wide_delete_file():
         ],
     )
     t.commit("delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, None, [1])])])
+    t.finish()
+
+
+def build_with_positional():
+    import pyarrow as pa
+
+    t = Table("iceberg_v2_eq_with_positional", fruit_schema())
+    data = t.parquet(
+        "data-1.parquet",
+        [
+            (
+                1,
+                "fruit",
+                pa.string(),
+                ["apple", "banana", "cherry", "date", "elderberry"],
+            ),
+            (2, "count", pa.int64(), [1, 2, 3, 4, 5]),
+        ],
+    )
+    t.commit("append", [("m-data-1.avro", 0, 0, [(1, None, data, 0, None, None)])])
+    # Reserved field IDs of a position delete file.
+    positional = t.parquet(
+        "delete-pos-2.parquet",
+        [
+            (2147483546, "file_path", pa.string(), [data[0]]),
+            (2147483545, "pos", pa.int64(), [3]),
+        ],
+    )
+    equality = t.parquet("delete-eq-2.parquet", [(1, "fruit", pa.string(), ["banana"])])
+    t.commit(
+        "delete",
+        [
+            (
+                "m-delete-2.avro",
+                1,
+                0,
+                [
+                    (1, None, positional, 1, None, None),
+                    (1, None, equality, 2, None, [1]),
+                ],
+            )
+        ],
+    )
     t.finish()
 
 
@@ -889,6 +938,10 @@ PARTITION_SHAPES = [
 FIXTURES = {
     "iceberg_v2_eq_wide_delete_file": (
         build_wide_delete_file,
+        [("apple", 1), ("cherry", 3), ("elderberry", 5)],
+    ),
+    "iceberg_v2_eq_with_positional": (
+        build_with_positional,
         [("apple", 1), ("cherry", 3), ("elderberry", 5)],
     ),
     "iceberg_v2_eq_manifest_rewrite": (
