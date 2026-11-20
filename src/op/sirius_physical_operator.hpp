@@ -523,15 +523,17 @@ struct input_stats {
   /// captured at stats-build time. Used by sirius_gpu_scan_operator's memory
   /// estimate to skip the decode-expansion factor on already-resident inputs.
   bool resident = false;
+  /// Whether scan normalization will cast a selected column of the resident scan input.
+  bool needs_carrier_conversion = false;
   /// Transient working set needed to materialize the input. Defaults to zero
   /// for callers that only provide the historical byte basis.
   std::size_t working_set_bytes = 0;
-  /// Whether scan normalization will cast a selected column of the resident scan input.
-  bool needs_carrier_conversion = false;
   /// Exact bytes of the destinations those casts allocate (see
   /// scan_operator_input::conversion_destination_bytes). Zero means unknown; the scan estimate
   /// then keeps its conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes = 0;
+  /// Total rows of the input batches, or nullopt if any batch cannot provide a count.
+  std::optional<std::size_t> rows = std::nullopt;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
