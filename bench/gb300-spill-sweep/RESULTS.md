@@ -23,8 +23,8 @@ Exact byte counts and per-query values are in the linked CSVs.
 | SF1000 | 450 GiB | 112.5 GiB | 22/22 | 29.548 | 0.000 | 0.000 |
 | SF3000 | 32 GiB | 8 GiB | 22/22 | 62.758 | 38.565 | 67.280 |
 | SF3000 | 64 GiB | 16 GiB | 22/22 | 99.005 | 39.598 | 0.000 |
-| SF3000 | 128 GiB | 32 GiB | 22/22 | 103.153 | 32.329 | 0.000 |
-| SF3000 | 256 GiB | 64 GiB | 22/22 | 87.193 | 0.000 | 0.000 |
+| SF3000 | 128 GiB | 32 GiB | 22/22 | 105.486 | 34.149 | 0.000 |
+| SF3000 | 256 GiB | 64 GiB | 22/22 | 127.282 | 0.000 | 0.000 |
 | SF3000 | 450 GiB | 112.5 GiB | 22/22 | 118.695 | 0.000 | 0.000 |
 | SF10000 | 32 GiB | 8 GiB | 22/22 | 533.031 | 411.147 | 349.675 |
 | SF10000 | 64 GiB | 16 GiB | 22/22 | 633.883 | 441.663 | 269.134 |
@@ -51,6 +51,15 @@ completed on GPU, and their counts were checked against their Quent traces.
 The prior GPU→HOST totals were 29.520 and 27.106 GiB, respectively. The prior
 query records remain archived alongside the selected rerun records as
 `q<NN>.previous-20261120/` on the GB300 machine.
+
+The SF3000 128 and 256 GiB rows were likewise rerun on November 19, 2026
+(CST), with the same Sirius main commit, built extension, and config. All 44
+queries completed on GPU; their three transition counts were checked against
+the Quent traces. The prior 128 GiB totals were 103.153 GiB GPU→HOST and
+32.329 GiB HOST→DISK; the prior 256 GiB GPU→HOST total was 87.193 GiB. The
+new 256 GiB GPU→HOST total is 127.282 GiB, with most of the increase in Q7,
+Q14, and Q18. The earlier query records are preserved as
+`q<NN>.previous-20261120/` alongside the selected reruns.
 
 Exact results: [SF1000](results/sf1000/per-query.csv),
 [SF3000](results/sf3000/per-query.csv), and
