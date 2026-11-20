@@ -30,3 +30,23 @@ function(sirius_duckdb_revision dir out)
     endif()
   endforeach()
 endfunction()
+
+# Fails unless <library_revision>, the DuckDB commit Sirius was built from, is
+# the commit checked out in <source_dir>. Revisions that cannot be determined
+# are an error for "static" <linkage> and not compared otherwise.
+function(sirius_require_duckdb_revision library_revision source_dir linkage)
+  sirius_duckdb_revision("${source_dir}" revision)
+  if(NOT "${library_revision}" STREQUAL "" AND NOT "${revision}" STREQUAL "")
+    if(NOT "${library_revision}" STREQUAL "${revision}")
+      message(
+        FATAL_ERROR
+          "Sirius was built from DuckDB ${library_revision}, but this extension is built from DuckDB ${revision}"
+      )
+    endif()
+  elseif(linkage STREQUAL "static")
+    message(
+      FATAL_ERROR
+        "Cannot verify that Sirius ('${library_revision}') and this extension ('${revision}') use one DuckDB revision: build both from git checkouts"
+    )
+  endif()
+endfunction()
