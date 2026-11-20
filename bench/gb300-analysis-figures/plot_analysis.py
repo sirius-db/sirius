@@ -14,49 +14,22 @@ from matplotlib.ticker import MultipleLocator
 SCALES = (100, 300, 1000)
 STREAMS = (1, 2, 4, 8, 10)
 COLORS = {100: "#0072B2", 300: "#009E73", 1000: "#D55E00"}
-ABLATIONS = (
-    (
-        "Type narrowing first",
-        "narrow-first-summary.csv",
-        (
-            "all_off",
-            "type_narrow",
-            "build_probe",
-            "dynamic_filter",
-            "compressed_pin",
-            "fused_decode",
-        ),
-        (
-            "Off",
-            "Type\nnarrow",
-            "BUILD\nPROBE",
-            "Dynamic\nfilter",
-            "Compressed\npin",
-            "Fused\ndecode",
-        ),
-        "#0072B2",
-    ),
-    (
-        "BUILD_PROBE first",
-        "join-first-corrected-summary.csv",
-        (
-            "all_off",
-            "build_probe",
-            "dynamic_filter",
-            "type_narrow",
-            "compressed_pin",
-            "fused_decode",
-        ),
-        (
-            "Off",
-            "BUILD\nPROBE",
-            "Dynamic\nfilter",
-            "Type\nnarrow",
-            "Compressed\npin",
-            "Fused\ndecode",
-        ),
-        "#009E73",
-    ),
+ABLATION_SOURCE = "join-first-corrected-summary.csv"
+ABLATION_STAGES = (
+    "all_off",
+    "build_probe",
+    "dynamic_filter",
+    "type_narrow",
+    "compressed_pin",
+    "fused_decode",
+)
+ABLATION_LABELS = (
+    "All off",
+    "Adaptive\nJoin",
+    "Dynamic\nFilter",
+    "Type\nNarrowing",
+    "Compression",
+    "Operating on\nCompressed Data",
 )
 
 
@@ -131,103 +104,75 @@ def export(fig: plt.Figure, stem: Path) -> None:
 
 def concurrency_figure(by_scale: dict[int, list[dict[str, str]]], stem: Path) -> None:
     setup_style()
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.7), facecolor="white")
-    fig.subplots_adjust(left=0.075, right=0.98, bottom=0.19, top=0.77, wspace=0.25)
+    fig, ax = plt.subplots(figsize=(8.4, 4.2), facecolor="white")
+    fig.subplots_adjust(left=0.11, right=0.98, bottom=0.20, top=0.83)
     for scale in SCALES:
         rates = [float(row["queries_per_second"]) for row in by_scale[scale]]
-        for ax, values in zip(axes, (rates, [rate / rates[0] for rate in rates])):
-            ax.plot(
-                STREAMS,
-                values,
-                color=COLORS[scale],
-                marker="o",
-                markersize=5.5,
-                linewidth=2,
-                label=f"SF {scale:,}",
-            )
-    for ax in axes:
-        ax.set_xlim(0.7, 10.3)
-        ax.set_xticks(STREAMS)
-        ax.set_xlabel("Concurrent query streams")
-        ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
-        ax.set_axisbelow(True)
-    axes[0].set_ylim(0, 29)
-    axes[0].yaxis.set_major_locator(MultipleLocator(5))
-    axes[0].set_title("A   Aggregate throughput", loc="left", weight="bold")
-    axes[0].set_ylabel("Completed queries per second")
-    axes[1].set_ylim(0.8, 2.25)
-    axes[1].yaxis.set_major_locator(MultipleLocator(0.25))
-    axes[1].set_title("B   Gain over one stream", loc="left", weight="bold")
-    axes[1].set_ylabel("Throughput relative to one stream")
-    fig.text(
-        0.5,
-        0.955,
-        "TPC-H Parquet concurrency on GB300",
-        ha="center",
-        va="top",
-        weight="bold",
-        fontsize=14,
-    )
+        ax.plot(
+            STREAMS,
+            rates,
+            color=COLORS[scale],
+            marker="o",
+            markersize=5.5,
+            linewidth=2,
+            label=f"SF {scale:,}",
+        )
+    ax.set_xlim(0.7, 10.3)
+    ax.set_xticks(STREAMS)
+    ax.set_xlabel("Concurrent query streams")
+    ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.set_ylim(0, 29)
+    ax.yaxis.set_major_locator(MultipleLocator(5))
+    ax.set_ylabel("Completed queries per second")
     fig.legend(
-        *axes[0].get_legend_handles_labels(),
+        *ax.get_legend_handles_labels(),
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.87),
+        bbox_to_anchor=(0.53, 0.99),
         ncol=3,
         frameon=False,
         fontsize=10,
     )
     fig.text(
-        0.075,
-        0.06,
+        0.11,
+        0.055,
         "One pass per point; randomized query order and predicates. Union of input columns pinned on host before timing.",
         ha="left",
-        fontsize=8.8,
+        fontsize=8,
         color="#444444",
     )
     export(fig, stem)
 
 
-def ablation_figure(results: list[list[float]], stem: Path) -> None:
+def ablation_figure(times: list[float], stem: Path) -> None:
     setup_style()
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 5.0), facecolor="white", sharey=True)
-    fig.subplots_adjust(left=0.075, right=0.98, bottom=0.24, top=0.80, wspace=0.14)
-    for index, (ax, config, times) in enumerate(zip(axes, ABLATIONS, results)):
-        title, _, _, labels, color = config
-        positions = list(range(6))
-        ax.plot(positions, times, marker="o", color=color, markersize=6, linewidth=2.2)
-        for position, value in zip(positions, times):
-            ax.annotate(
-                f"{value:.2f}",
-                (position, value),
-                xytext=(0, 7),
-                textcoords="offset points",
-                ha="center",
-                fontsize=8.5,
-            )
-        ax.set_xticks(positions, labels)
-        ax.set_xlim(-0.25, 5.25)
-        ax.set_ylim(0, 25.5)
-        ax.yaxis.set_major_locator(MultipleLocator(5))
-        ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
-        ax.set_axisbelow(True)
-        ax.set_title(f"{chr(65 + index)}   {title}", loc="left", weight="bold")
-        ax.set_xlabel("Optimization enabled at this step")
-    axes[0].set_ylabel("Sum of 22 query times (s)")
+    fig, ax = plt.subplots(figsize=(8.4, 4.4), facecolor="white")
+    fig.subplots_adjust(left=0.11, right=0.98, bottom=0.25, top=0.91)
+    positions = list(range(6))
+    ax.plot(positions, times, marker="o", color="#009E73", markersize=6, linewidth=2.2)
+    for position, value in zip(positions, times):
+        ax.annotate(
+            f"{value:.2f}",
+            (position, value),
+            xytext=(0, 7),
+            textcoords="offset points",
+            ha="center",
+            fontsize=9,
+        )
+    ax.set_xticks(positions, ABLATION_LABELS)
+    ax.set_xlim(-0.25, 5.65)
+    ax.set_ylim(0, 25.5)
+    ax.yaxis.set_major_locator(MultipleLocator(5))
+    ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
+    ax.set_axisbelow(True)
+    ax.set_xlabel("Optimization enabled at this step")
+    ax.set_ylabel("Sum of 22 query times (s)")
     fig.text(
-        0.5,
-        0.955,
-        "Corrected cumulative ablations · SF1k host pin",
-        ha="center",
-        va="top",
-        weight="bold",
-        fontsize=14,
-    )
-    fig.text(
-        0.075,
-        0.07,
+        0.11,
+        0.055,
         "Each stage runs once in a fresh process; pin/unpin excluded. Gains depend on the order and enabled context.",
         ha="left",
-        fontsize=8.8,
+        fontsize=8,
         color="#444444",
     )
     export(fig, stem)
@@ -237,12 +182,11 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[2]
     destination = Path(__file__).resolve().parent
     by_scale = check_concurrency(repo / "bench/gb300-results/concurrency/summary.csv")
-    results = [
-        check_ablation(repo / "bench/gb300-ablation/results" / filename, expected)
-        for _, filename, expected, _, _ in ABLATIONS
-    ]
+    result = check_ablation(
+        repo / "bench/gb300-ablation/results" / ABLATION_SOURCE, ABLATION_STAGES
+    )
     concurrency_figure(by_scale, destination / "gb300-concurrency")
-    ablation_figure(results, destination / "gb300-cumulative-ablation")
+    ablation_figure(result, destination / "gb300-cumulative-ablation")
     print(f"Saved concurrency and ablation figures to {destination}")
 
 

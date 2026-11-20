@@ -124,7 +124,6 @@ def render(points: list[Point], output_dir: Path) -> None:
         {
             "font.family": "DejaVu Sans",
             "font.size": 11,
-            "axes.titlesize": 11,
             "axes.labelsize": 10,
             "xtick.labelsize": 9.5,
             "ytick.labelsize": 9.5,
@@ -141,26 +140,10 @@ def render(points: list[Point], output_dir: Path) -> None:
         figure=fig,
         left=0.07,
         right=0.99,
-        bottom=0.105,
-        top=0.82,
+        bottom=0.13,
+        top=0.91,
         wspace=0.34,
-        hspace=0.72,
-    )
-    fig.text(
-        0.53,
-        0.905,
-        "Host-memory limit · GPU default; host pools scaled",
-        ha="center",
-        weight="bold",
-        fontsize=11,
-    )
-    fig.text(
-        0.53,
-        0.465,
-        "Device-memory limit · host fixed at 384 GiB",
-        ha="center",
-        weight="bold",
-        fontsize=11,
+        hspace=0.45,
     )
 
     legend_handles = [
@@ -215,13 +198,6 @@ def render(points: list[Point], output_dir: Path) -> None:
             time_ax.yaxis.set_major_locator(MaxNLocator(nbins=3, min_n_ticks=3))
             time_ax.grid(axis="y", color="#DDDDDD", linewidth=0.6)
             time_ax.tick_params(axis="x", bottom=False, labelbottom=False)
-            time_ax.set_title(
-                f"{chr(65 + row * 3 + column)}   SF {scale:,}",
-                loc="left",
-                pad=4,
-                fontsize=11,
-                weight="bold",
-            )
             for xi, runtime in zip(x, times):
                 time_ax.annotate(
                     f"{runtime:,.0f}",
@@ -271,7 +247,8 @@ def render(points: list[Point], output_dir: Path) -> None:
             move_ax.grid(axis="y", color="#DDDDDD", linewidth=0.6)
             move_ax.set_axisbelow(True)
             move_ax.set_xticks(x, [str(point.cap) for point in selected])
-            move_ax.set_xlabel("Host cap (GiB)" if sweep == "host" else "GPU cap (GB)")
+            cap_label = "Host cap (GiB)" if sweep == "host" else "GPU cap (GB)"
+            move_ax.set_xlabel(f"SF {scale:,} · {cap_label}")
             if not any(host_disk) and not any(gpu_disk):
                 move_ax.text(
                     0.99,
@@ -283,6 +260,14 @@ def render(points: list[Point], output_dir: Path) -> None:
                     color="#555555",
                     fontsize=9,
                 )
+    fig.text(
+        0.07,
+        0.025,
+        "Host-cap sweep: GPU default, host pools scaled. GPU-cap sweep: host fixed at 384 GiB.",
+        ha="left",
+        fontsize=8.5,
+        color="#444444",
+    )
     stem = output_dir / "gb300-spill-sweeps"
     for suffix in ("pdf", "svg"):
         fig.savefig(stem.with_suffix(f".{suffix}"), facecolor="white")

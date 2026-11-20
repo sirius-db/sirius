@@ -132,7 +132,7 @@ def plot(measurements: list[Measurement], output: Path) -> None:
         }
     )
     fig, ax = plt.subplots(figsize=(10.8, 5.2), facecolor="white")
-    fig.subplots_adjust(left=0.10, right=0.975, bottom=0.21, top=0.76)
+    fig.subplots_adjust(left=0.10, right=0.975, bottom=0.21, top=0.85)
     for engine, profile, color, marker, style in SERIES:
         selected = sorted(
             (
@@ -166,19 +166,10 @@ def plot(measurements: list[Measurement], output: Path) -> None:
     ax.set_axisbelow(True)
     ax.set_xlabel("TPC-H scale factor")
     ax.set_ylabel("Sum of 22 query times (s)")
-    fig.text(
-        0.54,
-        0.955,
-        "TPC-H Parquet scale sweep on GB300",
-        ha="center",
-        va="top",
-        fontsize=15,
-        weight="bold",
-    )
     fig.legend(
         *ax.get_legend_handles_labels(),
         loc="upper center",
-        bbox_to_anchor=(0.54, 0.88),
+        bbox_to_anchor=(0.54, 0.99),
         ncol=5,
         frameon=False,
         columnspacing=1.3,
