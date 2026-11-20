@@ -3,18 +3,22 @@
 Measured on GB300 on 2026-11-20 with Sirius main
 `26b5caba3e2c96290fdc63d4cf40ac42572eaab8`. The extension SHA-256 was
 `25a9c16319571926356c813bfbf145a3b2ed0d61c76771e83ee48f9e24389fa6`.
-The commands were `bash bench/gb300-device-spill-sweep/run_sf.sh 1000` and
-`bash bench/gb300-device-spill-sweep/run_sf.sh 10000`. For SF10000, the runner
+The commands were `bash bench/gb300-device-spill-sweep/run_sf.sh <scale>` for
+scales 1000, 3000, and 10000. For SF10000, the runner
 skipped the already completed 32 GB results and then ran 64, 128, and 256 GB.
 Each of the 22 TPC-H queries ran once at each limit, unpinned, in a fresh Sirius
 process against the same Parquet datasets used by the host-memory sweep.
-All 176 queries finished with GPU plans.
+All 264 queries finished with GPU plans.
 
 The base was `bench/gb300-cold/config.yaml`, with
 `memory.gpu.usage_limit_bytes` set to the indicated decimal GB limit, host cap
 fixed at 384 GiB, and initial host pools at 192. Spill compression stayed on,
 max readahead scans stayed at 8, and no `--profile` override or query-specific
 config was used. Quent telemetry was on.
+
+SF1000 and SF3000 recorded no disk movement at any GPU limit with this host
+budget. Their GPU→HOST movement fell as the GPU limit increased, while the
+runtime improvement was modest compared with SF10000.
 
 ## SF1000
 
@@ -30,6 +34,22 @@ Exact per-query results:
 [64 GB](results/sf1000-gpu64gb-host384gib-per-query.csv),
 [128 GB](results/sf1000-gpu128gb-host384gib-per-query.csv), and
 [256 GB](results/sf1000-gpu256gb-host384gib-per-query.csv). Matching exact-byte
+totals files are alongside them. The runner exited with code 0.
+
+## SF3000
+
+| GPU limit | Queries | Sum of query runtimes | GPU→HOST | HOST→DISK | GPU→DISK | Total into disk |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 GB | 22/22 | 235.793 s | 529.137 GiB | 0 GiB | 0 GiB | 0 GiB |
+| 64 GB | 22/22 | 215.665 s | 330.011 GiB | 0 GiB | 0 GiB | 0 GiB |
+| 128 GB | 22/22 | 206.210 s | 170.784 GiB | 0 GiB | 0 GiB | 0 GiB |
+| 256 GB | 22/22 | 206.495 s | 139.537 GiB | 0 GiB | 0 GiB | 0 GiB |
+
+Exact per-query results:
+[32 GB](results/sf3000-gpu32gb-host384gib-per-query.csv),
+[64 GB](results/sf3000-gpu64gb-host384gib-per-query.csv),
+[128 GB](results/sf3000-gpu128gb-host384gib-per-query.csv), and
+[256 GB](results/sf3000-gpu256gb-host384gib-per-query.csv). Matching exact-byte
 totals files are alongside them. The runner exited with code 0.
 
 ## SF10000

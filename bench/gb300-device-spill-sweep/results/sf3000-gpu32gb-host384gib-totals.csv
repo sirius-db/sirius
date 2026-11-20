@@ -1,0 +1,2 @@
+scale_factor,gpu_cap_gb,host_cap_gib,completed_queries,successful_queries,requested_queries,gpu_to_host_bytes,host_to_disk_bytes,gpu_to_disk_bytes
+3000,32,384,22,22,22,568156118781,0,0

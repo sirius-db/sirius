@@ -23,6 +23,9 @@ tmux new-session -d -s gb300-device-spill-sf10k \
   'bash bench/gb300-device-spill-sweep/run_sf.sh 10000'
 ```
 
+Use `1000` or `3000` in place of `10000` to reproduce the smaller scale
+factors. Run the scale factors sequentially on one GPU.
+
 Progress is in
 `test_datasets/gb300-device-spill-sweep/host384Gi/sf10000/progress.log`.
 An `exit-code` file is written at completion. The runner saves each effective
