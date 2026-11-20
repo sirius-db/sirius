@@ -18,6 +18,7 @@
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
+#include "utils/scoped_sirius_setting.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
@@ -854,8 +855,10 @@ duckdb::idx_t local_parquet_file_row_count(fs::path const& path)
   return static_cast<duckdb::idx_t>(rows);
 }
 
+/// DuckDB's CPU plan for @p sql, which shows the cardinality DuckDB binds for each scan.
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
 {
+  sirius::test::scoped_sirius_setting const gpu_execution(con, "gpu_execution", false);
   auto result = require_query_ok(con, "EXPLAIN " + sql);
   std::string out;
   for (duckdb::idx_t r = 0; r < result->RowCount(); ++r) {
