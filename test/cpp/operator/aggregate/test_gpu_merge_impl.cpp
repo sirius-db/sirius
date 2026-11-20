@@ -1302,6 +1302,26 @@ TEST_CASE("Ordered selector maps each group's minimum rank back to its row",
   CHECK(carried_value_by_key(*batch) == std::map<int64_t, int64_t>{{0, 12}, {1, 13}});
 }
 
+TEST_CASE("Ordered grouped aggregate with no request keeps each group's first row",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // `t` falls with the row index, so each key's first row under `t` is its last row, which
+  // cudf::distinct and the unordered selector both pass over.
+  auto* mem_space = get_shared_mem_space();
+  std::vector<std::vector<int64_t>> columns(3);
+  for (int64_t r = 0; r < 12; ++r) {
+    columns[0].push_back(r % 3);
+    columns[1].push_back(r);
+    columns[2].push_back(100 - r);
+  }
+  auto input    = make_int64_batch(columns, *mem_space);
+  auto ro_batch = input->to_read_only();
+  auto output   = gpu_aggregate_impl::local_grouped_aggregate(
+    ro_batch, {0}, {}, {}, {}, {1, 2}, ascending_order(1), cudf::get_default_stream(), *mem_space);
+  CHECK(sirius::get_cudf_table_view(*output).num_columns() == 3);
+  CHECK(carried_value_by_key(*output) == std::map<int64_t, int64_t>{{0, 9}, {1, 10}, {2, 11}});
+}
+
 TEST_CASE("Ordered grouped merge keeps each group's first row across partials",
           "[operator][merge_grouped_agg][distinct]")
 {
@@ -1310,7 +1330,7 @@ TEST_CASE("Ordered grouped merge keeps each group's first row across partials",
   auto* mem_space       = get_shared_mem_space();
   bool const descending = GENERATE(false, true);
   CAPTURE(descending);
-  bool const with_request = GENERATE(true);
+  bool const with_request = GENERATE(false, true);
   CAPTURE(with_request);
 
   std::vector<std::shared_ptr<data_batch>> partials;

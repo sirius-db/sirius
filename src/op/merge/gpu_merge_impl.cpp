@@ -331,7 +331,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     }
   }
 
-  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0) {
+  // cudf::distinct keeps an arbitrary row, which only an unordered list may take.
+  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0 && carried_order.empty()) {
     auto deduped =
       detail::aggregate_carried_columns_only(concatenated->view(), num_group_cols, stream, mr);
     SIRIUS_LOG_DEBUG(

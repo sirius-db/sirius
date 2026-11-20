@@ -211,7 +211,8 @@ std::unique_ptr<cudf::table> grouped_aggregate_table(
     }
   }
 
-  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty()) {
+  // cudf::distinct keeps an arbitrary row, which only an unordered list may take.
+  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty() && carried_order.empty()) {
     std::vector<cudf::size_type> selected(group_idx.begin(), group_idx.end());
     selected.insert(selected.end(), carried_idx.begin(), carried_idx.end());
     auto deduped = detail::aggregate_carried_columns_only(
