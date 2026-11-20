@@ -64,3 +64,27 @@ compression, while the Simpatico-only stage logged 29 compression events for
 `lineitem` and `orders`. Pinning and unpinning time is excluded from these
 totals. This is one paired pass, so the 4.44% gain should be repeated to assess
 its stability.
+
+## Compressed pinning with the other four switches on
+
+A fresh paired run enabled type narrowing, fused decode filtering, BUILD_PROBE
+admission, and dynamic filters in both stages. The generated YAML files were
+identical. The first stage pinned raw data; the second used the same explicit
+Simpatico plans for `lineitem` and `orders`. Each ran Q1–Q22 once in a fresh
+Sirius process with per-query host pinning.
+
+| Configuration | 22-query total | Change from uncompressed |
+| :--- | ---: | ---: |
+| All other switches on, compressed pinning off | 7.246 s | — |
+| All switches on, compressed pinning on | 6.930 s | −0.316 s (−4.36%) |
+
+The [paired totals](results/all-on-vs-simpatico-summary.csv),
+[per-query times](results/all-on-vs-simpatico-per-query.csv), and
+[run manifest](results/all-on-vs-simpatico-manifest.json) are saved here. Both
+stages completed, and all query result rows matched. Q11 only reordered rows
+with tied sort keys. The raw-pin stage logged no pin compression; the
+compressed-pin stage logged 29 compression events for `lineitem` and `orders`.
+Query time excludes pinning and unpinning. The fused-decode switch remains on
+in both YAMLs, but its compressed-input path cannot run with raw pins, so this
+pair measures the combined execution effect of compressed pinning and the
+enabled consumers of compressed input. This is one pass per condition.

@@ -1,0 +1,31 @@
+{
+  "all_query_results_match": true,
+  "compressed_pin_tables": [
+    "lineitem",
+    "orders"
+  ],
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "extension_sha256": "7ed19c6e8530c18a99303e381e85f67d4b33f029107f5dfba693936b298091a0",
+  "iterations_per_query": 1,
+  "machine": "NVIDIA GB300, one GPU, CDMM driver mode",
+  "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-all-on-vs-simpatico-20261120",
+  "pin_tier": "host",
+  "profile": "hot",
+  "queries": "Q1-Q22",
+  "run_started_utc": "2026-11-20T17:38:30Z",
+  "runtime_excludes": "pin and unpin",
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "source_commit": "53836140819a3be81214023df80dc8197555de22",
+  "stage_config_sha256": {
+    "all_on_compressed": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e",
+    "all_on_uncompressed": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e"
+  },
+  "stage_exit_codes": {
+    "all_on_compressed": 0,
+    "all_on_uncompressed": 0
+  },
+  "validation": "21 exact result text matches; Q11 has the same rows in a different tied-row order. Uncompressed logged zero pin-compression events; compressed logged 29 for lineitem and orders."
+}

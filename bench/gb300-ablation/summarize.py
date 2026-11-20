@@ -45,21 +45,28 @@ def read_stage(root: Path, stage: int, label: str) -> dict[str, float] | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument(
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument(
         "--baseline-vs-simpatico",
         action="store_true",
         help="summarize the all-off versus Simpatico-only comparison",
+    )
+    comparison.add_argument(
+        "--all-on-vs-simpatico",
+        action="store_true",
+        help="summarize all-on runs with host pin compression off and on",
     )
     args = parser.parse_args()
     root = args.output.resolve()
     if not root.is_dir():
         parser.error(f"missing output directory: {root}")
 
-    stages = (
-        ((0, "all_off"), (6, "simpatico_only"))
-        if args.baseline_vs_simpatico
-        else tuple(enumerate(STAGES))
-    )
+    if args.baseline_vs_simpatico:
+        stages = ((0, "all_off"), (6, "simpatico_only"))
+    elif args.all_on_vs_simpatico:
+        stages = ((7, "all_on_uncompressed"), (8, "all_on_compressed"))
+    else:
+        stages = tuple(enumerate(STAGES))
     all_times = [read_stage(root, stage, label) for stage, label in stages]
     summary = root / "summary.csv"
     with summary.open("w", newline="") as stream:

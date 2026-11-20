@@ -53,6 +53,12 @@ processes. Stage 6 compresses only `lineitem` and `orders`, with type narrowing,
 fused filtering, BUILD_PROBE admission, and dynamic filters still off. Summarize
 that paired run with `summarize.py --baseline-vs-simpatico <output-directory>`.
 
+To isolate compressed pinning when the other four feature switches are on,
+use `--all-on-vs-simpatico`. This runs stages 7 and 8 with identical YAMLs,
+switching only `--no-pin-compression` to `--pin-compression`. Summarize with
+`summarize.py --all-on-vs-simpatico <output-directory>`. With uncompressed
+pins, the fused-decode switch is still on but has no compressed input to act on.
+
 After the run, generate a six-stage total and a per-query comparison with:
 
 ```bash
