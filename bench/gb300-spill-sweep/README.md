@@ -54,9 +54,11 @@ The checked-in [results](results/) contain `per-query.csv` and `totals.csv`
 for SF1000, SF3000, and SF10000. [RESULTS.md](RESULTS.md) summarizes them.
 Raw Quent traces remain under `test_datasets/gb300-spill-sweep/` on the GB300
 machine; the SF10000 directory alone is about 2 GiB. The selected SF1000 and
-SF3000 128 and 256 GiB rows were rerun. SF3000 was repeated twice, and the
-exact three-run comparison is in
-[repeats-128-256.csv](results/sf3000/repeats-128-256.csv). Its earlier query
-directories remain as `q<NN>.previous-20261120/` and
-`q<NN>.previous-repeat1-20261120/` alongside the selected records. SF1000's
+SF3000 128 and 256 GiB rows were rerun. SF3000 was repeated twice; the
+selected rows use the first repeat at 128 GiB and the second at 256 GiB.
+The exact three-run comparison and selection are in
+[repeats-128-256.csv](results/sf3000/repeats-128-256.csv). Nonselected query
+directories remain as `q<NN>.previous-20261120/`,
+`q<NN>.previous-repeat1-20261120/`, or
+`q<NN>.previous-repeat2-20261120/` alongside the selected records. SF1000's
 prior query directories remain as `q<NN>.previous-20261120/`.

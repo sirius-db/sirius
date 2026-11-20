@@ -23,7 +23,7 @@ Exact byte counts and per-query values are in the linked CSVs.
 | SF1000 | 450 GiB | 112.5 GiB | 22/22 | 29.548 | 0.000 | 0.000 |
 | SF3000 | 32 GiB | 8 GiB | 22/22 | 62.758 | 38.565 | 67.280 |
 | SF3000 | 64 GiB | 16 GiB | 22/22 | 99.005 | 39.598 | 0.000 |
-| SF3000 | 128 GiB | 32 GiB | 22/22 | 136.246 | 32.660 | 0.000 |
+| SF3000 | 128 GiB | 32 GiB | 22/22 | 105.486 | 34.149 | 0.000 |
 | SF3000 | 256 GiB | 64 GiB | 22/22 | 127.127 | 0.000 | 0.000 |
 | SF3000 | 450 GiB | 112.5 GiB | 22/22 | 118.695 | 0.000 | 0.000 |
 | SF10000 | 32 GiB | 8 GiB | 22/22 | 533.031 | 411.147 | 349.675 |
@@ -54,24 +54,22 @@ query records remain archived alongside the selected rerun records as
 
 The SF3000 128 and 256 GiB cases were each rerun twice on November 19, 2026
 (CST), with the same Sirius main commit, built extension, and config. All 88
-rerun queries completed on GPU. The latest 44 counts were checked against
-their Quent traces and are selected in the main table. The three measurements
-show material run-to-run variation in GPU→HOST movement:
+rerun queries completed on GPU. The 44 selected counts were checked against
+their Quent traces. The main table selects the first repeat at 128 GiB and
+the second repeat at 256 GiB, as requested. The three measurements show
+material run-to-run variation in GPU→HOST movement:
 
 | SF3000 measurement | 128 GiB GPU→HOST | 128 GiB HOST→DISK | 256 GiB GPU→HOST | 256 GiB HOST→DISK |
 | --- | ---: | ---: | ---: | ---: |
 | Initial | 103.153 | 32.329 | 87.193 | 0 |
-| First repeat | 105.486 | 34.149 | 127.282 | 0 |
-| Second repeat (selected) | 136.246 | 32.660 | 127.127 | 0 |
+| First repeat (selected at 128 GiB) | 105.486 | 34.149 | 127.282 | 0 |
+| Second repeat (selected at 256 GiB) | 136.246 | 32.660 | 127.127 | 0 |
 
-All values are GiB; GPU→DISK was zero in all six cases. Exact bytes are in
-[the repeat comparison CSV](results/sf3000/repeats-128-256.csv). The initial
-and first-repeat query records remain on the GB300 machine as
-`q<NN>.previous-20261120/` and `q<NN>.previous-repeat1-20261120/` alongside
-the selected records. Compared with the first repeat, most of the 128 GiB
-GPU→HOST increase came from Q7 (+18.510 GiB), Q3 (+8.387 GiB), and Q21
-(+4.472 GiB). At 256 GiB, Q21 rose by 10.480 GiB while Q18 fell by 10.301
-GiB, leaving the total nearly unchanged.
+All values are GiB; GPU→DISK was zero in all six cases. Exact bytes and the
+selection are in [the repeat comparison CSV](results/sf3000/repeats-128-256.csv).
+The nonselected query records remain on the GB300 machine as
+`q<NN>.previous-20261120/`, `q<NN>.previous-repeat1-20261120/`, or
+`q<NN>.previous-repeat2-20261120/` alongside the selected records.
 
 Exact results: [SF1000](results/sf1000/per-query.csv),
 [SF3000](results/sf3000/per-query.csv), and
