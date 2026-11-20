@@ -309,7 +309,9 @@ bool gpu_supports_list_aggr(duckdb::BoundFunctionExpression const& expr)
   auto const& element_type = duckdb::ListType::GetChildType(children[0]->GetReturnType());
   if (!element_type.IsNumeric()) { return false; }
   auto const& operation = children[1]->Cast<duckdb::BoundConstantExpression>().GetValue();
-  if (operation.IsNull() || operation.type().id() != duckdb::LogicalTypeId::VARCHAR) { return false; }
+  if (operation.IsNull() || operation.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+    return false;
+  }
   auto const& name = duckdb::StringValue::Get(operation);
   if (name == "avg") { return true; }
   if (name != "sum") { return false; }
@@ -355,8 +357,8 @@ std::unique_ptr<node> translate_array_extract(duckdb::BoundFunctionExpression co
   if (!source) { return nullptr; }
   std::vector<std::unique_ptr<node>> arguments;
   arguments.push_back(std::move(source));
-  arguments.push_back(std::make_unique<node>(
-    constant{*index, sirius::logical_type::make(sirius::type_id::BIGINT)}));
+  arguments.push_back(
+    std::make_unique<node>(constant{*index, sirius::logical_type::make(sirius::type_id::BIGINT)}));
   return std::make_unique<node>(function_call{
     function_id::array_extract, std::move(arguments), sirius::from_duckdb(expr.GetReturnType())});
 }
