@@ -183,8 +183,19 @@ impl Default for ComputeNodeConfig {
     }
 }
 
+/// StarRocks release and commit of the submodule the CN was built from (see `build.rs`). The
+/// thrift plan structures change between releases, so the CN runs only with this release's FE.
+const STARROCKS_RELEASE: &str = env!("SIRIUS_CN_STARROCKS_RELEASE");
+const STARROCKS_COMMIT: &str = env!("SIRIUS_CN_STARROCKS_COMMIT");
+
+/// The version the heartbeat reports, shown by `SHOW COMPUTE NODES`, e.g.
+/// `sirius-starrocks-cn/0.1.0 (starrocks 4.1.3, 8a8e186)`.
 fn default_compute_node_version() -> String {
-    format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    format!(
+        "{}/{} (starrocks {STARROCKS_RELEASE}, {STARROCKS_COMMIT})",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn compute_node_registration_sql(host: &Host, heartbeat_port: u16) -> String {
@@ -1403,6 +1414,40 @@ mod tests {
             Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9020))
         );
         assert!(snapshot.last_heartbeat_ms.is_some());
+    }
+
+    /// Verifies the heartbeat reports the StarRocks release the CN was built for.
+    #[test]
+    fn heartbeat_version_names_the_starrocks_release() {
+        let handler = ComputeNodeHeartbeatHandler::new(
+            ComputeNodeConfig::default(),
+            SharedHeartbeatState::new(),
+            None,
+        );
+
+        let result = handler.handle_heartbeat(master(7)).unwrap();
+
+        assert_eq!(
+            result.backend_info.version.as_deref(),
+            Some(
+                format!(
+                    "sirius-starrocks-cn/{} (starrocks {STARROCKS_RELEASE}, {STARROCKS_COMMIT})",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .as_str()
+            )
+        );
+        // build.rs read the submodule: a release number, and a short commit unless git is missing.
+        assert!(
+            STARROCKS_RELEASE.starts_with(|c: char| c.is_ascii_digit()),
+            "{STARROCKS_RELEASE}"
+        );
+        assert!(
+            STARROCKS_COMMIT == "unknown"
+                || (STARROCKS_COMMIT.len() == 7
+                    && STARROCKS_COMMIT.chars().all(|c| c.is_ascii_hexdigit())),
+            "{STARROCKS_COMMIT}"
+        );
     }
 
     /// Verifies equal or increasing heartbeat epochs keep the handler state current.
