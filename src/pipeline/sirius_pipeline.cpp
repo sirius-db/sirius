@@ -286,6 +286,12 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
+bool sirius_pipeline::finished_successfully() const
+{
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  return !_finalize_failed && is_pipeline_finished();
+}
+
 bool sirius_pipeline::is_query_terminal() const
 {
   auto s = get_sink();
@@ -408,8 +414,17 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
           just_closed = true;
-          for (auto& op : get_operators()) {
-            op.get().finalize_operator();
+          try {
+            for (auto& op : get_operators()) {
+              op.get().finalize_operator();
+            }
+          } catch (...) {
+            // pipeline_finished is already visible. Record the failure before the lock is
+            // released, so nobody who then finds the pipeline finished reports the query
+            // complete. The caller reports the error.
+            _finalize_failed = true;
+            end_nvtx_range_if_finished();
+            throw;
           }
           end_nvtx_range_if_finished();
           should_notify = true;
@@ -420,7 +435,9 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 
     // Signal from the transition so non-epilogue finish paths cannot strand execute() (#1486).
     // Sampling under the lock pairs with set_completion_handler().
-    if (should_notify && is_query_terminal()) { completion = _completion_handler.lock(); }
+    if (should_notify && !_finalize_failed && is_query_terminal()) {
+      completion = _completion_handler.lock();
+    }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
