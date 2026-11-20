@@ -2505,7 +2505,7 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // the reactors (e.g. a deferred Puffin read on a metadata worker), so build from the mask the
   // reservation was planned from.
   if (type == cucascade::io::io_context_type::restful && !_config.startup_cpus.empty()) {
-    exec::thread_util::scoped_thread_affinity affinity(_config.startup_cpus);
+    exec::scoped_startup_affinity affinity(_config.startup_cpus);
     build_and_start();
   } else {
     build_and_start();

@@ -131,7 +131,7 @@ coordinator_pool::~coordinator_pool() { stop(); }
 void coordinator_pool::start_workers()
 {
   if (!workers_.empty()) return;
-  exec::thread_util::scoped_thread_affinity affinity(cpu_affinity_);
+  exec::scoped_startup_affinity affinity(cpu_affinity_);
   try {
     for (size_t i = 0; i < state_->worker_count; ++i) {
       if (before_thread_) before_thread_(i);

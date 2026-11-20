@@ -17,11 +17,13 @@
 #include "catch.hpp"
 #include "duckdb/common/exception.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/metadata_placement.hpp"
 #include "scan_manager/native_reader_executor.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/preparation_fixture.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <algorithm>
 #include <array>
@@ -3958,4 +3960,76 @@ TEST_CASE("fallback control runner uses the saved startup mask",
   f.finish();
   CHECK(control_cpus == cpus);
   CHECK_FALSE(f.completion.has_error());
+}
+
+TEST_CASE("cached worker wrapping cannot publish success before startup reports allocation failure",
+          "[.][host_allocation_fault][preparation_startup]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  bool fail = GENERATE(false, true);
+  // Register the production uncached Parquet coalescer alongside a cached
+  // worker's external-use capture. No GPU materialization is needed for the race.
+  fixture f;
+  auto info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->names          = {"x"};
+  info->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids     = {duckdb::ColumnIndex(0)};
+  info->projected_output_count = 1;
+  info->contract_id            = 1;
+  info->approximate_batch_size = size_t{64} << 20;
+  sirius::op::scan::parquet_gpu_ingestible parquet(std::move(info));
+  auto out = std::make_shared<sink>();
+  preparation_coordinator::source source;
+  source.coalescer = parquet.create_batch_coalescer();
+  REQUIRE(source.coalescer->asynchronous_preparation());
+  source.try_claim = []() -> preparation_coordinator::claim_result {
+    return preparation_pending{};
+  };
+  source.construct = [](auto batch) { return make_publication(std::move(batch)); };
+  source.close     = [out] { out->close(); };
+  f.coordinator.after_publication_for_testing([](size_t, auto const&, size_t) {});
+  f.register_source(std::move(source), out);
+  auto cleanup           = f.shutdown_guard();
+  auto done              = f.completion.get_awaitable();
+  bool allocation_failed = false;
+  try {
+    f.completion.run_startup([&] {
+      f.coordinator.arm();
+      auto cached_use = f.coordinator.external_use();
+      REQUIRE(cached_use);
+      f.coordinator.start();
+      // Normal EOS can arrive from GPU work before cached workers are wrapped.
+      f.completion.mark_completed();
+      try {
+        // The padding makes wrapping allocate even with AnyInvocable's inline storage.
+        auto work = [use     = std::move(cached_use),
+                     padding = std::array<char, 64>{}](std::stop_token) {};
+        fault injection(fault::every_allocation_scope, fail ? 1 : 0);
+        f.dispatcher.enqueue(std::move(work));
+        (void)injection.stop();
+      } catch (std::bad_alloc const&) {
+        // Force the coordinator to retire after the failed wrap destroyed its
+        // external-use capture, before the startup owner gets to report the error.
+        f.coordinator.drain();
+        CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+        CHECK(done.wait_for(0ms) == std::future_status::timeout);
+        throw;
+      }
+      f.dispatcher.wait_for_all();
+      f.coordinator.drain();
+      CHECK(done.wait_for(0ms) == std::future_status::timeout);
+    });
+  } catch (std::bad_alloc const&) {
+    allocation_failed = true;
+  }
+  CHECK(allocation_failed == fail);
+  REQUIRE(done.wait_for(1s) == std::future_status::ready);
+  if (fail) {
+    CHECK_THROWS_AS(done.get(), std::bad_alloc);
+    CHECK(f.completion.has_error());
+  } else {
+    CHECK_NOTHROW(done.get());
+    CHECK_FALSE(f.completion.has_error());
+  }
 }

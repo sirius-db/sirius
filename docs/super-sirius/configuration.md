@@ -1362,6 +1362,11 @@ preserve the launch mask on the main thread until then. Changing the main thread
 before capture changes the boundary; this mechanism cannot reconstruct historical launch
 settings. Native/coordinator workers start lazily from the saved mask, and each startup scope
 restores its caller's previous affinity on success and failure without changing CUDA/TLS state.
+If the deployment cpuset shrinks before lazy startup, coordinator/native workers, the
+dedicated coordinator runner, and lazy REST/exchange construction use the nonempty subset
+the kernel grants from the saved boundary and log the narrowed mask. They never substitute
+the creating thread's narrower mask or expand beyond the saved boundary. An empty subset
+still rejects startup; dormant worker pools may retry after the allowance is restored.
 
 cuCascade resolves cgroup2 mount roots and inherited effective cpusets. If cgroup discovery is
 unavailable, it retains the main-thread affinity with a diagnostic. If the main thread's mask

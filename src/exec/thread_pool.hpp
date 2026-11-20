@@ -48,6 +48,8 @@ class static_thread_pool {
     if (num_threads <= 0 || domains.size() > static_cast<size_t>(num_threads))
       throw std::invalid_argument("thread pool needs at least one worker per domain");
     domains_ = std::move(domains);
+    // Queue 0 holds unrouted work that any worker can run; each domain gets its
+    // own queue at index domain + 1 for work restricted to that domain's workers.
     queues_.resize(domains_.size() + 1);
     threads_.reserve(num_threads);
 

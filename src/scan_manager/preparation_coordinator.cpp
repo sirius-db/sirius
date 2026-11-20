@@ -880,7 +880,7 @@ void preparation_coordinator::arm()
         state_->gate->pool_wakeup = pooled_->notifier();
         state_->gate->notify_under_lock();
       } else {
-        exec::thread_util::scoped_thread_affinity affinity(state_->options.control_cpu_affinity);
+        exec::scoped_startup_affinity affinity(state_->options.control_cpu_affinity);
         runner_ = std::thread([st = state_] { st->run(st); });
       }
     }

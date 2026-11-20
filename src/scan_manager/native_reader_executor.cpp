@@ -112,7 +112,7 @@ native_reader_executor::native_reader_executor(size_t workers,
 void native_reader_executor::start_workers()
 {
   if (!state_->workers.empty()) return;
-  exec::thread_util::scoped_thread_affinity affinity(cpu_affinity_);
+  exec::scoped_startup_affinity affinity(cpu_affinity_);
   try {
     for (size_t i = 0; i < state_->worker_count; ++i) {
       if (before_thread_) before_thread_(i);

@@ -268,17 +268,19 @@ void sirius_engine::execute()
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
-    query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                      query_id_,
-                                      completion_handler_,
-                                      telemetry::query_telemetry_info{
-                                        .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
-                                      },
-                                      [&client = context] { return client.IsInterrupted(); });
-    sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    completion_handler_->run_startup([&] {
+      query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                        query_id_,
+                                        completion_handler_,
+                                        telemetry::query_telemetry_info{
+                                          .telemetry_query_id = telemetry_uuid,
+                                          .worker_id = telemetry_context_->worker_id().raw(),
+                                          .query_id  = query_id_,
+                                        },
+                                        [&client = context] { return client.IsInterrupted(); });
+      sirius_ctx->get_task_scheduler().start_query(*query_);
+      sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    });
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
