@@ -3976,6 +3976,15 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
   return widest;
 }
 
+bool pinned_column_dictionary_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
+{
+  if (entry.column_storage.empty()) { return false; }
+  return std::ranges::all_of(
+    entry.column_storage, [&](std::vector<pinned_column_storage_meta> const& row) {
+      return entry_position < row.size() && row[entry_position].string_dictionary;
+    });
+}
+
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::shared_ptr<pinned_entry const> entry,
   std::span<std::size_t const> selected_columns,

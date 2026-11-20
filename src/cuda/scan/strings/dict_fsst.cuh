@@ -25,8 +25,11 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 
+#include <cudf/types.hpp>
+
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/std/utility>
 #include <cuda/stream>
 
 #include <cstdint>
@@ -82,5 +85,28 @@ void launch_dict_fsst_mark_nulls(dict_fsst_desc const* d_descs,
                                  uint8_t* d_null_mask,
                                  uint32_t n_segments,
                                  ::cuda::stream_ref stream);
+
+//! A dictionary entry's bytes; a null pointer is a null entry.
+using dict_entry_pair = ::cuda::std::pair<char const*, cudf::size_type>;
+
+//! @brief Write one pair per stacked dictionary slot: segment @c s owns slots
+//! `[seg_dict_offset_base, seg_dict_offset_base + dict_count + 1)`, aligned with the offset arrays.
+//! Slot 0 (the NULL entry) and the trailing slot are null; mode-0 entries point at the raw
+//! dictionary bytes, mode-1 entries at their predecoded bytes. Modes 0/1 only.
+void launch_dict_fsst_entry_pairs(dict_fsst_desc const* d_descs,
+                                  uint32_t n_segments,
+                                  uint32_t const* d_byte_offsets,
+                                  uint32_t const* d_decoded_offsets,
+                                  uint8_t const* d_predecode,
+                                  dict_entry_pair* d_pairs,
+                                  ::cuda::stream_ref stream);
+
+//! @brief Per-row code: the merged key index @p d_slot_to_key maps the row's stacked slot to. A
+//! NULL row (index 0) gets code 0; the null mask hides it. Modes 0/1 only.
+void launch_dict_fsst_codes(dict_fsst_desc const* d_chunks,
+                            uint32_t n_chunks,
+                            int32_t const* d_slot_to_key,
+                            int32_t* d_codes,
+                            ::cuda::stream_ref stream);
 
 }  // namespace sirius::cuda::scan

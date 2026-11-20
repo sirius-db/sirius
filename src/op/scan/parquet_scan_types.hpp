@@ -126,6 +126,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t projected_output_count = 0;
+  /// Output ordinals the plan carries as DICTIONARY32. The reader then returns dictionary columns
+  /// (it can only do so for every flat string column at once); the scan core decodes the others.
+  std::vector<std::size_t> dictionary_outputs;
 
   parquet_ingestible_table_info() = default;
 

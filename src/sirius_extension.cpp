@@ -3281,6 +3281,14 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
+static void SetEnableDictionaryCarrier(ClientContext& /*context*/,
+                                       SetScope /*scope*/,
+                                       Value& /*parameter*/)
+{
+  // Empty for the reason SetEnableCompressedMaterialization is: planning reads the connection's
+  // own value through dictionary_carrier_enabled().
+}
+
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                           = get_operator_params(context, scope);
@@ -4047,6 +4055,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "enable_dictionary_carrier",
+    "Keep dictionary-encoded VARCHAR columns (compressed pins, Parquet, DuckDB-native storage) as "
+    "DICTIONARY32 carriers past the scan, so grouped aggregates group on the codes (off by "
+    "default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dictionary_carrier),
+    SetEnableDictionaryCarrier);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",

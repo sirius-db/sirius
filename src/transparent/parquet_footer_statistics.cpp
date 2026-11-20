@@ -449,6 +449,110 @@ std::size_t parquet_files_row_count(duckdb::ClientContext& context,
   return rows;
 }
 
+namespace {
+
+bool is_dictionary_encoding(duckdb_parquet::Encoding::type encoding)
+{
+  return encoding == duckdb_parquet::Encoding::PLAIN_DICTIONARY ||
+         encoding == duckdb_parquet::Encoding::RLE_DICTIONARY;
+}
+
+bool chunk_is_dictionary_encoded(duckdb_parquet::ColumnMetaData const& meta,
+                                 std::size_t max_dictionary_bytes)
+{
+  if (meta.type != duckdb_parquet::Type::BYTE_ARRAY || !meta.__isset.dictionary_page_offset ||
+      meta.data_page_offset <= meta.dictionary_page_offset) {
+    return false;
+  }
+  if (static_cast<std::size_t>(meta.data_page_offset - meta.dictionary_page_offset) >
+      max_dictionary_bytes) {
+    return false;
+  }
+  if (meta.__isset.encoding_stats) {
+    return std::ranges::all_of(meta.encoding_stats, [](auto const& stats) {
+      bool const data_page = stats.page_type == duckdb_parquet::PageType::DATA_PAGE ||
+                             stats.page_type == duckdb_parquet::PageType::DATA_PAGE_V2;
+      return !data_page || stats.count == 0 || is_dictionary_encoding(stats.encoding);
+    });
+  }
+  return std::ranges::any_of(meta.encodings, is_dictionary_encoding);
+}
+
+std::mutex dictionary_columns_mutex;
+std::unordered_map<std::string, std::pair<std::string, std::vector<std::string>>>
+  dictionary_columns_cache;
+
+}  // namespace
+
+std::vector<std::string> parquet_dictionary_string_columns(duckdb::ClientContext& context,
+                                                           duckdb::LogicalGet const& get,
+                                                           std::size_t max_dictionary_bytes)
+{
+  auto const& name = get.function.GetName().GetIdentifierName();
+  if (name != "read_parquet" && name != "parquet_scan") { return {}; }
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (!bind || !bind->file_list) { return {}; }
+  try {
+    auto const file = bind->file_list->GetFirstFile();
+    auto const* base =
+      bind->initial_reader
+        ? dynamic_cast<duckdb::TableFunctionFileReader const*>(bind->initial_reader.get())
+        : nullptr;
+    auto const options = base && base->bind_data
+                           ? duckdb::ParquetScanFunction::GetFileOptions(*base->bind_data)
+                           : duckdb::ParquetOptions(context);
+
+    std::optional<std::string> version;
+    if (auto const listed = listed_metadata(file)) { version = version_of(file.path, *listed); }
+    if (!version) {
+      auto& fs = duckdb::FileSystem::GetFileSystem(context);
+      if (auto const metadata = fs.GetStatsIfExists(file)) {
+        version = version_of(file.path, *metadata);
+      }
+    }
+    auto const key = std::to_string(max_dictionary_bytes) + '\0' + file.path;
+    if (version) {
+      std::lock_guard guard(dictionary_columns_mutex);
+      auto const found = dictionary_columns_cache.find(key);
+      if (found != dictionary_columns_cache.end() && found->second.first == *version) {
+        return found->second.second;
+      }
+    }
+
+    duckdb::ParquetReader reader(context, file, options);
+    auto const* metadata = reader.GetFileMetadata();
+    // A chunk without metadata names no column, so it leaves the whole file undecided.
+    bool all_chunks_described = !metadata->row_groups.empty();
+    std::unordered_map<std::string, bool> verdicts;
+    for (auto const& row_group : metadata->row_groups) {
+      for (auto const& chunk : row_group.columns) {
+        if (!chunk.__isset.meta_data) {
+          all_chunks_described = false;
+          continue;
+        }
+        auto const& meta = chunk.meta_data;
+        if (meta.path_in_schema.size() != 1) { continue; }
+        auto [entry, inserted] = verdicts.emplace(meta.path_in_schema.front(), true);
+        entry->second = entry->second && chunk_is_dictionary_encoded(meta, max_dictionary_bytes);
+      }
+    }
+    std::vector<std::string> columns;
+    if (all_chunks_described) {
+      for (auto const& [column, dictionary] : verdicts) {
+        if (dictionary) { columns.push_back(column); }
+      }
+    }
+    if (version) {
+      std::lock_guard guard(dictionary_columns_mutex);
+      dictionary_columns_cache[key] = {std::move(*version), columns};
+    }
+    return columns;
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("No dictionary columns for a Parquet scan: {}", e.what());
+    return {};
+  }
+}
+
 std::size_t detail::merged_statistics_cache_size()
 {
   std::lock_guard guard(merge_mutex);

@@ -20,6 +20,8 @@
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -29,6 +31,8 @@
 #include <cuda/scan/gpu_decode_strings.cuh>
 
 #include <catch.hpp>
+
+#include <set>
 
 namespace {
 
@@ -102,6 +106,119 @@ void check_decode(segment const& seg,
                                   offsets[row + 1] - offsets[row]);
     REQUIRE(actual == *value);
   }
+}
+
+struct staged_segments {
+  std::vector<rmm::device_buffer> bytes;
+  std::vector<rmm::device_buffer> validity;
+  sirius::cuda::scan::gpu_string_column_decode_input input{};
+};
+
+// Stage @p segments as one DICT_FSST run, or as one run per segment when @p run_per_segment.
+staged_segments stage(std::vector<segment> const& segments,
+                      std::vector<std::optional<std::string>> const& expected,
+                      bool run_per_segment,
+                      rmm::cuda_stream_view stream)
+{
+  staged_segments staged;
+  staged.input.total_rows = 0;
+  staged.input.has_nulls  = false;
+  for (auto const& seg : segments) {
+    auto& bytes         = staged.bytes.emplace_back(seg.bytes.data(), seg.bytes.size(), stream);
+    uint32_t max_length = 0;
+    for (uint64_t row = seg.start; row < seg.start + seg.rows; ++row) {
+      if (expected[row]) {
+        max_length = std::max(max_length, static_cast<uint32_t>(expected[row]->size()));
+      } else {
+        staged.input.has_nulls = true;
+      }
+    }
+    sirius::cuda::scan::gpu_string_segment_desc desc{static_cast<uint8_t const*>(bytes.data()),
+                                                     static_cast<uint32_t>(bytes.size()),
+                                                     staged.input.total_rows,
+                                                     seg.rows,
+                                                     0,
+                                                     max_length};
+    if (run_per_segment || staged.input.data.empty()) {
+      staged.input.data.push_back({duckdb::CompressionType::COMPRESSION_DICT_FSST, {desc}});
+    } else {
+      staged.input.data.back().segments.push_back(desc);
+    }
+    if (seg.all_null_validity) {
+      std::vector<uint8_t> zeros((seg.rows + 7) / 8, 0);
+      auto& validity = staged.validity.emplace_back(zeros.data(), zeros.size(), stream);
+      staged.input.validity.push_back({duckdb::CompressionType::COMPRESSION_UNCOMPRESSED,
+                                       {{static_cast<uint8_t const*>(validity.data()),
+                                         static_cast<uint32_t>(validity.size()),
+                                         staged.input.total_rows,
+                                         seg.rows}}});
+    }
+    staged.input.total_rows += seg.rows;
+  }
+  return staged;
+}
+
+// Decode @p segments to a DICTIONARY32 column and check every row against the CPU's value, and
+// that the keys are exactly the distinct non-null values.
+void check_dictionary_decode(std::vector<segment> const& segments,
+                             std::vector<std::optional<std::string>> const& expected,
+                             bool run_per_segment)
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  auto staged = stage(segments, expected, run_per_segment, stream);
+  auto column = sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr);
+  REQUIRE(column);
+  REQUIRE(column->type().id() == cudf::type_id::DICTIONARY32);
+  REQUIRE(column->size() == static_cast<cudf::size_type>(staged.input.total_rows));
+
+  cudf::dictionary_column_view dictionary(column->view());
+  std::set<std::string> distinct;
+  for (uint64_t row = segments.front().start; row < segments.front().start + column->size();
+       ++row) {
+    if (expected[row]) { distinct.insert(*expected[row]); }
+  }
+  REQUIRE(dictionary.keys_size() == static_cast<cudf::size_type>(distinct.size()));
+
+  auto decoded = cudf::dictionary::decode(dictionary, stream, mr);
+  cudf::strings_column_view strings(decoded->view());
+  auto const count = static_cast<uint32_t>(column->size());
+  auto offsets     = sirius::test::decode::download<int32_t>(
+    strings.offsets().data<int32_t>(), count + 1, stream.value());
+  std::vector<uint8_t> chars;
+  if (strings.chars_size(stream) != 0) {
+    chars = sirius::test::decode::download<uint8_t>(
+      strings.chars_begin(stream), strings.chars_size(stream), stream.value());
+  }
+  std::vector<cudf::bitmask_type> mask;
+  if (decoded->nullable()) {
+    mask = sirius::test::decode::download<cudf::bitmask_type>(
+      decoded->view().null_mask(), (count + 31) / 32, stream.value());
+  }
+  for (uint32_t row = 0; row < count; ++row) {
+    CAPTURE(row, run_per_segment);
+    auto const& value = expected[segments.front().start + row];
+    bool const valid  = mask.empty() || ((mask[row / 32] >> (row % 32)) & 1u);
+    REQUIRE(valid == value.has_value());
+    if (!valid) { continue; }
+    auto actual = offsets[row] == offsets[row + 1]
+                    ? std::string{}
+                    : std::string(reinterpret_cast<char const*>(chars.data() + offsets[row]),
+                                  offsets[row + 1] - offsets[row]);
+    REQUIRE(actual == *value);
+  }
+}
+
+void verify_dictionary_shape(size_t shape_index, bool multiple_segments = false)
+{
+  fixture disk;
+  disk.create(candidate_shapes().at(shape_index));
+  auto const segments = disk.read_segments();
+  REQUIRE_FALSE(segments.empty());
+  if (multiple_segments) { REQUIRE(segments.size() > 1); }
+  auto const expected = disk.cpu_rows();
+  check_dictionary_decode(segments, expected, false);
+  if (multiple_segments) { check_dictionary_decode(segments, expected, true); }
 }
 
 void check_sql(fixture& disk, std::vector<std::optional<std::string>> expected)
@@ -211,4 +328,33 @@ TEST_CASE("DuckDB-written DICT_FSST decodes a slice after the segment head",
           "[integration][scan][decode][strings][dict_fsst]")
 {
   verify_shape(3, 0, false, false, 33);
+}
+
+TEST_CASE("DuckDB-written DICT_FSST decodes to a DICTIONARY32 column",
+          "[integration][scan][decode][strings][dict_fsst][dictionary_carrier]")
+{
+  SECTION("plain dictionary with NULL and empty entries") { verify_dictionary_shape(0); }
+  SECTION("FSST-compressed dictionary") { verify_dictionary_shape(1); }
+  SECTION("non-shifting alignment boundary") { verify_dictionary_shape(3); }
+  SECTION("all-NULL dictionary") { verify_dictionary_shape(4); }
+  SECTION("zero-width lengths distinguish NULL and empty") { verify_dictionary_shape(5); }
+}
+
+TEST_CASE("DuckDB-written DICT_FSST merges segment dictionaries into one key set",
+          "[integration][scan][decode][strings][dict_fsst][dictionary_carrier]")
+{
+  verify_dictionary_shape(6, true);
+}
+
+TEST_CASE("DuckDB-written DICT_FSST without a dictionary declines the DICTIONARY32 decode",
+          "[integration][scan][decode][strings][dict_fsst][dictionary_carrier]")
+{
+  fixture disk;
+  disk.create(candidate_shapes().at(2));
+  auto const segments = disk.read_segments();
+  REQUIRE_FALSE(segments.empty());
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  auto staged = stage(segments, disk.cpu_rows(), false, stream);
+  REQUIRE_FALSE(sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr));
 }

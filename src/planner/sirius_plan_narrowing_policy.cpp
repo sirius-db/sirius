@@ -33,6 +33,7 @@
 #include <memory>
 #include <optional>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -40,7 +41,8 @@
 // The tier narrowing policy: the analysis-only first pass of `apply_compressed_schema_passes`. It
 // walks the pre-propagation tree with the same traversal skeleton and per-operator column maps as
 // `propagate_compressed_schema`, tracing each candidate narrow scan column (a non-native sidecar
-// entry of a scan marked `sidecar_from_gpu_tier_pin`) upward and accumulating four use flags per
+// entry of a scan marked `sidecar_from_gpu_tier_pin`, or any dictionary carrier) upward and
+// accumulating four use flags per
 // column: transport (survives into a hash-join payload output or an eligible grouped-aggregate key
 // output), narrow_comparison (engages a narrow-domain comparison or BETWEEN), evaluator_restore
 // (any other reference occurrence inside an expression), and boundary_restore (dies where
@@ -97,6 +99,34 @@ void mark_boundary_restore(policy_state& state, carried_columns const& columns)
 {
   for (auto const& candidate : columns) {
     if (candidate) { state.candidates[*candidate].boundary_restore = true; }
+  }
+}
+
+// The native-boundary aggregate of propagation's admit_dictionary_group_keys: a DICTIONARY32
+// group key read by nothing else enters the aggregate unrestored, which earns transport; every
+// other carried child column is a boundary restore.
+void admit_dictionary_group_keys(policy_state& state,
+                                 sirius::op::sirius_physical_grouped_aggregate const& aggregate,
+                                 carried_columns const& inputs)
+{
+  auto const read_by_values = aggregate.value_read_inputs();
+  std::unordered_set<std::size_t> dictionary_keys;
+  for (auto const key_idx : aggregate.group_idx) {
+    if (key_idx < 0 || static_cast<std::size_t>(key_idx) >= inputs.size()) { continue; }
+    auto const child_idx = static_cast<std::size_t>(key_idx);
+    if (inputs[child_idx] && !read_by_values.contains(child_idx) &&
+        state.candidates[*inputs[child_idx]].carrier.id() == cudf::type_id::DICTIONARY32) {
+      dictionary_keys.insert(child_idx);
+    }
+  }
+  for (std::size_t child_idx = 0; child_idx < inputs.size(); ++child_idx) {
+    if (!inputs[child_idx]) { continue; }
+    auto& candidate = state.candidates[*inputs[child_idx]];
+    if (dictionary_keys.contains(child_idx)) {
+      candidate.transport = true;
+    } else {
+      candidate.boundary_restore = true;
+    }
   }
 }
 
@@ -319,13 +349,18 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       // case marks boundary restores anyway.
       auto& scan = op.Cast<sirius::op::sirius_physical_table_scan>();
       carried_columns map(op.types.size());
-      if (!scan.sidecar_from_gpu_tier_pin || !op.has_physical_overrides()) { return map; }
+      if (!op.has_physical_overrides()) { return map; }
+      // A host-tier pin keeps its narrow numeric columns, which shrink the upload, but its
+      // dictionary carriers upload the same compressed bytes either way and are judged.
+      bool const judge_narrow =
+        scan.sidecar_from_gpu_tier_pin || scan.sidecar_from_source_dictionaries;
       auto const native    = native_physical_schema(op);
       auto const& physical = op.get_physical_types();
       D_ASSERT(native.size() == physical.size());
       if (native.size() != physical.size()) { return map; }
       for (std::size_t column_idx = 0; column_idx < physical.size(); ++column_idx) {
         if (physical[column_idx] == native[column_idx]) { continue; }
+        if (!judge_narrow && physical[column_idx].id() != cudf::type_id::DICTIONARY32) { continue; }
         map[column_idx] = state.candidates.size();
         state.candidates.push_back({&scan, column_idx, physical[column_idx]});
       }
@@ -463,9 +498,10 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       if (op.children.size() != 1) { break; }
       auto const& aggregate = op.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.has_grouping_sets()) { break; }
-      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots)) { break; }
-      if (op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
-        break;
+      if (!sirius::op::all_slots_plain(aggregate.aggregate_slots) ||
+          op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
+        admit_dictionary_group_keys(state, aggregate, child_maps[0]);
+        return carried_columns(op.types.size());
       }
       auto const child_width = op.children[0]->types.size();
       bool consistent        = true;
