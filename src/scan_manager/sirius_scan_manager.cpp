@@ -2612,10 +2612,9 @@ std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // rethrow, caching nothing. The partially started context is torn down when it goes out of
   // scope; the next lookup of this key rebuilds it.
   auto const log_start_failure = [type](std::exception const& e) {
-    SIRIUS_LOG_ERROR(
-      "[sirius_scan_manager] {} backend failed to start or initialize its cache: {}",
-      to_string(type),
-      e.what());
+    SIRIUS_LOG_ERROR("[sirius_scan_manager] {} backend failed to start or initialize its cache: {}",
+                     to_string(type),
+                     e.what());
   };
   auto const build_and_start = [&] {
     build = make_ioctx_or_explain(type,
