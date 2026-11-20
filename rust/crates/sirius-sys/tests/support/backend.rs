@@ -1,8 +1,10 @@
 //! Rust-owned stand-ins for native handles, used only by Miri test executables.
 //! These model ownership and output slots, not YAML parsing or engine behavior.
-#![allow(unsafe_op_in_unsafe_fn)]
+//!
+//! SAFETY: the unmangled symbols here implement the test C ABI. The Miri build
+//! skips native linking and includes exactly one copy of this backend.
 
-use sirius_sys::c_api::*;
+use crate::c_api::*;
 use std::{cell::RefCell, ffi::c_char, ptr, sync::Arc};
 
 thread_local! {
@@ -27,31 +29,37 @@ struct Config([u64; 2]);
 
 unsafe fn create<T, P: Default>(out: *mut *mut T, error: *mut *mut SiriusError) -> u32 {
     if !error.is_null() {
-        *error = ptr::null_mut();
+        // SAFETY: a supplied diagnostic slot is writable for this call.
+        unsafe { *error = ptr::null_mut() };
     }
     if out.is_null() {
         return SIRIUS_INVALID_ARGUMENT;
     }
-    *out = ptr::null_mut();
+    // SAFETY: the caller supplies a writable handle slot, checked above for null.
+    unsafe { *out = ptr::null_mut() };
     if let Some((status, message)) = FAILURE.with(|f| f.borrow_mut().take()) {
         if let Some(mut message) = message.filter(|_| !error.is_null()) {
             message.push(0);
-            *error = Box::into_raw(Box::new(message)).cast();
+            // SAFETY: the non-null slot receives sole ownership of this boxed diagnostic.
+            unsafe { *error = Box::into_raw(Box::new(message)).cast() };
         }
         return status;
     }
-    *out = Arc::into_raw(Arc::new(P::default())).cast_mut().cast();
+    // SAFETY: the output slot receives one strong reference to the new payload.
+    unsafe { *out = Arc::into_raw(Arc::new(P::default())).cast_mut().cast() };
     SIRIUS_SUCCESS
 }
 
 unsafe fn retain<T, P>(value: *mut T) {
     if !value.is_null() {
-        Arc::increment_strong_count(value.cast::<P>());
+        // SAFETY: value came from Arc::<P>::into_raw and the caller holds a live reference.
+        unsafe { Arc::increment_strong_count(value.cast::<P>()) };
     }
 }
 unsafe fn release<T, P>(value: *mut T) {
     if !value.is_null() {
-        Arc::decrement_strong_count(value.cast::<P>());
+        // SAFETY: the caller transfers one outstanding Arc<P> reference for release.
+        unsafe { Arc::decrement_strong_count(value.cast::<P>()) };
     }
 }
 
@@ -60,7 +68,8 @@ unsafe extern "C" fn sirius_context_config_builder_create(
     out: *mut *mut SiriusContextConfigBuilder,
     error: *mut *mut SiriusError,
 ) -> u32 {
-    create::<_, Builder>(out, error)
+    // SAFETY: the caller provides writable, non-overlapping output slots or null.
+    unsafe { create::<_, Builder>(out, error) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_builder_from_yaml(
@@ -69,12 +78,14 @@ unsafe extern "C" fn sirius_context_config_builder_from_yaml(
     out: *mut *mut SiriusContextConfigBuilder,
     error: *mut *mut SiriusError,
 ) -> u32 {
-    let bytes = std::slice::from_raw_parts(path.cast::<u8>(), size);
+    // SAFETY: the calling wrapper borrows a non-null path buffer of size bytes for this call.
+    let bytes = unsafe { std::slice::from_raw_parts(path.cast::<u8>(), size) };
     PATH.with(|p| *p.borrow_mut() = bytes.to_vec());
     if bytes.contains(&0) {
         fail_next(SIRIUS_INVALID_ARGUMENT, Some(b"path contains NUL"));
     }
-    create::<_, Builder>(out, error)
+    // SAFETY: the caller provides writable, non-overlapping output slots or null.
+    unsafe { create::<_, Builder>(out, error) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_builder_build(
@@ -82,34 +93,44 @@ unsafe extern "C" fn sirius_context_config_builder_build(
     out: *mut *mut SiriusContextConfig,
     error: *mut *mut SiriusError,
 ) -> u32 {
-    assert_eq!((*builder.cast::<Builder>()).0, 0);
-    create::<_, Config>(out, error)
+    // SAFETY: the caller borrows a live Builder allocated by this backend.
+    let builder = unsafe { &*builder.cast::<Builder>() };
+    assert_eq!(builder.0, 0);
+    // SAFETY: the caller provides writable, non-overlapping output slots or null.
+    unsafe { create::<_, Config>(out, error) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_builder_retain(value: *mut SiriusContextConfigBuilder) {
-    retain::<_, Builder>(value)
+    // SAFETY: a non-null handle borrows a live Arc<Builder> reference.
+    unsafe { retain::<_, Builder>(value) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_builder_release(value: *mut SiriusContextConfigBuilder) {
-    release::<_, Builder>(value)
+    // SAFETY: a non-null handle surrenders an owned Arc<Builder> reference.
+    unsafe { release::<_, Builder>(value) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_retain(value: *mut SiriusContextConfig) {
     if !value.is_null() {
-        assert_eq!((*value.cast::<Config>()).0, [0; 2]);
+        // SAFETY: non-null configuration handles point to a live Config in this backend.
+        let config = unsafe { &*value.cast::<Config>() };
+        assert_eq!(config.0, [0; 2]);
     }
-    retain::<_, Config>(value)
+    // SAFETY: a non-null handle borrows a live Arc<Config> reference.
+    unsafe { retain::<_, Config>(value) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_context_config_release(value: *mut SiriusContextConfig) {
-    release::<_, Config>(value)
+    // SAFETY: a non-null handle surrenders an owned Arc<Config> reference.
+    unsafe { release::<_, Config>(value) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_error_message(error: *const SiriusError) -> *const c_char {
     if error.is_null() {
         c"".as_ptr()
     } else {
-        (*error.cast::<Vec<u8>>()).as_ptr().cast()
+        // SAFETY: the caller keeps this boxed, NUL-terminated message live while borrowing it.
+        unsafe { (*error.cast::<Vec<u8>>()).as_ptr().cast() }
     }
 }
 #[unsafe(no_mangle)]
@@ -117,16 +138,96 @@ unsafe extern "C" fn sirius_error_message_size(error: *const SiriusError) -> usi
     if error.is_null() {
         0
     } else {
-        (*error.cast::<Vec<u8>>()).len() - 1
+        // SAFETY: error points to a live message whose final byte is the appended terminator.
+        unsafe { (*error.cast::<Vec<u8>>()).len() - 1 }
     }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sirius_error_destroy(error: *mut SiriusError) {
     if !error.is_null() {
-        drop(Box::from_raw(error.cast::<Vec<u8>>()));
+        // SAFETY: create transferred the Box with into_raw and the caller returns it exactly once.
+        drop(unsafe { Box::from_raw(error.cast::<Vec<u8>>()) });
     }
 }
 #[unsafe(no_mangle)]
 extern "C" fn sirius_abi_version() -> u32 {
     SIRIUS_ABI_VERSION
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_literal_int64(
+    _value: i64,
+    out: *mut *mut SiriusExpression,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    // SAFETY: the caller provides writable, non-overlapping output slots or null.
+    unsafe { create::<_, i64>(out, error) }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_retain(value: *mut SiriusExpression) {
+    // SAFETY: a non-null literal handle borrows a live Arc<i64> reference.
+    unsafe { retain::<_, i64>(value) };
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_expression_release(value: *mut SiriusExpression) {
+    // SAFETY: a non-null literal handle surrenders an owned Arc<i64> reference.
+    unsafe { release::<_, i64>(value) };
+}
+
+// A single-field schema stand-in stores the name in the allocation retained by the wrapper.
+// Borrowing that name lets Miri check both the input copy and output lifetime.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_create(
+    fields: *const sirius_field,
+    count: usize,
+    out: *mut *mut SiriusSchema,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    assert_eq!(count, 1);
+    // SAFETY: the test caller supplies count initialized fields and count is one.
+    let field = unsafe { &*fields };
+    // SAFETY: the field borrows its non-null name buffer for the duration of this call.
+    let name = unsafe { std::slice::from_raw_parts(field.name.cast::<u8>(), field.name_size) };
+    // SAFETY: the test wrapper supplies distinct, writable output slots.
+    unsafe {
+        *error = ptr::null_mut();
+        *out = Arc::into_raw(Arc::new(name.to_vec())).cast_mut().cast();
+    }
+    SIRIUS_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_field(
+    schema: *const SiriusSchema,
+    index: usize,
+    out: *mut sirius_field,
+    error: *mut *mut SiriusError,
+) -> u32 {
+    assert_eq!(index, 0);
+    // SAFETY: the caller holds a live schema, backed by the Arc<Vec<u8>> from schema_create.
+    let name = unsafe { &*schema.cast::<Vec<u8>>() };
+    // SAFETY: both outputs are writable and distinct. The name stays live while the schema is held.
+    unsafe {
+        *error = ptr::null_mut();
+        *out = sirius_field {
+            name: name.as_ptr().cast(),
+            name_size: name.len(),
+            type_: SIRIUS_TYPE_INT64,
+            nullable: 1,
+        };
+    }
+    SIRIUS_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_retain(value: *mut SiriusSchema) {
+    // SAFETY: a non-null handle borrows a live Arc<Vec<u8>> reference.
+    unsafe { retain::<_, Vec<u8>>(value) }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sirius_schema_release(value: *mut SiriusSchema) {
+    // SAFETY: a non-null handle surrenders an owned Arc<Vec<u8>> reference.
+    unsafe { release::<_, Vec<u8>>(value) }
 }

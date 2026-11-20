@@ -1,7 +1,15 @@
-//! Raw bindings to the public Sirius C ABI.
+//! Rust access to the public Sirius C ABI.
 //!
-//! This crate links `libsirius` without compiling C++ code. Safe wrappers live in `sirius`.
+//! [`c_api`] exposes the raw declarations. [`handles`] owns native references and
+//! provides safe operations over them. The `sirius` crate provides the end-user API.
 //! Existing C++ FFI bindings live in the `sirius-ffi` crate.
 
-/// Raw configuration bindings to the public C ABI.
+pub mod handles;
+
+/// Raw configuration and plan construction bindings to the public C ABI.
 pub mod c_api;
+
+#[doc(hidden)]
+#[cfg(all(miri, feature = "miri-test-backend"))]
+#[path = "../tests/support/backend.rs"]
+pub mod miri_test_backend;
