@@ -23,6 +23,7 @@
 #include <cucascade/exec/thread_util.hpp>
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/tls/config.hpp>
@@ -40,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1178,25 +1180,31 @@ TEST_CASE("sirius_config rejects invalid cuFile settings with key context",
   }
 }
 
-TEST_CASE("the documented cuFile configuration example loads",
-          "[scan_manager][config][backend][cufile]")
+namespace {
+
+/// The YAML block that follows the HTML comment @p marker in configuration.md; there must be
+/// exactly one.
+std::string documented_yaml_example(std::string_view marker)
 {
   std::ifstream doc(SIRIUS_PROJECT_ROOT "/docs/super-sirius/configuration.md");
   REQUIRE(doc.is_open());
   bool in_yaml = false;
+  bool marked  = false;
   std::string block;
   std::string example;
   size_t examples = 0;
   for (std::string line; std::getline(doc, line);) {
+    if (line == marker) { marked = true; }
     if (!in_yaml) {
       if (line == "```yaml") {
         in_yaml = true;
         block.clear();
       }
     } else if (line == "```") {
-      if (block.find("backend: cufile") != std::string::npos) {
+      if (marked) {
         ++examples;
         example = block;
+        marked  = false;
       }
       in_yaml = false;
     } else {
@@ -1204,6 +1212,15 @@ TEST_CASE("the documented cuFile configuration example loads",
     }
   }
   REQUIRE(examples == 1);
+  return example;
+}
+
+}  // namespace
+
+TEST_CASE("the documented cuFile configuration example loads",
+          "[scan_manager][config][backend][cufile]")
+{
+  auto const example = documented_yaml_example("<!-- scan-cufile-example -->");
   scan_manager_config cfg;
   REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_cufile.yaml", example));
   CHECK(cfg.backend == io_backend::cufile);
@@ -1221,6 +1238,9 @@ TEST_CASE("the documented cuFile configuration example loads",
   CHECK(cfg.cufile.gds_threshold == (256UL << 10));
   CHECK(cfg.cufile.use_odirect);
   CHECK(cfg.cufile.compat_mode == cucascade::io::cufile::compat::automatic);
+  // The opt-in read paths stay off unless a block enables them.
+  CHECK_FALSE(cfg.cufile.fused_reads.enabled);
+  CHECK_FALSE(cfg.cufile.host_batch.enabled);
 }
 
 TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
@@ -1933,4 +1953,370 @@ TEST_CASE("metadata worker YAML records explicit counts even when equal to defau
     CHECK(sirius::scan_manager::resolve_scan_manager_num_threads(config, more_domains) ==
           initial + 1);
   }
+}
+
+// ===========================================================================
+// cufile.fused_reads and cufile.host_batch (cuCascade's opt-in read paths)
+// ===========================================================================
+
+namespace {
+
+std::string cufile_yaml(std::string const& body)
+{
+  return single_gpu_scan_manager_yaml("      cufile:\n" + body);
+}
+
+}  // namespace
+
+TEST_CASE("cufile.fused_reads and cufile.host_batch default to cuCascade's structs, off",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  namespace cf = cucascade::io::cufile;
+  // The C++ default, an absent block and an empty block are all cuCascade's defaults.
+  scan_manager_config const defaults{};
+  CHECK(defaults.cufile.fused_reads == cf::fused_read_config{});
+  CHECK(defaults.cufile.host_batch == cf::host_batch_config{});
+  CHECK_FALSE(defaults.cufile.fused_reads.enabled);
+  CHECK_FALSE(defaults.cufile.host_batch.enabled);
+  for (auto const* body : {"        {}\n", "        fused_reads: {}\n        host_batch: {}\n"}) {
+    CAPTURE(body);
+    auto const cfg = load_scan_manager("sirius_cufile_read_blocks_default.yaml", cufile_yaml(body));
+    CHECK(cfg.cufile.fused_reads == cf::fused_read_config{});
+    CHECK(cfg.cufile.host_batch == cf::host_batch_config{});
+  }
+  // Enabling a block keeps every other field at cuCascade's default.
+  auto const enabled = load_scan_manager(
+    "sirius_cufile_read_blocks_enabled.yaml",
+    cufile_yaml("        fused_reads: {enabled: true}\n        host_batch: {enabled: true}\n"));
+  auto expected_fused    = cf::fused_read_config{};
+  expected_fused.enabled = true;
+  auto expected_batch    = cf::host_batch_config{};
+  expected_batch.enabled = true;
+  CHECK(enabled.cufile.fused_reads == expected_fused);
+  CHECK(enabled.cufile.host_batch == expected_batch);
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(enabled));
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(enabled.to_io_config().cufile.fused_reads == expected_fused);
+  CHECK(enabled.to_io_config().cufile.host_batch == expected_batch);
+#endif
+}
+
+TEST_CASE("sirius_config reads every cufile.fused_reads and cufile.host_batch key",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  namespace cf      = cucascade::io::cufile;
+  auto const cfg    = load_scan_manager("sirius_cufile_read_blocks_all.yaml",
+                                     cufile_yaml("        fused_reads:\n"
+                                                    "          enabled: true\n"
+                                                    "          reactors_per_device: 4\n"
+                                                    "          lanes_per_reactor: 32\n"
+                                                    "          max_lanes_per_device: 96\n"
+                                                    "          slot_bytes: 4MiB\n"
+                                                    "          fuse: false\n"
+                                                    "          fuse_gap_bytes: 64 KiB\n"
+                                                    "          register_streams: false\n"
+                                                    "          completion: callback\n"
+                                                    "          max_gated_lanes: 3\n"
+                                                    "          max_resubmits: 0\n"
+                                                    "          max_parts_per_read: 17\n"
+                                                    "          failure_limit: 2\n"
+                                                    "          cooldown_s: 0\n"
+                                                    "          stall_warn_s: 0\n"
+                                                    "        host_batch:\n"
+                                                    "          enabled: true\n"
+                                                    "          reactors: 3\n"
+                                                    "          depth: 1024\n"
+                                                    "          max_entry_bytes: 1MiB\n"
+                                                    "          max_wave_bytes: 0\n"
+                                                    "          min_bytes: 0\n"
+                                                    "          poll_us: 1000000\n"
+                                                    "          failure_limit: 1\n"
+                                                    "          submit_policy: exclusive\n"));
+  auto const& fused = cfg.cufile.fused_reads;
+  CHECK(fused.enabled);
+  CHECK(fused.reactors_per_device == 4);
+  CHECK(fused.lanes_per_reactor == 32);
+  CHECK(fused.max_lanes_per_device == 96);
+  CHECK(fused.slot_bytes == (4UL << 20));
+  CHECK_FALSE(fused.fuse);
+  CHECK(fused.fuse_gap_bytes == (64UL << 10));
+  CHECK_FALSE(fused.register_streams);
+  CHECK(fused.completion == cf::lane_completion::callback);
+  CHECK(fused.max_gated_lanes == 3);
+  CHECK(fused.max_resubmits == 0);
+  CHECK(fused.max_parts_per_read == 17);
+  CHECK(fused.failure_limit == 2);
+  CHECK(fused.cooldown_s == 0);
+  CHECK(fused.stall_warn_s == 0);
+  auto const& batch = cfg.cufile.host_batch;
+  CHECK(batch.enabled);
+  CHECK(batch.reactors == 3);
+  CHECK(batch.depth == 1024);
+  CHECK(batch.max_entry_bytes == (1UL << 20));
+  CHECK(batch.max_wave_bytes == 0);
+  CHECK(batch.min_bytes == 0);
+  CHECK(batch.poll_us == 1'000'000);
+  CHECK(batch.failure_limit == 1);
+  CHECK(batch.submit_policy == cf::batch_submit_policy::exclusive);
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
+#ifdef CUCASCADE_HAS_CUFILE
+  // Handed to cuCascade unchanged.
+  auto const io = cfg.to_io_config();
+  CHECK(io.cufile.fused_reads == fused);
+  CHECK(io.cufile.host_batch == batch);
+#endif
+
+  for (auto const& [spelling, expected] : {std::pair{"poll", cf::lane_completion::poll},
+                                           std::pair{"callback", cf::lane_completion::callback}}) {
+    auto const parsed = load_scan_manager(
+      "sirius_cufile_lane_completion.yaml",
+      cufile_yaml(std::string{"        fused_reads:\n          completion: "} + spelling + "\n"));
+    CHECK(parsed.cufile.fused_reads.completion == expected);
+  }
+  for (auto const& [spelling, expected] :
+       {std::pair{"per_reader", cf::batch_submit_policy::per_reader},
+        std::pair{"exclusive", cf::batch_submit_policy::exclusive},
+        std::pair{"continuous", cf::batch_submit_policy::continuous}}) {
+    auto const parsed = load_scan_manager(
+      "sirius_cufile_batch_policy.yaml",
+      cufile_yaml(std::string{"        host_batch:\n          submit_policy: "} + spelling + "\n"));
+    CHECK(parsed.cufile.host_batch.submit_policy == expected);
+  }
+}
+
+TEST_CASE("cuCascade's fused_reads and host_batch rejections surface with their YAML key",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  auto const fused = [](std::string const& keys) {
+    return cufile_yaml("        fused_reads:\n          enabled: true\n" + keys);
+  };
+  auto const batch = [](std::string const& keys) {
+    return cufile_yaml("        host_batch:\n          enabled: true\n" + keys);
+  };
+  constexpr auto slot_range  = "must be a multiple of 64 KiB in [64 KiB, 1 GiB]";
+  constexpr auto entry_range = "must be a multiple of IO_BLOCK_SIZE in [4 KiB, 1 GiB]";
+  for (auto const& [text, key, message] : {
+         // validate() of fused_read_config, one row per rule.
+         std::tuple{fused("          reactors_per_device: 0\n"),
+                    "cufile.fused_reads.reactors_per_device",
+                    "must be in [1, 64]"},
+         std::tuple{fused("          reactors_per_device: 65\n"),
+                    "cufile.fused_reads.reactors_per_device",
+                    "must be in [1, 64]"},
+         std::tuple{fused("          lanes_per_reactor: 0\n"),
+                    "cufile.fused_reads.lanes_per_reactor",
+                    "must be in [1, 64]"},
+         std::tuple{fused("          lanes_per_reactor: 65\n"),
+                    "cufile.fused_reads.lanes_per_reactor",
+                    "must be in [1, 64]"},
+         std::tuple{fused("          max_lanes_per_device: 0\n"),
+                    "cufile.fused_reads.max_lanes_per_device",
+                    "must be positive"},
+         std::tuple{
+           fused("          slot_bytes: 32KiB\n"), "cufile.fused_reads.slot_bytes", slot_range},
+         std::tuple{
+           fused("          slot_bytes: 100KiB\n"), "cufile.fused_reads.slot_bytes", slot_range},
+         std::tuple{
+           fused("          slot_bytes: 2GiB\n"), "cufile.fused_reads.slot_bytes", slot_range},
+         std::tuple{fused("          fuse_gap_bytes: 8MiB\n"),
+                    "cufile.fused_reads.fuse_gap_bytes",
+                    "must be smaller than slot_bytes"},
+         std::tuple{fused("          max_gated_lanes: 17\n"),
+                    "cufile.fused_reads.max_gated_lanes",
+                    "must not exceed lanes_per_reactor"},
+         std::tuple{fused("          failure_limit: 0\n"),
+                    "cufile.fused_reads.failure_limit",
+                    "must be positive"},
+         std::tuple{fused("          max_parts_per_read: 0\n"),
+                    "cufile.fused_reads.max_parts_per_read",
+                    "must be positive"},
+         // validate() of host_batch_config.
+         std::tuple{
+           batch("          reactors: 0\n"), "cufile.host_batch.reactors", "must be in [1, 64]"},
+         std::tuple{
+           batch("          reactors: 65\n"), "cufile.host_batch.reactors", "must be in [1, 64]"},
+         std::tuple{
+           batch("          depth: 0\n"), "cufile.host_batch.depth", "must be in [1, 1024]"},
+         std::tuple{
+           batch("          depth: 1025\n"), "cufile.host_batch.depth", "must be in [1, 1024]"},
+         std::tuple{batch("          max_entry_bytes: 2KiB\n"),
+                    "cufile.host_batch.max_entry_bytes",
+                    entry_range},
+         std::tuple{batch("          max_entry_bytes: 6KiB\n"),
+                    "cufile.host_batch.max_entry_bytes",
+                    entry_range},
+         std::tuple{batch("          max_entry_bytes: 2GiB\n"),
+                    "cufile.host_batch.max_entry_bytes",
+                    entry_range},
+         std::tuple{
+           batch("          poll_us: 0\n"), "cufile.host_batch.poll_us", "must be in [1, 1000000]"},
+         std::tuple{batch("          poll_us: 1000001\n"),
+                    "cufile.host_batch.poll_us",
+                    "must be in [1, 1000000]"},
+         std::tuple{batch("          failure_limit: 0\n"),
+                    "cufile.host_batch.failure_limit",
+                    "must be positive"},
+         std::tuple{batch("          max_wave_bytes: 6000\n"),
+                    "cufile.host_batch.max_wave_bytes",
+                    "must be 0 or a multiple of IO_BLOCK_SIZE"},
+       }) {
+    CAPTURE(text);
+    require_load_error("sirius_cufile_read_blocks_invalid.yaml",
+                       text,
+                       "'" + std::string{key} + "': " + std::string{message});
+  }
+}
+
+TEST_CASE("sirius_config rejects malformed cufile.fused_reads and cufile.host_batch values",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  for (auto const& [body, needle] : {
+         std::pair{"        fused_reads: 1\n", "cufile.fused_reads: expected a mapping"},
+         std::pair{"        host_batch: [1]\n", "cufile.host_batch: expected a mapping"},
+         std::pair{"        fused_reads:\n          lanes: 4\n",
+                   "unknown config key: 'lanes' in cufile.fused_reads"},
+         std::pair{"        host_batch:\n          entries: 4\n",
+                   "unknown config key: 'entries' in cufile.host_batch"},
+         std::pair{"        fused_reads:\n          enabled: maybe\n",
+                   "'cufile.fused_reads.enabled'"},
+         std::pair{"        fused_reads:\n          lanes_per_reactor: -1\n",
+                   "'cufile.fused_reads.lanes_per_reactor': must be a nonnegative integer"},
+         std::pair{"        fused_reads:\n          max_resubmits: -1\n",
+                   "'cufile.fused_reads.max_resubmits': must be a nonnegative integer"},
+         std::pair{"        fused_reads:\n          stall_warn_s: 4294967296\n",
+                   "'cufile.fused_reads.stall_warn_s': must be a nonnegative integer"},
+         std::pair{"        fused_reads:\n          slot_bytes: -1\n",
+                   "'cufile.fused_reads.slot_bytes'"},
+         std::pair{"        fused_reads:\n          slot_bytes: 8 parsecs\n",
+                   "'cufile.fused_reads.slot_bytes'"},
+         std::pair{"        fused_reads:\n          completion: Poll\n",
+                   "'cufile.fused_reads.completion': invalid enum value 'Poll' (expected poll, "
+                   "callback)"},
+         std::pair{"        host_batch:\n          submit_policy: perreader\n",
+                   "'cufile.host_batch.submit_policy': invalid enum value 'perreader' (expected "
+                   "per_reader, exclusive, continuous)"},
+         std::pair{"        host_batch:\n          depth: -4\n",
+                   "'cufile.host_batch.depth': must be a nonnegative integer"},
+         std::pair{"        host_batch:\n          min_bytes: -1\n",
+                   "'cufile.host_batch.min_bytes'"},
+       }) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_cufile_read_blocks_malformed.yaml", cufile_yaml(body));
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(needle));
+  }
+}
+
+TEST_CASE("a disabled cufile read block is range-checked only once enabled",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  // cuCascade's contract: validate() checks a block only when it is enabled.
+  auto const body = std::string{
+    "        fused_reads:\n          slot_bytes: 1000\n"
+    "        host_batch:\n          depth: 0\n"};
+  auto const cfg = load_scan_manager("sirius_cufile_read_blocks_disabled.yaml", cufile_yaml(body));
+  CHECK(cfg.cufile.fused_reads.slot_bytes == 1000);
+  CHECK(cfg.cufile.host_batch.depth == 0);
+  CHECK_NOTHROW(sirius::scan_manager::validate_scan_manager_config(cfg));
+  require_load_error("sirius_cufile_read_blocks_enabled_invalid.yaml",
+                     cufile_yaml(body + "          enabled: true\n"),
+                     "'cufile.host_batch.depth': must be in [1, 1024]");
+}
+
+TEST_CASE("C++ cufile read blocks are validated before the scan manager starts",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  namespace cf = cucascade::io::cufile;
+  scan_manager_config cfg{};
+  std::string key;
+  SECTION("fused reads")
+  {
+    cfg.cufile.fused_reads.enabled    = true;
+    cfg.cufile.fused_reads.slot_bytes = 4096;
+    key                               = "'cufile.fused_reads.slot_bytes': must be a multiple";
+  }
+  SECTION("host batch")
+  {
+    cfg.cufile.host_batch.enabled         = true;
+    cfg.cufile.host_batch.max_entry_bytes = 0;
+    key                                   = "'cufile.host_batch.max_entry_bytes': must be";
+  }
+  SECTION("fused reads with the async engine")
+  {
+    cfg.cufile.fused_reads.enabled = true;
+    cfg.cufile.async_engine.mode   = cf::engine_mode::async_auto;
+    key = "'cufile.fused_reads.enabled': requires cufile.async_engine.mode legacy";
+  }
+  CHECK_THROWS_MATCHES(sirius::scan_manager::validate_scan_manager_config(cfg),
+                       std::invalid_argument,
+                       Catch::Matchers::MessageMatches(Catch::Matchers::StartsWith(key)));
+  // The engine alone, with fused reads off, is not this check's business.
+  scan_manager_config engine_only{};
+  engine_only.cufile.async_engine.mode = cf::engine_mode::async_auto;
+  CHECK_NOTHROW(sirius::scan_manager::validate_cufile_read_blocks(engine_only.cufile));
+}
+
+TEST_CASE("legal but surprising cufile read settings are logged",
+          "[scan_manager][config][cufile][fused_reads][host_batch]")
+{
+  auto const count = [](sirius::test::scoped_recording_log_sink const& logs,
+                        std::string_view needle) {
+    std::size_t n = 0;
+    for (auto const& record : logs.records()) {
+      if (record.message.find(needle) != std::string::npos) {
+        CHECK(record.level == sirius::log::level::warn);
+        ++n;
+      }
+    }
+    return n;
+  };
+  constexpr std::string_view excess = "exceeds max_lanes_per_device (128)";
+  constexpr std::string_view crash  = "'cufile.host_batch.submit_policy': continuous crashes";
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    std::ignore = load_scan_manager("sirius_cufile_excess_lanes.yaml",
+                                    cufile_yaml("        fused_reads:\n"
+                                                "          enabled: true\n"
+                                                "          reactors_per_device: 16\n"
+                                                "          lanes_per_reactor: 16\n"
+                                                "        host_batch:\n"
+                                                "          enabled: true\n"
+                                                "          submit_policy: continuous\n"));
+    CHECK(count(logs, excess) == 1);
+    CHECK(count(logs, crash) == 1);
+  }
+  {
+    // Disabled blocks, or the defaults, stay quiet.
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    std::ignore = load_scan_manager("sirius_cufile_quiet_lanes.yaml",
+                                    cufile_yaml("        fused_reads:\n"
+                                                "          reactors_per_device: 16\n"
+                                                "          lanes_per_reactor: 16\n"
+                                                "        host_batch:\n"
+                                                "          submit_policy: continuous\n"));
+    std::ignore = load_scan_manager(
+      "sirius_cufile_default_lanes.yaml",
+      cufile_yaml("        fused_reads: {enabled: true}\n        host_batch: {enabled: true}\n"));
+    CHECK(count(logs, excess) == 0);
+    CHECK(count(logs, crash) == 0);
+  }
+}
+
+TEST_CASE("the documented GPFS fused-lanes recipe loads",
+          "[scan_manager][config][backend][cufile][fused_reads]")
+{
+  namespace cf       = cucascade::io::cufile;
+  auto const example = documented_yaml_example("<!-- cufile-gpfs-fused-recipe -->");
+  scan_manager_config cfg;
+  REQUIRE_NOTHROW(cfg = load_scan_manager("sirius_documented_gpfs_fused.yaml", example));
+  CHECK(cfg.backend == io_backend::cufile);
+  CHECK(cfg.cufile_n_reactors == 0);
+  CHECK(cfg.cufile.storage_hint_path == "/path/on/the/gpfs/mount/some.parquet");
+  auto expected_fused    = cf::fused_read_config{};
+  expected_fused.enabled = true;
+  auto expected_batch    = cf::host_batch_config{};
+  expected_batch.enabled = true;
+  CHECK(cfg.cufile.fused_reads == expected_fused);
+  CHECK(cfg.cufile.host_batch == expected_batch);
 }

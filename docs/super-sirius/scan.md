@@ -713,6 +713,22 @@ planned pool, `SiriusContext::initialize` reserves them (`reserve_cufile_staging
 before the GPU memory pools claim the device. See
 [cuFile configuration](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp).
 
+Two opt-in blocks change how the pool reads; both are off by default.
+[`cufile.fused_reads`](configuration.md#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in)
+adds *lane reactors* to each GPU's group (8 by default, built before the synchronous ones,
+whose automatic count then drops to 8). Each owns lanes (16 by default), a lane being a
+registered slot plus a CUDA stream. A device read of a registered file is cut on the
+submitting thread into 4 KiB-aligned windows of up to `slot_bytes` (8 MiB), neighbouring
+slices of one request fused, and each window is one `cuFileReadAsync` followed by
+device-to-device copies into the destinations on the lane's stream. Completion stays
+host-observed. The lane slots (1032 MiB per GPU with the defaults) live outside RMM on top of
+the staging cap, and `reserve_cufile_staging` reserves them first.
+[`cufile.host_batch`](configuration.md#cufilehost_batch--host-reads-through-the-cufile-batch-api-opt-in)
+adds batch reactors that serve aligned host reads through `cuFileBatchIOSubmit`. Fusion is
+per request: the cuDF reader the cuFile scan decodes through issues one `device_read_async`
+per contiguous run of column chunks, so runs are split into windows but never fused with
+each other.
+
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future
 settles only when the destination is ready. Host reads, small device reads (default
@@ -720,7 +736,8 @@ threshold 256KiB), and compatibility/failure fallbacks use POSIX reads; device f
 stages through pinned host scratch and H2D copies. None of this staging is `fs_cache`,
 and neither cache mode nor an explicit readahead budget enables cuFile scan readahead.
 At shutdown the scan manager logs how many reads and bytes went staged, direct, POSIX
-device and host, plus the cuFile failures (`cufile_ioctx::stats()`).
+device and host, plus the cuFile failures (`cufile_ioctx::stats()`), and, when
+`fused_reads` or `host_batch` is enabled, the lane and batch counters.
 
 `compat_mode: auto` permits host/POSIX fallback when cuFile is unavailable for a
 file, including on a compatibility-only host without `nvidia-fs`. `on` forces POSIX;

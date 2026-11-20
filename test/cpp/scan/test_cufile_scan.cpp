@@ -23,7 +23,9 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/io/parquet_io_utils.hpp>
 
@@ -49,6 +51,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -507,6 +511,354 @@ TEST_CASE("cuFile staging is reserved ahead of the pool, on Sirius's GPU only",
   ioctx->start();
   CHECK(cufile::staging_usage_of(0).allocated_bytes == reserved.allocated_bytes);
   ioctx->shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// cufile.fused_reads and cufile.host_batch (opt-in).  cuFile runs in compatibility mode
+// on hosts without GDS, where lanes still run (cuFile bounces each read through host
+// memory) and the batch API still serves host reads.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The id and value columns write_parquet() stores in @p groups.
+std::vector<std::vector<std::int64_t>> expected_rows(
+  cudf::io::parquet::FileMetaData const& metadata, std::vector<cudf::size_type> const& groups)
+{
+  std::vector<std::vector<std::int64_t>> expected(2);
+  std::int64_t first_row = 0;
+  for (std::size_t group = 0; group < metadata.row_groups.size(); ++group) {
+    auto const rows = metadata.row_groups[group].num_rows;
+    if (std::find(groups.begin(), groups.end(), static_cast<cudf::size_type>(group)) !=
+        groups.end()) {
+      for (auto id = first_row; id < first_row + rows; ++id) {
+        expected[0].push_back(id);
+        expected[1].push_back(17 * id * id + 31 * id + 7);
+      }
+    }
+    first_row += rows;
+  }
+  return expected;
+}
+
+/// A planned pool on GPU 0 that lets cuFile register the file, so device reads can take
+/// lanes, with a small lane set (2 lane reactors x 4 lanes of the default 8 MiB).
+scan_manager_config fused_reads_config()
+{
+  auto config              = reader_config(io_backend::cufile);
+  config.cufile_n_reactors = 0;
+  config.cufile.compat_mode.reset();
+  config.cufile.use_odirect                     = true;
+  config.cufile.fused_reads.enabled             = true;
+  config.cufile.fused_reads.reactors_per_device = 2;
+  config.cufile.fused_reads.lanes_per_reactor   = 4;
+  return config;
+}
+
+}  // namespace
+
+TEST_CASE("fused lane reads serve the cuFile scan and decode the same rows",
+          "[cufile][scan][fused_reads]")
+{
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_fused_scan");
+  write_parquet(directory);
+
+  auto const config = fused_reads_config();
+  auto memory       = initialize_memory_manager(1);
+  auto topology     = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager reader{lifecycle, config, *memory, topology};
+  sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+
+  auto const* ioctx = dynamic_cast<cufile::cufile_ioctx const*>(reader.io_ctx());
+  REQUIRE(ioctx != nullptr);
+  // The plan carries the lane reactors next to the synchronous ones, whose automatic
+  // count drops to the local default with fused reads on.
+  auto const& plan = ioctx->plan();
+  REQUIRE(plan.groups.size() == 1);
+  auto const& group = plan.groups.front();
+  CHECK(group.device == 0);
+  CHECK(group.lane_reactors == 2);
+  CHECK(group.lanes_per_reactor == 4);
+  CHECK(group.lane_slots == 8);
+  CHECK(group.n_reactors == cufile::local_reactors_per_device);
+  CHECK(plan.lane_slot_bytes == config.cufile.fused_reads.slot_bytes);
+  CHECK(plan.total_reactors() == group.lane_reactors + group.n_reactors);
+
+  auto const path = directory.file("input.parquet");
+  auto source     = reader.create_datasource(path);
+  auto baseline   = native.create_datasource(path);
+  REQUIRE(source);
+  REQUIRE(baseline);
+  REQUIRE(source->io_ctx().get() == reader.io_ctx());
+  if (!ioctx->path_capability(source->get_io_object()).registered) {
+    SKIP("cuFile did not register the file here; its device reads use POSIX, not lanes");
+  }
+
+  auto options = cudf::io::parquet_reader_options::builder().column_names({"id", "value"}).build();
+  auto footer  = cudf::io::parquet::fetch_footer_to_host(*baseline);
+  cudf::io::parquet::experimental::hybrid_scan_reader footer_reader(
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options);
+  auto const metadata =
+    std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+  std::vector<cudf::size_type> groups(metadata->row_groups.size());
+  std::iota(groups.begin(), groups.end(), 0);
+  auto const ranges = sirius::op::scan::column_chunk_ranges(*metadata, options, groups);
+
+  // One vectored read of every selected chunk, behind work queued on the caller's stream
+  // (two-phase lane reads): each row group's adjacent id and value chunks share a window.
+  rmm::cuda_stream caller(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream observer(rmm::cuda_stream::flags::non_blocking);
+  rmm::cuda_stream decoder(rmm::cuda_stream::flags::non_blocking);
+  auto const want = read_chunks(*baseline, ranges, caller, observer, false);
+  auto const got  = read_chunks(*source, ranges, caller, observer, true);
+  for (std::size_t i = 0; i < ranges.size(); ++i) {
+    CAPTURE(i, ranges[i].offset(), ranges[i].size());
+    auto const& actual   = got.observed_bytes[i];
+    auto const& expected = want.observed_bytes[i];
+    CHECK(std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()));
+  }
+  auto const vectored = ioctx->stats();
+  CHECK(vectored.lane_reads > 0);
+  CHECK(vectored.lane_parts > vectored.lane_reads);  // neighbours were fused
+  CHECK(vectored.lane_issued_bytes >= vectored.lane_bytes);
+  CHECK(vectored.lane_failures == 0);
+  CHECK(vectored.cufile_failures == 0);
+
+  // Sirius's scan route for this backend: cuDF's reader, one device read per contiguous run.
+  std::array<parquet_source, 1> const sources{{{source, metadata, groups}}};
+  CHECK_FALSE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  auto table = sirius::op::scan::materialize_parquet(
+    sources, options, {}, decoder, cudf::get_current_device_resource_ref());
+  REQUIRE(table);
+  auto const actual   = host_columns(table->view(), decoder);
+  auto const expected = expected_rows(*metadata, groups);
+  CHECK(std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()));
+  auto const scanned = ioctx->stats() - vectored;
+  CHECK(scanned.lane_reads > 0);
+  CHECK(scanned.lane_failures == 0);
+  CHECK(scanned.cufile_failures == 0);
+}
+
+TEST_CASE("cuFile fused-read lane slots are reserved ahead of the pool",
+          "[cufile][scan][scan_manager][fused_reads]")
+{
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile staging requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover());
+  auto const& topology = discovery.get_topology();
+
+  auto config = fused_reads_config();
+  // A slot size of its own, so the lane slots are told apart from the synchronous ones.
+  config.cufile.fused_reads.slot_bytes = 1UL << 20;
+  std::vector<int> const gpu_0{0};
+  // Staging is process-wide: start from none.
+  std::ignore = cufile::release_staging(0);
+  REQUIRE(cufile::staging_usage_of(0).leased_slots == 0);
+  REQUIRE(cufile::staging_usage_of(0).allocated_bytes == 0);
+
+  auto const cfg  = config.resolved_cufile(gpu_0);
+  auto const plan = cufile::plan_cufile_pool(cfg, &topology, cufile::probe_platform());
+  REQUIRE(plan.groups.size() == 1);
+  auto const& group = plan.groups.front();
+  REQUIRE(group.lane_slots == 8);
+  CHECK(plan.lane_slot_bytes == (1UL << 20));
+  // The lanes are budgeted on top of the synchronous cap; the plan's cap includes them.
+  auto const lane_bytes = cufile::fused_lane_staging_bytes(cfg);
+  CHECK(lane_bytes == 8 * ((1UL << 20) + (64UL << 10)));
+  CHECK(group.staging_cap_bytes >= lane_bytes);
+
+  // A flat pool leases its lane slots at its first reads: nothing is reserved for it.
+  auto flat              = config;
+  flat.cufile_n_reactors = 4;
+  sirius::scan_manager::reserve_cufile_staging(flat, gpu_0, topology);
+  CHECK(cufile::staging_usage_of(0).allocated_bytes == 0);
+
+  sirius::scan_manager::reserve_cufile_staging(config, gpu_0, topology);
+  auto const reserved = cufile::staging_usage_of(0);
+  CHECK(reserved.leased_slots == 0);
+  CHECK(reserved.free_slots == group.lane_slots + group.staging_slots);
+  if (group.staging_slots == 0) {
+    // No GDS here: automatic staging reserves no synchronous slots, only the lanes'.
+    CHECK(reserved.allocated_bytes == lane_bytes);
+  } else {
+    CHECK(reserved.allocated_bytes > lane_bytes);
+  }
+
+  // The pool built afterwards starts its lanes on the reserved slots.
+  auto ioctx = cufile::make_cufile_ioctx(0, cfg);
+  ioctx->start();
+  CHECK(cufile::staging_usage_of(0).allocated_bytes == reserved.allocated_bytes);
+  ioctx->shutdown();
+}
+
+TEST_CASE("cuFile host batch serves an aligned host read through Sirius's datasource",
+          "[cufile][scan][host_batch]")
+{
+  namespace cufile = cucascade::io::cufile;
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  sirius::test::scratch_dir directory("cufile_host_batch");
+  write_parquet(directory);
+
+  auto config              = reader_config(io_backend::cufile);
+  config.cufile_n_reactors = 0;
+  config.cufile.compat_mode.reset();
+  config.cufile.use_odirect                = true;
+  config.cufile.host_batch.enabled         = true;
+  config.cufile.host_batch.max_entry_bytes = 256UL << 10;  // several entries per read
+  auto memory                              = initialize_memory_manager(1);
+  auto topology                            = single_gpu_index();
+  sirius::exec::query_lifecycle_registry lifecycle;
+  sirius_scan_manager reader{lifecycle, config, *memory, topology};
+  sirius_scan_manager native{lifecycle, reader_config(io_backend::native), *memory, topology};
+
+  auto const* ioctx = dynamic_cast<cufile::cufile_ioctx const*>(reader.io_ctx());
+  REQUIRE(ioctx != nullptr);
+  CHECK(ioctx->plan().host_batch_reactors == config.cufile.host_batch.reactors);
+
+  auto const path = directory.file("input.parquet");
+  auto source     = reader.create_datasource(path);
+  auto baseline   = native.create_datasource(path);
+  REQUIRE(source);
+  REQUIRE(baseline);
+  if (!ioctx->path_capability(source->get_io_object()).registered) {
+    SKIP("cuFile did not register the file here; its host reads use POSIX");
+  }
+  constexpr std::size_t offset = 4096;
+  constexpr std::size_t bytes  = 1UL << 20;
+  REQUIRE(source->size() >= offset + bytes);
+  std::vector<std::uint8_t> expected(bytes);
+  REQUIRE(baseline->host_read(offset, bytes, expected.data()) == bytes);
+
+  // A 4 KiB-aligned destination for a 4 KiB-aligned range: the batch path's shape.
+  auto const release = [](std::uint8_t* p) { std::free(p); };
+  std::unique_ptr<std::uint8_t, decltype(release)> aligned{
+    static_cast<std::uint8_t*>(std::aligned_alloc(4096, bytes)), release};
+  REQUIRE(aligned);
+  REQUIRE(source->host_read(offset, bytes, aligned.get()) == bytes);
+  CHECK(std::equal(aligned.get(), aligned.get() + bytes, expected.begin(), expected.end()));
+  auto const batched = ioctx->stats();
+  CHECK(batched.batch_reads == 1);
+  CHECK(batched.batch_bytes == bytes);
+  CHECK(batched.batch_entries >= bytes / config.cufile.host_batch.max_entry_bytes);
+  CHECK(batched.batch_failures == 0);
+  CHECK(batched.batch_partial_status == 0);
+
+  // An incongruent destination keeps the synchronous path.
+  std::vector<std::uint8_t> unaligned(bytes + 1);
+  REQUIRE(source->host_read(offset, bytes, unaligned.data() + 1) == bytes);
+  CHECK(std::equal(unaligned.begin() + 1, unaligned.end(), expected.begin(), expected.end()));
+  auto const after = ioctx->stats();
+  CHECK(after.batch_reads == batched.batch_reads);
+  CHECK(after.host_reads > batched.host_reads);
+}
+
+TEST_CASE("a SQL scan through the cuFile backend reads on fused lanes",
+          "[cufile][scan][fused_reads][isolated_context]")
+{
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count == 0) { SKIP("cuFile scan integration requires a CUDA device"); }
+  sirius::test::scratch_dir directory("cufile_fused_sql");
+  write_parquet(directory);
+  auto const config_path = directory.file("sirius_cufile_fused.yaml");
+  {
+    std::ofstream yaml(config_path);
+    yaml << "sirius:\n"
+            "  topology:\n"
+            "    num_gpus: 1\n"
+            "  memory:\n"
+            "    gpu:\n"
+            "      usage_limit_bytes: 2GiB\n"
+            "    host:\n"
+            "      capacity_bytes: 1GiB\n"
+            "  executor:\n"
+            "    pipeline:\n"
+            "      num_threads: 2\n"
+            "    scan_manager:\n"
+            "      backend: cufile\n"
+            "      cufile_n_reactors: 0\n"
+            "      uring_n_reactors: 1\n"
+            "      cufile:\n"
+            "        fused_reads:\n"
+            "          enabled: true\n"
+            "          reactors_per_device: 2\n"
+            "          lanes_per_reactor: 4\n";
+    REQUIRE(yaml);
+  }
+
+  auto db = sirius::test::open_sirius_db(nullptr, config_path);
+  {
+    duckdb::Connection con(*db);
+    auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    auto& scans       = context->get_scan_manager();
+    auto const* ioctx = dynamic_cast<cucascade::io::cufile::cufile_ioctx const*>(scans.io_ctx());
+    REQUIRE(ioctx != nullptr);
+    REQUIRE(ioctx->plan().groups.size() == 1);
+    CHECK(ioctx->plan().groups.front().lane_reactors == 2);
+    CHECK(ioctx->plan().groups.front().lanes_per_reactor == 4);
+    auto const path       = directory.file("input.parquet");
+    auto const registered = [&] {
+      auto source = scans.create_datasource(path);
+      REQUIRE(source);
+      return ioctx->path_capability(source->get_io_object()).registered;
+    }();
+
+    auto const run = [&](std::string const& sql) {
+      auto result = con.Query(sql);
+      REQUIRE(result);
+      INFO((result->HasError() ? result->GetError() : std::string{}));
+      REQUIRE_FALSE(result->HasError());
+      return result;
+    };
+    // A GPU failure must surface rather than fall back to DuckDB's own reader.
+    std::ignore = run("SET enable_duckdb_fallback = false");
+    auto const query =
+      "SELECT count(*), min(id), max(id), min(value), max(value) FROM "
+      "read_parquet(" +
+      directory.file_literal("input.parquet") + ") WHERE id >= 100000";
+    auto const before = ioctx->stats();
+    auto gpu          = run(query);
+    auto const read   = ioctx->stats() - before;
+    std::ignore       = run("SET gpu_execution = false");
+    auto cpu          = run(query);
+    REQUIRE(gpu->RowCount() == 1);
+    REQUIRE(cpu->RowCount() == 1);
+    REQUIRE(gpu->ColumnCount() == cpu->ColumnCount());
+    for (duckdb::idx_t c = 0; c < gpu->ColumnCount(); ++c) {
+      CAPTURE(c);
+      CHECK(gpu->Collection().GetValue(c, 0).ToString() ==
+            cpu->Collection().GetValue(c, 0).ToString());
+    }
+    constexpr std::int64_t last = 262143;
+    CHECK(gpu->Collection().GetValue(0, 0).GetValue<std::int64_t>() == last - 100000 + 1);
+    CHECK(gpu->Collection().GetValue(4, 0).GetValue<std::int64_t>() ==
+          17 * last * last + 31 * last + 7);
+
+    CHECK(read.cufile_failures == 0);
+    CHECK(read.lane_failures == 0);
+    if (registered) {
+      // The GPU scan read its column chunks through the lanes.
+      CHECK(read.lane_reads > 0);
+      CHECK(read.lane_bytes > 0);
+    } else {
+      WARN("cuFile did not register the file here; the scan's device reads used POSIX");
+    }
+  }
+  db.reset();
 }
 
 #endif  // CUCASCADE_HAS_CUFILE

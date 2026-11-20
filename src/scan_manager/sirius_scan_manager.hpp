@@ -1416,8 +1416,12 @@ class sirius_scan_manager {
  * memory manager's pools took their share of each GPU; called first, this takes the
  * slots the pool plans for @p gpu_ids while the memory is still free, and the pool
  * then reuses them.  Does nothing unless @c backend is @c cufile with a planned pool
- * (@c cufile_n_reactors == 0) and the plan stages (see @c cufile.staging_mode): on a
- * host without GPUDirect Storage, @c automatic reserves nothing.
+ * (@c cufile_n_reactors == 0).  It reserves the fused-read lane slots the plan budgets
+ * when @c cufile.fused_reads is enabled (@c cufile::fused_lane_staging_bytes per GPU,
+ * on top of @c cufile.max_staging_bytes_per_device; unregistered slots are accepted in
+ * cuFile compatibility mode), then the synchronous staging slots when the plan stages
+ * (see @c cufile.staging_mode: on a host without GPUDirect Storage, @c automatic
+ * reserves none).
  *
  * @param config The scan manager configuration the default context is built from.
  * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).

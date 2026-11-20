@@ -443,6 +443,47 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
   return std::max(workers, static_cast<int>(domains));
 }
 
+/**
+ * @brief Check cuCascade's two opt-in cuFile read blocks, @c cufile.fused_reads and
+ *        @c cufile.host_batch, and report a failure under its YAML key.
+ *
+ * The ranges and cross-field rules are cuCascade's (@c fused_read_config::validate,
+ * @c host_batch_config::validate), checked only for an enabled block; their messages name the
+ * struct field ("fused_reads.slot_bytes must be ...") and are rethrown as
+ * "'cufile.fused_reads.slot_bytes': must be ...".  Adds the rule the cuFile reactors enforce at
+ * construction: fused reads need the legacy engine (@c async_engine.mode).
+ *
+ * @throws std::invalid_argument naming the first invalid key.
+ */
+inline void validate_cufile_read_blocks(cucascade::io::cufile::config const& cufile)
+{
+  auto const rethrow = [](std::string_view block, std::invalid_argument const& e) {
+    std::string_view const what{e.what()};
+    auto const space = what.find(' ');
+    if (what.starts_with(std::string{block} + ".") && space != std::string_view::npos) {
+      throw std::invalid_argument("'cufile." + std::string{what.substr(0, space)} +
+                                  "': " + std::string{what.substr(space + 1)});
+    }
+    throw std::invalid_argument("'cufile." + std::string{block} + "': " + std::string{what});
+  };
+  try {
+    cufile.fused_reads.validate();
+  } catch (std::invalid_argument const& e) {
+    rethrow("fused_reads", e);
+  }
+  try {
+    cufile.host_batch.validate();
+  } catch (std::invalid_argument const& e) {
+    rethrow("host_batch", e);
+  }
+  if (cufile.fused_reads.enabled &&
+      cufile.async_engine.mode != cucascade::io::cufile::engine_mode::legacy) {
+    throw std::invalid_argument(
+      "'cufile.fused_reads.enabled': requires cufile.async_engine.mode legacy (the async engine "
+      "and the fused lanes would claim the same device reads)");
+  }
+}
+
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
@@ -466,6 +507,7 @@ inline scan_manager_config validate_scan_manager_config(scan_manager_config conf
     throw std::invalid_argument(
       "'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
   }
+  validate_cufile_read_blocks(config.cufile);
   return config;
 }
 }  // namespace sirius::scan_manager

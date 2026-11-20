@@ -1591,6 +1591,41 @@ sirius_scan_manager::~sirius_scan_manager()
         s.host_bytes >> 20,
         s.cufile_failures,
         s.parked_slices);
+      // The opt-in paths (cufile.fused_reads, cufile.host_batch).  Fusion = parts / reads,
+      // waste = issued / payload; failures re-served synchronously and partial batch statuses
+      // (each poisons its reader) should stay 0.
+      if (_config.cufile.fused_reads.enabled || s.lane_reads != 0 || s.lane_failures != 0) {
+        auto const finished = s.lane_reads + s.lane_failures;
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cufile lanes: reads {} ({} MiB payload, {} MiB issued, {} parts), "
+          "resubmits {}, failures {}, gated {}, mean lane cycle {} us",
+          s.lane_reads,
+          s.lane_bytes >> 20,
+          s.lane_issued_bytes >> 20,
+          s.lane_parts,
+          s.lane_resubmits,
+          s.lane_failures,
+          s.lane_gated_reads,
+          finished == 0 ? 0 : s.lane_flight_ns / finished / 1000);
+      }
+      if (_config.cufile.host_batch.enabled || s.batch_reads != 0) {
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] cufile host batch: reads {} ({} MiB), waves {}, entries {}, "
+          "failures {}, rejected submits {}, partial status {}",
+          s.batch_reads,
+          s.batch_bytes >> 20,
+          s.batch_waves,
+          s.batch_entries,
+          s.batch_failures,
+          s.batch_rejected_submits,
+          s.batch_partial_status);
+      }
+      if (s.batch_partial_status != 0) {
+        SIRIUS_LOG_WARN(
+          "[sirius_scan_manager] cuFile returned {} partial batch status(es); each left its batch "
+          "reader poisoned (see cuCascade's docs/io/cufile-fused-lanes.md)",
+          s.batch_partial_status);
+      }
     } catch (...) {
       // Diagnostics must not prevent shutdown during exception unwinding.
     }
@@ -2766,7 +2801,8 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
                 "cuFile reader could not be constructed (requires cuCascade built with "
                 "CUCASCADE_HAS_CUFILE; check cufile_n_reactors, cufile.reactors_per_device, "
                 "cufile.devices, cufile.max_inflight, cufile.max_op_bytes, "
-                "cufile.staging_piece_bytes, cufile.use_odirect and cufile.compat_mode). "
+                "cufile.staging_piece_bytes, cufile.use_odirect, cufile.compat_mode, "
+                "cufile.fused_reads and cufile.host_batch). "
                 "Direct reads require libcufile and a compatible GDS path; compat_mode=on "
                 "uses POSIX fallback without requiring GDS availability",
               .by_configuration = false};
@@ -4648,6 +4684,34 @@ void reserve_cufile_staging(scan_manager_config const& config,
   // piece size), so the pool's start() finds these slots instead of allocating more.
   if (plan.staging_piece_bytes != 0) { cfg.staging_piece_bytes = plan.staging_piece_bytes; }
   for (auto const& group : plan.groups) {
+    // Fused-read lane slots first, as the pool's own start() takes them: the plan budgets
+    // them before the synchronous staging, and group.staging_cap_bytes covers both.
+    // Without this, the lanes would lease their slots at the first read, after the GPU
+    // memory pool may have taken the device.
+    if (group.lane_slots != 0 && plan.lane_slot_bytes != 0) {
+      auto const lanes = cufile::reserve_staging_slots(group.device,
+                                                       group.lane_slots,
+                                                       plan.lane_slot_bytes,
+                                                       group.staging_cap_bytes,
+                                                       cufile::gds_available());
+      if (lanes < group.lane_slots) {
+        SIRIUS_LOG_WARN(
+          "[sirius_scan_manager] reserved only {} of {} cuFile fused-read lane slots on GPU {} "
+          "ahead of its memory pool; its lane reactors run with fewer lanes",
+          lanes,
+          group.lane_slots,
+          group.device);
+      } else {
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] reserved {} cuFile fused-read lane slots of {} KiB on GPU {} "
+          "ahead of its memory pool ({} MiB of lanes wanted per GPU, on top of "
+          "cufile.max_staging_bytes_per_device)",
+          lanes,
+          plan.lane_slot_bytes >> 10,
+          group.device,
+          cufile::fused_lane_staging_bytes(cfg) >> 20);
+      }
+    }
     if (group.staging_slots == 0) { continue; }
     cfg.max_staging_bytes_per_device = group.staging_cap_bytes;
     auto const reserved = cufile::reserve_staging(group.device, group.staging_slots, cfg);
@@ -4666,6 +4730,17 @@ void reserve_cufile_staging(scan_manager_config const& config,
         (reserved * cfg.staging_slot_bytes()) >> 20,
         group.device);
     }
+  }
+  for (auto const& group : plan.groups) {
+    if (group.lane_slots == 0 && group.staging_slots == 0) { continue; }
+    auto const usage = cufile::staging_usage_of(group.device);
+    SIRIUS_LOG_INFO(
+      "[sirius_scan_manager] cuFile staging on GPU {}: {} MiB allocated outside RMM ({} MiB "
+      "registered), cap {} MiB",
+      group.device,
+      usage.allocated_bytes >> 20,
+      usage.registered_bytes >> 20,
+      group.staging_cap_bytes >> 20);
   }
 #else
   (void)config;
