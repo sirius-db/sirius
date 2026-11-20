@@ -275,7 +275,7 @@ for all disk settings.
 
 ## Logging
 Source builds log with [spdlog](https://github.com/gabime/spdlog) to `log/sirius_<date>.log`, relative to the current working directory, at level `info`.
-Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer where enabled) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.
 
 The released `sirius_cuda12` and `sirius_cuda13` extensions write no files by default: they log through DuckDB's logger and leave Quent telemetry off. Read their logs with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`, or select file logging with `SET sirius_log_backend = 'spdlog'` or `SIRIUS_LOG_BACKEND=spdlog`. When a query falls back to the CPU, the banner printed on stdout includes the GPU error.
 
