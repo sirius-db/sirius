@@ -24,12 +24,10 @@ namespace simpatico {
 // The build mirrors the fusion accept rules (see plan/fusion.hpp). Fusable ops
 // are bitpack, zigzag, delta, rle, and for:
 //   * bitpack is a leaf (its outgoing edges are entropy tails, ignored).
-//   * delta/rle/for recurse into each declared channel when it feeds a codegen
-//     op, else synthesize a Raw passthrough leaf (channel drained through a
-//     synthetic identity leaf, left terminal, or feeding a non-fusable op); rle
+//   * delta/rle/for/zigzag recurse into each declared channel when it feeds a
+//     codegen op, else synthesize a Raw passthrough leaf (channel drained through
+//     a synthetic identity leaf, left terminal, or feeding a non-fusable op); rle
 //     keeps both its "runs" and "values" children.
-//   * zigzag fuses its "zigzag" child only when present and codegen; otherwise
-//     it carries no child.
 //
 // Children are keyed by their DSL channel name directly ("differences", "runs",
 // "values", "deltas", "zigzag") with no translation, and stored in a std::map so
@@ -41,8 +39,8 @@ namespace simpatico {
 // (index == jit node_id). For a real op node `plan_node` is the PlanTree node
 // id. For a synthesized Raw passthrough leaf, `is_raw_passthrough` is true,
 // `parent_node` is the owning parent node, `parent_op` is the parent's op name
-// ("rle", "for", "delta") and `parent_channel` is the exact DSL channel name
-// being materialized ("values", "runs", "deltas", "differences").
+// ("rle", "for", "delta", "zigzag") and `parent_channel` is the exact DSL channel
+// name being materialized ("values", "runs", "deltas", "differences", "zigzag").
 struct FusedNodeOrigin {
   codegen::jit::FusedTree* node = nullptr;
   NodeId plan_node              = 0;

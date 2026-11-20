@@ -57,10 +57,11 @@ enum class late_failure_cause : uint8_t {
   retry_exhausted,
   gpu_error,
   other,
-  resource
+  resource,
+  object_changed
 };
 inline constexpr std::size_t late_failure_cause_count =
-  static_cast<std::size_t>(late_failure_cause::resource) + 1;
+  static_cast<std::size_t>(late_failure_cause::object_changed) + 1;
 // One bounded, best-effort decision record, including policy/cleanup early exits.
 struct late_failure_trace {
   ~late_failure_trace() noexcept;
@@ -70,15 +71,24 @@ struct late_failure_trace {
 };
 class classified_execution_error : public std::runtime_error {
  public:
-  classified_execution_error(late_failure_cause kind, std::string message)
-    : std::runtime_error(std::move(message)), cause(kind)
+  classified_execution_error(late_failure_cause kind, std::string message, std::string reason = {})
+    : std::runtime_error(std::move(message)), cause(kind), reason(std::move(reason))
   {
   }
   late_failure_cause cause;
+  // Stable refusal token within the cause family (empty when the cause alone describes it).
+  std::string reason;
+};
+// Bound-schema compatibility failure of Arrow input; both import routes report it as
+// physical_input with the stable reason kArrowSchemaDrift.
+inline constexpr char const* kArrowSchemaDrift = "arrow_schema_drift";
+struct arrow_schema_drift_error : std::invalid_argument {
+  using std::invalid_argument::invalid_argument;
 };
 struct failure_cause {
   late_failure_cause cause = late_failure_cause::other;
   std::string detail;
+  std::string reason;
 };
 failure_cause classify_failure(std::exception_ptr error,
                                late_failure_cause fallback = late_failure_cause::other);

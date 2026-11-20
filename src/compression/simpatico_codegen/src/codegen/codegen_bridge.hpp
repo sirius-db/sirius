@@ -13,12 +13,13 @@
 #include <cuda/stream>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace simpatico {
+
+class decode_frame;
 
 struct CodegenHead {
   std::shared_ptr<codegen::jit::FusedTree> tree;
@@ -41,7 +42,6 @@ struct CodegenHead {
 /// ``head_out`` is non-null it receives the extracted CodegenHead so the caller
 /// can inspect covered_nodes.
 ///
-/// Mirror of ``decode_fused_subtree`` below.
 bool encode_fused_subtree(PlanTree const& tree,
                           NodeId start_node,
                           cudf::column_view input_col,
@@ -60,31 +60,16 @@ bool launch_encode_fused_tree(CodegenHead const& head,
                               fused_leaf_builder& builder,
                               std::string* error_out);
 
-/// Callback used by the high-level decode bridge to materialize an entropy-tail
-/// child while binding a fused subtree.
-using decode_materialize_fn = std::function<cudf::column const*(NodeId)>;
-
-/// JIT-decode the maximal fused subtree rooted at ``start_node``. Builds the
-/// shared FusedTree once, resolves metadata, binds persisted buffers (using
-/// ``materialize`` for entropy tails), allocates the output, and launches the
-/// inverse kernel. Returns nullptr and sets ``error_out`` on failure.
-///
-/// Mirror of ``encode_fused_subtree`` above.
-std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
-                                                   NodeId start_node,
-                                                   decode_materialize_fn const& materialize,
-                                                   ::cuda::stream_ref stream,
-                                                   rmm::device_async_resource_ref const& mr,
-                                                   std::string* error_out);
-
-/// Launch an already-prepared fused decode tree. ``labeled`` must contain all
-/// persisted buffers; this adds decode-only transients, renders/compiles, and
-/// launches the kernel into ``out``.
-bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
-                              codegen::jit::LabeledBuffers& labeled,
+/// Launch an already-prepared fused decode tree. ``labeled`` must contain all persisted buffers;
+/// decode-only scratch is allocated and released on the frame's stream, and the frame keeps the
+/// kernel loaded through session completion. Inputs and output must either be released in the
+/// frame's stream order or remain borrowed through that completion. Errors propagate; this function
+/// never completes the stream.
+void launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
+                              codegen::jit::LabeledBuffers const& labeled,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,
-                              ::cuda::stream_ref stream);
+                              decode_frame& frame);
 
 }  // namespace simpatico

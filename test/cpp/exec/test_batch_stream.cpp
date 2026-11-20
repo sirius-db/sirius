@@ -26,7 +26,6 @@
 #include <sirius/exception.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <exception>
 #include <memory>
 #include <mutex>

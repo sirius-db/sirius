@@ -1,6 +1,6 @@
 # Sirius Governance
 
-Sirius is a _GPU-native composable analytics engine_ under the [Apache-2.0 license](./LICENSE). Governance is intentionally minimal and will formalize as the project grows, with the goal of eventually moving under a neutral open source foundation.
+Sirius is a _GPU-native SQL engine_ under the [Apache-2.0 license](./LICENSE). Governance is intentionally minimal and will formalize as the project grows, with the goal of eventually moving under a neutral open source foundation.
 
 ## Roles
 

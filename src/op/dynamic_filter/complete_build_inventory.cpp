@@ -36,11 +36,9 @@ namespace sirius::op {
 // complete_build_inventory
 //===--------------------------------------------------------------------===//
 std::optional<complete_build_inventory> complete_build_inventory::try_create(
-  std::vector<batch_entry> batches,
-  std::vector<std::optional<cudf::data_type>> schema,
-  std::size_t partition_count)
+  std::vector<batch_entry> batches, std::vector<std::optional<cudf::data_type>> schema)
 {
-  if (partition_count <= 1 || batches.empty()) { return std::nullopt; }
+  if (batches.empty()) { return std::nullopt; }
   std::ranges::sort(batches, {}, &batch_entry::batch_id);
   std::size_t total_rows = 0;
   std::optional<std::uint64_t> previous;
@@ -148,8 +146,7 @@ std::optional<complete_build_inventory> build_arrival_ledger::certify(certificat
   _status = status::CLOSED;
   if (!_schema || _entries.size() != facts.repository_batches) { return std::nullopt; }
   try {
-    auto inventory = complete_build_inventory::try_create(
-      std::move(_entries), std::move(*_schema), facts.partition_count);
+    auto inventory = complete_build_inventory::try_create(std::move(_entries), std::move(*_schema));
     if (inventory) { _status = status::CERTIFIED; }
     return inventory;
   } catch (std::bad_alloc const&) {

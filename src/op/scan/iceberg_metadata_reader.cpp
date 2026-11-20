@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#include "io/io_context.hpp"
-#include "io/types.hpp"
+#include "io/path_utils.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
@@ -25,23 +24,26 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <duckdb/common/types/vector.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/main/database.hpp>
+#include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/query_result_stream.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
-#include <io/sirius_datasource.hpp>
-#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+#include <op/scan/parquet_delete_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
 #include <sirius_context.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -150,6 +152,20 @@ std::shared_ptr<physical_check_counters> iceberg_counters(duckdb::ClientContext&
   return state ? state->physical_counters() : nullptr;
 }
 
+bool iceberg_metadata_accepts_expected_table_uuid(duckdb::ClientContext& context)
+{
+  duckdb::ExtensionLoader loader(duckdb::DatabaseInstance::GetDatabase(context), "iceberg");
+  auto entry = loader.TryGetTableFunction(duckdb::Identifier("iceberg_metadata"));
+  if (!entry) return false;
+  duckdb::Identifier const option("expected_table_uuid");
+  auto const& functions = entry->Cast<duckdb::TableFunctionCatalogEntry>().functions.functions;
+  return std::ranges::any_of(functions, [&](auto const& function) {
+    auto const& signature = function->GetSignature();
+    auto const kwargs     = signature.GetTypedKwargs();
+    return signature.GetParameterIndexByName(option).IsValid() || (kwargs && kwargs->Find(option));
+  });
+}
+
 }  // namespace
 
 void validate_deletion_vector_claims(iceberg_delete_discovery const& files)
@@ -180,10 +196,41 @@ bool IcebergDeleteFileEntry::has_decodable_record_count() const
   return record_count >= 0 && record_count <= kMaxDeletionVectorPositions;
 }
 
+std::unordered_set<std::string> iceberg_files_without_partition_values(
+  duckdb::ClientContext& context, iceberg_delete_inventory const& inventory)
+{
+  iceberg_metadata_connection connection(context);
+  std::unordered_map<std::string, bool> manifests;
+  std::unordered_set<std::string> files, unproved;
+  for (auto const& entry : inventory.entries) {
+    if (entry.content != "DATA") continue;
+    auto [it, fresh] = manifests.emplace(entry.manifest_path, false);
+    if (fresh) {
+      auto result = connection.Query("SELECT data_file.partition FROM read_avro('" +
+                                     escape_sql_string(entry.manifest_path) + "') LIMIT 0");
+      // The pinned Avro reader represents an empty record as NULL (older builds
+      // used INTEGER). Nonempty partition records are STRUCTs. Unknown/
+      // unavailable schemas grant no proof.
+      it->second = result && !result->HasError() && result->GetTypes().size() == 1 &&
+                   (result->GetTypes()[0] == duckdb::LogicalType::SQLNULL ||
+                    result->GetTypes()[0] == duckdb::LogicalType::INTEGER);
+    }
+    auto const path = sirius::io::strip_file_scheme(entry.file_path);
+    if (it->second)
+      files.insert(path);
+    else
+      unproved.insert(path);
+  }
+  for (auto const& path : unproved)
+    files.erase(path);
+  return files;
+}
+
 inventory_result read_delete_inventory(duckdb::ClientContext& context,
                                        std::string const& table_path,
                                        std::optional<int64_t> snapshot_id,
-                                       std::string_view injection)
+                                       std::string_view injection,
+                                       std::string_view expected_table_uuid)
 {
   auto counters = iceberg_counters(context);
   iceberg_metadata_connection metadata_conn(context);
@@ -191,6 +238,10 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   std::string source = "iceberg_metadata('" + escape_sql_string(table_path) + "'";
   if (snapshot_id.has_value()) {
     source += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
+  }
+  if (!expected_table_uuid.empty() && iceberg_metadata_accepts_expected_table_uuid(context)) {
+    source +=
+      ", expected_table_uuid = '" + escape_sql_string(std::string(expected_table_uuid)) + "'";
   }
   source += ")";
   // status is the entry's liveness (ADDED / EXISTING / DELETED); a manifest keeps listing entries
@@ -398,26 +449,71 @@ void read_positional_delete_file(duckdb::ClientContext& context,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
-  auto internal = duckdb::SiriusContext::open_internal_connection(context);
-  auto& conn    = internal;
-
-  auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
-                           escape_sql_string(delete_file_path) + "')");
-
-  if (!result || result->HasError()) {
-    throw std::runtime_error("[iceberg] Failed to read positional-delete file '" +
-                             delete_file_path +
-                             "': " + (result ? result->GetError() : "null result"));
+  using position_map = std::unordered_map<std::string, std::vector<int64_t>>;
+  std::deque<position_map> partials;
+  read_parquet_delete_batches(
+    context,
+    duckdb::OpenFileInfo(delete_file_path),
+    {},
+    [](auto const& columns, uint64_t) {
+      std::vector<uint64_t> projection;
+      for (auto const& required : {std::string("file_path"), std::string("pos")}) {
+        std::optional<uint64_t> found;
+        for (uint64_t i = 0; i < columns.size(); ++i) {
+          if (duckdb::StringUtil::CIEquals(columns[i].name, required)) {
+            if (found) throw std::runtime_error("[iceberg] Ambiguous position-delete column");
+            found = i;
+          }
+        }
+        auto type = required == "pos" ? duckdb::LogicalType::BIGINT : duckdb::LogicalType::VARCHAR;
+        if (!found || columns[*found].type != type)
+          throw std::runtime_error(
+            "[iceberg] Position deletes require file_path VARCHAR and pos BIGINT");
+        projection.push_back(*found);
+      }
+      return projection;
+    },
+    [&] {
+      auto& positions = partials.emplace_back();
+      return [&positions](duckdb::DataChunk& chunk) {
+        duckdb::UnifiedVectorFormat paths;
+        duckdb::UnifiedVectorFormat offsets;
+        chunk.data[0].ToUnifiedFormat(paths);
+        chunk.data[1].ToUnifiedFormat(offsets);
+        auto const* path_data = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(paths);
+        auto const* pos_data  = duckdb::UnifiedVectorFormat::GetData<int64_t>(offsets);
+        std::vector<int64_t>* target = nullptr;
+        duckdb::string_t target_key;
+        for (duckdb::idx_t i = 0; i < chunk.size(); ++i) {
+          auto const path_idx = paths.sel->get_index(i);
+          auto const pos_idx  = offsets.sel->get_index(i);
+          if (!paths.validity.RowIsValid(path_idx) || !offsets.validity.RowIsValid(pos_idx))
+            throw std::runtime_error("[iceberg] Invalid null position delete");
+          auto const& key = path_data[path_idx];
+          if (target == nullptr || !(key == target_key)) {
+            target     = &positions[key.GetString()];
+            target_key = key;
+          }
+          // Preserve signed legacy positions; visibility filtering excludes out-of-range values.
+          target->push_back(pos_data[pos_idx]);
+        }
+      };
+    });
+  std::unordered_map<std::string_view, size_t> remaining;
+  for (auto& partial : partials) {
+    out_map.merge(partial);
+    for (auto const& [path, positions] : partial)
+      remaining[path] += positions.size();
   }
-
-  while (true) {
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) break;
-
-    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      auto file_path = chunk->GetValue(0, i).ToString();
-      auto pos_val   = chunk->GetValue(1, i).GetValue<int64_t>();
-      out_map[file_path].push_back(pos_val);
+  for (auto& partial : partials) {
+    for (auto& [path, positions] : partial) {
+      auto& dest = out_map.at(path);
+      auto total = remaining.extract(path);
+      // For small appends, retain vector's amortized growth across delete files.
+      if (!total.empty() && total.mapped() > dest.size())
+        dest.reserve(dest.size() + total.mapped());
+      dest.insert(dest.end(), positions.begin(), positions.end());
+      std::vector<int64_t>().swap(positions);
     }
   }
 }
@@ -430,14 +526,14 @@ struct equality_delete_read_result {
 
 /// Reads an equality-delete file into a GPU table, plus its column names and Iceberg field ids.
 /// Stays on device because the result feeds a cudf::distinct_hash_join directly. @p ioctx must
-/// be non-null: this entry point has no kvikio bypass.
-equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
-                                                      sirius::io::ioctx& ioctx)
+/// be non-null: the caller must provide an ioctx.
+equality_delete_read_result read_equality_delete_file(
+  std::string const& delete_file_path, std::shared_ptr<cucascade::io::ioctx> const& ioctx)
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
 
   // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
-  auto datasource = ioctx.open_datasource(delete_file_path);
+  auto datasource = sirius::io::open_datasource(ioctx, delete_file_path);
 
   auto opts =
     cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
@@ -578,7 +674,7 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
 /// Groups equality deletes by (schema, sequence number) so the scan-time applicability check is
 /// one CPU comparison per group.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
-                                  sirius::io::ioctx& ioctx,
+                                  std::shared_ptr<cucascade::io::ioctx> const& ioctx,
                                   IcebergDeleteData& data)
 {
   if (eq_entries.empty()) return;
@@ -697,7 +793,7 @@ constexpr bool kEqualityDeleteRouteImplementedToSpec = false;
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  sirius::io::ioctx* metadata_ioctx,
+  std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery)
 {
   g_uncached_read_count.fetch_add(1, std::memory_order_relaxed);
@@ -706,8 +802,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
 
   if (metadata_ioctx == nullptr) {
     throw std::invalid_argument(
-      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide a "
-      "ioctx (this entry point does not implement a kvikio fallback).");
+      "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide an "
+      "ioctx.");
   }
 
   // Errors propagate rather than degrading to empty delete data: empty is indistinguishable
@@ -750,7 +846,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
     }
     data->data_file_manifest_sequence_numbers =
       std::move(discovery.data_file_manifest_sequence_numbers);
-    materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
+    materialize_equality_deletes(discovery.equality_delete_entries, metadata_ioctx, *data);
   }
 
   return data;
@@ -761,8 +857,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  sirius::io::ioctx* metadata_ioctx,
-  std::optional<uint64_t> snapshot_id,
+  std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery)
 {
   return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, discovery);

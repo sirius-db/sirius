@@ -2,6 +2,8 @@
 # description: Sirius extension loads in DuckDB
 # group: [sql]
 
+require-env SIRIUS_TEST_GPU
+
 load __TEST_DIR__/sirius_package.duckdb
 
 require parquet

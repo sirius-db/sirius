@@ -16,17 +16,18 @@
 
 #pragma once
 #include "op/scan/iceberg_metadata_reader.hpp"
+#include "scan_manager/preparation_claim.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
 namespace sirius::op::scan {
 struct iceberg_delete_set;
 class iceberg_dv_attempt;
 class iceberg_gpu_ingestible;
+struct iceberg_dv_results;
 
 /// Plan-time descriptors of a scan's deletion vectors: which scanned file each manifest entry
 /// refers to, in one retained arena charged to the statement admission at lowering. Read-only
-/// after construction; the per-execution result slots inside the records are written only
-/// through an iceberg_dv_attempt.
+/// after construction. Reserved result storage is transferred once to the execution attempt.
 class iceberg_dv_preparation {
  public:
   static scan_manager::scan_envelope envelope(iceberg_delete_discovery const&,
@@ -42,7 +43,6 @@ class iceberg_dv_preparation {
   struct file {
     std::string_view path;
     IcebergDeleteFileEntry const* dv = nullptr;
-    std::weak_ptr<iceberg_delete_set const> result;
   };
   std::span<file const> files() const noexcept { return files_; }
   scan_contract_id contract() const noexcept { return contract_; }
@@ -56,7 +56,6 @@ class iceberg_dv_preparation {
  private:
   friend class iceberg_dv_attempt;
   friend class iceberg_gpu_ingestible;
-  std::span<file> slots() noexcept { return files_; }
   void release() noexcept;
 
   scan_contract_id const contract_;
@@ -65,32 +64,55 @@ class iceberg_dv_preparation {
   std::shared_ptr<iceberg_delete_discovery const> inventory_;
   struct storage;
   std::shared_ptr<storage> storage_;
+  std::unique_ptr<iceberg_dv_results> results_;
 };
 
-/// One execution of a prepared scan: owns the attempt ledger handed over when the statement
-/// admission is consumed and the write side of the plan's result slots. A prepared scan must
-/// have only one active attempt — two would share those slots and either finish() would retire
-/// the descriptors under the other — so begin_preparation() rejects a second installation on the
-/// ingestible. stop() drops the ledger once metadata work has drained; finish() additionally
-/// retires the plan's descriptors.
-class iceberg_dv_attempt {
+/// One execution of a prepared scan owns its ledger, cursor and result slots. Result storage
+/// transfers from the plan once. stop() drops the ledger after preparation drains; finish()
+/// releases result slots and descriptors after GPU consumers retire.
+class iceberg_dv_attempt : public std::enable_shared_from_this<iceberg_dv_attempt> {
  public:
   iceberg_dv_attempt(std::shared_ptr<iceberg_dv_preparation>,
                      std::shared_ptr<scan_manager::preparation_ledger>);
+  ~iceberg_dv_attempt();
   iceberg_dv_attempt(iceberg_dv_attempt const&)            = delete;
   iceberg_dv_attempt& operator=(iceberg_dv_attempt const&) = delete;
-  iceberg_dv_preparation const& plan() const noexcept { return *plan_; }
-  std::shared_ptr<scan_manager::preparation_ledger> const& ledger() const noexcept
-  {
-    return ledger_;
-  }
-  void record(size_t index, std::shared_ptr<iceberg_delete_set const> const&);
-  std::shared_ptr<iceberg_delete_set const> result(size_t index) const noexcept;
-  void stop() noexcept { ledger_.reset(); }
+  void bind_wakeup(scan_manager::preparation_wakeup);
+  class file_job {
+   public:
+    ~file_job();
+    file_job(file_job const&)            = delete;
+    file_job& operator=(file_job const&) = delete;
+    iceberg_dv_preparation::file const& descriptor() const noexcept { return descriptor_; }
+    std::shared_ptr<void const> const& path_owner() const noexcept { return storage_; }
+    scan_manager::charging_allocator allocator() const { return ledger_->allocator(permit_); }
+    scan_manager::unit_key key() const noexcept;
+    void commit();
+    void complete(std::shared_ptr<iceberg_delete_set const> const&);
+
+   private:
+    friend class iceberg_dv_attempt;
+    file_job(std::shared_ptr<iceberg_dv_attempt>, size_t);
+    std::shared_ptr<iceberg_dv_attempt> attempt_;
+    size_t index_;
+    iceberg_dv_preparation::file descriptor_;
+    std::shared_ptr<void const> storage_;
+    std::shared_ptr<scan_manager::preparation_ledger> ledger_;
+    scan_manager::w_permit permit_;
+    bool registered_ = false, committed_ = false, completed_ = false;
+  };
+  scan_manager::preparation_claim<std::shared_ptr<file_job>> try_claim();
+  std::shared_ptr<iceberg_delete_set const> result(size_t index,
+                                                   std::string_view path) const noexcept;
+  void stop() noexcept;
   void finish() noexcept;
 
  private:
+  mutable std::mutex mutex_;
+  size_t next_   = 0;
+  bool claiming_ = false, stopped_ = false;
   std::shared_ptr<iceberg_dv_preparation> plan_;
   std::shared_ptr<scan_manager::preparation_ledger> ledger_;
+  std::unique_ptr<iceberg_dv_results> results_;
 };
 }  // namespace sirius::op::scan

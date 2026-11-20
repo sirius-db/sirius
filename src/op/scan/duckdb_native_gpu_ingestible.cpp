@@ -19,19 +19,18 @@
 #include "transparent/replay_admission.hpp"
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/owning_table_view.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
-#include <io/io_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
-#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
-#include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <sirius_context.hpp>
 
 // duckdb
@@ -42,7 +41,6 @@
 // cudf
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -54,6 +52,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -64,6 +63,8 @@ namespace {
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
+  std::size_t target_batch_bytes() const noexcept override { return _cap; }
+  std::size_t retained_bytes() const noexcept override { return _acc_bytes; }
   duckdb_native_batch_coalescer(std::size_t approximate_batch_size, std::vector<bool> is_varchar)
     : _cap(approximate_batch_size),
       _is_varchar(std::move(is_varchar)),
@@ -204,7 +205,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   bool _have_template           = false;
   bool _produced_any            = false;
   scan_contract_id _contract_id = 0;
-  std::shared_ptr<sirius::io::sirius_datasource> _datasource;
+  std::shared_ptr<cucascade::io::datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
 
@@ -439,8 +440,13 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)](
+           scan_manager::preparation_stop_token stop) -> std::unique_ptr<scan_info> {
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     auto io_ctx = resolve(_info->db_path);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
@@ -462,8 +468,12 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                          ")): " + range.viability_failure_reason);
     }
-    auto split = std::make_unique<duckdb_native_scan_info>(
-      std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
+    if (stop.stop_requested())
+      throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+    auto split =
+      std::make_unique<duckdb_native_scan_info>(std::move(range.row_groups),
+                                                sirius::io::open_datasource(io_ctx, _info->db_path),
+                                                _block_manager);
     std::vector<split_materializer_certificate> certificates;
     std::vector<split_dependencies> dependencies;
     certificates.reserve(split->row_groups.size());
@@ -497,7 +507,9 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   ::cucascade::memory::memory_space const& mem_space,
   ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  expression_query_policy /*policy*/,
+  scan_execution_context /*execution*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (_inject_decode_failure) {
@@ -585,7 +597,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  expression_query_policy policy)
 {
   auto const output_arity        = _column_layout.output_data_positions.size();
   auto const decoded_cols        = _column_layout.data_roles.size();
@@ -602,7 +615,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
                                       stream,
-                                      strategy_from_config(),
+                                      policy,
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));

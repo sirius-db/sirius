@@ -205,6 +205,11 @@ materialized wide. An operator the classifier does not model is by construction 
 restores at, so the default under uncertainty is native. Retractions are counted by the
 plan-time `scan_narrow_targets_retracted` counter.
 
+A compacted (filter-pushdown) Simpatico decode of a GPU-tier compressed chunk writes such a
+column directly in its restore type when the scan's output assembly is a leading identity, so the
+widening cast, and its `scan_columns_restored` count, is skipped for those chunks. Other decodes
+still restore in scan normalization. See [Decode to Restore Type](optimizations.md#decode-to-restore-type).
+
 The policy commutes with the dynamic-filter guard in the propagation pass — both only ever flip
 narrow → native, so a guard target the policy already retracted is a no-op for the guard, and
 payload columns that no dynamic filter targets keep their transport verdicts. Zero-benefit pruning
@@ -317,7 +322,8 @@ the finished sidecars at wrap time rather than through a propagation case:
   goes native; unused child columns may remain narrow until the aggregate discards them. Shapes whose
   partial batch layout deviates from the declared output — multiple grouping sets, grouping
   functions, AVG (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial
-  column) — keep the native boundary.
+  column) — keep the native boundary. So does any `FIRST`: its carried columns are copied out of
+  the chosen row rather than aggregated, which this model does not describe.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 
@@ -387,9 +393,10 @@ Two consequences are worth stating plainly. A chunk pinned narrow and queried at
 target — the stacking happy path — issues no cast and is charged no conversion destination, where
 charging by "storage is narrow" would have reserved a full native destination for a conversion
 that never runs. And the estimate no longer consults the zone-map sidecar at all, so a table
-pinned with `enable_pinned_zone_map_pruning = false`, or a GPU-tier compression-enabled pin (which
-stores no zone-map sidecar), uses the same carrier-based sizing path as any other pin. The former
-8×-bound limitation on those pins is gone.
+pinned with `enable_pinned_zone_map_pruning = false`, or with types for which capture provides no
+usable statistics, uses the same carrier-based sizing path as any other pin. Compressed GPU pins
+retain supported native statistics when capture is enabled; compression itself does not make a
+pin statless. The former 8×-bound limitation on those pins is gone.
 
 Rows come from whichever form stores the chunk — a Simpatico-compressed chunk reports its row
 count from the representation and always contributes the validity-mask term, since per-column
@@ -436,7 +443,8 @@ so a DECIMAL128 column that narrows to DECIMAL64 becomes encodable where the nat
 not.
 
 Width coverage has to be complete rather than merely typical, because the plan is not chosen at pin
-time: it arrives from `plan_register` as a fixed DSL string authored against the unnarrowed column.
+time: it is loaded from the connection's configured plan directory as a fixed DSL string authored
+against the unnarrowed column.
 A column narrowed to INT16 is therefore handed a plan written for its INT64 original, and an
 element type the plan's ops cannot encode fails the whole batch's compression and latches
 compression off for the rest of the pin.
@@ -510,8 +518,9 @@ basis unchanged.
 
 - Compression on, narrowing off: native blobs, all-native metadata, no sidecars — compression-only
   behavior unchanged.
-- Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or
-  compression is disabled): narrow carriers use uncompressed storage.
+- Narrowing on, compression off (compression is disabled, a selected explicit plan does not cover
+  the pinned columns, or compression is declined): narrow carriers use uncompressed storage.
+  A missing plan file selects plans automatically rather than disabling compression.
 - Both on: narrow, then compress; the gate reads the recorded carriers and the serve decompresses
   straight into them. Chunks stored at the plan target need no normalization cast; narrower chunks
   widen to it.
@@ -520,7 +529,7 @@ basis unchanged.
   dispatches per chunk and the recorded metadata is identical either way.
 - Both on, the GPU-tier narrowing policy retracts a target: the plan target is native, decode
   still yields the narrow carrier, and scan normalization restores it (counted by
-  `scan_columns_restored`). Pin-on/query-off behaves the same way. An entry's tier, not its
+  `scan_columns_restored`), unless a compacted decode already wrote it in the native type. Pin-on/query-off behaves the same way. An entry's tier, not its
   compression, decides `sidecar_from_gpu_tier_pin`.
 - INSERT deltas: the residency gate installs no narrow sidecar when deltas will serve (see the
   residency states above); entry chunks and their metadata are untouched by deltas.

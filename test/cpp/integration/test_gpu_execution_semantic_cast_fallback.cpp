@@ -16,15 +16,15 @@
 
 /**
  * @file test_gpu_execution_semantic_cast_fallback.cpp
- * @brief Verifies that GPU planning rejects semantic temporal-numeric casts.
+ * @brief Verifies that GPU planning rejects unsupported semantic casts.
  *
- * DuckDB's CAST and TRY_CAST behavior for these pairs cannot be implemented by the physical DATE
- * carrier tunnel. The tests cover configured CPU fallback, fallback-disabled plan rejection, and
- * positive GPU-planning controls. A file-backed database exercises the DuckDB-native scan path.
+ * DuckDB's temporal-numeric CAST and TRY_CAST behavior cannot be implemented by the physical DATE
+ * carrier tunnel. VARCHAR-to-numeric casts also need DuckDB's string parsing semantics. The tests
+ * cover configured CPU fallback, fallback-disabled plan rejection, and positive GPU-planning
+ * controls. A file-backed database exercises the DuckDB-native scan path.
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -36,6 +36,7 @@ namespace {
 
 /// Rejection wording of the projection translation site (sirius_plan_projection.cpp).
 constexpr char kProjectionRejection[] = "Unsupported expression in projection";
+constexpr char kAggregateRejection[]  = "Unsupported expression in aggregate";
 /// Shared prefix of both filter rejection sites: LogicalFilter translation (sirius_plan_filter.cpp,
 /// "Unsupported filter predicate (falling back to CPU)") and pushed-down table filters
 /// (sirius_plan_get.cpp, "Unsupported filter predicate on column ..."). DuckDB pushes the tested
@@ -84,7 +85,52 @@ void create_cast_table(SemanticCastFixture& fx)
   fx.run_ok("CHECKPOINT;");
 }
 
+void create_varchar_cast_table(SemanticCastFixture& fx)
+{
+  fx.run_ok("CREATE TABLE varchar_cast_t(s VARCHAR);");
+  fx.run_ok("INSERT INTO varchar_cast_t VALUES ('1.5'), ('bad'), (NULL);");
+  fx.run_ok("CHECKPOINT;");
+}
+
 }  // namespace
+
+TEST_CASE_METHOD(SemanticCastFixture,
+                 "VARCHAR-to-numeric TRY_CAST falls back before either GPU evaluator",
+                 "[integration][gpu_execution][varchar_numeric_cast_fallback]")
+{
+  create_varchar_cast_table(*this);
+  auto const strategy = GENERATE("materialize", "ast_interpret", "ast_jit");
+  run_ok(std::string("SET expression_evaluator_strategy = '") + strategy + "';");
+
+  expect_plan_fallback_matches_cpu("SELECT TRY_CAST(s AS DOUBLE) FROM varchar_cast_t;");
+  expect_plan_fallback_matches_cpu(
+    "SELECT SUM(TRY_CAST(s AS DOUBLE) * 123.456) FROM varchar_cast_t;");
+  expect_gpu_only_rejection(
+    *this, "SELECT TRY_CAST(s AS DOUBLE) FROM varchar_cast_t;", kProjectionRejection);
+  expect_gpu_only_rejection(
+    *this, "SELECT SUM(TRY_CAST(s AS DOUBLE) * 123.456) FROM varchar_cast_t;", kAggregateRejection);
+}
+
+TEST_CASE_METHOD(SemanticCastFixture,
+                 "VARCHAR-to-numeric CAST uses DuckDB conversion errors",
+                 "[integration][gpu_execution][varchar_numeric_cast_fallback]")
+{
+  create_varchar_cast_table(*this);
+  run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query("SELECT CAST(s AS DOUBLE) FROM varchar_cast_t;");
+  auto const after  = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  REQUIRE(after.fallbacks == before.fallbacks + 1);
+  REQUIRE(after.executions == before.executions);
+
+  run_ok("SET gpu_execution = false;");
+  auto cpu_result = con->Query("SELECT CAST(s AS DOUBLE) FROM varchar_cast_t;");
+  REQUIRE(cpu_result);
+  REQUIRE(cpu_result->HasError());
+  REQUIRE(result->GetError() == cpu_result->GetError());
+}
 
 TEST_CASE_METHOD(SemanticCastFixture,
                  "semantic cast - TRY_CAST(DATE AS SMALLINT) falls back and returns NULLs",

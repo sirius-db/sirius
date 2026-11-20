@@ -18,12 +18,17 @@
 
 #include <cucascade/data/common.hpp>
 
+#include <cstdint>
+
 namespace sirius {
 
 /** @brief RTTI base for Simpatico-compressed data representations. */
 class simpatico_compressed_representation : public cucascade::idata_representation {
  public:
   ~simpatico_compressed_representation() override = default;
+
+  /// Rows of the table this representation decodes to.
+  [[nodiscard]] virtual std::int64_t num_rows() const noexcept = 0;
 
  protected:
   explicit simpatico_compressed_representation(cucascade::memory::memory_space& memory_space)

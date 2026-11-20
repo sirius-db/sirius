@@ -8,7 +8,7 @@ write_basic_package_version_file(
   COMPATIBILITY SameMinorVersion)
 
 install(
-  DIRECTORY include/sirius
+  DIRECTORY include/sirius include/sirius-c
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
   COMPONENT sirius_library)
 install(
@@ -51,6 +51,8 @@ if(SIRIUS_BUILD_STATIC)
             parquet_extension
             cucascade_static
             cucascade_cudf_static
+            cucascade_io_static
+            cucascade_io_thirdparty
             cucascade_topology_discovery_static
     EXPORT sirius-static-targets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library)

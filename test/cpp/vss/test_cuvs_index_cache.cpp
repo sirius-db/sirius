@@ -28,7 +28,6 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime_api.h>
 

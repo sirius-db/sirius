@@ -98,7 +98,7 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception when already built, after a failed build() (no
   ///         retry; create a new fragment), no catalog, no Sirius state, null plan, a declared
   ///         input the plan never reads, or bound_plan::prepared types that do not match the
-  ///         plan's output types (HUGEINT over a BIGINT plan column is accepted).
+  ///         plan's output types.
   /// @throws whatever the plan source, binder, or plan generator raises.
   void build();
 

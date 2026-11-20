@@ -866,7 +866,7 @@ TEST_CASE("pin-time native type records the declared mapping, not the decoded ca
   auto const declared = duckdb::LogicalType::DECIMAL(15, 2);
   auto const decoded  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
 
-  auto const plan_time_native = sirius::try_get_cudf_type(sirius::from_duckdb(declared));
+  auto const plan_time_native = sirius::get_cudf_type(sirius::from_duckdb(declared));
   require_decimal_type(plan_time_native, cudf::type_id::DECIMAL64, -2);
 
   REQUIRE(sirius::pin_native_type(decoded, &declared) == *plan_time_native);

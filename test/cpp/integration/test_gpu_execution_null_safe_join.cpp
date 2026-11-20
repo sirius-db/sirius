@@ -21,9 +21,11 @@
 // passes null_equality::EQUAL when the equi-key condition is null-safe.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <duckdb/optimizer/optimizer.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
+
+#include <string>
 
 namespace {
 
@@ -330,4 +332,222 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
   // '=', keeps running on the GPU.
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr) AS in_b FROM mnl");
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.a IN (SELECT mnr.a FROM mnr) AS in_a FROM mnl");
+}
+
+// An all-null-safe MARK over a build larger than both hash_partition_bytes and
+// max_build_hash_table_bytes runs hash-partitioned (STANDARD, natural partition count) instead of
+// one forced whole-build BUILD_PROBE partition. Both sides carry NULL keys, so NULL-to-NULL
+// matches and definite FALSE misses are exercised across partitions. The null-propagating IN
+// MARK over the same data keeps its single whole-build partition and its NULL marks.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution hash-partitioned null-safe MARK join matches the CPU",
+                 "[integration][gpu_execution][join][nulls][mark][partition]")
+{
+  run_ok(
+    "CREATE TABLE pml AS SELECT i AS id, CASE WHEN i % 97 = 0 THEN NULL ELSE (i * 7) % 400000 END "
+    "AS k FROM range(300000) AS t(i);");
+  run_ok(
+    "CREATE TABLE pmr AS SELECT i AS id, CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 3) % 500000 END "
+    "AS k FROM range(600000) AS t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+  // Below the per-partition build size: only the planner's whole-build concat (join_concat_all)
+  // folds each partition's build into the one batch a MARK needs.
+  sirius::test::scoped_setting small_concat(*con, "concat_batch_bytes", 64 * 1024);
+
+  // Correlated projected EXISTS: decorrelates to an all-null-safe MARK.
+  compare_gpu_vs_cpu(
+    "SELECT has_match, count(*), sum(id) FROM (SELECT pml.id, EXISTS (SELECT 1 FROM pmr WHERE "
+    "pmr.k = pml.k) AS has_match FROM pml) GROUP BY has_match");
+  compare_gpu_vs_cpu(
+    "SELECT has_match, count(*), sum(id) FROM (SELECT pml.id, EXISTS (SELECT 1 FROM pmr WHERE "
+    "pmr.k IS NOT DISTINCT FROM pml.k) AS has_match FROM pml) GROUP BY has_match");
+}
+
+// Null-propagating ('=') MARK joins (IN / NOT IN, = ANY / <> ALL) over a build larger than both
+// hash_partition_bytes and max_build_hash_table_bytes are hash-partitioned too. SQL's NULL rule is
+// global, so a single NULL build key -- which lands in one partition -- must still turn every
+// unmatched probe row in every other partition into NULL.
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution hash-partitioned null-propagating MARK join matches the CPU",
+                 "[integration][gpu_execution][join][nulls][mark][partition]")
+{
+  // Probe keys span every partition; 1 in 97 probe keys is NULL.
+  run_ok(
+    "CREATE TABLE ppl AS SELECT i AS id, CASE WHEN i % 97 = 0 THEN NULL ELSE (i * 7) % 400000 END "
+    "AS k, i % 13 AS g FROM range(300000) AS t(i);");
+  // Build sides: no NULL; exactly one NULL; NULLs throughout.
+  run_ok(
+    "CREATE TABLE ppr_clean AS SELECT i AS id, (i * 3) % 500000 AS k, i % 13 AS g "
+    "FROM range(600000) AS t(i);");
+  run_ok(
+    "CREATE TABLE ppr_one_null AS SELECT i AS id, CASE WHEN i = 12345 THEN NULL ELSE (i * 3) % "
+    "500000 END AS k, i % 13 AS g FROM range(600000) AS t(i);");
+  run_ok(
+    "CREATE TABLE ppr_nulls AS SELECT i AS id, CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 3) % "
+    "500000 END AS k, i % 13 AS g FROM range(600000) AS t(i);");
+  run_ok("CHECKPOINT;");
+
+  sirius::test::scoped_setting small_partitions(*con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(*con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(*con, "scan_task_batch_size", 256 * 1024);
+  // Below the per-partition build size: only the planner's whole-build concat (join_concat_all)
+  // folds each partition's build into the one batch a MARK needs.
+  sirius::test::scoped_setting small_concat(*con, "concat_batch_bytes", 64 * 1024);
+
+  for (std::string const build : {"ppr_clean", "ppr_one_null", "ppr_nulls"}) {
+    CAPTURE(build);
+    // Projected IN / NOT IN marks, including NULL probe keys: true / false / NULL per row.
+    compare_gpu_vs_cpu("SELECT in_k, count(*), sum(id) FROM (SELECT id, k IN (SELECT k FROM " +
+                       build + ") AS in_k FROM ppl) GROUP BY in_k");
+    compare_gpu_vs_cpu(
+      "SELECT not_in_k, count(*), sum(id) FROM (SELECT id, k NOT IN (SELECT k FROM " + build +
+      ") AS not_in_k FROM ppl) GROUP BY not_in_k");
+    // NOT IN as a filter: any NULL build key filters every row out.
+    compare_gpu_vs_cpu("SELECT count(*), sum(id) FROM ppl WHERE k NOT IN (SELECT k FROM " + build +
+                       ")");
+    // = ANY / <> ALL spellings.
+    compare_gpu_vs_cpu("SELECT m, count(*) FROM (SELECT k = ANY (SELECT k FROM " + build +
+                       ") AS m FROM ppl) GROUP BY m");
+    compare_gpu_vs_cpu("SELECT m, count(*) FROM (SELECT k <> ALL (SELECT k FROM " + build +
+                       ") AS m FROM ppl) GROUP BY m");
+  }
+
+  // Correlated IN mixes a null-safe correlation key with the plain IN key; that MARK shape is
+  // rejected at plan time and runs on the CPU (unchanged by partitioning).
+  expect_plan_fallback_matches_cpu(
+    "SELECT in_k, count(*) FROM (SELECT ppl.k IN (SELECT ppr_nulls.k FROM ppr_nulls WHERE "
+    "ppr_nulls.g = ppl.g) AS in_k FROM ppl) GROUP BY in_k");
+}
+
+// Below, every key is IS NOT DISTINCT FROM, the join a set operation lowers to. Each case disables
+// BUILD_SIDE_PROBE_SIDE so the join keeps its left-side type instead of flipping to a RIGHT_ form.
+
+// Two-column keys where a NULL in either column must still match the same NULL on the other side.
+class PartialNullKeyJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  PartialNullKeyJoinFixture()
+  {
+    run_ok("CREATE TABLE pl (id INTEGER, a INTEGER, b INTEGER);");
+    run_ok("CREATE TABLE pr (id INTEGER, a INTEGER, b INTEGER);");
+    run_ok("INSERT INTO pl VALUES (1, 1, NULL), (2, NULL, NULL), (3, 1, 2);");
+    run_ok("INSERT INTO pr VALUES (100, 1, NULL), (101, NULL, NULL), (102, 1, 3);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+// DuckDB compares -0.0 equal to 0.0 and NaN equal to NaN; the GPU join must too.
+class FloatKeyJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  FloatKeyJoinFixture()
+  {
+    run_ok("CREATE TABLE fl (id INTEGER, k DOUBLE);");
+    run_ok("CREATE TABLE fr (id INTEGER, k DOUBLE);");
+    run_ok("INSERT INTO fl VALUES (1, -(0.0::DOUBLE)), (2, 'NaN'::DOUBLE), (3, 1.5);");
+    run_ok("INSERT INTO fr VALUES (100, 0.0), (101, 'NaN'::DOUBLE), (102, 2.5);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(NullSafeJoinFixture,
+                 "gpu_execution all-null-safe SEMI join matches NULL to NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Ids 1, 2 and 3 survive: l's NULL keys match r's NULL key.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT l.id, l.k FROM l SEMI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM l SEMI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+}
+
+TEST_CASE_METHOD(PartialNullKeyJoinFixture,
+                 "gpu_execution two-key all-null-safe SEMI join matches partial NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Ids 1 and 2 survive; id 3 differs from (1, 3) in its non-NULL column.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT pl.id, pl.a, pl.b FROM pl SEMI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM pl SEMI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+}
+
+TEST_CASE_METHOD(FloatKeyJoinFixture,
+                 "gpu_execution all-null-safe SEMI join on DOUBLE keys matches signed zero and NaN",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The CPU keeps ids 1 and 2. Ids only, so the comparison does not depend on how -0.0 prints.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT fl.id FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+}
+
+TEST_CASE_METHOD(NullSafeJoinFixture,
+                 "gpu_execution all-null-safe ANTI join removes NULL matched by NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Only id 4 survives: l's NULL keys match r's NULL key and are removed.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT l.id, l.k FROM l ANTI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM l ANTI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+}
+
+TEST_CASE_METHOD(PartialNullKeyJoinFixture,
+                 "gpu_execution two-key all-null-safe ANTI join matches partial NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Only id 3 survives.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT pl.id, pl.a, pl.b FROM pl ANTI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM pl ANTI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+}
+
+TEST_CASE_METHOD(FloatKeyJoinFixture,
+                 "gpu_execution all-null-safe ANTI join on DOUBLE keys matches signed zero and NaN",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The CPU keeps only id 3.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT fl.id FROM fl ANTI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM fl ANTI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+}
+
+TEST_CASE_METHOD(
+  NullSafeJoinFixture,
+  "gpu_execution all-null-safe ANTI join against an empty right side keeps every row",
+  "[integration][gpu_execution][join][nulls]")
+{
+  run_ok("CREATE TABLE r_empty (id INTEGER, k INTEGER);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT l.id, l.k FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+}
+
+TEST_CASE_METHOD(
+  NullSafeJoinFixture,
+  "gpu_execution all-null-safe ANTI join against an empty right side keeps every row without "
+  "BUILD_PROBE",
+  "[integration][gpu_execution][join][nulls]")
+{
+  // A zero budget turns BUILD_PROBE, and with it broadcast, off even for a zero-byte build.
+  run_ok("CREATE TABLE r_empty (id INTEGER, k INTEGER);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  sirius::test::scoped_sirius_setting no_build_probe{
+    *con, "max_build_hash_table_bytes", std::uint64_t{0}};
+  compare_gpu_vs_cpu(
+    "SELECT l.id, l.k FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
 }

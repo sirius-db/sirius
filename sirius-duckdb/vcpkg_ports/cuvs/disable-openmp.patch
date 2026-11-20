@@ -8,14 +8,12 @@
  #include "../../../util/serialize_validation.hpp"
  #include "../../detail/ann_utils.cuh"
  #include "../utils/reductions.cuh"
-@@ -31,7 +32,6 @@
- 
+@@ -34,5 +35,4 @@
+ #include <algorithm>
  #include <limits>
  #include <numeric>
 -#include <omp.h>
  #include <vector>
- 
- namespace cuvs::neighbors::ivf_rabitq::detail {
 @@ -777,7 +777,7 @@
    size_t batch_count = 0;
  

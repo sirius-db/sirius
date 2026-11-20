@@ -43,6 +43,8 @@ namespace sirius::planner {
 
 struct descent_policy {
   bool descend_build_blocks = false;
+  // A NULL-preserving filter cannot cross a side that synthesizes NULL output rows.
+  bool preserve_nulls = false;
 };
 
 struct descent_step {
@@ -53,6 +55,9 @@ struct descent_step {
 struct route_terminal {
   sirius::op::sirius_physical_operator* node = nullptr;  // Borrowed from the walked subtree.
   std::size_t ordinal                        = 0;
+  // Set for a scan inside the body of a delim CTE whose proven outer-row read the walk reached.
+  // The read's own terminal is reported as well, so an endpoint still filters the read.
+  bool in_cte_body = false;
 };
 
 /**
@@ -81,7 +86,8 @@ struct endpoint_placement {
 /**
  * @brief Returns the join child and ordinal that safely supplies an output column
  *
- * LEFT/OUTER build-block and RIGHT/OUTER probe-block descent rely on plain-equality admission.
+ * LEFT/OUTER build-block and RIGHT/OUTER probe-block descent require a filter that rejects NULL
+ * keys.
  */
 [[nodiscard]] std::optional<descent_step> join_block_descent(
   duckdb::JoinType join_type,
@@ -105,12 +111,17 @@ struct endpoint_placement {
   sirius::op::sirius_physical_operator& root, std::size_t a0, descent_policy policy);
 
 /**
- * @brief Matches DuckDB's INNER/RIGHT/SEMI producer allowlist
+ * @brief Returns producer join types that can discard probe rows with no matching build key
+ *
+ * RIGHT_SEMI and RIGHT_ANTI output build rows. Removing probe nonmatches preserves whether
+ * each build row has a match. Key admission separately enforces equality and null-safe routing
+ * rules.
  */
-[[nodiscard]] constexpr bool scan_route_join_type_admissible(duckdb::JoinType t) noexcept
+[[nodiscard]] constexpr bool probe_filter_join_type_admissible(duckdb::JoinType t) noexcept
 {
   return t == duckdb::JoinType::INNER || t == duckdb::JoinType::RIGHT ||
-         t == duckdb::JoinType::SEMI;
+         t == duckdb::JoinType::SEMI || t == duckdb::JoinType::RIGHT_SEMI ||
+         t == duckdb::JoinType::RIGHT_ANTI;
 }
 
 /**

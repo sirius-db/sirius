@@ -15,6 +15,8 @@
  */
 
 #include <expression/ast/node.hpp>
+#include <op/sirius_physical_column_data_scan.hpp>
+#include <op/sirius_physical_cte.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 #include <op/sirius_physical_hash_join.hpp>
@@ -23,6 +25,7 @@
 #include <op/sirius_physical_projection.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <variant>
 
@@ -100,12 +103,20 @@ std::optional<descent_step> join_block_descent(
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
+    if (policy.preserve_nulls &&
+        (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)) {
+      return std::nullopt;
+    }
     if (!probe_block_descent_admissible(join_type)) { return std::nullopt; }
     return descent_step{
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
   if (!policy.descend_build_blocks) { return std::nullopt; }
+  if (policy.preserve_nulls &&
+      (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)) {
+    return std::nullopt;
+  }
   if (!build_block_descent_admissible(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
@@ -164,9 +175,19 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     }
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
       return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
+    // The node's output is its second child's; the first child is the shared body.
+    case SiriusPhysicalOperatorType::CTE:
+      if (node.children.size() != 2 || output_ordinal >= node.types.size()) { return {}; }
+      return {descent_step{.child_index = 1, .child_ordinal = output_ordinal}};
+    // Copies rows without changing values. Output k is input k; the trailing copy count is not an
+    // output, so descent never reaches it.
+    case SiriusPhysicalOperatorType::REPLICATE:
+      if (output_ordinal >= node.types.size()) { return {}; }
+      return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
     case SiriusPhysicalOperatorType::INVALID:
     case SiriusPhysicalOperatorType::ORDER_BY:
     case SiriusPhysicalOperatorType::LIMIT:
+    case SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT:
     case SiriusPhysicalOperatorType::STREAMING_LIMIT:
     case SiriusPhysicalOperatorType::LIMIT_PERCENT:
     case SiriusPhysicalOperatorType::TOP_N:
@@ -205,7 +226,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::ASOF_JOIN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE:
     case SiriusPhysicalOperatorType::RECURSIVE_KEY_CTE:
-    case SiriusPhysicalOperatorType::CTE:
     case SiriusPhysicalOperatorType::INSERT:
     case SiriusPhysicalOperatorType::BATCH_INSERT:
     case SiriusPhysicalOperatorType::DELETE_OPERATOR:
@@ -244,11 +264,12 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS:
     case SiriusPhysicalOperatorType::CREATE_SECRET:
     // Feeders are added after discovery in `insert_gpu_pipeline_operators()`: the join child's
-    // CONCAT -> PARTITION -> existing child, and the UNION arm's PASSTHROUGH_SINK -> existing
-    // child. Targets therefore end up below the wrappers either way, even though each wrapper is
-    // terminal if encountered here.
+    // CONCAT -> PARTITION -> optional BUILD_FILTER -> existing child, and the UNION arm's
+    // PASSTHROUGH_SINK -> existing child. Targets therefore end up below the wrappers either way,
+    // even though each wrapper is terminal if encountered here.
     case SiriusPhysicalOperatorType::PARTITION:
     case SiriusPhysicalOperatorType::CONCAT:
+    case SiriusPhysicalOperatorType::BUILD_FILTER:
     case SiriusPhysicalOperatorType::PASSTHROUGH_SINK:
     case SiriusPhysicalOperatorType::MERGE_SORT:
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY:
@@ -259,7 +280,11 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
     case SiriusPhysicalOperatorType::STREAMING_SOURCE:
-    case SiriusPhysicalOperatorType::STREAMING_SINK: return {};
+    case SiriusPhysicalOperatorType::STREAMING_SINK:
+    // Below a hash or range exchange, this rank's build holds only its share of the keys: a filter
+    // there would drop rows other ranks' builds match.
+    case SiriusPhysicalOperatorType::EXCHANGE_SINK:
+    case SiriusPhysicalOperatorType::EXCHANGE_SOURCE: return {};
   }
   return {};  // unreachable
 }
@@ -278,19 +303,86 @@ bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
   return true;
 }
 
+// The reads of the CTE with @p cte_table_index below @p node, nested CTE bodies included.
+void collect_readers(sirius::op::sirius_physical_operator const& node,
+                     std::size_t cte_table_index,
+                     std::vector<sirius::op::sirius_physical_column_data_scan const*>& readers)
+{
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::CTE_SCAN) {
+    auto const& read = node.Cast<sirius::op::sirius_physical_column_data_scan>();
+    if (read.cte_index == cte_table_index) { readers.push_back(&read); }
+    return;
+  }
+  for (auto const& child : node.children) {
+    if (child) { collect_readers(*child, cte_table_index, readers); }
+  }
+}
+
+// Filtering a delim CTE's outer-row read can move into the CTE's body when the delim rewrite was
+// proven restrictable (planner/delim_cte_proof.hpp): the only other read computes the correlation
+// domain of those rows, and the subquery's answer for a kept row's key does not change. The roles
+// come from the plan before DuckDB optimized it, so re-check that the CTE still has exactly those
+// two reads, as DuckDB's own CTEFilterDependency::MatchesConsumers does.
+bool is_proven_outer_row_read(sirius::op::sirius_physical_cte const& cte,
+                              sirius::op::sirius_physical_column_data_scan const& read)
+{
+  using sirius::op::cte_reader_role;
+  if (read.reader_role != cte_reader_role::outer_row || cte.children.size() != 2 ||
+      !cte.children[1]) {
+    return false;
+  }
+  std::vector<sirius::op::sirius_physical_column_data_scan const*> readers;
+  collect_readers(*cte.children[1], cte.table_index, readers);
+  if (readers.size() != 2 || (readers[0] != &read && readers[1] != &read)) { return false; }
+  auto const* other = readers[0] == &read ? readers[1] : readers[0];
+  return other->reader_role == cte_reader_role::key;
+}
+
+// The CTE nodes the walk passed on its way down. A body is entered only from a read of one of
+// them, so the join that produces the filter sits above that CTE node. Its build side is outside
+// the CTE's scope and cannot read the CTE, so the body never depends on the build that filters it.
+using cte_stack = std::vector<sirius::op::sirius_physical_cte const*>;
+
 void trace_probe_key_into(sirius::op::sirius_physical_operator& node,
                           std::size_t ordinal,
                           descent_policy policy,
+                          cte_stack& ctes,
                           std::vector<route_terminal>& terminals)
 {
   auto const steps = descent_steps(node, ordinal, policy);
   if (!steps_are_followable(node, steps)) {
     terminals.push_back(route_terminal{.node = &node, .ordinal = ordinal});
+    if (node.type != sirius::op::SiriusPhysicalOperatorType::CTE_SCAN) { return; }
+    auto const& read = node.Cast<sirius::op::sirius_physical_column_data_scan>();
+    auto const owner = std::find_if(ctes.begin(), ctes.end(), [&](auto const* cte) {
+      return cte->table_index == read.cte_index;
+    });
+    if (owner == ctes.end() || !is_proven_outer_row_read(**owner, read) ||
+        ordinal >= (*owner)->children[0]->types.size()) {
+      return;
+    }
+    // Only scans are registered: a filter on a body that ends in anything else gains nothing.
+    cte_stack body_ctes;
+    std::vector<route_terminal> body;
+    trace_probe_key_into(*(*owner)->children[0], ordinal, policy, body_ctes, body);
+    bool const all_scans =
+      !body.empty() && std::all_of(body.begin(), body.end(), [](auto const& t) {
+        return t.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN;
+      });
+    if (!all_scans) { return; }
+    for (auto& terminal : body) {
+      terminal.in_cte_body = true;
+      terminals.push_back(terminal);
+    }
     return;
   }
+  bool const is_cte = node.type == sirius::op::SiriusPhysicalOperatorType::CTE;
+  if (is_cte) { ctes.push_back(&node.Cast<sirius::op::sirius_physical_cte>()); }
   for (auto const& step : steps) {
-    trace_probe_key_into(*node.children[step.child_index], step.child_ordinal, policy, terminals);
+    trace_probe_key_into(
+      *node.children[step.child_index], step.child_ordinal, policy, ctes, terminals);
   }
+  if (is_cte) { ctes.pop_back(); }
 }
 
 }  // namespace
@@ -300,7 +392,8 @@ std::vector<route_terminal> trace_probe_key(sirius::op::sirius_physical_operator
                                             descent_policy policy)
 {
   std::vector<route_terminal> terminals;
-  trace_probe_key_into(root, a0, policy, terminals);
+  cte_stack ctes;
+  trace_probe_key_into(root, a0, policy, ctes, terminals);
   return terminals;
 }
 

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/batch_stream.hpp"
+#include "op/partition/partition_spec.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/types.hpp>
@@ -31,35 +32,15 @@
 
 namespace sirius::op {
 
-/// How a partitioned sink routes rows across its output streams. Destination nodes are the
-/// wrapper's routing table — the sink stays oblivious.
-enum class partition_mode {
-  hash,       ///< GPU-hash-partition by key_columns; key_columns must be non-empty.
-  broadcast,  ///< Replicate every batch to all N outputs; key_columns must be empty.
-};
-
-struct partition_spec {
-  partition_mode mode = partition_mode::hash;
-
-  /// Hashed to pick a destination. Must be non-empty for hash mode; must be empty for broadcast.
-  std::vector<int> key_columns;
-
-  /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is. Ignored in broadcast.
-  std::vector<cudf::data_type> key_cast_types;
-
-  partition_spec() = default;
-
-  /// Hash-mode shorthand: partition_spec({col}, {cast}) without naming the mode.
-  partition_spec(std::vector<int> keys, std::vector<cudf::data_type> casts = {})
-    : key_columns(std::move(keys)), key_cast_types(std::move(casts))
-  {
-  }
-};
-
 /// Fragment terminal: push pipeline output into one batch_stream per destination.
 /// No on_data — consumer blocks in wait(); no channel-level backpressure.
 class sirius_physical_streaming_sink : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
 
   /// The pipeline feeding this sink is its only sender.

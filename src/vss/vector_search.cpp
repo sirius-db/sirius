@@ -59,7 +59,7 @@ void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
   auto const n = std::min(cols.size(), native_types.size());
   for (std::size_t j = 0; j < n; ++j) {
     if (cols[j] == nullptr) { continue; }
-    auto const native = sirius::get_cudf_type(native_types[j]);
+    auto const native = sirius::require_cudf_type(native_types[j]);
     // Only widen a genuinely-narrowed carrier; leave native columns and any type we can't
     // safely widen back (e.g. non-numeric) untouched. cast_through_rep handles DATE, which a
     // plain cudf::cast cannot restore from its narrowed integer carrier.

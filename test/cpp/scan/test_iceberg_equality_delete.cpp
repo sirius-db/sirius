@@ -29,7 +29,6 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>

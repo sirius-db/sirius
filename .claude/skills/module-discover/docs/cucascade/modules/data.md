@@ -8,6 +8,10 @@
 
 The data module provides the core data abstraction layer for cuCascade. It defines how data is represented across memory tiers (GPU tables, CPU host tables), how batches of data are managed with thread-safe state machines, and how repositories store and dispatch batches between pipeline stages. This is the most heavily used cuCascade module in Sirius — virtually every operator and pipeline component touches `data_batch` or `gpu_table_representation`.
 
+## Writer ordering
+
+GPU representations live in `cucascade/cudf/gpu_data_representation.hpp`. Converter sources and `clone(stream)` are const, but constness provides no GPU ordering: `wait_for_writer(reader_stream)` orders a recorded writer event, or synchronizes the source device when writer provenance is unknown. `make_written_on(table, space, writer_stream)` records a known writer, including the null default stream, and rejects a stream from the wrong device before taking the table; passing null to a constructor instead means an unknown writer. View-backed `release_table(stream)` waits for its ownership-preserving copy; owned release orders the writer asynchronously. Do not read a released representation as if it still held a table.
+
 ## API Reference
 
 ### `cucascade::idata_representation` (abstract base)
@@ -22,11 +26,10 @@ public:
 
   memory::Tier get_current_tier() const;
   int get_device_id() const;
-  cucascade::memory::memory_space& get_memory_space();
-  const cucascade::memory::memory_space& get_memory_space() const;
+  cucascade::memory::memory_space& get_memory_space() const noexcept;
 
   virtual std::size_t get_size_in_bytes() const = 0;
-  virtual std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const = 0;
 
   template <class TargetType>
     requires std::derived_from<TargetType, idata_representation>
@@ -57,7 +60,7 @@ public:
                            cucascade::memory::memory_space& memory_space);
 
   std::size_t get_size_in_bytes() const override;
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const override;
   const cudf::table& get_table() const;
   std::unique_ptr<cudf::table> release_table();
 };
@@ -85,7 +88,7 @@ public:
                            memory::memory_space* memory_space);
 
   std::size_t get_size_in_bytes() const override;
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const override;
   const std::unique_ptr<memory::host_table_allocation>& get_host_table() const;
 };
 ```
@@ -111,7 +114,7 @@ public:
     cucascade::memory::memory_space* memory_space);
 
   std::size_t get_size_in_bytes() const override;
-  std::unique_ptr<idata_representation> clone(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<idata_representation> clone(::cuda::stream_ref stream) const override;
   const std::unique_ptr<cucascade::memory::host_table_packed_allocation>& get_host_table() const;
 };
 ```
@@ -274,7 +277,7 @@ public:
   bool has_converter() const;
 
   template <typename TargetType>
-  std::unique_ptr<TargetType> convert(idata_representation& source,
+  std::unique_ptr<TargetType> convert(idata_representation const& source,
                                       const memory::memory_space* target,
                                       rmm::cuda_stream_view stream = rmm::cuda_stream_default) const;
 };

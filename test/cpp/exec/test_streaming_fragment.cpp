@@ -26,18 +26,25 @@
 #include <cudf/unary.hpp>
 
 #include <catch.hpp>
-#include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
-#include <duckdb.hpp>
+#include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/query_result.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
+#include <duckdb/planner/planner.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -139,18 +146,19 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
   return rows;
 }
 
-//! region → SUM(amount) from a gather stream of VARCHAR + BIGINT.
+//! region → SUM(amount) from a gather stream of VARCHAR + HUGEINT (DECIMAL128 with scale 0).
 std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
 {
   std::map<std::string, std::int64_t> groups;
   while (auto batch = fragment.pull(id)) {
     auto view = sirius::get_cudf_table_view(**batch);
     REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(1).type() == cudf::data_type{cudf::type_id::DECIMAL128, 0});
     auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
-    auto amounts = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(1));
+    auto amounts = sirius::test::operator_utils::copy_column_to_host<__int128_t>(view.column(1));
     REQUIRE(regions.size() == amounts.size());
     for (std::size_t i = 0; i < regions.size(); ++i) {
-      groups[regions[i]] += amounts[i];
+      groups[regions[i]] += static_cast<std::int64_t>(amounts[i]);
     }
   }
   return groups;
@@ -580,6 +588,192 @@ TEST_CASE_METHOD(fragment_fixture,
   }
 }
 
+TEST_CASE_METHOD(fragment_fixture,
+                 "a bare distinct set-operation fragment owns its multiplicity",
+                 "[integration][streaming_fragment][set_operation][setop_distinct_fragment]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  std::string const left =
+    "SELECT k FROM (VALUES (1), (1), (2), (2), (NULL::INTEGER), (NULL::INTEGER)) l(k)";
+  std::string const right = "SELECT k FROM (VALUES (1), (NULL::INTEGER)) r(k)";
+  auto sorted_rows        = [](duckdb::QueryResult& result) {
+    REQUIRE(result.ColumnCount() == 1);
+    std::vector<std::string> rows;
+    for (duckdb::idx_t row = 0; row < result.RowCount(); ++row) {
+      rows.push_back(result.Collection().GetValue(0, row).ToString());
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  };
+  std::vector<std::string> expected;
+  duckdb::vector<duckdb::LogicalType> expected_types;
+  {
+    sirius::test::scoped_sirius_setting cpu_execution{*con, "gpu_execution", false};
+    auto cpu = con->Query(left + " " + keyword + " " + right);
+    REQUIRE(cpu != nullptr);
+    REQUIRE_FALSE(cpu->HasError());
+    expected       = sorted_rows(*cpu);
+    expected_types = cpu->GetTypes();
+    REQUIRE(expected.size() == (keyword == "EXCEPT" ? 1 : 2));
+    REQUIRE(expected_types == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  }
+
+  fragment_spec spec;
+  spec.plan_source = [all_sql = left + " " + keyword + " ALL " + right](auto& context) {
+    duckdb::Parser parser(context);
+    parser.ParseQuery(all_sql);
+    duckdb::Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    std::size_t set_operations                                  = 0;
+    std::function<void(duckdb::LogicalOperator&)> make_distinct = [&](auto& node) {
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        node.template Cast<duckdb::LogicalSetOperation>().setop_all = false;
+        ++set_operations;
+      }
+      for (auto& child : node.children) {
+        make_distinct(*child);
+      }
+    };
+    make_distinct(*planner.plan);
+    REQUIRE(set_operations == 1);
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names = planner.names;
+    prepared->types = planner.types;
+    duckdb::Optimizer optimizer(*planner.binder, context);
+    auto plan = optimizer.Optimize(std::move(planner.plan));
+    plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*plan);
+    std::function<void(duckdb::LogicalOperator&)> require_no_wrapper = [&](auto& node) {
+      REQUIRE(node.type != duckdb::LogicalOperatorType::LOGICAL_DISTINCT);
+      for (auto& child : node.children) {
+        require_no_wrapper(*child);
+      }
+    };
+    require_no_wrapper(*plan);
+    return bound_plan{std::move(plan), std::move(prepared)};
+  };
+
+  con->BeginTransaction();
+  try {
+    {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      fragment.build();
+      fragment.run();
+      auto result = fragment.take_result();
+      REQUIRE(result != nullptr);
+      REQUIRE_FALSE(result->HasError());
+      CHECK(result->GetTypes() == expected_types);
+      CHECK(result->RowCount() == expected.size());
+      CHECK(sorted_rows(*result) == expected);
+    }
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "a bare set-operation fragment refuses right-only native collation",
+                 "[integration][streaming_fragment][set_operation][setop_child_collation]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  run_ok("CREATE TABLE coll_l (s VARCHAR);");
+  run_ok("CREATE TABLE coll_r (s VARCHAR COLLATE nocase);");
+  run_ok("INSERT INTO coll_l VALUES ('A'), ('B');");
+  run_ok("INSERT INTO coll_r VALUES ('a');");
+  run_ok("CHECKPOINT;");
+  std::string const left  = "SELECT s FROM coll_l";
+  std::string const right = "SELECT s FROM coll_r";
+  {
+    sirius::test::scoped_sirius_setting cpu_execution{*con, "gpu_execution", false};
+    auto cpu = con->Query(left + " " + keyword + " " + right);
+    REQUIRE(cpu != nullptr);
+    REQUIRE_FALSE(cpu->HasError());
+    REQUIRE(cpu->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::VARCHAR});
+    REQUIRE(sirius::test::collect_rows(*cpu) ==
+            std::vector<std::vector<std::string>>{{keyword == "EXCEPT" ? "B" : "A"}});
+  }
+
+  fragment_spec spec;
+  spec.plan_source = [all_sql = left + " " + keyword + " ALL " + right](auto& context) {
+    duckdb::Parser parser(context);
+    parser.ParseQuery(all_sql);
+    duckdb::Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    std::function<void(duckdb::LogicalOperator&)> make_distinct = [&](auto& node) {
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        node.template Cast<duckdb::LogicalSetOperation>().setop_all = false;
+      }
+      for (auto& child : node.children) {
+        make_distinct(*child);
+      }
+    };
+    make_distinct(*planner.plan);
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names = planner.names;
+    prepared->types = planner.types;
+    duckdb::Optimizer optimizer(*planner.binder, context);
+    auto plan = optimizer.Optimize(std::move(planner.plan));
+    plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*plan);
+    std::size_t set_operations                                            = 0;
+    std::function<void(duckdb::LogicalOperator&)> require_right_collation = [&](auto& node) {
+      REQUIRE(node.type != duckdb::LogicalOperatorType::LOGICAL_DISTINCT);
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        ++set_operations;
+        REQUIRE_FALSE(node.template Cast<duckdb::LogicalSetOperation>().setop_all);
+        REQUIRE(node.types.size() == 1);
+        REQUIRE(node.children.size() == 2);
+        REQUIRE(node.children[0]->types.size() == 1);
+        REQUIRE(node.children[1]->types.size() == 1);
+        REQUIRE(duckdb::StringType::GetCollation(node.types[0]).empty());
+        REQUIRE(duckdb::StringType::GetCollation(node.children[0]->types[0]).empty());
+        REQUIRE(duckdb::StringType::GetCollation(node.children[1]->types[0]) == "nocase");
+      }
+      for (auto& child : node.children) {
+        require_right_collation(*child);
+      }
+    };
+    require_right_collation(*plan);
+    REQUIRE(set_operations == 1);
+    return bound_plan{std::move(plan), std::move(prepared)};
+  };
+
+  con->BeginTransaction();
+  try {
+    {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      REQUIRE_THROWS_WITH(
+        fragment.build(),
+        ContainsSubstring("keys DuckDB compares through a collation or normalization"));
+    }
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
 // ============================================================================
 // FRAG-7: relay_from rejects a bad relay before any batch moves
 // ============================================================================
@@ -804,7 +998,7 @@ TEST_CASE_METHOD(fragment_fixture,
       require_window_free();
     }
 
-    SECTION("a HUGEINT prepared column over a BIGINT plan column, as DuckDB types SUM(BIGINT)")
+    SECTION("a HUGEINT prepared column over a BIGINT plan column")
     {
       fragment_spec spec;
       spec.plan_source =
@@ -817,17 +1011,23 @@ TEST_CASE_METHOD(fragment_fixture,
           bound.prepared->types = {duckdb::LogicalType::HUGEINT};
           return bound;
         };
+      // The planner keeps SUM's HUGEINT, so a BIGINT plan column under it is a real mismatch.
       streaming_fragment fragment(*con->context, std::move(spec));
-      fragment.build();
-      fragment.run();
-      auto result = fragment.take_result();
+      REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
+      require_window_free();
+    }
+
+    SECTION("a SUM result keeps DuckDB's HUGEINT type")
+    {
+      auto fragment = make_fragment("SELECT sum(a::BIGINT) AS s FROM (VALUES (-7), (2)) t(a)", {});
+      fragment->build();
+      fragment->run();
+      auto result = fragment->take_result();
       REQUIRE(result->GetTypes() ==
               duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
-      REQUIRE(result->RowCount() == 2);
-      // A sign-dropping widen would turn -7 into a value no int64 holds.
-      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() +
-                result->Collection().GetValue(0, 1).GetValue<std::int64_t>() ==
-              -5);
+      REQUIRE(result->RowCount() == 1);
+      // A sign-dropping widen would turn -5 into a value no int64 holds.
+      REQUIRE(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == -5);
     }
 
     SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
@@ -940,11 +1140,12 @@ TEST_CASE_METHOD(fragment_fixture,
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
-                 "FRAG-9b: an INTEGER and a BIGINT sender route each key to the same destination",
+                 "FRAG-9b: INTEGER, BIGINT and HUGEINT senders route each key to the same "
+                 "destination",
                  "[integration][streaming_fragment]")
 {
-  // cuDF hashes raw bytes, so without the INT32 -> INT64 key cast the two senders would split
-  // matching keys across destinations.
+  // cuDF hashes raw bytes, so without the per-type key cast the senders would split matching
+  // keys across destinations. The HUGEINT sender partitions on a SUM output.
   std::string keys;
   for (int k = 1; k <= 20; ++k) {
     keys += (k > 1 ? ", (" : "(") + std::to_string(k) + ")";
@@ -964,8 +1165,11 @@ TEST_CASE_METHOD(fragment_fixture,
     };
     auto narrow = make_sender("SELECT a FROM (VALUES " + keys + ") t(a)");
     auto wide   = make_sender("SELECT a::BIGINT AS a FROM (VALUES " + keys + ") t(a)");
+    auto summed =
+      make_sender("SELECT sum(a::BIGINT) AS a FROM (VALUES " + keys + ") t(a) GROUP BY a");
     REQUIRE(narrow->sink_types()[0].id() == sirius::type_id::INTEGER);
     REQUIRE(wide->sink_types()[0].id() == sirius::type_id::BIGINT);
+    REQUIRE(summed->sink_types()[0].id() == sirius::type_id::HUGEINT);
 
     auto drain_keys = [](streaming_fragment& sender, stream_id_t destination) {
       std::vector<std::int64_t> values;
@@ -983,9 +1187,11 @@ TEST_CASE_METHOD(fragment_fixture,
     for (stream_id_t destination : {0, 1}) {
       auto const from_narrow = drain_keys(*narrow, destination);
       auto const from_wide   = drain_keys(*wide, destination);
+      auto const from_summed = drain_keys(*summed, destination);
       // Both destinations get keys, so matching sets are not just "everything went to one".
       REQUIRE_FALSE(from_narrow.empty());
       REQUIRE(from_narrow == from_wide);
+      REQUIRE(from_narrow == from_summed);
       routed += from_narrow.size();
     }
     REQUIRE(routed == 20);
@@ -1157,7 +1363,8 @@ TEST_CASE_METHOD(fragment_fixture,
       auto fragment = make_leaf();
       {
         query_window window(*sirius_ctx, *con->context, "frag12_outer");
-        REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("nested execution window"));
+        REQUIRE_THROWS_WITH(fragment->build(),
+                            ContainsSubstring("Nested Sirius execution windows"));
       }
       REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("cannot be retried"));
     }
@@ -1334,7 +1541,7 @@ TEST_CASE_METHOD(fragment_fixture,
 
     REQUIRE(leaf0->sink_types().size() == 2);
     REQUIRE(leaf0->sink_types()[0].id() == sirius::type_id::VARCHAR);
-    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::HUGEINT);
     REQUIRE(leaf1->sink_types() == leaf0->sink_types());
 
     // Stream names match the root SQL (`SUM(amount)`); types come from the leaf sink

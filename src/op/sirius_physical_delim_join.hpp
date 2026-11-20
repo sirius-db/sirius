@@ -68,18 +68,17 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   {
     return false;
   }
-
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::NO_ORDER;
-  }
-  bool sink_order_dependent() const override { return false; }
 };
 
 //! sirius_physical_right_delim_join represents a join where the RHS will be duplicate eliminated
 //! and pushed into a PhysicalColumnDataScan in the LHS.
 class sirius_physical_right_delim_join : public sirius_physical_delim_join {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
 
@@ -102,6 +101,11 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::LEFT_DELIM_JOIN;
 

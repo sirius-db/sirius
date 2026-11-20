@@ -25,6 +25,8 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 // standard library
 #include <cstdint>
 #include <utility>
@@ -367,7 +369,7 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
     like_multiliteral_kernel<int64_t><<<num_blocks, threads_per_block, 0, stream.get()>>>(
       words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   }
-  CUDF_CHECK_CUDA(stream.get());
+  CUDF_CUDA_TRY(cudaGetLastError());
   return result;
 }
 

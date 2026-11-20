@@ -22,5 +22,5 @@
   "name": "raft",
   "port-version": 1,
   "supports": "linux",
-  "version-string": "26.08.00"
+  "version-string": "26.10.00"
 }

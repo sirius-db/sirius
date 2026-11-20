@@ -15,11 +15,11 @@
  */
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -34,9 +34,11 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
-#include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
+#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -47,28 +49,180 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
+#include "planner/gpu_admission.hpp"
+#include "planner/join_implied_filters.hpp"
+#include "planner/join_key_nullability.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_join_utils.hpp"
 #include "sirius_context.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace sirius::planner {
 
-/// Returns a set of output column indices proven to form a unique key for the
-/// given logical operator subtree, or an empty set if uniqueness cannot be proven.
-static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
+  duckdb::LogicalOperator& op,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+  duckdb::vector<sirius::join_condition> conditions,
+  duckdb::JoinType join_type,
+  sirius::operator_params const& params,
+  hash_join_options options)
+{
+  auto join =
+    duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(op,
+                                                             std::move(left),
+                                                             std::move(right),
+                                                             std::move(conditions),
+                                                             join_type,
+                                                             options.left_projection_map,
+                                                             options.right_projection_map,
+                                                             std::move(options.delim_types),
+                                                             op.estimated_cardinality,
+                                                             params.max_build_hash_table_bytes,
+                                                             std::move(options.dynamic_filter_plan),
+                                                             params.hash_partition_bytes,
+                                                             params.max_broadcast_join_size,
+                                                             options.dynamic_filter_stats_sink);
+  join->mark_join_build_switch_ratio   = params.mark_join_build_switch_ratio;
+  join->runtime_distinct_build_probe   = params.enable_runtime_distinct_build_probe;
+  join->max_build_probe_resident_bytes = params.max_build_probe_resident_bytes;
+  return join;
+}
+
+/// Whether @p get is a plain parquet scan whose output columns are the files' own columns, read by
+/// name. A pin proves something about those columns, so a scan that maps, renames, merges or
+/// synthesizes columns (iceberg_scan resolves them by field id and fills in added columns and
+/// partition values; union_by_name and an explicit schema merge and remap the files') may return
+/// different values under the same name. An allowlist, so a scan this does not know is not proven.
+static bool returns_raw_parquet_columns(duckdb::LogicalGet const& get)
+{
+  auto const function_name = get.function.GetName().GetIdentifierName();
+  if (function_name != "read_parquet" && function_name != "parquet_scan") { return false; }
+  auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get());
+  if (multi_file == nullptr) { return false; }
+  auto const& options = multi_file->file_options;
+  return !options.union_by_name && options.schema.empty() && options.bound_schema.empty() &&
+         options.mapping == duckdb::MultiFileColumnMappingMode::BY_NAME;
+}
+
+/// Alternative unique keys of an operator's output: each set of output column indices is a key on
+/// its own, so a join whose equality keys include any one of them has unique keys on that side.
+using unique_keys = std::vector<std::unordered_set<duckdb::idx_t>>;
+
+/// Whether @p columns include every column of at least one of @p keys.
+static bool includes_unique_key(unique_keys const& keys,
+                                std::unordered_set<duckdb::idx_t> const& columns)
+{
+  return std::any_of(keys.begin(), keys.end(), [&](auto const& key) {
+    return !key.empty() &&
+           std::all_of(key.begin(), key.end(), [&](auto col) { return columns.contains(col); });
+  });
+}
+
+/// Remaps every key through @p map_column (child position to output position, or nullopt when the
+/// column does not reach the output), keeping only the keys whose columns all reach the output.
+template <typename MapColumn>
+static unique_keys remap_unique_keys(unique_keys const& child_keys, MapColumn&& map_column)
+{
+  unique_keys mapped;
+  for (auto const& key : child_keys) {
+    std::unordered_set<duckdb::idx_t> mapped_key;
+    for (auto const col : key) {
+      auto const out = map_column(col);
+      if (!out) { break; }
+      mapped_key.insert(*out);
+    }
+    if (mapped_key.size() == key.size()) { mapped.push_back(std::move(mapped_key)); }
+  }
+  return mapped;
+}
+
+/// Output position of the first output column produced from child column @p child_col through
+/// @p projection_map (output[i] = child[projection_map[i]]), or nullopt.
+template <typename ProjectionMap>
+static std::optional<duckdb::idx_t> through_projection_map(ProjectionMap const& projection_map,
+                                                           duckdb::idx_t child_col)
+{
+  for (duckdb::idx_t i = 0; i < projection_map.size(); i++) {
+    if (projection_map[i] == child_col) { return i; }
+  }
+  return std::nullopt;
+}
+
+/// Output positions of a parquet scan's columns that the pinned copy of the same files proved
+/// distinct at pin time (see late_mat::unique_probe: no nulls and no repeated value across the
+/// whole table), each a single-column key. Only the scan's own files count, so a filter or
+/// projection above the scan keeps the fact valid: a subset of distinct values is distinct.
+static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
+                                         duckdb::LogicalGet& get)
+{
+  if (sirius_context == nullptr || !returns_raw_parquet_columns(get)) { return {}; }
+  auto const files = resolve_parquet_scan_file_paths(
+    get.function.GetName().GetIdentifierName(), get.bind_data.get(), get.parameters);
+  if (files.empty()) { return {}; }
+  auto const entry = sirius_context->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+  if (!entry) { return {}; }
+  auto const& pinned_names = entry->cache_info.names;
+  auto const proven_unique = [&](std::string const& name) {
+    for (std::size_t entry_idx = 0; entry_idx < pinned_names.size(); ++entry_idx) {
+      if (pinned_names[entry_idx] == name) {
+        return entry_idx < entry->proven_unique_columns.size() &&
+               entry->proven_unique_columns[entry_idx];
+      }
+    }
+    return false;
+  };
+
+  // A Hive partition column takes its value from the directory name, even when the files also hold
+  // a column of that name, so what the pin proved about the file column says nothing about it.
+  std::unordered_set<duckdb::idx_t> hive_partition_columns;
+  if (auto const* multi_file =
+        dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+    for (auto const& partition : multi_file->reader_bind.hive_partitioning_indexes) {
+      hive_partition_columns.insert(partition.index);
+    }
+  }
+
+  auto const& column_ids  = get.GetColumnIds();
+  auto const& proj_ids    = get.projection_ids;
+  auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
+  unique_keys keys;
+  for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
+    auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
+    auto const primary_column_index = column_ids[column_idx].GetPrimaryIndex();
+    // Virtual columns (row ids and the like) have no pinned counterpart.
+    if (primary_column_index >= get.names.size()) { continue; }
+    if (hive_partition_columns.contains(primary_column_index)) { continue; }
+    auto const& column_name = get.names[primary_column_index].GetIdentifierName();
+    if (proven_unique(column_name)) {
+      SIRIUS_LOG_DEBUG("[join] column '{}' proven distinct by the pinned table", column_name);
+      keys.push_back({output_idx});
+    }
+  }
+  return keys;
+}
+
+/// Returns the unique keys proven for the given logical operator subtree's output, or none if
+/// uniqueness cannot be proven.
+static unique_keys prove_unique_columns(duckdb::SiriusContext* sirius_context,
+                                        duckdb::LogicalOperator& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET: {
       auto& get  = op.Cast<duckdb::LogicalGet>();
       auto table = get.GetTable();
-      if (!table) { return {}; }
+      if (!table) { return prove_unique_from_pin(sirius_context, get); }
 
       const auto& constraints = table->GetConstraints();
       const auto& column_ids  = get.GetColumnIds();
@@ -110,7 +264,8 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
           best = std::move(candidate);
         }
       }
-      return best;
+      if (best.empty()) { return {}; }
+      return {std::move(best)};
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
@@ -121,7 +276,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       for (duckdb::idx_t i = 0; i < aggr.groups.size(); i++) {
         unique_set.insert(i);
       }
-      return unique_set;
+      return {std::move(unique_set)};
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET: {
@@ -132,75 +287,69 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       // construction — under EQUAL null semantics too, since GROUP BY collapses NULL keys
       // into one group. Only the complete column set is a key; a subset can repeat.
       auto& delim_get = op.Cast<duckdb::LogicalDelimGet>();
+      if (delim_get.chunk_types.empty()) { return {}; }
       std::unordered_set<duckdb::idx_t> unique_set;
       for (duckdb::idx_t i = 0; i < delim_get.chunk_types.size(); i++) {
         unique_set.insert(i);
       }
-      return unique_set;
+      return {std::move(unique_set)};
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
     case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
       // These operators only truncate rows — no column remapping.
       if (op.children.empty()) { return {}; }
-      return prove_unique_columns(*op.children[0]);
+      return prove_unique_columns(sirius_context, *op.children[0]);
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& filter = op.Cast<duckdb::LogicalFilter>();
       if (!filter.HasProjectionMap()) { return child_unique; }
-      // Remap through projection_map: output[i] = child[projection_map[i]].
-      std::unordered_set<duckdb::idx_t> remapped;
-      for (duckdb::idx_t i = 0; i < filter.projection_map.size(); i++) {
-        if (child_unique.count(filter.projection_map[i])) { remapped.insert(i); }
-      }
-      return (remapped.size() == child_unique.size()) ? remapped
-                                                      : std::unordered_set<duckdb::idx_t>{};
+      return remap_unique_keys(child_unique, [&](duckdb::idx_t col) {
+        return through_projection_map(filter.projection_map, col);
+      });
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
       auto& order = op.Cast<duckdb::LogicalOrder>();
       if (!order.HasProjectionMap()) { return child_unique; }
-      std::unordered_set<duckdb::idx_t> remapped;
-      for (duckdb::idx_t i = 0; i < order.projection_map.size(); i++) {
-        if (child_unique.count(order.projection_map[i])) { remapped.insert(i); }
-      }
-      return (remapped.size() == child_unique.size()) ? remapped
-                                                      : std::unordered_set<duckdb::idx_t>{};
+      return remap_unique_keys(child_unique, [&](duckdb::idx_t col) {
+        return through_projection_map(order.projection_map, col);
+      });
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
       if (op.children.empty()) { return {}; }
-      auto child_unique = prove_unique_columns(*op.children[0]);
+      auto child_unique = prove_unique_columns(sirius_context, *op.children[0]);
       if (child_unique.empty()) { return {}; }
 
       auto& proj = op.Cast<duckdb::LogicalProjection>();
-      // Remap child unique indices through projection expressions.
       // Only direct BoundReferenceExpression pass-throughs are safe.
-      std::unordered_set<duckdb::idx_t> remapped;
-      for (duckdb::idx_t i = 0; i < proj.expressions.size(); i++) {
-        auto& expr = proj.expressions[i];
-        if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
-        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().Index();
-        if (child_unique.count(child_idx)) { remapped.insert(i); }
-      }
-      // All child unique columns must map through.
-      if (remapped.size() == child_unique.size()) { return remapped; }
-      return {};
+      return remap_unique_keys(
+        child_unique, [&](duckdb::idx_t col) -> std::optional<duckdb::idx_t> {
+          for (duckdb::idx_t i = 0; i < proj.expressions.size(); i++) {
+            auto& expr = proj.expressions[i];
+            if (expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+                expr->Cast<duckdb::BoundReferenceExpression>().Index() == col) {
+              return i;
+            }
+          }
+          return std::nullopt;
+        });
     }
 
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
       if (op.children.size() != 2) { return {}; }
       auto& join = op.Cast<duckdb::LogicalComparisonJoin>();
 
-      auto left_unique  = prove_unique_columns(*op.children[0]);
-      auto right_unique = prove_unique_columns(*op.children[1]);
+      auto left_unique  = prove_unique_columns(sirius_context, *op.children[0]);
+      auto right_unique = prove_unique_columns(sirius_context, *op.children[1]);
       if (left_unique.empty() && right_unique.empty()) { return {}; }
 
       // Collect equality key columns on each side (only direct column refs).
@@ -218,18 +367,8 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
         }
       }
 
-      // unique ⊆ keys → join keys include a unique key, so that side has no duplicates.
-      auto unique_subset_of_keys = [](const std::unordered_set<duckdb::idx_t>& unique,
-                                      const std::unordered_set<duckdb::idx_t>& keys) {
-        if (unique.empty()) { return false; }
-        for (auto col : unique) {
-          if (!keys.count(col)) { return false; }
-        }
-        return true;
-      };
-
-      bool right_keys_unique = unique_subset_of_keys(right_unique, right_eq_keys);
-      bool left_keys_unique  = unique_subset_of_keys(left_unique, left_eq_keys);
+      bool right_keys_unique = includes_unique_key(right_unique, right_eq_keys);
+      bool left_keys_unique  = includes_unique_key(left_unique, left_eq_keys);
 
       // Which side's row-level uniqueness survives the join?
       bool left_preserved  = false;
@@ -254,22 +393,17 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       }
       if (!left_preserved && !right_preserved) { return {}; }
 
-      // Remap child unique indices through a projection map to output positions.
-      auto remap = [](const std::unordered_set<duckdb::idx_t>& child_unique,
+      // Remap child unique keys through a projection map to output positions.
+      auto remap = [](unique_keys const& child_unique,
                       const duckdb::vector<duckdb::ProjectionIndex>& proj_map,
-                      duckdb::idx_t offset) -> std::unordered_set<duckdb::idx_t> {
-        std::unordered_set<duckdb::idx_t> mapped;
-        if (proj_map.empty()) {
-          for (auto col : child_unique) {
-            mapped.insert(offset + col);
-          }
-        } else {
-          for (duckdb::idx_t i = 0; i < proj_map.size(); i++) {
-            if (child_unique.count(proj_map[i])) { mapped.insert(offset + i); }
-          }
-          if (mapped.size() != child_unique.size()) { return {}; }
-        }
-        return mapped;
+                      duckdb::idx_t offset) {
+        return remap_unique_keys(child_unique,
+                                 [&](duckdb::idx_t col) -> std::optional<duckdb::idx_t> {
+                                   if (proj_map.empty()) { return offset + col; }
+                                   auto const out = through_projection_map(proj_map, col);
+                                   if (!out) { return std::nullopt; }
+                                   return offset + *out;
+                                 });
       };
 
       bool only_left =
@@ -281,21 +415,16 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
                                           ? op.children[0]->types.size()
                                           : join.left_projection_map.size();
 
-      std::unordered_set<duckdb::idx_t> best;
-      if (left_preserved && !only_right) {
-        auto mapped = remap(left_unique, join.left_projection_map, 0);
-        if (!mapped.empty() && (best.empty() || mapped.size() < best.size())) {
-          best = std::move(mapped);
-        }
-      }
+      unique_keys keys;
+      if (left_preserved && !only_right) { keys = remap(left_unique, join.left_projection_map, 0); }
       if (right_preserved && !only_left) {
         duckdb::idx_t right_offset = only_right ? 0 : left_output_count;
         auto mapped                = remap(right_unique, join.right_projection_map, right_offset);
-        if (!mapped.empty() && (best.empty() || mapped.size() < best.size())) {
-          best = std::move(mapped);
-        }
+        keys.insert(keys.end(),
+                    std::make_move_iterator(mapped.begin()),
+                    std::make_move_iterator(mapped.end()));
       }
-      return best;
+      return keys;
     }
 
     default: return {};
@@ -393,32 +522,76 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     }
   }
 
+  normalize_non_null_join_keys(op);
+  planner::drop_join_implied_filters(op);
+
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const dynamic_filter_enabled =
-    sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
+    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
-  bool const build_evidence = build_filtered || build_opaque;
+  bool const build_join_filtered =
+    dynamic_filter_enabled && build_subtree_has_filtering_join(*op.children[1]);
+  bool const build_evidence = build_filtered || build_opaque || build_join_filtered;
 
   // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
-    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
+    build_evidence ? build_key_domain_evidence_for(op, context, sirius_context->get_scan_manager())
+                   : std::vector<sirius::op::dynamic_filter_domain_evidence>{};
+  // The coverage gate needs a domain that bounds rows. A filter's keep-ratio estimate needs only a
+  // bound on the values, which survive any join, and can use a Parquet scan's footer row count.
+  auto condition_value_domains =
+    build_evidence ? build_key_domain_cardinalities(
+                       op,
+                       [&](duckdb::LogicalGet const& get) {
+                         auto const rows = transparent::parquet_scan_row_count(get);
+                         return rows ? rows : duckdb_base_table_cardinality{context}(get);
+                       },
+                       origin_policy::value_preserving)
                    : std::vector<std::size_t>{};
 
-  auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
+  // Pin-time uniqueness facts count as proofs only with pin_table_prove_unique_keys; without a
+  // context, prove_unique_columns considers declared PRIMARY KEYs alone.
+  auto* const pin_facts_context =
+    sirius_context && duckdb::query_operator_options(context)->prove_unique_keys
+      ? sirius_context.get()
+      : nullptr;
+  auto build_side_unique_keys  = prove_unique_columns(pin_facts_context, *op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
   left->estimated_cardinality  = lhs_cardinality;
   right->estimated_cardinality = rhs_cardinality;
 
   if (op.conditions.empty()) {
-    throw duckdb::NotImplementedException("Cross product not supported in GPU");
-    // no conditions: insert a cross product
-    // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
+    // No conditions: a cross product, as LogicalCrossProduct lowers to. DuckDB emits this for a
+    // correlated scalar count(*): a LEFT join against a one-row default. On two non-empty inputs
+    // INNER/LEFT/RIGHT/OUTER all equal the cross product and the nested loop join pads a 0-row
+    // side per join type; SEMI/ANTI/MARK/SINGLE would need rows filtered or marked, which the
+    // condition-less path does not do.
+    switch (op.join_type) {
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::RIGHT:
+      case duckdb::JoinType::OUTER:
+        op.estimated_cardinality = memory::saturating_mul(lhs_cardinality, rhs_cardinality);
+        return make_cross_product_join(
+          op,
+          std::move(left),
+          std::move(right),
+          op.join_type,
+          op.estimated_cardinality,
+          duckdb::vector<std::size_t>(op.left_projection_map.begin(), op.left_projection_map.end()),
+          duckdb::vector<std::size_t>(op.right_projection_map.begin(),
+                                      op.right_projection_map.end()));
+      default:
+        throw duckdb::NotImplementedException("Cross product with join type " +
+                                              duckdb::JoinTypeToString(op.join_type) +
+                                              " not supported in GPU");
+    }
   }
 
   // Preserve key shape before materialization makes computed keys look like direct references.
@@ -449,8 +622,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type);
   // DuckDB's check accepts join types the Sirius NLJ execute switch has no arm for
   // (RIGHT_SEMI / RIGHT_ANTI / SINGLE), which would throw mid-query instead of falling back.
-  // The hash join screens the same way via are_conditions_supported, so SINGLE -- which no GPU
-  // join implements -- is rejected on both routes.
+  // The hash join screens the same way via are_conditions_supported. SINGLE is implemented by
+  // the hash join only, so a SINGLE join whose conditions need the NLJ (no hashable equality)
+  // still falls back.
   const bool nlj_join_type_supported =
     sirius::op::sirius_physical_nested_loop_join::is_join_type_supported(op.join_type);
   const bool nlj_is_supported = nlj_conditions_supported && nlj_join_type_supported;
@@ -468,7 +642,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    const auto& op_params = sirius_context->get_config().get_operator_params();
+    auto options               = duckdb::query_operator_options(context);
+    const auto& op_params      = *options;
+    auto* const stats          = &sirius_context->get_dynamic_filter_stats();
+    bool const multi_partition = op_params.enable_dynamic_filter_multi_partition;
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
@@ -476,27 +653,45 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto const host_spaces =
       memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
 
-    // Only a single-column proof can establish per-key uniqueness.
-    auto const build_side_unique_column =
-      build_side_unique_cols.size() == 1
-        ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
-        : std::nullopt;
-    auto admitted_keys = admit_dynamic_filter_keys(
-      conditions, condition_key_shapes, condition_domains, build_side_unique_column);
+    // Only a single-column proof can establish per-key uniqueness; take one that is a build key.
+    std::optional<std::size_t> build_side_unique_column;
+    for (auto const& condition : conditions) {
+      if (!condition.right->is_reference()) { continue; }
+      auto const col = static_cast<duckdb::idx_t>(condition.right->as_reference().column_index);
+      if (includes_unique_key(build_side_unique_keys, {col})) {
+        build_side_unique_column = static_cast<std::size_t>(col);
+        break;
+      }
+    }
+    auto admitted_keys = admit_dynamic_filter_keys(conditions,
+                                                   condition_key_shapes,
+                                                   condition_domains,
+                                                   build_side_unique_column,
+                                                   condition_value_domains);
 
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = build_evidence &&
-                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-                                !gpu_spaces.empty() && !host_spaces.empty();
+    bool const needs_early_publication =
+      op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
+    bool const discovery_runs =
+      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+      !gpu_spaces.empty() && !host_spaces.empty() &&
+      (!needs_early_publication || right_family_publication_enabled(op_params));
     if (discovery_runs) {
-      bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
-      descent_policy const policy{.descend_build_blocks = true};
+      bool const scan_bind_armed = probe_filter_join_type_admissible(op.join_type);
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
         auto const& condition = conditions[key.planner_condition_index];
+        // Right-family partitioning waits for the probe. Only register keys that the
+        // pre-partition accumulator can publish before that scan drains.
+        if (needs_early_publication &&
+            !sirius::op::detail::accumulated_bloom_builder::supports(key.storage_type)) {
+          continue;
+        }
+        descent_policy const policy{.descend_build_blocks = true,
+                                    .preserve_nulls       = key.preserve_nulls};
         // Terminal ordinals are local to each terminal, not the probe entry schema.
         auto const terminals =
           trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
@@ -534,9 +729,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           targets[entry->second].key_bindings.push_back(
             {.admitted_key_index   = key_index,
              .channel_push_ordinal = terminal.ordinal,
-             .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
+             .probe_storage_type   = sirius::get_cudf_type(scan.types[terminal.ordinal])
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
-          scan_bound = true;
+          // A body scan is an addition to the reader's endpoint, not a replacement for it.
+          scan_bound = scan_bound || !terminal.in_cte_body;
         }
         if (scan_bound) { continue; }
         // Admission proves build-block safety; placement preserves the reported site ordinal.
@@ -552,15 +748,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           std::move(left),
           static_cast<std::size_t>(key.probe_key_ordinal),
           policy,
-          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
+          [&site_channels, &op_params, stats](sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
             auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-              site.types,
-              site.estimated_cardinality,
+            auto consumer = sirius::op::scan::make_dynamic_filter_consumer(
               channel,
+              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
+              /*decode_bindings=*/{},
+              stats);
+            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+              site.types, site.estimated_cardinality, std::move(consumer));
             site_channels.push_back(std::move(channel));
             return endpoint;
           });
@@ -585,13 +783,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       }
     }
     if (!targets.empty()) {
+      std::string evidence;
+      for (auto const& [present, name] : {std::pair{build_filtered, "filtered"},
+                                          std::pair{build_opaque, "opaque"},
+                                          std::pair{build_join_filtered, "semi-join"}}) {
+        if (!present) { continue; }
+        if (!evidence.empty()) { evidence += '+'; }
+        evidence += name;
+      }
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
         "target(s) ({} scan-bound, {} join-edge; evidence={}; build est {} rows).",
         targets.size(),
         scan_target_count,
         targets.size() - scan_target_count,
-        build_filtered ? (build_opaque ? "filtered+opaque" : "filtered") : "opaque",
+        evidence,
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
@@ -603,7 +809,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "neither filter nor opaque-build evidence (build est {} rows).",
+        "no filter, opaque-build or semi-join evidence (build est {} rows).",
         rhs_cardinality);
     }
 
@@ -642,27 +848,54 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
        .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
-       .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
-       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
+       .enable_multi_partition    = multi_partition,
+       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu()}};
 
-    auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
-      op,
-      std::move(left),
-      std::move(right),
-      std::move(conditions),
-      op.join_type,
-      std::move(left_projection_map),
-      std::move(right_projection_map),
-      sirius::from_duckdb_vec(op.mark_types),
-      op.estimated_cardinality,
-      op_params.max_build_hash_table_bytes,
-      std::move(filter_plan),
-      op_params.hash_partition_bytes,
-      op_params.max_broadcast_join_size,
-      &sirius_context->get_dynamic_filter_stats());
-    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
-    hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
+    auto join = make_hash_join(op,
+                               std::move(left),
+                               std::move(right),
+                               std::move(conditions),
+                               op.join_type,
+                               op_params,
+                               {.left_projection_map       = std::move(left_projection_map),
+                                .right_projection_map      = std::move(right_projection_map),
+                                .delim_types               = sirius::from_duckdb_vec(op.mark_types),
+                                .dynamic_filter_plan       = std::move(filter_plan),
+                                .dynamic_filter_stats_sink = stats});
+    auto& hj  = *join;
+    if (op.join_type == duckdb::JoinType::RIGHT_SEMI ||
+        op.join_type == duckdb::JoinType::RIGHT_ANTI) {
+      // Every partition keeps its build rows resident until the whole probe is read, and that
+      // state cannot be spilled, so partitioning does not bound it. Build on the kept side only
+      // when all of it fits the per-GPU BUILD_PROBE residency budget across the GPUs.
+      auto const num_gpus   = std::max<std::size_t>(1, gpu_spaces.size());
+      auto const kept_bytes = sirius::memory::saturating_mul(
+        rhs_cardinality,
+        sirius::planner::estimate_bytes_per_row(hj.children[1]->types,
+                                                op_params.avg_variable_column_bytes));
+      auto const budget =
+        sirius::memory::saturating_mul(num_gpus, op_params.max_build_probe_resident_bytes);
+      if (kept_bytes < budget) {
+        hj.set_kept_build_streaming(true);
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} builds on its kept side and streams the probe (probe "
+          "est {} rows, build est {} rows, {} bytes).",
+          duckdb::JoinTypeToString(op.join_type),
+          lhs_cardinality,
+          rhs_cardinality,
+          kept_bytes);
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_plan_comparison_join] {} keeps the STANDARD build: its kept side, est {} "
+          "bytes, exceeds the {} GPU(s)' residency budget of {} bytes.",
+          duckdb::JoinTypeToString(op.join_type),
+          kept_bytes,
+          num_gpus,
+          budget);
+      }
+    }
+    hj.set_single_join_error_on_multiple_rows(
+      duckdb::Settings::Get<duckdb::ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).
@@ -689,17 +922,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         build_key_cols.insert(c.right->get<sirius::ast::reference>().column_index);
       }
       if (keys_extractable && !build_key_cols.empty()) {
-        // build_side_unique_cols was computed before create_plan (which moves logical node data).
-        // proven_unique ⊆ build_key_cols  →  build keys are unique.
-        if (!build_side_unique_cols.empty()) {
-          bool is_subset = true;
-          for (auto col : build_side_unique_cols) {
-            if (!build_key_cols.count(col)) {
-              is_subset = false;
-              break;
-            }
-          }
-          if (is_subset) { hj.unique_build_keys = true; }
+        // build_side_unique_keys was computed before create_plan (which moves logical node data).
+        // Some proven key ⊆ build_key_cols  →  build keys are unique.
+        if (includes_unique_key(build_side_unique_keys, build_key_cols)) {
+          hj.unique_build_keys = true;
         }
       }
     }

@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "compression/compressed_disk_representation.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/spill_compression.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -34,6 +37,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -55,11 +59,35 @@ class convertible_data_batch : public convertible_data {
  public:
   /**
    * @brief Construct from a shared_ptr to a cucascade data_batch.
-   * @param batch The data batch to wrap (shared ownership retained).
+   * @param batch        The data batch to wrap (shared ownership retained).
+   * @param source_space When non-null, convert() only moves the batch while it is still in this
+   *                     space -- the space it was picked to relieve. The batch may have moved
+   *                     since (e.g. spilled and upgraded on another GPU), and converting it with
+   *                     the caller's stream, which belongs to the original device, would then
+   *                     fail inside cuCascade ("stream belongs to CUDA device N but this
+   *                     representation's memory lives on device M"). Leave null to allow
+   *                     conversion from any space.
    */
-  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch)
-    : _batch(std::move(batch))
+  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
+                                  cucascade::memory::memory_space const* source_space = nullptr)
+    : _batch(std::move(batch)), _source_space(source_space)
   {
+  }
+
+  /**
+   * @brief Whether a batch currently in @p cur_space is one this conversion should move.
+   *
+   * False once a source-bound batch has left its source space, or when it already sits in a
+   * target space. convertible_gpu_pipeline_task applies the same rule under a shared lock before
+   * convert() re-checks it under the exclusive one.
+   */
+  static bool should_convert(
+    cucascade::memory::memory_space const* cur_space,
+    cucascade::memory::memory_space const* source_space,
+    const std::vector<const cucascade::memory::memory_space*>& target_spaces)
+  {
+    if (source_space != nullptr && cur_space != source_space) { return false; }
+    return std::find(target_spaces.begin(), target_spaces.end(), cur_space) == target_spaces.end();
   }
 
   /**
@@ -95,14 +123,17 @@ class convertible_data_batch : public convertible_data {
     }
     auto& mut = *mut_opt;
 
-    // Check if the batch is already in the target space
     auto cur_space = mut.get_memory_space();
-    for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
-      const auto* space = target_spaces[idx];
-      if (cur_space == space) { return std::nullopt; }
-    }
+    if (!should_convert(cur_space, _source_space, target_spaces)) { return std::nullopt; }
 
-    auto data_size = mut.get_data()->get_size_in_bytes();
+    // A batch going to the GPU needs room for its decoded form, which for a compressed
+    // batch is larger than what it occupies now.
+    auto const data_size = [&] {
+      auto const* data = mut.get_data();
+      auto const going_to_gpu =
+        !target_spaces.empty() && target_spaces.front()->get_tier() == cucascade::memory::Tier::GPU;
+      return going_to_gpu ? data->get_uncompressed_data_size_in_bytes() : data->get_size_in_bytes();
+    }();
 
     for (std::size_t idx = 0; idx < target_spaces.size(); ++idx) {
       const auto* space = target_spaces[idx];
@@ -138,10 +169,25 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
+          if (try_spill_compressed<compressed_host_representation>(mut, *reservation, stream)) {
+            break;
+          }
+          // A compressed batch has no raw host form to fall back to.
+          if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
           mut.convert_to<cucascade::host_data_representation>(
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::DISK:
+          if (dynamic_cast<compressed_host_representation const*>(mut.get_data()) != nullptr) {
+            // Already compressed: write it out as is.
+            mut.convert_to<compressed_disk_representation>(
+              converter_registry, *reservation, stream);
+            break;
+          }
+          if (try_spill_compressed<compressed_disk_representation>(mut, *reservation, stream)) {
+            break;
+          }
+          if (is_simpatico_compressed_representation(mut.get_data())) { continue; }
           mut.convert_to<cucascade::disk_data_representation>(
             converter_registry, *reservation, stream);
           break;
@@ -160,22 +206,55 @@ class convertible_data_batch : public convertible_data {
   /**
    * @brief Get the size in bytes of this batch in the specified memory space.
    *
-   * Acquires a shared (read-only) lock to access the memory space pointer, then
-   * compares with the provided space. Returns the batch size in bytes if the batch
-   * resides in the given space, 0 otherwise.
+   * Never waits on the batch lock: a batch another thread holds exclusively counts as 0, since
+   * a non-blocking convert() could not move it either and the caller sizing candidates must not
+   * stall behind the holder. So 0 means the batch is elsewhere or could not be inspected.
    *
    * @param space The memory space to query.
-   * @return The batch size in bytes if the batch resides in the given space, 0 otherwise.
+   * @return The batch size in bytes if it resides in the given space and could be inspected,
+   *         0 otherwise.
    */
   std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
   {
-    auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
+    auto ro = _batch->try_to_read_only();
+    if (!ro) { return 0; }
+    if (ro->get_memory_space() == space) { return ro->get_data()->get_size_in_bytes(); }
     return 0;
   }
 
  private:
+  /**
+   * @brief Spill a GPU batch in its Simpatico-compressed form, when spill compression
+   *        applies to it.
+   *
+   * @return true when the batch now holds a @p Compressed representation; false when
+   *         it was not a candidate, or the encode declined or failed, in which case the
+   *         batch is unchanged and the caller spills it uncompressed.
+   */
+  template <typename Compressed>
+  static bool try_spill_compressed(cucascade::mutable_data_batch& mut,
+                                   cucascade::memory::reservation& reservation,
+                                   ::cuda::stream_ref stream)
+  {
+    auto* data = mut.get_data();
+    if (dynamic_cast<cucascade::gpu_table_representation*>(data) == nullptr ||
+        !compression::spill_compression_applies(data->get_size_in_bytes())) {
+      return false;
+    }
+    try {
+      mut.convert_to<Compressed>(sirius::converter_registry::get(), reservation, stream);
+      return true;
+    } catch (compression::spill_compression_declined const& e) {
+      SIRIUS_LOG_DEBUG("[spill_compression] spilling uncompressed: {}", e.what());
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_DEBUG("[spill_compression] encode failed, spilling uncompressed: {}", e.what());
+    }
+    return false;
+  }
+
   std::shared_ptr<cucascade::data_batch> _batch;
+  /// Non-owning; null converts the batch from any space.
+  cucascade::memory::memory_space const* _source_space{nullptr};
 };
 
 /**
@@ -335,7 +414,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
+      return std::make_unique<convertible_data_batch>(std::move(batch), space);
     }
 
     return nullptr;

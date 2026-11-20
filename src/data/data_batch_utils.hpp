@@ -120,9 +120,9 @@ inline std::size_t peak_materialization_bytes(const cucascade::idata_representat
 /**
  * @brief Row count of @p data read from its metadata, without touching column data.
  *
- * Known for GPU tables and for unpacked host and disk tables; nullopt for other representations
- * (packed host tables, Simpatico-compressed chunks) and for nullptr. A table with no columns has
- * zero rows.
+ * Known for GPU tables, for unpacked host and disk tables and for Simpatico-compressed
+ * representations; nullopt for other representations (packed host tables) and for nullptr. A table
+ * with no columns has zero rows.
  */
 inline std::optional<std::size_t> representation_num_rows(
   const cucascade::idata_representation* data)
@@ -130,6 +130,9 @@ inline std::optional<std::size_t> representation_num_rows(
   if (data == nullptr) { return std::nullopt; }
   if (auto const* gpu = dynamic_cast<const cucascade::gpu_table_representation*>(data)) {
     return static_cast<std::size_t>(gpu->get_table_view().num_rows());
+  }
+  if (auto const* compressed = dynamic_cast<const simpatico_compressed_representation*>(data)) {
+    return static_cast<std::size_t>(compressed->num_rows());
   }
   auto const rows_of = [](std::vector<cucascade::memory::column_metadata> const& columns) {
     return columns.empty() ? std::size_t{0} : static_cast<std::size_t>(columns.front().num_rows);
@@ -171,13 +174,10 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
 /**
  * @brief Create a shared_ptr<data_batch> from a cudf::table, recording the writer event.
  *
- * STREAM-LINEAGE: @p writer_stream is REQUIRED. Every data_batch carrying a
- * gpu_table_representation is born with a recorded writer event so
- * cucascade::convert_gpu_to_gpu() can call
- * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying
- * source buffers. This closes the cross-mempool stream-ordered race in
- * multi-GPU runs. Record on the producing thread/device, including when the actual writer
- * is the default stream: cuCascade's constructor treats its null handle as a legacy sentinel.
+ * STREAM-LINEAGE: @p writer_stream must be ordered after every write to the table.
+ * `gpu_table_representation::make_written_on` records its event on the producing device, including
+ * when a null handle names the actual default stream. Readers can then wait before accessing the
+ * bytes on another stream or GPU.
  *
  * @param table The cudf table (will be moved from).
  * @param memory_space The memory space where the table resides.
@@ -196,9 +196,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = cucascade::gpu_table_representation::make_written_on(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
-  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
@@ -219,9 +218,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  auto gpu_repr = cucascade::gpu_table_representation::make_written_on(
     std::move(table), memory_space, writer_stream);
-  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,

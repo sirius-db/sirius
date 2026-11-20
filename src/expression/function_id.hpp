@@ -17,11 +17,20 @@
 #pragma once
 
 // standard library
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
 
 namespace sirius {
+
+// Checked day arithmetic; distinct from generic numeric add/subtract.
+enum class date_arithmetic_operation : uint8_t {
+  date_add_days,
+  days_add_date,
+  date_sub_days,
+  date_difference
+};
 
 /**
  * @brief Closed identifier for every named scalar function the Sirius GPU
@@ -31,7 +40,7 @@ namespace sirius {
  * test_function_id.cpp). The order is grouped by category for human
  * readability; integer values are part of the public ABI — new entries go
  * at the end of their category, never in the middle. Cardinality is
- * exactly 33 (D-01).
+ * exactly 35 (D-01).
  */
 enum class function_id : uint16_t {
   // Arithmetic — 6 entries (also the contents of supported_ast_functions)
@@ -78,24 +87,31 @@ enum class function_id : uint16_t {
 
   // Additional numeric functions
   round,
+  abs,
+  negate,  // unary minus: DuckDB's one-argument "-"
 };
 
 /**
- * @brief Resolve a DuckDB scalar-function name to the matching function_id.
+ * @brief Resolve a DuckDB scalar-function name and argument count to a function_id.
  *
- * Returns std::nullopt when the name does not correspond to any function
- * the Sirius executor handles. Both "substring" and "substr" resolve to
- * function_id::substring (D-SUB-1).
+ * Returns std::nullopt when no GPU handler takes that name with that many
+ * arguments. "-" resolves to function_id::negate with one argument and to
+ * function_id::sub with two. "substr" is an alias of "substring" (D-SUB-1).
  */
-std::optional<function_id> from_duckdb_function_name(std::string_view name);
+std::optional<function_id> from_duckdb_function_name(std::string_view name,
+                                                     std::size_t argument_count);
 
 /**
  * @brief Recover the canonical DuckDB function name for a function_id.
  *
- * Returns the DuckDB-side spelling that round-trips back through
- * from_duckdb_function_name. For function_id::substring, the canonical
- * spelling is "substring" (D-SUB-1).
+ * Round-trips through from_duckdb_function_name with an accepted argument
+ * count. Throws sirius::internal_exception for an id outside the enum.
  */
 std::string_view to_duckdb_function_name(function_id id);
+
+/**
+ * @brief Whether the GPU handler for @p id takes @p argument_count arguments.
+ */
+bool accepts_argument_count(function_id id, std::size_t argument_count);
 
 }  // namespace sirius

@@ -148,7 +148,10 @@ std::unique_ptr<cudf::table> run_one(memory_space& space,
                                      cudf::table_view tv,
                                      exp_strategy_enum strategy)
 {
-  exp_executor executor(expr_ptr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(expr_ptr,
+                        get_resource_ref(space),
+                        cudf::get_default_stream(),
+                        sirius::expression_query_policy{strategy});
   return executor.evaluate(tv);
 }
 

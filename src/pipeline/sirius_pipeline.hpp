@@ -29,6 +29,7 @@
 #include "query_id.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -180,9 +181,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //!
   //! Queue index keys are derived from this (see the multi_index_priority_queue extractors in
   //! task_scheduler and task_creator), so that per-query drains target the right tasks. Read it
-  //! from here rather than recovering it from the packed scheduling priority: the priority masks
-  //! the id to 31 bits (see sirius::query_priority_bits), so the recovered value diverges from
-  //! the real query id once bit 31 is set.
+  //! from here so ownership stays independent of scheduling priority.
   [[nodiscard]] sirius::query_id_t get_query_id() const noexcept { return query_id_; }
   //! Returns the parent pipelines (pipelines that depend on this pipeline)
   std::vector<sirius_pipeline*> get_parents() const;
@@ -194,9 +193,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! update_pipeline_status. If it is, we dont want to schedule tasks for its consumers, that will
   //! be done later.
   void notify_downstream_pipelines(bool original_pipeline);
-
-  //! Returns whether any of the operators in the pipeline care about preserving order
-  bool is_order_dependent() const;
 
   //! Registers a new batch index for a pipeline executor - returns the current minimum batch index
   std::size_t register_new_batch_index();
@@ -215,8 +211,11 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
-  //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
-  //! completion signals execute().
+  //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
+  [[nodiscard]] bool is_limit_exhausted() const;
+
+  //! Query-terminal sink (RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE): no downstream
+  //! schedule/wiring; completion signals execute().
   [[nodiscard]] bool is_query_terminal() const;
 
   void mark_task_created();
@@ -237,15 +236,26 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
   [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
   {
-    return _task_creator;
+    return _task_creator.load(std::memory_order_acquire);
   }
 
-  //! Returns a scoped lock on the pipeline status mutex.
-  //! Callers must hold this lock across the operation that consumes pipeline state
-  //! (port data pop, partition claim, etc.) and the task constructor that calls
-  //! mark_task_created(), so that update_pipeline_status() cannot observe an
-  //! empty-port / balanced-counter state while a task is mid-creation.
-  [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
+  // Serializes input claims without blocking task completion while a source waits.
+  // The guard prevents finalization across the input-pop / task-construction gap.
+  // Normal creation exits must recheck status after release; exceptions fail the query.
+  class task_creation_guard {
+   public:
+    ~task_creation_guard();
+    task_creation_guard(task_creation_guard const&)            = delete;
+    task_creation_guard& operator=(task_creation_guard const&) = delete;
+    void unlock();
+
+   private:
+    friend class sirius_pipeline;
+    explicit task_creation_guard(sirius_pipeline&);
+    sirius_pipeline* pipeline_;
+    std::unique_lock<std::mutex> lock_;
+  };
+  [[nodiscard]] task_creation_guard get_task_creation_lock();
 
   [[nodiscard]] quent::Uuid pipeline_uuid() const { return _pipeline_uuid; }
 
@@ -308,8 +318,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
 
   bool schedule_parallel(std::shared_ptr<duckdb::Event>& event);
 
-  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
-  sirius::creator::task_creator* _task_creator{nullptr};
+  //! Task creator pointer for scheduling downstream consumers when this pipeline finishes. Set
+  //! last by prepare_for_query, so a caller on another thread that sees it sees the query's state.
+  std::atomic<sirius::creator::task_creator*> _task_creator{nullptr};
 
   //! Per-query completion reference for terminal pipelines. Guarded by _status_mutex.
   std::weak_ptr<completion_handler> _completion_handler;
@@ -324,10 +335,11 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! Plan-time context (replaces sirius_engine& for plan-time needs)
   pipeline_build_context build_ctx_;
 
-  //! Serialises update_pipeline_status() checks against task_creator's port-pop +
-  //! mark_task_created() sequences so neither can observe a transiently-balanced
-  //! counter while the other is mid-operation.
+  // Status updates never hold the input-claim mutex. The active flag is guarded
+  // by the status mutex and excludes finalization while a creator claims input.
   mutable std::mutex _status_mutex;
+  std::mutex _task_creation_mutex;
+  bool _task_creation_active = false;
 
   //! Whether the pipeline has been finished
   std::atomic<bool> pipeline_finished = false;

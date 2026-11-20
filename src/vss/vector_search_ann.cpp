@@ -28,13 +28,11 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -154,7 +152,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
                                       cudf::data_type{cudf::type_id::BOOL8},
                                       c.stream,
                                       c.mr);
-  auto kept  = sirius::ApplyRetentionMask(
+  auto kept  = sirius::apply_retention_mask(
     cudf::table_view{{search.neighbors->view(), search.distances->view()}},
     valid->view(),
     c.stream,

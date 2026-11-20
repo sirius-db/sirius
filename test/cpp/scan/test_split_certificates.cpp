@@ -19,6 +19,7 @@
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -26,24 +27,21 @@
 #include "sirius_context.hpp"
 #include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
-#include "utils/table_filter_test_utils.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
-#include <io/kvikio/kvikio_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <chrono>
@@ -143,10 +141,10 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   info->projected_output_count = 1;
   if (all_pruned) {
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->SetFilterByColumnIndex(
+    info->table_filters->PushFilter(
       duckdb::ProjectionIndex(0),
-      sirius::test::constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN,
-                                    duckdb::Value::INTEGER(-1)));
+      duckdb::ExpressionFilter::CreateComparisonFilter(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                       duckdb::Value::INTEGER(-1)));
   }
   return info;
 }
@@ -170,8 +168,7 @@ std::unique_ptr<parquet_ingestible_table_info> parquet_info(scan_contract_id con
 struct parquet_certificate_fixture {
   static constexpr scan_contract_id contract_id = 53;
   temporary_directory files;
-  std::shared_ptr<sirius::io::kvikio_context> ioctx =
-    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::ioctx> ioctx = sirius::test::make_test_local_ioctx();
   std::shared_ptr<gpu_ingestible> ingestible;
 
   parquet_certificate_fixture()
@@ -191,9 +188,9 @@ struct parquet_certificate_fixture {
   std::unique_ptr<parquet_file_scan_info> next_file()
   {
     auto provider = ingestible->next_split_provider(
-      [this](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto info  = provider();
+    auto info  = provider({});
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
@@ -239,7 +236,7 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->certificates()[0].input_identity == file.certificates()[0].input_identity);
   CHECK(split->certificates()[0].split_id == split_id);
   CHECK(split->dependencies()[0].footer == file.file_metadata);
-  CHECK(split->dependencies()[0].delete_set == file.dependencies()[0].delete_set);
+  CHECK(split->dependencies()[0].visibility == file.dependencies()[0].visibility);
   CHECK(split->rg_slices[0].file_metadata == file.file_metadata);
   CHECK(split->rg_slices[0].file_path == file.file_path);
   CHECK(split->rg_slices[0].file_index == file.file_index);
@@ -477,17 +474,17 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   info->resolved_file_paths    = paths;
   info->approximate_batch_size = 64 * 1024 * 1024;
   auto ingestible              = make_ingestible(std::move(info));
-  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                   = sirius::test::make_test_local_ioctx();
   if (warm_cache) {
     auto warm_info                 = make_info();
     warm_info->resolved_file_paths = paths;
     auto warmer                    = make_ingestible(std::move(warm_info));
     for (auto const& path : paths) {
       auto provider = warmer->next_split_provider(
-        [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+        [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
       REQUIRE(provider);
-      REQUIRE(provider());
-      REQUIRE(ioctx->open_datasource(path)->metadata());
+      REQUIRE(provider({}));
+      REQUIRE(cucascade::io::open_datasource(ioctx, path)->metadata());
     }
   }
   auto coalescer = ingestible->create_batch_coalescer();
@@ -499,9 +496,9 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   };
   for (auto const& path : paths) {
     auto provider = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto file = provider();
+    auto file = provider({});
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
     REQUIRE(file->dependencies().size() == 1);
@@ -582,10 +579,10 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   } else {
     ingestible = make_ingestible(std::move(info));
   }
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx = sirius::test::make_test_local_ioctx();
   auto work  = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto metadata = work();
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto metadata = work({});
   auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
   REQUIRE(file.row_groups.size() > 1);
   CHECK(file.disable_filter_pushdown == iceberg);
@@ -644,7 +641,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   CHECK(pruned->flush().empty());
 }
 TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
-          "[scan][certificate][parquet_certificate]")
+          "[scan][certificate][parquet_certificate][fw_s4]")
 {
   auto const defect  = std::string{GENERATE("missing", "extra", "foreign", "uncertified_foreign")};
   auto const pending = std::string{GENERATE("empty", "rows", "pruned")};
@@ -681,7 +678,17 @@ TEST_CASE("Parquet coalescing rejects malformed files without changing pending w
       certificate.contract_id = id;
   }
   malformed->set_contract_payload(id, std::move(certificates), std::move(dependencies));
-  REQUIRE_THROWS_AS(coalescer->push(std::move(malformed)), std::invalid_argument);
+  try {
+    coalescer->push(std::move(malformed));
+    FAIL("expected certificate refusal");
+  } catch (sirius::transparent::classified_execution_error const& error) {
+    CHECK(error.cause == sirius::transparent::late_failure_cause::certificate);
+    CHECK(error.reason.empty());
+    auto expected = (defect == "foreign" || defect == "uncertified_foreign")
+                      ? "parquet file contract does not match coalescer contract"
+                      : "parquet file requires one certificate and dependency";
+    CHECK(std::string(error.what()) == expected);
+  }
 
   auto preserved = coalescer->flush();
   REQUIRE(preserved.size() == (pending == "empty" ? 0 : 1));
@@ -793,15 +800,19 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   // Finalize can publish evidence after constructing the ingestible, before metadata dispatch.
   registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
-  auto resolve = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
+  auto ioctx   = sirius::test::make_test_local_ioctx();
+  auto resolve = [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    return ioctx;
+  };
   auto first_provider  = ingestible->next_split_provider(resolve);
   auto second_provider = ingestible->next_split_provider(resolve);
   REQUIRE(first_provider);
   REQUIRE(second_provider);
   // Metadata tasks share the ingestible and may initialize its evidence index concurrently.
-  auto first_file  = std::async(std::launch::async, std::move(first_provider));
-  auto second_file = std::async(std::launch::async, std::move(second_provider));
+  auto first_file = std::async(
+    std::launch::async, [provider = std::move(first_provider)]() mutable { return provider({}); });
+  auto second_file = std::async(
+    std::launch::async, [provider = std::move(second_provider)]() mutable { return provider({}); });
   std::vector<std::unique_ptr<scan_info>> splits;
   splits.push_back(first_file.get());
   splits.push_back(second_file.get());
@@ -875,12 +886,12 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
                                (files.path / "a.parquet").string()};
   info->read_views          = registry;
   auto ingestible           = make_ingestible(std::move(info));
-  auto ioctx                = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                = sirius::test::make_test_local_ioctx();
   for (auto const index : {1, 0}) {
     auto provider = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
-    auto file = provider();
+    auto file = provider({});
     REQUIRE(file);
     REQUIRE(file->certificates().size() == 1);
     auto const identity = file->certificates().front().input_identity;
@@ -906,11 +917,11 @@ TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
   auto info       = native_info(fixture, 62);
   auto* database  = &info->storage->GetAttached();
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
-  auto split = provider();
+  auto split = provider({});
   REQUIRE(split);
   REQUIRE_FALSE(split->dependencies().empty());
   REQUIRE(split->dependencies().front().checkpoint_iteration);
@@ -954,14 +965,14 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   auto info                    = native_info(fixture, contract_id);
   info->approximate_batch_size = 1;
   auto ingestible              = make_ingestible(std::move(info));
-  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                   = sirius::test::make_test_local_ioctx();
   auto coalescer               = ingestible->create_batch_coalescer();
   std::size_t input_slices     = 0;
   std::size_t input_ranges     = 0;
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
-    auto range = provider();
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
+    auto range = provider({});
     ++input_ranges;
     REQUIRE(range);
     auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
@@ -1066,11 +1077,11 @@ TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
                       "native split requires one certificate and dependency per row group");
 
   // Rejection must leave the coalescer ready for a valid provider.
-  auto ioctx    = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx    = sirius::test::make_test_local_ioctx();
   auto provider = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
-  REQUIRE(coalescer->push(provider()).empty());
+  REQUIRE(coalescer->push(provider({})).empty());
   auto splits = coalescer->flush();
   REQUIRE(splits.size() == 1);
   REQUIRE(splits.front()->certificates().size() == 1);
@@ -1088,12 +1099,12 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   exec_ok(*fixture.connection, "CHECKPOINT");
 
   auto ingestible = make_ingestible(native_info(fixture, contract_id, /*all_pruned=*/true));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto coalescer  = ingestible->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
-    auto emitted = coalescer->push(provider());
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
+    auto emitted = coalescer->push(provider({}));
     CHECK_FALSE(coalescer->first_retained_time());
     CHECK_FALSE(coalescer->partial_emit());
     for (auto& split : emitted) {
@@ -1153,16 +1164,38 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
 }
 
+TEST_CASE("Execution rebuilds foreign footer provenance before schema access",
+          "[scan][certificate][consumption][metadata_retention]")
+{
+  auto info    = parquet_info(81);
+  auto path    = info->resolved_file_paths.front();
+  auto ioctx   = sirius::test::make_test_local_ioctx();
+  auto source  = cucascade::io::open_datasource(ioctx, path);
+  auto foreign = std::make_shared<parquet_metadata>(nullptr,
+                                                    64,
+                                                    parquet_encryption_evidence{},
+                                                    std::vector<uint8_t>{},
+                                                    std::string{},
+                                                    std::vector<uint8_t>{},
+                                                    "foreign-open");
+  REQUIRE(source->store_metadata(foreign));
+  auto ingestible = make_ingestible(std::move(info));
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto split = provider({});
+  REQUIRE(split != nullptr);
+}
+
 TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
           "[scan][certificate][consumption]")
 {
   auto info       = parquet_info(81);
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = ingestible->create_batch_coalescer();
-  auto splits    = coalescer->push(provider());
+  auto splits    = coalescer->push(provider({}));
   auto tail      = coalescer->flush();
   for (auto& s : tail)
     splits.push_back(std::move(s));
@@ -1184,6 +1217,31 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
     certificates[0].input_identity = parquet->rg_slices[0].file_path + "|footer=0";
   }
   SECTION("missing file approval") { dependencies[0].parquet_approval.reset(); }
+  SECTION("missing metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner.reset();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign metadata owner")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->metadata_owner         = std::make_shared<cucascade::io::io_object_metadata>();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("missing object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity.clear();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign object identity")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->object_identity += "different-version";
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+
   SECTION("row group outside approved set")
   {
     auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
@@ -1326,10 +1384,10 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
           "CREATE TABLE items AS SELECT i::INTEGER id FROM range(300000) t(i)");
   exec_ok(*fixture.connection, "CHECKPOINT");
   auto ingestible = make_ingestible(native_info(fixture, 81));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  auto split = provider();
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+  auto split = provider({});
   auto required =
     check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
   REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, *split));
@@ -1361,8 +1419,8 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }
 
-TEST_CASE("Production scan preparation runs and publishes on the execute owner",
-          "[integration][scan][certificate][scan_preparation][query_thread]")
+TEST_CASE("Metadata-only production scans publish on the query owner",
+          "[integration][scan][certificate][scan_preparation][coordinator_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
@@ -1384,10 +1442,11 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
     if (result->HasError()) { INFO(result->GetError()); }
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 1);
+    auto chunk = result->Fetch();
     if (std::string_view(sql).starts_with("SELECT sum"))
-      CHECK(result->Collection().GetValue(0, 0).ToString() == "499500");
+      CHECK(chunk->GetValue(0, 0).ToString() == "499500");
     else {
-      auto value = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+      auto value = chunk->GetValue(0, 0).GetValue<int64_t>();
       CHECK(value >= 0);
       CHECK(value < 1000);
     }
@@ -1400,7 +1459,7 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
         CHECK(observation.execute_owner != std::thread::id{});
         CHECK(observation.preparation_owner == observation.execute_owner);
         CHECK(observation.preparation_runner == observation.execute_owner);
-        CHECK(observation.preparation_publisher == observation.execute_owner);
+        CHECK(observation.preparation_publisher == observation.preparation_runner);
       }
     }
   }
@@ -1461,21 +1520,23 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
     info->delete_sets->emplace(intact, std::make_shared<iceberg_delete_set const>(intact));
   }
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   std::vector<std::unique_ptr<scan_info>> splits;
   auto coalescer = ingestible->create_batch_coalescer();
   for (auto const& path : {deleted, intact}) {
     auto work = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(work);
-    auto metadata = work();
+    auto metadata = work({});
     REQUIRE(metadata->dependencies().size() == 1);
-    auto const set = metadata->dependencies().front().delete_set;
+    auto const set = metadata->dependencies().front().visibility;
     REQUIRE(set);
-    CHECK(set->positions.empty() == (path == intact));
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (path == intact));
     if (path == deleted) {
-      CHECK(set->positions.data() == positions);
-      CHECK(std::vector<int64_t>(set->positions.begin(), set->positions.end()) ==
+      CHECK(iceberg_set->positions.data() == positions);
+      CHECK(std::vector<int64_t>(iceberg_set->positions.begin(), iceberg_set->positions.end()) ==
             std::vector<int64_t>{0, 0, 4});
     }
     auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
@@ -1491,16 +1552,22 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
   REQUIRE(splits.size() == 2);
   for (size_t i = 0; i < splits.size(); ++i) {
     REQUIRE(splits[i]->dependencies().size() == 1);
-    auto const& set = splits[i]->dependencies().front().delete_set;
+    auto const& set = splits[i]->dependencies().front().visibility;
     REQUIRE(set);
-    CHECK(set->positions.empty() == (i == 1));
+    auto const iceberg_set = std::dynamic_pointer_cast<iceberg_delete_set const>(set);
+    REQUIRE(iceberg_set);
+    CHECK(iceberg_set->positions.empty() == (i == 1));
     CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
   }
   coalescer.reset();
   ingestible.reset();
   payload.reset();
   CHECK_FALSE(owner.expired());
-  CHECK(splits.front()->dependencies().front().delete_set->positions.front() == 0);
+  auto first_set = std::dynamic_pointer_cast<iceberg_delete_set const>(
+    splits.front()->dependencies().front().visibility);
+  REQUIRE(first_set);
+  CHECK(first_set->positions.front() == 0);
+  first_set.reset();
   splits.clear();
   CHECK(owner.expired());
 }
@@ -1517,17 +1584,17 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
     auto set = std::make_shared<iceberg_delete_set const>(path);
     info->delete_sets->emplace(path, set);
     auto ingestible = make_ingestible(std::move(info));
-    auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+    auto ioctx      = sirius::test::make_test_local_ioctx();
     auto work       = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-    auto metadata = work();
-    CHECK(metadata->dependencies().front().delete_set == set);
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
+    auto metadata = work({});
+    CHECK(metadata->dependencies().front().visibility == set);
     CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
     auto coalescer = ingestible->create_batch_coalescer();
     CHECK(coalescer->push(std::move(metadata)).empty());
     auto splits = coalescer->flush();
     REQUIRE(splits.size() == 1);
-    CHECK(splits.front()->dependencies().front().delete_set == set);
+    CHECK(splits.front()->dependencies().front().visibility == set);
   }
   SECTION("missing result must not become empty")
   {
@@ -1662,11 +1729,11 @@ TEST_CASE("Iceberg materialization refuses missing or replaced delete dependenci
     info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, backing));
   }
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = sirius::test::make_test_local_ioctx();
   auto work       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = ingestible->create_batch_coalescer();
-  CHECK(coalescer->push(work()).empty());
+  CHECK(coalescer->push(work({})).empty());
   auto batches = coalescer->flush();
   REQUIRE(batches.size() == 1);
   auto& split = dynamic_cast<parquet_split_info&>(*batches.front());
@@ -1675,11 +1742,11 @@ TEST_CASE("Iceberg materialization refuses missing or replaced delete dependenci
   std::string expected =
     "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'";
   if (defect == "missing") {
-    dependencies.front().delete_set.reset();
+    dependencies.front().visibility.reset();
   } else if (defect == "wrong_file") {
-    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>("other.parquet");
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>("other.parquet");
   } else if (defect == "replacement") {
-    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>(key);
+    dependencies.front().visibility = std::make_shared<iceberg_delete_set const>(key);
   } else if (defect == "pushdown") {
     split.disable_filter_pushdown = false;
     expected = "[iceberg_gpu_ingestible] positional deletes require pushdown suppression";

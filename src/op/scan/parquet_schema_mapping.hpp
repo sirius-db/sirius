@@ -26,6 +26,11 @@
 
 namespace sirius::op::scan::detail {
 
+/** Decoded scalar carrier width; 0 excludes unsupported schemas, SIZE_MAX denotes STRING.
+ * Follows cuDF's default Parquet type resolution, including legacy annotations.
+ */
+std::size_t carrier_decoded_width(cudf::io::parquet::SchemaElement const& column);
+
 /**
  * @brief Return the parquet column-chunk indices whose top-level schema name
  *        (path_in_schema[0]) matches @p column_name.

@@ -17,7 +17,9 @@
 #pragma once
 
 // Pin-time proof that a column's values are distinct across a whole pinned
-// table (env gate: SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS).
+// table. Every integer column of a pin (and a small table's other columns) is observed when
+// `pin_table_prove_unique_keys` is set and the pin is a parquet one or late materialization is on;
+// the join planner and late materialization both read the facts.
 //
 // This fact is what lets a ride survive a GROUP BY: if the deferred columns are
 // functionally determined by a key that is unique over the pinned table, the
@@ -70,6 +72,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -78,27 +82,14 @@
 
 namespace sirius::late_mat {
 
-/// Which pinned columns to observe, from `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS`,
-/// positional with @p column_names:
-///
-///   unset / "" / "0" / "none"  -> nothing observed (the probe is off)
-///   "all"                      -> every column (the probe still skips the
-///                                 ones it cannot decide, e.g. non-integers)
-///   "c_custkey,o_orderkey"     -> exactly those names, case-insensitively
-///
-/// A name-list is the usual setting: distinct_count over every integer column
-/// of a wide fact table is pin-time work nobody asked for, and the columns a
-/// group-by-rowid ride can use are known in advance.
-[[nodiscard]] std::vector<bool> pin_unique_probe_selection(
-  std::span<std::string const> column_names);
-
-/// Row cap for the exact stage (SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS, default 300M).
-///
-/// The exact check sorts the whole assembled column, so on a fact table it is
-/// pin-time work measured in seconds — for a fact nobody asked for, since the
-/// tables whose keys unlock a ride are dimensions. Above the cap the column
-/// stays UNKNOWN, which costs an optimization and never an answer.
-[[nodiscard]] std::size_t exact_uniqueness_row_cap();
+/// Byte cap on what the exact stage retains across all columns
+/// (`pin_table_unique_exact_max_bytes`):
+/// @p configured_bytes when non-zero, otherwise `config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION`
+/// of @p gpu_capacity_bytes.
+/// The check's peak GPU use is about three times the cap; a column that no longer fits stays
+/// UNKNOWN.
+[[nodiscard]] std::size_t exact_uniqueness_byte_cap(std::uint64_t configured_bytes,
+                                                    std::uint64_t gpu_capacity_bytes);
 
 /// What the per-chunk pass concluded about one pinned column. The distinction
 /// that matters is @c refused vs @c undecided: a refused column is one the
@@ -112,6 +103,78 @@ enum class unique_verdict : std::uint8_t {
   undecided,         ///< chunk-distinct everywhere, but the chunk ranges overlap
   proven,            ///< distinct across the whole pinned table
 };
+
+/// GPU bytes to set aside, per byte of a column, for the sort a column's chunk may
+/// undergo: the sorted copy plus the radix sort's own buffers.
+inline constexpr std::size_t sort_scratch_factor = 3;
+
+/// Rows up to which a non-integer column stays in the running (see unique_probe::observe). A
+/// dimension table's name column fits; a fact table's does not, and its first chunk ends the
+/// column's chances before anything is sorted or retained.
+inline constexpr std::size_t small_table_max_rows = 1'000'000;
+
+/// How many batches' worth of free GPU memory the pin keeps beside an optional retained copy: the
+/// next required batch and its working data (narrowing and compression buffers).
+inline constexpr std::size_t retention_headroom_batches = 2;
+
+/// Whether a copy of @p copy_bytes may be retained for the exact stage while @p available_bytes
+/// of GPU memory are free and a decoded batch is @p batch_bytes. The copy is optional and the
+/// batches the pin still has to decode and store are not, so the copy yields when it would leave
+/// less than retention_headroom_batches batches free.
+[[nodiscard]] constexpr bool retention_has_headroom(std::size_t available_bytes,
+                                                    std::size_t copy_bytes,
+                                                    std::size_t batch_bytes) noexcept
+{
+  return available_bytes >= copy_bytes + retention_headroom_batches * batch_bytes;
+}
+
+/// Column positions in the order the exact stage's retained copies claim memory, from @p types
+/// (positional with the pinned columns): integer columns first, then the others, each by position.
+/// A non-integer column is a candidate only while its table is small (see unique_probe::observe),
+/// so it must not crowd out an integer key for good and then be refused itself.
+[[nodiscard]] std::vector<std::size_t> exact_retention_priority(
+  std::span<cudf::data_type const> types);
+
+/// Makes room for a retained copy of column @p column_pos by giving up the copies of columns of
+/// lower priority in @p priority (from exact_retention_priority), lowest first, until @p fits
+/// holds. @p holds_copies(c) tells whether column c retains anything, and @p give_up(c) releases
+/// column c's copies and takes it out of the exact stage. Columns of higher priority than
+/// @p column_pos are never given up. Returns whether @p fits holds in the end.
+template <typename Fits, typename HoldsCopies, typename GiveUp>
+bool make_room_for_retained_copy(std::span<std::size_t const> priority,
+                                 std::size_t column_pos,
+                                 Fits&& fits,
+                                 HoldsCopies&& holds_copies,
+                                 GiveUp&& give_up)
+{
+  auto lower = priority.rbegin();
+  while (!fits()) {
+    while (lower != priority.rend() && *lower != column_pos && !holds_copies(*lower)) {
+      ++lower;
+    }
+    if (lower == priority.rend() || *lower == column_pos) { return false; }
+    give_up(*lower);
+    ++lower;
+  }
+  return true;
+}
+
+/// Runs @p required, work the pin cannot do without, and survives an out-of-memory failure caused
+/// by optional copies. When @p required throws std::bad_alloc (which covers rmm::out_of_memory) and
+/// @p release_optional returns true, having given the optional memory back, @p required runs once
+/// more. A second failure, a failure with nothing to release (@p release_optional returns false)
+/// and any other exception propagate unchanged. Only for work that leaves nothing behind when it
+/// fails, so that repeating it is safe.
+template <typename Required, typename ReleaseOptional>
+auto retry_after_releasing_optional(Required&& required, ReleaseOptional&& release_optional)
+{
+  try {
+    return required();
+  } catch (std::bad_alloc const&) {
+    if (!release_optional()) { throw; }
+  }
+  return required();
+}
 
 /// Exact whole-column check, for the columns the cheap per-chunk pass could not
 /// decide: assemble @p chunks into one column, sort it, and count consecutive
@@ -156,10 +219,31 @@ class unique_probe {
   /// the selection; a mismatch abandons the whole proof (fails closed) rather
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
-  void observe(cudf::table_view const& chunk, ::cuda::stream_ref stream);
+  /// A column whose chunk is unsorted is sorted on the spot, which needs about
+  /// sort_scratch_factor times the column's bytes of GPU memory. @p try_reserve_sort_memory is
+  /// asked for that many bytes first and is expected to reserve them until its next call; when it
+  /// declines, or the sort fails for want of memory, the column is dropped without a proof and the
+  /// pin goes on. The reservation is a pledge only: cuDF's sort takes its temporary buffers from
+  /// the current device resource, so they cannot be allocated from it.
+  void observe(cudf::table_view const& chunk,
+               ::cuda::stream_ref stream,
+               std::function<bool(std::size_t bytes)> const& try_reserve_sort_memory = {});
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;
+
+  /// Tells the probe that the exact stage can no longer settle @p column_pos: it was declined for
+  /// want of budget, or the pin abandoned the stage. A column that only chunk ranges that never
+  /// overlap could still prove is then dropped as soon as a chunk's range overlaps an earlier one,
+  /// before that chunk is sorted.
+  void exact_unavailable(std::size_t column_pos);
+
+  /// True while the column is still possibly unique. The pin driver retains values for the exact
+  /// stage only for these columns.
+  [[nodiscard]] bool candidate(std::size_t column_pos) const
+  {
+    return column_pos < _columns.size() && _columns[column_pos].candidate;
+  }
 
   /// Shorthand for `verdicts()[i] == unique_verdict::proven`.
   [[nodiscard]] std::vector<bool> proven() const;
@@ -185,7 +269,11 @@ class unique_probe {
     /// min/max could not be read). Not a refusal — the exact check may still
     /// decide it, so the verdict is `undecided` rather than `refused`.
     bool cheap_undecidable{false};
+    /// The exact stage may still settle this column. Cleared by exact_unavailable().
+    bool exact_available{true};
     std::vector<range> ranges;  ///< one per observed non-empty chunk
+    /// Rows seen so far of a non-integer column, bounded by small_table_max_rows.
+    std::size_t observed_rows{0};
   };
 
   std::vector<column_state> _columns;

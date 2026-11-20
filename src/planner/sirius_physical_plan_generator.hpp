@@ -18,13 +18,17 @@
 
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/delim_cte_proof.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,9 +50,11 @@ class Value;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
+class LogicalCopyToFile;
 class LogicalDelimGet;
 class LogicalDistinct;
 class LogicalDummyScan;
@@ -59,14 +65,29 @@ class LogicalGet;
 class LogicalLimit;
 class LogicalOrder;
 class LogicalTopN;
+class LogicalWindow;
 class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 class TableFilterSet;
+class Binder;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Rewrite nested decorrelated `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
+/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: the outer
+/// rows become a CTE, LEFT JOINed against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery over `t`
+/// restricted to the CTE's distinct keys, plus a filter. Operators above that read the outer rows'
+/// columns are repointed to the CTE's scan. Subqueries DuckDB left as plain SEMI
+/// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
+/// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
+/// number of subqueries rewritten.
+std::size_t rewrite_correlated_inequality_exists(duckdb::ClientContext& context,
+                                                 duckdb::Binder& binder,
+                                                 duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+                                                 std::uint64_t gpu_memory_budget = 0);
 
 /// Attribution attached to every scan contract created by one plan build.
 /// Execution-time plans carry a window id; plans built before an execution
@@ -109,6 +130,9 @@ class sirius_physical_plan_generator {
                                  scan_contract_provenance provenance);
   ~sirius_physical_plan_generator();
 
+  // Original frontend SQL for validating COPY options consumed by DuckDB binding.
+  std::string copy_statement_sql;
+
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
@@ -133,29 +157,27 @@ class sirius_physical_plan_generator {
   //! sink
   static bool use_batch_index(duckdb::ClientContext& context,
                               sirius::op::sirius_physical_operator& plan);
-  //! Whether or not we should preserve insertion order for executing the given sink
-  static bool preserve_insertion_order(duckdb::ClientContext& context,
-                                       sirius::op::sirius_physical_operator& plan);
-  //! The order preservation type of the given operator decided by recursively looking at its
-  //! children
-  static sirius::OrderPreservationType order_preservation_recursive(
-    sirius::op::sirius_physical_operator& op);
 
-  //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
-  [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
+  //! Throws sirius::not_implemented_exception (CPU fallback) unless each @p planned column is its
+  //! @p declared type; @p subject names the input in the message.
+  static void require_planned_schema(std::span<sirius::logical_type const> planned,
+                                     duckdb::vector<duckdb::LogicalType> const& declared,
+                                     std::string_view subject);
 
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
-  // &op);
+  //! Plan an INNER ANY join as a cross product filtered by its condition; other join types throw.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalColumnDataGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalComparisonJoin& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCopyToFile& op);
   // create_plan(duckdb::LogicalCopyDatabase &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreate
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -165,6 +187,18 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCreateSecret &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalCrossProduct& op);
+  //! Lower a join with no conditions to the nested loop join's cross product. Shared by the
+  //! LogicalCrossProduct overload and by plan_comparison_join for a LogicalComparisonJoin whose
+  //! condition list is empty, so the two entry points cannot drift. Leaves
+  //! op.estimated_cardinality to the caller.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_cross_product_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+    duckdb::JoinType join_type,
+    std::size_t estimated_cardinality,
+    duckdb::vector<std::size_t> left_projection_map,
+    duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);
@@ -189,6 +223,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalWindow& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPositionalJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -198,8 +233,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! `UNION ALL` only; the builder rejects distinct UNION. EXCEPT / INTERSECT share the same
-  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -230,6 +264,37 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! Lowers distinct EXCEPT / INTERSECT to full-row deduplication over a null-safe ANTI / SEMI hash
+  //! join, and their ALL forms to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
+    duckdb::LogicalSetOperation& op);
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
+    duckdb::LogicalSetOperation& op);
+
+  //! A grouped aggregate over @p child keyed on its @p key_columns, in that order, carrying each of
+  //! @p carried_columns through a FIRST; its output is the keys, then the carried columns.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    std::span<duckdb::idx_t const> key_columns,
+    std::span<duckdb::idx_t const> carried_columns,
+    duckdb::idx_t estimated_cardinality);
+
+  //! `plan_dedup` keyed on every column of @p child, in order, with nothing carried: the
+  //! deduplication a distinct `UNION`, `EXCEPT` or `INTERSECT` applies to its result.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_full_row_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    duckdb::idx_t estimated_cardinality);
+
+  //! Whether `plan_union` / `plan_except_intersect` end the plan of @p op with
+  //! `plan_full_row_dedup`, so its rows are already distinct. A `LogicalDistinct` over such a set
+  //! operation emits no second deduplication.
+  static bool set_operation_deduplicates(duckdb::LogicalSetOperation const& op) noexcept;
+
+  //! Whether every row @p op produces is distinct because, below any identity projections, it is
+  //! a set operation for which `set_operation_deduplicates` holds.
+  static bool input_rows_are_distinct(duckdb::LogicalOperator const& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
@@ -248,9 +313,12 @@ class sirius_physical_plan_generator {
                                         std::string_view operation);
 
   // private:
-  bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
+  //! Delim CTE reads whose rows may be restricted (see planner/delim_cte_proof.hpp). Null when the
+  //! plan was not captured with proofs; then no read is treated as restrictable.
+  std::shared_ptr<delim_cte_proofs const> cte_reader_proofs;
+
   std::size_t delim_index = 0;
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t next_scan_node_id = 0;

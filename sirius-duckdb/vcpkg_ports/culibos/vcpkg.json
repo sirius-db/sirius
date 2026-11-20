@@ -4,5 +4,5 @@
   "license": "LicenseRef-Proprietary",
   "name": "culibos",
   "supports": "linux & (x64 | arm64)",
-  "version": "13.3.33"
+  "version": "13.5.25"
 }

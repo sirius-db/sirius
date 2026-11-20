@@ -16,18 +16,26 @@
 
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
-#include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 
+#include <chrono>
+#include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -247,6 +255,56 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   REQUIRE(cd->bytes_in_space(e.gpu_space) == batch_p1_size);
 }
 
+TEST_CASE("convertible_data_batch skips a batch that left the space it was picked from",
+          "[convertible_data_batch][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+
+  auto mgr   = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto* gpu0 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* gpu1 = mgr->get_memory_space(cucascade::memory::Tier::GPU, 1);
+  auto* host = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(gpu0 != nullptr);
+  REQUIRE(gpu1 != nullptr);
+  REQUIRE(host != nullptr);
+
+  cucascade::shared_data_repository repo;
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *gpu0, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  repo.add_data_batch(batch);
+
+  // GPU 0's downgrade executor picks the batch...
+  sirius::convertible_data_batch_provider provider(&repo);
+  auto cd = provider.get_next_convertible(gpu0, false);
+  REQUIRE(cd != nullptr);
+
+  // ...and before its worker runs, the batch moves to GPU 1 (spilled, then upgraded there).
+  rmm::cuda_stream stream0;
+  auto& registry = sirius::converter_registry::get();
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host, stream0);
+  }
+  stream0.synchronize();
+  {
+    rmm::cuda_set_device_raii const device{rmm::cuda_device_id{1}};
+    rmm::cuda_stream stream1;
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream1);
+    }
+    stream1.synchronize();
+  }
+  REQUIRE(batch_in_space(*batch, gpu1));
+
+  // The worker's GPU 0 stream cannot serve GPU 1's memory: the batch is skipped, not converted.
+  std::optional<std::vector<std::size_t>> result;
+  REQUIRE_NOTHROW(result = cd->convert({host}, stream0, *mgr, true));
+  CHECK_FALSE(result.has_value());
+  CHECK(batch_in_space(*batch, gpu1));
+  CHECK(batch->get_state() == cucascade::batch_state::idle);
+}
+
 TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
           "[convertible_data_batch]")
 {
@@ -283,6 +341,30 @@ TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[conver
   REQUIRE(size > 0);
   REQUIRE(size == get_batch_size(*batch));
   REQUIRE(wrapper.bytes_in_space(e.host_space) == 0);
+}
+
+// The executor sizes its candidates on its one processing thread; a batch that another thread
+// took exclusively after the snapshot must not stall it, and counts as nothing to move.
+TEST_CASE("convertible_data_batch bytes_in_space does not wait on an exclusively held batch",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  sirius::convertible_data_batch wrapper(batch, e.gpu_space);
+
+  std::optional<cucascade::mutable_data_batch> held;
+  held.emplace(batch->to_mutable());
+
+  auto probe = std::async(std::launch::async, [&] { return wrapper.bytes_in_space(e.gpu_space); });
+  bool const returned = probe.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  CHECK(returned);
+  held.reset();  // release before joining, so a probe that blocked can still finish
+  auto const bytes = probe.get();
+  REQUIRE(returned);
+  REQUIRE(bytes == 0);
+  REQUIRE(wrapper.bytes_in_space(e.gpu_space) == get_batch_size(*batch));
 }
 
 TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",

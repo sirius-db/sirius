@@ -28,9 +28,7 @@
 #include <catch.hpp>
 #include <late_mat/column_origin.hpp>
 
-#include <cstdlib>
 #include <memory>
-#include <string>
 
 using sirius::late_mat::column_origin;
 using sirius::late_mat::pin_entry_handle;
@@ -149,12 +147,4 @@ TEST_CASE("live_rows follows the selection's own form", "[late_mat][origin]")
   listed.range   = range;
   listed.num_ids = 17;
   REQUIRE(listed.live_rows() == 17);
-}
-
-TEST_CASE("the gate reads its environment once and the same way", "[late_mat][origin]")
-{
-  // Whatever the environment says, every caller must agree — the point of the
-  // single reader is that two of them cannot disagree.
-  bool const enabled = sirius::late_mat::late_mat_enabled();
-  REQUIRE(sirius::late_mat::late_mat_enabled() == enabled);
 }

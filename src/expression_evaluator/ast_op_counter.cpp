@@ -32,9 +32,7 @@
 #include <sirius/exception.hpp>
 
 // standard library
-#include <algorithm>
 #include <cstddef>
-#include <variant>
 
 // Single source of truth for "how many cuDF AST operators does this Sirius AST
 // alternative lower to, recursively." Drives the AST-vs-MATERIALIZE strategy
@@ -43,7 +41,7 @@
 //
 // The method name carries the cuDF coupling: counts are tied to cuDF's
 // ast_operator set, supported_ast_cast_types, supported_ast_functions, and
-// known cuDF AST limitations (no CASE, no COALESCE, decimal-intermediate bug,
+// known cuDF AST limitations (no CASE, no COALESCE, decimal arithmetic,
 // etc.). A new AST backend would need its own equivalent method, not a
 // generic rename.
 
@@ -87,12 +85,9 @@ std::size_t between::cudf_ast_op_count() const
 
 std::size_t cast::cudf_ast_op_count() const
 {
-  // Only target types in supported_ast_cast_types_native lower to a single
-  // CAST_TO_* cuDF AST op; others force materialize.
-  bool const supported = std::find(supported_ast_cast_types_native.begin(),
-                                   supported_ast_cast_types_native.end(),
-                                   target_type.id()) != supported_ast_cast_types_native.end();
-  return supported ? 1 + child->cudf_ast_op_count() : 0;
+  // Only casts ast_supports_cast admits lower to a single CAST_TO_* cuDF AST op; others force
+  // materialize.
+  return ast_supports_cast(child->return_type(), target_type) ? 1 + child->cudf_ast_op_count() : 0;
 }
 
 std::size_t unary_op::cudf_ast_op_count() const
@@ -129,13 +124,7 @@ std::size_t in_list::cudf_ast_op_count() const
 
 std::size_t function_call::cudf_ast_op_count() const
 {
-  // DECIMAL output -> 0 (cuDF AST chokes on intermediate decimal results
-  // until https://github.com/rapidsai/cudf/pull/21996 lands).
-  if (return_type().id() == sirius::type_id::DECIMAL) { return 0; }
-  bool const supported =
-    std::find(supported_ast_functions.begin(), supported_ast_functions.end(), function()) !=
-    supported_ast_functions.end();
-  if (!supported) { return 0; }
+  if (!ast_supports_function(*this)) { return 0; }
   std::size_t count = 1;
   for (auto const& a : arguments()) {
     count += a->cudf_ast_op_count();

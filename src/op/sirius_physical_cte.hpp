@@ -33,6 +33,11 @@ namespace op {
 
 class sirius_physical_cte : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CTE;
 
  public:
@@ -57,8 +62,6 @@ class sirius_physical_cte : public sirius_physical_operator {
  public:
   // Sink interface
   bool is_sink() const override { return true; }
-
-  bool sink_order_dependent() const override { return false; }
 
   // execute() forwards producer batches; types describes the consumer subtree's result.
   [[nodiscard]] bool declared_output_schema_is_runtime_schema() const noexcept override

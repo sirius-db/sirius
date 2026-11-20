@@ -9,7 +9,6 @@
 
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/exception.hpp>
-#include <duckdb/common/string_util.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/secret/secret.hpp>

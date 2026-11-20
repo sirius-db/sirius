@@ -20,6 +20,10 @@
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/structs/structs_column_view.hpp>
+
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -90,7 +94,9 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
                    double,
                    decimal64_tag)
 {
-  using Traits = gpu_type_traits<TestType>;
+  using Traits               = gpu_type_traits<TestType>;
+  auto const* row_count_name = GENERATE("count_star", "count");
+  CAPTURE(row_count_name);
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -186,7 +192,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     {
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
         duckdb::BoundAggregateFunction(
-          MakeDummyAggregate("count_star", {}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
+          MakeDummyAggregate(row_count_name, {}, LogicalType(duckdb::LogicalTypeId::BIGINT))),
         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
         nullptr,
         nullptr,
@@ -450,5 +456,140 @@ TEST_CASE("stddev_samp rejects non-finite results after checking sample size", "
                             Catch::Matchers::ContainsSubstring("STDDEV_SAMP is out of range"));
       }
     }
+  }
+}
+
+TEST_CASE("FIRST skips empty partials and preserves a real NULL",
+          "[ungrouped_aggregate][first_empty]")
+{
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space   = manager->get_memory_space(Tier::GPU, 0);
+  auto scenario = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
+  auto defs     = sirius::test::create_aggregate_expressions<gpu_type_traits<int64_t>>(
+    {}, {"first", "count"}, {0, 0});
+  sirius_physical_ungrouped_aggregate local(std::move(defs.output_types),
+                                            std::move(defs.aggregates),
+                                            1,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  sirius_physical_ungrouped_aggregate_merge merge(&local);
+  auto empty = make_numeric_batch_with_nulls<int64_t>(*space, {}, {}, cudf::type_id::INT64);
+  auto value = make_numeric_batch_with_nulls<int64_t>(*space, {42}, {true}, cudf::type_id::INT64);
+  auto null  = make_numeric_batch_with_nulls<int64_t>(*space, {0}, {false}, cudf::type_id::INT64);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  switch (scenario) {
+    case 0: batches = {empty, value}; break;
+    case 1: batches = {value, empty}; break;
+    case 2: batches = {empty, empty}; break;
+    case 3: batches = {empty}; break;
+    case 4: batches = {null, value}; break;
+    case 5: batches = {empty, null, value}; break;
+    case 6: batches = {value}; break;
+    case 7: batches = {null}; break;
+  }
+  auto partial = local.execute(pipelineable_operator_data(batches), default_stream());
+  auto result  = merge.execute(*partial, default_stream());
+  auto view    = sirius::get_cudf_table_view(
+    *dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()[0]);
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == 1);
+  REQUIRE(copy_validity_to_host(view.column(0))[0] == (scenario < 2 || scenario == 6));
+  if (scenario < 2 || scenario == 6) REQUIRE(copy_column_to_host<int64_t>(view.column(0))[0] == 42);
+  REQUIRE(copy_column_to_host<int64_t>(view.column(1))[0] ==
+          ((scenario == 2 || scenario == 3 || scenario == 7) ? 0 : 1));
+}
+
+TEMPLATE_TEST_CASE("Empty scalar aggregates reserve memory for every partial result",
+                   "[ungrouped_aggregate][empty_aggregate_budget]",
+                   double,
+                   string_tag)
+{
+  using Traits = gpu_type_traits<TestType>;
+  std::string scenario;
+  if constexpr (std::is_same_v<TestType, double>) {
+    scenario = GENERATE("sum", "count", "first", "avg", "stddev_samp", "mixed");
+  } else {
+    scenario = GENERATE("first", "min", "max", "count_distinct");
+  }
+  auto n = GENERATE(std::size_t{1}, std::size_t{3});
+  CAPTURE(scenario, n);
+  std::vector<std::string> names =
+    scenario == "mixed"
+      ? std::vector<std::string>{"sum", "count", "first", "avg", "stddev_samp"}
+      : std::vector<std::string>{scenario == "count_distinct" ? "count" : scenario};
+  auto defs = sirius::test::create_aggregate_expressions<Traits>(
+    {}, names, std::vector<std::size_t>(names.size(), 0));
+  if (scenario == "count_distinct") {
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+    children.push_back(duckdb::make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
+    auto function = MakeDummyAggregate("count", {Traits::logical_type()}, LogicalType::BIGINT);
+    BoundAggregateExpression expression(duckdb::BoundAggregateFunction(function),
+                                        std::move(children),
+                                        nullptr,
+                                        nullptr,
+                                        AggregateType::DISTINCT);
+    defs.aggregates[0] = sirius::ast::from_duckdb(expression);
+  }
+  sirius_physical_ungrouped_aggregate local(std::move(defs.output_types),
+                                            std::move(defs.aggregates),
+                                            1,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto estimate = local.no_history_peak_memory_estimate({n, 0});
+  REQUIRE(estimate > 0);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (std::size_t i = 0; i < n; ++i) {
+    if constexpr (std::is_same_v<TestType, double>) {
+      batches.push_back(make_numeric_batch<double>(*space, {}, cudf::type_id::FLOAT64));
+    } else {
+      batches.push_back(make_string_batch(*space, {}));
+    }
+  }
+  auto reservation = space->make_reservation_or_null(estimate);
+  REQUIRE(reservation);
+  auto* allocator =
+    reservation->template get_memory_resource_as<reservation_aware_resource_adaptor>();
+  REQUIRE(allocator);
+  REQUIRE(
+    allocator->attach_reservation_to_tracker(default_stream(),
+                                             std::move(reservation),
+                                             std::make_unique<fail_reservation_limit_policy>(),
+                                             nullptr));
+  absl::Cleanup reset = [allocator]() { allocator->reset_stream_reservation(default_stream()); };
+  auto result         = local.execute(pipelineable_operator_data(batches), default_stream());
+  auto const& outputs = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(outputs.size() == n);
+  for (auto const& batch : outputs) {
+    auto view = sirius::get_cudf_table_view(*batch);
+    REQUIRE(view.num_rows() == 1);
+    REQUIRE(view.num_columns() == local.get_local_output_types().size());
+    cudf::size_type index = 0;
+    for (auto const& name : names) {
+      auto column = view.column(index++);
+      if (scenario == "count_distinct") {
+        REQUIRE(column.type().id() == cudf::type_id::LIST);
+        CHECK(cudf::lists_column_view(column).child().size() == 0);
+      } else if (name == "count") {
+        CHECK(column.null_count() == 0);
+        CHECK(copy_column_to_host<int64_t>(column)[0] == 0);
+      } else if (name == "stddev_samp") {
+        REQUIRE(column.type().id() == cudf::type_id::STRUCT);
+        cudf::structs_column_view state(column);
+        REQUIRE(state.num_children() == 3);
+        CHECK(state.get_sliced_child(0).null_count() == 0);
+        CHECK(copy_column_to_host<int64_t>(state.get_sliced_child(0))[0] == 0);
+        CHECK(state.get_sliced_child(1).null_count() == 1);
+        CHECK(state.get_sliced_child(2).null_count() == 1);
+      } else {
+        CHECK(column.null_count() == 1);
+        if (name == "first" || name == "avg") {
+          auto count = view.column(index++);
+          CHECK(count.null_count() == 0);
+          CHECK(copy_column_to_host<int64_t>(count)[0] == 0);
+        }
+      }
+    }
+    CHECK(index == view.num_columns());
   }
 }

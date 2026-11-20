@@ -312,7 +312,7 @@ std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& t
                                                            const numeric_range& range)
 {
   if (!is_narrowable_numeric_type(type)) { return std::nullopt; }
-  auto const declared = try_get_cudf_type(type);
+  auto const declared = get_cudf_type(type);
   if (!declared) { return std::nullopt; }
   // Candidates are chosen against the representation, so DATE picks from the signed integer set.
   auto const native = narrowing_rep_type(*declared);
@@ -354,7 +354,7 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
       column.null_count() == column.size()) {
     return std::nullopt;
   }
-  auto const native = get_cudf_type(logical);
+  auto const native = require_cudf_type(logical);
   if (column.type() != native) { return std::nullopt; }
 
   return compute_exact_numeric_range(column, stream, mr);

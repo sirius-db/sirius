@@ -18,29 +18,37 @@
 
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/delim_cte_proof.hpp"
+#include "planner/delim_cte_rewrites.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_delim_aggregate_reuse.hpp"
+#include "planner/sirius_plan_partial_aggregate_pushdown.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
-#include <duckdb/common/enums/optimizer_type.hpp>
-#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/planner/binder.hpp>
-#include <duckdb/planner/expression/bound_columnref_expression.hpp>
-#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
-#include <duckdb/planner/operator/logical_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/filter/table_filter_functions.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_top_n.hpp>
 #include <log/logging.hpp>
 #include <util/duckdb_error_message.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
-#include <map>
-#include <unordered_set>
+#include <memory>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::transparent {
@@ -54,169 +62,187 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
-//===--------------------------------------------------------------------===//
-// Join-dependent filter derivation (see sirius_pre_optimizer_hook)
-//===--------------------------------------------------------------------===//
-
-/// Guards against quadratic blow-up: an N-branch disjunction derives one N-child OR per table.
-constexpr std::size_t kMaxDerivedDisjuncts = 16;
-
-void collect_table_indexes(duckdb::Expression const& expr,
-                           std::unordered_set<duckdb::TableIndex>& out)
+bool parquet_footer_statistics_enabled(const duckdb::ClientContext& context)
 {
-  duckdb::ExpressionIterator::VisitExpression<duckdb::BoundColumnRefExpression>(
-    expr, [&out](duckdb::BoundColumnRefExpression const& colref) {
-      out.insert(colref.Binding().table_index);
-    });
+  duckdb::Value setting;
+  auto lookup_result = context.TryGetCurrentSetting("parquet_footer_statistics", setting);
+  return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
-bool references_multiple_tables(duckdb::Expression const& expr)
+/// The option as `query_operator_options` resolves it, without creating the session's overrides:
+/// those snapshot the global configuration, which would stop the session from seeing later
+/// changes to it.
+bool delim_aggregate_reuse_enabled(duckdb::ClientContext& context)
 {
-  std::unordered_set<duckdb::TableIndex> tables;
-  collect_table_indexes(expr, tables);
-  return tables.size() > 1;
-}
-
-/// The single-table conjuncts of one OR branch, grouped by table index. Ordered so the derived
-/// predicates - and therefore the plan - are deterministic.
-using per_table_conjuncts =
-  std::map<duckdb::TableIndex, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>>;
-
-/// AND-decompose @p expr; every leaf that restricts exactly one table is filed under that table in
-/// @p conjuncts.
-void extract_single_table_conjuncts(duckdb::Expression const& expr, per_table_conjuncts& conjuncts)
-{
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION &&
-      expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
-    for (auto const& child : expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
-      extract_single_table_conjuncts(*child, conjuncts);
-    }
-    return;
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_delim_aggregate_reuse;
   }
-  // The derived copy is evaluated on rows the original disjunction rejects, and - once pushed into
-  // a scan - ahead of the branch it came from. Anything whose evaluation is observable (volatile,
-  // throwing, subquery, unbound parameter) would therefore change behaviour, so it is left alone.
-  // This is stricter than DuckDB's own JoinDependentFilterRule, which only checks volatility.
-  if (expr.IsVolatile() || expr.CanThrow() || expr.HasSubquery() || expr.HasParameter()) { return; }
-
-  std::unordered_set<duckdb::TableIndex> tables;
-  collect_table_indexes(expr, tables);
-  if (tables.size() != 1) { return; }
-
-  conjuncts[*tables.begin()].push_back(expr.Copy());
-}
-
-/// AND @p conjuncts back into a single expression. Never called with an empty list.
-duckdb::unique_ptr<duckdb::Expression> conjoin(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& conjuncts)
-{
-  if (conjuncts.size() == 1) { return conjuncts[0]->Copy(); }
-  auto result =
-    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
-  for (auto const& conjunct : conjuncts) {
-    result->GetChildrenMutable().push_back(conjunct->Copy());
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_delim_aggregate_reuse;
   }
-  return result;
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_delim_aggregate_reuse;
 }
 
-/// Append to @p filter, for every table restricted by *all* branches of an OR-ed filter expression,
-/// the OR of those per-branch restrictions.
-void derive_join_dependent_filters(duckdb::LogicalFilter& filter)
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool exists_minmax_rewrite_enabled(duckdb::ClientContext& context)
 {
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> derived;
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_exists_minmax_rewrite;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_exists_minmax_rewrite;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_exists_minmax_rewrite;
+}
 
-  for (auto const& expression : filter.expressions) {
-    if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONJUNCTION ||
-        expression->GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_OR) {
-      continue;
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool partial_aggregate_below_join_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_partial_aggregate_below_join;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_partial_aggregate_below_join;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_partial_aggregate_below_join;
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool subquery_key_carry_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_subquery_key_carry;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_subquery_key_carry;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_subquery_key_carry;
+}
+
+/// The option as `query_operator_options` resolves it, without creating the session's overrides.
+bool exists_from_aggregate_enabled(duckdb::ClientContext& context)
+{
+  auto const state = duckdb::get_sirius_connection_state(context);
+  if (state && state->execution_options) {
+    return state->execution_options->enable_exists_from_aggregate;
+  }
+  if (state && state->operator_overrides) {
+    return state->operator_overrides->enable_exists_from_aggregate;
+  }
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  return runtime && runtime->get_config().get_operator_params().enable_exists_from_aggregate;
+}
+
+/// The smallest GPU's downgrade threshold: the bytes a GPU holds before Sirius starts moving data
+/// off it. 0 when no GPU capacity is configured.
+std::uint64_t gpu_memory_budget(duckdb::ClientContext& context)
+{
+  auto const runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!runtime) { return 0; }
+  std::uint64_t budget = 0;
+  for (auto const& space : runtime->get_config().get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    std::uint64_t const threshold = gpu->downgrade_trigger_threshold();
+    budget                        = budget == 0 ? threshold : std::min(budget, threshold);
+  }
+  return budget;
+}
+
+using top_n_filter_copies = std::unordered_map<duckdb::DynamicFilterData const*,
+                                               duckdb::shared_ptr<duckdb::DynamicFilterData>>;
+
+void copy_top_n_states(duckdb::LogicalOperator const& from,
+                       duckdb::LogicalOperator& to,
+                       top_n_filter_copies& filters)
+{
+  if (from.type == duckdb::LogicalOperatorType::LOGICAL_TOP_N) {
+    auto const& original = from.Cast<duckdb::LogicalTopN>().dynamic_filter;
+    if (original) {
+      duckdb::annotated_lock_guard<duckdb::annotated_shared_mutex> guard(original->lock);
+      auto fresh = duckdb::make_shared_ptr<duckdb::DynamicFilterData>(original->comparison_type,
+                                                                      original->constant);
+      to.Cast<duckdb::LogicalTopN>().dynamic_filter = fresh;
+      filters.emplace(original.get(), std::move(fresh));
     }
-    auto const& disjunction   = expression->Cast<duckdb::BoundConjunctionExpression>();
-    std::size_t const num_alt = disjunction.GetChildren().size();
-    if (num_alt < 2 || num_alt > kMaxDerivedDisjuncts) { continue; }
+  }
+  for (size_t i = 0; i < from.children.size(); ++i)
+    copy_top_n_states(*from.children[i], *to.children[i], filters);
+}
 
-    // A disjunction confined to one table is already pushable as it stands; there is nothing to
-    // derive. Only a branch spanning several tables hides a single-table restriction.
-    bool spans_multiple_tables = false;
-    for (auto const& branch : disjunction.GetChildren()) {
-      if (references_multiple_tables(*branch)) {
-        spans_multiple_tables = true;
-        break;
+void reconnect_top_n_expression(duckdb::Expression const& from,
+                                duckdb::Expression& to,
+                                top_n_filter_copies const& filters)
+{
+  if (from.GetExpressionClass() != to.GetExpressionClass())
+    throw duckdb::NotImplementedException("Plan copy changed the runtime filter expression");
+  if (from.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+    auto const& original = from.Cast<duckdb::BoundFunctionExpression>();
+    auto& copied         = to.Cast<duckdb::BoundFunctionExpression>();
+    if (original.Function().GetName() != copied.Function().GetName())
+      throw duckdb::NotImplementedException("Plan copy changed the runtime filter function");
+    // Optional filters keep their predicate in bind data, not in the argument list.
+    auto optional_child = duckdb::ExpressionFilter::GetOptionalFilterChild(from);
+    if (optional_child && copied.BindInfo()) {
+      duckdb::Expression* target = nullptr;
+      if (original.Function().GetName() == duckdb::OptionalFilterScalarFun::NAME)
+        target = copied.BindInfoMutable()
+                   ->Cast<duckdb::OptionalFilterFunctionData>()
+                   .child_filter_expr.get();
+      else if (original.Function().GetName() == duckdb::SelectivityOptionalFilterScalarFun::NAME)
+        target = copied.BindInfoMutable()
+                   ->Cast<duckdb::SelectivityOptionalFilterFunctionData>()
+                   .child_filter_expr.get();
+      if (target) reconnect_top_n_expression(*optional_child, *target, filters);
+    }
+
+    if (original.Function().GetName() == duckdb::DynamicFilterScalarFun::NAME &&
+        original.BindInfo()) {
+      auto const& state =
+        original.BindInfo()->Cast<duckdb::DynamicFilterFunctionData>().filter_data;
+      auto found = filters.find(state.get());
+      if (found != filters.end()) {
+        copied.BindInfoMutable() =
+          duckdb::make_uniq<duckdb::DynamicFilterFunctionData>(found->second);
       }
     }
-    if (!spans_multiple_tables) { continue; }
-
-    std::vector<per_table_conjuncts> per_branch(num_alt);
-    for (std::size_t i = 0; i < num_alt; i++) {
-      extract_single_table_conjuncts(*disjunction.GetChildren()[i], per_branch[i]);
-    }
-
-    for (auto const& entry : per_branch[0]) {
-      auto const table_index = entry.first;
-
-      // A branch that restricts this table not at all leaves it unrestricted overall - the
-      // disjunction then implies nothing about it.
-      bool restricted_by_every_branch = true;
-      for (std::size_t i = 1; i < num_alt; i++) {
-        if (per_branch[i].find(table_index) == per_branch[i].end()) {
-          restricted_by_every_branch = false;
-          break;
-        }
-      }
-      if (!restricted_by_every_branch) { continue; }
-
-      // Drop the conjuncts that every branch carries verbatim: DuckDB's DistributivityRule hoists
-      // those out of the OR by itself, so keeping them would only bolt a duplicate predicate onto
-      // the scan. Dropping them weakens each branch, and a weaker branch still yields an implied
-      // (so still sound) disjunction.
-      auto is_branch_invariant = [&](duckdb::Expression const& conjunct) {
-        for (std::size_t i = 0; i < num_alt; i++) {
-          auto const& other = per_branch[i].find(table_index)->second;
-          bool found        = false;
-          for (auto const& candidate : other) {
-            if (candidate->Equals(conjunct)) {
-              found = true;
-              break;
-            }
-          }
-          if (!found) { return false; }
-        }
-        return true;
-      };
-
-      auto restriction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
-        duckdb::ExpressionType::CONJUNCTION_OR);
-      bool every_branch_restricts_further = true;
-      for (std::size_t i = 0; i < num_alt; i++) {
-        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> varying;
-        for (auto const& conjunct : per_branch[i].find(table_index)->second) {
-          if (!is_branch_invariant(*conjunct)) { varying.push_back(conjunct->Copy()); }
-        }
-        if (varying.empty()) {
-          // This branch adds nothing beyond what is already hoisted, so the OR is trivially true.
-          every_branch_restricts_further = false;
-          break;
-        }
-        restriction->GetChildrenMutable().push_back(conjoin(varying));
-      }
-      if (!every_branch_restricts_further) { continue; }
-
-      derived.push_back(std::move(restriction));
-    }
   }
-
-  for (auto& restriction : derived) {
-    filter.expressions.push_back(std::move(restriction));
-  }
+  std::vector<duckdb::Expression const*> children;
+  duckdb::ExpressionIterator::EnumerateChildren(
+    from, [&](duckdb::Expression const& child) { children.push_back(&child); });
+  size_t index = 0;
+  duckdb::ExpressionIterator::EnumerateChildren(to, [&](duckdb::Expression& child) {
+    if (index >= children.size())
+      throw duckdb::NotImplementedException("Plan copy changed the runtime filter children");
+    reconnect_top_n_expression(*children[index++], child, filters);
+  });
+  if (index != children.size())
+    throw duckdb::NotImplementedException("Plan copy changed the runtime filter children");
 }
 
-void derive_join_dependent_filters_recursive(duckdb::LogicalOperator& op)
+void reconnect_top_n_filters(duckdb::LogicalOperator const& from,
+                             duckdb::LogicalOperator& to,
+                             top_n_filter_copies const& filters)
 {
-  if (op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
-    derive_join_dependent_filters(op.Cast<duckdb::LogicalFilter>());
+  if (from.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto& copied = to.Cast<duckdb::LogicalGet>().table_filters;
+    for (auto const& entry : from.Cast<duckdb::LogicalGet>().table_filters) {
+      auto& target = copied.GetFilterByColumnIndexMutable(entry.GetIndex());
+      reconnect_top_n_expression(*entry.Filter().Cast<duckdb::ExpressionFilter>().expr,
+                                 *target.Cast<duckdb::ExpressionFilter>().expr,
+                                 filters);
+    }
   }
-  for (auto& child : op.children) {
-    derive_join_dependent_filters_recursive(*child);
-  }
+  for (size_t i = 0; i < from.children.size(); ++i)
+    reconnect_top_n_filters(*from.children[i], *to.children[i], filters);
 }
 
 void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
@@ -246,33 +272,92 @@ void preserve_parquet_bindings(duckdb::LogicalOperator const& from,
   }
 }
 
-}  // namespace
-
-void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
-                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+// The delim CTE rewrites that have to run before DuckDB orders the joins. Only for queries headed
+// to the GPU: with GPU execution off, DuckDB plans exactly what it plans without Sirius. Each
+// edit is decided and built in full before it changes the plan, with moves that cannot fail, so
+// the plan is valid whenever a rewrite throws. There is no rollback: edits made before the throw
+// stay, including an `EXISTS` already answered when the search for the next one fails.
+void rewrite_delim_ctes(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
 {
-  if (!plan) { return; }
+  auto& context = input.context;
+  // First: once the keys reach a second table, the subquery no longer has the single key join the
+  // comparison of the two subqueries looks for.
+  if (exists_from_aggregate_enabled(context)) {
+    try {
+      sirius::planner::answer_exists_from_aggregate(context, plan);
+    } catch (std::exception& e) {
+      SIRIUS_LOG_DEBUG("Stopped answering EXISTS from aggregate subqueries: {}",
+                       sirius::sanitized_message(e));
+    }
+  }
+  if (subquery_key_carry_enabled(context)) {
+    try {
+      sirius::planner::carry_subquery_keys_across_equalities(context, input.optimizer.binder, plan);
+    } catch (std::exception& e) {
+      SIRIUS_LOG_DEBUG("Subquery keys not carried across equalities: {}",
+                       sirius::sanitized_message(e));
+    }
+  }
+}
+
+// What Sirius needs from the plan before DuckDB optimizes it: its decision on the query, scan
+// statistics, the delim CTE rewrites, and the proofs about the delim CTEs they leave.
+void prepare_for_sirius(duckdb::OptimizerExtensionInput& input, duckdb::LogicalOperator& plan)
+{
   auto& context = input.context;
   auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Decide before optimization can remove scans, including when GPU execution is off.
-  if (should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties()) !=
-      decline_reason::none) {
-    return;
+  auto const declined =
+    should_use_duckdb(context, &plan, &input.optimizer.binder.GetStatementProperties());
+  if (parquet_footer_statistics_enabled(context)) {
+    auto const scans = add_parquet_footer_statistics(context, plan);
+    if (scans > 0) { SIRIUS_LOG_DEBUG("Gave {} Parquet scans their footer statistics", scans); }
   }
-  // Mirror sirius_optimizer_hook's gate: when Sirius never initialized (or the
-  // GPU is off for this connection), the query runs on CPU and its plan must
-  // stay byte-identical to a stock DuckDB plan — the derivation is
-  // row-preserving but still perturbs EXPLAIN output and cost estimates.
-  if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
+  // After the statistics, whose row counts one rewrite reads; before the proofs, which describe
+  // the plan the built-in optimizers will receive.
+  if (gpu_execution_enabled(context) && declined == decline_reason::none) {
+    rewrite_delim_ctes(input, plan);
+  }
+  // DuckDB clears its delim-CTE restriction proof before this hook runs, and never sets it for
+  // Parquet scans. Re-derive it before the built-in optimizers restructure the delim CTEs; the
+  // optimizer hook keeps it only together with the plan of this same run.
+  conn_state->stage_cte_reader_proofs(nullptr);
+  if (gpu_execution_enabled(context)) {
+    try {
+      conn_state->stage_cte_reader_proofs(std::make_shared<sirius::planner::delim_cte_proofs const>(
+        sirius::planner::collect_delim_cte_proofs(context, plan)));
+    } catch (std::exception& e) {
+      SIRIUS_LOG_DEBUG("Delim CTE reader proofs unavailable: {}", sirius::sanitized_message(e));
+    }
+  }
+  // DuckDB v2 derives the single-table restrictions implied by an OR-ed join condition itself
+  // (JoinDependentFilterRule now also runs on INNER and SEMI join conditions, which is where the
+  // TPC-H q19 and q7 disjunctions end up). This hook used to derive them too, for DuckDB 1.5, which
+  // missed q19's. Deriving both made every pushed restriction appear twice: TPC-H q19's part scan
+  // evaluated each column's OR filter twice and its FILTER carried two copies of the per-branch
+  // restriction, which cost about 0.1 s at SF1000. The hook therefore only classifies the query.
+}
 
-  // Optimizer hooks must not throw: a failed derivation only costs the pushdown, never the query.
+}  // namespace
+
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  if (!plan) { return; }
+  prepare_for_sirius(input, *plan);
+  // DuckDB clears every delim CTE's filter_dependency before it calls a pre-optimize hook, because
+  // it cannot vouch for what an extension does to the plan. Without it, DuckDB's CTE filter pushers
+  // skip delim CTEs, in its CPU plans too. The rewrites above keep each delim CTE's two readers and
+  // a join-back that keeps an outer row only through that row, so give the dependency back,
+  // re-derived with DuckDB's own rule on the plan as it now is, for every query, GPU execution on
+  // or off.
   try {
-    derive_join_dependent_filters_recursive(*plan);
+    sirius::planner::restore_cte_filter_dependencies(input.context, *plan);
   } catch (std::exception& e) {
-    SIRIUS_LOG_DEBUG("Transparent execution: join-dependent filter derivation failed: {}",
+    SIRIUS_LOG_DEBUG("Delim CTE filter dependencies not restored: {}",
                      sirius::sanitized_message(e));
   }
 }
@@ -289,11 +374,62 @@ bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::Log
   return matched;
 }
 
+namespace {
+
+// A plan copy re-binds every Parquet scan, re-parsing the footers DuckDB's metadata cache would
+// hold. The re-bound data is replaced by `preserve_parquet_bindings`, so only the cost matters.
+// Enables the cache for the copy and restores the connection's own setting afterwards.
+class scoped_parquet_metadata_cache {
+ public:
+  explicit scoped_parquet_metadata_cache(duckdb::ClientContext& context) : _context(context)
+  {
+    auto& db_config = duckdb::DBConfig::GetConfig(context);
+    duckdb::optional_ptr<duckdb::ConfigurationOption const> option;
+    auto const index = db_config.TryGetSettingIndex("parquet_metadata_cache", option);
+    if (!index.IsValid()) { return; }
+    _index   = index.GetIndex();
+    _was_set = context.config.user_settings.IsSet(_index);
+    if (_was_set) {
+      context.config.user_settings.TryGetSetting(db_config.user_settings, _index, _previous);
+    }
+    context.config.user_settings.SetUserSetting(_index, duckdb::Value::BOOLEAN(true));
+    _active = true;
+  }
+  ~scoped_parquet_metadata_cache()
+  {
+    if (!_active) { return; }
+    if (_was_set) {
+      _context.config.user_settings.SetUserSetting(_index, _previous);
+    } else {
+      _context.config.user_settings.ClearSetting(_index);
+    }
+  }
+  scoped_parquet_metadata_cache(scoped_parquet_metadata_cache const&)            = delete;
+  scoped_parquet_metadata_cache& operator=(scoped_parquet_metadata_cache const&) = delete;
+
+ private:
+  duckdb::ClientContext& _context;
+  duckdb::idx_t _index = 0;
+  duckdb::Value _previous;
+  bool _was_set = false;
+  bool _active  = false;
+};
+
+}  // namespace
+
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  auto copy = plan.Copy(context);
+  auto copy = [&] {
+    scoped_parquet_metadata_cache const cache{context};
+    return plan.Copy(context);
+  }();
   preserve_parquet_bindings(plan, *copy, context);
+  // Serialization omits runtime state. Reconnect the original bindings with
+  // independent, uninitialized filters for this execution.
+  top_n_filter_copies filters;
+  copy_top_n_states(plan, *copy, filters);
+  if (!filters.empty()) reconnect_top_n_filters(plan, *copy, filters);
   if (!copy_cardinality_estimates(plan, *copy)) {
     SIRIUS_LOG_DEBUG(
       "Transparent execution: plan copy differs in shape from the original, some cardinality "
@@ -334,7 +470,53 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    // The subquery rewrites on @p copy; returns the subqueries the EXISTS rewrite replaced. A
+    // rewrite that fails is left out by starting over from a fresh copy. The delim reuse runs
+    // first, so its failure starts over before the EXISTS rewrite has replaced anything.
+    auto const rewrite_subqueries =
+      [&](duckdb::unique_ptr<duckdb::LogicalOperator>& copy) -> std::size_t {
+      if (delim_aggregate_reuse_enabled(context)) {
+        try {
+          sirius::planner::reuse_delim_rows_for_subquery_aggregates(
+            context, input.optimizer.binder, copy);
+        } catch (std::exception& e) {
+          SIRIUS_LOG_WARN(
+            "Transparent execution: delim aggregate reuse failed, planning without it: {}",
+            sirius::sanitized_message(e));
+          copy = copy_logical_plan(*captured, context);
+        }
+      }
+      if (!exists_minmax_rewrite_enabled(context)) { return 0; }
+      try {
+        return sirius::planner::rewrite_correlated_inequality_exists(
+          context, input.optimizer.binder, copy, gpu_memory_budget(context));
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: EXISTS MIN/MAX rewrite failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy = copy_logical_plan(*captured, context);
+        return 0;
+      }
+    };
+    auto copy                     = copy_logical_plan(*captured, context);
+    auto exists_rewrites          = rewrite_subqueries(copy);
+    std::size_t pushed_aggregates = 0;
+    if (partial_aggregate_below_join_enabled(context)) {
+      try {
+        pushed_aggregates = sirius::planner::push_partial_aggregates_below_joins(
+          context, input.optimizer.binder, copy);
+      } catch (std::exception& e) {
+        SIRIUS_LOG_WARN(
+          "Transparent execution: partial aggregate pushdown failed, planning without it: {}",
+          sirius::sanitized_message(e));
+        copy            = copy_logical_plan(*captured, context);
+        exists_rewrites = rewrite_subqueries(copy);
+      }
+    }
+    // Recorded once the plan is final, so the counts describe the plan that is captured.
+    ctx->record_exists_minmax_rewrites(exists_rewrites);
+    ctx->record_partial_aggregate_pushdowns(pushed_aggregates);
+    conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

@@ -29,7 +29,6 @@
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/main/attached_database.hpp>

@@ -16,7 +16,6 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
-#include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -25,7 +24,7 @@
 #include "pipeline/query_retirement_test_utils.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_scheduler.hpp"
-#include "scan/test_utils.hpp"
+#include "scan/test_utils.hpp"  // IWYU pragma: keep
 #include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
@@ -538,4 +537,91 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   INFO("Max-retry OOM test passed: " << global_state->oom_count.load() << " OOM events, "
                                      << global_state->completed_count.load()
                                      << " small tasks completed, error correctly reported");
+}
+
+TEST_CASE("GPU retry-handler failures preserve their type and runtime classification",
+          "[gpu_pipeline_executor][device_health]")
+{
+  using namespace std::chrono_literals;
+  bool const fatal = GENERATE(false, true);
+  oom_test_fixture f;
+  if (!f.setup(1, "retry-error")) { SKIP("No GPU available"); }
+
+  class retry_failure_task final : public oom_test_task_base {
+   public:
+    using oom_test_task_base::oom_test_task_base;
+    std::exception_ptr failure;
+    void execute(::cuda::stream_ref) override
+    {
+      throw sirius::pipeline::task_reschedule_exception(nullptr, 0, "retry requested");
+    }
+    std::unique_ptr<gpu_pipeline_task> create_rescheduled_task(
+      uint64_t, std::unique_ptr<sirius::pipeline::sirius_pipeline_task_local_state>) override
+    {
+      std::rethrow_exception(failure);
+    }
+  };
+  auto global = std::make_shared<oom_test_global_state>();
+  global->set_completion_handler(f.completion);
+  auto task = std::make_unique<retry_failure_task>(
+    0, std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr), global);
+  task->failure =
+    fatal
+      ? std::make_exception_ptr(cudf::cuda_error("retry factory failed", cudaErrorIllegalAddress))
+      : std::make_exception_ptr(std::runtime_error("retry factory input: cudaErrorUnknown"));
+  auto result = f.completion->get_awaitable();
+  f.executor->start();
+  f.executor->schedule(std::move(task));
+  REQUIRE(result.wait_for(10s) == std::future_status::ready);
+  if (fatal) {
+    CHECK_THROWS_AS(result.get(), cudf::cuda_error);
+  } else {
+    CHECK_THROWS_WITH(result.get(), "retry factory input: cudaErrorUnknown");
+  }
+  CHECK(f.lifecycle.runtime_failed() == fatal);
+  sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
+  f.executor->stop();
+}
+
+TEST_CASE("GPU executor reports CCCL and Thrust task failures before completion",
+          "[gpu_pipeline_executor][device_health]")
+{
+  using namespace std::chrono_literals;
+  bool const cccl = GENERATE(false, true);
+  auto status     = GENERATE(cudaErrorIllegalAddress, cudaErrorInvalidValue);
+  oom_test_fixture f;
+  if (!f.setup(1, "typed-cuda-error")) { SKIP("No GPU available"); }
+
+  class cuda_failure_task final : public oom_test_task_base {
+   public:
+    using oom_test_task_base::oom_test_task_base;
+    std::exception_ptr failure;
+    void execute(::cuda::stream_ref) override { std::rethrow_exception(failure); }
+  };
+  auto global = std::make_shared<oom_test_global_state>();
+  global->set_completion_handler(f.completion);
+  auto task = std::make_unique<cuda_failure_task>(
+    0, std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr), global);
+  auto failure =
+    cccl ? std::make_exception_ptr(::cuda::cuda_error(status, "prepare stream synchronization"))
+         : std::make_exception_ptr(thrust::system_error(status, thrust::cuda_category(), "task"));
+  task->failure = failure;
+  auto result   = f.completion->get_awaitable();
+  f.executor->start();
+  f.executor->schedule(std::move(task));
+  REQUIRE(result.wait_for(10s) == std::future_status::ready);
+  try {
+    result.get();
+    FAIL("task failure must reach completion");
+  } catch (std::exception const&) {
+    CHECK(std::current_exception() == failure);
+  }
+  CHECK(f.lifecycle.runtime_failed() == (status == cudaErrorIllegalAddress));
+  // This fixture has no completion observer: the worker must record its owner
+  // before publishing shared health failure or signaling completion.
+  auto diagnostics = f.lifecycle.diagnostics();
+  REQUIRE(diagnostics.size() == 1);
+  CHECK_FALSE(diagnostics.front().error.empty());
+  sirius::test::retire_scheduler_query(f.lifecycle, *f.executor, sirius::make_query_id(0));
+  f.executor->stop();
 }

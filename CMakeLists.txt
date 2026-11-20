@@ -32,11 +32,14 @@ if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
   message(FATAL_ERROR "Enable at least one Sirius library output")
 endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
+option(
+  SIRIUS_DISTRIBUTION_DEFAULTS
+  "Default to DuckDB logging and no Quent telemetry, for released extensions"
+  OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
-option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
@@ -69,4 +72,5 @@ endif()
 if(SIRIUS_BUILD_TESTS)
   include(cmake/sirius-test-sources.cmake)
   include(cmake/sirius-tests.cmake)
+  include(cmake/sirius-tpch-havoc.cmake)
 endif()

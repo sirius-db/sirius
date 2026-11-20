@@ -15,6 +15,10 @@
  */
 
 #include "catch.hpp"
+#include "expression/ast/case_expr.hpp"
+#include "expression/ast/coalesce.hpp"
+#include "expression/ast/comparison.hpp"
+#include "expression/ast/conjunction.hpp"
 #include "expression/ast/constant.hpp"
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
@@ -29,6 +33,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -89,6 +94,108 @@ std::size_t count_projection_operators(sirius::op::sirius_physical_operator cons
     count += count_projection_operators(*child);
   }
   return count;
+}
+
+std::unique_ptr<sirius::ast::node> make_add(std::unique_ptr<sirius::ast::node> left,
+                                            std::unique_ptr<sirius::ast::node> right)
+{
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(std::move(left));
+  args.push_back(std::move(right));
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::function_call{sirius::function_id::add,
+                               std::move(args),
+                               sirius::logical_type::make(sirius::type_id::INTEGER)});
+}
+
+std::unique_ptr<sirius::ast::node> make_equal(std::unique_ptr<sirius::ast::node> left,
+                                              std::unique_ptr<sirius::ast::node> right)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, std::move(left), std::move(right)});
+}
+
+std::unique_ptr<sirius::ast::node> make_and(std::unique_ptr<sirius::ast::node> left,
+                                            std::unique_ptr<sirius::ast::node> right)
+{
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(std::move(left));
+  children.push_back(std::move(right));
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::conjunction{sirius::ast::conjunction::kind::op_and, std::move(children)});
+}
+
+std::unique_ptr<sirius::ast::node> make_coalesce(std::unique_ptr<sirius::ast::node> first,
+                                                 std::unique_ptr<sirius::ast::node> second)
+{
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.push_back(std::move(first));
+  children.push_back(std::move(second));
+  return std::make_unique<sirius::ast::node>(sirius::ast::coalesce{
+    std::move(children), sirius::logical_type::make(sirius::type_id::INTEGER)});
+}
+
+std::unique_ptr<sirius::ast::node> make_case(std::vector<sirius::ast::case_expr::when_then> cases,
+                                             std::unique_ptr<sirius::ast::node> otherwise,
+                                             bool eager = false)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::case_expr{std::move(cases),
+                           std::move(otherwise),
+                           sirius::logical_type::make(sirius::type_id::INTEGER),
+                           eager});
+}
+
+std::unique_ptr<sirius::ast::node> make_case(std::unique_ptr<sirius::ast::node> when,
+                                             std::unique_ptr<sirius::ast::node> then,
+                                             std::unique_ptr<sirius::ast::node> otherwise,
+                                             bool eager = false)
+{
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back({std::move(when), std::move(then)});
+  return make_case(std::move(cases), std::move(otherwise), eager);
+}
+
+// inner: [ add(#0, #1), #0, #1 ], so an outer #0 reads GPU work and outer #1 and #2 read columns.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_sum_projection()
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select;
+  select.push_back(make_add(make_reference(0), make_reference(1)));
+  select.push_back(make_reference(0));
+  select.push_back(make_reference(1));
+  return make_projection(std::move(select), make_dummy_scan(2));
+}
+
+// An outer expression over make_sum_projection that reads the sum (#0) once, in @p slot.
+std::unique_ptr<sirius::ast::node> read_sum_in(std::string const& slot)
+{
+  auto const guard = [] { return make_equal(make_reference(1), make_reference(2)); };
+  auto const test  = [] { return make_equal(make_reference(0), make_reference(2)); };
+  if (slot == "then") { return make_case(guard(), make_reference(0), make_reference(1)); }
+  if (slot == "else") { return make_case(guard(), make_reference(1), make_reference(0)); }
+  if (slot == "later when") {
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back({guard(), make_reference(1)});
+    cases.push_back({test(), make_reference(2)});
+    return make_case(std::move(cases), make_reference(1));
+  }
+  if (slot == "when and operand") {
+    return make_case(make_and(guard(), test()), make_reference(1), make_reference(2));
+  }
+  if (slot == "coalesce argument") { return make_coalesce(make_reference(1), make_reference(0)); }
+  if (slot == "then of a nested case") {
+    return make_add(make_case(guard(), make_reference(0), make_reference(1)), make_reference(2));
+  }
+  if (slot == "first when") { return make_case(test(), make_reference(1), make_reference(2)); }
+  if (slot == "first coalesce argument") {
+    return make_coalesce(make_reference(0), make_reference(1));
+  }
+  if (slot == "value and operand") { return make_and(guard(), test()); }
+  if (slot == "eager case then") {
+    return make_case(guard(), make_reference(0), make_reference(1), /*eager=*/true);
+  }
+  FAIL("unknown slot " << slot);
+  return nullptr;
 }
 
 }  // namespace
@@ -244,6 +351,66 @@ TEST_CASE("projection_fold - non-trivial inner expr referenced once is folded", 
   REQUIRE(count_projection_operators(*plan) == 1);
   auto& folded = plan->Cast<sirius_physical_projection>();
   REQUIRE(folded.select_list[0]->holds<sirius::ast::function_call>());
+}
+
+TEST_CASE("projection_fold - non-trivial inner expr read where a branch skips rows is not folded",
+          "[projection_fold]")
+{
+  // DuckDB computes the inner projection on every row, so its errors raise even for rows that a
+  // CASE or COALESCE branch above it never sees. Inside the branch they would not.
+  auto const slot = GENERATE(as<std::string>{},
+                             "then",
+                             "else",
+                             "later when",
+                             "when and operand",
+                             "coalesce argument",
+                             "then of a nested case");
+  INFO(slot);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> outer_select;
+  outer_select.push_back(read_sum_in(slot));
+  auto plan = sirius::planner::push_projection(
+    make_sum_projection(), make_integer_types(1), std::move(outer_select), 1);
+
+  REQUIRE(count_projection_operators(*plan) == 2);
+}
+
+TEST_CASE("projection_fold - non-trivial inner expr read on every row is folded",
+          "[projection_fold]")
+{
+  auto const slot = GENERATE(as<std::string>{},
+                             "first when",
+                             "first coalesce argument",
+                             "value and operand",
+                             "eager case then");
+  INFO(slot);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> outer_select;
+  outer_select.push_back(read_sum_in(slot));
+  auto plan = sirius::planner::push_projection(
+    make_sum_projection(), make_integer_types(1), std::move(outer_select), 1);
+
+  REQUIRE(count_projection_operators(*plan) == 1);
+}
+
+TEST_CASE("projection_fold - column references fold into a branch that skips rows",
+          "[projection_fold]")
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> inner_select;
+  inner_select.push_back(make_reference(1));
+  inner_select.push_back(make_reference(0));
+  auto plan = make_projection(std::move(inner_select), make_dummy_scan(2));
+
+  // outer: [ CASE WHEN #0 = #1 THEN #0 ELSE #1 END ]
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> outer_select;
+  outer_select.push_back(make_case(
+    make_equal(make_reference(0), make_reference(1)), make_reference(0), make_reference(1)));
+  plan = sirius::planner::push_projection(
+    std::move(plan), make_integer_types(1), std::move(outer_select), 1);
+
+  REQUIRE(count_projection_operators(*plan) == 1);
+  auto const& folded = plan->Cast<sirius_physical_projection>();
+  auto const& alt    = folded.select_list[0]->get<sirius::ast::case_expr>();
+  REQUIRE(alt.cases[0].then_->get<sirius::ast::reference>().column_index == 1);
+  REQUIRE(alt.else_->get<sirius::ast::reference>().column_index == 0);
 }
 
 TEST_CASE("projection_fold - identity outer projection is elided", "[projection_fold]")

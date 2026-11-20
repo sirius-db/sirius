@@ -29,7 +29,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -157,12 +155,13 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   state->completion_handler = handler;
 
   auto pipeline_priorities = compute_pipeline_priorities(query);
+  auto const host_spaces   = _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  auto const* host_staging_space = host_spaces.empty() ? nullptr : host_spaces.front();
 
   // Filled once, here, and never mutated afterwards: task-creation workers read it without a
   // lock, holding only their shared_ptr to this state. Note the map is NOT cleared — other
   // queries own their own entries, and this one is brand new.
   for (const auto& pipeline : pipelines) {
-    pipeline->set_task_creator(this);
     if (pipeline->is_query_terminal()) { pipeline->set_completion_handler(handler); }
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) {
@@ -170,8 +169,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
       continue;
     }
     size_t operator_id = source_operator->get_operator_id();
-    auto gs =
-      std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    auto gs            = std::make_shared<pipeline::gpu_pipeline_task_global_state>(
+      pipeline, telemetry_context, host_staging_space);
     gs->set_completion_handler(handler);
     if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
       gs->set_priority(it->second);
@@ -181,15 +180,25 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
     state->global_states.emplace(operator_id, std::move(gs));
   }
 
-  std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
-  state->lookahead_queue.clear();
-  auto scan_operators            = query.get_scan_operators();
-  state->index_of_next_lookahead = 0;
-  if (!scan_operators.empty()) {
-    auto begin = scan_operators.begin() + 1;
-    for (auto it = begin; it != scan_operators.end(); ++it) {
-      state->lookahead_queue.push_back(*it);
+  {
+    std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
+    state->lookahead_queue.clear();
+    auto scan_operators            = query.get_scan_operators();
+    state->index_of_next_lookahead = 0;
+    if (!scan_operators.empty()) {
+      auto begin = scan_operators.begin() + 1;
+      for (auto it = begin; it != scan_operators.end(); ++it) {
+        state->lookahead_queue.push_back(*it);
+      }
     }
+  }
+
+  // Last: an exchange or streaming source schedules from another thread once its pipeline has a
+  // creator, and a worker that finds no global state for the source drops the batch it took. An
+  // exchange source notified earlier schedules nothing; it is scheduled again when its stream
+  // ends, which waits on this rank's own producer and so comes after the query starts.
+  for (const auto& pipeline : pipelines) {
+    pipeline->set_task_creator(this);
   }
 }
 
@@ -255,8 +264,8 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   // Inject the query id into the high 32 bits so tasks are ordered by query first, then by the
   // within-query pipeline rank in the low 32 bits. The priority queue picks the LOWEST value first,
   // so an earlier query (smaller id) always runs before a later one, and within a query the dense
-  // 0..N-1 rank preserves pipeline execution order. See query_priority_bits() for the masking
-  // contract that keeps the packed value non-negative.
+  // 0..N-1 rank preserves pipeline execution order. See query_priority_bits() for the
+  // range-checking contract that keeps the packed value non-negative.
   const exec::queue_priority query_bits = sirius::query_priority_bits(query.query_id());
   for (auto& [pipeline, priority] : priorities) {
     const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
@@ -385,11 +394,13 @@ void task_creator::do_stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _bounded_pool->interrupt();
+  if (_bounded_pool) { _bounded_pool->interrupt(); }
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
-  _bounded_pool->stop();
+  if (_bounded_pool) {
+    _bounded_pool->wait_all();
+    _bounded_pool->stop();
+  }
   _bounded_pool.reset();
 }
 
@@ -696,12 +707,16 @@ void task_creator::manager_loop()
             }
 
             while (!node->all_ports_empty()) {
-              auto task_lock  = pipeline->get_task_creation_lock();
+              auto task_lock = pipeline->get_task_creation_lock();
+              // Serialize this check with task registration and pipeline completion. A claim
+              // may race this check, but any extra task is counted and safely claims zero rows.
+              if (pipeline->is_pipeline_finished() || pipeline->is_limit_exhausted()) { break; }
               auto input_data = node->get_next_task_input_data();
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
               if (!input_data ||
-                  (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+                  (pipelineable_input && pipelineable_input->get_data_batches().empty() &&
+                   !node->runs_without_input())) {
                 // no data to create task for
                 break;
               }
@@ -770,11 +785,8 @@ void task_creator::manager_loop()
                                                        return a.second < b.second;
                                                      })
                                       ->first;
-                    auto gpus = _topology_index->gpus_of(top_host);
-                    if (!gpus.empty()) {
-                      auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                      preferred_device_id = gpus[idx];
-                    }
+                    preferred_device_id =
+                      _numa_affinity.next_gpu(top_host, _topology_index->gpus_of(top_host));
                   }
                   SIRIUS_LOG_DEBUG(
                     "Task Creator: locality score gpu_sources={} host_sources={} "
@@ -809,11 +821,9 @@ void task_creator::manager_loop()
                           // pick a GPU on the same NUMA. The host space's device id
                           // is the NUMA key verbatim (-1 = "unknown"), matching the
                           // pipelineable locality block above.
-                          auto gpus = _topology_index->gpus_of(space->get_device_id());
-                          if (!gpus.empty()) {
-                            auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                            preferred_device_id = gpus[idx];
-                          }
+                          auto const host = space->get_device_id();
+                          preferred_device_id =
+                            _numa_affinity.next_gpu(host, _topology_index->gpus_of(host));
                         }
                         SIRIUS_LOG_DEBUG(
                           "Task Creator: cached-scan locality tier={} device_id={} "

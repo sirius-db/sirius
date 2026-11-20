@@ -21,20 +21,13 @@
 #include <op/scan/scan_utils.hpp>
 
 // duckdb
-#include <duckdb/common/types/value.hpp>
-#include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
-#include <duckdb/planner/filter/in_filter.hpp>
 
 // standard library
-#include <cstdint>
 #include <format>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>

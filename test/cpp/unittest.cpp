@@ -16,7 +16,6 @@
 
 #include "catch.hpp"
 #include "config.hpp"
-#include "log/logging.hpp"
 #include "log/spdlog_owning_sink.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "utils/s3_backend.hpp"
@@ -26,7 +25,6 @@
 
 #include <unistd.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -144,8 +142,7 @@ int main(int argc, char* argv[])
       ? std::nullopt
       : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
   auto log_sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
-  log_sink->set_level(lvl);
-  sirius::log::set_sink(std::move(log_sink));
+  sirius::log::set_sink(std::move(log_sink), lvl);
 
   // This child must register a replacement before the first Sirius load. Even creating a
   // paused shared_test_env below would initialize the process-wide callback cache too early.

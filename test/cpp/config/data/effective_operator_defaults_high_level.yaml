@@ -5,4 +5,5 @@ sirius:
     gpu:
       usage_limit_bytes: 256MiB
     host:
-      capacity_bytes: 256MiB
+      # Four default I/O reactors use 256 MiB of staging; leave room for execution.
+      capacity_bytes: 512MiB

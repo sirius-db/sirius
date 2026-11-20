@@ -157,11 +157,12 @@ physical plan, and roots it in a `sirius_physical_streaming_sink` or
 - **Every declared input must be read by the plan.** An unread input throws; nothing would ever
   close it.
 - **`prepared` types must match the plan's output types**, because the collector decodes GPU
-  output with them. One exception: HUGEINT over a BIGINT plan column. DuckDB types `SUM(BIGINT)` as
-  HUGEINT, the planner narrows it to BIGINT, and the collector casts it back.
+  output with them.
 - **Hash-key cast types.** cuDF `murmur3` hashes raw bytes, so an `INT32` and an `INT64` sender
   would split matching keys. When `partitioning.key_cast_types` is empty, `build()` fills one per
-  key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY` (as-is);
+  key: `TINYINT`, `SMALLINT`, `INTEGER`, `HUGEINT` → `INT64` (a HUGEINT key's DECIMAL128 carrier
+  hashes as its INT64 wrap, which matches a BIGINT key); `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY`
+  (as-is);
   `DECIMAL` → `FLOAT64`; any other type throws. An out-of-range key column throws first.
 
 **`run()`**
@@ -230,6 +231,10 @@ run():    ┌─ in_transaction ─ streaming_fragment::run() ──────
 - **One transaction at a time per `Context`.** Fragments share the connection, and a second
   `BEGIN` would fail and invalidate the open transaction. `in_transaction` holds the `Context`'s
   `conn_mutex`, so concurrent `build()`, `run()`, and `execute_substrait` calls wait for each other.
+
+`run()` holds a query admission permit through execution and retirement. `build()` does not
+retain one. The FFI Context still serializes its connection; concurrent SQL admission does not
+establish a concurrent streaming producer/consumer contract.
 
 ## Tests
 

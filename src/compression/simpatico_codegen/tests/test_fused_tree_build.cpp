@@ -179,17 +179,23 @@ void test_for_fused_and_raw_modes()
   }
 }
 
-void test_zigzag_leaf_and_fused_child()
+void test_zigzag_raw_and_fused_child()
 {
   {
     auto t                   = build_tree("input -> zigzag -> zigzag\n");
     simpatico::NodeId zigzag = node_for_op(t, "zigzag");
     auto built               = simpatico::build_fused_tree(t, zigzag);
-    expect(built.has_value(), "leaf Zigzag builds");
+    expect(built.has_value(), "zigzag+raw builds");
     expect(built->tree->op == OpKind::Zigzag, "root is Zigzag");
-    expect(built->tree->is_leaf(), "terminal Zigzag has no child");
-    expect(built->preorder.size() == 1, "leaf Zigzag has one preorder node");
-    expect(built->preorder[0].plan_node == zigzag, "leaf Zigzag preorder origin");
+    auto const& raw = *built->tree->children.at("zigzag");
+    expect(raw.op == OpKind::Raw && raw.is_leaf(), "terminal Zigzag child is Raw");
+    expect(built->preorder.size() == 2, "Zigzag+Raw has 2 preorder nodes");
+    expect(built->preorder[0].plan_node == zigzag, "Zigzag preorder origin");
+    auto const& origin = built->preorder[1];
+    expect(origin.is_raw_passthrough, "Zigzag Raw origin is passthrough");
+    expect(origin.parent_node == zigzag, "Zigzag Raw parent node");
+    expect(origin.parent_op == "zigzag", "Zigzag Raw parent op");
+    expect(origin.parent_channel == "zigzag", "Zigzag Raw parent channel");
   }
 
   {
@@ -231,7 +237,7 @@ int main()
     test_rle_raw_values_passthrough();
     test_delta_raw_differences_passthrough();
     test_for_fused_and_raw_modes();
-    test_zigzag_leaf_and_fused_child();
+    test_zigzag_raw_and_fused_child();
     test_invalid_roots();
     std::printf("test_fused_tree_build: PASS\n");
     return 0;

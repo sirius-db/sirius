@@ -21,12 +21,11 @@
 // that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
 // test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
-#include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/common/arrow/arrow.hpp>
 #include <substrait/plan.pb.h>
 

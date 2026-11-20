@@ -1,6 +1,15 @@
 # Compressed pinning: putting hot columns on the GPU
 
-`pin_table` can store pinned chunks Simpatico-compressed on either tier:
+`pin_table` attempts Simpatico compression by default on either host or GPU tiers,
+without requiring a plan file:
+
+```sql
+CALL pin_table('/data/lineitem/*.parquet', tier => 'gpu', name => 'lineitem');
+-- Opt out for one pin:
+-- CALL pin_table(..., compression => false);
+```
+
+An optional table plan overrides automatic selection:
 
 ```sql
 SET pin_table_input_compression_plan_dir = '/path/to/plans';  -- <table>.txt per table
@@ -11,13 +20,54 @@ CALL pin_table('/data/lineitem/*.parquet',
                compression => true);
 ```
 
-Tables with no plan file pin uncompressed. Each plan file carries one `---`-separated DSL
+When no readable, nonempty matching plan is found, a GPU-tier pin smaller than
+`pin_table_compression_min_table_device_fraction` (default 0.05) of the memory of the GPUs it
+pins to is stored uncompressed. Such a pin frees little GPU memory, and its scans would still
+pay for decoding. The size is the pin's uncompressed bytes: the first materialized chunk's
+bytes per row, after narrowing, times the table's row count. If the row count can't be read,
+the pin is not gated. Host-tier pins are never gated, because every scan copies them over the
+host-to-device link and fewer bytes always shorten that copy. On SF1000 with GB300, the default
+compresses the `lineitem` and `orders` pins of most queries and leaves `part`, `partsupp`,
+`customer` and `supplier` raw. Compressing those as well slowed q2, q11, q14, q16, q19 and q20
+by 4 to 27 ms each on the GPU tier. On the host tier, compressing every table is 0.26 s faster
+over the suite than keeping the small ones raw.
+
+Otherwise each materialized chunk selects its plans automatically. The policy is close to
+[spill compression](memory-management.md#spill-compression)'s, but it favors plans a filtered
+scan can decode in place. It samples up to 65,536 values. Integer-valued columns choose
+between bitpacking and delta-bitpacking, and delta-bitpacking needs over 10% estimated size
+savings. Delta-RLE-bitpacking, which every scan decodes in full, is chosen only when it saves
+at least a quarter of the column's uncompressed size more than the better of those two. A
+sorted key whose differences already pack to almost nothing does not qualify. Strings with
+at least 4,096 rows use a dictionary with bitpacked indices when at most 10% of the sample is
+distinct. Otherwise they keep their characters as is beside delta-bitpacked offsets, which a
+filtered scan gathers for surviving rows only. Other eligible fixed-width columns use
+bitpacking; short strings and unsupported types are stored as is. Selection runs after
+carrier narrowing and in pinned-column order.
+
+Each explicit plan file carries one `---`-separated DSL
 block per full-table column in schema order; a pin of a column subset selects the matching
-blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
-at task-prepare time via the `compressed_host_representation` /
-`compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-4 fixed streams (measured strictly better than serial; the stream count is deliberately
-not configurable).
+blocks (`select_plan_blocks`). Each pin reads its plan from the calling connection's
+`pin_table_input_compression_plan_dir`; plans are not stored in a process-wide registry.
+Scans of a compressed entry decompress the projected columns at task-prepare time via the
+`compressed_host_representation` / `compressed_device_blob` → `gpu_table_representation`
+converters. With per-thread reservation tracking, multi-column decodes use up to 4
+column-parallel streams (the limit is not configurable); otherwise they use the task stream.
+Simpatico leases the parallel streams exclusively from its per-device cuCascade pool.
+The scan orders their input reads after writes on the task stream, waits for the decode
+before returning, and rebinds the decoded columns to the task stream (`decompress_chunk`
+in `src/compression/compressed_scan.cpp`).
+
+A GPU-tier compressed chunk is decoded in place on the GPU that holds it. When query admission
+(`topology.gpus_per_query` or `admission_bytes_per_gpu`) assigns its scan to another GPU, the
+converter copies the compressed buffers of the projected columns to that GPU and decodes them
+there, as it does for a host-tier compressed chunk. The copy is a peer copy where the two GPUs'
+pools have peer access and is staged through pinned host memory otherwise
+(`memory::enqueue_device_copy`). The pinned chunk stays on its GPU and is only read. Such a
+scan pays a transfer of the compressed bytes per query, and its reservation covers the copied
+compressed bytes together with the decoded output. When that pinned host memory runs out, the
+task is retried without growing its GPU reservation (see
+[Pipeline Execution](pipeline-execution.md#reschedule-handling-oom-and-cuda-launch-failures)).
 
 ## Decode-time equality pushdown
 
@@ -30,13 +80,28 @@ directly. Interfaces: `src/compression/compressed_representation.hpp`
 (`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
 translation), threaded through `sirius_scan_manager::prepare_for_query`.
 
-The compression settings can be staged before a table is pinned. Compression becomes active only
-when `CALL pin_table(..., compression => true)` requests it, the plan-directory setting is
-non-empty, and a matching table plan exists. `pin_table` warns and pins uncompressed when
-compression is requested but the plan directory is empty; a missing table plan likewise warns and
-falls back. The batch-size and compressed-fraction settings are inert until a matching plan
-activates compression. The existing `pin_table_compression` setting remains the default for calls
-that omit the `compression` argument; an explicit argument always wins.
+The `pin_table_compression` setting defaults to true; an explicit `compression` argument
+always wins. Chunks below 1 MiB remain raw by default. After encoding, compression is
+kept by default only when header plus payload is at most 75% of the original device footprint.
+All-identity automatic plans skip encoding. Encoding failures leave subsequent chunks raw;
+automatic GPU pins retain their source until staging succeeds so staging failures can
+also fall back. An explicit plan that does not cover the pinned columns is rejected with
+a warning and the pin stays raw; it is not silently replaced by an automatic plan.
+The `parquet` pin tier continues to cache file bytes without this decode/compress step.
+
+When pinned zone-map capture is enabled, supported native min/max statistics are
+retained for compressed chunks on both tiers, so entire chunks can be pruned before decode.
+
+Fully raw automatic GPU results use ordinary column-major storage and can merge compatible
+raw columns. If the previous GPU pin stored chunks in compressed form, a fully raw re-pin
+replaces that entry instead of attempting a column merge. GPU pins containing compressed
+chunks also replace the previous entry on re-pin: pin the full intended column set in one
+call, or opt out of compression when incremental column merging is required.
+
+The current late-materialization installer declines compressed origins because their
+null counts cannot be checked without decoding. Those queries use ordinary decoding and
+materialization instead. Use `compression => false` when evaluating raw-pin deferral;
+compression does not imply that late materialization will be admitted.
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
@@ -81,7 +146,17 @@ Rules of thumb:
   `scan_task_batch_size` of the *pinned subset*, so a narrow pin concentrates a column's
   chars in each batch.
 
-## Filtering while decompressing (experimental)
+All newly written `.hpln` files use version 14, with either nvCOMP 5 or 6. Version 13
+introduced five-word bitpack decode guards; version 14 additionally records a payload-format
+identifier in each ANS and Cascaded leaf's metadata. These identifiers distinguish pre-v6
+and v6 nvCOMP payloads independently of future file-layout versions. Incompatible codec
+metadata and older file versions are rejected before fetching or decoding payloads.
+
+With nvCOMP 6, `nvcomp_cascaded` plans remain unavailable because the old configurable Cascaded
+options were removed. Its metadata field reserves the distinction needed to support the new
+Cascaded API later. nvCOMP 5 builds continue to support the existing Cascaded plans.
+
+## Filtering while decompressing
 
 A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
 a column's plan allows it the filter is answered from the compressed form, and the surviving
@@ -96,11 +171,12 @@ filter the decode applies alongside does not change this: it is optional, so whe
 batch does not bear on the scan's own filter. With any conjunct of the scan's own filter left to
 the scan (an unsupported shape) or on any decline, every column comes back as before.
 
-It is off by default and inert when off (byte-identical to an ordinary decompress):
+It is enabled by default. Disable it per connection with
+`SET enable_fused_scan_filter = false`; YAML accepts the same name under
+`sirius.operator_params`. Enable the decision trace for a connection with:
 
-```bash
-SIRIUS_EXP_FUSED_SCAN_FILTER=1     # the gate
-SIRIUS_EXP_FUSED_SCAN_DIAG=1       # the decision trace — reach for this first
+```sql
+SET fused_scan_diagnostics = true;
 ```
 
 Measured on GB300, TPC-H SF1000, on top of a GPU-pinned compressed configuration: the suite
@@ -125,22 +201,45 @@ bitpack-rooted plan additionally buys the mask walk.
 Selectivity governs whether compaction is attempted at all, because compacting is only cheaper
 than decoding when enough rows are dropped:
 
-- a batch with any full-width column proceeds only below `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL`
-  (0.10);
-- otherwise compaction is given up above `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` (0.35), unless a
+- a batch with any full-width column proceeds only below `fused_scan_full_route_max_selectivity`
+  (0.10), or below `fused_scan_max_selectivity` when it also has a dictionary output, whose
+  savings pay for the full-width columns' gather;
+- otherwise compaction is given up above `fused_scan_max_selectivity` (0.35), unless a
   dictionary output is present — that route is exempt, since it wins regardless;
-- below `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` (0.15) the decode walks a survivor index list
+- below `fused_scan_index_walk_max_selectivity` (0.15) the decode walks a survivor index list
   instead of the mask bits.
+
+These thresholds and `fused_scan_max_membership_sources` (default 1) accept connection-local
+`SET` overrides and YAML startup defaults under `sirius.operator_params`. A query snapshots its
+policy, including diagnostics, so later settings changes do not affect work already submitted.
 
 One batch measured unselective predicts the rest of that scan, so the scan stops attempting it
 rather than paying per batch.
 
-Two operational caveats. These are environment variables, not `SET` options: they are
-process-wide, read once and cached, so they cannot be changed per session and do not appear in
-`duckdb_settings()`. And the trace is the only way to see what happened — the plan per column (route,
-bounds, what was dropped and why), then per batch the sources in the order they ran, the
-enumeration chosen, the survivor count and whether the batch came back needing no further
-filtering.
+Use `SET <name> = <value>` to change these settings for subsequent queries on the current
+connection, and `RESET <name>` to restore the startup default, including any YAML override.
+Inspect their current values in `duckdb_settings()`. Each query keeps the policy captured when
+it starts; later changes do not alter work already submitted.
+
+The decision trace shows what happened: the plan per column (route, bounds, what was dropped
+and why), then per batch the sources in the order they ran, the enumeration chosen, the
+survivor count and whether the batch came back needing no further filtering. Enable
+`fused_scan_diagnostics` to emit these decisions at INFO level.
+
+### Reporting the rows the decode kept
+
+A decode that compacts can hand back the positions it kept, as an ascending INT32 index list over
+the pre-filter batch (`pushdown_outcome::survivor_rows`). It is produced only when the request
+asks (`pushdown_request::report_survivors`, set through
+`decompression_pushdown_scan::with_survivor_reporting()`), which only a scan carrying a
+late-materialization deferral does — that rowid addresses the pinned chunk by position, and a
+compacted batch no longer holds the chunk's rows in order.
+
+The answer is not re-derived: the tier-B route already materialized the index list to gather by,
+and every other route left the counted mask it balloted, so this either copies a buffer that
+exists or expands one (`mask_to_row_indices`). `pushdown_outcome::compacted` reports that rows
+were dropped at all — separately from `row_filtered`, which additionally claims the whole filter
+was carried — so a consumer can tell "no positions asked for" apart from "no rows dropped".
 
 ## Interaction with the downgrade executor
 
@@ -176,3 +275,19 @@ python test/tpch_performance/performance_test.py --engine gpu --mode grouped \
 Checked-in SF1000 plans live in `src/compression/simpatico_codegen/plans/tpch_sf1000/`;
 per-column ratio and throughput annotations are in each file's comments. Re-measure with
 `simpatico_cli benchmark` when hardware changes.
+
+## Compression streams
+
+In Sirius builds, Simpatico leases its column-parallel CUDA streams from
+`cucascade::memory::exclusive_stream_pool`. Both scan decoding's four-stream
+thread/device cache and the compression/decompression APIs' temporary leases use
+this backend. Leases are exclusive and grow the per-device pool when needed, so
+concurrent callers cannot deadlock while acquiring several streams.
+
+These pools use the same implementation as pipeline execution, but have separate,
+process-lifetime owners: compressed and decoded buffers can retain their allocation
+stream after a call or submitting thread exits. Releasing a lease synchronizes its
+streams before returning them. Input-ready events and decode completion preserve
+the ordering needed for the downstream pipeline stream.
+Allocations still run on the calling thread for cuCascade reservation accounting.
+Standalone Simpatico builds retain their CUDA-only stream backend.

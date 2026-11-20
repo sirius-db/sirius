@@ -140,6 +140,10 @@ class logical_type {
   /// Returns true if this is a DECIMAL type.
   bool is_decimal() const noexcept { return _id == type_id::DECIMAL; }
 
+  /// Returns true if cuDF carries this type as fixed point: DECIMAL, and HUGEINT as DECIMAL128
+  /// with scale 0.
+  bool has_fixed_point_carrier() const noexcept { return is_decimal() || _id == type_id::HUGEINT; }
+
   /// Returns true if this is a VARCHAR (variable-length string) type.
   bool is_varchar() const noexcept { return _id == type_id::VARCHAR; }
 
@@ -249,7 +253,6 @@ class logical_type {
       case type_id::DATE: return 4;
       case type_id::BIGINT:
       case type_id::UBIGINT:
-      case type_id::HUGEINT:   // cuDF maps HUGEINT → INT64
       case type_id::UHUGEINT:  // cuDF maps UHUGEINT → UINT64
       case type_id::DOUBLE:
       case type_id::TIMESTAMP_SEC:
@@ -260,6 +263,7 @@ class logical_type {
         if (_precision <= decimal_max_precision_int32) return 4;  // DECIMAL32
         if (_precision <= decimal_max_precision_int64) return 8;  // DECIMAL64
         return 16;                                                // DECIMAL128
+      case type_id::HUGEINT: return 16;                           // cuDF maps HUGEINT → DECIMAL128
       case type_id::VARCHAR: return 0;                            // variable-length
       case type_id::LIST:
       case type_id::ARRAY:

@@ -10,7 +10,8 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=DOCS_RS");
-    if std::env::var_os("DOCS_RS").is_some() {
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_MIRI");
+    if std::env::var_os("DOCS_RS").is_some() || std::env::var_os("CARGO_CFG_MIRI").is_some() {
         return;
     }
 

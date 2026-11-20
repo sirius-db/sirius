@@ -1,0 +1,21 @@
+sirius:
+  executor:
+    scan_manager:
+      rest:
+        max_connections: 128
+        conn_max_age_s: 300
+        pin_to_irq_cpus: false
+        min_mtu: 8000
+      num_threads: 8
+      rest_n_reactors: 4
+    task_creator:
+      num_threads: 2
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 2
+  memory:
+    host:
+      initial_number_pools: 1600
+  compression:
+    enable_spill_compression: true

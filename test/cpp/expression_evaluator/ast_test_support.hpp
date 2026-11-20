@@ -174,6 +174,25 @@ inline std::unique_ptr<ast_node> make_cast(std::unique_ptr<ast_node> child,
   return std::make_unique<ast_node>(sirius::ast::cast{std::move(child), target_type, try_cast});
 }
 
+inline std::unique_ptr<ast_node> make_case(std::vector<sirius::ast::case_expr::when_then> cases,
+                                           std::unique_ptr<ast_node> else_clause,
+                                           sirius::logical_type return_type)
+{
+  return std::make_unique<ast_node>(
+    sirius::ast::case_expr{std::move(cases), std::move(else_clause), std::move(return_type)});
+}
+
+// CASE WHEN when THEN then ELSE else_clause END
+inline std::unique_ptr<ast_node> make_case(std::unique_ptr<ast_node> when,
+                                           std::unique_ptr<ast_node> then,
+                                           std::unique_ptr<ast_node> else_clause,
+                                           sirius::logical_type return_type)
+{
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back({std::move(when), std::move(then)});
+  return make_case(std::move(cases), std::move(else_clause), std::move(return_type));
+}
+
 inline std::unique_ptr<ast_node> make_coalesce(std::vector<std::unique_ptr<ast_node>> children,
                                                sirius::logical_type return_type)
 {

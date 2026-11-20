@@ -119,6 +119,63 @@ bool check_thread_device_pool()
   return true;
 }
 
+// Moving a lease must transfer ownership without returning active streams.
+// Releasing it must drain submitted work before another caller can borrow it.
+void check_pool_lease_lifetime()
+{
+  simpatico::stream_pool first;
+  expect(first.init(2), "lease init");
+  auto handles = first.streams;
+  simpatico::stream_pool moved(std::move(first));
+  expect(first.streams.empty(), "move constructor clears source");
+  expect(moved.streams == handles, "move constructor preserves handles");
+
+  simpatico::stream_pool assigned;
+  // Exceed cuCascade's initial capacity while another lease is held.
+  expect(assigned.init(20), "assignment destination init and pool growth");
+  for (auto handle : assigned.streams) {
+    for (auto active : handles)
+      expect(handle != active, "live leases must be disjoint");
+  }
+  assigned = std::move(moved);
+  expect(moved.streams.empty(), "move assignment clears source");
+  expect(assigned.streams == handles, "move assignment preserves handles");
+
+  void* buffer = nullptr;
+  expect(cudaMallocAsync(&buffer, 1024 * 1024, handles.front()) == cudaSuccess,
+         "stream ordered allocation");
+  expect(cudaMemsetAsync(buffer, 42, 1024 * 1024, handles.front()) == cudaSuccess,
+         "enqueue buffer write");
+#ifndef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+  expect(cudaFreeAsync(buffer, handles.front()) == cudaSuccess, "standalone buffer free");
+#endif
+  cudaEvent_t done{};
+  expect(cudaEventCreateWithFlags(&done, cudaEventDisableTiming) == cudaSuccess, "event create");
+  expect(cudaEventRecord(done, handles.front()) == cudaSuccess, "event record");
+  assigned.shutdown();
+  expect(cudaEventQuery(done) == cudaSuccess, "release drains pending work");
+  expect(cudaEventDestroy(done) == cudaSuccess, "event destroy");
+  expect(assigned.streams.empty(), "shutdown clears handles");
+#ifdef SIMPATICO_USE_CUCASCADE_STREAM_POOL
+  // Returned device buffers can still hold these allocation streams. They
+  // must remain valid after the pool facade (or submitting thread) goes away.
+  expect(cudaFreeAsync(buffer, handles.front()) == cudaSuccess,
+         "buffer can be freed after lease release");
+  for (auto handle : handles) {
+    expect(cudaStreamSynchronize(handle) == cudaSuccess, "released stream remains alive");
+  }
+  cudaStream_t thread_handle{};
+  std::thread worker([&] {
+    expect(cudaSetDevice(0) == cudaSuccess, "worker device");
+    thread_handle = simpatico::thread_device_stream_pool(4).streams.front();
+  });
+  worker.join();
+  expect(cudaStreamSynchronize(thread_handle) == cudaSuccess, "stream survives thread exit");
+#endif
+  expect(assigned.init(2), "released pool can be reinitialized");
+  std::printf("PASS: stream pool move, isolation, synchronization and lifetime\n");
+}
+
 int main()
 {
   int device_count       = 0;
@@ -131,6 +188,7 @@ int main()
   }
   // Checkable on one GPU, so it runs before the multi-device skip below.
   if (device_count >= 1 && !check_thread_device_pool()) { return 1; }
+  if (device_count >= 1) { check_pool_lease_lifetime(); }
 
   if (device_count < 2) {
     std::printf(

@@ -47,6 +47,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -61,13 +62,20 @@ namespace sirius::test::mgpu {
  * not caching, so they set cache=none explicitly.
  */
 struct mgpu_env_params {
-  int num_gpus                        = 2;
+  int num_gpus = 2;
+  // topology.gpus_per_query: admit each query onto at most this many GPUs. Omitted from the
+  // yaml when 0, which leaves every GPU admitted.
+  int gpus_per_query                  = 0;
   std::string cache                   = "none";  // none | table_gpu | table_host | parquet
   uint64_t scan_task_batch_size       = 100'000'000;
   uint64_t hash_partition_bytes       = 10'000'000;
   uint64_t concat_batch_bytes         = 100'000'000;
   uint64_t max_build_hash_table_bytes = 90'000'000;
-  double usage_limit_fraction         = 0.4;
+  // Per-GPU BUILD_PROBE resident-payload budget (max_build_probe_resident_bytes). Omitted from
+  // the yaml when unset, leaving the engine default; set it (0 is a valid "disable BUILD_PROBE"
+  // value) to force payload-bound denial explicitly.
+  std::optional<uint64_t> max_build_probe_resident_bytes;
+  double usage_limit_fraction = 0.4;
   // Absolute per-GPU usage cap in bytes. When non-zero this is emitted as
   // `usage_limit_bytes` (mutually exclusive with usage_limit_fraction per
   // sirius_config.cpp:201) so a test can impose a small fixed budget that
@@ -90,9 +98,9 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
   f << "sirius:\n"
        "  topology:\n"
        "    num_gpus: "
-    << params.num_gpus
-    << "\n"
-       "  memory:\n"
+    << params.num_gpus << "\n";
+  if (params.gpus_per_query > 0) { f << "    gpus_per_query: " << params.gpus_per_query << "\n"; }
+  f << "  memory:\n"
        "    gpu:\n";
   if (params.usage_limit_bytes != 0) {
     f << "      usage_limit_bytes: " << params.usage_limit_bytes << "\n";
@@ -132,6 +140,9 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    max_build_hash_table_bytes: "
     << params.max_build_hash_table_bytes << "\n";
+  if (params.max_build_probe_resident_bytes) {
+    f << "    max_build_probe_resident_bytes: " << *params.max_build_probe_resident_bytes << "\n";
+  }
 }
 
 /**

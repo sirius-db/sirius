@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared types for evaluating a scan's filter while decompressing
-// (env gate: SIRIUS_EXP_FUSED_SCAN_FILTER).
+// (query policy: enable_fused_scan_filter).
 //
 // Owned by the wave orchestration. Included by:
 //   - the JIT decode variants (ballot-to-mask, mask-consuming) as kernel-arg
@@ -19,6 +19,7 @@
 #pragma once
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
 
 #include <cudf/column/column_view.hpp>
 
@@ -32,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace cudf {
@@ -97,9 +99,11 @@ struct range_predicate {
 //                 the shared survivor index map. Costs about the unfiltered
 //                 path, so it is admitted only at low selectivity: once the
 //                 survivor count is known the batch proceeds iff
-//                 survivors/rows <= SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL
+//                 survivors/rows <= fused_scan.full_route_max_selectivity
 //                 (default 0.10), else the decode gives compaction up
 //                 (measured losses at high selectivity: q1 +43.5%, q5 +6.2%).
+//                 Beside a dict_codes output the ceiling is
+//                 fused_scan.max_selectivity instead.
 //   bitpack_mask— a bitpack root decoded straight into a compacted
 //                 survivor_count-row column, skipping the writes for rejected
 //                 rows.
@@ -109,7 +113,9 @@ struct range_predicate {
 //                 survivor count. Economics differ from the write-skipping
 //                 routes: this wins 2.1-2.6x at ALL selectivities (it skips the
 //                 full string materialization round trip), so the selectivity
-//                 ceiling does NOT apply to a batch with such an output.
+//                 ceiling does NOT apply to a batch with such an output, and a
+//                 batch that also has `full` outputs gets the ordinary ceiling
+//                 rather than the full-route one.
 //   str_split   — str_split strings: masked offsets reconstruction plus a
 //                 survivor-only chars byte-gather. Shaped like the dictionary
 //                 case (skipped char materialization scales with selectivity)
@@ -139,17 +145,17 @@ struct filter_column_directive {
   range_predicate pred;  // inclusive [lo,hi] in the decoded integer domain
 };
 
-// One dynamic MEMBERSHIP conjunct (a join build's in_list / cuco set / Bloom
-// over a scan key column). Wave 1 decodes the key column full
-// width, invokes `probe` (device-side membership test -> BOOL8, nonzero =
-// keep, NO null mask, exactly the batch's row count) and ANDs the packed
-// result into the batch mask; wave 2 compacts everything else as usual.
-// Probe contract (same as every wave-1 launcher): ALL device work enqueued on
-// the given stream before returning — no internal stream hops, no host sync
-// required; the closure must PIN the filter structure it captures (e.g. a
-// shared_ptr to the published device set) for the duration of the
-// decompress_scan_filter call. Directives snapshot the filter SET per batch —
-// the converter must never hand a probe that reads mutable live state.
+// One dynamic MEMBERSHIP conjunct (a join build's in_list / cuco set / Bloom over a scan key
+// column). Wave 1 decodes the key column full width, invokes `probe` (device-side membership test
+// -> BOOL8, nonzero = keep, NO null mask, exactly the batch's row count) and ANDs the packed result
+// into the batch mask; wave 2 compacts everything else as usual. When the batch also has a range,
+// BOOL8 or keep-mask source, the probes instead run one at a time on stream 0 after wave 1's
+// combine, each given the running combined mask as its prior. Probe contract (same as every wave-1
+// launcher): ALL device work enqueued on the given stream before returning — no internal stream
+// hops, no host sync required; the closure must PIN the filter structure it captures (e.g. a
+// shared_ptr to the published device set) for the duration of the decompress_scan_filter call.
+// Directives snapshot the filter SET per batch — the converter must never hand a probe that reads
+// mutable live state.
 struct membership_filter_directive {
   std::size_t column;  // key column, indexes into `selected`
   // Second argument is an OPTIONAL prior keep-mask over the batch's rows (packed selection-mask
@@ -180,6 +186,9 @@ struct bool8_filter_directive {
 // precondition and falls back to the unfiltered path when any fail.
 // Source-count cap: ranges + equalities + probes <= 8, one source per kernel.
 struct scan_filter_request {
+  /// Explicit caller policy, independent of the executing worker thread or process environment.
+  bool enable_fused_scan_filter = true;
+  fused_scan_policy fused_scan;
   std::vector<filter_column_directive> filters;                 // range conjuncts
   std::vector<bool8_filter_directive> bool8_filters;            // dictionary-answered equalities
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes
@@ -195,22 +204,30 @@ struct scan_filter_request {
   int64_t keep_mask_rows          = 0;
   // On an applied decode only selected[0, n) are returned, in order; the columns past n act only as
   // wave-1 filter sources and are neither decoded nor gathered in wave 2. Unset = every selected
-  // column. Outside [1, selected.size()] the request is refused (plain decode). Every non-applied
-  // outcome (refused, declined_unselective, failed, or an assembly refusal) returns every selected
-  // column.
+  // column. Outside [1, selected.size()] the request is refused (plain decode). Every successful
+  // non-applied return holds every selected column. Execution failures throw without publishing
+  // output.
   std::optional<std::size_t> delivered_prefix;
+  // Optional per-column output types, parallel to `selected`: the type the caller will restore a
+  // column to. Applied only where the decode can widen to it directly (see decode_selection).
+  std::vector<std::optional<cudf::data_type>> output_types;
+  // Report how many rows the membership probes kept, together and one by one
+  // (scan_filter_result::membership_rows_* and membership_probe_rows). The counts are kernels on
+  // the CNT wave's stream that copy back with its one host sync; callers still ask only while they
+  // need the measurement.
+  bool measure_membership = false;
 };
 
 // Outcome of a decompress_scan_filter call. `declined_unselective` is worth remembering
 // per scan: chunks are unclustered, so one such batch predicts the rest and the caller
 // drops row selection from its remaining batches. The orchestrator stays stateless.
 enum class scan_filter_status : uint8_t {
-  refused = 0,               // gate off / nothing requested / a precondition failed
-                             // (no device work was done)
+  refused = 0,               // semantic refusal: gate/precondition, declined sources,
+                             // or unsupported null policy; preparatory work may have completed
   applied              = 1,  // the filtered decode produced the batch
   declined_unselective = 2,  // too many rows survived to pay for compacting; wave-1 cost paid,
                              // ordinary full-width output
-  failed = 3,                // mid-flight failure; full-width output (exceptional)
+  failed = 3,                // filtered execution failed; the call throws, no output is published
 };
 
 // Selection data surviving the converter call, owned by the batch (freed with
@@ -230,6 +247,22 @@ struct scan_filter_result {
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no
                                      // tier_b output or survivor_count == 0)
+  // How many membership probes ran (not capped, not declined) on a counted selection (status
+  // applied or declined_unselective); 0 otherwise.
+  size_t membership_probes_applied = 0;
+  // Filled only for scan_filter_request::measure_membership when at least one membership probe ran
+  // and the selection was counted: the rows the probes were evaluated on (those surviving every
+  // other source) and the rows that also passed every probe that ran.
+  int64_t membership_rows_in  = -1;
+  int64_t membership_rows_out = -1;
+  // One probe's share of that measurement: the rows it was evaluated on, which passed every
+  // earlier probe in request order, and the rows it kept. -1 for a probe that did not run.
+  struct membership_probe_rows {
+    int64_t rows_in  = -1;
+    int64_t rows_out = -1;
+  };
+  // Parallel to scan_filter_request::membership_filters when membership_rows_in is filled.
+  std::vector<membership_probe_rows> membership_probe_rows;
 
   selection_mask view()
   {
@@ -262,14 +295,32 @@ void combine_masks_and(uint32_t* dst_words,
                        int64_t num_words,
                        ::cuda::stream_ref stream);
 
+// *count += the rows set in the AND of src_words[0..num_srcs), counting the FULL padded strip
+// (num_words = WordsFor(num_rows), so the tail-zero invariant keeps padding out of the count).
+// Asynchronous: the caller zeroes *count first and reads it back later, for example through
+// run_selection_cnt's `counters`. num_srcs in [1, 8].
+void count_masked_rows(uint32_t const* const* src_words,
+                       int num_srcs,
+                       int64_t num_words,
+                       uint32_t* count,
+                       ::cuda::stream_ref stream);
+
+// Device counters to copy back with the CNT wave's host sync: `host.size()` uint32 values at
+// `device`, which the caller filled on the same stream before the call.
+struct counter_readback {
+  uint32_t const* device = nullptr;
+  std::span<uint32_t> host;
+};
+
 // CNT wave: per-chunk popcount (word-per-thread, warp-reduced) + CUB exclusive
 // scan into mask.chunk_offsets (pre-allocated, ChunksFor(num_rows)+1 entries),
 // then a 1-thread tail kernel for the sentinel. Copies the total back to the
 // host — this HOST-SYNCS `stream` once (the survivor count gates wave-2
-// allocations). Fills mask.survivor_count and returns it.
+// allocations) — together with any `counters`. Fills mask.survivor_count and returns it.
 int64_t run_selection_cnt(selection_mask& mask,
                           ::cuda::stream_ref stream,
-                          rmm::device_async_resource_ref mr);
+                          rmm::device_async_resource_ref mr,
+                          counter_readback counters = {});
 
 // Expand the mask to ascending int32 survivor row ids (TierB gather map).
 // Requires run_selection_cnt to have filled chunk_offsets/survivor_count.

@@ -2,6 +2,7 @@
 
 #include "sirius_extension.hpp"
 
+#include "duckdb/storage/object_cache.hpp"
 #include "sirius/duckdb.hpp"
 
 #define SIRIUS_STRINGIFY_IMPL(name) #name
@@ -9,6 +10,14 @@
 #define SIRIUS_ENTRY(name)          DUCKDB_CPP_EXTENSION_ENTRY(name, loader)
 
 namespace duckdb {
+
+// Tells the sirius loader that backend initialization started, so it propagates a failure instead
+// of falling back to the CPU. The loader looks the key up by name.
+struct SiriusBackendInitStarted : ObjectCacheEntry {
+  static constexpr char const* KEY = "sirius_backend_init_started";
+  std::string GetObjectType() override { return KEY; }
+  optional_idx GetEstimatedCacheMemory() const override { return optional_idx(); }
+};
 
 static void LoadInternal(ExtensionLoader& loader)
 {
@@ -22,6 +31,8 @@ static void LoadInternal(ExtensionLoader& loader)
     if (loader.GetDatabaseInstance().ExtensionIsLoaded(other)) {
       throw InvalidInputException("Cannot load %s while %s is already loaded", name, other);
     }
+    auto& cache = loader.GetDatabaseInstance().GetObjectCache();
+    cache.Put(SiriusBackendInitStarted::KEY, make_shared_ptr<SiriusBackendInitStarted>());
   }
   sirius::register_duckdb_extension(loader);
 }

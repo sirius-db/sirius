@@ -17,16 +17,32 @@
 #include "catch.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
-#include "utils/sirius_test_env.hpp"
+#include "utils/log_test_utils.hpp"
+
+#include <cucascade/exec/thread_util.hpp>
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/tls/config.hpp>
+#include <cucascade/io/uring/config.hpp>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
-using sirius::io::cache::cache_mode;
-using sirius::io::cache::eviction_policy;
+using cucascade::io::cache::cache_mode;
+using cucascade::io::cache::eviction_policy;
 using sirius::scan_manager::enum_to_string;
 using sirius::scan_manager::io_backend;
 using sirius::scan_manager::scan_manager_config;
@@ -37,7 +53,7 @@ namespace {
 class scoped_yaml {
  public:
   explicit scoped_yaml(std::string const& name, std::string const& text)
-    : path_(std::filesystem::temp_directory_path() / name)
+    : path_(std::filesystem::temp_directory_path() / (std::to_string(::getpid()) + "_" + name))
   {
     std::ofstream out(path_);
     out << text;
@@ -94,22 +110,68 @@ std::string single_gpu_scan_manager_yaml(std::string const& body)
          body;
 }
 
+std::string uring_yaml(std::string const& body)
+{
+  return scan_manager_yaml("      uring:\n" + body);
+}
+
+std::string rest_yaml(std::string const& body) { return scan_manager_yaml("      rest:\n" + body); }
+
+std::string tls_yaml(std::string const& body) { return rest_yaml("        tls:\n" + body); }
+
+/// Loading @p text must fail, and the error must end with @p message (the loader
+/// prefixes it with the file it was reading).
+void require_load_error(std::string const& name,
+                        std::string const& text,
+                        std::string const& message)
+{
+  scoped_yaml yaml(name, text);
+  sirius::sirius_config cfg;
+  REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::EndsWith(": " + message));
+}
+
+/// The hardware defaults a config loaded from a file resolves to on this machine: the unnamed
+/// REST reactor count follows this machine's kTLS state and egress NIC.
+sirius::exec::hardware_thread_defaults machine_thread_defaults()
+{
+  auto const kernel_tls = cucascade::memory::discover_kernel_tls();
+  auto const irq_cpus = sirius::rest_reactor_irq_cpus(kernel_tls, sirius::discover_egress_nic(""));
+  return sirius::exec::derive_thread_defaults(
+    std::thread::hardware_concurrency(), 1, kernel_tls.loaded, irq_cpus);
+}
+
 }  // namespace
 
 TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
           "[scan_manager][config][preparation_config]")
 {
-  auto [body, residence_ms, interrupt_ms] = GENERATE(table<std::string, int, int>({
-    {"", 10, 10},
-    {"      preparation: {}\n", 10, 10},
-    {"      preparation:\n        underfilled_batch_residence: 25ms\n", 25, 10},
-    {"      preparation:\n        interrupt_check_interval: 3\n", 10, 3},
-    {"      preparation:\n        underfilled_batch_residence: 0\n"
-     "        interrupt_check_interval: 1s\n",
-     0,
-     1000},
-    {"      preparation:\n        underfilled_batch_residence: 0ms\n", 0, 10},
-  }));
+  auto [body, fill, min_ms, max_ms, interrupt_ms] =
+    GENERATE(table<std::string, int, int, int, int>({
+      {"", 50, 50, 2000, 10},
+      {"      preparation: {}\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_metadata_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        max_inflight_dv_jobs: 0\n", 50, 50, 2000, 10},
+      {"      preparation:\n        interrupt_check_interval: 3\n", 50, 50, 2000, 3},
+      {"      preparation:\n        interrupt_check_interval: 1s\n", 50, 50, 2000, 1000},
+      {"      preparation:\n        partial_batch: {}\n", 50, 50, 2000, 10},
+      {"      preparation:\n        partial_batch:\n          min_fill_percent: 25\n",
+       25,
+       50,
+       2000,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 20\n"
+       "          max_residence: 500ms\n",
+       50,
+       20,
+       500,
+       10},
+      {"      preparation:\n        partial_batch:\n          min_residence: 1s\n"
+       "          max_residence: 1s\n",
+       50,
+       1000,
+       1000,
+       10},
+    }));
   INFO(body);
   scoped_yaml yaml("sirius_preparation_timing.yaml", scan_manager_yaml(body));
   cucascade::memory::system_topology_info topology{};
@@ -120,20 +182,20 @@ TEST_CASE("Preparation timing YAML overrides survive configuration resolution",
   auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
   auto const& config      = resolved.get_scan_manager_config();
   auto options            = config.preparation.resolve(config.thread_pool.num_threads);
-  if (residence_ms == 0)
-    CHECK_FALSE(options.underfilled_batch_residence);
-  else
-    CHECK(options.underfilled_batch_residence == std::chrono::milliseconds{residence_ms});
+  REQUIRE(options.partial_batch);
+  CHECK(options.partial_batch->min_fill_percent == static_cast<size_t>(fill));
+  CHECK(options.partial_batch->min_residence == std::chrono::milliseconds{min_ms});
+  CHECK(options.partial_batch->max_residence == std::chrono::milliseconds{max_ms});
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{interrupt_ms});
-  CHECK(options.max_inflight_jobs == static_cast<size_t>(config.thread_pool.num_threads));
+  CHECK(options.max_inflight_metadata_jobs ==
+        (body.find("max_inflight_metadata_jobs: 0") != std::string::npos ? 0 : 4096));
+  CHECK(options.max_inflight_dv_jobs == 0);
 }
 
 TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
           "[scan_manager][config][preparation_config]")
 {
-  auto field = GENERATE("underfilled_batch_residence: -1ms",
-                        "underfilled_batch_residence: later",
-                        "interrupt_check_interval: 0",
+  auto field = GENERATE("interrupt_check_interval: 0",
                         "interrupt_check_interval: -1ms",
                         "interrupt_check_interval: later",
                         "interrupt_check_interval: []",
@@ -146,20 +208,50 @@ TEST_CASE("Preparation timing YAML rejects invalid values and unknown keys",
                   sirius::configuration_input_error);
 }
 
-TEST_CASE("Preparation limit YAML overrides preserve omitted worker-derived defaults",
-          "[scan_manager][config][preparation_config]")
+TEST_CASE("Partial batch YAML rejects invalid policies and unknown keys",
+          "[scan_manager][config][preparation_config][partial_batch]")
 {
-  auto selected = GENERATE(0, 1, 2, 3, 4, 5);
-  std::array keys{"max_inflight_jobs",
-                  "max_active_units",
-                  "max_pending_results",
+  auto field = GENERATE("min_fill_percent: 0",
+                        "min_fill_percent: -1",
+                        "min_fill_percent: 101",
+                        "min_fill_percent: 1.5",
+                        "min_fill_percent: []",
+                        "min_residence: 0ms",
+                        "min_residence: -1ms",
+                        "min_residence: later",
+                        "max_residence: 0",
+                        "max_residence: 49ms",
+                        "max_residence: []",
+                        "min_residence: 3s",
+                        "min_fill: 50");
+  INFO(field);
+  scoped_yaml yaml(
+    "sirius_partial_batch_invalid.yaml",
+    scan_manager_yaml(std::string("      preparation:\n        partial_batch:\n          ") +
+                      field + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
+TEST_CASE("Preparation limit YAML overrides preserve omitted defaults",
+          "[scan_manager][config][preparation_config][native_runtime]")
+{
+  auto selected = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  std::array keys{"max_inflight_metadata_jobs",
+                  "max_inflight_dv_jobs",
+                  "lookahead_batches",
                   "max_control_work",
-                  "drain_quantum"};
-  std::array<size_t, 5> values{1, 7, 9, 4, 5};
-  std::string body = "      num_threads: 3\n      preparation:\n";
+                  "drain_quantum",
+                  "native_reader_workers",
+                  "max_native_readers",
+                  "coordinator_workers"};
+  std::array<size_t, 8> values{1, 2, 7, 4, 5, 5, 8, 3};
+  auto const workers = GENERATE(1, 3);
+  std::string body   = "      num_threads: " + std::to_string(workers) + "\n      preparation:\n";
   for (size_t i = 0; i < keys.size(); ++i)
-    if (selected == 5 || selected == static_cast<int>(i))
+    if (selected == 8 || selected == static_cast<int>(i))
       body += std::string("        ") + keys[i] + ": " + std::to_string(values[i]) + "\n";
+  if (selected == 9) body += "        coordinator_workers: 0\n";
   INFO(body);
   scoped_yaml yaml("sirius_preparation_limits.yaml", scan_manager_yaml(body));
   cucascade::memory::system_topology_info topology{};
@@ -169,32 +261,44 @@ TEST_CASE("Preparation limit YAML overrides preserve omitted worker-derived defa
   topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
   auto resolved           = sirius::parsed_sirius_config::from_file(yaml.path()).resolve(topology);
   auto const& config      = resolved.get_scan_manager_config();
-  REQUIRE(config.thread_pool.num_threads == 3);
+  REQUIRE(config.thread_pool.num_threads == workers);
   auto options = config.preparation.resolve(config.thread_pool.num_threads);
-  std::array actual{options.max_inflight_jobs,
-                    options.max_active_units,
-                    options.max_pending_results,
+  std::array actual{options.max_inflight_metadata_jobs,
+                    options.max_inflight_dv_jobs,
+                    options.lookahead_batches,
                     options.max_control_work,
-                    options.drain_quantum};
-  std::array<size_t, 5> defaults{3, 6, 6, 3, 3};
+                    options.drain_quantum,
+                    config.preparation.resolved_native_workers(),
+                    config.preparation.resolved_native_readers(),
+                    config.preparation.resolved_coordinator_workers()};
+  std::array<size_t, 8> defaults{4096, 0, 2, size_t(workers), size_t(workers), 2, 64, 1};
   for (size_t i = 0; i < keys.size(); ++i) {
     INFO(keys[i]);
-    CHECK(actual[i] ==
-          ((selected == 5 || selected == static_cast<int>(i)) ? values[i] : defaults[i]));
+    auto expected = (selected == 8 || selected == static_cast<int>(i)) ? values[i] : defaults[i];
+    if (selected == 9 && i == 7) expected = 0;
+    CHECK(actual[i] == expected);
   }
-  CHECK(options.underfilled_batch_residence == std::chrono::milliseconds{10});
+  CHECK(options.partial_batch);
   CHECK(options.interrupt_check_interval == std::chrono::milliseconds{10});
 }
 
-TEST_CASE("Preparation limit YAML rejects nonpositive and malformed values",
+TEST_CASE("Preparation limit YAML rejects invalid values",
           "[scan_manager][config][preparation_config]")
 {
-  auto key   = GENERATE("max_inflight_jobs",
-                      "max_active_units",
-                      "max_pending_results",
+  auto key   = GENERATE("max_inflight_metadata_jobs",
+                      "max_inflight_dv_jobs",
+                      "lookahead_batches",
                       "max_control_work",
-                      "drain_quantum");
+                      "drain_quantum",
+                      "native_reader_workers",
+                      "max_native_readers",
+                      "coordinator_workers");
   auto value = GENERATE("0", "-1", "1.5", "many", "[]", "18446744073709551616");
+  if ((std::string_view(key) == "max_inflight_metadata_jobs" ||
+       std::string_view(key) == "max_inflight_dv_jobs" ||
+       std::string_view(key) == "coordinator_workers") &&
+      std::string_view(value) == "0")
+    return;
   INFO(key << ": " << value);
   scoped_yaml yaml(
     "sirius_preparation_limit_invalid.yaml",
@@ -203,43 +307,52 @@ TEST_CASE("Preparation limit YAML rejects nonpositive and malformed values",
                   sirius::configuration_input_error);
 }
 
+TEST_CASE("Preparation YAML rejects retired keys", "[scan_manager][config][preparation_config]")
+{
+  auto key = GENERATE("max_active_units", "max_pending_results", "max_inflight_jobs");
+  scoped_yaml yaml("sirius_preparation_old_window.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + key + ": 8\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
+}
+
 TEST_CASE("cache_mode string_to_enum accepts known modes", "[scan_manager][config][cache_mode]")
 {
-  cache_mode mode = cache_mode::sirius;
+  cache_mode mode = cache_mode::cucs;
 
-  REQUIRE(sirius::io::cache::string_to_enum("none", mode));
+  REQUIRE(cucascade::io::cache::string_to_enum("none", mode));
   CHECK(mode == cache_mode::none);
 
-  REQUIRE(sirius::io::cache::string_to_enum("os", mode));
+  REQUIRE(cucascade::io::cache::string_to_enum("os", mode));
   CHECK(mode == cache_mode::os);
 
-  REQUIRE(sirius::io::cache::string_to_enum("sirius", mode));
-  CHECK(mode == cache_mode::sirius);
+  REQUIRE(cucascade::io::cache::string_to_enum("cucs", mode));
+  CHECK(mode == cache_mode::cucs);
 }
 
 TEST_CASE("cache_mode string_to_enum rejects unknown modes", "[scan_manager][config][cache_mode]")
 {
-  cache_mode mode = cache_mode::sirius;
+  cache_mode mode = cache_mode::cucs;
 
-  CHECK_FALSE(sirius::io::cache::string_to_enum("", mode));
-  CHECK_FALSE(sirius::io::cache::string_to_enum("SIRIUS", mode));
-  CHECK_FALSE(sirius::io::cache::string_to_enum("odirect", mode));
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("", mode));
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("CUCS", mode));
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("odirect", mode));
   // The pre-consolidation spellings are gone, not silently remapped.
-  CHECK_FALSE(sirius::io::cache::string_to_enum("persistent", mode));
-  CHECK_FALSE(sirius::io::cache::string_to_enum("prefetch", mode));
-  CHECK(mode == cache_mode::sirius);
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("persistent", mode));
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("prefetch", mode));
+  CHECK(mode == cache_mode::cucs);
 }
 
 TEST_CASE("cache_mode enum_to_string returns canonical names", "[scan_manager][config][cache_mode]")
 {
   std::string out;
 
-  REQUIRE(sirius::io::cache::enum_to_string(cache_mode::none, out));
+  REQUIRE(cucascade::io::cache::enum_to_string(cache_mode::none, out));
   CHECK(out == "none");
-  REQUIRE(sirius::io::cache::enum_to_string(cache_mode::os, out));
+  REQUIRE(cucascade::io::cache::enum_to_string(cache_mode::os, out));
   CHECK(out == "os");
-  REQUIRE(sirius::io::cache::enum_to_string(cache_mode::sirius, out));
-  CHECK(out == "sirius");
+  REQUIRE(cucascade::io::cache::enum_to_string(cache_mode::cucs, out));
+  CHECK(out == "cucs");
 }
 
 TEST_CASE("eviction_policy round-trips through its YAML spelling",
@@ -247,31 +360,37 @@ TEST_CASE("eviction_policy round-trips through its YAML spelling",
 {
   eviction_policy policy = eviction_policy::lru;
 
-  REQUIRE(sirius::io::cache::string_to_enum("idle", policy));
+  REQUIRE(cucascade::io::cache::string_to_enum("idle", policy));
   CHECK(policy == eviction_policy::idle);
-  REQUIRE(sirius::io::cache::string_to_enum("lru", policy));
+  REQUIRE(cucascade::io::cache::string_to_enum("lru", policy));
   CHECK(policy == eviction_policy::lru);
-  CHECK_FALSE(sirius::io::cache::string_to_enum("fifo", policy));
+  CHECK_FALSE(cucascade::io::cache::string_to_enum("fifo", policy));
   CHECK(policy == eviction_policy::lru);
 
   std::string out;
-  REQUIRE(sirius::io::cache::enum_to_string(eviction_policy::idle, out));
+  REQUIRE(cucascade::io::cache::enum_to_string(eviction_policy::idle, out));
   CHECK(out == "idle");
-  REQUIRE(sirius::io::cache::enum_to_string(eviction_policy::lru, out));
+  REQUIRE(cucascade::io::cache::enum_to_string(eviction_policy::lru, out));
   CHECK(out == "lru");
 }
 
-TEST_CASE("scan_manager_config defaults to the none cache mode",
+TEST_CASE("scan_manager_config defaults to the cucs cache with LRU eviction",
           "[scan_manager][config][cache_mode]")
 {
   scan_manager_config cfg{};
 
-  CHECK(cfg.cache.mode == cache_mode::none);
+  CHECK(cfg.cache.mode == cache_mode::cucs);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
   CHECK(cfg.uring.use_odirect);
-  CHECK_FALSE(cfg.cache.enabled());
-  CHECK_FALSE(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.enabled());
+  CHECK(cfg.cache.use_fs_cache());
   CHECK_FALSE(cfg.cache.dispose_on_idle);
+
+  auto const io = cfg.to_io_config();
+  CHECK(io.cache.mode == cache_mode::cucs);
+  CHECK(io.cache.eviction == eviction_policy::lru);
+  CHECK(io.cache.use_fs_cache());
+  CHECK_FALSE(io.cache.dispose_on_idle);
 }
 
 TEST_CASE("apply_cache_mode derives the knobs for every mode", "[scan_manager][config][cache_mode]")
@@ -282,25 +401,25 @@ TEST_CASE("apply_cache_mode derives the knobs for every mode", "[scan_manager][c
   cfg.apply_cache_mode();
   CHECK(cfg.uring.use_odirect);
   CHECK_FALSE(cfg.cache.enabled());
-  CHECK_FALSE(cfg.cache.use_prefetching_cache());
+  CHECK_FALSE(cfg.cache.use_fs_cache());
 
   cfg.cache.mode = cache_mode::os;
   cfg.apply_cache_mode();
   CHECK_FALSE(cfg.uring.use_odirect);
   CHECK(cfg.cache.enabled());
-  CHECK_FALSE(cfg.cache.use_prefetching_cache());
+  CHECK_FALSE(cfg.cache.use_fs_cache());
 
-  cfg.cache.mode     = cache_mode::sirius;
+  cfg.cache.mode     = cache_mode::cucs;
   cfg.cache.eviction = eviction_policy::lru;
   cfg.apply_cache_mode();
   CHECK(cfg.uring.use_odirect);
-  CHECK(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.use_fs_cache());
   CHECK_FALSE(cfg.cache.dispose_on_idle);
 
   cfg.cache.eviction = eviction_policy::idle;
   cfg.apply_cache_mode();
   CHECK(cfg.uring.use_odirect);
-  CHECK(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.use_fs_cache());
   CHECK(cfg.cache.dispose_on_idle);
 }
 
@@ -325,41 +444,77 @@ TEST_CASE("sirius_config derives scan_manager knobs from the cache block",
   auto const os = load_scan_manager("sirius_cache_mode_os.yaml", cache_yaml("        mode: os\n"));
   CHECK(os.cache.mode == cache_mode::os);
   CHECK_FALSE(os.uring.use_odirect);
-  CHECK_FALSE(os.cache.use_prefetching_cache());
+  CHECK_FALSE(os.cache.use_fs_cache());
 
   auto const lru = load_scan_manager("sirius_cache_mode_lru.yaml",
-                                     cache_yaml("        mode: sirius\n"
+                                     cache_yaml("        mode: cucs\n"
                                                 "        eviction: lru\n"));
-  CHECK(lru.cache.mode == cache_mode::sirius);
+  CHECK(lru.cache.mode == cache_mode::cucs);
   CHECK(lru.uring.use_odirect);
-  CHECK(lru.cache.use_prefetching_cache());
+  CHECK(lru.cache.use_fs_cache());
   CHECK_FALSE(lru.cache.dispose_on_idle);
 
   auto const idle = load_scan_manager("sirius_cache_mode_idle.yaml",
-                                      cache_yaml("        mode: sirius\n"
+                                      cache_yaml("        mode: cucs\n"
                                                  "        eviction: idle\n"));
-  CHECK(idle.cache.mode == cache_mode::sirius);
+  CHECK(idle.cache.mode == cache_mode::cucs);
   CHECK(idle.uring.use_odirect);
-  CHECK(idle.cache.use_prefetching_cache());
+  CHECK(idle.cache.use_fs_cache());
   CHECK(idle.cache.dispose_on_idle);
 }
 
-TEST_CASE("sirius_config defaults the cache mode to none when YAML omits it",
+TEST_CASE("sirius_config accepts the deprecated sirius cache mode as cucs",
+          "[scan_manager][config][cache_mode]")
+{
+  // `sirius` named the prefetching cache before it moved to cuCascade; existing
+  // YAML keeps working and selects the same cache.
+  auto const cfg =
+    load_scan_manager("sirius_cache_mode_sirius_alias.yaml", cache_yaml("        mode: sirius\n"));
+  CHECK(cfg.cache.mode == cache_mode::cucs);
+  CHECK(cfg.cache.use_fs_cache());
+  CHECK(cfg.uring.use_odirect);
+}
+
+TEST_CASE("sirius_config defaults the cache mode to cucs when YAML omits it",
           "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_mode_default.yaml",
                                      scan_manager_yaml("      uring_n_reactors: 2\n"));
 
-  CHECK(cfg.cache.mode == cache_mode::none);
+  CHECK(cfg.cache.mode == cache_mode::cucs);
   CHECK(cfg.cache.eviction == eviction_policy::lru);
   CHECK(cfg.uring.use_odirect);
-  CHECK_FALSE(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.use_fs_cache());
+  CHECK_FALSE(cfg.cache.dispose_on_idle);
+}
+
+TEST_CASE("sirius_config allows disabling the default cache or overriding its eviction",
+          "[scan_manager][config][cache_mode]")
+{
+  auto const off =
+    load_scan_manager("sirius_cache_disabled.yaml", cache_yaml("        mode: none\n"));
+  CHECK(off.cache.mode == cache_mode::none);
+  CHECK_FALSE(off.cache.enabled());
+  CHECK_FALSE(off.cache.use_fs_cache());
+  CHECK(off.uring.use_odirect);
+  CHECK(off.resolve_readahead(7, sirius::scan_manager::prefetch_strategy::eager).budget == 0);
+
+  auto const idle =
+    load_scan_manager("sirius_cache_default_idle.yaml", cache_yaml("        eviction: idle\n"));
+  CHECK(idle.cache.mode == cache_mode::cucs);
+  CHECK(idle.cache.eviction == eviction_policy::idle);
+  CHECK(idle.cache.dispose_on_idle);
+
+  auto const empty =
+    load_scan_manager("sirius_cache_empty.yaml", scan_manager_yaml("      cache: {}\n"));
+  CHECK(empty.cache.mode == cache_mode::cucs);
+  CHECK(empty.cache.eviction == eviction_policy::lru);
 }
 
 TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_tunables.yaml",
-                                     cache_yaml("        mode: sirius\n"
+                                     cache_yaml("        mode: cucs\n"
                                                 "        eviction: idle\n"
                                                 "        eviction_threshold_fraction: 0.25\n"
                                                 "        min_prefetching_budget_fraction: 0.5\n"));
@@ -406,10 +561,11 @@ TEST_CASE("max_readahead_scans overrides the cache-derived readahead budget",
 
   scan_manager_config cfg{};
   // Unset + no cache: nothing to read ahead into.
+  cfg.cache.mode = cache_mode::none;
   CHECK(cfg.resolve_readahead(backend_budget, backend_strategy).budget == 0);
 
   // Unset + a cache on: the backend reactor's own depth.
-  cfg.cache.mode = cache_mode::sirius;
+  cfg.cache.mode = cache_mode::cucs;
   CHECK(cfg.resolve_readahead(backend_budget, backend_strategy).budget == backend_budget);
 
   // Explicitly zero: off, cache or no cache.
@@ -421,7 +577,7 @@ TEST_CASE("max_readahead_scans overrides the cache-derived readahead budget",
   // Explicitly positive: that count, even with the cache off.
   cfg.max_readahead_scans = 3;
   CHECK(cfg.resolve_readahead(backend_budget, backend_strategy).budget == 3);
-  cfg.cache.mode = cache_mode::sirius;
+  cfg.cache.mode = cache_mode::cucs;
   CHECK(cfg.resolve_readahead(backend_budget, backend_strategy).budget == 3);
 }
 
@@ -432,7 +588,7 @@ TEST_CASE("readahead_strategy defers to the backend until it is set",
   constexpr std::size_t backend_budget = 7;
 
   scan_manager_config cfg{};
-  cfg.cache.mode = cache_mode::sirius;
+  cfg.cache.mode = cache_mode::cucs;
 
   // Unset: whatever the serving backend prefers, either way.
   REQUIRE_FALSE(cfg.readahead_strategy.has_value());
@@ -457,7 +613,7 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
   constexpr std::size_t backend_budget = 7;
 
   scan_manager_config cfg{};
-  cfg.cache.mode     = cache_mode::sirius;
+  cfg.cache.mode     = cache_mode::cucs;
   cfg.pipeline_width = 2;
 
   // Opportunistic issues one prefetch per non-scan deployment, so the budget
@@ -483,22 +639,27 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
 TEST_CASE("apply_defaults derives the readahead budgets like the file path does",
           "[scan_manager][config][readahead]")
 {
-  constexpr auto pipeline_threads =
-    static_cast<std::size_t>(std::max(1, sirius::exec::default_gpu_pipeline_num_threads));
-
   sirius::sirius_config cfg;
   cfg.apply_defaults();
+  auto const pipeline_threads =
+    static_cast<std::size_t>(cfg.get_gpu_pipeline_executor_config().num_threads);
   auto const& scan_manager = cfg.get_scan_manager_config();
 
+  CHECK(scan_manager.cache.mode == cache_mode::cucs);
+  CHECK(scan_manager.cache.eviction == eviction_policy::lru);
+  CHECK(scan_manager.cache.use_fs_cache());
+  CHECK_FALSE(scan_manager.cache.dispose_on_idle);
+
   // Having no sirius.yaml must size the readahead exactly like an empty one.
-  // The local (uring) backend defaults to 0 (readahead off); the rest backend
+  // The local (uring) backend defaults to the pipeline width; the rest backend
   // defaults to max(8, 2x the pipeline width).
   CHECK(scan_manager.pipeline_width == pipeline_threads);
-  CHECK(scan_manager.uring.n_max_concurrent_scans == 0);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == pipeline_threads);
+  CHECK_FALSE(scan_manager.uring.n_max_concurrent_scans_explicit);
   CHECK(scan_manager.rest.n_max_concurrent_scans == std::max<std::size_t>(8, 2 * pipeline_threads));
 }
 
-TEST_CASE("uring scan budget defaults off and honors an explicit value",
+TEST_CASE("uring scan budget defaults to the pipeline width unless set",
           "[scan_manager][config][readahead]")
 {
   constexpr std::size_t pipeline_width = 7;
@@ -523,18 +684,18 @@ TEST_CASE("uring scan budget defaults off and honors an explicit value",
     return text;
   };
 
-  // Omitted: the local backend is off by default and is NOT scaled to the
-  // pipeline width any more.
+  // Omitted: the local backend takes one scan per pipeline thread, and the value is a
+  // derived default rather than a named one.
   auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
   CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
-  CHECK(omitted.uring.n_max_concurrent_scans == 0);
+  CHECK(omitted.uring.n_max_concurrent_scans == pipeline_width);
 
-  // An explicit 0 is still recorded as explicit (== the struct default).
+  // An explicit 0 is recorded as explicit and keeps the local readahead off.
   auto const explicit_zero = load_scan_manager("sirius_uring_budget_explicit_zero.yaml", yaml(0));
   CHECK(explicit_zero.uring.n_max_concurrent_scans_explicit);
   CHECK(explicit_zero.uring.n_max_concurrent_scans == 0);
 
-  // An explicit positive value opts the local path back in and wins.
+  // An explicit positive value wins over the pipeline width.
   auto const explicit_other =
     load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
   CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
@@ -558,6 +719,158 @@ TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][rea
   CHECK(*budget.max_readahead_scans == 12);
 }
 
+TEST_CASE("reserve_rest_reactor_cpus keeps the thread pools off the planned reactor CPUs",
+          "[scan_manager][config][rest_placement]")
+{
+  auto const load = [](std::string const& name, std::string const& body) {
+    scoped_yaml yaml(name, scan_manager_yaml(body));
+    sirius::sirius_config cfg;
+    cfg.load_from_file(yaml.path());
+    return cfg;
+  };
+  auto const pool_affinities = [](sirius::sirius_config const& cfg) {
+    return std::array<std::vector<int>, 4>{
+      cfg.get_gpu_pipeline_executor_config().cpu_affinity_list,
+      cfg.get_scan_manager_config().thread_pool.cpu_affinity_list,
+      cfg.get_task_creator_config().thread_pool.cpu_affinity_list,
+      cfg.get_downgrade_executor_config().thread_pool.cpu_affinity_list};
+  };
+
+  // Unpinned reactors reserve nothing and leave every pool alone.
+  auto const unpinned = load("sirius_reserve_unpinned.yaml",
+                             "      rest_n_reactors: 0\n"
+                             "      rest:\n"
+                             "        pin_to_irq_cpus: false\n");
+  CHECK(unpinned.get_rest_reactor_cpus().empty());
+  for (auto const& affinity : pool_affinities(unpinned)) {
+    CHECK(affinity.empty());
+  }
+
+  // The switch off: nothing reserved even where the reactors would pin.
+  auto const off = load("sirius_reserve_off.yaml",
+                        "      rest_n_reactors: 0\n"
+                        "      reserve_rest_reactor_cpus: false\n");
+  CHECK_FALSE(off.get_scan_manager_config().reserve_rest_reactor_cpus);
+  CHECK(off.get_rest_reactor_cpus().empty());
+
+  // The default: exactly cuCascade's plan for this host (empty unless its NIC IRQs are steered),
+  // and no pool keeps any of those CPUs.
+  auto const on = load("sirius_reserve_on.yaml", "      rest_n_reactors: 0\n");
+  CHECK(on.get_scan_manager_config().reserve_rest_reactor_cpus);
+  auto const planned =
+    cucascade::io::rest::planned_reactor_cpus(0, on.get_scan_manager_config().rest);
+  auto const allowed = cucascade::exec::thread_util::get_current_thread_affinity();
+  bool const room    = std::any_of(allowed.begin(), allowed.end(), [&](int cpu) {
+    return std::find(planned.begin(), planned.end(), cpu) == planned.end();
+  });
+  if (planned.empty() || !room) {
+    CHECK(on.get_rest_reactor_cpus().empty());
+    CHECK(on.get_scan_manager_config().rest_placement_cpus.empty());
+  } else {
+    CHECK(on.get_rest_reactor_cpus() == planned);
+    // REST contexts built later, from restricted pool threads, plan from the configuring mask.
+    CHECK(on.get_scan_manager_config().rest_placement_cpus == allowed);
+    for (auto const& affinity : pool_affinities(on)) {
+      CHECK_FALSE(affinity.empty());
+      for (int const cpu : planned) {
+        CHECK(std::find(affinity.begin(), affinity.end(), cpu) == affinity.end());
+      }
+    }
+  }
+}
+
+TEST_CASE("reserve_cpus_for_rest_reactors restricts pools to an injected plan",
+          "[scan_manager][config][rest_placement]")
+{
+  using sirius::exec::thread_pool_config;
+  std::vector<int> const allowed{0, 1, 2, 3, 4, 5, 6, 7};
+  auto const plan_of = [](std::vector<int> cpus) {
+    return [cpus](std::size_t, cucascade::io::rest::config const&) { return cpus; };
+  };
+  struct pools_t {
+    thread_pool_config unset, overlapping, disjoint, all_reserved;
+    std::array<thread_pool_config*, 4> all()
+    {
+      return {&unset, &overlapping, &disjoint, &all_reserved};
+    }
+  };
+  auto const fresh = [] {
+    pools_t pools;
+    pools.overlapping.cpu_affinity_list  = {0, 4, 5};
+    pools.disjoint.cpu_affinity_list     = {5, 6};
+    pools.all_reserved.cpu_affinity_list = {1, 0};
+    return pools;
+  };
+  scan_manager_config cfg;
+
+  SECTION("an unsorted plan is reserved from every pool")
+  {
+    auto pools = fresh();
+    auto const reserved =
+      sirius::reserve_cpus_for_rest_reactors(cfg, plan_of({1, 0}), allowed, pools.all());
+    CHECK(reserved == std::vector<int>{0, 1});
+    CHECK(pools.unset.cpu_affinity_list == std::vector<int>{2, 3, 4, 5, 6, 7});
+    CHECK(pools.overlapping.cpu_affinity_list == std::vector<int>{4, 5});
+    CHECK(pools.disjoint.cpu_affinity_list == std::vector<int>{5, 6});
+    // A pool configured onto reactor CPUs only keeps its configuration.
+    CHECK(pools.all_reserved.cpu_affinity_list == std::vector<int>{1, 0});
+  }
+
+  auto const untouched = [](pools_t& pools) {
+    CHECK(pools.unset.cpu_affinity_list.empty());
+    CHECK(pools.overlapping.cpu_affinity_list == std::vector<int>{0, 4, 5});
+    CHECK(pools.disjoint.cpu_affinity_list == std::vector<int>{5, 6});
+    CHECK(pools.all_reserved.cpu_affinity_list == std::vector<int>{1, 0});
+  };
+
+  SECTION("a plan covering every allowed CPU reserves nothing")
+  {
+    auto pools = fresh();
+    CHECK(
+      sirius::reserve_cpus_for_rest_reactors(cfg, plan_of(allowed), allowed, pools.all()).empty());
+    untouched(pools);
+  }
+
+  SECTION("unpinned reactors (an empty plan) reserve nothing")
+  {
+    auto pools = fresh();
+    CHECK(sirius::reserve_cpus_for_rest_reactors(cfg, plan_of({}), allowed, pools.all()).empty());
+    untouched(pools);
+  }
+
+  SECTION("the opt-out never consults the planner")
+  {
+    cfg.reserve_rest_reactor_cpus = false;
+    bool planned                  = false;
+    auto pools                    = fresh();
+    auto const reserved           = sirius::reserve_cpus_for_rest_reactors(
+      cfg,
+      [&](std::size_t, cucascade::io::rest::config const&) {
+        planned = true;
+        return std::vector<int>{0};
+      },
+      allowed,
+      pools.all());
+    CHECK(reserved.empty());
+    CHECK_FALSE(planned);
+    untouched(pools);
+  }
+
+  SECTION("a discovery failure leaves the pools alone")
+  {
+    auto pools          = fresh();
+    auto const reserved = sirius::reserve_cpus_for_rest_reactors(
+      cfg,
+      [](std::size_t, cucascade::io::rest::config const&) -> std::vector<int> {
+        throw std::runtime_error("no sysfs");
+      },
+      allowed,
+      pools.all());
+    CHECK(reserved.empty());
+    untouched(pools);
+  }
+}
+
 TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_strategy_unset.yaml",
@@ -578,56 +891,109 @@ TEST_CASE("sirius_config reads readahead_strategy", "[scan_manager][config][read
 
 TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b{};
 
+  REQUIRE(string_to_enum("native", b));
+  CHECK(b == io_backend::native);
+
+  // Deprecated spelling of `native`, still accepted.
   REQUIRE(string_to_enum("sirius", b));
-  CHECK(b == io_backend::sirius);
-
-  REQUIRE(string_to_enum("kvikio", b));
-  CHECK(b == io_backend::kvikio);
+  CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend string_to_enum rejects unknown backends", "[scan_manager][config][backend]")
 {
-  io_backend b = io_backend::kvikio;
+  io_backend b{};
 
   CHECK_FALSE(string_to_enum("", b));
+  CHECK_FALSE(string_to_enum("NATIVE", b));
   CHECK_FALSE(string_to_enum("SIRIUS", b));
   CHECK_FALSE(string_to_enum("uring", b));
+  CHECK_FALSE(string_to_enum("kvikio", b));
   CHECK_FALSE(string_to_enum("true", b));
-  CHECK(b == io_backend::kvikio);
+  CHECK(b == io_backend::native);
 }
 
 TEST_CASE("backend enum_to_string returns canonical names", "[scan_manager][config][backend]")
 {
   std::string out;
 
-  REQUIRE(enum_to_string(io_backend::sirius, out));
-  CHECK(out == "sirius");
-  REQUIRE(enum_to_string(io_backend::kvikio, out));
-  CHECK(out == "kvikio");
+  REQUIRE(enum_to_string(io_backend::native, out));
+  CHECK(out == "native");
 }
 
-TEST_CASE("scan_manager_config defaults to the sirius backend", "[scan_manager][config][backend]")
+TEST_CASE("scan_manager_config defaults to the native backend", "[scan_manager][config][backend]")
 {
   scan_manager_config cfg{};
 
-  CHECK(cfg.backend == io_backend::sirius);
+  CHECK(cfg.backend == io_backend::native);
+}
+
+TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_config",
+          "[scan_manager][config][backend]")
+{
+  scan_manager_config cfg{};
+  cfg.uring_n_reactors      = 3;
+  cfg.rest_n_reactors       = 5;
+  cfg.cache.mode            = cache_mode::os;
+  cfg.cache.eviction        = eviction_policy::idle;
+  cfg.object_store.endpoint = "http://object-store.test:9000";
+  cfg.rest.max_connections  = 17;
+
+  auto const io = cfg.to_io_config();
+  CHECK(io.backend == cucascade::io::io_backend::native);
+  CHECK(io.uring_n_reactors == 3);
+  CHECK(io.rest_n_reactors == 5);
+  // A non-default value in each copied sub-config survives the copy.
+  CHECK(io.object_store.endpoint == "http://object-store.test:9000");
+  CHECK(io.rest.max_connections == 17);
+  CHECK(io.cache.eviction == eviction_policy::idle);
+  // Sirius's uring default (readahead off) reaches cuCascade unchanged.
+  CHECK(io.uring.n_max_concurrent_scans == 0);
+  CHECK_FALSE(io.uring.n_max_concurrent_scans_explicit);
+  CHECK(io.rest.n_max_concurrent_scans == cfg.rest.n_max_concurrent_scans);
+  CHECK(io.cache.mode == cache_mode::os);
+  // The cache-derived knobs are refreshed even though apply_cache_mode() was not called.
+  CHECK_FALSE(io.uring.use_odirect);
+  CHECK(io.cache.dispose_on_idle);
+
+  // 0 (size the REST pool from the NIC) is handed to cuCascade as is.
+  cfg.rest_n_reactors = 0;
+  CHECK(cfg.to_io_config().rest_n_reactors == 0);
 }
 
 TEST_CASE("sirius_config reads the backend from YAML", "[scan_manager][config][backend]")
 {
-  auto const kvikio = load_scan_manager("sirius_backend_kvikio.yaml",
-                                        single_gpu_scan_manager_yaml("      backend: kvikio\n"));
-  CHECK(kvikio.backend == io_backend::kvikio);
-
-  auto const sirius = load_scan_manager("sirius_backend_sirius.yaml",
-                                        single_gpu_scan_manager_yaml("      backend: sirius\n"));
-  CHECK(sirius.backend == io_backend::sirius);
+  auto const native = load_scan_manager("sirius_backend_native.yaml",
+                                        single_gpu_scan_manager_yaml("      backend: native\n"));
+  CHECK(native.backend == io_backend::native);
 
   auto const omitted = load_scan_manager("sirius_backend_default.yaml",
                                          scan_manager_yaml("      uring_n_reactors: 2\n"));
-  CHECK(omitted.backend == io_backend::sirius);
+  CHECK(omitted.backend == io_backend::native);
+}
+
+TEST_CASE("sirius_config rejects the removed kvikio backend and block",
+          "[scan_manager][config][backend]")
+{
+  require_load_error("sirius_backend_kvikio_removed.yaml",
+                     single_gpu_scan_manager_yaml("      backend: kvikio\n"),
+                     "'scan_manager.backend': backend: kvikio has been removed; "
+                     "use backend: native instead");
+  for (auto const* block : {"{}", "{task_size: 8 MiB}"}) {
+    require_load_error("sirius_kvikio_block_removed.yaml",
+                       scan_manager_yaml(std::string{"      kvikio: "} + block + "\n"),
+                       "'scan_manager.kvikio': removed; remove this block and use "
+                       "backend: native instead");
+  }
+}
+
+TEST_CASE("sirius_config accepts the deprecated sirius backend as native",
+          "[scan_manager][config][backend]")
+{
+  auto const cfg = load_scan_manager("sirius_backend_sirius_alias.yaml",
+                                     single_gpu_scan_manager_yaml("      backend: sirius\n"));
+  CHECK(cfg.backend == io_backend::native);
 }
 
 TEST_CASE("sirius_config rejects an invalid backend", "[scan_manager][config][backend]")
@@ -680,18 +1046,598 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
-TEST_CASE("sirius_config forces the sirius backend for multi-GPU",
-          "[scan_manager][config][backend][multi_gpu]")
+TEST_CASE("REST and TLS empty YAML blocks preserve cuCascade's transport defaults",
+          "[scan_manager][config][rest][tls]")
 {
-  if (!sirius::test::has_gpus(2)) { return; }
+  // Sirius sets no REST transport defaults of its own beyond the derived ones (the scan budget,
+  // min_mtu and max_connections): an empty block must leave every other field at cuCascade's struct
+  // default (compared field by field, so a cuCascade default change needs no edit here).
+  cucascade::io::rest::config const d{};
+  for (auto const* body : {"        {}\n", "        tls: {}\n"}) {
+    CAPTURE(body);
+    auto const cfg = load_scan_manager("sirius_rest_defaults.yaml", rest_yaml(body));
+    auto const& r  = cfg.rest;
+    CHECK(cfg.rest_n_reactors == machine_thread_defaults().rest_reactors);
+    CHECK(r.request_timeout_s == d.request_timeout_s);
+    CHECK(r.stall_speed_limit_bytes == d.stall_speed_limit_bytes);
+    CHECK(r.stall_time_s == d.stall_time_s);
+    // Derived from this machine's kTLS state: 128 with kTLS loaded, 64 without.
+    CHECK(r.max_connections == sirius::default_rest_max_connections(
+                                 cucascade::memory::discover_kernel_tls(), d.queue_depth));
+    CHECK(r.merge_max_gap == d.merge_max_gap);
+    CHECK(r.upkeep_interval == d.upkeep_interval);
+    CHECK(r.upkeep_http1 == d.upkeep_http1);
+    CHECK(r.conn_max_age == d.conn_max_age);
+    CHECK(r.min_segment_bytes == d.min_segment_bytes);
+    CHECK(r.max_segment_bytes == d.max_segment_bytes);
+    CHECK(r.receive_buffer_bytes == d.receive_buffer_bytes);
+    CHECK(r.queue_depth == d.queue_depth);
+    CHECK(r.iowq_max_unbound == d.iowq_max_unbound);
+    CHECK(r.wait_mode == d.wait_mode);
+    CHECK(r.dns_ttl == d.dns_ttl);
+    CHECK(r.dns_accumulate == d.dns_accumulate);
+    CHECK(r.dns_max_addresses == d.dns_max_addresses);
+    CHECK(r.connect_timeout == d.connect_timeout);
+    CHECK(r.keepalive_idle_s == d.keepalive_idle_s);
+    CHECK(r.keepalive_interval_s == d.keepalive_interval_s);
+    CHECK(r.keepalive_count == d.keepalive_count);
+    // The one transport default Sirius derives (from the egress NIC's MTU) besides the scan budget.
+    CHECK(r.min_mtu == sirius::default_rest_min_mtu(sirius::discover_egress_nic("")));
+    CHECK(r.mtu_reject_max_attempts == d.mtu_reject_max_attempts);
+    CHECK(r.close_with_rst == d.close_with_rst);
+    CHECK(r.fan_out == d.fan_out);
+    CHECK(r.interface == d.interface);
+    CHECK(r.pin_to_irq_cpus == d.pin_to_irq_cpus);
+    CHECK(r.raise_reactor_priority == d.raise_reactor_priority);
+    CHECK(r.max_retry_attempts == d.max_retry_attempts);
+    CHECK(r.max_auth_retry_attempts == d.max_auth_retry_attempts);
+    CHECK(r.retry_backoff_base == d.retry_backoff_base);
+    CHECK(r.retry_jitter == d.retry_jitter);
+    CHECK(r.honor_retry_after == d.honor_retry_after);
+    CHECK(r.footer_probe_bytes == d.footer_probe_bytes);
+    CHECK(r.list_max_matches == d.list_max_matches);
+    CHECK(r.list_max_scanned == d.list_max_scanned);
+    CHECK(r.tls.ktls == d.tls.ktls);
+    CHECK(r.tls.fallback_rx == d.tls.fallback_rx);
+    CHECK(r.tls.placement == d.tls.placement);
+    CHECK(r.tls.min_version == d.tls.min_version);
+    CHECK(r.tls.max_version == d.tls.max_version);
+    CHECK(r.tls.expect_no_pad == d.tls.expect_no_pad);
+    CHECK(r.tls.session_cache == d.tls.session_cache);
+    CHECK(r.tls.session_cache_per_endpoint == d.tls.session_cache_per_endpoint);
+    CHECK(r.tls.max_connection_bytes == d.tls.max_connection_bytes);
+    CHECK(r.tls.ciphersuites == d.tls.ciphersuites);
+    CHECK(r.tls.cipher_list == d.tls.cipher_list);
+    CHECK(r.tls.groups == d.tls.groups);
+    CHECK(r.tls.sni_override == d.tls.sni_override);
+    CHECK(r.tls.allow_tls13_without_rekey == d.tls.allow_tls13_without_rekey);
+    CHECK(r.tls.verify == d.tls.verify);
+  }
+}
 
-  auto const cfg = load_scan_manager("sirius_backend_multi_gpu.yaml",
-                                     "sirius:\n"
-                                     "  topology:\n"
-                                     "    num_gpus: 2\n"
-                                     "  executor:\n"
-                                     "    scan_manager:\n"
-                                     "      backend: kvikio\n");
+TEST_CASE("sirius_config reads REST transport tuning", "[scan_manager][config][rest]")
+{
+  using cucascade::io::rest::reactor_wait_mode;
+  auto const cfg = load_scan_manager("sirius_rest_transport.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 4\n"
+                                                       "      rest:\n"
+                                                       "        n_max_concurrent_scans: 5\n"
+                                                       "        request_timeout_s: 11\n"
+                                                       "        stall_speed_limit_bytes: 4096\n"
+                                                       "        stall_time_s: 3\n"
+                                                       "        merge_max_gap: 16 KiB\n"
+                                                       "        min_segment_bytes: 2 MiB\n"
+                                                       "        max_segment_bytes: 8 MiB\n"
+                                                       "        footer_probe_bytes: 64 KiB\n"
+                                                       "        list_max_matches: 13\n"
+                                                       "        list_max_scanned: 31\n"
+                                                       "        retry_backoff_base_ms: 7ms\n"
+                                                       "        retry_jitter_ms: 9\n"
+                                                       "        max_retry_attempts: 5\n"
+                                                       "        max_auth_retry_attempts: 2\n"
+                                                       "        honor_retry_after: false\n"
+                                                       "        max_connections: 13\n"
+                                                       "        conn_max_age_s: 2s\n"
+                                                       "        upkeep_interval_ms: 1500\n"
+                                                       "        upkeep_http1: true\n"
+                                                       "        connect_timeout_ms: 1200\n"
+                                                       "        dns_ttl_s: 30\n"
+                                                       "        dns_accumulate: true\n"
+                                                       "        dns_max_addresses: 8\n"
+                                                       "        keepalive_idle_s: 20\n"
+                                                       "        keepalive_interval_s: 5\n"
+                                                       "        keepalive_count: 3\n"
+                                                       "        min_mtu: 9001\n"
+                                                       "        mtu_reject_max_attempts: 2\n"
+                                                       "        close_with_rst: false\n"
+                                                       "        receive_buffer_bytes: 1 MiB\n"
+                                                       "        queue_depth: 256\n"
+                                                       "        wait_mode: uring\n"
+                                                       "        iowq_max_unbound: 9\n"
+                                                       "        fan_out: 3\n"
+                                                       "        interface: eth1\n"
+                                                       "        pin_to_irq_cpus: false\n"
+                                                       "        raise_reactor_priority: true\n"));
+  CHECK(cfg.rest_n_reactors == 4);
+  auto const check = [](cucascade::io::rest::config const& rest) {
+    CHECK(rest.n_max_concurrent_scans == 5);
+    CHECK(rest.n_max_concurrent_scans_explicit);
+    CHECK(rest.request_timeout_s == 11);
+    CHECK(rest.stall_speed_limit_bytes == 4096);
+    CHECK(rest.stall_time_s == 3);
+    CHECK(rest.merge_max_gap == (16UL << 10));
+    CHECK(rest.merge_gap_size() == (16UL << 10));
+    CHECK(rest.min_segment_bytes == (2UL << 20));
+    CHECK(rest.max_segment_bytes == (8UL << 20));
+    CHECK(rest.footer_probe_bytes == (64UL << 10));
+    CHECK(rest.list_max_matches == 13);
+    CHECK(rest.list_max_scanned == 31);
+    CHECK(rest.retry_backoff_base == std::chrono::milliseconds{7});
+    CHECK(rest.retry_jitter == std::chrono::milliseconds{9});
+    CHECK(rest.max_retry_attempts == 5);
+    CHECK(rest.max_auth_retry_attempts == 2);
+    CHECK_FALSE(rest.honor_retry_after);
+    CHECK(rest.max_connections == 13);
+    CHECK(rest.conn_max_age == std::chrono::seconds{2});
+    CHECK(rest.upkeep_interval == std::chrono::milliseconds{1500});
+    CHECK(rest.upkeep_http1);
+    CHECK(rest.connect_timeout == std::chrono::milliseconds{1200});
+    CHECK(rest.dns_ttl == std::chrono::seconds{30});
+    CHECK(rest.dns_accumulate);
+    CHECK(rest.dns_max_addresses == 8);
+    CHECK(rest.keepalive_idle_s == 20);
+    CHECK(rest.keepalive_interval_s == 5);
+    CHECK(rest.keepalive_count == 3);
+    CHECK(rest.min_mtu == 9001);
+    CHECK(rest.mtu_reject_max_attempts == 2);
+    CHECK_FALSE(rest.close_with_rst);
+    CHECK(rest.receive_buffer_bytes == (1UL << 20));
+    CHECK(rest.queue_depth == 256);
+    CHECK(rest.wait_mode == reactor_wait_mode::uring);
+    CHECK(rest.iowq_max_unbound == 9);
+    CHECK(rest.fan_out == 3);
+    CHECK(rest.interface == "eth1");
+    CHECK_FALSE(rest.pin_to_irq_cpus);
+    CHECK(rest.raise_reactor_priority);
+  };
+  check(cfg.rest);
+  check(cfg.to_io_config().rest);
+  CHECK(cfg.to_io_config().rest_n_reactors == 4);
+}
 
-  CHECK(cfg.backend == io_backend::sirius);
+TEST_CASE("REST transport accepts documented zero sentinels and range boundaries",
+          "[scan_manager][config][rest]")
+{
+  auto const cfg = load_scan_manager("sirius_rest_transport_bounds.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 0\n"
+                                                       "      rest:\n"
+                                                       "        n_max_concurrent_scans: 0\n"
+                                                       "        request_timeout_s: 0\n"
+                                                       "        stall_speed_limit_bytes: 0\n"
+                                                       "        stall_time_s: 0\n"
+                                                       "        merge_max_gap: 0\n"
+                                                       "        conn_max_age_s: 0\n"
+                                                       "        upkeep_interval_ms: 0\n"
+                                                       "        retry_backoff_base_ms: 0\n"
+                                                       "        retry_jitter_ms: 0\n"
+                                                       "        max_retry_attempts: 1\n"
+                                                       "        max_auth_retry_attempts: 1\n"
+                                                       "        max_connections: 1\n"
+                                                       "        connect_timeout_ms: 1\n"
+                                                       "        min_segment_bytes: 1\n"
+                                                       "        max_segment_bytes: 1\n"
+                                                       "        keepalive_count: 0\n"
+                                                       "        min_mtu: 0\n"
+                                                       "        mtu_reject_max_attempts: 1\n"
+                                                       "        receive_buffer_bytes: 16 KiB\n"
+                                                       "        queue_depth: 2\n"
+                                                       "        iowq_max_unbound: 0\n"
+                                                       "        dns_max_addresses: 4096\n"
+                                                       "        footer_probe_bytes: 1 GiB\n"
+                                                       "        fan_out: 1\n"
+                                                       "        tls:\n"
+                                                       "          session_cache: false\n"
+                                                       "          session_cache_per_endpoint: 0\n"
+                                                       "          max_connection_bytes: 0\n"));
+  // rest_n_reactors 0 sizes the pool from the egress NIC when the REST ioctx is built.
+  CHECK(cfg.rest_n_reactors == 0);
+  CHECK(cfg.rest.n_max_concurrent_scans == 0);
+  CHECK(cfg.rest.n_max_concurrent_scans_explicit);
+  CHECK(cfg.rest.request_timeout_s == 0);
+  CHECK(cfg.rest.stall_speed_limit_bytes == 0);
+  CHECK(cfg.rest.stall_time_s == 0);
+  CHECK(cfg.rest.merge_gap_size() == 0);
+  CHECK(cfg.rest.conn_max_age.count() == 0);
+  CHECK(cfg.rest.upkeep_interval.count() == 0);
+  CHECK(cfg.rest.retry_backoff_base.count() == 0);
+  CHECK(cfg.rest.retry_jitter.count() == 0);
+  CHECK(cfg.rest.max_retry_attempts == 1);
+  CHECK(cfg.rest.max_auth_retry_attempts == 1);
+  CHECK(cfg.rest.max_connections == 1);
+  CHECK(cfg.rest.connect_timeout.count() == 1);
+  CHECK(cfg.rest.min_segment_bytes == 1);
+  CHECK(cfg.rest.max_segment_bytes == 1);
+  CHECK(cfg.rest.keepalive_count == 0);
+  CHECK(cfg.rest.min_mtu == 0);
+  CHECK(cfg.rest.mtu_reject_max_attempts == 1);
+  CHECK(cfg.rest.receive_buffer_bytes == (16UL << 10));
+  CHECK(cfg.rest.queue_depth == 2);
+  CHECK(cfg.rest.iowq_max_unbound == 0);
+  CHECK(cfg.rest.dns_max_addresses == 4096);
+  CHECK(cfg.rest.footer_probe_bytes == (1UL << 30));
+  CHECK(cfg.rest.fan_out == 1);
+  CHECK(cfg.rest.tls.session_cache_per_endpoint == 0);
+  CHECK(cfg.rest.tls.max_connection_bytes == 0);
+
+  auto const upper = load_scan_manager("sirius_rest_transport_upper.yaml",
+                                       rest_yaml("        max_connections: 64\n"
+                                                 "        queue_depth: 32768\n"
+                                                 "        min_mtu: 65607\n"
+                                                 "        receive_buffer_bytes: 4 MiB\n"));
+  CHECK(upper.rest.queue_depth == 32768);
+  CHECK(upper.rest.min_mtu == 65607);
+  CHECK(upper.rest.receive_buffer_bytes == (4UL << 20));
+
+  auto const tight =
+    load_scan_manager("sirius_rest_queue_tight.yaml",
+                      rest_yaml("        max_connections: 64\n        queue_depth: 128\n"));
+  CHECK(tight.rest.queue_depth == 128);
+
+  // The default fan-out (2) is clamped to a one-reactor pool rather than rejected,
+  // and any fan-out is left to the REST ioctx when the pool is NIC-sized.
+  auto const one = load_scan_manager("sirius_rest_fan_out_default.yaml",
+                                     scan_manager_yaml("      rest_n_reactors: 1\n"));
+  CHECK(one.rest.fan_out == 2);
+  auto const automatic = load_scan_manager("sirius_rest_fan_out_auto.yaml",
+                                           scan_manager_yaml("      rest_n_reactors: 0\n"
+                                                             "      rest:\n"
+                                                             "        fan_out: 8\n"));
+  CHECK(automatic.rest.fan_out == 8);
+}
+
+TEST_CASE("sirius_config rejects invalid REST transport ranges with key context",
+          "[scan_manager][config][rest]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"n_max_concurrent_scans: -1", "n_max_concurrent_scans"},
+        std::pair{"request_timeout_s: -1", "request_timeout_s"},
+        std::pair{"stall_speed_limit_bytes: -1", "stall_speed_limit_bytes"},
+        std::pair{"stall_time_s: -1", "stall_time_s"},
+        std::pair{"conn_max_age_s: -1", "conn_max_age_s"},
+        std::pair{"upkeep_interval_ms: -1", "upkeep_interval_ms"},
+        std::pair{"retry_backoff_base_ms: -1", "retry_backoff_base_ms"},
+        std::pair{"retry_jitter_ms: -1", "retry_jitter_ms"},
+        std::pair{"max_retry_attempts: -1", "max_retry_attempts"},
+        std::pair{"max_retry_attempts: 0", "max_retry_attempts"},
+        std::pair{"max_auth_retry_attempts: -1", "max_auth_retry_attempts"},
+        std::pair{"max_auth_retry_attempts: 0", "max_auth_retry_attempts"},
+        std::pair{"list_max_matches: 0", "list_max_matches"},
+        std::pair{"list_max_scanned: -1", "list_max_scanned"},
+        std::pair{"footer_probe_bytes: 2 GiB", "footer_probe_bytes"},
+        std::pair{"connect_timeout_ms: 0", "connect_timeout_ms"},
+        std::pair{"connect_timeout_ms: -1", "connect_timeout_ms"},
+        std::pair{"connect_timeout_ms: 0.5ms", "connect_timeout_ms"},
+        std::pair{"max_connections: 0", "max_connections"},
+        std::pair{"max_connections: -1", "max_connections"},
+        std::pair{"max_connections: 4097", "max_connections"},
+        std::pair{"min_segment_bytes: 0", "min_segment_bytes"},
+        std::pair{"min_segment_bytes: -1", "min_segment_bytes"},
+        std::pair{"max_segment_bytes: -1", "max_segment_bytes"},
+        std::pair{"min_segment_bytes: 64 MiB", "max_segment_bytes"},
+        std::pair{"max_segment_bytes: 512 KiB", "max_segment_bytes"},
+        std::pair{"dns_ttl_s: 0", "dns_ttl_s"},
+        std::pair{"dns_max_addresses: 0", "dns_max_addresses"},
+        std::pair{"dns_max_addresses: 4097", "dns_max_addresses"},
+        std::pair{"keepalive_idle_s: 0", "keepalive_idle_s"},
+        std::pair{"keepalive_interval_s: 0", "keepalive_interval_s"},
+        std::pair{"keepalive_count: -1", "keepalive_count"},
+        std::pair{"min_mtu: 65608", "min_mtu"},
+        std::pair{"min_mtu: -1", "min_mtu"},
+        std::pair{"mtu_reject_max_attempts: 0", "mtu_reject_max_attempts"},
+        std::pair{"mtu_reject_max_attempts: 4294967296", "mtu_reject_max_attempts"},
+        std::pair{"receive_buffer_bytes: 8 KiB", "receive_buffer_bytes"},
+        std::pair{"receive_buffer_bytes: 8 MiB", "receive_buffer_bytes"},
+        std::pair{"queue_depth: 127", "queue_depth"},
+        std::pair{"queue_depth: 32769", "queue_depth"},
+        std::pair{"queue_depth: 0", "queue_depth"},
+        std::pair{"max_connections: 1024", "queue_depth"},
+        std::pair{"wait_mode: poll", "wait_mode"},
+        std::pair{"iowq_max_unbound: -1", "iowq_max_unbound"},
+        std::pair{"iowq_max_unbound: 4294967296", "iowq_max_unbound"},
+        std::pair{"fan_out: 0", "fan_out"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_rest_transport_invalid.yaml",
+                     rest_yaml(std::string{"        "} + body + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(std::string{"rest."} + key));
+  }
+
+  // The REST reactor count is a nonnegative total.
+  for (auto const* value : {"-1", "1.5", "many"}) {
+    CAPTURE(value);
+    scoped_yaml yaml("sirius_rest_reactors_invalid.yaml",
+                     scan_manager_yaml(std::string{"      rest_n_reactors: "} + value + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("rest_n_reactors"));
+  }
+
+  // An explicit fan-out may not exceed an explicit reactor count (rest_ioctx's rule).
+  require_load_error("sirius_rest_fan_out_too_wide.yaml",
+                     scan_manager_yaml("      rest_n_reactors: 2\n"
+                                       "      rest:\n"
+                                       "        fan_out: 3\n"),
+                     "'rest.fan_out': must be at most rest_n_reactors (2)");
+}
+
+TEST_CASE("sirius_config rejects REST keys the transport does not have",
+          "[scan_manager][config][rest]")
+{
+  // Never-released spellings of a different transport design (ring_entries is
+  // queue_depth here; the TLS handshake is bounded by connect_timeout_ms).
+  for (auto const* key : {"keep_warm_connections: 4",
+                          "enable_controller: false",
+                          "link_gbps: 100",
+                          "tls_handshake_timeout_ms: 3000",
+                          "ring_entries: 1024",
+                          "write_part_bytes: 16 MiB",
+                          "expect_continue: true",
+                          "sqpoll: true",
+                          "defer_taskrun: true"}) {
+    CAPTURE(key);
+    scoped_yaml yaml("sirius_rest_unknown_key.yaml",
+                     rest_yaml(std::string{"        "} + key + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("unknown config key") &&
+                          Catch::Matchers::ContainsSubstring("in rest"));
+  }
+}
+
+TEST_CASE("sirius_config reads TLS transport policy", "[scan_manager][config][rest][tls]")
+{
+  namespace tls    = cucascade::io::tls;
+  auto const cfg   = load_scan_manager("sirius_rest_tls.yaml",
+                                     tls_yaml("          ktls: require\n"
+                                                "          user_space_rx: library\n"
+                                                "          recv_placement: iowq\n"
+                                                "          min_version: tls1.3\n"
+                                                "          max_version: tls1.3\n"
+                                                "          expect_no_pad: false\n"
+                                                "          session_cache: true\n"
+                                                "          session_cache_per_endpoint: 7\n"
+                                                "          max_connection_bytes: 12 GiB\n"
+                                                "          ciphersuites: TLS_AES_128_GCM_SHA256\n"
+                                                "          cipher_list: ECDHE-RSA-AES128-GCM-SHA256\n"
+                                                "          groups: X25519:P-256\n"
+                                                "          sni_override: object-store.test\n"
+                                                "          allow_tls13_without_rekey: false\n"));
+  auto const check = [](tls::config const& policy) {
+    CHECK(policy.ktls == tls::ktls_mode::require);
+    CHECK(policy.fallback_rx == tls::user_space_rx::library);
+    CHECK(policy.placement == tls::recv_placement::iowq);
+    CHECK(policy.min_version == tls::version_bound::tls1_3);
+    CHECK(policy.max_version == tls::version_bound::tls1_3);
+    CHECK_FALSE(policy.expect_no_pad);
+    CHECK(policy.session_cache);
+    CHECK(policy.session_cache_per_endpoint == 7);
+    CHECK(policy.max_connection_bytes == (12ULL << 30));
+    CHECK(policy.ciphersuites == "TLS_AES_128_GCM_SHA256");
+    CHECK(policy.cipher_list == "ECDHE-RSA-AES128-GCM-SHA256");
+    CHECK(policy.groups == "X25519:P-256");
+    CHECK(policy.sni_override == "object-store.test");
+    CHECK_FALSE(policy.allow_tls13_without_rekey);
+    CHECK(policy.verify);
+    CHECK(policy.ca_file.empty());
+    CHECK(policy.ca_dir.empty());
+    CHECK(policy.ca_blob.empty());
+  };
+  check(cfg.rest.tls);
+  check(cfg.to_io_config().rest.tls);
+}
+
+TEST_CASE("REST TLS enum spellings select the planned transport modes",
+          "[scan_manager][config][rest][tls]")
+{
+  namespace tls = cucascade::io::tls;
+  for (auto const& [spelling, expected] : {std::pair{"prefer", tls::ktls_mode::prefer},
+                                           std::pair{"require", tls::ktls_mode::require},
+                                           std::pair{"disable", tls::ktls_mode::disable}}) {
+    auto const cfg = load_scan_manager("sirius_tls_ktls.yaml",
+                                       tls_yaml(std::string{"          ktls: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.ktls == expected);
+  }
+  for (auto const& [spelling, expected] :
+       {std::pair{"record_layer", tls::user_space_rx::record_layer},
+        std::pair{"library", tls::user_space_rx::library}}) {
+    auto const cfg = load_scan_manager(
+      "sirius_tls_rx.yaml", tls_yaml(std::string{"          user_space_rx: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.fallback_rx == expected);
+  }
+  for (auto const& [spelling, expected] : {std::pair{"automatic", tls::recv_placement::automatic},
+                                           std::pair{"inline", tls::recv_placement::inline_},
+                                           std::pair{"iowq", tls::recv_placement::iowq}}) {
+    auto const cfg =
+      load_scan_manager("sirius_tls_placement.yaml",
+                        tls_yaml(std::string{"          recv_placement: "} + spelling + "\n"));
+    CHECK(cfg.rest.tls.placement == expected);
+  }
+  for (auto const& [spelling, expected] : {std::pair{"tls1.2", tls::version_bound::tls1_2},
+                                           std::pair{"tls1.3", tls::version_bound::tls1_3}}) {
+    auto const cfg = load_scan_manager("sirius_tls_version.yaml",
+                                       tls_yaml(std::string{"          min_version: "} + spelling +
+                                                "\n          max_version: " + spelling + "\n"));
+    CHECK(cfg.rest.tls.min_version == expected);
+    CHECK(cfg.rest.tls.max_version == expected);
+  }
+  auto const automatic = load_scan_manager("sirius_tls_max_auto.yaml",
+                                           tls_yaml("          max_version: auto\n"
+                                                    "          max_connection_bytes: 0\n"
+                                                    "          session_cache_per_endpoint: 1\n"));
+  CHECK_FALSE(automatic.rest.tls.max_version.has_value());
+  CHECK(automatic.rest.tls.max_connection_bytes == 0);
+  CHECK(automatic.rest.tls.session_cache_per_endpoint == 1);
+}
+
+TEST_CASE("sirius_config rejects invalid TLS policies with key context",
+          "[scan_manager][config][rest][tls]")
+{
+  for (auto const& [body, key] :
+       {std::pair{"ktls: auto", "ktls"},
+        std::pair{"ktls: user-space", "ktls"},
+        std::pair{"ktls: PREFER", "ktls"},
+        std::pair{"ktls: ''", "ktls"},
+        std::pair{"ktls: []", "ktls"},
+        std::pair{"user_space_rx: openssl", "user_space_rx"},
+        std::pair{"recv_placement: auto", "recv_placement"},
+        std::pair{"recv_placement: inline_", "recv_placement"},
+        std::pair{"min_version: auto", "min_version"},
+        std::pair{"min_version: tls1.1", "min_version"},
+        std::pair{"max_version: TLS1.3", "max_version"},
+        std::pair{"max_version: tls1.4", "max_version"},
+        std::pair{"min_version: tls1.3\n          max_version: tls1.2", "max_version"},
+        std::pair{"session_cache: true\n          session_cache_per_endpoint: 0",
+                  "session_cache_per_endpoint"},
+        std::pair{"session_cache_per_endpoint: -1", "session_cache_per_endpoint"},
+        std::pair{"session_cache_per_endpoint: 4294967296", "session_cache_per_endpoint"},
+        std::pair{"max_connection_bytes: -1", "max_connection_bytes"}}) {
+    CAPTURE(body);
+    scoped_yaml yaml("sirius_rest_tls_invalid.yaml",
+                     tls_yaml(std::string{"          "} + body + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring(std::string{"rest.tls."} + key));
+  }
+  for (auto const* body : {"        tls: []\n", "        tls: {unknown_tls_option: true}\n"}) {
+    scoped_yaml yaml("sirius_rest_tls_shape.yaml", rest_yaml(body));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("rest.tls"));
+  }
+  // Library-internal TLS fields are not configurable.
+  for (auto const* key :
+       {"alpn_http11: false", "client_cert_file: /c", "client_key_file: /k", "keylog_env: true"}) {
+    CAPTURE(key);
+    scoped_yaml yaml("sirius_rest_tls_internal.yaml",
+                     tls_yaml(std::string{"          "} + key + "\n"));
+    REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                        Catch::Matchers::ContainsSubstring("unknown config key"));
+  }
+}
+
+TEST_CASE("REST TLS trust remains owned by object_store", "[scan_manager][config][rest][tls]")
+{
+  for (auto const& [key, value] : {std::pair{"verify", "false"},
+                                   std::pair{"ca_file", "/tmp/ca.pem"},
+                                   std::pair{"ca_dir", "/tmp/certs"},
+                                   std::pair{"ca_blob", "PEM"}}) {
+    // Even a null value is a forbidden second trust source.
+    for (auto const* spelling : {value, "null"}) {
+      CAPTURE(key, spelling);
+      scoped_yaml yaml("sirius_tls_trust_rejected.yaml",
+                       tls_yaml(std::string{"          "} + key + ": " + spelling + "\n"));
+      using Catch::Matchers::ContainsSubstring;
+      if (std::string_view{key} == "verify") {
+        REQUIRE_THROWS_WITH(sirius::parsed_sirius_config::from_file(yaml.path()),
+                            ContainsSubstring(std::string{"rest.tls."} + key) &&
+                              ContainsSubstring("trust is owned by object_store") &&
+                              ContainsSubstring("sirius_config::set_object_store_config()") &&
+                              ContainsSubstring("VERIFY_SSL"));
+      } else {
+        REQUIRE_THROWS_WITH(
+          sirius::parsed_sirius_config::from_file(yaml.path()),
+          ContainsSubstring(std::string{"rest.tls."} + key) &&
+            ContainsSubstring("trust is owned by object_store") &&
+            ContainsSubstring("sirius_config::set_object_store_config()") &&
+            ContainsSubstring("ca_bundle_path") && ContainsSubstring("NIX_SSL_CERT_FILE") &&
+            ContainsSubstring("SSL_CERT_FILE") && !ContainsSubstring("CREATE SECRET"));
+      }
+    }
+  }
+}
+
+TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
+{
+  auto const check_defaults = [&](scan_manager_config const& cfg) {
+    // Loading from a file resolves against this machine's discovered topology.
+    auto const threads = machine_thread_defaults();
+    CHECK(cfg.uring_n_reactors == threads.uring_reactors);
+    CHECK(cfg.rest_n_reactors == threads.rest_reactors);
+    // The local readahead budget is derived from the pipeline pool, not named.
+    CHECK(cfg.pipeline_width > 0);
+    CHECK(cfg.uring.n_max_concurrent_scans == cfg.pipeline_width);
+    CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
+    CHECK(cfg.uring.slices_per_pass == 4);
+    CHECK(cfg.uring.range_batch_slices == 8);
+  };
+
+  SECTION("resolved defaults")
+  {
+    sirius::sirius_config config;
+    config.apply_defaults();
+    check_defaults(config.get_scan_manager_config());
+  }
+
+  SECTION("empty uring block")
+  {
+    check_defaults(load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n")));
+  }
+}
+
+TEST_CASE("sirius_config reads uring.slices_per_pass", "[scan_manager][config][uring]")
+{
+  for (std::size_t const value : {std::size_t{0}, std::size_t{8}, std::size_t{64}}) {
+    CAPTURE(value);
+    auto const cfg =
+      load_scan_manager("sirius_uring_slices_per_pass_" + std::to_string(value) + ".yaml",
+                        uring_yaml("        slices_per_pass: " + std::to_string(value) + "\n"));
+    CHECK(cfg.uring.slices_per_pass == value);
+    CHECK(cfg.to_io_config().uring.slices_per_pass == value);
+  }
+}
+
+TEST_CASE("sirius_config rejects an out-of-range uring.slices_per_pass",
+          "[scan_manager][config][uring]")
+{
+  require_load_error("sirius_uring_slices_per_pass_65.yaml",
+                     uring_yaml("        slices_per_pass: 65\n"),
+                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
+                     "free staging slot), got 65");
+  require_load_error("sirius_uring_slices_per_pass_negative.yaml",
+                     uring_yaml("        slices_per_pass: -1\n"),
+                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
+                     "free staging slot), got -1");
+}
+
+TEST_CASE("sirius_config reads uring.range_batch_slices", "[scan_manager][config][uring]")
+{
+  for (std::size_t const value : {std::size_t{0}, std::size_t{1}, std::size_t{32}}) {
+    CAPTURE(value);
+    auto const cfg =
+      load_scan_manager("sirius_uring_range_batch_slices_" + std::to_string(value) + ".yaml",
+                        uring_yaml("        range_batch_slices: " + std::to_string(value) + "\n"));
+    CHECK(cfg.uring.range_batch_slices == value);
+    CHECK(cfg.to_io_config().uring.range_batch_slices == value);
+  }
+  require_load_error("sirius_uring_range_batch_slices_negative.yaml",
+                     uring_yaml("        range_batch_slices: -1\n"),
+                     "'uring.range_batch_slices': must be 0 or more (0 = no split), got -1");
+}
+
+TEST_CASE("sirius_config rejects the removed uring.prefetch_reactors key",
+          "[scan_manager][config][uring]")
+{
+  scoped_yaml yaml("sirius_uring_prefetch_reactors.yaml",
+                   uring_yaml("        prefetch_reactors: 1\n"));
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
+}
+
+TEST_CASE("Native runtime YAML rejects insufficient reader capacity",
+          "[scan_manager][config][preparation_config][native_runtime]")
+{
+  auto fields = GENERATE("native_reader_workers: 3\n        max_native_readers: 2",
+                         "native_reader_workers: 65",
+                         "max_native_readers: 1");
+  scoped_yaml yaml("sirius_native_runtime_invalid.yaml",
+                   scan_manager_yaml(std::string("      preparation:\n        ") + fields + "\n"));
+  CHECK_THROWS_AS(sirius::parsed_sirius_config::from_file(yaml.path()),
+                  sirius::configuration_input_error);
 }

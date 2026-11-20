@@ -30,7 +30,8 @@
 
 namespace sirius::op::scan {
 class iceberg_ingestible_table_info;
-}
+class gpu_ingestible;
+}  // namespace sirius::op::scan
 
 namespace sirius {
 namespace transparent {
@@ -67,6 +68,11 @@ enum compare_type {
 
 class sirius_physical_table_scan : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::INSERTION_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TABLE_SCAN;
 
  public:
@@ -90,6 +96,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   ~sirius_physical_table_scan() override;
 
   std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
+  std::shared_ptr<scan::gpu_ingestible> prepared_ingestible;
 
   //! The table function
   duckdb::BoundTableFunction function;

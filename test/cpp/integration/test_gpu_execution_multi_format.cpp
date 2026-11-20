@@ -23,25 +23,22 @@
  * generic duckdb_scan path) is currently disabled.
  */
 
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/puffin_reader.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 #include "yyjson.hpp"
 
-#include <cudf/utilities/default_stream.hpp>
-
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/common/types/blob.hpp>
-#include <duckdb/parser/sql_statement.hpp>
+#include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -57,9 +54,9 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <transparent/read_view_registry.hpp>
-#include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/local_ioctx.hpp>
 #include <utils/log_test_utils.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
@@ -380,6 +377,11 @@ class ParquetCountCarrierFixture : public MultiFormatFixtureBase {
           "SELECT CASE WHEN i % 4 = 0 THEN NULL::BIGINT ELSE i END AS id, "
           "NULL::BOOLEAN AS flag FROM range(257) t(i)");
     write("empty.parquet", rows + " WHERE false");
+    // `v` is INTEGER in one file and BIGINT in the other, and equal to `k` in both.
+    write("drift/a.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::INTEGER AS v FROM range(129) t(i)");
+    write("drift/b.parquet",
+          "SELECT (i % 7)::INTEGER AS k, (i % 7)::BIGINT AS v FROM range(128) t(i)");
     // Keep COUNT(*) in the scan instead of answering it from parquet statistics.
     optimizer_guard =
       std::make_unique<sirius::test::disabled_optimizers_guard>(*con, "statistics_propagation");
@@ -443,6 +445,28 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
   compare_gpu_vs_cpu("SELECT part, count(*) FROM read_parquet(" +
                      scratch.file_literal("evolved/part=*/*.parquet") +
                      ", hive_partitioning=true, union_by_name=true) GROUP BY part ORDER BY part");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet type drift under a FIRST input is refused by the scan",
+                 "[integration][scan][parquet][gpu][schema_evolution][distinct]")
+{
+  std::string const drift = "read_parquet(" + scratch.file_literal("drift/*.parquet") +
+                            ", union_by_name=true, hive_partitioning=false)";
+  // A FIRST's input is semantic, so the scan refuses the drift before cuDF concatenates both
+  // widths; the CPU answers.
+  for (auto const& query : {"SELECT k, first(v) FROM " + drift + " GROUP BY k",
+                            "SELECT DISTINCT ON (k) k, v FROM " + drift}) {
+    INFO(query);
+    sirius::test::scoped_recording_log_sink logs;
+    compare_gpu_vs_cpu(query, std::nullopt, gpu_route::runtime_fallback);
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("Parquet column 'v' has unqualified type drift from INTEGER to "
+                              "BIGINT") != std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,
@@ -767,10 +791,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   //
   // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
   // build ignored them silently, so an oracle on that build would agree with a GPU path that
-  // dropped them too. 5b9ff899a1 (the build INSTALL resolves for DuckDB v1.5.6) was checked
+  // dropped them too. 4c0c0874c4 (the build INSTALL resolves for DuckDB v2.0.0) was checked
   // against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3 surviving
   // rows, not all 5. Re-run that check when bumping this.
-  static constexpr const char* kVerifiedIcebergVersion = "5b9ff899a1";
+  static constexpr const char* kVerifiedIcebergVersion = "4c0c0874c4";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
@@ -781,9 +805,6 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   static constexpr gpu_route kPositionalDeleteRoute = gpu_route::gpu;
   static constexpr gpu_route kDeletionVectorRoute   = gpu_route::gpu;
 
-  // Every GPU-route case pins its snapshot; see pinned_scan().
-  static constexpr gpu_route kUnpinnedRoute = gpu_route::plan_fallback;
-
   GPUExecutionIcebergFixture()
   {
     require_repo_root_cwd();
@@ -792,6 +813,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     auto root = get_project_root();
     v1_path   = (root / "test/cpp/integration/data/iceberg_v1").string();
     v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
+    evolved_fields_path =
+      (root / "test/cpp/integration/data/iceberg_evolved_fields_with_deletes").string();
 
     auto const conf       = root / "test/cpp/integration/data/iceberg_conformance";
     conf_append_only_path = (conf / "append_only/conf/append_only").string();
@@ -827,7 +850,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
    */
   void load_iceberg_extension()
   {
-    auto load = con->Query("LOAD iceberg;");
+    // SIRIUS_TEST_ICEBERG_EXTENSION names an Iceberg build to load instead of the installed one.
+    auto const* build = std::getenv("SIRIUS_TEST_ICEBERG_EXTENSION");
+    auto load = con->Query(build && *build ? "LOAD " + sirius::test::sql_literal(build) + ";"
+                                           : std::string("LOAD iceberg;"));
     REQUIRE(load);
     if (load->HasError()) {
       FAIL("the iceberg extension is required by these tests but could not be loaded: "
@@ -880,8 +906,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   }
 
   /**
-   * @brief `iceberg_scan(path, snapshot_from_id = <current>)` — the only spelling the GPU path
-   *        accepts; the unpinned form declines at plan time.
+   * @brief Select the current snapshot explicitly for tests of the snapshot argument.
    *
    * The id comes from the metadata's own `current-snapshot-id`, NOT from the highest sequence
    * number: rollback, branches and staged WAP commits all break that derivation, which is the
@@ -1091,6 +1116,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 
   std::string v1_path;
   std::string v2_path;
+  std::string evolved_fields_path;
   std::string conf_append_only_path;
   std::string conf_drop_readd_path;
   std::string conf_rename_col_path;
@@ -1201,66 +1227,63 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 // Resolving by name finds the old column and returns 111/222 — with no error and no
 // fallback, which is the worst failure mode available.
 //
-// The route is the assertion that matters here. Correct rows alone would also be produced by
-// a GPU scan that had silently read the dropped column and happened to agree, so this pins
-// that the table was REFUSED at plan time and DuckDB answered. When field-ID resolution
-// lands, the expected route flips back to `gpu` and the rows stay exactly as written.
-//
-// ⚠️ Must stay UNPINNED, and it is the concrete cost of requiring `snapshot_from_id`. This
-// table's single snapshot carries schema-id 0, where `y` is still field id 3; the drop and re-add
-// that made it id 4 came later as metadata with no new snapshot. `snapshot_from_id` is Iceberg's
-// TIME-TRAVEL selector, so it selects that snapshot's SCHEMA too:
-//
-//     iceberg_scan(path)                        current schema (2) -> y is field 4 -> NULL
-//     iceberg_scan(path, snapshot_from_id = S)  snapshot schema (0) -> y is field 3 -> 111, 222
-//
-// Both answers are correct for the question asked, and DuckDB with Sirius unloaded returns 111/222
-// for the pinned form too. A user told to pin to reach the GPU gets a DIFFERENT table, not the
-// same one faster, so pinning here would change the expected rows.
-//
-// It declines on the unpinned-snapshot gate; the schema gate is covered by the two cases below.
+// The default bind uses the current schema. Supplying the same snapshot ID explicitly
+// would select its historical schema, in which y still has field id 3.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance dropped-and-re-added column reads NULL",
                  "[integration][gpu_execution][iceberg]")
 {
   require_session_can_read(conf_drop_readd_path);
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
   expect_iceberg_rows(
     "SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path + "') ORDER BY id;",
-    gpu_route::plan_fallback,
+    gpu_route::gpu,
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
 }
 
 // Pinned, unlike the case above: these schema changes arrived WITH new snapshots, so both forms
-// return the same rows and pinning is what keeps the schema gate reachable at all.
-//
-// A rename keeps the field id and changes the NAME, so the id space stays contiguous and the
-// field-id gap test cannot see it. The older data file still spells the column `val` where the
-// table now says `value`. Per-file metadata checks refuse the old file before cuDF decoding;
-// DuckDB then resolves the field id during runtime fallback.
+// return the same rows and pinning keeps the field-ID mapper on the GPU path.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance renamed column declines at metadata time",
+                 "gpu_execution iceberg - conformance renamed column maps by field id",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_rename_col_path);
-  expect_iceberg_schema_refusal(
+  expect_iceberg_rows(
     "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
-    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-    "does not carry the table's current schema (no match for value#2)",
+    gpu_route::gpu,
     {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
 }
 
-// An ADD keeps ids contiguous too (1,2,3 over three columns), so the gap test misses it for the
-// same reason. `b` is absent from the first data file and must read NULL there. The metadata
-// check refuses that file, and DuckDB supplies the missing column during runtime fallback.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - conformance added column declines at metadata time",
+                 "gpu_execution iceberg - mapped scan bypasses raw parquet warm pin",
+                 "[integration][gpu_execution][iceberg][cache][schema_evolution]")
+{
+  require_session_can_read(conf_rename_col_path);
+  auto const raw_glob = conf_rename_col_path + "/data/*.parquet";
+  auto pin            = con->Query("CALL pin_table(" + sirius::test::sql_literal(raw_glob) +
+                        ", name='iceberg_mapping_raw_pin', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  expect_iceberg_rows(
+    "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
+    gpu_route::gpu,
+    {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+  auto unpin = con->Query("CALL unpin_table('iceberg_mapping_raw_pin');");
+  REQUIRE(unpin);
+  REQUIRE_FALSE(unpin->HasError());
+}
+
+// An ADD keeps ids contiguous too (1,2,3 over three columns). `b` is absent from the first data
+// file and the field-ID mapper supplies its typed NULL default before the projection.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance added column materializes NULL",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   require_session_can_read(conf_add_column_path);
-  expect_iceberg_schema_refusal(
+  expect_iceberg_rows(
     "SELECT id, a, b FROM " + pinned_scan(conf_add_column_path) + " ORDER BY id;",
-    sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-    "does not carry the table's current schema (no match for b#3)",
+    gpu_route::gpu,
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}, {"3", "30", "300"}, {"4", "40", "400"}});
 }
 
@@ -1297,61 +1320,60 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - promoted column type declines",
+                 "gpu_execution iceberg - promoted column type maps",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
-  // `count` stored as INT32 while the table declares it `long`. Promotion keeps both the name and
-  // the field id, so a pair comparison reports the file as current, and nothing throws -- the scan
-  // just returns the file's narrower type. Only comparing the TYPE catches it.
+  // `count` stored as INT32 while the table declares it `long`; the mapper widens the physical
+  // field by its Iceberg field id before the projection.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_promoted_type").string();
-  expect_iceberg_schema_refusal(
-    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-    sirius::op::scan::verdict_reason::iceberg_schema_promoted_type,
-    "as INTEGER while the table declares BIGINT",
-    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - reordered data file declines",
+                 "gpu_execution iceberg - reordered data file maps",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
-  // The same two fields with the same ids and types, stored in the opposite physical order. This
-  // is a VALID Iceberg table -- ids identify fields, so order carries no meaning, and DuckDB reads
-  // it BY_FIELD_ID and returns the snapshot's order.
-  //
-  // The GPU path does not: for a full `SELECT *` build_scan_plan installs no reader projection, so
-  // cuDF emits the file's order while the rest of the plan expects the bound snapshot's. `fruit`
-  // and `count` are castable to each other's declared types, so nothing throws -- the values come
-  // back swapped and converted. A (name, field id) membership comparison cannot see it; only
-  // comparing the ORDER can.
-  //
-  // Declining a valid layout is the gate's fail-closed bias, and DuckDB returns the right rows.
+  // The same two fields with the same ids and types are stored in the opposite physical order.
+  // Field-ID mapping reads them by identity and restores the bound projection order.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_reordered").string();
-  expect_iceberg_schema_refusal(
-    "SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
-    sirius::op::scan::verdict_reason::iceberg_schema_physical_order,
-    "stores the table's fields in a different physical order",
-    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "gpu_execution iceberg - unpinned scan declines",
+                 "gpu_execution iceberg - missing identity partition column stays refused",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  auto path =
+    (get_project_root() / "test/cpp/integration/data/iceberg_missing_partition_column").string();
+  expect_iceberg_schema_refusal("SELECT * FROM " + pinned_scan(path) + ";",
+                                sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
+                                "does not carry the table's current schema (no match for count#2)",
+                                {{"apple", "42"}, {"banana", "42"}, {"cherry", "42"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - explicit and default snapshots apply deletes",
                  "[integration][gpu_execution][iceberg]")
 {
-  // The plain spelling is what a user writes, and the one the GPU path cannot answer. It must
-  // decline at PLAN time -- a runtime fallback poisons the connection.
-  //
-  // On the append-only table on purpose: with no deletes at all, the decline can only be about the
-  // missing snapshot identity.
-  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + v1_path + "') ORDER BY count;",
-                      kUnpinnedRoute,
-                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
-
-  // And the connection still answers a GPU query afterwards — the liveness half of the point.
-  expect_iceberg_rows(
-    "SELECT count(*) FROM " + pinned_scan(v1_path) + ";", gpu_route::gpu, {{"3"}});
+  auto const metadata  = sirius::test::sql_literal(v2_path + "/metadata/v1.metadata.json");
+  auto const directory = sirius::test::sql_literal(v2_path);
+  auto const snapshot  = std::to_string(current_snapshot_id(v2_path));
+  require_delete_files(v2_path, 1);
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  for (auto const& scan : {"iceberg_scan(" + metadata + ", snapshot_from_id = " + snapshot + ")",
+                           "iceberg_scan(" + metadata + ")",
+                           "iceberg_scan(" + directory + ")"}) {
+    expect_iceberg_rows("SELECT a.fruit, a.count FROM " + scan + " a JOIN " + scan +
+                          " b ON a.count = b.count ORDER BY a.count;",
+                        gpu_route::gpu,
+                        {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1466,7 +1488,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
-                 "R2a pre-capture marks Iceberg equality refusal on scan node",
+                 "Pre-capture marks Iceberg equality refusal on scan node",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   auto transaction = con->Query("BEGIN TRANSACTION READ ONLY");
@@ -1506,7 +1528,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2a pre-capture refusal keeps first planning error",
+                 "Pre-capture refusal keeps first planning error",
                  "[integration][gpu_execution][iceberg][verdict]")
 {
   auto enabled = con->Query("SET gpu_execution=true");
@@ -1516,14 +1538,15 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE(strict);
   REQUIRE_FALSE(strict->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
-  auto result       = con->Query("SELECT sin(count) FROM iceberg_scan('" + v1_path + "')");
+  auto result =
+    con->Query("SELECT sin(count) FROM iceberg_scan('" + v1_path + "', allow_moved_paths=true)");
   REQUIRE(result);
   REQUIRE(result->HasError());
-  CHECK(result->GetError().find("without 'snapshot_from_id'") != std::string::npos);
+  CHECK(result->GetError().find("was given 'allow_moved_paths'") != std::string::npos);
   CHECK(result->GetError().find("Unsupported expression in projection") == std::string::npos);
   auto const after = sirius::test::get_transparent_execution_stats(*con);
   auto const reason =
-    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_no_snapshot_id);
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_moved_paths);
   CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
   auto projection_only = con->Query("SELECT sin(count) FROM " + pinned_scan(v1_path));
   REQUIRE(projection_only);
@@ -1911,6 +1934,129 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                                                  {"elderberry", "5", "purple"}};
   std::sort(expected.begin(), expected.end());
   REQUIRE(collect_rows(*result) == expected);
+
+  // Evolution is intentionally executed through DuckDB while the GPU reader
+  // lacks the missing-column materialization needed for this shape. The same
+  // connection must remain usable by the next GPU query.
+  auto recovery_before = sirius::test::get_transparent_execution_stats(*con);
+  auto recovery        = con->Query("SELECT count(*) FROM " + pinned_scan(v1_path) + ";");
+  REQUIRE(recovery);
+  REQUIRE_FALSE(recovery->HasError());
+  require_route(
+    recovery_before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - field IDs materialize missing defaults",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  REQUIRE(delete_file_count(evolved_fields_path) == 1);
+  expect_iceberg_rows(
+    "SELECT * FROM " + pinned_scan(evolved_fields_path) + " ORDER BY count;",
+    gpu_route::gpu,
+    {{"1.5", "1", "NULL", "7"}, {"NULL", "3", "NULL", "7"}, {"5.5", "5", "NULL", "7"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - mapped virtual rows preserve deletion positions",
+                 "[integration][gpu_execution][iceberg][schema_evolution][virtual_columns]")
+{
+  bool const filtered = GENERATE(false, true);
+  auto query          = "SELECT count, score, fruit, added, file_row_number FROM " +
+               pinned_scan(evolved_fields_path) + (filtered ? " WHERE count >= 3" : "") +
+               " ORDER BY count;";
+  std::vector<std::vector<std::string>> expected{{"1", "1.5", "NULL", "7", "0"},
+                                                 {"3", "NULL", "NULL", "7", "2"},
+                                                 {"5", "5.5", "NULL", "7", "4"}};
+  if (filtered) expected.erase(expected.begin());
+  expect_iceberg_rows(query, gpu_route::gpu, std::move(expected));
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - evolution preserves count and NULL predicates",
+                 "[integration][gpu_execution][iceberg][schema_evolution]")
+{
+  REQUIRE(delete_file_count(evolved_fields_path) == 1);
+  expect_iceberg_rows(
+    "SELECT count(*) FROM " + pinned_scan(evolved_fields_path) + ";", gpu_route::gpu, {{"3"}});
+  // Mapping runs before predicates, so NULL tests observe the logical field-ID layout rather
+  // than the physical projection of each evolved file.
+  expect_iceberg_rows(
+    "SELECT count(*) FROM " + pinned_scan(evolved_fields_path) + " WHERE score IS NULL;",
+    gpu_route::gpu,
+    {{"1"}});
+  expect_iceberg_rows("SELECT count(*) FROM " + pinned_scan(evolved_fields_path) +
+                        " WHERE score IS NOT NULL AND count IS NOT NULL;",
+                      gpu_route::gpu,
+                      {{"2"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - unrequested nested fields preserve flat evolution",
+                 "[integration][gpu_execution][iceberg][schema_evolution][nested]")
+{
+  // The physical files stay flat. Add an optional nested field to the current
+  // binding, before, between or after the scalar fields that need ID mapping.
+  auto const nested_type = GENERATE(
+    std::string{
+      R"({"type":"struct","fields":[{"id":7,"name":"x","required":false,"type":"int"}]})"},
+    std::string{R"({"type":"list","element-id":7,"element-required":false,"element":"int"})"},
+    std::string{
+      R"({"type":"map","key-id":7,"key":"string","value-id":8,"value-required":false,"value":"int"})"});
+  auto const position = GENERATE(0, 2, 4);
+  CAPTURE(nested_type, position);
+  sirius::test::scratch_dir scratch{"iceberg_nested_evolution"};
+  auto const metadata_dir = scratch.path() / "metadata";
+  fs::create_directories(metadata_dir);
+  fs::copy_file(fs::path(evolved_fields_path) / "metadata/version-hint.text",
+                metadata_dir / "version-hint.text");
+
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file(
+      (fs::path(evolved_fields_path) / "metadata/v1.metadata.json").c_str(), 0, nullptr, nullptr),
+    yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> metadata(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(metadata);
+  auto const field_json = R"({"id":6,"name":"nested","required":false,"type":)" + nested_type + "}";
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> field(
+    yyjson_read(field_json.data(), field_json.size(), 0), yyjson_doc_free);
+  REQUIRE(field);
+  auto* root   = yyjson_mut_doc_get_root(metadata.get());
+  auto* schema = yyjson_mut_arr_get(yyjson_mut_obj_get(root, "schemas"), 0);
+  auto* fields = yyjson_mut_obj_get(schema, "fields");
+  REQUIRE(yyjson_mut_arr_insert(
+    fields, yyjson_val_mut_copy(metadata.get(), yyjson_doc_get_root(field.get())), position));
+  REQUIRE(yyjson_mut_obj_put(
+    root, yyjson_mut_str(metadata.get(), "last-column-id"), yyjson_mut_int(metadata.get(), 8)));
+  REQUIRE(yyjson_mut_write_file(
+    (metadata_dir / "v1.metadata.json").c_str(), metadata.get(), 0, nullptr, nullptr));
+
+  auto const scan = pinned_scan(scratch.path().string());
+  // Reorder the output and read scalar slots after the nested field. The rows
+  // exercise promotion, renaming, missing defaults and positional deletes.
+  auto const query =
+    "SELECT added, count, score, fruit FROM " + scan + " WHERE count >= 3 ORDER BY count";
+  auto const expected =
+    std::vector<std::vector<std::string>>{{"7", "3", "NULL", "NULL"}, {"7", "5", "5.5", "NULL"}};
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
+
+  // Keeping a placeholder must not admit nested materialization to the flat mapper.
+  {
+    sirius::test::scoped_recording_log_sink logs;
+    expect_iceberg_rows("SELECT nested, count FROM " + scan + " ORDER BY count",
+                        gpu_route::runtime_fallback,
+                        {{"NULL", "1"}, {"NULL", "3"}, {"NULL", "5"}});
+    bool refused = false;
+    for (auto const& record : logs.records())
+      if (record.message.find("adapter field mapping does not support a required nested field") !=
+          std::string::npos)
+        refused = true;
+    CHECK(refused);
+  }
+  expect_iceberg_rows(query, gpu_route::gpu, expected);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1949,7 +2095,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "iceberg internal queries remain invisible with global GPU execution enabled",
+                 "iceberg manifest queries remain invisible with global GPU execution enabled",
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
@@ -1974,9 +2120,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE_FALSE(enabled->HasError());
     REQUIRE(enabled->Collection().GetValue(0, 0).GetValue<bool>());
   }
-  sirius::io::kvikio_context ioctx;
-  auto const reads_before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
-  // Positional deletes read Parquet metadata; deletion vectors also reread their Avro manifest.
+  // Deletion vectors also require an Avro manifest query during discovery.
   for (auto const* dataset : {"iceberg_snapshot_deletes", "iceberg_v3_deletion_vector"}) {
     auto const table = (get_project_root() / "test/cpp/integration/data" / dataset).string();
     CAPTURE(table);
@@ -1985,12 +2129,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(inventory.inventory);
     auto discovery = sirius::op::scan::discover_from_manifests(
       *con->context, table, std::move(*inventory.inventory));
-    auto data = sirius::op::scan::load_delete_payload(
-      *con->context, table, &ioctx, current_snapshot_id(table), discovery);
-    REQUIRE(data);
-    REQUIRE_FALSE(data->positional_deletes.empty());
+    REQUIRE(discovery.positional_delete_files.size() + discovery.deletion_vector_entries.size() ==
+            1);
   }
-  CHECK(sirius::op::scan::iceberg_delete_data_uncached_read_count() == reads_before + 2);
   auto const after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
   CHECK(after.provider_internal_skips == before.provider_internal_skips);
@@ -2009,11 +2150,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  con->Query("SET disabled_optimizers = 'extension'");
+  // Appends to Sirius's load-time mask and restores it; a RESET would clear the mask for every
+  // later test on the shared database.
+  sirius::test::disabled_optimizers_guard no_hook{*con, "extension"};
   expect_iceberg_rows("SELECT * FROM " + pinned_scan(path) + " ORDER BY count;",
                       gpu_route::plan_fallback,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
@@ -2025,11 +2164,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   auto path  = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
   auto query = "SELECT * FROM " + pinned_scan(path) + " ORDER BY count";
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  REQUIRE_FALSE(con->Query("SET disabled_optimizers = 'extension'")->HasError());
+  sirius::test::disabled_optimizers_guard no_hook{*con, "extension"};
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = false")->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
 
@@ -2088,6 +2223,226 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   }
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = true")->HasError());
   REQUIRE_FALSE(con->Query("DROP SEQUENCE read_view_selector")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg implicit snapshot drift preserves the original CPU result",
+                 "[integration][iceberg][transparent][read_view][iceberg_implicit_drift]")
+{
+  auto const fallback = GENERATE(true, false);
+  sirius::test::scratch_dir scratch{"iceberg_implicit_drift"};
+  auto const directory = scratch.path() / "metadata";
+  auto const source =
+    get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes/metadata";
+  fs::create_directories(directory);
+  fs::copy_file(source / "v1.metadata.json", directory / "v1.metadata.json");
+  fs::copy_file(source / "version-hint.text", directory / "version-hint.text");
+
+  // Both snapshots use the same data files; snapshot 2 deletes two rows. Only the
+  // default selection changes: the SQL has no snapshot argument and the UUID stays fixed.
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file((source / "v1.metadata.json").c_str(), 0, nullptr, nullptr), yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> metadata(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(metadata);
+  auto* root = yyjson_mut_doc_get_root(metadata.get());
+  REQUIRE(yyjson_mut_obj_put(root,
+                             yyjson_mut_str(metadata.get(), "current-snapshot-id"),
+                             yyjson_mut_sint(metadata.get(), 9400000000000001LL)));
+  auto* main = yyjson_mut_obj_get(yyjson_mut_obj_get(root, "refs"), "main");
+  REQUIRE(yyjson_mut_obj_put(main,
+                             yyjson_mut_str(metadata.get(), "snapshot-id"),
+                             yyjson_mut_sint(metadata.get(), 9400000000000001LL)));
+  REQUIRE(yyjson_mut_write_file(
+    (directory / "v2.metadata.json").c_str(), metadata.get(), 0, nullptr, nullptr));
+  REQUIRE_FALSE(
+    con->Query(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"))
+      ->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+
+  struct hint_switch : duckdb::OptimizerExtensionInfo {
+    std::atomic<duckdb::ClientContext*> target{nullptr};
+    fs::path hint;
+    unsigned binds = 0;
+  };
+  auto state    = duckdb::make_shared_ptr<hint_switch>();
+  state->target = con->context.get();
+  state->hint   = directory / "version-hint.text";
+  auto reset    = reset_after_test(state->target);
+  duckdb::OptimizerExtension observer;
+  observer.optimizer_info    = state;
+  observer.optimize_function = [](duckdb::OptimizerExtensionInput& input,
+                                  duckdb::unique_ptr<duckdb::LogicalOperator>&) {
+    auto& state = static_cast<hint_switch&>(*input.info);
+    if (state.target.load() != &input.context || ++state.binds != 1) return;
+    // The original scan has bound snapshot 2; the SQL replan will bind snapshot 1.
+    std::ofstream hint(state.hint);
+    hint << "2";
+    hint.close();
+    REQUIRE(hint.good());
+  };
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con->context),
+                                       std::move(observer));
+  auto result   = con->Query("SELECT fruit, count FROM iceberg_scan(" + scratch.file_literal("") +
+                           ") ORDER BY count");
+  state->target = nullptr;
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : "query succeeded"));
+  CHECK(state->binds == 2);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  sirius::test::require_transparent_execution_delta(before, after, 0, fallback ? 1 : 0, 0);
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == std::vector<std::vector<std::string>>{
+                                     {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+  } else {
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("selector_unproven") != std::string::npos);
+  }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg table replacement at the same location",
+                 "[integration][iceberg][transparent][read_view][iceberg_table_replacement]")
+{
+  auto const fallback = GENERATE(true, false);
+  auto const pinned   = GENERATE(false, true);
+  // Optimizer call after which the table is replaced: 1 is the original bind, 2 the replan.
+  auto const replaced_after = GENERATE(0u, 1u, 2u);
+  sirius::test::scratch_dir scratch{"iceberg_table_replacement"};
+  auto const directory = scratch.path() / "metadata";
+  auto const source =
+    get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes/metadata";
+  fs::create_directories(directory);
+  fs::copy_file(source / "v1.metadata.json", directory / "v1.metadata.json");
+  fs::copy_file(source / "version-hint.text", directory / "version-hint.text");
+
+  // The replacement keeps the snapshot ID and data file; it has another table UUID and no deletes.
+  using namespace duckdb_yyjson;
+  std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> original(
+    yyjson_read_file((source / "v1.metadata.json").c_str(), 0, nullptr, nullptr), yyjson_doc_free);
+  REQUIRE(original);
+  std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> replaced(
+    yyjson_doc_mut_copy(original.get(), nullptr), yyjson_mut_doc_free);
+  REQUIRE(replaced);
+  auto* root          = yyjson_mut_doc_get_root(replaced.get());
+  auto const selected = yyjson_mut_get_sint(yyjson_mut_obj_get(root, "current-snapshot-id"));
+  REQUIRE(
+    yyjson_mut_obj_put(root,
+                       yyjson_mut_str(replaced.get(), "table-uuid"),
+                       yyjson_mut_str(replaced.get(), "00000000-0000-4000-8000-0000000000ff")));
+  yyjson_mut_val* snapshot      = nullptr;
+  yyjson_mut_val* other_listing = nullptr;
+  size_t index, count;
+  yyjson_mut_val* entry;
+  yyjson_mut_arr_foreach(yyjson_mut_obj_get(root, "snapshots"), index, count, entry)
+  {
+    if (yyjson_mut_get_sint(yyjson_mut_obj_get(entry, "snapshot-id")) == selected) {
+      snapshot = entry;
+    } else {
+      other_listing = yyjson_mut_obj_get(entry, "manifest-list");
+    }
+  }
+  REQUIRE(snapshot);
+  REQUIRE(other_listing);
+  REQUIRE(yyjson_mut_obj_put(snapshot,
+                             yyjson_mut_str(replaced.get(), "manifest-list"),
+                             yyjson_mut_strcpy(replaced.get(), yyjson_mut_get_str(other_listing))));
+  REQUIRE(yyjson_mut_write_file(
+    (directory / "v2.metadata.json").c_str(), replaced.get(), 0, nullptr, nullptr));
+
+  auto probe = con->Query(
+    "SELECT count(*) FROM duckdb_functions() WHERE function_name = "
+    "'iceberg_metadata' AND list_contains(parameters, 'expected_table_uuid')");
+  REQUIRE(probe);
+  REQUIRE_FALSE(probe->HasError());
+  bool const verified = probe->Collection().GetValue(0, 0).GetValue<int64_t>() > 0;
+  CAPTURE(fallback, pinned, replaced_after, verified);
+  // A build named by SIRIUS_TEST_ICEBERG_EXTENSION is there to cover the verified lookup.
+  if (auto const* named = std::getenv("SIRIUS_TEST_ICEBERG_EXTENSION"); named && *named) {
+    INFO("the named Iceberg build does not accept expected_table_uuid on iceberg_metadata()");
+    REQUIRE(verified);
+  }
+
+  auto const query = "SELECT fruit, count FROM iceberg_scan(" + scratch.file_literal("") +
+                     (pinned ? ", snapshot_from_id = " + std::to_string(selected) : std::string()) +
+                     ") ORDER BY count";
+  std::vector<std::vector<std::string>> const original_rows{
+    {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}};
+  REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=false")->HasError());
+  auto oracle = con->Query(query);
+  REQUIRE_FALSE(con->Query("SET SESSION gpu_execution=true")->HasError());
+  REQUIRE(oracle);
+  REQUIRE_FALSE(oracle->HasError());
+  REQUIRE(collect_rows(*oracle) == original_rows);
+
+  REQUIRE_FALSE(
+    con->Query(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"))
+      ->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+
+  struct hint_switch : duckdb::OptimizerExtensionInfo {
+    std::atomic<duckdb::ClientContext*> target{nullptr};
+    fs::path hint;
+    unsigned replace_after = 0;
+    unsigned binds         = 0;
+  };
+  auto state           = duckdb::make_shared_ptr<hint_switch>();
+  state->target        = con->context.get();
+  state->hint          = directory / "version-hint.text";
+  state->replace_after = replaced_after;
+  auto reset           = reset_after_test(state->target);
+  duckdb::OptimizerExtension observer;
+  observer.optimizer_info    = state;
+  observer.optimize_function = [](duckdb::OptimizerExtensionInput& input,
+                                  duckdb::unique_ptr<duckdb::LogicalOperator>&) {
+    auto& state = static_cast<hint_switch&>(*input.info);
+    if (state.target.load() != &input.context || ++state.binds != state.replace_after) return;
+    std::ofstream hint(state.hint);
+    hint << "2";
+    hint.close();
+    REQUIRE(hint.good());
+  };
+  duckdb::OptimizerExtension::Register(duckdb::DBConfig::GetConfig(*con->context),
+                                       std::move(observer));
+  auto result   = con->Query(query);
+  state->target = nullptr;
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : "query succeeded"));
+  CHECK(state->binds == 2);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  // Replaced before the replan, the two binds disagree; after it, only the delete lookup differs.
+  bool const rebind_differs = replaced_after == 1;
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + (rebind_differs ? 1 : 0));
+  if (replaced_after == 0) {
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == original_rows);
+    return;
+  }
+  if (!rebind_differs && !verified) {
+    // Known limitation without expected_table_uuid: the delete lookup reads the replacement, so
+    // deleted rows come back.
+    WARN("iceberg_metadata() has no expected_table_uuid; the table replacement is not detected");
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) ==
+          std::vector<std::vector<std::string>>{
+            {"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+    return;
+  }
+  sirius::test::require_transparent_execution_delta(before, after, 0, fallback ? 1 : 0, 0);
+  if (fallback) {
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == original_rows);
+  } else {
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find(rebind_differs ? "selector_unproven" : "Table UUID mismatch") !=
+          std::string::npos);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -2272,14 +2627,15 @@ class HivePartitionDataset {
     return result;
   }
 
-  watchdog_result run_gpu_query_with_watchdog(std::string const& query,
-                                              std::chrono::seconds timeout)
+  watchdog_result run_gpu_query_with_watchdog(
+    std::string const& query,
+    std::chrono::seconds timeout,
+    std::string child_case = "gpu_execution hive partition watchdog child runner")
   {
     static std::atomic<std::uint64_t> next_child_id{0};
     auto const output_path =
       hive_dir / ("watchdog_result_" + std::to_string(next_child_id.fetch_add(1)) + ".txt");
-    std::vector<std::string> child_arguments{"sirius_unittest",
-                                             "gpu_execution hive partition watchdog child runner"};
+    std::vector<std::string> child_arguments{"sirius_unittest", std::move(child_case)};
     std::vector<char*> child_argv;
     child_argv.reserve(child_arguments.size() + 1);
     for (auto& argument : child_arguments) {
@@ -2704,6 +3060,118 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
   }
 };
 
+TEST_CASE_METHOD(HivePartitionDataset,
+                 "parquet all-pruned SQL completes under watchdog",
+                 "[scan][parquet][source_pruning][watchdog]")
+{
+  auto result = run_gpu_query_with_watchdog(
+    "", std::chrono::seconds{60}, "parquet all-pruned SQL watchdog child");
+  INFO(result.error);
+  REQUIRE_FALSE(result.timed_out);
+  REQUIRE(result.error.empty());
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet all-pruned SQL watchdog child",
+                 "[.][integration][scan][parquet][source_pruning][watchdog_child]")
+{
+  auto const* output = std::getenv("SIRIUS_HIVE_WATCHDOG_OUTPUT");
+  if (!output) { return; }
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection writer(db);
+    auto result = writer.Query(
+      "COPY (SELECT {'items': [1,2]::INTEGER[], 'label': 'nested'} AS record, "
+      "map(['k'], [[1,2]::INTEGER[]]) AS mapping, "
+      "[[1,2]::BIGINT[]] AS lists, [1,2]::INTEGER[2] AS fixed) TO " +
+      scratch.file_literal("nested_schema.parquet") + " (FORMAT PARQUET)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto counters = state->physical_counters();
+  auto reset =
+    reset_after_test(counters->parquet_phase_for_testing, counters->parquet_metadata_for_testing);
+  std::atomic<size_t> footers{0}, metadata{0}, control_footers{0};
+  counters->parquet_phase_for_testing = [&](auto const& path, bool footer) {
+    if (footer && path == scratch.file("keys.parquet")) { ++control_footers; }
+    if (footer && path != scratch.file("keys.parquet")) {
+      ++footers;
+      throw std::runtime_error("execution accessed a file eliminated by source pruning");
+    }
+  };
+  counters->parquet_metadata_for_testing = [&](auto const& path, bool) {
+    if (path != scratch.file("keys.parquet")) { ++metadata; }
+  };
+  auto compare = [&](std::string const& query) {
+    INFO(query);
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu    = con->Query(query);
+    REQUIRE(gpu);
+    INFO((gpu->HasError() ? gpu->GetError() : ""));
+    REQUIRE_FALSE(gpu->HasError());
+    require_route(before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+    REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+    auto cpu =
+      con->Query(duckdb::StringUtil::Replace(query, "sirius_read_parquet", "read_parquet"));
+    REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+    REQUIRE(cpu);
+    REQUIRE_FALSE(cpu->HasError());
+    CHECK(gpu->GetTypes() == cpu->GetTypes());
+    CHECK(gpu->GetNames() == cpu->GetNames());
+    CHECK(collect_rows(*gpu) == collect_rows(*cpu));
+    CHECK(gpu->RowCount() == cpu->RowCount());
+    for (duckdb::idx_t row = 0; row < gpu->RowCount(); ++row) {
+      for (duckdb::idx_t col = 0; col < gpu->ColumnCount(); ++col) {
+        CHECK(gpu->Collection().GetValue(col, row).IsNull() ==
+              cpu->Collection().GetValue(col, row).IsNull());
+      }
+    }
+    CHECK(footers == 0);
+    CHECK(metadata == 0);
+  };
+  for (auto const* function : {"read_parquet", "sirius_read_parquet"}) {
+    auto const input = std::string{function} + "(" + scratch.file_literal("a.parquet") + ")";
+    auto const empty = "(SELECT x FROM " + input + " WHERE file_index = 99)";
+    for (auto const* projection : {"filename, file_index, file_row_number",
+                                   "x, filename, file_index, file_row_number, x",
+                                   "x",
+                                   "42"}) {
+      compare("SELECT " + std::string{projection} + " FROM " + input + " WHERE file_index = 99");
+    }
+    compare(
+      "SELECT count(*), count(x), sum(x), min(x), max(x), avg(x), first(x), "
+      "count(DISTINCT x) FROM " +
+      input + " WHERE file_index = 99");
+    compare("SELECT x, count(*) FROM " + input + " WHERE file_index = 99 GROUP BY x");
+    compare("SELECT sentinel, filename, file_index FROM " + input + " WHERE filename = 'absent'");
+    auto const nested =
+      std::string{function} + "(" + scratch.file_literal("nested_only.parquet") + ")";
+    compare("SELECT payload, filename, file_index, file_row_number FROM " + nested +
+            " WHERE file_index = 99");
+    auto const nested_schema =
+      std::string{function} + "(" + scratch.file_literal("nested_schema.parquet") + ")";
+    compare("SELECT record, mapping, lists, fixed, filename, file_index, file_row_number FROM " +
+            nested_schema + " WHERE file_index = 99");
+    // Explicit joins keep an empty scan on either side and exercise null-extension.
+    for (auto const* join : {"INNER", "LEFT", "RIGHT", "FULL OUTER", "SEMI", "ANTI"}) {
+      for (bool empty_left : {false, true}) {
+        auto const keys = "(SELECT x FROM " + file("keys.parquet") + ")";
+        compare("SELECT l.x FROM " + (empty_left ? empty : keys) + " l " + join + " JOIN " +
+                (empty_left ? keys : empty) + " r ON l.x = r.x ORDER BY l.x");
+      }
+    }
+    compare("SELECT count(*) FROM " + empty + " l FULL OUTER JOIN " + empty + " r ON l.x=r.x");
+  }
+  // A successful ordinary scan after empty sources proves their completion did not
+  // poison the connection or leave source work in flight.
+  compare("SELECT count(*) FROM " + file("keys.parquet"));
+  CHECK(control_footers > 0);
+  HivePartitionDataset::write_watchdog_result(output, {});
+}
+
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns preserve bound file and row provenance",
                  "[integration][gpu_execution][scan][virtual_columns][acceptance]")
@@ -2714,6 +3182,31 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                      " ORDER BY file_index, file_row_number");
   compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + files() +
                      " WHERE x >= 30 ORDER BY file_index, file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet relative glob preserves filename equality and row provenance",
+                 "[integration][gpu_execution][scan][virtual_columns][source_pruning]")
+{
+  auto const relative_dir = fs::relative(scratch.path(), fs::current_path());
+  REQUIRE(relative_dir.is_relative());
+  auto const filename = (relative_dir / "b.parquet").generic_string();
+  auto const scan     = "read_parquet(" +
+                    sirius::test::sql_literal((relative_dir / "[ab].parquet").generic_string()) +
+                    ", hive_partitioning=false)";
+  auto const query = "SELECT filename, file_row_number, sentinel FROM " + scan +
+                     " WHERE filename = " + sirius::test::sql_literal(filename);
+
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  auto expected = con->Query(query + " ORDER BY file_row_number");
+  REQUIRE(expected);
+  REQUIRE_FALSE(expected->HasError());
+  std::vector<std::vector<std::string>> const expected_rows{
+    {filename, "0", "B0"}, {filename, "1", "B1"}, {filename, "2", "B2"}};
+  REQUIRE(collect_rows(*expected) == expected_rows);
+
+  compare_gpu_vs_cpu(query + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu(query + " AND x >= 60 ORDER BY file_row_number");
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
@@ -2744,6 +3237,10 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                      " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, file_index FROM " + files() +
                      " WHERE file_index = 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index, file_row_number FROM " + files() +
+                     " WHERE file_index IN (1, NULL) ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index, file_row_number FROM " + files() +
+                     " WHERE file_index IN (1, NULL) OR x = 10 ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, filename FROM " + files() +
                      " WHERE filename LIKE '%b.parquet' ORDER BY sentinel");
   compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
@@ -2843,13 +3340,13 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
-                 "parquet nested-only virtual scans decline before GPU execution",
+                 "parquet nested-only virtual scans synthesize metadata on GPU",
                  "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
-  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", true);
-  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"),
-                     std::nullopt,
-                     gpu_route::plan_fallback);
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"));
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("nested_only.parquet"));
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
@@ -3030,23 +3527,74 @@ TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
                      " WHERE x >= 4096 ORDER BY x");
 }
 
+TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
+                 "parquet file pruning and mixed predicates preserve multi-file row identity",
+                 "[integration][gpu_execution][scan][virtual_columns][source_pruning]")
+{
+  auto const small_splits = GENERATE(false, true);
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    for (auto const* name : {"B", "C"}) {
+      auto result =
+        writer.Query("COPY (SELECT i::INTEGER AS x, ('" + std::string{name} +
+                     "' || i)::VARCHAR AS sentinel FROM range(6144) t(i) ORDER BY i) TO " +
+                     scratch.file_literal(std::string{name} + ".parquet") +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+    }
+  }
+  con->Query("SET gpu_execution=false");
+  sirius::test::scoped_setting cap(*con, "scan_task_batch_size", small_splits ? 1024 : 100000000);
+  con->Query("SET gpu_execution=true");
+  auto const input = "read_parquet([" + scratch.file_literal("multi.parquet") + ", " +
+                     scratch.file_literal("B.parquet") + ", " + scratch.file_literal("C.parquet") +
+                     "], hive_partitioning=false)";
+  auto const physical = " AND (x < 2048 OR x >= 4096) AND x % 3 = 1 AND file_row_number >= 1000";
+  for (auto const& predicate :
+       {"file_index IN (0, 2)" + std::string{physical},
+        "filename IN (" + scratch.file_literal("multi.parquet") + ", " +
+          scratch.file_literal("C.parquet") + ")" + physical,
+        std::string{"file_index = 99 AND x >= 4096"},
+        "file_index IN (0, 2) AND sentinel LIKE 'R%'" + std::string{physical},
+        std::string{"file_index IN (0, 2) AND (x % 3 = 1 OR file_row_number = 0)"},
+        std::string{"file_index NOT IN (1, NULL)"},
+        std::string{"file_index NOT IN (1) AND file_row_number = 0"},
+        std::string{"1::UBIGINT < file_index AND file_row_number = 0"},
+        "filename = " + scratch.file_literal("c.parquet")}) {
+    CAPTURE(small_splits, predicate);
+    compare_gpu_vs_cpu("SELECT sentinel, file_row_number, filename, file_index FROM " + input +
+                       " WHERE " + predicate + " ORDER BY file_index, file_row_number");
+  }
+  // The planner deliberately declines this unsigned-to-signed predicate. A conservative
+  // source evaluator must not turn its unsupported cast into a file-pruning decision.
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number, filename, file_index FROM " + input +
+                       " WHERE CAST(file_index AS BIGINT) = 2 AND file_row_number = 0 "
+                       "ORDER BY file_index, file_row_number",
+                     std::nullopt,
+                     gpu_route::plan_fallback);
+}
+
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2a pre-capture text precedes an earlier L0 refusal",
+                 "Pre-capture text precedes an earlier L0 refusal",
                  "[integration][iceberg][verdict]")
 {
-  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE r2a_first_l0(i INTEGER)")->HasError());
-  REQUIRE_FALSE(con->Query("INSERT INTO r2a_first_l0 VALUES (1)")->HasError());
+  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE first_planning_refusal(i INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO first_planning_refusal VALUES (1)")->HasError());
   REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
-  auto logical = con->ExtractPlan("SELECT i FROM r2a_first_l0 UNION ALL SELECT count FROM " +
-                                  ("iceberg_scan('" + v1_path + "')"));
+  auto logical =
+    con->ExtractPlan("SELECT i FROM first_planning_refusal UNION ALL SELECT count FROM " +
+                     ("iceberg_scan('" + v1_path + "', allow_moved_paths=true)"));
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   bool refused = false;
   try {
     generator.create_plan(std::move(logical));
   } catch (sirius::op::scan::scan_verdict_declined const& decline) {
     refused = true;
-    CHECK(std::string(decline.what()).find("without 'snapshot_from_id'") != std::string::npos);
+    CHECK(std::string(decline.what()).find("was given 'allow_moved_paths'") != std::string::npos);
     CHECK(decline.declined.size() == 2);
   }
   CHECK(refused);
@@ -3121,8 +3669,8 @@ TEST_CASE_METHOD(
   REQUIRE_FALSE(sibling.Query("SELECT 1")->HasError());
   auto discovery = sirius::op::scan::discover_from_manifests(
     *con->context, v2_path, std::move(*inventory.inventory));
-  sirius::io::kvikio_context ioctx;
-  auto data = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  auto ioctx = sirius::test::make_test_local_ioctx();
+  auto data  = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, discovery);
   REQUIRE(data);
   REQUIRE(data->positional_deletes.size() == 1);
   CHECK(data->positional_deletes.begin()->second == std::vector<int64_t>{1, 3});
@@ -3130,9 +3678,8 @@ TEST_CASE_METHOD(
   CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
   REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
-  auto cached =
-    sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
-  auto hit = sirius::op::scan::load_delete_payload(*con->context, v2_path, &ioctx, sid, discovery);
+  auto cached = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, discovery);
+  auto hit    = sirius::op::scan::load_delete_payload(*con->context, v2_path, ioctx, discovery);
   CHECK(cached != hit);
   CHECK(cached->positional_deletes == data->positional_deletes);
   CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
@@ -3259,7 +3806,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       auto entry = get.named_parameters.find("snapshot_from_id");
       REQUIRE(entry != get.named_parameters.end());
       get.named_parameters.erase(entry);
-      expected = reason::iceberg_no_snapshot_id;
+      get.function.get_bind_info = nullptr;
+      expected                   = reason::iceberg_no_snapshot_id;
       break;
     }
     case 7: {
@@ -3299,6 +3847,19 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // bound GET to exercise Sirius's own ordered guards. Check 9 needs a context without Sirius.
   auto result = sirius::planner::registered_iceberg_decline_reason(
     get, which == 9 ? *no_state.context : *con->context, provenance);
+  // A non-contiguous field-id space is valid for the field-ID mapper: a dropped and
+  // re-added field is resolved by ID and materialized as a missing/default value. The old
+  // name-based path rejected this at the early guard, so keep the regression as an admission
+  // check rather than requiring a stale field-id-gap refusal.
+  if (which == 7) {
+    CHECK_FALSE(result.decline);
+    CHECK(result.inventory);
+    CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
+          before.iceberg_manifest_walks + 1);
+    CHECK_FALSE(provenance.budget.time_exceeded());
+    CHECK_FALSE(provenance.budget.bytes_exceeded());
+    return;
+  }
   REQUIRE(result.decline);
   CHECK(result.decline->reason == expected);
   std::vector<std::string> const texts{"called without a table path",
@@ -3404,24 +3965,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "SQL multi-Iceberg replan retains the R1 correspondence refusal",
-                 "[integration][iceberg][verdict]")
+                 "SQL multi-Iceberg replan runs on the GPU",
+                 "[integration][iceberg][verdict][iceberg_multiscan]")
 {
   auto query = "SELECT a.count, b.count FROM " + pinned_scan(v1_path) + " a JOIN " +
                pinned_scan(v2_path) + " b ON a.count=b.count";
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  sirius::test::scoped_recording_log_sink logs;
-  expect_iceberg_rows(query, gpu_route::plan_fallback, {{"1", "1"}, {"3", "3"}});
-  auto after = sirius::test::get_transparent_execution_stats(*con);
-  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
-  bool seen = false;
-  for (auto const& record : logs.records())
-    if (record.message.find("no_correspondence") != std::string::npos) seen = true;
-  CHECK(seen);
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  expect_iceberg_rows(query, gpu_route::gpu, {{"1", "1"}, {"3", "3"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Iceberg later schema failure follows a successfully decoded file",
+                 "Iceberg later schema evolution follows a successfully decoded file",
                  "[integration][iceberg][verdict]")
 {
   auto query = "SELECT id, value FROM " + pinned_scan(inventory_fixture("schema_later"));
@@ -3447,10 +4001,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       changed.notify_all();
     }
   };
-  expect_iceberg_schema_refusal(query,
-                                sirius::op::scan::verdict_reason::iceberg_schema_missing_field,
-                                "does not carry the table's current schema (no match for value#2)",
-                                {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+  // Field-ID mapping resolves the two physical schemas by field ID before
+  // visibility/filter/projection, so the later file is a supported GPU evolution case rather than a
+  // late schema refusal.
+  expect_iceberg_rows(
+    query, gpu_route::gpu, {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
   CHECK(observed);
 }
 
@@ -3604,7 +4159,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "Production residence publishes ready data before a blocked footer resumes",
+                 "Default preparation coalesces files while a later footer is delayed",
                  "[integration][scan_preparation][iceberg][default_residence]")
 {
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
@@ -3612,14 +4167,14 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   preparation_test_state observed(counters);
   std::mutex mutex;
   std::condition_variable changed;
-  bool earlier_decoded = false, overlapped = false;
+  bool earlier_decoded = false, decoded_while_held = false, held_footer = false;
   auto reset                          = reset_after_test(counters->parquet_phase_for_testing);
   counters->parquet_phase_for_testing = [&](std::string const& file, bool footer) {
     std::unique_lock lock(mutex);
     if (footer && file.ends_with("c.parquet")) {
-      if (!changed.wait_for(lock, std::chrono::seconds(20), [&] { return earlier_decoded; }))
-        throw std::runtime_error("ready data did not decode while the later footer was blocked");
-      overlapped = true;
+      held_footer = true;
+      decoded_while_held =
+        changed.wait_for(lock, std::chrono::milliseconds(50), [&] { return earlier_decoded; });
     } else if (!footer && !file.ends_with("c.parquet")) {
       earlier_decoded = true;
       changed.notify_all();
@@ -3633,13 +4188,16 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three")),
                       gpu_route::gpu,
                       expected);
-  CHECK(overlapped);
+  CHECK(held_footer);
+  CHECK_FALSE(decoded_while_held);
   REQUIRE(observed.routes.size() == 1);
   CHECK(observed.routes.front().second);
   auto publication = observed.publication();
-  CHECK(publication.partial_emissions > 0);
-  REQUIRE(sirius::scan_manager::k_underfilled_batch_residence);
-  CHECK(publication.max_residence >= *sirius::scan_manager::k_underfilled_batch_residence);
+  CHECK(publication.partial_emissions == 0);
+  auto policy = sirius::scan_manager::preparation_config{}.resolve(1).partial_batch;
+  REQUIRE(policy);
+  CHECK(policy->max_residence == std::chrono::seconds(2));
+  CHECK(publication.max_residence == std::chrono::microseconds(0));
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -3697,7 +4255,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       if (info.deferred) {
         if (!admission) admission = info.deferred->admission();
         CHECK(info.deferred->admission() == admission);
-        CHECK(info.deferred->files().front().result.expired());
       } else {
         REQUIRE(info.delete_data);
         CHECK_FALSE(info.delete_data->positional_deletes.empty());
@@ -3764,15 +4321,14 @@ TEST_CASE_METHOD(
         REQUIRE(observed.provider->seen->requests == 1);
         REQUIRE(observed.provider->outstanding() == 1);
         auto installed_ledger = std::make_shared<preparation_ledger>(installed_provider);
-        auto envelope         = scan_envelope{{{8, 8, 16, 20}}, 0, 0, true};
+        auto envelope         = scan_envelope{{{{8, 8, 16}, 20}}, {}, true};
         REQUIRE(installed_ledger
                   ->admit(std::array{envelope}, memory_space_id(cucascade::memory::Tier::HOST, 0))
                   .deferred);
-        auto installed = std::make_shared<iceberg_dv_attempt>(second_plan, installed_ledger);
-        REQUIRE_NOTHROW(scans.back()->begin_preparation(installed));
+        REQUIRE_NOTHROW(scans.back()->attach_preparation_ledger(installed_ledger));
         CHECK_THROWS_WITH(engine.execute(), "DV preparation attempt already started");
         CHECK_THROWS_AS(admission->consume(), std::logic_error);
-        CHECK_FALSE(installed->ledger());
+        CHECK(installed_ledger.use_count() == 1);
         CHECK(observed.reads_started.empty());
         CHECK(first_plan->files().empty());
         CHECK(second_plan->files().empty());
@@ -3896,6 +4452,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     con.reset();
     pending.reset();
     prepared.reset();
+  }
+  SECTION("abandoned materialized GPU collector does not retain its client context")
+  {
+    duckdb::weak_ptr<duckdb::ClientContext> weak_context = con->context;
+    // Let DuckDB's executor finish initializing its collector before dropping
+    // the handles; this used to expose the collector -> ClientContext cycle.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    con.reset();
+    pending.reset();
+    prepared.reset();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!weak_context.expired() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(weak_context.expired());
   }
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
@@ -4081,6 +4652,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     REQUIRE(observed.reads_started.size() == 1);
     CHECK(observed.reads_started.front() == sidecar);
     auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.iceberg_delete_corrupt_inputs ==
+          before.iceberg_delete_corrupt_inputs + (deferred && !missing ? 1 : 0));
+    CHECK(after.iceberg_delete_reader_io_failures ==
+          before.iceberg_delete_reader_io_failures + (deferred && missing ? 1 : 0));
     auto cause =
       static_cast<size_t>(missing ? sirius::transparent::late_failure_cause::reader_io
                                   : sirius::transparent::late_failure_cause::physical_input);
@@ -4090,6 +4665,52 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     CHECK(after.runtime_fallbacks == before.runtime_fallbacks + (deferred && fallback ? 1 : 0));
     CHECK(after.fallbacks == before.fallbacks + (!deferred && fallback ? 1 : 0));
   }
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin is declined before planning opens the sidecar",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  // Only the Puffin URI is remote; metadata, manifests, and data stay local so
+  // discovery can complete without any network access. The unsupported scheme
+  // must be rejected by the planning-only backend lookup.
+  auto table    = inventory_fixture("dv_unsupported_uri");
+  auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  size_t routes = 0;
+  size_t opens  = 0;
+  auto reset    = reset_after_test(counters->iceberg_preparation_route_for_testing,
+                                counters->iceberg_dv_phase_for_testing);
+  counters->iceberg_preparation_route_for_testing = [&](auto, bool) { ++routes; };
+  counters->iceberg_dv_phase_for_testing          = [&](auto const&, bool start) {
+    if (start) ++opens;
+  };
+
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("no planning-capable remote backend") != std::string::npos);
+  CHECK(routes == 0);
+  CHECK(opens == 0);
+
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  auto reason =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_uri_unsupported);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Unsupported remote Puffin for an unselected data file is ignored",
+                 "[integration][scan_preparation][iceberg][planning]")
+{
+  auto table = inventory_fixture("dv_unused_unsupported_uri");
+  sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
+  auto result = con->Query("SELECT fruit, count FROM " + pinned_scan(table));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -4140,6 +4761,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto three    = GENERATE(false, true);
   auto context  = sirius::test::get_registered_sirius_context(*con);
   auto counters = context->physical_counters();
+  auto dv_limit = GENERATE(std::optional<size_t>{},
+                           std::optional<size_t>{0},
+                           std::optional<size_t>{1},
+                           std::optional<size_t>{8});
+  struct config_restore {
+    sirius::sirius_config& config;
+    sirius::scan_manager::scan_manager_config saved;
+    ~config_restore() { config.set_scan_manager_config(saved); }
+  } restore{context->get_config(), context->get_config().get_scan_manager_config()};
+  auto scan_config                             = restore.saved;
+  scan_config.preparation.max_inflight_dv_jobs = dv_limit;
+  context->get_config().set_scan_manager_config(scan_config);
   REQUIRE_FALSE(counters->preparation_provider_for_testing);
   auto spaces =
     context->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -4176,11 +4809,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(d.allocation_granularity == block);
   auto const& config    = context->get_config().get_scan_manager_config();
   auto limits           = config.preparation.resolve(config.thread_pool.num_threads);
-  auto expected_permits = std::min<size_t>({three ? 3u : 1u,
-                                            static_cast<size_t>(config.thread_pool.num_threads),
-                                            limits.max_inflight_jobs,
-                                            limits.max_active_units,
-                                            limits.max_pending_results});
+  auto expected_permits = std::min<size_t>(three ? 3u : 1u, config.thread_pool.num_threads);
+  if (limits.max_inflight_dv_jobs)
+    expected_permits = std::min(expected_permits, limits.max_inflight_dv_jobs);
   CHECK(d.c_requested == d.sigma_retained + (scarce ? 1 : expected_permits) * d.w);
   CHECK(d.c_requested % d.allocation_granularity == 0);
   REQUIRE(observed.routes.size() == 1);
@@ -4208,9 +4839,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   size_t injected = 0;
   counters->preparation_envelope_for_testing = [&](auto& envelope) {
     for (auto& unit : envelope.units) {
-      unit.blob          = 1;
-      unit.footer_parser = 1;
-      unit.roaring       = 0;
+      unit.temporary = {1, 1};
       ++injected;
     }
   };

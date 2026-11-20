@@ -33,7 +33,6 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/table_filter.hpp>
 
 #include <cstddef>
 #include <initializer_list>

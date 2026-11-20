@@ -35,9 +35,10 @@
 # `Host Frame: ... alloc_and_peer_copy_async ...` lines in BOTH contexts:
 #   1) Race findings (headed by `Use-before-alloc on allocation`) — the
 #      ACTUAL gate target; cluster_B must count these.
-#   2) API-error backtraces (headed by `Program hit cuda...`) — emitted
-#      by probe_peer_dma_works during init when cudaMemcpyPeer returns
-#      cudaErrorPeerAccessAlreadyEnabled. NOT a Phase 22 D-07 regression.
+#   2) API-error backtraces (headed by `Program hit cuda...`). Historical
+#      ordinary-peer setup produced cudaErrorPeerAccessAlreadyEnabled entries.
+#      The merged private-pool verifier no longer enables ordinary peers; new
+#      API failures are errors and must be inspected separately from race counts.
 # The cluster_B count uses an awk windowed match (in_race state) instead
 # of a flat grep. See 23-VERDICT.md Section J for the false-positive trail.
 #
@@ -168,9 +169,11 @@ fi
 # pass state for Cluster B), and `set -e` would otherwise abort.
 #
 # Phase 23 gap-closure: cluster_B was a false-positive when total_races=0
-# because alloc_and_peer_copy_async also appears in cudaErrorPeerAccessAlreadyEnabled
-# API-error backtraces emitted by probe_peer_dma_works at init. We now
-# count host-frame mentions ONLY inside race-check sections (headed by
+# because alloc_and_peer_copy_async also appeared in historical ordinary-peer
+# API-error backtraces. The merged verifier uses private pools instead. These
+# cluster counts do not accept or suppress current CUDA API failures; inspect
+# full sanitizer output and process status separately. Count host-frame mentions
+# ONLY inside race-check sections (headed by
 # 'Use-before-alloc on allocation' — same header TOTAL_RACES uses).
 # An API-error section is headed by 'Program hit cuda' (compute-sanitizer
 # boilerplate for cudaError* surfaced via memcheck).

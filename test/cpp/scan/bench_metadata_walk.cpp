@@ -22,15 +22,12 @@
 // repeat (product hit), varied predicate (snapshot hit + assemble).
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/table_filter.hpp>
-#include <duckdb/storage/data_table.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/duckdb_native_metadata_cache.hpp>
 #include <utils/table_filter_test_utils.hpp>

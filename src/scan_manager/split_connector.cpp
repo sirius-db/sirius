@@ -36,22 +36,40 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   auto const split_bytes = split->get_estimated_size_in_bytes();
   push_split_sized(std::move(split), split_bytes);
 }
-void split_connector::set_consumption_callback(std::function<void()> callback)
+void split_connector::set_consumption_callback(std::function<void(size_t, size_t)> callback)
 {
-  auto owning = std::make_shared<std::function<void()> const>(std::move(callback));
+  auto owning = std::make_shared<std::function<void(size_t, size_t)> const>(std::move(callback));
   std::lock_guard lock(_mutex);
   _on_consumption = std::move(owning);
 }
 void split_connector::push_split_sized(std::unique_ptr<op::operator_data>&& split,
-                                       size_t split_bytes)
+                                       size_t split_bytes,
+                                       size_t preparation_bytes)
 {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
-    _splits.push_back(std::move(split));
+    _splits.emplace_back();
+    _splits.back() = {std::move(split), preparation_bytes};
     // A zero estimate means unknown, not empty; latch it so the total remains conservative.
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
+  }
+  _cv.notify_one();
+}
+
+void split_connector::push_prepared_scan(std::unique_ptr<op::scan::scan_operator_input>& input,
+                                         size_t bytes,
+                                         size_t preparation_bytes,
+                                         size_t source_id)
+{
+  {
+    std::lock_guard lock(_mutex);
+    if (_closed) throw std::logic_error("prepared scan published after connector close");
+    _splits.emplace_back();  // Allocate before moving or erasing the concrete type.
+    _splits.back() = {std::move(input), preparation_bytes, source_id};
+    _discovered_bytes += bytes;
+    _has_unsized_splits = _has_unsized_splits || bytes == 0;
   }
   _cv.notify_one();
 }
@@ -84,8 +102,8 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
                        std::memory_order_relaxed);
     auto consumed = _on_consumption;
     lock.unlock();
-    if (consumed) (*consumed)();
-    return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
+    if (consumed) (*consumed)(split.preparation_bytes, split.source_id);
+    return std::optional<std::unique_ptr<op::operator_data>>{std::move(split.input)};
   }
   return std::nullopt;
 }
@@ -121,7 +139,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resi
   std::lock_guard<std::mutex> lock(_mutex);
   batches.reserve(_splits.size());
   for (const auto& split : _splits) {
-    auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
+    auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(split.input.get());
     if (scan_input != nullptr && scan_input->is_resident()) {
       batches.push_back(scan_input->get_cached_batch());
     }

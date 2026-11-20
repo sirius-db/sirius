@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "cudf/ast_compat.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/types.hpp>

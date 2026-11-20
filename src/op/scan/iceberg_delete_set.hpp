@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <algorithm>
@@ -28,7 +29,7 @@ namespace sirius::op::scan {
 // For deferred results:
 // Positions use the charged allocation itself; no separately allocated vector or shadow charge.
 // Publish only shared_ptr<const iceberg_delete_set>. The backing outlives every consumer.
-struct iceberg_delete_set {
+struct iceberg_delete_set : prepared_visibility {
   iceberg_delete_set(iceberg_delete_set const&)            = delete;
   iceberg_delete_set& operator=(iceberg_delete_set const&) = delete;
   explicit iceberg_delete_set(std::string file) : file_owner_(std::move(file))
@@ -68,6 +69,14 @@ struct iceberg_delete_set {
   std::string_view data_file;
   std::span<int64_t const> positions;
   uint64_t source_dv_count = 0;
+  // Eager V2 inputs preserve signed, out-of-file legacy positions. Deferred
+  // inputs retain strict bounds validation even when the consumer clips ranges.
+  void validate_file_bounds(int64_t rows) const
+  {
+    if (rows < 0 || (!legacy_positions_ && !positions.empty() &&
+                     (positions.front() < 0 || positions.back() >= rows)))
+      throw std::invalid_argument("deferred delete position is outside its file");
+  }
 
  private:
   void validate(uint64_t count)

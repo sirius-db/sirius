@@ -24,7 +24,7 @@
 namespace sirius::op {
 
 /**
- * @brief The dynamic-filter publication counters, each held as a @p Counter
+ * @brief The dynamic-filter publication and application counters, each held as a @p Counter
  *
  * `dynamic_filter_stats` holds them as atomics for the lifetime of a connection.
  * `dynamic_filter_stats_snapshot` holds plain values, both for a copy of those atomics and for the
@@ -36,22 +36,33 @@ namespace sirius::op {
  * `publications_skipped_source_not_resident`; a source skip may reopen the claim window.
  * `publications_skipped_build_not_whole` is counted once per join rather than once per delivery.
  * `bindings_skipped_incompatible_probe` counts bindings whose recorded probe type no membership
- * adapter can read, which would decline every batch.
+ * adapter can read, which would decline every batch. `applications_skipped_other_device` counts
+ * batches a `sirius::op::scan::dynamic_filter_consumer` passed through unfiltered because the batch
+ * or its prepared program belongs to a device other than the current one.
+ *
+ * Cached placement counters describe successful complete scan payloads, not attempted invocations.
+ * Each such scan counts at most one of `cached_placements`, a decline or
+ * `cached_bypassed_transfer`. `cached_declined_no_membership` counts scans whose checkpoint ran no
+ * membership step: the batch was empty, the gate was inactive, no published filter could probe it,
+ * or every probe declined, even when a static residual still selected the rows.
+ * `cached_payload_bytes` counts a placement's selected table before normalization, excluding its
+ * separately counted position selection.
  *
  * Accumulation counters: `accumulations_started` counts attempts that allocated their partial
  * arrays. `accumulations_skipped_inventory` counts builds whose input could not be certified and
  * attempts ended because a task input could not be matched to exactly one certified batch.
  * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
- * published, including initialization leases, publication scratch, missing peer DMA, and a
+ * published, including initialization leases, publication workspace, and a
  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
  * unexpected or fatal failures before they propagate, and `accumulations_skipped_transient` counts
  * retryable kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every
  * batch contributed, `accumulations_abandoned` publications owed by a task that never ran them
  * before input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs
- * that pushed at least one filter. `accumulation_storage_leaks` counts partial storage deliberately
- * leaked because GPU work might still use it after a failed host join.
- * `accumulation_publication_latency_ns` sums the time from final contribution to first push for
- * every attempt that published a filter.
+ * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose
+ * replicas were staged through HOST memory instead of copied between GPU pools.
+ * `accumulation_storage_leaks` counts partial storage deliberately leaked because GPU work might
+ * still use it after a failed host join. `accumulation_publication_latency_ns` sums the time from
+ * final contribution to first push for every attempt that published a filter.
  */
 template <typename Counter>
 struct dynamic_filter_counters {
@@ -67,6 +78,7 @@ struct dynamic_filter_counters {
   Counter accumulations_abandoned{};
   Counter accumulation_storage_leaks{};
   Counter accumulation_publications_finished{};
+  Counter accumulation_publications_host_staged{};
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_bloom_unsupported{};
@@ -89,6 +101,14 @@ struct dynamic_filter_counters {
   Counter filters_pushed{};
 
   Counter bindings_skipped_incompatible_probe{};
+  Counter applications_skipped_other_device{};
+  Counter cached_placements{};
+  Counter cached_declined_no_layout{};
+  Counter cached_declined_no_membership{};
+  Counter cached_bypassed_transfer{};
+  Counter cached_disabled{};
+  Counter cached_payload_bytes{};
+  Counter cached_position_selections{};
 };
 
 /**
@@ -108,6 +128,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulations_abandoned,
   &dynamic_filter_counters<Counter>::accumulation_storage_leaks,
   &dynamic_filter_counters<Counter>::accumulation_publications_finished,
+  &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,
@@ -126,7 +147,15 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::publications_skipped_build_not_whole,
   &dynamic_filter_counters<Counter>::publications_skipped_targets_drained,
   &dynamic_filter_counters<Counter>::filters_pushed,
-  &dynamic_filter_counters<Counter>::bindings_skipped_incompatible_probe};
+  &dynamic_filter_counters<Counter>::bindings_skipped_incompatible_probe,
+  &dynamic_filter_counters<Counter>::applications_skipped_other_device,
+  &dynamic_filter_counters<Counter>::cached_placements,
+  &dynamic_filter_counters<Counter>::cached_declined_no_layout,
+  &dynamic_filter_counters<Counter>::cached_declined_no_membership,
+  &dynamic_filter_counters<Counter>::cached_bypassed_transfer,
+  &dynamic_filter_counters<Counter>::cached_disabled,
+  &dynamic_filter_counters<Counter>::cached_payload_bytes,
+  &dynamic_filter_counters<Counter>::cached_position_selections};
 
 static_assert(sizeof(dynamic_filter_counters<std::uint64_t>) ==
                 dynamic_filter_counter_fields<std::uint64_t>.size() * sizeof(std::uint64_t),
@@ -140,7 +169,7 @@ static_assert(sizeof(dynamic_filter_counters<std::uint64_t>) ==
 using dynamic_filter_stats_snapshot = dynamic_filter_counters<std::uint64_t>;
 
 /**
- * @brief Connection-lifetime publication counters owned by `SiriusContext`
+ * @brief Connection-lifetime dynamic-filter counters owned by `SiriusContext`
  */
 struct dynamic_filter_stats final : dynamic_filter_counters<std::atomic<std::uint64_t>> {
   /**
@@ -156,13 +185,14 @@ struct dynamic_filter_stats final : dynamic_filter_counters<std::atomic<std::uin
   }
 
   /**
-   * @brief Adds every counter of @p delta with relaxed increments.
+   * @brief Adds every nonzero counter of @p delta with relaxed increments.
    */
   void add(dynamic_filter_stats_snapshot const& delta) noexcept
   {
     for (std::size_t index = 0; index < shared_fields.size(); ++index) {
-      (this->*shared_fields[index])
-        .fetch_add(delta.*plain_fields[index], std::memory_order_relaxed);
+      if (auto const value = delta.*plain_fields[index]; value != 0) {
+        (this->*shared_fields[index]).fetch_add(value, std::memory_order_relaxed);
+      }
     }
   }
 

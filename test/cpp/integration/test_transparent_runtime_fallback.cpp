@@ -20,9 +20,9 @@
 // PhysicalSiriusExecution fail *after* plan generation succeeds — i.e. a runtime
 // failure, distinct from a plan-time (create_plan) fallback.
 
+#include "sirius_context.hpp"
+
 #include <catch.hpp>
-#include <config.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <fcntl.h>
 #include <signal.h>
@@ -192,11 +192,6 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
                  "transparent execution: specialized regex matches generic implementation",
                  "[transparent][integration][regex-jit-differential][regexp_replace]")
 {
-  struct regex_jit_restore_guard {
-    bool original;
-    ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
-  } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
-
   // Keep regexp_replace visible instead of the unsupported v2 rewrite (#2146).
   sirius::test::disabled_optimizers_guard optimizer_guard(*con, "expression_rewriter");
 
@@ -233,7 +228,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
       con->Query(std::string{"SET enable_regex_jit_impl = "} + (enabled ? "true" : "false"));
     REQUIRE(setting != nullptr);
     REQUIRE_FALSE(setting->HasError());
-    REQUIRE(duckdb::Config::ENABLE_REGEX_JIT_IMPL == enabled);
+    REQUIRE(duckdb::session_operator_params(*con->context).enable_regex_jit == enabled);
 
     auto const before = sirius::test::get_transparent_execution_stats(*con);
     auto query        = std::string{R"SQL(
@@ -328,13 +323,17 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   const std::string q = "SELECT count(*) AS n, sum(val) AS s FROM rf_basic WHERE val > 100;";
 
   // With injection: GPU is attempted (rebind + execution), fails, falls back to CPU.
-  inject();
+  inject("operator input contains cudaErrorUnknown");
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto gpu    = con->Query(q);
   REQUIRE(gpu);
   REQUIRE_FALSE(gpu->HasError());
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
 
   // Same query with no injection runs fully on the GPU (no runtime fallback).
   clear_injection();
@@ -510,7 +509,7 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
 {
   create_table("CREATE TABLE rf_plan AS SELECT i AS id, i % 5 AS grp FROM range(100) t(i);");
   const std::string window =
-    "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM rf_plan;";
+    "SELECT id, grp, LAG(id) OVER (PARTITION BY grp ORDER BY id) AS prev FROM rf_plan;";
 
   // Off: unsupported operator surfaces an error instead of silently using CPU.
   con->Query("SET enable_duckdb_fallback = false;");

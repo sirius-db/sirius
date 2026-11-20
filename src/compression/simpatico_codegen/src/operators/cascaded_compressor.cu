@@ -41,6 +41,7 @@ namespace simpatico {
 
 namespace {
 
+#if NVCOMP_VER_MAJOR < 6
 constexpr size_t kCascadedManagerChunkSize = 64 * 1024;
 
 nvcompType_t cascaded_type_for(cudf::data_type t)
@@ -80,8 +81,10 @@ detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t 
 
   detail::batched_codec_ops o;
   o.chunk_size             = kCascadedManagerChunkSize;
-  o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-    return nvcompBatchedCascadedCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+  o.compress_get_temp_size = [copts](
+                               size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+    return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+      nvcompBatchedCascadedCompressGetTempSize, stream, nc, mc, copts, tb, mt);
   };
   o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
     return nvcompBatchedCascadedCompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -98,8 +101,10 @@ detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t 
                              cudaStream_t s) {
     return nvcompBatchedCascadedCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
   };
-  o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-    return nvcompBatchedCascadedDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
+  o.decompress_get_temp_size = [dopts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t stream) {
+    return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+      nvcompBatchedCascadedDecompressGetTempSize, stream, nc, mc, dopts, tb, mt);
   };
   o.decompress_async = [dopts](void const* const* cp,
                                size_t const* cb,
@@ -115,6 +120,7 @@ detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t 
   };
   return o;
 }
+#endif
 
 }  // namespace
 
@@ -142,13 +148,17 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
 }
 
 std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
+  decode_frame& frame) const
 {
+  detail::require_nvcomp_payload_format("nvcomp_cascaded", payload_format);
   if (num_rows == 0 || payload_data() == nullptr || payload_size() == 0) {
     return cudf::make_fixed_width_column(
-      original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+      original_type, num_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
   }
 
+#if NVCOMP_VER_MAJOR >= 6
+  throw std::runtime_error("nvcomp_cascaded: unavailable with nvCOMP 6");
+#else
   nvcompBatchedCascadedCompressOpts_t copts = nvcompBatchedCascadedCompressDefaultOpts;
   copts.type                                = cascaded_type_for(original_type);
   copts.num_deltas                          = compress_num_deltas;
@@ -156,7 +166,8 @@ std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
   copts.use_bp                              = compress_use_bp;
 
   return detail::nvcomp_decompress_impl(
-    make_cascaded_ops(copts), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+    make_cascaded_ops(copts), payload_data(), payload_size(), original_type, num_rows, frame);
+#endif
 }
 
 std::unique_ptr<compressed_representation> cascaded_compressor::compress(
@@ -178,6 +189,10 @@ std::unique_ptr<compressed_representation> cascaded_compressor::compress(
       num_RLEs_,
       use_bp_);
   }
+
+#if NVCOMP_VER_MAJOR >= 6
+  throw std::runtime_error("nvcomp_cascaded: unavailable with nvCOMP 6");
+#else
   if (!cudf::is_fixed_width(dt)) {
     throw std::runtime_error("nvcomp_cascaded: only fixed-width columns supported");
   }
@@ -195,6 +210,7 @@ std::unique_ptr<compressed_representation> cascaded_compressor::compress(
 
   return std::make_unique<cascaded_compressed_representation>(
     dt, n, std::move(comp_buf), actual_size, uncompressed_size, num_deltas_, num_RLEs_, use_bp_);
+#endif
 }
 
 namespace detail {

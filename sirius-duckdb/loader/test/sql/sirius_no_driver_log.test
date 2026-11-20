@@ -1,0 +1,15 @@
+# name: test/sql/sirius_no_driver_log.test
+# description: Falling back to DuckDB's CPU engine leaves one entry in duckdb_logs
+# group: [sirius]
+# Assumes no usable NVIDIA driver, as on DuckDB's CI runners.
+
+statement ok
+CALL enable_logging(level = 'info');
+
+require sirius
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'Sirius GPU execution is unavailable; queries run on DuckDB''s CPU engine. Sirius requires an NVIDIA driver%';
+----
+1

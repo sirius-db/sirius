@@ -5,14 +5,9 @@
  * you may not use this file except in compliance with the License.
  */
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
-
 #include <catch.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <sirius/exception.hpp>
 
 namespace {
 
@@ -204,31 +199,6 @@ TEST_CASE("parquet virtual-only scans reject schemas without a usable carrier",
       {},
       parquet_virtuals()),
     duckdb::NotImplementedException);
-}
-
-TEST_CASE("parquet virtual synthesis rejects an unexpected decoded width",
-          "[scan][parquet][virtual_columns][virtual_review]")
-{
-  auto const plan = scan::build_scan_plan(
-    {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER)},
-    {},
-    {"x", "text"},
-    physical_types(),
-    1,
-    {},
-    parquet_virtuals());
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
-  columns.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}));
-  CHECK_THROWS_AS(
-    scan::append_parquet_virtual_columns(std::make_unique<cudf::table>(std::move(columns)),
-                                         plan,
-                                         "a.parquet",
-                                         0,
-                                         0,
-                                         cudf::get_default_stream(),
-                                         cudf::get_current_device_resource_ref()),
-    sirius::internal_exception);
 }
 
 TEST_CASE("parquet scan plan rejects an unknown bound virtual id",

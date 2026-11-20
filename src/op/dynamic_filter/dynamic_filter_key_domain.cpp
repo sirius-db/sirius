@@ -21,7 +21,6 @@
 
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime_api.h>
 

@@ -16,20 +16,32 @@
 
 #pragma once
 
+#include "compression/simpatico_codegen/src/codegen/selection/decompression_pushdown_policy.hpp"
 #include "config.hpp"
 #include "creator/config.hpp"
+#include "exchange/host_staging.hpp"
 #include "exec/config.hpp"
+#include "expression_evaluator/query_policy.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/config.hpp"
+#include "output/parquet_spec.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/net_topology.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace YAML {
 class Node;
@@ -52,12 +64,22 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+
+/// Fallback BUILD_PROBE budgets with the default hash partition size equal to batch size.
+/// Resolution derives the index budget from startup hash_partition_bytes; the resident budget
+/// remains batch-derived. At >= 4 bytes per row, an 8x index budget covers the former 2x payload
+/// threshold, subject to the cuDF row limit and the independent resident budget.
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
+
+/// Approximate cuco hash-table bytes per build row: 8-byte hash/index slots at 0.5 occupancy.
+/// Capacity rounding and auxiliary allocations are excluded; this is an admission estimate.
+constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -107,7 +129,27 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+constexpr bool DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE = true;
+
+/// Merge sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same
+/// table into one scan and a per-key MIN/MAX aggregate.
+constexpr bool DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE = true;
+
+/// Aggregate below an inner join that only adds variable-width columns the aggregate groups by,
+/// and combine the partial results above it.
+constexpr bool DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN = true;
+
+/// Restrict every table a delim subquery ties to its correlation column by an equality, before
+/// DuckDB orders the joins. Off for now: the rewrite is not tested on multiple GPUs, and a query
+/// that falls back to the CPU after the pre-optimize hook runs the rewritten plan.
+constexpr bool DEFAULT_ENABLE_SUBQUERY_KEY_CARRY = false;
+
+/// Answer a correlated `EXISTS` from a scalar aggregate subquery over the same rows. Off for now,
+/// for the same reasons, and because a scan without a row estimate reports one row and so passes
+/// the rewrite's size guard.
+constexpr bool DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE = false;
+
+/// 0 = auto: a share of GPU tier capacity, mirroring max_sort_partition_bytes. The
 /// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
 /// any fixed size, and a constant admits it at one data size and rejects it at the next.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
@@ -120,6 +162,14 @@ constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
 /// Budget when GPU tier capacity cannot be read at planning time.
 constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// 0 = auto: a share of the pinning GPU memory space's capacity, below.
+constexpr uint64_t DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES = 0;
+
+/// Share of the GPU memory space capacity that the values retained across all columns may occupy
+/// in the pin-time exact uniqueness check when its cap is auto. The check's peak is about three
+/// times the retained bytes, so this keeps it near 30% of the space.
+constexpr double PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION = 0.10;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -127,12 +177,31 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 /// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
-  /// Construct defaults with a shared batch size and twice that size for hash builds.
+  /// Connection-local optimization policy, snapshotted before query execution.
+  bool enable_late_materialization    = true;
+  bool enable_fused_scan_filter       = true;
+  bool enable_low_cardinality_groupby = true;
+
+  /// Connection-local deferral thresholds, copied into each query's planning policy.
+  int late_materialization_min_boundaries                  = 4;
+  std::int64_t late_materialization_min_value_x_boundaries = 128;
+  bool late_materialization_count_defer                    = false;
+  std::int64_t late_materialization_min_value_compressed   = 1;
+  codegen::fused_scan_policy fused_scan;
+
+  /// Construct defaults with a shared batch size and 8x BUILD_PROBE budgets.
   static operator_params with_batch_size(uint64_t batch_size);
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
+  bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept
+  {
+    return {expression_strategy, enable_regex_jit};
+  }
 
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
@@ -146,20 +215,28 @@ struct operator_params {
   /// Target size (bytes) per hash partition for joins and group-bys.
   uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  /// Target size (bytes) for the concat operator output batch.
+  /// Target output batch size (bytes) for CONCAT and REPLICATE. REPLICATE may exceed the target by
+  /// one row.
   uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target output size (bytes) of each cross product task. A pair of input batches whose cross
   /// join is larger is split into tasks over row ranges of the left batch.
-  uint64_t cross_join_task_bytes = config::derived_default_batch_size();
+  uint64_t cross_join_task_bytes = config::DEFAULT_BATCH_SIZE;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
-  /// concatenated if needed.
+  /// Estimated per-GPU cuco hash-table byte budget for BUILD_PROBE, computed from measured rows.
+  /// Defaults to 8x startup-resolved hash_partition_bytes unless explicitly configured.
+  /// SET hash_partition_bytes does not re-derive it; 0 disables BUILD_PROBE including MARK.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+
+  /// Per-GPU decoded build payload budget for BUILD_PROBE. The folded batch stays read-locked
+  /// for the probe stream, and folding may temporarily hold both inputs and output. Admission
+  /// uses a per-partition average for hash partitioning, so skew and concurrent joins can exceed
+  /// available memory. Defaults to 8x batch size; 0 disables BUILD_PROBE including MARK.
+  // SET/RESET overrides are connection-local and captured in the query options snapshot.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -188,16 +265,34 @@ struct operator_params {
   /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
   bool enable_dynamic_filter_multi_partition = true;
 
-  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
-  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
-    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
+  /// Engine-owned per-GPU Bloom-array cap, always 4x this query's scan batch size.
+  /// Saturate overflow; YAML and SQL cannot override the budget independently.
+  [[nodiscard]] uint64_t max_dynamic_filter_bloom_bytes_per_gpu() const noexcept
+  {
+    return memory::saturating_mul(4, scan_task_batch_size);
+  }
+
+  /// Distributed execution: "host:port" of every rank's exchange listener, indexed by rank.
+  /// Fewer than two run in one process. Every rank runs the same SQL over every file of each table
+  /// and scans its own share of the files; rank 0 returns the result.
+  std::vector<std::string> exchange_peers;
+  /// This process's rank among exchange_peers.
+  uint32_t exchange_rank = 0;
+  /// Distributed execution: whether the exchange host-stages its writes to peers.
+  exchange::host_staging exchange_host_staging = exchange::host_staging::automatic;
+
+  /// More than one rank: plans are split across processes and exchange rows.
+  [[nodiscard]] bool distributed() const noexcept { return exchange_peers.size() > 1; }
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
-  /// above 1 disable the gate.
-  double dynamic_filter_domain_coverage_threshold = 0.9;
+  /// Skip an eligible key when its complete build meets this known row-domain coverage. A key is
+  /// eligible when proven unique, or declared through `pin_table(..., unique_cols => [...])` on a
+  /// matching materialized Parquet pin. Unknown or zero domains disable the gate, as do values
+  /// above 1.
+  double dynamic_filter_domain_coverage_threshold =
+    sirius::op::default_dynamic_filter_domain_coverage_threshold;
 
   /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
   /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.
@@ -210,9 +305,9 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Decide decimal SUM widening from base-table statistics at plan time: an aggregate input with
-  /// a proven magnitude bound skips the per-batch min/max scan and its stream synchronization
-  /// (planner::resolve_decimal_sum_input_bounds). Off: every batch is measured.
+  /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
+  /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
+  /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.
   bool enable_decimal_sum_stats_bound = true;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -235,8 +330,48 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
+  /// Prove pinned parquet columns distinct at pin time and let the join planner treat a build key
+  /// proven distinct like a PRIMARY KEY, so the join takes the single-pass distinct hash join.
+  /// When on, pin_table observes every column of a parquet pin (and of a native table's pin when
+  /// late materialization is on); an observed column must be an integer column without a repeated
+  /// value in any chunk, or any column of a table under late_mat::small_table_max_rows rows, to
+  /// stay a candidate. When off, the planner ignores pin-time facts and the pin observes nothing,
+  /// so late materialization gets no proof either.
+  bool prove_unique_keys{true};
+
+  /// Cap, in bytes, on what a pin retains across all columns for the exact uniqueness check, which
+  /// sorts a whole column when its chunks overlap in range. Integer columns take priority over the
+  /// others when the cap is short, and earlier columns over later ones; the check's peak GPU use
+  /// is about three times the cap. A column that no longer fits stays unproven. 0 = a share
+  /// (config::PIN_TABLE_UNIQUE_EXACT_MEMORY_FRACTION) of the pinning GPU memory space's capacity.
+  uint64_t unique_exact_max_bytes{config::DEFAULT_PIN_TABLE_UNIQUE_EXACT_MAX_BYTES};
+
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Compute a decorrelated subquery's MIN/MAX/AVG per key from the outer rows its delim join
+  /// materializes rather than by rescanning the subquery's tables, when those rows are provably the
+  /// same. See `reuse_delim_rows_for_subquery_aggregates`.
+  bool enable_delim_aggregate_reuse = config::DEFAULT_ENABLE_DELIM_AGGREGATE_REUSE;
+
+  /// Rewrite sibling correlated `[NOT] EXISTS (... t.k = outer.k AND t.x <> outer.x)` over the
+  /// same table into one scan and `MIN(t.x), MAX(t.x) GROUP BY k`. See
+  /// `rewrite_correlated_inequality_exists`.
+  bool enable_exists_minmax_rewrite = config::DEFAULT_ENABLE_EXISTS_MINMAX_REWRITE;
+
+  /// Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds
+  /// variable-width group-by columns, so the join repeats them once per key instead of once per
+  /// row. See `push_partial_aggregates_below_joins`.
+  bool enable_partial_aggregate_below_join = config::DEFAULT_ENABLE_PARTIAL_AGGREGATE_BELOW_JOIN;
+
+  /// Under `delim_join_as_cte`, a subquery restricted to the outer rows' keys on one column also
+  /// gets them on every column of another table an equality ties to it. See
+  /// `carry_subquery_keys_across_equalities`.
+  bool enable_subquery_key_carry = config::DEFAULT_ENABLE_SUBQUERY_KEY_CARRY;
+
+  /// Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also
+  /// reads, and keep the outer rows that have a group. See `answer_exists_from_aggregate`.
+  bool enable_exists_from_aggregate = config::DEFAULT_ENABLE_EXISTS_FROM_AGGREGATE;
 
   /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
   /// does not fit declines the fusion, leaving the ordinary join + aggregate.
@@ -257,15 +392,15 @@ struct operator_params {
   uint64_t avg_variable_column_bytes = 32;
 };
 
-constexpr std::string QUENT_NDJSON_EXPORTER = "ndjson";
-
 struct telemetry_config {
-  bool enable_quent{true};
+  /// Off in released extensions (SIRIUS_DISTRIBUTION_DEFAULTS), on otherwise.
+  static bool const default_enable_quent;
+
+  bool enable_quent{default_enable_quent};
   /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
   /// enable_quent is false.
   bool enable_nvtx{false};
 
-  std::string exporter{QUENT_NDJSON_EXPORTER};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
   /// Optional override naming an NVTX injection library. Normally Sirius uses
@@ -274,14 +409,14 @@ struct telemetry_config {
   std::string nvtx_injection_lib{};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression. The unprefixed fields apply to
+/// pin_table(tier=>'host' or 'gpu'); the spill_ fields apply to batches the downgrade
+/// executor spills to the host or disk tier.
 struct compression_config {
-  /// When true, pin_table(tier=>'host') attempts to compress each chunk with
-  /// Simpatico before storing it in host memory. Falls back to uncompressed
-  /// host storage when no plan file is found for a table or compression fails.
-  bool enable_pin_table_compression{false};
+  /// Attempt Simpatico compression for host/GPU pins by default. Explicit table
+  /// plans override automatic spill-policy selection; size/ratio gates and
+  /// encoding failures may leave chunks uncompressed. A per-call opt-out wins.
+  bool enable_pin_table_compression{true};
 
   /// Minimum chunk size (uncompressed bytes) below which compression is
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
@@ -296,13 +431,40 @@ struct compression_config {
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
+  /// Select plans automatically for a GPU-tier pin only when its uncompressed size (the first
+  /// chunk's bytes per row times the table's rows) is at least this fraction of the memory of
+  /// the GPUs it pins to. A smaller pin is stored uncompressed: it frees little GPU memory and
+  /// its scans still pay for decoding. Host pins are not gated, as fewer bytes always shorten
+  /// their host-to-device copies. Explicit table plans are not gated either. Finite and
+  /// non-negative; 0 disables the gate.
+  double min_table_device_fraction{0.05};
+
   /// Directory containing per-table Simpatico plan files for input-table
   /// compression.  Each file is named "<table_name>.<ext>" (any extension);
   /// its contents are the multi-column plan DSL (columns separated by "---"
-  /// lines) passed verbatim to simpatico::compress_with_plan.  If no file
-  /// exists for a table, that table is pinned uncompressed regardless of the
-  /// enable flag.  Empty string = feature disabled.
+  /// lines) passed to simpatico::compress_with_plan after column selection.
+  /// An empty directory setting or no readable, nonempty matching file selects plans
+  /// automatically. A matching plan that does not cover pinned columns leaves the pin raw.
   std::string input_plan_dir{};
+
+  /// Store batches the downgrade executor spills to the host or disk tier
+  /// Simpatico-compressed, with per-type default plans, and decode them on their way
+  /// back to the GPU. A batch whose compressed form saves too little (see
+  /// spill_max_compressed_fraction) or fails to encode spills uncompressed.
+  bool enable_spill_compression{false};
+
+  /// Batches smaller than this spill uncompressed.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};  // 64 MiB
+
+  /// Keep a spilled batch compressed only when its header + payload is at most this
+  /// fraction of the batch's device size. Finite and non-negative; values above 1
+  /// allow compressed forms that expand relative to the original batch.
+  double spill_max_compressed_fraction{0.75};
+
+  /// Encode a spilled batch only when this fraction of its size could be reserved in
+  /// its GPU memory space (the encoder's headroom); otherwise it spills uncompressed.
+  /// In [0, 1]; 0 skips the check.
+  double spill_encode_reserve_fraction{0.5};
 };
 
 class configuration_input_error : public std::runtime_error {
@@ -311,6 +473,65 @@ class configuration_input_error : public std::runtime_error {
 };
 
 class parsed_sirius_config;
+
+/// The egress NIC a REST pool would use (the configured @c rest.interface, else the default
+/// route's interface), as cuCascade discovers it; @c nullopt when there is none or it cannot be
+/// read.  cuCascade's own discovery in production.
+using egress_nic_probe = std::function<std::optional<cucascade::memory::nic_topology>(
+  std::string_view configured_interface)>;
+
+/// cuCascade's egress-NIC discovery, exactly as the REST pool planner runs it.  Never throws.
+[[nodiscard]] std::optional<cucascade::memory::nic_topology> discover_egress_nic(
+  std::string_view configured_interface);
+
+/// Whether the REST reactor count may be sized from the egress NIC rather than from the CPU count:
+/// kernel TLS is loaded and the NIC's queue IRQs are steered to a strict subset of its NUMA node's
+/// cores.  When the NIC also has fewer than @c exec::rest_reactors_max IRQ CPUs, the default is one
+/// reactor per IRQ CPU (at least @c exec::rest_reactors_min_kernel_tls); see
+/// @c rest_reactor_irq_cpus and @c exec::derive_thread_defaults.
+[[nodiscard]] bool rest_reactors_sized_from_nic(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The IRQ CPU count the REST reactor default maps to: the egress NIC's IRQ CPU count when
+/// @c rest_reactors_sized_from_nic, otherwise 0 (the CPU-count default applies).
+[[nodiscard]] std::size_t rest_reactor_irq_cpus(
+  cucascade::memory::kernel_tls_info const& kernel_tls,
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The @c rest.max_connections default: 128 with kernel TLS loaded, 64 (cuCascade's default)
+/// without.  Capped at half of @p queue_depth (each connection needs a primary and a cancel SQE),
+/// so an explicit smaller @c rest.queue_depth stays valid.
+[[nodiscard]] std::size_t default_rest_max_connections(
+  cucascade::memory::kernel_tls_info const& kernel_tls, std::size_t queue_depth) noexcept;
+
+/// The @c rest.min_mtu default for @p egress_nic: the NIC's MTU when the topology reports a
+/// jumbo-frame interface (an MTU above the standard Ethernet 1500), so a connection that negotiated
+/// smaller segments is rejected and retried on the next address; 0 (no check) otherwise, including
+/// when there is no NIC information.
+[[nodiscard]] std::size_t default_rest_min_mtu(
+  std::optional<cucascade::memory::nic_topology> const& egress_nic) noexcept;
+
+/// The CPUs a REST pool built from (@c rest_n_reactors, @c rest) would pin to, sorted:
+/// cuCascade's @c planned_reactor_cpus in production.  May throw.
+using rest_reactor_cpu_planner =
+  std::function<std::vector<int>(std::size_t n_reactors, cucascade::io::rest::config const& rest)>;
+
+/**
+ * @brief Remove the CPUs the pinned REST reactors will take from each of @p pools.
+ *
+ * A pool without an affinity starts from @p allowed (the configuring thread's mask); a pool
+ * whose affinity lies entirely on reactor CPUs keeps it rather than losing every CPU.
+ *
+ * @return The reserved CPUs, sorted; empty when nothing is reserved (the switch is off, planning
+ * failed, the reactors run unpinned, or they would take every allowed CPU), and the pools are
+ * then left untouched.
+ */
+[[nodiscard]] std::vector<int> reserve_cpus_for_rest_reactors(
+  scan_manager::scan_manager_config const& scan_manager,
+  rest_reactor_cpu_planner const& plan,
+  std::vector<int> const& allowed,
+  std::span<exec::thread_pool_config* const> pools);
 
 struct sirius_config {
   sirius_config()  = default;
@@ -322,6 +543,7 @@ struct sirius_config {
   /// Replace all settings with hardware-resolved defaults. Apply programmatic
   /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept { return _max_concurrent_queries; }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -339,7 +561,7 @@ struct sirius_config {
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
   /// disagree.
-  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  [[nodiscard]] const cucascade::io::cache::config& get_cache_config() const noexcept
   {
     return _scan_manager_config.cache;
   }
@@ -351,9 +573,16 @@ struct sirius_config {
 
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
-  void set_object_store_config(io::object_store_config config) noexcept;
+  void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
+
+  /// CPUs reserved for the pinned REST reactors and kept out of every Sirius
+  /// thread pool's affinity; empty when nothing is reserved.
+  [[nodiscard]] const std::vector<int>& get_rest_reactor_cpus() const noexcept
+  {
+    return _rest_reactor_cpus;
+  }
 
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
@@ -380,6 +609,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  output::parquet_compression parquet_output_compression() const noexcept
+  {
+    return _parquet_output_compression;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -389,16 +623,17 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the uring prefetch reactors, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::native (the
+  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
+  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -407,10 +642,25 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// configured pipeline pool size (one scan per pipeline thread), so the local
+  /// readahead runs with the width the executor can actually use. Called from
+  /// @ref finalize_derived_config; an explicit config value (an explicit 0
+  /// included) is left alone.
+  void derive_uring_scan_budget();
+
+  /// Restrict the GPU pipeline, scan manager, task creator and downgrade pools
+  /// to the CPUs the REST reactors will not pin to (see
+  /// @c scan_manager_config::reserve_rest_reactor_cpus).  Called from
+  /// @ref finalize_derived_config.
+  void reserve_rest_reactor_cpus();
+
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
+  /// Query admission limit (`sirius.max_concurrent_queries`).
+  int _max_concurrent_queries{1};
   scan_manager::scan_manager_config _scan_manager_config{};
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
@@ -418,6 +668,9 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  /// CPUs the REST reactors will pin to, reserved from the thread pools (empty: none).
+  std::vector<int> _rest_reactor_cpus;
+  output::parquet_compression _parquet_output_compression{output::parquet_compression::snappy};
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.
@@ -431,8 +684,14 @@ class parsed_sirius_config {
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
-  [[nodiscard]] sirius_config resolve(
-    const cucascade::memory::system_topology_info& topology) const;
+  [[nodiscard]] output::parquet_compression parquet_output_compression() const noexcept;
+  /// The scan-manager settings as parsed (backend selection, REST tuning, cache). Lets an
+  /// embedder check backend-dependent options before the engine is brought up.
+  [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
+  /// @p probe finds the egress NIC, once, when a value derived from it is unnamed (the REST reactor
+  /// count, which also needs loaded kernel TLS, or @c rest.min_mtu); tests inject a fixed NIC.
+  [[nodiscard]] sirius_config resolve(const cucascade::memory::system_topology_info& topology,
+                                      const egress_nic_probe& probe = discover_egress_nic) const;
 
  private:
   struct Impl;

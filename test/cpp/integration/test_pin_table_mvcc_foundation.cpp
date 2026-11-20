@@ -25,13 +25,13 @@
  *        asserts query-time visibility.
  */
 
+#include "compression/compressed_representation.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/common/limits.hpp>
 #include <duckdb/main/config.hpp>
@@ -85,12 +85,23 @@ entry_probe probe_entry(duckdb::Connection& con, const std::string& name)
       out.num_rows    = entry.num_rows;
       out.gpu_chunks  = entry.chunk_memory_spaces.size();
       out.host_chunks = entry.host_chunks.size();
-      if (!entry.data_batches_by_column.empty()) {
+      if (!entry.device_chunks.empty()) {
+        out.gpu_chunks = entry.device_chunks.size();
+        for (auto const& chunk : entry.device_chunks) {
+          out.actual_chunk_rows.push_back(static_cast<std::size_t>(
+            chunk.compressed ? chunk.compressed->num_rows() : chunk.columns.front()->size()));
+        }
+      } else if (!entry.data_batches_by_column.empty()) {
         for (auto const& chunk : entry.data_batches_by_column.begin()->second) {
           out.actual_chunk_rows.push_back(static_cast<std::size_t>(chunk->size()));
         }
       } else {
         for (auto const& chunk : entry.host_chunks) {
+          if (auto const* compressed =
+                dynamic_cast<sirius::compressed_host_representation const*>(chunk.get())) {
+            out.actual_chunk_rows.push_back(static_cast<std::size_t>(compressed->num_rows()));
+            continue;
+          }
           auto const& host_table =
             chunk->cast<cucascade::host_data_representation>().get_host_table();
           out.actual_chunk_rows.push_back(
@@ -318,16 +329,6 @@ TEST_CASE_METHOD(PinMvccFixture,
   REQUIRE(after.n_cache == before.n_cache);
 
   run_ok("CALL unpin_table('mvcc_dml_t');");
-}
-
-TEST_CASE_METHOD(PinMvccFixture,
-                 "pin_table mvcc - attach_mvcc_metadata without an entry throws",
-                 "[integration][pin_table_mvcc]")
-{
-  auto sirius_ctx = sirius::test::get_registered_sirius_context(*con);
-  REQUIRE(sirius_ctx != nullptr);
-  REQUIRE_THROWS_AS(sirius_ctx->get_scan_manager().attach_mvcc_metadata("mvcc_no_such_entry", {}),
-                    std::invalid_argument);
 }
 
 //===----------------------------------------------------------------------===//

@@ -3,10 +3,19 @@ target_sources(
   PRIVATE aggregate/aggregate_op_util.cpp
           aggregate/stddev.cpp
           aggregate/group_key_labels.cpp
+          aggregate/carried_columns.cpp
           aggregate/gpu_aggregate_impl.cpp
+          window/aggregate_types.cpp
+          window/cumulative.cpp
+          window/float_extremum.cpp
+          window/ranking.cpp
+          window/whole_partition.cpp
           merge/gpu_merge_impl.cpp
           order/gpu_order_impl.cpp
           partition/gpu_partition_impl.cpp
+          partition/partition_exchange.cpp
+          partition/consumer_partition_policy.cpp
+          dynamic_filter/hash_join_partition_observer.cpp
           result/host_table_chunk_reader.cpp
           scan/cached_ranges.cpp
           scan/duckdb_insert_delta.cpp
@@ -19,19 +28,36 @@ target_sources(
           scan/host_keep_mask.cpp
           scan/owning_table_view.cpp
           scan/parquet_batch_layout.cpp
+          scan/parquet_byte_range.cpp
+          scan/parquet_source_filter.cpp
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
+          scan/scan_execution_record.cpp
           scan/scan_utils.cpp
           scan/sirius_gpu_scan_operator.cpp
           scan/sirius_gpu_scan_operator_data.cpp
+          scan/composite_scan_driver.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
+          scan/parquet_scan_core.cpp
+          scan/materialization_contract.cpp
+          scan/shared_materializer.cpp
+          scan/row_lineage.cpp
+          scan/row_lineage.cu
+          scan/positional_visibility.cpp
+          scan/positional_visibility.cu
+          scan/field_id_mapping.cpp
+          scan/arrow_materializer.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
+          scan/table_scan/owned_arrow_scan.cpp
+          scan/table_scan/split_validation.cpp
           scan/table_scan/bound_read_view.cpp
+          scan/table_scan/field_mapper.cpp
           scan/table_scan/parquet_physical_profile.cpp
           scan/iceberg_metadata_reader.cpp
+          scan/parquet_delete_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp
           scan/equality_delete_filter.cpp
@@ -41,10 +67,12 @@ target_sources(
           dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/complete_build_inventory.cpp
-          dynamic_filter/dynamic_filter_replica_space.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
+          dynamic_filter/sirius_physical_build_filter.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
           sirius_physical_column_data_scan.cpp
+          sirius_physical_exchange_sink.cpp
+          sirius_physical_exchange_source.cpp
           sirius_physical_streaming_sink.cpp
           sirius_physical_streaming_source.cpp
           sirius_physical_concat.cpp
@@ -57,6 +85,7 @@ target_sources(
           sirius_physical_gpu_values.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp
+          join_cross_schedule.cpp
           sirius_physical_hash_join.cpp
           sirius_physical_limit.cpp
           sirius_physical_merge_sort.cpp
@@ -68,12 +97,23 @@ target_sources(
           sirius_physical_partition_consumer_operator.cpp
           sirius_physical_passthrough_sink.cpp
           sirius_physical_projection.cpp
+          sirius_physical_replicate.cpp
+          sirius_physical_parquet_sink.cpp
           sirius_physical_result_collector.cpp
           sirius_physical_sort_partition.cpp
           sirius_physical_sort_sample.cpp
+          distributed/sample_all_gather_boundaries.cpp
+          distributed/bloom_all_gather_merge.cpp
           sirius_physical_table_scan.cpp
           sirius_physical_top_n.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
+          sirius_physical_window.cpp
+          aggregate/average.cu
+          aggregate/wide_integer_sum.cu
+          join/kept_build_marks.cu
           partition/crc32_partition_hash.cu
+          replicate/gpu_replicate_impl.cu
           scan/equality_delete_mask.cu)
+
+add_subdirectory(scan/arrow)

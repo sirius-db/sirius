@@ -16,22 +16,15 @@
 
 #include "config.hpp"
 
-#include "log/logging.hpp"
-
 namespace duckdb {
 
-sirius::expression_evaluator_strategy Config::EXPRESSION_EVALUATOR_STRATEGY =
-  sirius::expression_evaluator_strategy::AST_INTERPRET;
-
-bool Config::ENABLE_REGEX_JIT_IMPL = true;
-
-uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB
-
-uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
-
+#ifdef SIRIUS_DISTRIBUTION_DEFAULTS
+std::string Config::LOG_BACKEND = "duckdb";
+#else
 std::string Config::LOG_BACKEND = "spdlog";
-std::string Config::LOG_LEVEL   = "info";
-std::string Config::LOG_DIR     = "log";
-int Config::LOG_FLUSH_SECONDS   = 3;
+#endif
+std::string Config::LOG_LEVEL = "info";
+std::string Config::LOG_DIR   = "log";
+int Config::LOG_FLUSH_SECONDS = 3;
 
 }  // namespace duckdb

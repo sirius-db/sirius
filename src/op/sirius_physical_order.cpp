@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_order.hpp"
 
-#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"

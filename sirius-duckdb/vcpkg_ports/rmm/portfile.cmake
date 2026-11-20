@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  0ea7efa882e13431c4faba60bbc805522436735ed91922987448aa5e64137b44937b66fc2d6bcf8658f2bda71f90fcc0f369cc384cdd481848cbefb5b30c0836
+  67b090cc1d3018bcc983f601b7680ea6bb018baf8245b65fe19032b077076bd11e16c22444dfe286e23d87b258f18c0077b1c638dc4eefc696eabdfb9ffbae94
   HEAD_REF
   main
   PATCHES
@@ -20,11 +20,13 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v26.08.00
+  v26.10.00
   SHA512
-  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
+  c5c2be8672faae3990713a990b8e0d4e1082307c9dfd5857805bd543243daf0ec2c1fe41bbdb1736d5ea4e4e9fa261de44b2e8b885d812ce822814251d9f65d2
   HEAD_REF
   main)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../rapids_common.cmake")
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -32,9 +34,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-logger
   REF
-  v0.2.3
+  v0.3.0
   SHA512
-  eb7b5ebf6289d10307b8a34d9d1469ffcb63e9371e9dd5ccbda0351923b920ebae8220ceaa8d1d52c9bed57200f35921a6365a5f9a25a209a98314f75195310c
+  0952bcd7c6579b0cc613e848c1d695466942d3a09d3f98af4c8fed97d23f5e7ad86d73603bfc58b55a4f33461b4e567716d0a70957935fefb896907bdf1074d1
   HEAD_REF
   main)
 
@@ -47,12 +49,14 @@ vcpkg_replace_string(
 
 # Ensure vcpkg CCCL headers are found before pixi/conda system CCCL headers. The
 # pixi compiler injects -I flags for its bundled CCCL which may be an older
-# version. RMM still includes cuda/stream_ref, deprecated by CCCL 3.4.3.
+# version. RMM still includes cuda/stream_ref, deprecated by CCCL 3.5.0.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
   OPTIONS
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
+  -DCPM_DOWNLOAD_LOCATION=${CPM_CMAKE_PATH}
+  -DCPM_LOCAL_PACKAGES_ONLY=ON
   -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
   -DBUILD_TESTS=OFF
   -DBUILD_BENCHMARKS=OFF

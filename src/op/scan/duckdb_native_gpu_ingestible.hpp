@@ -48,10 +48,6 @@ namespace duckdb {
 class SingleFileBlockManager;
 }
 
-namespace sirius::op {
-class sirius_dynamic_filter_set;
-}  // namespace sirius::op
-
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -68,11 +64,6 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::size_t projected_output_count = 0;
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
-  /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
-  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
-  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
-  /// dynamic path).
-  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;
@@ -125,7 +116,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   duckdb_native_scan_info() = default;
 
   duckdb_native_scan_info(std::vector<duckdb_row_group_metadata> row_groups,
-                          std::shared_ptr<sirius::io::sirius_datasource> datasource,
+                          std::shared_ptr<cucascade::io::datasource> datasource,
                           duckdb::SingleFileBlockManager const* block_manager)
     : scan_info(make_fadvise_entries(row_groups, datasource, block_manager)),
       row_groups(std::move(row_groups)),
@@ -137,7 +128,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// Row-group metadata for this unit.
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
-  std::shared_ptr<sirius::io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
   /// Owners of the bytes that host-backed descriptors (host_ptr) point
@@ -162,7 +153,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
  private:
   static std::vector<fadvise_entry> make_fadvise_entries(
     std::vector<duckdb_row_group_metadata> const& row_groups,
-    std::shared_ptr<sirius::io::sirius_datasource> const& datasource,
+    std::shared_ptr<cucascade::io::datasource> const& datasource,
     duckdb::SingleFileBlockManager const* block_manager)
   {
     if (!datasource || block_manager == nullptr) { return {}; }
@@ -211,14 +202,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver resolve) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
     scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
     ::cuda::stream_ref stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    expression_query_policy policy   = {},
+    scan_execution_context execution = {}) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
@@ -227,7 +220,8 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::span<std::size_t const> elided,
+    expression_query_policy policy = {}) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

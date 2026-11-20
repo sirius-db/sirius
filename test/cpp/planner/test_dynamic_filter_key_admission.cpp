@@ -16,9 +16,8 @@
 
 // `join_condition` only forward-declares `sirius::ast::node`, so destroying a
 // `vector<join_condition>` needs the definition in this translation unit.
-#include "expression/ast/node.hpp"
+#include "expression/ast/node.hpp"  // IWYU pragma: keep
 #include "expression/join_condition.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 
@@ -38,6 +37,8 @@
 namespace {
 
 using sirius::op::dynamic_filter_condition_shape;
+using sirius::op::dynamic_filter_domain_evidence;
+using sirius::op::dynamic_filter_domain_source;
 using sirius::op::dynamic_filter_key_shape;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::planner::admit_dynamic_filter_keys;
@@ -271,7 +272,8 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
   REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(0)});
 }
 
-TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key_admission]")
+TEST_CASE("admission preserves NULLs for a wrapped null-equal condition",
+          "[dynamic_filter][key_admission]")
 {
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(
@@ -279,8 +281,10 @@ TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
   std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
 
-  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
-  REQUIRE(admitted.empty());
+  auto const admitted     = admit_dynamic_filter_keys(conditions, shapes, {});
+  auto expected           = expected_key(0);
+  expected.preserve_nulls = true;
+  REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected});
 }
 
 TEST_CASE("admitted keys without any target build a valid but disabled plan",
@@ -303,13 +307,27 @@ TEST_CASE("admission re-emits domain cardinalities in admitted order",
 {
   auto const conditions = make_wrapped_equalities(3);
   std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
-  std::vector<std::size_t> const condition_domains{10, 20, 30};
+  std::vector<dynamic_filter_domain_evidence> const condition_domains{
+    {10, dynamic_filter_domain_source::catalog_bound, false},
+    {20, dynamic_filter_domain_source::pinned_parquet_exact, true},
+    {30, dynamic_filter_domain_source::pinned_parquet_exact, false}};
 
   auto const admitted = admit_dynamic_filter_keys(conditions, shapes, condition_domains);
   REQUIRE(admitted.size() == 3);
-  REQUIRE(admitted[0].build_key_domain_cardinality == 10);
-  REQUIRE(admitted[1].build_key_domain_cardinality == 20);
-  REQUIRE(admitted[2].build_key_domain_cardinality == 30);
+  REQUIRE(admitted[0].build_key_domain.cardinality == 10);
+  REQUIRE(admitted[1].build_key_domain.cardinality == 20);
+  REQUIRE(admitted[2].build_key_domain.cardinality == 30);
+  REQUIRE(admitted[0].build_key_domain.source == dynamic_filter_domain_source::catalog_bound);
+  REQUIRE(admitted[1].build_key_domain.source ==
+          dynamic_filter_domain_source::pinned_parquet_exact);
+  REQUIRE(admitted[2].build_key_domain.source ==
+          dynamic_filter_domain_source::pinned_parquet_exact);
+  REQUIRE_FALSE(admitted[0].build_key_domain.declared_unique);
+  REQUIRE(admitted[1].build_key_domain.declared_unique);
+  REQUIRE_FALSE(admitted[2].build_key_domain.declared_unique);
+  for (auto const& key : admitted) {
+    REQUIRE_FALSE(key.build_key_proven_unique);
+  }
 }
 
 TEST_CASE("admission records zero domains from an empty domain vector",
@@ -323,8 +341,44 @@ TEST_CASE("admission records zero domains from an empty domain vector",
   auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
   REQUIRE(admitted.size() == 2);
-  REQUIRE(admitted[0].build_key_domain_cardinality == 0);
-  REQUIRE(admitted[1].build_key_domain_cardinality == 0);
+  REQUIRE(admitted[0].build_key_domain.cardinality == 0);
+  REQUIRE(admitted[1].build_key_domain.cardinality == 0);
+  for (auto const& key : admitted) {
+    REQUIRE(key.build_key_domain.source == dynamic_filter_domain_source::unknown);
+    REQUIRE_FALSE(key.build_key_domain.declared_unique);
+  }
+}
+
+TEST_CASE("admission copies independent declarations without creating a uniqueness proof",
+          "[dynamic_filter][key_admission][domain_evidence]")
+{
+  auto const conditions = make_wrapped_equalities_at({{9, 4}, {3, 7}, {2, 5}});
+  std::vector<dynamic_filter_condition_shape> const shapes{
+    {.probe = dynamic_filter_key_shape::direct, .build = dynamic_filter_key_shape::cast},
+    kDirectDirect,
+    kDirectDirect};
+  std::vector<dynamic_filter_domain_evidence> evidence{
+    {10, dynamic_filter_domain_source::pinned_parquet_exact, true},
+    {20, dynamic_filter_domain_source::pinned_parquet_exact, true},
+    {30, dynamic_filter_domain_source::pinned_parquet_exact, true}};
+  auto admitted =
+    admit_dynamic_filter_keys(conditions, shapes, evidence, std::size_t{7}, {100, 200, 300});
+  evidence.clear();
+  dynamic_filter_publish_plan const plan{std::move(admitted), {}, {}};
+  auto const& keys = plan.admitted_keys();
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0].planner_condition_index == 1);
+  CHECK(keys[0].build_key_ordinal == 7);
+  CHECK(keys[0].build_key_domain.cardinality == 20);
+  CHECK(keys[0].build_key_value_domain == 200);
+  CHECK(keys[0].build_key_domain.declared_unique);
+  CHECK(keys[0].build_key_proven_unique);
+  CHECK(keys[1].planner_condition_index == 2);
+  CHECK(keys[1].build_key_ordinal == 5);
+  CHECK(keys[1].build_key_domain.cardinality == 30);
+  CHECK(keys[1].build_key_value_domain == 300);
+  CHECK(keys[1].build_key_domain.declared_unique);
+  CHECK_FALSE(keys[1].build_key_proven_unique);
 }
 
 TEST_CASE("admission marks only the key whose build ordinal is the proven-unique column",
@@ -353,6 +407,20 @@ TEST_CASE("admission marks only the key whose build ordinal is the proven-unique
   }
 }
 
+TEST_CASE("value-domain estimates do not create coverage eligibility",
+          "[dynamic_filter][key_admission][domain_evidence]")
+{
+  auto const conditions = make_wrapped_equalities(2);
+  std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {100, 200});
+  REQUIRE(admitted.size() == 2);
+  for (std::size_t i = 0; i < admitted.size(); ++i) {
+    CHECK(admitted[i].build_key_value_domain == (i + 1) * 100);
+    CHECK(admitted[i].build_key_domain.cardinality == 0);
+    CHECK_FALSE(admitted[i].domain_gate_eligible());
+  }
+}
+
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
@@ -363,9 +431,15 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
     std::vector<dynamic_filter_condition_shape> const bad_shapes(1, kDirectDirect);
     REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, bad_shapes, {}), std::invalid_argument);
   }
+  SECTION("misaligned value domains")
+  {
+    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {100}),
+                      std::invalid_argument);
+  }
   SECTION("misaligned domain cardinalities")
   {
-    std::vector<std::size_t> const bad_domains{1};
+    std::vector<dynamic_filter_domain_evidence> const bad_domains{
+      {1, dynamic_filter_domain_source::catalog_bound, false}};
     REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, bad_domains),
                       std::invalid_argument);
   }
@@ -427,7 +501,7 @@ TEST_CASE("join-edge route accepts only direct matching membership-supported equ
     REQUIRE_FALSE(
       direct_route_admissible(duckdb::JoinType::ANTI, equal, kDirectDirect, kInt32, kInt32));
     REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
-                                          sirius::comparison_type::not_distinct_from,
+                                          sirius::comparison_type::distinct_from,
                                           kDirectDirect,
                                           kInt32,
                                           kInt32));
@@ -528,7 +602,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  probe_storage_type,
                  key_shape,
                  domain,
-                 unique] = expected_key(3);
+                 value_domain,
+                 unique,
+                 preserve_nulls]                             = expected_key(3);
+    auto const [cardinality, domain_source, declared_unique] = expected_key(3).build_key_domain;
     (void)planner_condition_index;
     (void)build_key_ordinal;
     (void)probe_key_ordinal;
@@ -536,10 +613,18 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)probe_storage_type;
     (void)key_shape;
     (void)domain;
+    (void)value_domain;
     (void)unique;
+    (void)preserve_nulls;
+    (void)cardinality;
+    (void)domain_source;
+    (void)declared_unique;
 
     auto const base = expected_key(3);
     REQUIRE(base == expected_key(3));
+    auto vary_null_policy           = base;
+    vary_null_policy.preserve_nulls = true;
+    REQUIRE_FALSE(base == vary_null_policy);
 
     auto vary_planner_condition_index                    = base;
     vary_planner_condition_index.planner_condition_index = 4;
@@ -566,11 +651,46 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     REQUIRE_FALSE(base == vary_key_shape);
 
     auto vary_domain                         = base;
-    vary_domain.build_key_domain_cardinality = 1000;
+    vary_domain.build_key_domain.cardinality = 1000;
     REQUIRE_FALSE(base == vary_domain);
+
+    auto vary_value_domain                   = base;
+    vary_value_domain.build_key_value_domain = 1000;
+    REQUIRE_FALSE(base == vary_value_domain);
 
     auto vary_proven_unique                    = base;
     vary_proven_unique.build_key_proven_unique = true;
     REQUIRE_FALSE(base == vary_proven_unique);
+
+    auto vary_declared_unique                             = base;
+    vary_declared_unique.build_key_domain.declared_unique = true;
+    REQUIRE_FALSE(base == vary_declared_unique);
+
+    auto vary_domain_source                    = base;
+    vary_domain_source.build_key_domain.source = dynamic_filter_domain_source::pinned_parquet_exact;
+    REQUIRE_FALSE(base == vary_domain_source);
+  }
+}
+
+TEST_CASE("key comparison determines NULL preservation independently for each key",
+          "[dynamic_filter][key_admission]")
+{
+  auto conditions          = make_wrapped_equalities(3);
+  conditions[0].comparison = sirius::comparison_type::not_distinct_from;
+  conditions[1].comparison = sirius::comparison_type::distinct_from;
+  std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
+  auto const keys = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(keys.size() == 2);
+  CHECK(keys[0].planner_condition_index == 0);
+  CHECK(keys[0].preserve_nulls);
+  CHECK(keys[1].planner_condition_index == 2);
+  CHECK_FALSE(keys[1].preserve_nulls);
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::RIGHT,
+                         duckdb::JoinType::RIGHT_SEMI,
+                         duckdb::JoinType::RIGHT_ANTI}) {
+    CHECK(direct_route_admissible(
+      join_type, sirius::comparison_type::not_distinct_from, kDirectDirect, kInt32, kInt32));
   }
 }

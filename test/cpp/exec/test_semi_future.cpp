@@ -19,7 +19,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <exception>
 #include <memory>
 #include <thread>
@@ -29,21 +28,6 @@ using namespace sirius::exec;
 using namespace std::chrono_literals;
 
 namespace {
-
-template <class counter_t>
-std::uint64_t counter_value(counter_t const& counter)
-{
-  if constexpr (requires { counter.load(std::memory_order_relaxed); }) {
-    return counter.load(std::memory_order_relaxed);
-  } else {
-    return static_cast<std::uint64_t>(counter);
-  }
-}
-
-std::uint64_t raw_futex_wake_count()
-{
-  return counter_value(sirius::exec::detail::raw_futex_wake_count());
-}
 
 void wait_until_count(std::atomic<int>& counter, int expected)
 {
@@ -62,10 +46,8 @@ void rethrow_if_set(std::exception_ptr ep)
 
 }  // namespace
 
-TEST_CASE("semi_future untimed get wakes and does not issue raw futex wake", "[exec][semi_future]")
+TEST_CASE("semi_future untimed get wakes", "[exec][semi_future]")
 {
-  auto const before = raw_futex_wake_count();
-
   promise<int> p;
   auto sf = p.get_semi_future();
   std::atomic<int> entered{0};
@@ -88,7 +70,6 @@ TEST_CASE("semi_future untimed get wakes and does not issue raw futex wake", "[e
 
   rethrow_if_set(error);
   CHECK(value == 42);
-  CHECK(raw_futex_wake_count() - before == 0);
 }
 
 TEST_CASE("semi_future timed get wakes promptly before its deadline", "[exec][semi_future]")
@@ -151,11 +132,10 @@ TEST_CASE("semi_future timed get times out when the promise is not fulfilled",
 
 TEST_CASE("semi_future timed and untimed waiters on one core both wake", "[exec][semi_future]")
 {
-  auto core = std::make_shared<sirius::exec::detail::core<int>>();
-  semi_future<int> untimed{std::make_unique<sirius::exec::detail::leaf_state<int>>(core)};
-  semi_future<int> timed{std::make_unique<sirius::exec::detail::leaf_state<int>>(core)};
+  auto core = std::make_shared<cucascade::exec::detail::core<int>>();
+  semi_future<int> untimed{std::make_unique<cucascade::exec::detail::leaf_state<int>>(core)};
+  semi_future<int> timed{std::make_unique<cucascade::exec::detail::leaf_state<int>>(core)};
 
-  auto const before = raw_futex_wake_count();
   std::atomic<int> entered{0};
   std::atomic<bool> untimed_woke{false};
   int timed_value = 0;
@@ -191,26 +171,22 @@ TEST_CASE("semi_future timed and untimed waiters on one core both wake", "[exec]
   rethrow_if_set(timed_error);
   CHECK(untimed_woke.load(std::memory_order_acquire));
   CHECK(timed_value == 77);
-  CHECK(raw_futex_wake_count() > before);
 }
 
-TEST_CASE("semi_future raw futex wake is gated to parked timed waiters", "[exec][semi_future]")
+TEST_CASE("semi_future resolution without a parked waiter still delivers", "[exec][semi_future]")
 {
-  SECTION("no waiter")
+  SECTION("no waiter: value is available after set_value")
   {
-    auto const before = raw_futex_wake_count();
     promise<int> p;
     auto sf = p.get_semi_future();
 
     p.set_value(7);
 
-    CHECK(raw_futex_wake_count() - before == 0);
     CHECK(std::move(sf).get() == 7);
   }
 
-  SECTION("callback waiter")
+  SECTION("callback waiter: install_callback runs on resolution")
   {
-    auto const before = raw_futex_wake_count();
     promise<int> p;
     auto sf = p.get_semi_future();
     std::atomic<int> observed{0};
@@ -221,34 +197,5 @@ TEST_CASE("semi_future raw futex wake is gated to parked timed waiters", "[exec]
     p.set_value(8);
 
     CHECK(observed.load(std::memory_order_acquire) == 8);
-    CHECK(raw_futex_wake_count() - before == 0);
-  }
-
-  SECTION("parked timed waiter")
-  {
-    auto const before = raw_futex_wake_count();
-    promise<int> p;
-    auto sf = p.get_semi_future();
-    std::atomic<int> entered{0};
-    int value = 0;
-    std::exception_ptr error;
-
-    std::thread waiter([sf = std::move(sf), &entered, &value, &error]() mutable {
-      entered.fetch_add(1, std::memory_order_release);
-      try {
-        value = std::move(sf).get(500ms);
-      } catch (...) {
-        error = std::current_exception();
-      }
-    });
-
-    wait_until_count(entered, 1);
-    std::this_thread::sleep_for(20ms);
-    p.set_value(9);
-    waiter.join();
-
-    rethrow_if_set(error);
-    CHECK(value == 9);
-    CHECK(raw_futex_wake_count() > before);
   }
 }

@@ -30,7 +30,6 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -41,14 +40,14 @@
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/uri_parser.hpp"
+#include "io/path_utils.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
-#include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/scan_returned_types.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -58,13 +57,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -81,55 +78,6 @@ pre_decline iceberg_decline(scan_reason reason,
                             scan_verdict verdict = scan_verdict::unsupported)
 {
   return {verdict, reason, "iceberg_scan declines the GPU scan path: " + std::move(text)};
-}
-
-/// Descends into children so a struct's fields count toward the id space they occupy.
-void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
-                       std::vector<int32_t>& out)
-{
-  for (auto const& column : columns) {
-    if (!column.identifier.IsNull() &&
-        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
-      out.push_back(column.identifier.GetValue<int32_t>());
-    }
-    collect_field_ids(column.children, out);
-  }
-}
-
-/**
- * @brief Refuse tables whose Iceberg field-id space has a gap, meaning a column was dropped.
- *
- * Iceberg never reuses a field id, so a column dropped and re-added under the same name gets a
- * NEW id and must read NULL in older data files. This path resolves columns by NAME, so it finds
- * the dropped column and returns data the table removed, with no error and no fallback.
- *
- * With no drops N fields occupy ids 1..N, so `max > count` means an id was retired. Reads only
- * bind data, opens no files.
- *
- * A PRE-FILTER, not the whole test: a plain ADDED column keeps the space contiguous and slips
- * through, but that case fails loudly instead of returning wrong rows. Resolving by field id is
- * the complete fix; DuckDB's MultiFileColumnMapper already implements it.
- */
-std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
-{
-  auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
-  if (bind_data == nullptr) { return std::nullopt; }
-
-  // `reader_bind.schema` is the Iceberg schema and the only one carrying field ids; the generic
-  // `columns` list may leave `identifier` null, so it is a fallback only.
-  std::vector<int32_t> field_ids;
-  collect_field_ids(
-    bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
-    field_ids);
-  if (field_ids.empty()) { return std::nullopt; }
-
-  auto const max_field_id = *std::max_element(field_ids.begin(), field_ids.end());
-  if (max_field_id <= static_cast<int32_t>(field_ids.size())) { return std::nullopt; }
-
-  return "iceberg_scan table has a gap in its Iceberg field ids (highest is " +
-         std::to_string(max_field_id) + " across " + std::to_string(field_ids.size()) +
-         " fields), so a column was dropped; this scan path resolves columns by name and would "
-         "read a dropped column's data in place of the re-added one";
 }
 
 // Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
@@ -173,14 +121,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       "iceberg_scan table path is empty, so its delete files cannot be inspected");
   }
 
-  // iceberg_scan has three snapshot selectors; the delete path honours only snapshot_from_id,
-  // so the others would resolve deletes against the CURRENT snapshot while the scan reads the
-  // time-travelled one — filtering snapshot A's data by snapshot B's deletes.
-  //
-  // Deliberately coarse: narrowing it to tables that actually have deletes at the SELECTED
-  // snapshot needs the very selector resolution that is missing. To lift it, thread the full
-  // selector into read_iceberg_delete_data AND into its cache key — the key currently records
-  // snapshot_from_id or "current", so two timestamps against one table would collide.
+  // Keep the existing refusal for non-ID selectors. For a default scan, reuse the
+  // selected snapshot below without changing how Iceberg binds the data schema.
   for (auto const& selector : {"snapshot_from_timestamp", "version"}) {
     auto it = op.named_parameters.find(selector);
     if (it != op.named_parameters.end() && !it->second.IsNull()) {
@@ -212,28 +154,18 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     }
   }
 
-  // "current" is resolved independently by DuckDB's bind, by Sirius's rebind of the serialized
-  // plan, and by delete discovery; nothing makes the three agree, so a commit landing between any
-  // two pairs one snapshot's data files with another's deletes. The id DuckDB bound is not
-  // reachable -- it lives in types the iceberg extension compiles privately.
-  //
-  // Do NOT resolve it here instead. Highest sequence number is not the current snapshot under
-  // rollback, branches or staged WAP commits, and comparing data-file sets cannot separate two
-  // snapshots that differ only in deletes. Lifting this needs serializable iceberg bind data
-  // upstream, or Sirius not planning twice.
-  {
-    auto const it = op.named_parameters.find("snapshot_from_id");
-    if (it == op.named_parameters.end() || it->second.IsNull()) {
+  std::optional<int64_t> snapshot_id;
+  auto const sid_it          = op.named_parameters.find("snapshot_from_id");
+  bool const has_explicit_id = sid_it != op.named_parameters.end() && !sid_it->second.IsNull();
+  auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
+  if (!has_explicit_id) {
+    if (!bound) {
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
-        "iceberg_scan was called without 'snapshot_from_id', so the snapshot DuckDB bound "
-        "cannot be recovered; the GPU path resolves delete files in a separate pass and "
-        "would risk pairing one snapshot's data files with another's deletes");
+        "iceberg_scan was called without 'snapshot_from_id' and the binding did not publish "
+        "a committed snapshot identity for delete discovery");
     }
-  }
-
-  if (auto reason = iceberg_retired_field_id_decline_reason(op)) {
-    return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
+    snapshot_id = bound->snapshot_id;
   }
 
   if (!iceberg_table_schema_has_field_ids(op.bind_data.get())) {
@@ -243,10 +175,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       "field IDs to prove per-file schema correspondence");
   }
 
-  std::optional<int64_t> snapshot_id;
-  // Inspect the same snapshot the scan will read.
-  auto sid_it = op.named_parameters.find("snapshot_from_id");
-  if (sid_it != op.named_parameters.end() && !sid_it->second.IsNull()) {
+  if (has_explicit_id) {
     try {
       snapshot_id = sid_it->second.GetValue<int64_t>();
     } catch (...) {
@@ -275,10 +204,7 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     }
     duckdb::SiriusContext::InternalQueryGuard guard(context);
 
-    // See iceberg_metadata_connection: one entry point, shared with discover_from_manifests so
-    // both agree on which tables are legible, and pinned to the same snapshot the scan was bound
-    // to. It mirrors the session's `unsafe_enable_version_guessing` rather than forcing it; a
-    // table the outer session cannot read fails here and the decline below sends it to DuckDB.
+    // Reopen metadata for the selected snapshot, even if the table head has moved.
     struct probe_timer {
       uint64_t& elapsed;
       std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -293,7 +219,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
-    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto result = op::scan::read_delete_inventory(
+      context,
+      table_path,
+      snapshot_id,
+      injection,
+      bound ? std::string_view(bound->table_uuid) : std::string_view{});
     auto const n_delete_files = result.equality_count;
     timer.stop();
     if (n_delete_files > 0) {
@@ -369,7 +300,7 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   bool changed = false;
   for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
     auto const logical = sirius::from_duckdb(op.types[output_idx]);
-    auto const native  = sirius::try_get_cudf_type(logical);
+    auto const native  = sirius::get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
     if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
@@ -881,8 +812,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
     for (auto const& entry : *table_filters) {
-      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
-      if (column_id < op.returned_types.size()) {
+      auto const column_id      = column_ids[entry.GetIndex()].GetPrimaryIndex();
+      auto const virtual_column = op.virtual_columns.find(column_id);
+      if (virtual_column != op.virtual_columns.end()) {
+        reject_nested_column_type(virtual_column->second.type,
+                                  virtual_column->second.name.GetIdentifierName(),
+                                  "a filter predicate");
+        reject_untranslatable_table_filter(entry.Filter(),
+                                           virtual_column->second.type,
+                                           virtual_column->second.name.GetIdentifierName());
+      } else if (column_id < op.returned_types.size()) {
         auto const column_name = column_id < op.names.size()
                                    ? op.names[column_id].GetIdentifierName()
                                    : std::to_string(column_id);
@@ -1078,7 +1017,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     sirius::from_duckdb_vec(original_types),  // Use original types, not modified
     op.function,
     std::move(op.bind_data),
-    sirius::from_duckdb_vec(op.returned_types),
+    scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
     duckdb::IdentifiersToStrings(op.names),

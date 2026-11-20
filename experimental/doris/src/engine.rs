@@ -1,6 +1,6 @@
 //! GPU-backed fragment executor: owns the Sirius engine on a dedicated thread.
 //!
-//! [`sirius::SiriusContext`] is `!Send`/`!Sync` and the engine serializes queries through a single
+//! [`sirius_ffi::SiriusContext`] is `!Send`/`!Sync` and the engine serializes queries through a single
 //! process-global context, so the context is created, used, and dropped on one dedicated thread.
 //! [`SiriusEngine`] talks to that thread over channels — which are `Send`/`Sync` and carry only
 //! owned data (`Vec<u8>` in, `Vec<RecordBatch>` out) — so it satisfies `dyn FragmentExecutor:
@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use arrow_array::RecordBatch;
 use doris_plan_translator::TranslatedPlan;
-use sirius::SiriusContext;
+use sirius_ffi::SiriusContext;
 use tracing::info;
 
 use crate::fragment_executor::{FragmentExecutor, FragmentResult};
@@ -323,7 +323,7 @@ mod tests {
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
     /// back. Exercises the dedicated-thread bring-up, the channel round-trip, and GPU execution.
-    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine, like the `sirius` crate's context
+    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine, like the `sirius-ffi` crate's context
     /// test.
     #[test]
     fn engine_executes_local_files_plan() {

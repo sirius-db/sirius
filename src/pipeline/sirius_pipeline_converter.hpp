@@ -73,7 +73,7 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
 //! 1. Schedule meta-pipelines in dependency order
 //! 2. Compute plan-time wiring descriptors via tree-parent lookup
 //! 3. Set up parent/dependency pipeline edges
-//! 4. Link hash join sibling partition operators and multi-GPU partition floors
+//! 4. Hand the admitted GPU set to every partition consumer
 //! 5. Reorder into the canonical strictly-topological schedule
 class sirius_pipeline_converter {
  public:
@@ -98,7 +98,6 @@ class sirius_pipeline_converter {
   //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();
   void finalize_pipeline_structure();
-  void link_join_partition_siblings();
 
   //! Hand the admitted GPU list to every PARTITION's sizing consumer (hash join, NLJ, merge,
   //! dense count join), which derives the partition count and placement from it, and to every

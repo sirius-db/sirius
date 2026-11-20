@@ -18,7 +18,7 @@
 //
 // Round-trips every supported sirius::type_id through from_duckdb / to_duckdb,
 // verifies typed-NULL fidelity (D-05), DECIMAL across all three width classes
-// (D-02 / D-06), HUGEINT narrowing (D-03), and the unsupported-type throw
+// (D-02 / D-06), exact HUGEINT, UHUGEINT narrowing (D-03), and the unsupported-type throw
 // path (D-07).
 
 #include "catch.hpp"
@@ -115,17 +115,21 @@ TEST_CASE("ast_value - BIGINT round-trips through from_duckdb / to_duckdb", "[as
   REQUIRE(back == dv);
 }
 
-TEST_CASE("ast_value - HUGEINT narrows to int64_t (D-03) and round-trips", "[ast_value]")
+TEST_CASE("ast_value - HUGEINT is an exact decimal128 with scale 0 and round-trips", "[ast_value]")
 {
-  // Use a value that fits cleanly in int64 so the narrowing is lossless.
-  // Out-of-int64-range HUGEINT values are a Phase 5 concern.
-  auto const t  = logical_type::make(type_id::HUGEINT);
-  auto const dv = duckdb::Value::HUGEINT(duckdb::hugeint_t{0, 12345});
-  auto const sv = sirius::from_duckdb(dv, t);
-  REQUIRE(std::holds_alternative<int64_t>(sv));
-  REQUIRE(std::get<int64_t>(sv) == 12345);
-  auto const back = sirius::to_duckdb(sv, t);
-  REQUIRE(back == dv);
+  auto const t = logical_type::make(type_id::HUGEINT);
+  // Small, past INT64_MAX, and past INT64_MIN.
+  for (auto const& hi : {duckdb::hugeint_t{0, 12345},
+                         duckdb::hugeint_t{0, uint64_t{1} << 63},
+                         duckdb::hugeint_t{-1, (uint64_t{1} << 63) - 1}}) {
+    auto const dv = duckdb::Value::HUGEINT(hi);
+    auto const sv = sirius::from_duckdb(dv, t);
+    REQUIRE(std::holds_alternative<sirius::decimal128>(sv));
+    CHECK(std::get<sirius::decimal128>(sv).scale == 0);
+    CHECK(std::get<sirius::decimal128>(sv).value ==
+          ((static_cast<__int128_t>(hi.upper) << 64) | hi.lower));
+    REQUIRE(sirius::to_duckdb(sv, t) == dv);
+  }
 }
 
 TEST_CASE("ast_value - UTINYINT round-trips through from_duckdb / to_duckdb", "[ast_value]")

@@ -19,6 +19,7 @@
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
 #include "log/logging.hpp"
+#include "memory/device_transfer.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
@@ -34,7 +35,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda/buffer>
-#include <cuda/utility>
 #include <cuda_runtime.h>
 
 #include <api/simpatico_codegen.hpp>
@@ -211,14 +211,54 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
 /// microbench.
 constexpr double kMaskRouteMaxDensity = 0.35;
 
-std::unique_ptr<cudf::column> require_non_null(std::unique_ptr<cudf::column> col)
+/// Reattach a compressed chunk's stripped validity to a decoded column that
+/// holds only the rows @p selection selected.
+///
+/// The sidecar's bitmask spans every row of the chunk while the decode returned
+/// the selected ones alone, so bit i of the result is bit `local_indices[i]` of
+/// the stored mask. Copying it verbatim would pair each value with some other
+/// row's validity. The all-valid and all-null shapes carry no bitmask and need
+/// no gather.
+void attach_selected_validity(cudf::column& col,
+                              simpatico::validity_sidecar const& validity,
+                              batch_selection const& selection,
+                              std::int64_t source_rows,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr)
 {
-  // None of these routes gathers a validity mask alongside the values, so a
-  // nullable column would come back with someone else's nulls.
-  if (col && col->null_count() != 0) {
-    throw std::runtime_error("late_mat::materialize: nullable origin columns are not supported");
+  if (validity.kind == simpatico::validity_kind::all_valid) { return; }
+
+  auto const count = col.size();
+  if (static_cast<std::int64_t>(count) != selection.survivors) {
+    throw std::runtime_error(
+      "late_mat::materialize: a compacted decode returned a row count the selection did not ask "
+      "for, so its validity cannot be aligned");
   }
-  return col;
+  if (validity.kind == simpatico::validity_kind::all_null) {
+    col.set_null_mask(cudf::create_null_mask(count, cudf::mask_state::ALL_NULL, stream, mr), count);
+    return;
+  }
+
+  auto const needed =
+    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(source_rows));
+  if (validity.mask.size() < needed) {
+    throw std::runtime_error(
+      "late_mat::materialize: the stored validity mask is too small for the chunk's rows");
+  }
+  if (selection.local_indices.size() < static_cast<std::size_t>(count) * sizeof(std::int32_t)) {
+    throw std::runtime_error(
+      "late_mat::materialize: the selection carries no row list to gather validity by");
+  }
+
+  auto out = cudf::create_null_mask(count, cudf::mask_state::UNINITIALIZED, stream, mr);
+  gather_validity_bits(static_cast<std::uint32_t const*>(validity.mask.data()),
+                       static_cast<std::int32_t const*>(selection.local_indices.data()),
+                       static_cast<std::int64_t>(count),
+                       static_cast<std::uint32_t*>(out.data()),
+                       stream);
+  auto const nulls =
+    cudf::null_count(static_cast<cudf::bitmask_type const*>(out.data()), 0, count, stream);
+  col.set_null_mask(std::move(out), nulls);
 }
 
 /// One compressed batch, by the cheapest route its plan can take.
@@ -235,12 +275,13 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
   auto const& table = source.compressed->table();
   auto const idx    = source.column_index;
 
-  // Whole batch live: no selection to express, so this is an ordinary decode.
+  // Whole batch live: no selection to express, so this is an ordinary decode,
+  // which reattaches the column's validity itself.
   if (selection.dense) {
     std::string err;
     auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
     if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
-    return require_non_null(std::move(full));
+    return full;
   }
 
   auto const rows = selection.rows.view();
@@ -250,8 +291,12 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
   // measured — it is the capability fallback below, not the faster one.
   {
     std::string err;
-    auto sparse = simpatico::decompress_column_rows(table, idx, rows, stream, mr, &err);
-    if (sparse) { return require_non_null(std::move(sparse)); }
+    simpatico::validity_sidecar const* validity = nullptr;
+    auto sparse = simpatico::decompress_column_rows(table, idx, rows, stream, mr, &err, &validity);
+    if (sparse) {
+      attach_selected_validity(*sparse, *validity, selection, source.num_rows, stream, mr);
+      return sparse;
+    }
   }
 
   // (b) Mask route: the shipped kernels, for the shapes with no random access
@@ -277,23 +322,29 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
                                          rows.num_survivors,
                                          static_cast<std::uint32_t*>(chunk_offsets.data())};
     std::string err;
-    auto compacted = simpatico::decompress_column_compacted(table, idx, mask, stream, mr, &err);
-    if (compacted) { return require_non_null(std::move(compacted)); }
+    simpatico::validity_sidecar const* validity = nullptr;
+    auto compacted =
+      simpatico::decompress_column_compacted(table, idx, mask, stream, mr, &err, &validity);
+    if (compacted) {
+      attach_selected_validity(*compacted, *validity, selection, source.num_rows, stream, mr);
+      return compacted;
+    }
   }
 
-  // (c) The route that always works: decode everything, gather once.
+  // (c) The route that always works: decode everything, gather once. The full
+  // decode carries the column's validity and the gather propagates it.
   std::string err;
   auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
   if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
-  auto checked = require_non_null(std::move(full));
   return gather_one(
-    checked->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
+    full->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
 }
 
 /// Buffers released from a column on another GPU. They stay alive here until
 /// the copies that read them have been ordered ahead of their frees.
 using retired_buffer  = std::variant<std::unique_ptr<rmm::device_buffer>,
-                                     std::unique_ptr<::cuda::device_buffer<std::byte>>>;
+                                     std::unique_ptr<::cuda::device_buffer<std::byte>>,
+                                     std::unique_ptr<::cuda::device_buffer<cudf::bitmask_type>>>;
 using retired_buffers = std::vector<retired_buffer>;
 
 /// What a remote gather allocated on the owning GPU: the gather map and, once
@@ -303,8 +354,8 @@ using retired_buffers = std::vector<retired_buffer>;
 /// stream reads the owner's gathered buffers; each buffer is freed on the
 /// stream it was allocated on. So before anything is freed, on every exit path
 /// including a throw mid-way, each stream is ordered behind the other's queued
-/// reads. All no-throw; if an event fails, the stream waited for is
-/// synchronized instead.
+/// reads. Normal completion checks this ordering; if it fails, the caller
+/// synchronizes both streams before borrowed selection storage can unwind.
 class owner_scratch {
  public:
   owner_scratch(int owner_device,
@@ -317,7 +368,10 @@ class owner_scratch {
       _consumer_stream{consumer_stream}
   {
   }
-  ~owner_scratch() { release(); }
+  ~owner_scratch()
+  {
+    if (!_released) { (void)drain_after_failure(); }
+  }
   owner_scratch(owner_scratch const&)            = delete;
   owner_scratch& operator=(owner_scratch const&) = delete;
 
@@ -325,47 +379,60 @@ class owner_scratch {
   retired_buffers retired;                 ///< the gathered column's buffers, after release()
   std::unique_ptr<cudf::column> gathered;  ///< owner-device column, until its buffers are retired
 
-  /// Order each stream behind the other, then free the owner's buffers. Idempotent.
-  void release() noexcept
+  /// Order both streams before freeing owner buffers; failures remain visible to the caller.
+  void release()
   {
     if (_released) { return; }
-    _released = true;
-    // Consumer behind owner: the owner's index copy reads `local_indices`.
-    if (!order(_owner_stream, _owner_device, _consumer_stream, _consumer_device)) {
-      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
-      (void)cudaStreamSynchronize(_owner_stream.get());
+    order(_owner_stream, _owner_device, _consumer_stream, _consumer_device);
+    order(_consumer_stream, _consumer_device, _owner_stream, _owner_device);
+    clear();
+  }
+
+  /// Called while the borrowed selection indices still exist, before exception unwinding.
+  [[nodiscard]] cudaError_t drain_after_failure() noexcept
+  {
+    cudaError_t failed = cudaSuccess;
+    for (auto const [device, stream] :
+         {std::pair{_owner_device, _owner_stream}, std::pair{_consumer_device, _consumer_stream}}) {
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+      auto const status = cudaStreamSynchronize(stream.get());
+      if (status != cudaSuccess) {
+        if (failed == cudaSuccess) { failed = status; }
+        (void)cudaGetLastError();
+        log::log_noexcept([&] {
+          SIRIUS_LOG_ERROR("[late_mat] cleanup synchronization failed on GPU {}: {}",
+                           device,
+                           cudaGetErrorString(status));
+        });
+      }
     }
-    // Owner behind consumer: the consumer's copies read the gathered buffers.
-    if (!order(_consumer_stream, _consumer_device, _owner_stream, _owner_device)) {
-      (void)cudaStreamSynchronize(_consumer_stream.get());
-    }
-    (void)cudaGetLastError();
-    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{_owner_device}};
-    gathered.reset();
-    retired.clear();
-    map = rmm::device_buffer{};
+    clear();
+    return failed;
   }
 
  private:
-  /// Make `waiter` wait for everything `producer` has queued so far.
-  [[nodiscard]] static bool order(::cuda::stream_ref producer,
-                                  int producer_device,
-                                  ::cuda::stream_ref waiter,
-                                  int waiter_device) noexcept
+  void clear() noexcept
   {
-    cudaEvent_t event{};
-    bool ordered = false;
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{_owner_device}};
+    gathered.reset();
+    retired.clear();
+    map       = rmm::device_buffer{};
+    _released = true;
+  }
+
+  static void order(::cuda::stream_ref producer,
+                    int producer_device,
+                    ::cuda::stream_ref waiter,
+                    int waiter_device)
+  {
+    std::optional<cucascade::cuda::cuda_event> event;
     {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{producer_device}};
-      if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) { return false; }
-      ordered = cudaEventRecord(event, producer.get()) == cudaSuccess;
+      event.emplace();
+      event->record(producer);
     }
-    if (ordered) {
-      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{waiter_device}};
-      ordered = cudaStreamWaitEvent(waiter.get(), event, 0) == cudaSuccess;
-    }
-    (void)cudaEventDestroy(event);
-    return ordered;
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{waiter_device}};
+    event->wait(waiter);
   }
 
   int _owner_device;
@@ -381,13 +448,20 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
                                   int destination_device,
                                   ::cuda::stream_ref stream,
                                   rmm::device_async_resource_ref mr,
-                                  retired_buffers& retire)
+                                  retired_buffers& retire,
+                                  cucascade::memory::memory_space const& source_space,
+                                  cucascade::cuda::cuda_event_view ready,
+                                  transfer_context transfers)
 {
+  auto const elements = source ? source->size() : std::size_t{0};
+  auto bytes          = elements;
   if constexpr (!std::is_same_v<Buffer, rmm::device_buffer>) {
-    static_assert(std::is_same_v<typename Buffer::value_type, std::byte>,
-                  "peer_copy only supports the cudf null-mask byte buffer type");
+    static_assert(std::is_same_v<typename Buffer::value_type, std::byte> ||
+                    std::is_same_v<typename Buffer::value_type, cudf::bitmask_type>,
+                  "peer_copy only supports cudf null-mask buffer types");
+    // CUDA buffers allocate elements; peer transfers always count bytes.
+    bytes *= sizeof(typename Buffer::value_type);
   }
-  auto const bytes       = source ? source->size() : std::size_t{0};
   Buffer const* retained = nullptr;
   {
     rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{source_device}};
@@ -408,12 +482,19 @@ std::unique_ptr<Buffer> peer_copy(std::unique_ptr<Buffer> source,
     if constexpr (std::is_same_v<Buffer, rmm::device_buffer>) {
       return std::make_unique<Buffer>(bytes, stream, mr);
     } else {
-      return std::make_unique<Buffer>(stream, mr, bytes, ::cuda::no_init);
+      return std::make_unique<Buffer>(stream, mr, elements, ::cuda::no_init);
     }
   }();
   if (bytes > 0) {
-    CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(
-      copy->data(), destination_device, retained->data(), source_device, bytes, stream.get()));
+    (void)memory::enqueue_device_copy({reinterpret_cast<std::byte*>(copy->data()), bytes},
+                                      rmm::cuda_device_id{destination_device},
+                                      stream,
+                                      {reinterpret_cast<std::byte const*>(retained->data()), bytes},
+                                      rmm::cuda_device_id{source_device},
+                                      &source_space,
+                                      ready,
+                                      transfers.host_staging_space,
+                                      transfers.policy);
   }
   return copy;
 }
@@ -426,7 +507,10 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
                                               int destination_device,
                                               ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr,
-                                              retired_buffers& retire)
+                                              retired_buffers& retire,
+                                              cucascade::memory::memory_space const& source_space,
+                                              cucascade::cuda::cuda_event_view ready,
+                                              transfer_context transfers)
 {
   rmm::cuda_set_device_raii const destination_guard{rmm::cuda_device_id{destination_device}};
   cudf::data_type type{};
@@ -447,13 +531,34 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
   try {
     children.reserve(contents.children.size());
     for (auto& child : contents.children) {
-      children.push_back(
-        transfer_column(std::move(child), source_device, destination_device, stream, mr, retire));
+      children.push_back(transfer_column(std::move(child),
+                                         source_device,
+                                         destination_device,
+                                         stream,
+                                         mr,
+                                         retire,
+                                         source_space,
+                                         ready,
+                                         transfers));
     }
-    data =
-      peer_copy(std::move(contents.data), source_device, destination_device, stream, mr, retire);
-    null_mask = peer_copy(
-      std::move(contents.null_mask), source_device, destination_device, stream, mr, retire);
+    data      = peer_copy(std::move(contents.data),
+                     source_device,
+                     destination_device,
+                     stream,
+                     mr,
+                     retire,
+                     source_space,
+                     ready,
+                     transfers);
+    null_mask = peer_copy(std::move(contents.null_mask),
+                          source_device,
+                          destination_device,
+                          stream,
+                          mr,
+                          retire,
+                          source_space,
+                          ready,
+                          transfers);
     return std::make_unique<cudf::column>(
       type, size, std::move(*data), std::move(*null_mask), null_count, std::move(children));
   } catch (...) {
@@ -471,17 +576,17 @@ std::unique_ptr<cudf::column> transfer_column(std::unique_ptr<cudf::column> colu
 /// A batch pinned on another GPU: gather its survivors where it lives, then
 /// bring only those rows over.
 ///
-/// Two transfers cross, both the size of the SELECTION rather than the batch:
-/// the batch-local indices go to the owner, the gathered rows come back. Both
-/// are cudaMemcpyPeerAsync, so a pair with working peer DMA takes it and a pair
-/// without is staged through host by the driver. The owner's work runs on a
-/// stream of its own space, ordered by events behind the consumer's selection
-/// build and ahead of the consumer's copy.
+/// Two transfers cross, both the size of the SELECTION rather than the batch: the batch-local
+/// indices go to the owner, the gathered rows come back. Each uses the shared transfer utility,
+/// which requests access to its source pool and otherwise stages through managed pinned HOST
+/// storage. Events order the owner's gather behind selection construction and ahead of return
+/// copies.
 std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& source,
                                                        batch_selection const& selection,
                                                        int consumer_device,
                                                        ::cuda::stream_ref stream,
-                                                       rmm::device_async_resource_ref mr)
+                                                       rmm::device_async_resource_ref mr,
+                                                       transfer_context transfers)
 {
   if (source.is_compressed()) {
     // Its decode would run on the owning GPU against a selection that lives on
@@ -507,33 +612,53 @@ std::unique_ptr<cudf::column> materialize_remote_batch(batch_source const& sourc
   // Owns the gathered column until its buffers have been retired safely.
   owner_scratch scratch{owner_device, owner_stream, consumer_device, stream};
   std::optional<cucascade::cuda::cuda_event> gathered_ready;
-  {
-    rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
-    selection_ready.wait(owner_stream);
-    if (selection.dense) {
-      scratch.gathered =
-        std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
-    } else {
-      auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
-      scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
-      CUCASCADE_CUDA_TRY(cudaMemcpyPeerAsync(scratch.map.data(),
-                                             owner_device,
-                                             selection.local_indices.data(),
-                                             consumer_device,
-                                             map_bytes,
-                                             owner_stream.get()));
-      scratch.gathered = gather_one(
-        source.uncompressed, int32_map(scratch.map, selection.survivors), owner_stream, owner_mr);
+  try {
+    {
+      rmm::cuda_set_device_raii const owner_guard{rmm::cuda_device_id{owner_device}};
+      selection_ready.wait(owner_stream);
+      if (selection.dense) {
+        scratch.gathered =
+          std::make_unique<cudf::column>(source.uncompressed, owner_stream, owner_mr);
+      } else {
+        auto const map_bytes = static_cast<std::size_t>(selection.survivors) * sizeof(std::int32_t);
+        scratch.map          = rmm::device_buffer(map_bytes, owner_stream, owner_mr);
+        (void)memory::enqueue_device_copy(
+          {static_cast<std::byte*>(scratch.map.data()), map_bytes},
+          rmm::cuda_device_id{owner_device},
+          owner_stream,
+          {static_cast<std::byte const*>(selection.local_indices.data()), map_bytes},
+          rmm::cuda_device_id{consumer_device},
+          transfers.consumer_space,
+          selection_ready.view(),
+          transfers.host_staging_space,
+          transfers.policy);
+        scratch.gathered = gather_one(
+          source.uncompressed, int32_map(scratch.map, selection.survivors), owner_stream, owner_mr);
+      }
+      gathered_ready.emplace();
+      gathered_ready->record(owner_stream);
     }
-    gathered_ready.emplace();
-    gathered_ready->record(owner_stream);
-  }
 
-  gathered_ready->wait(stream);
-  auto local = transfer_column(
-    std::move(scratch.gathered), owner_device, consumer_device, stream, mr, scratch.retired);
-  scratch.release();
-  return local;
+    gathered_ready->wait(stream);
+    auto local = transfer_column(std::move(scratch.gathered),
+                                 owner_device,
+                                 consumer_device,
+                                 stream,
+                                 mr,
+                                 scratch.retired,
+                                 owner,
+                                 gathered_ready->view(),
+                                 transfers);
+    scratch.release();
+    return local;
+  } catch (...) {
+    auto const status = scratch.drain_after_failure();
+    if (status != cudaSuccess) {
+      std::throw_with_nested(cucascade::cuda_error{"[late_mat] cleanup synchronization failed: " +
+                                                   std::string{cudaGetErrorName(status)}});
+    }
+    throw;
+  }
 }
 
 /// A batch's surviving rows, as a column of its own.
@@ -544,10 +669,11 @@ std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
                                                 batch_selection const& selection,
                                                 int consumer_device,
                                                 ::cuda::stream_ref stream,
-                                                rmm::device_async_resource_ref mr)
+                                                rmm::device_async_resource_ref mr,
+                                                transfer_context transfers)
 {
   if (is_remote(source, consumer_device)) {
-    return materialize_remote_batch(source, selection, consumer_device, stream, mr);
+    return materialize_remote_batch(source, selection, consumer_device, stream, mr, transfers);
   }
   if (source.is_compressed()) { return materialize_compressed(source, selection, stream, mr); }
   if (selection.dense) {
@@ -564,7 +690,8 @@ std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
                                           ::cuda::stream_ref stream,
-                                          rmm::device_async_resource_ref mr)
+                                          rmm::device_async_resource_ref mr,
+                                          transfer_context transfers)
 {
   nvtx_scoped_range nvtx_range{"sirius::late_mat::materialize"};
   auto const& layout = selection.layout();
@@ -604,8 +731,8 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
       ++remote_batches;
       remote_rows += canonical.batches[b].survivors;
     }
-    pieces.push_back(
-      materialize_batch(column.batches[b], canonical.batches[b], consumer_device, stream, mr));
+    pieces.push_back(materialize_batch(
+      column.batches[b], canonical.batches[b], consumer_device, stream, mr, transfers));
   }
   if (remote_batches > 0) {
     SIRIUS_LOG_INFO("[late-mat] GPU {}: gathered {} row(s) from {} batch(es) pinned on other GPUs",

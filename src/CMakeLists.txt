@@ -1,8 +1,17 @@
 target_sources(
   sirius_objects
-  PRIVATE config.cpp
+  PRIVATE c_api/config.cpp
+          c_api/context.cpp
+          c_api/error.cpp
+          c_api/object_store_config.cpp
+          c_api/plan.cpp
+          c_api/version.cpp
+          config.cpp
+          config_loading.cpp
           debug_utils.cpp
           pin_table.cpp
+          output/parquet_session.cpp
+          output/parquet_writer.cpp
           sirius_config.cpp
           sirius_context.cpp
           sirius_engine.cpp
@@ -17,6 +26,7 @@ add_subdirectory(cuda)
 add_subdirectory(data)
 add_subdirectory(downgrade)
 add_subdirectory(event)
+add_subdirectory(exchange)
 add_subdirectory(exec)
 add_subdirectory(expression)
 add_subdirectory(expression_evaluator)
@@ -25,6 +35,7 @@ add_subdirectory(io)
 add_subdirectory(late_mat)
 add_subdirectory(log)
 add_subdirectory(memory)
+add_subdirectory(object_store_scope)
 add_subdirectory(op)
 add_subdirectory(parallel)
 add_subdirectory(pipeline)

@@ -61,13 +61,11 @@
 
 #include "api/simpatico_codegen.hpp"
 #include "codegen/jit/kernel_cache.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "explore/compression_explorer.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -92,7 +90,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -184,8 +181,8 @@ std::unique_ptr<cudf::table> make_uint16_table(int num_rows, int seed)
 // lockstep with build_fixtures() below — the orchestrator sizes/labels work by
 // index into this list, so a shorter list silently drops the trailing fixtures
 // from the sweep.
-constexpr std::array<char const*, 11> kFixtureNames = {
-  "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
+constexpr std::array<char const*, 12> kFixtureNames = {
+  "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "u8_binary", "date", "dec128", "string"};
 
 struct fixture {
   std::string name;
@@ -214,6 +211,7 @@ std::vector<fixture> build_fixtures(::cuda::stream_ref stream, int n)
   add_numeric("f64", make_f64_table(1, n, 4));
   add_numeric("u8_binary", make_u8_table(n, 5));
   add_numeric("date", make_chrono_table(cudf::type_id::TIMESTAMP_DAYS, n, 6));
+  add_numeric("dec128", make_decimal128_table(1, n, 11));
   {
     fixture f;
     f.name = "string";

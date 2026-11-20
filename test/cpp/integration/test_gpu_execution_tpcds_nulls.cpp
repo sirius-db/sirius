@@ -32,7 +32,6 @@
 // Override the path with SIRIUS_TPCDS_TEST_DB_PATH.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdlib>

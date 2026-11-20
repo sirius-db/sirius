@@ -22,6 +22,7 @@
 #include <thrust/iterator/transform_iterator.h>
 
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
@@ -227,16 +228,28 @@ int simpatico_compact_raw_values(
   if (num_chunks <= 0 || !d_padded_v || !d_compact_v || !d_offsets_v) return 0;
   auto stream = static_cast<cudaStream_t>(stream_v);
   auto* offs  = static_cast<const std::int32_t*>(d_offsets_v);
-  if (elem_size == 8) {
+  // The width is dispatched exhaustively, and an unrecognised one is an ERROR
+  // rather than a default. This used to fall through to int32, which for a
+  // 16-byte element copied a quarter of each value at a quarter of the stride --
+  // silent corruption of an RLE `values` channel on a DECIMAL128 column, visible
+  // only as a decode mismatch much later. A width this code does not know about
+  // must stop the encode, not quietly truncate it.
+  if (elem_size == 16) {
+    compact_raw_values_kernel<__int128>
+      <<<num_chunks, 128, 0, stream>>>(static_cast<const __int128*>(d_padded_v),
+                                       static_cast<__int128*>(d_compact_v),
+                                       offs,
+                                       chunk_size);
+  } else if (elem_size == 8) {
     compact_raw_values_kernel<std::int64_t>
       <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int64_t*>(d_padded_v),
                                        static_cast<std::int64_t*>(d_compact_v),
                                        offs,
                                        chunk_size);
-  } else if (elem_size == 1) {
-    compact_raw_values_kernel<std::int8_t>
-      <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int8_t*>(d_padded_v),
-                                       static_cast<std::int8_t*>(d_compact_v),
+  } else if (elem_size == 4) {
+    compact_raw_values_kernel<std::int32_t>
+      <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int32_t*>(d_padded_v),
+                                       static_cast<std::int32_t*>(d_compact_v),
                                        offs,
                                        chunk_size);
   } else if (elem_size == 2) {
@@ -245,12 +258,18 @@ int simpatico_compact_raw_values(
                                        static_cast<std::int16_t*>(d_compact_v),
                                        offs,
                                        chunk_size);
-  } else {
-    compact_raw_values_kernel<std::int32_t>
-      <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int32_t*>(d_padded_v),
-                                       static_cast<std::int32_t*>(d_compact_v),
+  } else if (elem_size == 1) {
+    compact_raw_values_kernel<std::int8_t>
+      <<<num_chunks, 128, 0, stream>>>(static_cast<const std::int8_t*>(d_padded_v),
+                                       static_cast<std::int8_t*>(d_compact_v),
                                        offs,
                                        chunk_size);
+  } else {
+    std::fprintf(stderr,
+                 "simpatico::codegen: compact_raw_values: unsupported element size %d "
+                 "(supported: 1, 2, 4, 8, 16)\n",
+                 elem_size);
+    return 1;
   }
   return static_cast<int>(cudaGetLastError());
 }

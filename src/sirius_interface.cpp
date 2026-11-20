@@ -19,13 +19,16 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/settings.hpp"
-#include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/sirius_physical_parquet_sink.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <absl/cleanup/cleanup.h>
+#include <duckdb/common/types/column/column_data_collection.hpp>
+#include <duckdb/common/types/data_chunk.hpp>
 
 #include <optional>
 #include <stdexcept>
@@ -102,6 +105,43 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     sirius_active_query->engine =
       duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);
     auto& engine = *sirius_active_query->engine;
+    if (prepared.sirius_physical_plan->type == op::SiriusPhysicalOperatorType::COPY_TO_FILE) {
+      auto* sink = &prepared.sirius_physical_plan->Cast<op::sirius_physical_parquet_sink>();
+      engine.initialize(std::move(prepared.sirius_physical_plan));
+      try {
+        sink->prepare();
+        engine.execute();  // Returns only after all asynchronous plan users retire.
+        if (context.IsInterrupted()) throw duckdb::InterruptException();
+        auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+        auto gpu_spaces =
+          runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+        if (gpu_spaces.empty()) throw internal_exception("Parquet export has no configured GPU");
+        duckdb::unique_ptr<duckdb::QueryResult> completion;
+        sink->finish(
+          gpu_spaces.front()->get_device_id(), [&](output::parquet_export_result const& result) {
+            auto collection =
+              duckdb::make_uniq<duckdb::ColumnDataCollection>(context, prepared.prepared->types);
+            duckdb::ColumnDataAppendState append;
+            collection->InitializeAppend(append);
+            duckdb::DataChunk chunk;
+            chunk.Initialize(duckdb::Allocator::Get(context), prepared.prepared->types);
+            chunk.data[0].Append(duckdb::Value::BIGINT(static_cast<int64_t>(result.rows)));
+            chunk.CheckCardinality(1);
+            collection->Append(append, chunk);
+            completion = duckdb::make_uniq<duckdb::QueryResult>(prepared.prepared->statement_type,
+                                                                prepared.prepared->properties,
+                                                                prepared.prepared->names,
+                                                                std::move(collection),
+                                                                context.GetClientProperties());
+          });
+        return completion;
+      } catch (...) {
+        // A failed retirement retains the plan in the lifecycle registry. Leave
+        // cleanup to its eventual destruction rather than racing live writers.
+        if (engine.plan_users_quiescent()) sink->abort();
+        throw;
+      }
+    }
     auto collector =
       duckdb::make_uniq<op::sirius_physical_materialized_collector>(prepared, context);
     D_ASSERT(collector->result_column_types == prepared.prepared->types);
@@ -116,6 +156,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     // The caller routes this typed error to the transaction-preserving fallback.
     throw;
   } catch (std::exception& e) {
+    if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+      runtime->get_query_lifecycle_registry().report_failure(std::current_exception(), query_id);
     duckdb::ErrorData error(e);
     sirius_process_error(error, query);
     return duckdb::make_uniq<duckdb::QueryResult>(std::move(error));

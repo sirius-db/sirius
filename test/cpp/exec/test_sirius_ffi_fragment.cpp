@@ -30,7 +30,6 @@
 #include <catch.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
 
-#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>

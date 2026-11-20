@@ -15,9 +15,9 @@
  */
 
 #pragma once
-
 #include "config.hpp"
 #include "duckdb/common/common.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -47,6 +48,7 @@
 namespace sirius {
 
 class like_multiliteral_cache;
+struct operator_params;
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -112,14 +114,22 @@ enum class operator_data_type : uint8_t {
   PIPELINEABLE,
   PARTITIONED,
   GPU_SCAN,
-  GPU_VALUES,
+  INPUT_FREE,
+};
+
+// Describes the task delivering this input, independently of physical batch IDs.
+// The executor stamps the actual input before each execute() call. A writer's
+// accounting is query-local, so the original task ID needs no query ID here.
+struct delivery_metadata {
+  std::uint64_t original_task_id = 0;
+  std::uint32_t retry_count      = 0;
 };
 
 /**
  * @brief Generic base class for operator input/output data.
  *
- * This is an intentionally minimal base class with no opinion on what the
- * data should be. Derived classes define the concrete data representation.
+ * Derived classes define the concrete data representation. Optional delivery
+ * metadata describes the task invocation independently of that representation.
  */
 class operator_data {
  public:
@@ -130,6 +140,12 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  [[nodiscard]] delivery_metadata const* delivery() const noexcept
+  {
+    return _delivery ? &*_delivery : nullptr;
+  }
+  void set_delivery(delivery_metadata metadata) noexcept { _delivery = metadata; }
 
   /**
    * @brief Identify the concrete subclass at runtime.
@@ -233,6 +249,9 @@ class operator_data {
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
  private:
+  // Optional while constructing an input; overwritten for each task invocation,
+  // including after row-preserving materialization or a downstream task boundary.
+  std::optional<delivery_metadata> _delivery;
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
   std::optional<int> _preferred_device_id;
 };
@@ -256,19 +275,48 @@ class pipelineable_operator_data : public operator_data {
     _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
   }
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : _data_batches(std::move(data_batches)), _position(position)
   {
   }
+
+  /// Logical destination position; may describe a multi-batch merge input.
+  [[nodiscard]] std::optional<std::size_t> get_position() const { return _position; }
 
   /**
    * @brief IDs of the non-null input batches in input order, as constructed.
    *
-   * The IDs survive preparation, which may replace a batch with a cross-GPU clone that has a new
-   * ID, and task retries, which reuse this object. `dynamic_filter_publication_session` uses them
-   * to deduplicate contributions.
+   * The IDs survive every row-preserving replacement: preparation, which may replace a batch with a
+   * cross-GPU clone that has a new ID; `with_batches_preserving_rows`; and task retries, which
+   * reuse this object. `dynamic_filter_publication_session` uses them to deduplicate contributions.
    */
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
+
+  /**
+   * @brief Returns a new task input of the same type that holds @p batches in place of this one's
+   * batches.
+   *
+   * Late materialization calls this just before an operator runs, to swap each input batch for one
+   * with its deferred columns filled in. The rows and their order stay the same, so everything this
+   * task input records about those rows still holds, and the new task input keeps it:
+   * - its subtype and the subtype's fields, such as a partition index, a scan receipt, or a cross
+   *   join slice;
+   * - the original batch ID at each position, which dynamic-filter publication uses to drop
+   *   duplicate contributions (a batch replaced twice keeps the first ID);
+   * - the preferred device.
+   *
+   * Call it only when each new batch holds the same rows, in the same order, as the batch it
+   * replaces. An operator that adds, drops, or reorders rows must build a new plain task input.
+   * Subtypes with fields of their own override it to carry those fields over.
+   *
+   * @param batches One replacement per current batch, at the same position: null exactly where the
+   *                current batch is null
+   * @return The new task input; this one is unchanged
+   * @throws std::invalid_argument if @p batches does not line up with the current batches
+   */
+  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const;
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -282,26 +330,21 @@ class pipelineable_operator_data : public operator_data {
     const;
 
   /**
-   * @brief Task input of the same kind with @p data_batches in place of the batches.
-   *
-   * Late materialization calls it when it restores deferred columns just before an operator's
-   * execute(). Subclasses that carry state besides the batches, such as a cross product task's
-   * slice, override it to copy that state into the new task input.
-   *
-   * @param data_batches The batches of the new task input.
-   * @return A task input of the same type, holding @p data_batches.
-   */
-  [[nodiscard]] virtual std::unique_ptr<pipelineable_operator_data> with_data_batches(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches) const
-  {
-    return std::make_unique<pipelineable_operator_data>(std::move(data_batches));
-  }
-
-  /**
    * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
    * prepare_for_processing if present, otherwise transient read locks built from the idle batches.
    */
   [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches() const;
+
+  /**
+   * @brief Forward the same batches in a plain payload, retaining their read locks.
+   *
+   * Copies prepared read handles, or acquires read handles if this payload is unprepared, before
+   * returning. Replacing the input with this output therefore leaves no gap in protection against
+   * conversion. The output owns its locks until remove_read_only_lock() or destruction.
+   * @param position Logical output position; nullopt discards input ordering.
+   */
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> forward_with_read_only_locks(
+    std::optional<std::size_t> position) const;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
@@ -350,11 +393,54 @@ class pipelineable_operator_data : public operator_data {
     return result.empty() ? "UNKNOWN" : result;
   }
 
+ protected:
+  /**
+   * @brief Takes the row identity of @p source, whose batches this payload's batches replace
+   * position by position.
+   *
+   * Copies the preferred device and records, for each position whose batch ID differs, the original
+   * ID @p source reports for that position. Used by every `with_batches_preserving_rows`
+   * implementation.
+   *
+   * @throws std::invalid_argument if the two payloads do not hold non-null batches at the same
+   * positions
+   */
+  void adopt_row_identity(pipelineable_operator_data const& source);
+
  private:
+  /// The original ID of the batch at @p position, which must hold a non-null batch.
+  [[nodiscard]] std::uint64_t original_batch_id_at(std::size_t position) const;
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
-  /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
+  std::optional<std::size_t> _position;
+  /// (position, original ID) of each batch that a row-preserving replacement swapped for a batch
+  /// with another ID; usually empty.
   std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+};
+
+/// Output of a row router. Each batch has its own destination; omitted empty slices retain IDs.
+class routed_operator_data : public pipelineable_operator_data {
+ public:
+  routed_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                       std::vector<std::size_t> destinations)
+    : pipelineable_operator_data(std::move(batches)), _destinations(std::move(destinations))
+  {
+    if (get_data_batches().size() != _destinations.size()) {
+      throw std::invalid_argument("routed_operator_data: destination/batch count mismatch");
+    }
+  }
+  [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    auto replacement = std::make_unique<routed_operator_data>(std::move(batches), _destinations);
+    replacement->adopt_row_identity(*this);
+    return replacement;
+  }
+
+ private:
+  std::vector<std::size_t> _destinations;
 };
 
 /**
@@ -373,8 +459,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// @throws std::invalid_argument if `partition_idx >= placement.num_partitions()`.
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx,
-                            partition_placement const& placement)
-    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+                            partition_placement const& placement,
+                            std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position), _partition_idx(partition_idx)
   {
     if (partition_idx >= placement.num_partitions()) {
       throw std::invalid_argument("partitioned_operator_data: partition " +
@@ -390,8 +477,9 @@ class partitioned_operator_data : public pipelineable_operator_data {
   /// the GPU already holding the data. Used when a consumer produced a single partition, where no
   /// cross-task device agreement is required.
   explicit partitioned_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : pipelineable_operator_data(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+    std::optional<std::size_t> position = std::nullopt)
+    : pipelineable_operator_data(std::move(data_batches), position)
   {
   }
 
@@ -406,6 +494,14 @@ class partitioned_operator_data : public pipelineable_operator_data {
    *         "place by data affinity", not "partition 0".
    */
   [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
+
+  /// Keeps the partition index; see `pipelineable_operator_data::with_batches_preserving_rows`.
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
+
+ protected:
+  /// Takes the row identity and the partition index of @p source.
+  void adopt_partition_identity(partitioned_operator_data const& source);
 
  private:
   std::optional<std::size_t> _partition_idx;
@@ -508,6 +604,10 @@ class sirius_physical_operator {
 
   [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
 
+  /// The owning pipeline supplies query policy; standalone operators use fixed defaults.
+  [[nodiscard]] expression_query_policy expression_policy() const noexcept;
+  [[nodiscard]] const sirius::operator_params& operator_options() const noexcept;
+
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
   [[nodiscard]] std::shared_ptr<like_multiliteral_cache const> like_cache() const noexcept;
@@ -522,6 +622,33 @@ class sirius_physical_operator {
                                types.size());
     }
     _physical_types = std::move(schema);
+  }
+
+  //! Return the optional per-column alternate carriers. A column with an entry may arrive, batch
+  //! by batch, in either its expected carrier or this one. Empty means no column has one.
+  [[nodiscard]] const std::vector<std::optional<cudf::data_type>>& get_alternate_physical_types()
+    const noexcept
+  {
+    return _alternate_physical_types;
+  }
+
+  //! Whether @p type is the alternate carrier recorded for output column @p column.
+  [[nodiscard]] bool is_alternate_physical_type(std::size_t column,
+                                                cudf::data_type type) const noexcept
+  {
+    return column < _alternate_physical_types.size() && _alternate_physical_types[column] == type;
+  }
+
+  //! Install the per-column alternate carriers, one entry per logical column, or none.
+  void set_alternate_physical_types(std::vector<std::optional<cudf::data_type>> schema)
+  {
+    if (!schema.empty() && schema.size() != types.size()) {
+      throw internal_exception(
+        "alternate physical schema width {} does not match logical schema width {}",
+        schema.size(),
+        types.size());
+    }
+    _alternate_physical_types = std::move(schema);
   }
 
   //! Get the unique operator ID.
@@ -548,8 +675,8 @@ class sirius_physical_operator {
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   //! The late-materialization half this operator carries, if any. Both are empty on every
-  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
-  //! at query prepare, before any task runs, and only read from then on.
+  //! operator unless `enable_late_materialization` is on AND the pair installed; they are written
+  //! once, at query prepare, before any task runs, and only read from then on.
   //!
   //! A scan carries the producing half (stop emitting these positions' values) and its port
   //! carries the consuming half (put them back). Stamped only by
@@ -616,24 +743,21 @@ class sirius_physical_operator {
     return memory::saturating_mul(stats.bytes, 2);
   }
 
+  /// Local effect on logical row order: establish, discard, or preserve the input sequence.
+  /// Every concrete operator must make this decision explicitly; pipeline roles are irrelevant.
+  [[nodiscard]] virtual sirius::OrderPreservationType output_order_preservation() const = 0;
+
+  /// Resolve the output order of this plan subtree, following order-preserving operators.
+  /// INSERTION_ORDER at a leaf denotes an input sequence supplied outside this tree, not a
+  /// guarantee that batches have positions. This analysis does not consult session settings.
+  [[nodiscard]] sirius::OrderPreservationType output_order() const;
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
-
-  //! The influence the operator has on order (insertion order means no influence)
-  virtual sirius::OrderPreservationType operator_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
  public:
   // Source interface
   virtual bool is_source() const { return false; }
-
-  //! The type of order emitted by the operator (as a source)
-  virtual sirius::OrderPreservationType source_order() const
-  {
-    return sirius::OrderPreservationType::INSERTION_ORDER;
-  }
 
   // Data-size estimator hooks. nullopt means unavailable; see
   // docs/super-sirius/data-size-estimation.md.
@@ -667,8 +791,8 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, ::cuda::stream_ref stream);
 
-  //! An operator is a pipeline sink iff its tree parent is a PARTITION, RIGHT_DELIM_JOIN, or
-  //! DENSE_COUNT_JOIN — computed from `_parent_op` so it always reflects the final tree. Those
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER,
+  //! RIGHT_DELIM_JOIN, or DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those
   //! parents consume a child's output through a repository, so the child terminates its own
   //! pipeline. Unconditional sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION,
   //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE and the `delim.join` of a RIGHT_DELIM_JOIN
@@ -677,13 +801,10 @@ class sirius_physical_operator {
   {
     return _parent_op != nullptr &&
            (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
+            _parent_op->type == SiriusPhysicalOperatorType::BUILD_FILTER ||
             _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
             _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction
@@ -694,11 +815,22 @@ class sirius_physical_operator {
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
   //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
-  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  //! dispatches to on_finalize_operator(), then to each finalize listener. Do not override this;
+  //! override on_finalize_operator().
   void finalize_operator()
   {
     finalized.store(true);
     on_finalize_operator();
+    for (auto const& listener : _finalize_listeners) {
+      listener();
+    }
+  }
+
+  //! Adds @p listener, which finalize_operator() calls after on_finalize_operator(). Register it
+  //! while planning; it runs under the pipeline's status lock, so it must not block or throw.
+  void add_finalize_listener(std::function<void()> listener)
+  {
+    _finalize_listeners.push_back(std::move(listener));
   }
 
   //! True after finalize_operator() has been called on this operator.
@@ -765,8 +897,17 @@ class sirius_physical_operator {
   };
 
   /**
-   * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
+   * @brief Publishes @p batch to an explicit destination after observing its arrival.
    */
+  virtual void push_data_batch_partitioned(std::string_view port_id,
+                                           std::shared_ptr<cucascade::data_batch> batch,
+                                           std::size_t partition_idx);
+
+  void push_data_batch_at_position(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t position);
+
+  /// Publish to destination zero after on_input_batch_pushed observes the batch.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
@@ -814,6 +955,10 @@ class sirius_physical_operator {
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+
+  //! Whether the task creator may hand this operator a task with no input batches. A distributed
+  //! collective needs one on a rank whose input is empty, since the other ranks wait for it.
+  [[nodiscard]] virtual bool runs_without_input() const { return false; }
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
 
@@ -855,11 +1000,17 @@ class sirius_physical_operator {
   //! about their logical type. Private so the complete-or-absent invariant enforced by
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
+  //! Optional second carrier per output column, for columns whose carrier varies between batches
+  //! (a wide integer SUM's partials are INT64 or DECIMAL128). See set_alternate_physical_types().
+  std::vector<std::optional<cudf::data_type>> _alternate_physical_types;
 
   //! See `deferred_output()` / `port_directive()`. Private and written through one friend, so
   //! the two halves cannot be installed apart.
   late_mat::deferred_scan_output _deferred_output;
   late_mat::port_materialize_directive _port_directive;
+
+  //! See add_finalize_listener().
+  std::vector<std::function<void()>> _finalize_listeners;
 
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/plan/plan_tree.hpp"
 
+#include <algorithm>
 #include <deque>
+#include <iterator>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace simpatico {
@@ -114,19 +118,49 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
   return tree;
 }
 
+std::optional<ChannelId> output_port(PlanTree const& tree, NodeId node, std::string const& channel)
+{
+  if (node >= tree.nodes.size()) return std::nullopt;
+  if (node == 0) return ChannelId{0};
+  auto const& names = tree.nodes[node].output_names;
+  auto const found  = std::find(names.begin(), names.end(), channel);
+  if (found == names.end()) return std::nullopt;
+  return static_cast<ChannelId>(std::distance(names.begin(), found));
+}
+
+cudf::column const* terminal_identity_channel(PlanNode const& node, std::string const& channel)
+{
+  auto const output = std::find(node.output_names.begin(), node.output_names.end(), channel);
+  auto const index  = static_cast<std::size_t>(std::distance(node.output_names.begin(), output));
+  if (output == node.output_names.end() || index >= node.output_paths.size() ||
+      std::any_of(node.children.begin(), node.children.end(), [&](PlanEdge const& edge) {
+        return edge.channel == channel;
+      })) {
+    return nullptr;
+  }
+  auto const stored = node.channels.find(node.output_paths[index]);
+  if (stored == node.channels.end()) return nullptr;
+  auto const* identity =
+    dynamic_cast<identity_compressed_representation const*>(stored->second.get());
+  if (!identity || identity->channels_.size() != 1) return nullptr;
+  return identity->channels_[0].get();
+}
+
 namespace {
 
-// Output-port index of `channel` on producing node `node`. Node 0 (input) has
-// no named outputs; its single value is port 0.
-ChannelId port_of(PlanTree const& tree, NodeId node, std::string const& channel)
+// The value that `consumer` reads from `producer` through `channel`.
+ValueId consumed_value(PlanTree const& tree,
+                       NodeId consumer,
+                       NodeId producer,
+                       std::string const& channel)
 {
-  if (node != 0) {
-    auto const& names = tree.nodes[node].output_names;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-      if (names[i] == channel) return static_cast<ChannelId>(i);
-    }
+  auto const port = output_port(tree, producer, channel);
+  if (!port) {
+    throw std::invalid_argument("plan_tree: node " + std::to_string(consumer) +
+                                " consumes channel '" + channel + "', which node " +
+                                std::to_string(producer) + " does not output");
   }
-  return 0;
+  return ValueId{producer, *port};
 }
 
 }  // namespace
@@ -140,14 +174,14 @@ void compute_input_sources(PlanTree& tree)
     node.input_sources.clear();
     if (node.attrs.bitjoin.has_value()) {
       for (auto const& ref : node.attrs.bitjoin->inputs) {
-        node.input_sources.push_back(ValueId{ref.node, port_of(tree, ref.node, ref.channel)});
+        node.input_sources.push_back(consumed_value(tree, nid, ref.node, ref.channel));
       }
       continue;
     }
     for (NodeId parent = 0; parent < tree.nodes.size(); ++parent) {
       for (auto const& e : tree.nodes[parent].children) {
         if (e.child == nid) {
-          node.input_sources.push_back(ValueId{parent, port_of(tree, parent, e.channel)});
+          node.input_sources.push_back(consumed_value(tree, nid, parent, e.channel));
         }
       }
     }

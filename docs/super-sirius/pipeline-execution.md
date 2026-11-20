@@ -17,7 +17,7 @@ operators[0] --> operators[1] --> ... --> operators[N-1]
 - `sink` is an alias for the last operator — it also has a `sink()` method called after the execute loop
 - `operators` contains **all** operators, including source and sink (unlike DuckDB where source/sink are separate from the operators list)
 
-Each operator's `execute()` method is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
+Each operator's `execute()` entry point is called in sequence by `compute_task()`. After the loop, the sink's `sink()` method is called via `publish_output()` to push results to downstream ports.
 
 Pipelines are connected through **ports** on operators. When a sink pushes output into ports, a **task creator** monitors data availability and creates `gpu_pipeline_task` objects. These tasks are scheduled on the `gpu_pipeline_executor`, which manages GPU memory, CUDA streams, and a thread pool.
 
@@ -47,6 +47,20 @@ After pipeline finalization, `source` and `sink` are simply aliases for the firs
 - `sink(output_data, stream)` — called on the **last** operator by `publish_output()` to push results to downstream ports
 
 See [Operators](operators.md) for the complete operator reference.
+
+### Delivery metadata
+
+Before invoking `execute()`, the GPU task stamps `delivery_metadata` onto the actual
+input, after any deferred-column materialization. The metadata contains the original
+task ID and retry count; rescheduling retains the original ID, including zero.
+The retry count describes the attempt and is not part of the deduplication key.
+A replacement payload need not propagate metadata: the executor stamps each operator
+invocation and overwrites any metadata inherited from an upstream task.
+
+Parquet COPY requires this metadata and keys its query-local session by original task
+ID. Two tasks may consume the same shared physical batch and still count as separate
+deliveries. No query ID or separate contextual execution method is needed. Delivery
+metadata does not change physical batch identity, scan receipts, or row ordering.
 
 ### Ports
 
@@ -85,7 +99,7 @@ parallel::itask                          // base: local_state + global_state + e
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
 - `gpu_pipeline_task_local_state` — holds input `data_batch` vector, memory reservation, `_start_operator_index` (for OOM resume), `retry_count`
 
-**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each:
+**`compute_task(stream)`** iterates through **all** operators in the pipeline (source through sink inclusive), calling `execute()` on each with delivery metadata on the input:
 ```cpp
 auto operators = pipeline->get_operators();  // includes source and sink
 for (size_t i = start_index; i < operators.size(); i++) {
@@ -190,7 +204,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result collection also attempts a HOST reservation, but this baseline falls back to conversion without one if the reservation is unavailable; that conversion may OOM. Mandatory reservation-backed collection is introduced by the later memory-progress PR (#2001).
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 
@@ -208,17 +222,15 @@ if (evt->kind == task_request_kind::device_ready) {
 
 `schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
 
-**Per-device match.** For each ready device, the scheduler first pops a task with that exact preferred device. If none exists, it pops a task with no preference.
+**Per-device match.** The scheduler first selects the highest-priority exact-device task and
+considers the unbound bucket only if no exact-device task is available. Priority ordering applies
+within each bucket; the two bucket heads are not compared. Retry backoff sleeps in the worker
+before resubmission, rather than attaching a deadline to a queued task. A device preference remains binding;
+another GPU cannot claim that task. The creator confines tasks to their query's admitted GPU set.
+There is no equal-share or round-robin guarantee.
 
-```cpp
-task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-if (!task) {
-  task =
-    _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-}
-```
-
-A preference is binding: another ready GPU cannot claim that task. A preference-less task may be claimed by whichever ready device the management thread considers. With multiple ready devices, each independently searches for an exact-preference task before falling back to the shared no-preference bucket. There is no counter, offset, or round-robin ordering guarantee in this matcher.
+A ready-device credit is consumed only when the executor accepts dispatch. Refusing a canceled
+task leaves that worker capacity available for another query.
 
 `test/cpp/operator/test_task_scheduler_routing.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
 
@@ -284,9 +296,9 @@ while running:
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
-       a. exact preferred-device match
-       b. unpreferred task
-    4. Dispatch the selected task to that device's GPU executor
+       a. pop the highest-priority exact-preference task
+       b. if none exists, pop the highest-priority unbound task
+    4. Dispatch; consume readiness only if the executor accepts the task
 ```
 
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
@@ -368,9 +380,9 @@ The reservation request size comes from the task's memory-history estimate (`pea
 
 After a task completes:
 
-1. Retrieve `output_consumers` — first operators of parent pipelines
-2. If query not complete: call `task_creator->schedule(consumer)` for each
-3. If pipeline sink is `RESULT_COLLECTOR` and pipeline is finished: `completion_handler->mark_completed()`
+1. Check whether `pipeline->is_query_terminal()` (RESULT_COLLECTOR, STREAMING_SINK, or COPY_TO_FILE) and the pipeline is finished
+2. If complete: `completion_handler->mark_completed()`
+3. Otherwise, retrieve `output_consumers` — first operators of parent pipelines — and call `task_creator->schedule(consumer)` for each
 
 The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
 
@@ -425,7 +437,7 @@ and only the first call takes effect.
 
 Retryable execution failures are modeled as a small exception hierarchy: `task_reschedule_exception` is the base, with two subclasses —
 
-- `oom_reschedule_exception` — a GPU operator ran out of memory. Carries `intermediate_data` (partial results computed so far) and `_resume_operator_index` (which operator to resume from).
+- `oom_reschedule_exception` — a GPU operator ran out of memory. Carries `intermediate_data` (partial results computed so far) and `_resume_operator_index` (which operator to resume from). A GPU OOM also raises the task's retry reservation floor to at least twice its reservation and records the failure in the pipeline's memory history. When preparing the task's input runs out of the pinned HOST memory a cross-GPU copy stages through (`memory::host_staging_out_of_memory`, from `memory::enqueue_device_copy`), the task is rescheduled the same way, but the floor and the history are left unchanged, because a larger GPU reservation would not help.
 - `cuda_launch_reschedule_exception` — a transient CUDA kernel-launch failure. `gpu_pipeline_task` translates retryable `thrust::system_error` codes (`cudaErrorLaunchOutOfResources` / `cudaErrorInvalidValue`, seen from concurrent PDL launches in `cudf::hash_partition`) into this exception rather than failing the query.
 
 The GPU executor catches the **base** `task_reschedule_exception` and:

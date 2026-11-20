@@ -22,6 +22,8 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <stdexcept>
@@ -322,7 +324,7 @@ rmm::device_uvector<uint32_t> crc32_partition_hash::compute(
                                 cudaMemcpyHostToDevice,
                                 stream.get()));
   fold_all<<<grid_for(n), kBlock, 0, stream.get()>>>(d_descs.data(), ncols, hashes.data(), n);
-  CUDF_CHECK_CUDA(stream.get());
+  CUDF_CUDA_TRY(cudaGetLastError());
   return hashes;
 }
 

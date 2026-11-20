@@ -10,11 +10,17 @@
   </a>
 </p>
 
-Sirius is a GPU-Native Composable Analytics Engine. It plugs into existing databases via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with \* are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF, cuVS, and cuCascade, Sirius delivers high-performance GPU-accelerated analytics.
+Sirius is a GPU-native SQL engine. It plugs into existing databases via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Starrocks (coming soon), other systems marked with \* are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF, cuVS, and cuCascade, Sirius delivers high-performance GPU-accelerated analytics.
 
 <p align="center">
-  <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-Native Composable Analytics Engine" width="700"/>
+  <img src="super-sirius-arch.png" alt="Sirius architecture: a GPU-native SQL engine" width="700"/>
 </p>
+
+## Concurrent queries
+
+Use separate connections to one DuckDB DatabaseInstance and set startup
+`sirius.max_concurrent_queries` (default 1). See the [concurrent-query guide](super-sirius/concurrent-queries.md)
+for admission, maintenance, cancellation, memory pressure and qualification scope.
 
 ## Performance
 
@@ -28,18 +34,24 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
 - NVIDIA Turing or newer, with compute capability 7.5+.
-- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 525.60.13 or newer).
+- CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 570.26 or newer).
 - `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
 - Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
 
-### Build Requirements
+## Using Sirius as a DuckDB Extension
 
-- Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+Sirius is available as a DuckDB core extension since **DuckDB v2.0.1**, on Linux (`linux_amd64` and `linux_arm64`). This is the quickest way to try Sirius: install and load it from any DuckDB client.
+
+```sql
+INSTALL sirius;
+LOAD sirius;
+```
+
+`LOAD sirius` picks the Sirius backend that matches your NVIDIA driver (CUDA 12 or CUDA 13) and downloads it on first use. Once it's loaded, supported queries run on the GPU with no query changes. For details on backends, CPU fallback, updating and settings, see the [Sirius extension page](https://duckdb.org/docs/2.0/core_extensions/sirius) in the DuckDB documentation.
 
 ## Installing a Prebuilt Sirius Release
 
-Getting started? Download one of our prebuilt extensions instead of building from source:
+Prebuilt Sirius extensions are also published as GitHub releases, which you can use without building from source:
 
 - [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): a maintainer-selected build, promoted manually
 - [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): tracks the newest successful build on `main` automatically, possible to encounter breaking changes
@@ -47,11 +59,16 @@ Getting started? Download one of our prebuilt extensions instead of building fro
 Both include full install instructions in the release notes: installing a matching DuckDB
 version, downloading the right binary for your platform, and a sample query to try it with.
 
-## Building and Running Sirius
+## Building Sirius from Source
 
-For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
+Build from source to use the latest code on `main`, make changes to Sirius, or run its tests. For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-Quick start:
+### Build Requirements
+
+- Git (to clone the repo)
+- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+
+### Quick Start
 
 ```bash
 git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
@@ -97,9 +114,17 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
+Sirius supports one active engine context per process; this is not enforced at runtime.
+Connections to the same DuckDB database instance share that context.
+Close all connections to the first database instance and release any objects that
+keep it alive before creating another instance. See the [Context API documentation](../include/sirius/context/context.hpp)
+for process-wide configuration and lifetime restrictions.
+
 The v2 extension requires the exact DuckDB revision pinned in this repository.
-Use the built CLI above. The default environment's DuckDB 1.5 Python package cannot
-load this extension; Python use requires a package built from the matching revision.
+Python use requires a package built from that matching revision. The DuckDB Python
+package in [`pixi.toml`](../pixi.toml) is intended for fixtures and data generation;
+its version number alone does not establish extension compatibility. Use the built
+CLI above if a matching Python client is unavailable.
 
 Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
 with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
@@ -126,7 +151,8 @@ print(rows)
 con.close()
 ```
 
-Run it from the repository root:
+Run it from the repository root with a Python client built from the matching DuckDB
+revision. If that client is installed in your Pixi environment, use:
 
 ```bash
 pixi run python example.py
@@ -136,8 +162,8 @@ For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
 
 The Python benchmark and power/throughput runners require a Python DuckDB client
-built from the pinned v2 revision; the default environment's 1.5 client cannot
-load this extension. The CLI-based scripts use the built v2 host.
+built from the pinned v2 revision, as described above. The CLI-based scripts use
+the built v2 host.
 
 ## Pinning Tables for Hot Runs
 
@@ -174,9 +200,12 @@ unpinned and pinned again.
 
 ### Compression with Simpatico
 
-Sirius can use Simpatico to compress pinned data in GPU or host memory. After loading Sirius,
-set both compression options **before** calling `pin_table`. This example runs from the
-repository root and uses the bundled TPC-H SF1000 compression plans:
+Sirius attempts Simpatico compression by default when pinning data in GPU or host memory.
+Without a plan file, it automatically chooses a plan for each column in each chunk. Use
+`compression => false` on a pin call, or `SET pin_table_compression = false`, to opt out.
+
+Table plan files are optional overrides. This example runs from the repository root and uses
+the bundled TPC-H SF1000 plans instead of automatic selection:
 
 ```sql
 SET pin_table_compression = true;
@@ -194,12 +223,18 @@ ORDER BY l_returnflag;
 CALL unpin_table('lineitem');
 ```
 
-Use `tier = 'host'` to pin compressed data in host memory. For other datasets, point the plan
-directory at plans matching your table schemas. A plan file must match the pinned table's
-`name` (for example, `lineitem.txt`) and contain one column plan per full-table column in schema
-order. Tables without a matching plan, small batches, and batches with insufficient compression
-savings remain uncompressed. To change whether an existing pin is compressed, unpin and pin it
-again. Restart the process when changing a previously loaded compression plan.
+Use `tier = 'host'` to pin compressed data in host memory. To override automatic selection for
+other datasets, point the plan directory at plans matching your table schemas. A plan file
+must match the pinned table's `name` (for example, `lineitem.txt`) and contain one column plan
+per full-table column in schema order. Without a readable, nonempty matching file, selection
+remains automatic. A selected file that does not cover the requested columns leaves the pin
+uncompressed, as do small chunks, insufficient savings, and recoverable encoding failures.
+
+Each pin call reads the calling session's plan settings; no process restart is needed to
+change a plan. A compressed GPU result replaces the previous entry when pinned again. A raw
+GPU result can merge compatible raw columns, or replace a previous compressed GPU entry.
+Pin the complete intended column set together when compression is enabled. See the guide
+below for merge requirements and explicit-plan staging limits.
 
 From Python, execute the same SQL with `con.execute(...)` after loading the extension and before
 querying. See the [compressed pinning guide](super-sirius/compressed-pinning.md) for plan selection
@@ -215,11 +250,38 @@ Sirius loads its settings from a YAML config file, searched in this order:
 
 If no config file is found, built-in defaults apply (95% GPU memory, 8 GiB pinned host memory per NUMA node). See the [Configuration reference](super-sirius/configuration.md) for all options: memory tiers, thread pools, operator parameters, and runtime `SET` variables. An example config is provided at [`test/cpp/integration/integration.yaml`](../test/cpp/integration/integration.yaml).
 
-## Logging
-Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `log` (relative to the current working directory) and default log level is `info`.
+## Disk Spilling
 
-Log directory and level can be initialized via environment variables before loading the extension:
+Disk spilling is disabled by default: `sirius.memory.disk.downgrade_root_dirs` is empty,
+so there is no default spill directory. GPU data can still spill to host memory without
+a disk tier.
+
+To enable spilling from host memory to disk, add a spill directory on a fast local mount
+(NVMe preferred) to your `sirius.yaml` before starting Sirius:
+
+```yaml
+sirius:
+  memory:
+    disk:
+      downgrade_root_dirs: "/mnt/nvme/sirius-spill"
+      capacity_bytes: 1Ti
+```
+
+Replace the path with a writable directory on your machine. `capacity_bytes` limits the
+disk spill tier and defaults to 1 TiB; it must be greater than zero to enable the tier.
+If your config is elsewhere, set `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading
+the extension. See the [disk memory configuration](super-sirius/configuration.md#disk-memory-siriusmemorydisk)
+for all disk settings.
+
+## Logging
+Source builds log with [spdlog](https://github.com/gabime/spdlog) to `log/sirius_<date>.log`, relative to the current working directory, at level `info`.
+Messages from the embedded cuCascade library (GPU peer-access setup, topology discovery, CUDA error reports, and its I/O layer where enabled) flow through the same sink, prefixed `[cucascade]`, and are filtered by the same log level.
+
+The released `sirius_cuda12` and `sirius_cuda13` extensions write no files by default: they log through DuckDB's logger and leave Quent telemetry off. Read their logs with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`, or select file logging with `SET sirius_log_backend = 'spdlog'` or `SIRIUS_LOG_BACKEND=spdlog`. When a query falls back to the CPU, the banner printed on stdout includes the GPU error.
+
+Log directory and level for the `spdlog` backend can be initialized via environment variables before loading the extension:
 ```bash
+export SIRIUS_LOG_BACKEND=spdlog  # needed for the released extensions
 export SIRIUS_LOG_DIR=/path/to/logs
 export SIRIUS_LOG_LEVEL=trace
 ```

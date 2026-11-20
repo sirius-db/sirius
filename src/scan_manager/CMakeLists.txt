@@ -1,6 +1,8 @@
 target_sources(
   sirius_objects
   PRIVATE preparation_coordinator.cpp
+          coordinator_pool.cpp
+          native_reader_executor.cpp
           preparation.cpp
           preparation_ledger.cpp
           late_mat_resolver.cpp
@@ -14,4 +16,5 @@ target_sources(
           memory_prefetcher.cpp
           sirius_scan_manager.cpp
           split_connector.cpp
-          split_provider.cpp)
+          split_provider.cpp
+          uring_gauges_sampler.cpp)

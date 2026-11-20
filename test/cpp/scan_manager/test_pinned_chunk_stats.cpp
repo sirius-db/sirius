@@ -50,14 +50,8 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/dynamic_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
-#include <duckdb/planner/filter/in_filter.hpp>
-#include <duckdb/planner/filter/null_filter.hpp>
-#include <duckdb/planner/filter/optional_filter.hpp>
-#include <duckdb/planner/filter/struct_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
@@ -747,6 +741,13 @@ TEST_CASE("compute_pinned_chunk_stats - unsupported or degenerate columns yield 
   // must NOT produce stats — the raw rep would be off by 10^3.
   auto ms_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_MILLISECONDS, {1'000, 5'000});
   REQUIRE_FALSE(capture_one(ms_col->view(), LogicalType::TIMESTAMP));
+
+  // Top-N supports these units, but shared conversion must not broaden this allowlist.
+  REQUIRE_FALSE(capture_one(ms_col->view(), LogicalType::TIMESTAMP_MS));
+  auto sec_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_SECONDS, {1, 5});
+  REQUIRE_FALSE(capture_one(sec_col->view(), LogicalType::TIMESTAMP_S));
+  auto ns_col = make_gpu_col<int64_t>(cudf::type_id::TIMESTAMP_NANOSECONDS, {1'000, 5'000});
+  REQUIRE_FALSE(capture_one(ns_col->view(), LogicalType::TIMESTAMP_NS));
 
   // All-null and empty columns have no bounds to capture.
   auto all_null = make_gpu_col<int32_t>(cudf::type_id::INT32, {1, 2}, {false, false});

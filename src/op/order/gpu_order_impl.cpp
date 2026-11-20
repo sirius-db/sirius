@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 
+#include <cudf/sorting.hpp>
 namespace sirius {
 namespace op {
 
