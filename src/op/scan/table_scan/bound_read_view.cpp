@@ -689,7 +689,10 @@ std::optional<iceberg_snapshot_binding> capture_iceberg_snapshot(
   duckdb::TableFunctionGetBindInfoInput input(context,
                                               const_cast<duckdb::FunctionData*>(bind_data));
   auto const info = function.get_bind_info(input);
-  if (info.type != duckdb::ScanType::EXTERNAL) return std::nullopt;
+  // A path scan binds as EXTERNAL and a catalog table as TABLE; both publish these options.
+  if (info.type != duckdb::ScanType::EXTERNAL && info.type != duckdb::ScanType::TABLE) {
+    return std::nullopt;
+  }
   auto const option = [&](char const* name, duckdb::LogicalTypeId type) -> duckdb::Value const* {
     auto const it = info.options.find(name);
     return it != info.options.end() && !it->second.IsNull() && it->second.type().id() == type

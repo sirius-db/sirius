@@ -348,7 +348,13 @@ class SiriusConnectionState : public ClientContextState {
   /// objects across DatabaseInstances still get distinct ids).
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
+  /// The statement's connection when this is a Sirius internal connection, else null. Set
+  /// before the internal connection runs anything, so IO threads may read it.
+  void set_internal_outer(weak_ptr<ClientContext> outer) { internal_outer_ = std::move(outer); }
+  [[nodiscard]] shared_ptr<ClientContext> internal_outer() const { return internal_outer_.lock(); }
+
  private:
+  weak_ptr<ClientContext> internal_outer_;
   uint64_t planning_generation_   = 0;
   uint64_t captured_generation_   = 0;
   uint64_t declined_generation_   = 0;

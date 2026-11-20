@@ -4010,6 +4010,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A deletion vector whose manifest records a lower-case format applies on the GPU",
+                 "[integration][iceberg][deletion_vector]")
+{
+  // Read as a Parquet position-delete file, the Puffin sidecar fails to open at run time.
+  expect_iceberg_rows("SELECT fruit, count FROM " +
+                        pinned_scan(inventory_fixture("dv_lowercase_format")) + " ORDER BY count",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Qualifying DV work starts on workers after lowering and before decode",
                  "[integration][scan_preparation][iceberg][deferred]")
 {

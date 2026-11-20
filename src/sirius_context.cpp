@@ -383,6 +383,9 @@ struct SiriusContext::internal_connection::implementation {
   implementation(ClientContext& outer, AttachedDatabase& database, bool read_only)
     : connection(*outer.db), guard(*connection.context)
   {
+    if (auto state = get_sirius_connection_state(*connection.context)) {
+      state->set_internal_outer(outer.shared_from_this());
+    }
     auto result = connection.Query(read_only ? "BEGIN TRANSACTION READ ONLY" : "BEGIN TRANSACTION");
     if (!read_only) {
       if (!result || result->HasError()) {

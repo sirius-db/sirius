@@ -1275,6 +1275,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `gpu_execution` | true | Enable transparent GPU execution for plain SQL queries. When enabled, supported queries are automatically intercepted and executed on the GPU. When disabled, only explicit `CALL gpu_execution('...')` uses the GPU. |
+| `sirius_s3_header_signing` | false | Sign S3 requests whose credentials come from a DuckDB secret in the `Authorization` header instead of a presigned URL. Needed for endpoints that refuse presigned URLs. See [scan.md](scan.md#s3--object-store-backend). |
 
 ### Debug
 

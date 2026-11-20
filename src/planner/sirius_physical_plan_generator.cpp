@@ -442,11 +442,6 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       info->field_mapping_requirements = std::move(requirements);
   }
 
-  if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
-    throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
-  }
-  info->table_path = scan_op.parameters.front().GetValue<std::string>();
-
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw duckdb::NotImplementedException(
@@ -464,11 +459,21 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   auto inventory = std::move(*scan_op.delete_inventory);
   scan_op.delete_inventory.reset();
+  info->table_path = inventory.table;
   if (info->field_mapping_requirements)
     info->files_without_partition_values =
       sirius::op::scan::iceberg_files_without_partition_values(context, inventory);
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
+  // A deletion vector is opened by path after planning. Install the credential this statement
+  // resolves for it now, as for the data files.
+  for (auto const& dv : discovery.deletion_vector_entries) {
+    if (!sirius::io::s3::is_s3_path(dv.file_path)) { continue; }
+    sirius_ctx->get_scan_manager().install_s3_config(
+      dv.file_path,
+      sirius::io::s3::resolve_duckdb_s3_secret(
+        context, dv.file_path, sirius_ctx->get_config().get_scan_manager_config().object_store));
+  }
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else

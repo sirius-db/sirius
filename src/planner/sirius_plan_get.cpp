@@ -23,6 +23,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -98,22 +99,39 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   std::optional<op::scan::iceberg_delete_inventory>& inventory,
   std::string_view injection)
 {
-  if (op.parameters.empty() || op.parameters.front().IsNull()) {
-    return iceberg_decline(
-      scan_reason::iceberg_no_table_path,
-      "iceberg_scan called without a table path, so its delete files cannot be inspected");
-  }
-
   std::string table_path;
-  try {
-    // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
-    if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
-      throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
-    table_path = op.parameters.front().GetValue<std::string>();
-  } catch (...) {
-    return iceberg_decline(
-      scan_reason::iceberg_table_path_not_string,
-      "iceberg_scan table path is not a string, so its delete files cannot be inspected");
+  bool const catalog_table = op.parameters.empty() || op.parameters.front().IsNull();
+  if (catalog_table) {
+    // A catalog table's scan has no path argument. Address the table by its quoted qualified
+    // name, which iceberg_metadata() resolves through the same catalog.
+    duckdb::optional_ptr<duckdb::TableCatalogEntry> table;
+    try {
+      table = op.GetTable();
+    } catch (...) {
+      // GetTable() runs extension code; a failure leaves no table to address.
+    }
+    if (!table) {
+      return iceberg_decline(
+        scan_reason::iceberg_no_table_path,
+        "iceberg_scan called without a table path, so its delete files cannot be inspected");
+    }
+    auto const quoted = [](std::string const& name) {
+      return duckdb::KeywordHelper::WriteQuotedAndEscaped(name, '"');
+    };
+    table_path = quoted(table->ParentCatalog().GetName().GetIdentifierName()) + "." +
+                 quoted(table->ParentSchema().name.GetIdentifierName()) + "." +
+                 quoted(table->name.GetIdentifierName());
+  } else {
+    try {
+      // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
+      if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
+        throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
+      table_path = op.parameters.front().GetValue<std::string>();
+    } catch (...) {
+      return iceberg_decline(
+        scan_reason::iceberg_table_path_not_string,
+        "iceberg_scan table path is not a string, so its delete files cannot be inspected");
+    }
   }
   if (table_path.empty()) {
     return iceberg_decline(
@@ -160,6 +178,17 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
   auto const bound = op::scan::capture_iceberg_snapshot(op.function, op.bind_data.get(), context);
   if (!has_explicit_id) {
     if (!bound) {
+      // The extension withholds the snapshot of a table that has none and of a scan that also
+      // reads the transaction's own uncommitted changes. A catalog query names neither
+      // iceberg_scan nor snapshot_from_id, so say it in terms of the table.
+      if (catalog_table) {
+        return pre_decline{
+          scan_verdict::unsupported,
+          scan_reason::iceberg_no_snapshot_id,
+          "Iceberg table " + table_path +
+            " has no committed snapshot the GPU scan path can read: the table is empty, or "
+            "this statement also reads changes its transaction has not committed"};
+      }
       return iceberg_decline(
         scan_reason::iceberg_no_snapshot_id,
         "iceberg_scan was called without 'snapshot_from_id' and the binding did not publish "

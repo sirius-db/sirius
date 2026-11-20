@@ -3450,6 +3450,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionEvaluatorStrategy);
 
+  config.AddExtensionOption(
+    "sirius_s3_header_signing",
+    "Sign S3 requests made with a DuckDB secret in the Authorization header instead of a "
+    "presigned URL",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false));
+
   add_sirius_option(
     config,
     option_visibility::user,
