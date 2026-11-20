@@ -290,7 +290,8 @@ jit::CompiledKernel compile(Decoder const& decoder)
 }
 
 std::mutex g_decoders_mu;
-// The kernels themselves are the kernel cache's.
+// By architecture, then tree shape and element type; null where Meld does not decode the tree. The
+// kernels themselves are the kernel cache's.
 std::map<std::pair<int, std::string>, std::shared_ptr<Decoder const>> g_decoders;
 
 #endif  // SIMPATICO_WITH_MELD
@@ -340,21 +341,27 @@ std::optional<std::string> decode_scheme(jit::FusedTree const& tree, char const*
 std::optional<DecodeKernel> plain_decode_kernel(jit::FusedTree const& tree, char const* cxx_dtype)
 {
 #ifdef SIMPATICO_WITH_MELD
-  auto scheme = decode_scheme(tree, cxx_dtype);
-  if (!scheme) return std::nullopt;
-  int const arch = jit::arch_cc_for_current_device();
-  auto key       = std::make_pair(arch, *scheme);
+  std::string shape;
+  jit::append_tree_shape(shape, tree);
+  shape += '|';
+  if (cxx_dtype != nullptr) shape += cxx_dtype;
+  auto key = std::make_pair(jit::arch_cc_for_current_device(), std::move(shape));
 
-  std::shared_ptr<Decoder const> decoder;
+  std::optional<std::shared_ptr<Decoder const>> cached;
   {
     std::lock_guard<std::mutex> lock(g_decoders_mu);
-    if (auto found = g_decoders.find(key); found != g_decoders.end()) decoder = found->second;
+    if (auto found = g_decoders.find(key); found != g_decoders.end()) cached = found->second;
   }
-  if (!decoder) {
-    auto described = std::make_shared<Decoder const>(describe(std::move(*scheme), arch));
+  if (!cached) {
+    std::shared_ptr<Decoder const> described;
+    if (auto scheme = decode_scheme(tree, cxx_dtype)) {
+      described = std::make_shared<Decoder const>(describe(std::move(*scheme), key.first));
+    }
     std::lock_guard<std::mutex> lock(g_decoders_mu);
-    decoder = g_decoders.emplace(std::move(key), std::move(described)).first->second;
+    cached = g_decoders.emplace(std::move(key), std::move(described)).first->second;
   }
+  auto const& decoder = *cached;
+  if (!decoder) return std::nullopt;
 
   DecodeKernel launch;
   launch.kernel = jit::KernelCache::instance().get_or_build(

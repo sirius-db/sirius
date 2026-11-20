@@ -89,6 +89,20 @@ struct FusedTree {
   }
 };
 
+// Equal for structurally equal trees, however allocated.
+inline void append_tree_shape(std::string& key, FusedTree const& node)
+{
+  key += std::to_string(static_cast<int>(node.op));
+  key += '(';
+  for (auto const& [port, child] : node.children) {
+    key += port;
+    key += '=';
+    append_tree_shape(key, *child);
+    key += ';';
+  }
+  key += ')';
+}
+
 // Human-readable op tag for diagnostics (error messages).
 inline std::string op_kind_name(OpKind op)
 {
