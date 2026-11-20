@@ -792,9 +792,12 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON honors direction and NULL placement",
                  "[integration][gpu_execution][distinct]")
 {
+  // The descending winners of `t` are first rows, which the unordered route also keeps, so this
+  // pins the direction only; `v` rises within each group, so its descending winners are last rows.
   SECTION("DESC")
   {
     compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t DESC");
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, t FROM dist_ord ORDER BY v DESC");
   }
 
   SECTION("NULLS FIRST")
@@ -805,11 +808,6 @@ TEST_CASE_METHOD(DistinctFixture,
   SECTION("DESC NULLS FIRST")
   {
     compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t DESC NULLS FIRST");
-  }
-
-  SECTION("DESC NULLS LAST")
-  {
-    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t DESC NULLS LAST");
   }
 
   // Mixed directions over two keys: `u` ties at its maximum and `t` breaks the tie.
@@ -839,9 +837,22 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON over a GROUP BY ordered by an aggregate",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The top group per key, ordered by an integer SUM. No key has tied sums.
+  // The top and bottom group per key, ordered by an integer SUM, ties broken by `b`. Keys 1 and 3
+  // keep different groups in the two directions, so one of the two fails whichever group an
+  // unordered route keeps.
   compare_gpu_vs_cpu(
-    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC");
+    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC, b");
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c), b");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON orders by a computed key",
+                 "[integration][gpu_execution][distinct]")
+{
+  // `100 - t DESC` orders as `t` ascending, so the winners are last rows; sorting `t` itself
+  // descending would keep the first rows.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY 100 - t DESC");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -885,6 +896,43 @@ TEST_CASE_METHOD(DistinctFixture,
     compare_gpu_vs_cpu(
       "SELECT k, first(v ORDER BY u DESC, t), first(d ORDER BY u DESC, t) FROM dist_ord GROUP BY "
       "k");
+  }
+
+  // `100 - t DESC` orders as `t` ascending; a key column holding `t` would keep the first rows.
+  SECTION("a computed key, alone and shared by two FIRSTs")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY 100 - t DESC) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY 100 - t DESC), first(s ORDER BY 100 - t DESC) FROM dist_ord "
+      "GROUP BY k");
+  }
+
+  // The FILTER masks groups 1 and 2's winners (`t` 20, 15) for the sum only; a key column shared
+  // with the masked input would sort them last and keep another row.
+  SECTION("beside a FILTERed aggregate over the key column")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), sum(t) FILTER (WHERE t > 25) FROM dist_ord GROUP BY k");
+  }
+
+  // NOCASE lowers `s` before the sort. Under binary order group 2's descending winner is 'abc'
+  // (v 7); under NOCASE it is 'Ba' (v 9). Lower-cased values are unique in every group.
+  SECTION("a collated key")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY s COLLATE NOCASE DESC, t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s COLLATE NOCASE, t) FROM dist_ord GROUP BY k");
+  }
+
+  // `t` as DECIMAL and as DATE, so the sort runs on fixed-point and timestamp-days storage.
+  SECTION("DECIMAL and DATE keys")
+  {
+    run_ok(
+      "CREATE TABLE dist_ord_types AS SELECT k, v, t::DECIMAL(10, 2) AS dec, "
+      "DATE '2024-01-01' + t AS dt FROM dist_ord ORDER BY v;");
+    run_ok("CHECKPOINT;");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dec) FROM dist_ord_types GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dt DESC) FROM dist_ord_types GROUP BY k");
   }
 }
 

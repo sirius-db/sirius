@@ -1465,6 +1465,30 @@ TEST_CASE("Ordered grouped aggregate refuses an order position outside the carri
                     std::runtime_error);
 }
 
+TEST_CASE("Ordered grouped merge refuses an order position outside the carried columns",
+          "[operator][merge_grouped_agg][distinct]")
+{
+  // Partials `[k, a, b]` with two carried columns; position 2 is past them.
+  auto* mem_space = get_shared_mem_space();
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (int b = 0; b < 2; ++b) {
+    auto const columns = make_carried_columns(6, 6 * b);
+    partials.push_back(make_int64_batch({columns[0], columns[2], columns[3]}, *mem_space));
+  }
+  std::vector<read_only_data_batch> ro_batches;
+  for (auto& batch : partials) {
+    ro_batches.push_back(batch->to_read_only());
+  }
+  REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(ro_batches,
+                                                            1,
+                                                            {},
+                                                            /*num_carried=*/2,
+                                                            ascending_order(2),
+                                                            cudf::get_default_stream(),
+                                                            *mem_space),
+                    std::runtime_error);
+}
+
 namespace {
 
 batches_with_handles create_batches_with_local_orderby_result(
