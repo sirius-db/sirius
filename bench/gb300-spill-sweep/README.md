@@ -9,7 +9,22 @@ stays on, and max readahead scans stays at 8. No `--profile` override is used.
 Each fresh Sirius process starts with an empty Sirius cache; OS page-cache state
 is not controlled because this sweep measures batch movements, not cold I/O time.
 
-From the repository root:
+To reproduce SF1000, SF3000, and SF10000 sequentially from the repository
+root, run:
+
+```bash
+tmux new-session -d -s gb300-host-spill-all-sf \
+  'bash bench/gb300-spill-sweep/reproduce_all_sf.sh'
+```
+
+This runs all 22 queries once at each of the five host limits. It creates a
+fresh timestamped output directory under
+`test_datasets/gb300-spill-sweep/reproductions/`, verifies that all 330
+queries succeeded, and saves `run.log` there. Each scale factor has its own
+`progress.log`, `per-query.csv`, and `totals.csv`. Set `SWEEP_OUTPUT` to an
+absolute directory to choose a stable output path or resume an interrupted run.
+
+To run one scale factor at a time from the repository root:
 
 ```bash
 pixi run python bench/gb300-spill-sweep/run.py --sf 1000
@@ -17,7 +32,7 @@ pixi run python bench/gb300-spill-sweep/run.py --sf 3000
 pixi run python bench/gb300-spill-sweep/run.py --sf 10000
 ```
 
-For a persistent SF1000 run, start
+For a persistent single SF1000 run, start
 `tmux new-session -d -s gb300-spill-sf1000 'bash bench/gb300-spill-sweep/run_sf.sh 1000'`.
 Follow `test_datasets/gb300-spill-sweep/sf1000/progress.log`; `exit-code` is
 written when the sweep ends. `run_sf.sh` uses the local Pixi installation when

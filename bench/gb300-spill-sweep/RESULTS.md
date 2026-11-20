@@ -1,5 +1,8 @@
 # GB300 host-memory spill sweep
 
+The [all-scale reproduction script](reproduce_all_sf.sh) runs SF1000, SF3000,
+and SF10000 sequentially at all five host limits into a fresh output directory.
+
 Initially measured on GB300 on 2026-11-19 at Sirius main `26b5caba`. Each of the 22
 TPC-H queries ran once, unpinned and in a fresh Sirius process, at each of
 the 32, 64, 128, 256, and 450 GiB host caps. The base was

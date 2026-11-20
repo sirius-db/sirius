@@ -18,21 +18,23 @@ ratio. No `--profile` override is used.
 
 The runner requires the built Sirius extension, the Parquet dataset under
 `test_datasets/tpch_parquet_sf<SCALE>/`, and Pixi at
-`test_datasets/.generation-tools/pixi`. To reproduce SF1000 and SF3000 together
-from the repository root:
+`test_datasets/.generation-tools/pixi`. To reproduce SF1000, SF3000, and
+SF10000 together from the repository root:
 
 ```bash
-tmux new-session -d -s gb300-device-spill-sf1k-sf3k \
-  'bash bench/gb300-device-spill-sweep/reproduce_sf1k_sf3k.sh'
+tmux new-session -d -s gb300-device-spill-all-sf \
+  'bash bench/gb300-device-spill-sweep/reproduce_all_sf.sh'
 ```
 
-The script runs SF1000 followed by SF3000, with one iteration of all 22 queries
-at each of the four GPU limits. It creates a fresh timestamped output directory
-under `test_datasets/gb300-device-spill-sweep/reproductions/`, so an existing
-result cannot cause queries to be skipped. `run.log` gives the output directory
-and completion status; each scale factor has its own `progress.log`,
+The script runs SF1000, SF3000, then SF10000, with one iteration of all 22
+queries at each of the four GPU limits. It creates a fresh timestamped output
+directory under `test_datasets/gb300-device-spill-sweep/reproductions/`, so an
+existing result cannot cause queries to be skipped. `run.log` gives the output
+directory and completion status; each scale factor has its own `progress.log`,
 `per-query.csv`, and `totals.csv`. Set `SWEEP_OUTPUT` to an absolute directory
 if you want a stable output path or need to resume an interrupted run.
+The earlier [SF1000 and SF3000-only script](reproduce_sf1k_sf3k.sh) remains
+available.
 
 To run SF10000 on its own:
 
@@ -42,7 +44,7 @@ tmux new-session -d -s gb300-device-spill-sf10k \
 ```
 
 Use `1000` or `3000` in place of `10000` to reproduce the smaller scale
-factors. Run the scale factors sequentially on one GPU.
+factors separately. Run the scale factors sequentially on one GPU.
 
 Progress is in
 `test_datasets/gb300-device-spill-sweep/host384Gi/sf10000/progress.log`.
