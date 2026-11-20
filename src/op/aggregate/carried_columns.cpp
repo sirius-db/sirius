@@ -20,6 +20,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 
 #include <numeric>
@@ -45,27 +46,52 @@ std::unique_ptr<cudf::table> aggregate_carried_columns_only(cudf::table_view inp
 
 carried_row_selector append_carried_row_selector(
   std::vector<cudf::groupby::aggregation_request>& requests,
-  cudf::size_type num_rows,
+  cudf::table_view carried,
+  carried_row_order const& order,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  auto row_positions =
-    cudf::sequence(num_rows, cudf::numeric_scalar<cudf::size_type>(0, true, stream), stream, mr);
+  auto row_positions = cudf::sequence(
+    carried.num_rows(), cudf::numeric_scalar<cudf::size_type>(0, true, stream), stream, mr);
+  carried_row_selector selector{};
+  if (order.empty()) {
+    selector.values = std::move(row_positions);
+  } else {
+    selector.permutation = cudf::sorted_order(
+      carried.select(order.positions), order.column_order, order.null_precedence, stream, mr);
+    // rank[permutation[i]] = i: every row's sorted position, a permutation of the row positions.
+    cudf::table_view const positions{{row_positions->view()}};
+    selector.values = std::move(
+      cudf::scatter(positions, selector.permutation->view(), positions, stream, mr)->release()[0]);
+  }
   cudf::groupby::aggregation_request request;
-  request.values = row_positions->view();
+  request.values = selector.values->view();
   request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
-  auto const request_idx = requests.size();
+  selector.request_idx = requests.size();
   requests.push_back(std::move(request));
-  return {.row_positions = std::move(row_positions), .request_idx = request_idx};
+  return selector;
 }
 
-std::vector<std::unique_ptr<cudf::column>> gather_carried_columns(cudf::table_view carried,
-                                                                  cudf::column_view row_positions,
-                                                                  ::cuda::stream_ref stream,
-                                                                  rmm::device_async_resource_ref mr)
+std::vector<std::unique_ptr<cudf::column>> gather_carried_columns(
+  cudf::table_view carried,
+  carried_row_selector const& selector,
+  cudf::column_view selected,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
   // The selector has no nulls, so every gathered row is in range.
-  return cudf::gather(carried, row_positions, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
+  std::unique_ptr<cudf::column> rows;
+  if (selector.permutation) {
+    // MIN of a rank is a sorted position, not a row; the permutation maps it to its row.
+    rows     = std::move(cudf::gather(cudf::table_view{{selector.permutation->view()}},
+                                  selected,
+                                  cudf::out_of_bounds_policy::DONT_CHECK,
+                                  stream,
+                                  mr)
+                       ->release()[0]);
+    selected = rows->view();
+  }
+  return cudf::gather(carried, selected, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
     ->release();
 }
 

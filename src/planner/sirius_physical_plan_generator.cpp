@@ -1085,7 +1085,7 @@ plan_lineage collect_semantic_lineage(
     for (auto index : aggregate.cudf_aggregate_idx)
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
     // FIRST carries its input through cuDF gathers and concatenation before host export.
-    for (auto index : op::carried_inputs(aggregate.aggregate_slots))
+    for (auto index : op::make_carried_block(aggregate.aggregate_slots).inputs)
       mark_semantic(lineage_at(children[0], index));
     result.columns.resize(node.types.size());
   } else if (node.type == type::UNGROUPED_AGGREGATE && children.size() == 1) {

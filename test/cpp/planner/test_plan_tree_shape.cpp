@@ -2596,7 +2596,7 @@ TEST_CASE_METHOD(
       actual_inputs.push_back(first->input_idx);
     }
     CHECK(actual_inputs == first_inputs);
-    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == first_inputs);
+    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == first_inputs);
     return &aggregate;
   };
 
@@ -2711,7 +2711,7 @@ TEST_CASE_METHOD(
     auto const* sum = std::get_if<sirius::op::plain_slot>(&aggregate.aggregate_slots[1]);
     REQUIRE(sum != nullptr);
     CHECK(sum->partial_idx == 0);
-    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == std::vector<int>{1});
+    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == std::vector<int>{1});
     // The local and PARTITION schemas are the partial layout, not the declared one.
     CHECK(hgb->get_types() == aggregate.local_types);
     auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
