@@ -359,8 +359,9 @@ The helper uses a libcudf JIT transform with public CCCL overflow helpers and er
 collection; DATE inputs are bitcast to day counts without copying. Scalar operands
 use one-row columns broadcast by `cudf::scalar_column_view`, with the output row
 count passed explicitly so scalar-only and empty inputs retain the input shape.
-Offsets preserve NULLs and infinity and reject finite overflow or infinity-sentinel
-collisions. Date differences widen both day counts before subtraction and return
+Offsets preserve NULLs and infinity and reject finite overflow, infinity-sentinel
+collisions, and day counts below -infinity (`INT32_MIN`) as input or result, like
+DuckDB. Date differences widen both day counts before subtraction and return
 BIGINT. These operations materialize under every evaluator strategy; standalone
 cuDF AST translation declines them because it cannot implement the checks.
 The existing reference evaluator restores compressed operands before execution.
