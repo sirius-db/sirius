@@ -75,7 +75,7 @@ def schedule(hardware, profile, selected, iterations, sf):
     return steps
 
 
-def child_env(hardware, profile):
+def child_env(hardware, profile, source_dir=None):
     env = os.environ.copy()
     for key in (
         "SIRIUS_CONFIG_FILE",
@@ -88,7 +88,7 @@ def child_env(hardware, profile):
         "SIRIUS_EXP_LOWCARD_GROUPBY",
     ):
         env.pop(key, None)
-    env["SIRIUS_BUILD_PATH"] = str(ROOT / "sirius-duckdb/build/release")
+    env["SIRIUS_BUILD_PATH"] = str((source_dir or ROOT) / "sirius-duckdb/build/release")
     env["SIRIUS_PRE_SQL"] = "SET enable_duckdb_fallback = false;"
     env["SIRIUS_LOG_BACKEND"] = "spdlog"
     if env.get("SIRIUS_LOG_LEVEL") not in ("trace", "debug", "info"):
@@ -244,6 +244,12 @@ def main(argv=None):
     parser.add_argument("--queries", type=queries, default=list(range(1, 23)))
     parser.add_argument("--iterations", type=int)
     parser.add_argument(
+        "--source-dir",
+        type=Path,
+        default=ROOT,
+        help="Built engine checkout; defaults to this runner's checkout",
+    )
+    parser.add_argument(
         "--worker-timeout",
         type=int,
         default=3600,
@@ -266,6 +272,7 @@ def main(argv=None):
         help="Print plan only; no GPU, AWS, filesystem writes, or dataset access",
     )
     args = parser.parse_args(argv)
+    args.source_dir = args.source_dir.resolve()
     args.profile = "pinned" if args.profile == "pin" else args.profile
     args.iterations = (
         args.iterations
@@ -311,7 +318,9 @@ def main(argv=None):
                     "steps": steps,
                     "environment_overrides": {
                         k: v
-                        for k, v in child_env(args.hardware, args.profile).items()
+                        for k, v in child_env(
+                            args.hardware, args.profile, args.source_dir
+                        ).items()
                         if k
                         in (
                             "SIRIUS_PRE_SQL",
@@ -332,7 +341,8 @@ def main(argv=None):
     if args.output.exists():
         parser.error("Output directory already exists; choose a new path")
     extension = (
-        ROOT / "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
+        args.source_dir
+        / "sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension"
     )
     if not extension.is_file():
         parser.error("Build Sirius from this checkout first: pixi run make")
@@ -345,10 +355,12 @@ def main(argv=None):
     args.output.mkdir(parents=True)
     evidence.update(
         source_commit=subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ["git", "rev-parse", "HEAD"], cwd=args.source_dir, text=True
         ).strip(),
         submodules=subprocess.check_output(
-            ["git", "submodule", "status", "--recursive"], cwd=ROOT, text=True
+            ["git", "submodule", "status", "--recursive"],
+            cwd=args.source_dir,
+            text=True,
         ),
         benchmark_sha256=digest(BENCHMARK),
         steps=steps,
@@ -357,19 +369,23 @@ def main(argv=None):
         profile=args.profile,
         input=args.input,
         cpu_fallback=False,
+        source_dir=str(args.source_dir),
+        runner_commit=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
     )
     evidence["extension_sha256"] = digest(extension)
     evidence["source_status"] = subprocess.check_output(
-        ["git", "status", "--porcelain"], cwd=ROOT, text=True
+        ["git", "status", "--porcelain"], cwd=args.source_dir, text=True
     )
     evidence["worker_timeout_s"] = args.worker_timeout
     evidence["libraries_sha256"] = {
-        str(p.relative_to(ROOT)): digest(p)
-        for p in (ROOT / "build/release/install").glob("lib*/libsirius.so.*")
+        str(p.relative_to(args.source_dir)): digest(p)
+        for p in (args.source_dir / "build/release/install").glob("lib*/libsirius.so.*")
         if p.is_file() and not p.is_symlink()
     }
     evidence["logging"] = {
-        key: child_env(args.hardware, args.profile)[key]
+        key: child_env(args.hardware, args.profile, args.source_dir)[key]
         for key in ("SIRIUS_LOG_BACKEND", "SIRIUS_LOG_LEVEL")
     }
     (args.output / "provenance.json").write_text(json.dumps(evidence, indent=2) + "\n")
@@ -399,7 +415,7 @@ def main(argv=None):
                 result = subprocess.run(
                     step["command"],
                     cwd=ROOT,
-                    env=child_env(args.hardware, args.profile),
+                    env=child_env(args.hardware, args.profile, args.source_dir),
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     timeout=args.worker_timeout,

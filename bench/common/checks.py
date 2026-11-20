@@ -52,8 +52,23 @@ def verify_s3(source, region):
     if uri.scheme != "s3" or not uri.netloc or uri.query or uri.fragment:
         raise ValueError("Use an s3://bucket/prefix URI without query parameters")
     client = boto3.client("s3", region_name=region)
-    location = client.get_bucket_location(Bucket=uri.netloc)["LocationConstraint"]
-    location = {None: "us-east-1", "EU": "eu-west-1"}.get(location, location)
+    try:
+        location = client.get_bucket_location(Bucket=uri.netloc)["LocationConstraint"]
+        location = {None: "us-east-1", "EU": "eu-west-1"}.get(location, location)
+    except Exception as error:
+        if getattr(error, "response", {}).get("Error", {}).get("Code") not in (
+            "AccessDenied",
+            "403",
+        ):
+            raise
+        # Dataset roles may allow ListBucket/HEAD but omit GetBucketLocation.
+        # Require an actual AWS region response; never assume the client region.
+        response = client.head_bucket(Bucket=uri.netloc)
+        location = response.get("BucketRegion") or response.get(
+            "ResponseMetadata", {}
+        ).get("HTTPHeaders", {}).get("x-amz-bucket-region")
+        if not location:
+            raise ValueError("HEAD did not verify the S3 bucket region") from error
     if location != region:
         raise ValueError(
             f"S3 bucket is in {location}; EC2 is in {region}. Cross-region reads are forbidden."

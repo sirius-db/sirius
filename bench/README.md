@@ -46,6 +46,11 @@ bash bench/g7e/replay.sh 1000 hot --input s3://YOUR_SAME_REGION_BUCKET/tpch_sf10
 ```
 
 The shared entry point runs Python inside this checkout's Pixi environment.
+To measure a different engine revision without editing either checkout, pass
+`--source-dir /path/to/built/sirius`. Run with the engine checkout's Pixi Python
+when its locked environment differs, for example `pixi run --manifest-path
+/path/to/built/sirius/pixi.toml python /path/to/runner/bench/common/replay.py ...`.
+Provenance records the engine commit/binaries separately from the runner commit.
 `PIXI_BIN` can select Pixi. `DATASET_ROOT` defaults to `/mnt/datasets`, with
 `tpch_parquet_sf<SF>` appended when `--input` is omitted. Inputs are never
 generated or copied across regions by these scripts.

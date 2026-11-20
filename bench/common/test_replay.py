@@ -191,6 +191,37 @@ with (r/"csv/runtimes.csv").open("w") as f:
             "lineitem,orders",
         )
 
+    def test_separate_engine_checkout_does_not_change_config_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Path(tmp) / "pinned-engine"
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                replay.main(
+                    [
+                        "--hardware",
+                        "g7e",
+                        "--sf",
+                        "10000",
+                        "--profile",
+                        "cold",
+                        "--queries",
+                        "3",
+                        "--source-dir",
+                        str(engine),
+                        "--dry-run",
+                    ]
+                )
+            plan = json.loads(captured.getvalue())
+            self.assertEqual(
+                plan["environment_overrides"]["SIRIUS_BUILD_PATH"],
+                str(engine / "sirius-duckdb/build/release"),
+            )
+            self.assertEqual(
+                Path(plan["steps"][0]["config"]),
+                replay.ROOT / "bench/g7e/configs/cold.yaml",
+            )
+            self.assertFalse(engine.exists())
+
     def test_sums_keep_missing_measurements_missing(self):
         report = replay.summarize([3, 6], 2, {(3, 1): 4.0, (3, 2): 2.0, (6, 1): 7.0})
         self.assertEqual(report["sum_best_s"], 9.0)
@@ -272,6 +303,44 @@ with (r/"csv/runtimes.csv").open("w") as f:
             evidence = checks.verify_s3("s3://example/data", "us-east-1")
         self.assertEqual(evidence["region"], "us-east-1")
         self.assertEqual(pages.paginate.call_count, 8)
+
+    def test_head_bucket_region_is_required_when_location_is_denied(self):
+        for location in ("us-east-1", "eu-west-2", None):
+            with self.subTest(location=location):
+                client = Mock()
+                error = RuntimeError("GetBucketLocation denied")
+                error.response = {"Error": {"Code": "AccessDenied"}}
+                client.get_bucket_location.side_effect = error
+                client.head_bucket.return_value = {"BucketRegion": location}
+                pages = client.get_paginator.return_value
+                pages.paginate.side_effect = lambda **kwargs: [
+                    {"Contents": [{"Key": kwargs["Prefix"] + "/part.parquet"}]}
+                ]
+                with patch.dict(
+                    sys.modules,
+                    {"boto3": SimpleNamespace(client=Mock(return_value=client))},
+                ):
+                    if location == "us-east-1":
+                        self.assertEqual(
+                            checks.verify_s3("s3://example/data", "us-east-1")[
+                                "region"
+                            ],
+                            location,
+                        )
+                    else:
+                        with self.assertRaises(ValueError):
+                            checks.verify_s3("s3://example/data", "us-east-1")
+                        client.get_paginator.assert_not_called()
+
+    def test_location_network_errors_do_not_fall_back_to_assumed_region(self):
+        client = Mock()
+        client.get_bucket_location.side_effect = RuntimeError("network failure")
+        with patch.dict(
+            sys.modules, {"boto3": SimpleNamespace(client=Mock(return_value=client))}
+        ):
+            with self.assertRaises(RuntimeError):
+                checks.verify_s3("s3://example/data", "us-east-1")
+        client.head_bucket.assert_not_called()
 
     def test_saved_g7e_snapshot_hashes_and_sums(self):
         root = replay.ROOT / "bench/g7e/results/baseline-20261111"
