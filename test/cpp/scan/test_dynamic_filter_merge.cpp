@@ -77,6 +77,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <initializer_list>
 #include <latch>
@@ -84,9 +85,11 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using sirius::op::sirius_dynamic_filter;
@@ -5389,4 +5392,159 @@ TEST_CASE("the Consumer passes over the filter of a key the Construction Plan ca
     REQUIRE(selection.steps.size() == 2);
     CHECK(selection.steps[0].representative.filter == candidate);
   }
+}
+
+TEST_CASE("no Consumer uses the filter of a Shadowed Key, whatever else its Channel holds",
+          "[dynamic_filter][scan_merge][shadow]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  namespace op              = sirius::op;
+
+  // An IN-list over the keys [0, keys) on one column of the Channel. `make` builds a new filter
+  // object each time, so two Channels never share one.
+  struct filter_spec {
+    int keys;
+    bool small;
+    std::optional<double> estimate;
+    bool proven;
+    cudf::size_type column;
+
+    [[nodiscard]] std::shared_ptr<op::sirius_dynamic_filter> make(::cuda::stream_ref stream) const
+    {
+      std::shared_ptr<op::sirius_dynamic_filter> filter;
+      if (small) {
+        auto const values = make_sequence_column<int64_t>(keys, stream);
+        filter            = std::make_shared<op::sirius_dynamic_small_in_list_filter>(
+          values->view(), stream, cudf::get_current_device_resource_ref());
+      } else {
+        filter = make_in_list_prefix(keys, stream);
+      }
+      if (estimate) { filter->set_estimated_selectivity(*estimate, proven); }
+      return filter;
+    }
+  };
+  // Column 0 holds the row number and column 1 counts down from 99, so filters on different columns
+  // keep different rows. This is the row count left when every filter of `specs` is applied.
+  constexpr int rows                = 100;
+  auto const rows_after_all_filters = [](std::span<filter_spec const> specs) {
+    int first = 0;
+    int last  = rows;
+    for (auto const& spec : specs) {
+      if (spec.column == 0) {
+        last = std::min(last, spec.keys);
+      } else {
+        first = std::max(first, rows - spec.keys);
+      }
+    }
+    return std::max(0, last - first);
+  };
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_sequence_column<int64_t>(rows, stream));
+  columns.push_back(make_sequence_column<int64_t>(rows, stream, rows - 1, -1));
+  auto const table = std::make_shared<cudf::table>(std::move(columns));
+
+  // Raw engine output only: the distributions of <random> differ between standard libraries.
+  std::mt19937 generator{20261120};
+  auto const below = [&](std::uint32_t bound) { return generator() % bound; };
+  auto const share = [&] { return generator() / 4294967296.0; };
+  auto const draw  = [&](int keys, std::uint32_t proven_percent) {
+    filter_spec spec{
+       .keys  = keys,
+       .small = std::cmp_less_equal(keys, op::sirius_dynamic_small_in_list_filter::k_max_keys) &&
+               below(2) == 0,
+       .estimate = {},
+       .proven   = false,
+       .column   = static_cast<cudf::size_type>(below(2))};
+    // Proven, unproven, or no estimate at all; half of the estimates are strong ones.
+    if (auto const kind = below(100); kind < proven_percent + (100 - proven_percent) / 2) {
+      spec.estimate = below(2) == 0 ? share() * 0.1 : share();
+      spec.proven   = kind < proven_percent;
+    }
+    return spec;
+  };
+  auto const rows_kept = [&](std::shared_ptr<sirius_dynamic_filter_set> const& channel) {
+    dynamic_filter_consumer endpoint(
+      channel, {.mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS}, {});
+    auto const out = apply_consumer(endpoint, table, stream);
+    stream.sync();
+    return out ? out->num_rows() : rows;
+  };
+
+  std::size_t shadowed = 0;
+  std::size_t decisive = 0;  // Shadowed candidates that would remove rows if they were applied
+  for (int trial = 0; trial < 600; ++trial) {
+    std::vector<filter_spec> specs(1 + trial % 3);
+    for (auto& spec : specs) {
+      spec = draw(1 + static_cast<int>(below(rows - 1)), 70);
+    }
+    // Every fifth candidate has as many keys as a published filter: a tie in decode preference
+    // when the two are of one kind.
+    auto const candidate_spec =
+      draw(trial % 5 == 0 ? specs.front().keys : 1 + static_cast<int>(below(rows - 1)), 85);
+    auto const cap      = static_cast<std::size_t>(trial / 3 % 3);
+    auto const position = below(static_cast<std::uint32_t>(specs.size()) + 1);
+
+    std::vector<std::shared_ptr<op::sirius_dynamic_filter>> published;
+    std::vector<op::static_filter_facts> seen;
+    for (auto const& spec : specs) {
+      published.push_back(spec.make(stream));
+      seen.push_back(op::facts_of(*published.back()));
+      // `read_published_filters` reports no estimate for a filter whose estimate is not proven.
+      if (!seen.back().estimate_proven) { seen.back().estimated_keep.reset(); }
+    }
+    auto const candidate = candidate_spec.make(stream);
+    op::key_plan planned{};
+    planned.candidate = op::facts_of(*candidate);
+    std::vector<op::binding_facts> const bindings{
+      {.probe_type       = cudf::data_type{cudf::type_id::INT64},
+       .accepts_zone_map = true,
+       .published        = seen}};
+    if (!op::is_shadowed(planned, bindings, cap)) { continue; }
+    ++shadowed;
+    auto all_specs = specs;
+    all_specs.push_back(candidate_spec);
+    if (rows_after_all_filters(all_specs) < rows_after_all_filters(specs)) { ++decisive; }
+    CAPTURE(trial, cap, position, specs.size());
+
+    // The same published filters on two Channels, in the same order; one also holds the candidate,
+    // published at a random point among them. Every filter has its own producer, as every
+    // Producing Join has.
+    using publication = std::pair<cudf::size_type, std::shared_ptr<op::sirius_dynamic_filter>>;
+    std::vector<publication> with;
+    std::vector<publication> without;
+    for (std::size_t i = 0; i <= specs.size(); ++i) {
+      if (i == position) { with.emplace_back(candidate_spec.column, candidate); }
+      if (i == specs.size()) { break; }
+      with.emplace_back(specs[i].column, published[i]);
+      without.emplace_back(specs[i].column, specs[i].make(stream));
+    }
+    std::vector<sirius_dynamic_filter_set::producer> producers;
+    auto const channel_of = [&](std::span<publication const> publications) {
+      auto channel     = std::make_shared<sirius_dynamic_filter_set>();
+      auto const first = producers.size();
+      for (auto const& [column, filter] : publications) {
+        producers.push_back(channel->register_producer({static_cast<std::size_t>(column)}));
+      }
+      for (std::size_t i = 0; i < publications.size(); ++i) {
+        REQUIRE(producers[first + i].push_filter(static_cast<std::size_t>(publications[i].first),
+                                                 publications[i].second));
+      }
+      return channel;
+    };
+    auto const with_candidate    = channel_of(with);
+    auto const without_candidate = channel_of(without);
+
+    // Filtered Decode does not carry the candidate in any of its `cap` slots.
+    std::vector<binding> const decode_bindings{{0, 0}, {1, 1}};
+    dynamic_filter_consumer decode(with_candidate, {}, decode_bindings);
+    auto const selection = decode.select_for_decode(decode_bindings);
+    for (std::size_t i = 0; i < std::min(cap, selection.steps.size()); ++i) {
+      CHECK(selection.steps[i].representative.filter != candidate);
+    }
+    // After the decode, the Consumer keeps the rows it keeps without the candidate.
+    CHECK(rows_kept(with_candidate) == rows_kept(without_candidate));
+  }
+  CAPTURE(shadowed, decisive);
+  CHECK(shadowed >= 60);
+  CHECK(decisive >= 30);
 }
