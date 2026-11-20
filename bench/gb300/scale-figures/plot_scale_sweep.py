@@ -15,7 +15,7 @@ from matplotlib.ticker import FixedLocator, FuncFormatter
 
 
 SCALES = (100, 300, 1000, 3000, 10000)
-DUCKDB_SCALES = (1000, 3000)
+DUCKDB_SCALES = (100, 300, 1000, 3000)
 SERIES = (
     ("Sirius", "cold", "#0072B2", "o", "-"),
     ("Sirius", "hot", "#009E73", "o", "-"),
@@ -187,7 +187,7 @@ def plot(measurements: list[Measurement], output: Path) -> None:
     fig.text(
         0.10,
         0.035,
-        "DuckDB 2.0: SF1k/SF3k only; SF3k cold/hot caps 300/150 GiB. SF10k Sirius host pin unavailable.",
+        "DuckDB 2.0: SF100–SF3k; SF3k cold/hot caps 300/150 GiB. SF10k Sirius host pin unavailable.",
         ha="left",
         fontsize=9,
         color="#444444",

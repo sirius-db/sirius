@@ -1,0 +1,28 @@
+{
+  "duckdb_version": "2.0.0",
+  "dataset": "/mnt/datasets/tpch_parquet_sf300",
+  "parquet_file_count": 31,
+  "profile": "hot",
+  "iterations": 2,
+  "coherent_gpu_memory_mode": "driver",
+  "settings": {
+    "enable_external_file_cache": true,
+    "cache_local_files": true,
+    "parquet_metadata_cache": true,
+    "autoload_known_extensions": false,
+    "autoinstall_known_extensions": false
+  },
+  "sirius_loaded": false,
+  "cold_connection_scope": "fresh in-memory DuckDB database per query",
+  "os_cache_eviction": "sync + POSIX_FADV_DONTNEED on every dataset Parquet file",
+  "memory_limit_gib": null,
+  "effective_memory_limit": "385.7 GiB",
+  "temp_directory": "/localhome/local-byogatama/sirius/test_datasets/.duckdb-parquet-cache-20261119/sf300/hot/duckdb-tmp",
+  "timing": "connection.execute(sql), excluding view setup and result fetch",
+  "started_at_utc": "2026-11-20T22:28:33.883324+00:00",
+  "finished_at_utc": "2026-11-20T22:30:27.276403+00:00",
+  "query_time_s": [
+    39.981782,
+    37.986096
+  ]
+}

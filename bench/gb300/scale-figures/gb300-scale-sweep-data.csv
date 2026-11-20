@@ -13,6 +13,10 @@ Sirius,hot,3000,1,118.720970,bench/gb300/results/sf3000/hot-per-query.csv
 Sirius,pin,3000,0,21.926660,bench/gb300/results/sf3000/pin-per-query.csv
 Sirius,cold,10000,0,779.923276,bench/gb300/results/sf10000/cold-per-query.csv
 Sirius,hot,10000,1,810.056086,bench/gb300/results/sf10000/hot-per-query.csv
+DuckDB,cold,100,0,16.112255,bench/gb300/scale-figures/duckdb-snapshot/sf100/cold/runtimes.csv
+DuckDB,hot,100,1,12.067490,bench/gb300/scale-figures/duckdb-snapshot/sf100/hot/runtimes.csv
+DuckDB,cold,300,0,48.333488,bench/gb300/scale-figures/duckdb-snapshot/sf300/cold/runtimes.csv
+DuckDB,hot,300,1,37.986096,bench/gb300/scale-figures/duckdb-snapshot/sf300/hot/runtimes.csv
 DuckDB,cold,1000,0,175.153700,bench/gb300/scale-figures/duckdb-snapshot/sf1000/cold/runtimes.csv
 DuckDB,hot,1000,1,144.807157,bench/gb300/scale-figures/duckdb-snapshot/sf1000/hot/runtimes.csv
 DuckDB,cold,3000,0,634.874055,bench/gb300/scale-figures/duckdb-snapshot/sf3000/cold/runtimes.csv
