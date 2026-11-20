@@ -42,11 +42,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <format>
 #include <functional>
 #include <limits>
 #include <map>
@@ -113,6 +115,12 @@ int simpatico_compact_raw_values(const void* d_padded_v,
                                  std::int32_t chunk_size,
                                  std::int32_t elem_size,
                                  void* stream_v);
+int simpatico_first_mismatch(void const* a,
+                             void const* b,
+                             std::size_t rows,
+                             std::size_t row_bytes,
+                             void* first,
+                             void* stream_v);
 }
 
 #define SIMPATICO_CUDA_CHECK(call, ret, ...)                     \
@@ -834,37 +842,40 @@ void shadow_meld_decode(simpatico::meld::DecodeKernel const& decoder,
   auto const bytes = static_cast<std::size_t>(num_rows) * element_size;
   rmm::device_buffer shadow(bytes, frame.stream(), frame.mr());
   launch_meld_decode(decoder, persisted, transients, num_chunks, num_rows, shadow.data(), frame);
-  std::vector<unsigned char> expected(bytes), actual(bytes);
+
   auto const stream = frame.stream().get();
+  rmm::device_buffer first(sizeof(std::uint64_t), frame.stream(), frame.mr());
   simpatico::throw_if_cuda_error(
-    cudaMemcpyAsync(expected.data(), out, bytes, cudaMemcpyDeviceToHost, stream),
-    "simpatico decode: shadow copy (nvrtc)");
+    static_cast<cudaError_t>(simpatico_first_mismatch(
+      out, shadow.data(), static_cast<std::size_t>(num_rows), element_size, first.data(), stream)),
+    "simpatico decode: shadow compare");
+  std::uint64_t mismatch_index = 0;
   simpatico::throw_if_cuda_error(
-    cudaMemcpyAsync(actual.data(), shadow.data(), bytes, cudaMemcpyDeviceToHost, stream),
-    "simpatico decode: shadow copy (meld)");
+    cudaMemcpyAsync(
+      &mismatch_index, first.data(), sizeof(mismatch_index), cudaMemcpyDeviceToHost, stream),
+    "simpatico decode: shadow compare copy");
   simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream),
                                  "simpatico decode: shadow synchronize");
-  if (std::memcmp(expected.data(), actual.data(), bytes) == 0) return;
+  if (mismatch_index == static_cast<std::uint64_t>(num_rows)) return;
 
-  std::size_t row = 0;
-  while (std::memcmp(expected.data() + row * element_size,
-                     actual.data() + row * element_size,
-                     element_size) == 0)
-    ++row;
-  auto hex = [&](std::vector<unsigned char> const& values) {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string text               = "0x";
-    for (std::size_t byte = element_size; byte-- > 0;) {
-      auto const value = values[row * element_size + byte];
-      text += digits[value >> 4];
-      text += digits[value & 15];
-    }
-    return text;
+  auto mismatch_value = [&](void const* column) {
+    std::array<std::uint64_t, 2> words{};
+    simpatico::throw_if_cuda_error(
+      cudaMemcpyAsync(words.data(),
+                      static_cast<unsigned char const*>(column) + mismatch_index * element_size,
+                      element_size,
+                      cudaMemcpyDeviceToHost,
+                      stream),
+      "simpatico decode: shadow mismatch copy");
+    simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream),
+                                   "simpatico decode: shadow synchronize");
+    return element_size == 16 ? std::format("{:#018x}{:016x}", words[1], words[0])
+                              : std::format("{:#0{}x}", words[0], 2 + 2 * element_size);
   };
-  throw std::runtime_error("simpatico decode: shadow mismatch at row " + std::to_string(row) +
-                           " of " + std::to_string(num_rows) + ": nvrtc " + hex(expected) +
-                           ", meld " + hex(actual) + "; scheme:\n" +
-                           decoder.kernel->rendered_source);
+  throw std::runtime_error(
+    "simpatico decode: shadow mismatch at row " + std::to_string(mismatch_index) + " of " +
+    std::to_string(num_rows) + ": nvrtc " + mismatch_value(out) + ", meld " +
+    mismatch_value(shadow.data()) + "; scheme:\n" + decoder.kernel->rendered_source);
 }
 
 // Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`

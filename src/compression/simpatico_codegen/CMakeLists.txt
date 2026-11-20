@@ -76,6 +76,7 @@ add_library(
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/bridge/first_mismatch.cu
   src/selection/selection_wave.cu
   src/selection/chunk_row_set_build.cu
   src/selection/row_id_space.cu

@@ -14,11 +14,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+extern "C" int simpatico_first_mismatch(void const* a,
+                                        void const* b,
+                                        std::size_t rows,
+                                        std::size_t row_bytes,
+                                        void* first,
+                                        void* stream_v);
 
 namespace cc  = codegen;
 namespace jit = codegen::jit;
@@ -105,15 +114,13 @@ std::vector<std::vector<T>> fixtures(std::int64_t n)
 template <typename T>
 std::string hex(T value)
 {
-  static constexpr char digits[] = "0123456789abcdef";
-  unsigned char bytes[sizeof(T)];
-  std::memcpy(bytes, &value, sizeof(T));
-  std::string text = "0x";
-  for (std::size_t byte = sizeof(T); byte-- > 0;) {
-    text += digits[bytes[byte] >> 4];
-    text += digits[bytes[byte] & 15];
+  if constexpr (sizeof(T) == 16) {
+    auto const bits = static_cast<unsigned __int128>(value);
+    return std::format(
+      "{:#018x}{:016x}", static_cast<std::uint64_t>(bits >> 64), static_cast<std::uint64_t>(bits));
+  } else {
+    return std::format("{:#0{}x}", static_cast<std::make_unsigned_t<T>>(value), 2 + 2 * sizeof(T));
   }
-  return text;
 }
 
 template <typename T>
@@ -246,6 +253,44 @@ void test_declines_other_codecs()
          "a float column has a scheme");
 }
 
+// Rows past one grid's worth, so the kernel's grid-stride loop is exercised.
+void test_first_mismatch()
+{
+  constexpr std::size_t kRows = 3'000'000;
+  for (std::size_t const width : {1, 2, 4, 8, 16}) {
+    auto const bytes = kRows * width;
+    void *a = nullptr, *b = nullptr, *first = nullptr;
+    codegen_test::rt_check(cudaMalloc(&a, bytes), "cudaMalloc(a)");
+    codegen_test::rt_check(cudaMalloc(&b, bytes), "cudaMalloc(b)");
+    codegen_test::rt_check(cudaMalloc(&first, sizeof(std::uint64_t)), "cudaMalloc(first)");
+    codegen_test::rt_check(cudaMemset(a, 0, bytes), "cudaMemset(a)");
+    codegen_test::rt_check(cudaMemset(b, 0, bytes), "cudaMemset(b)");
+    auto first_of = [&] {
+      codegen_test::rt_check(
+        static_cast<cudaError_t>(simpatico_first_mismatch(a, b, kRows, width, first, nullptr)),
+        "simpatico_first_mismatch");
+      std::uint64_t row = 0;
+      codegen_test::rt_check(cudaMemcpy(&row, first, sizeof(row), cudaMemcpyDeviceToHost),
+                             "cudaMemcpy(first)");
+      return row;
+    };
+    auto const label = std::to_string(width) + "-byte rows: ";
+    expect(first_of() == kRows, label + "equal columns differ");
+    // In each row's last byte, the high word of a 16-byte row.
+    for (std::size_t const row : {kRows - 1, std::size_t{1'700'000}}) {
+      codegen_test::rt_check(
+        cudaMemset(static_cast<unsigned char*>(b) + row * width + width - 1, 1, 1),
+        "cudaMemset(b row)");
+    }
+    expect(first_of() == 1'700'000, label + "wrong first differing row");
+    codegen_test::rt_check(cudaMemset(b, 1, 1), "cudaMemset(b row 0)");
+    expect(first_of() == 0, label + "row 0 not found first");
+    cudaFree(a);
+    cudaFree(b);
+    cudaFree(first);
+  }
+}
+
 }  // namespace
 
 int main()
@@ -257,6 +302,7 @@ int main()
       std::fprintf(stderr, "test_meld_decode: cudaSetDevice failed\n");
       return 1;
     }
+    test_first_mismatch();
     if (std::getenv("SIMPATICO_JIT_CACHE_CLEAR")) jit::clear_jit_disk_cache();
     int const arch   = jit::arch_cc_for_current_device();
     auto const trees = closed_form_trees(/*transforms=*/2);
