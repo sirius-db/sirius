@@ -137,6 +137,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_integer_varchar_cast.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_abs.cpp
+    test/cpp/integration/test_gpu_execution_fused_multiply_add.cpp
     test/cpp/integration/test_gpu_execution_negate.cpp
     test/cpp/integration/test_gpu_execution_sql_errors.cpp
     test/cpp/integration/test_gpu_execution_round.cpp

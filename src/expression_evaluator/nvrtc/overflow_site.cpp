@@ -68,6 +68,19 @@ constexpr std::size_t max_listed_candidates = 4;
     "CAST({} AS {})", cast.child->return_type().to_string(), cast.target_type.to_string());
 }
 
+// A division or modulo is recorded as an overflow site exactly when it raises for a zero divisor.
+[[nodiscard]] bool raises_for_zero_divisor(overflow_site const& site) noexcept
+{
+  auto const* const* call = std::get_if<sirius::ast::function_call const*>(&site);
+  if (call == nullptr) { return false; }
+  switch ((*call)->function()) {
+    case sirius::function_id::div:
+    case sirius::function_id::int_div:
+    case sirius::function_id::mod: return true;
+    default: return false;
+  }
+}
+
 }  // namespace
 
 std::string overflow_message(std::span<overflow_site const> sites)
@@ -80,7 +93,10 @@ std::string overflow_message(std::span<overflow_site const> sites)
     }
   }
 
-  std::string message = "[expression_evaluator]: Overflow in NVRTC evaluation";
+  std::string message =
+    std::ranges::any_of(sites, raises_for_zero_divisor)
+      ? "[expression_evaluator]: Overflow or division by zero in NVRTC evaluation"
+      : "[expression_evaluator]: Overflow in NVRTC evaluation";
   if (candidates.empty()) { return message; }
   if (candidates.size() == 1) { return message + " of " + candidates.front(); }
   message += " of one of: ";

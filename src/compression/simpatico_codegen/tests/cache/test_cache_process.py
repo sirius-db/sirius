@@ -58,7 +58,7 @@ class CacheProcesses(unittest.TestCase):
 
     def test_actual_disk_write_and_second_process_hit(self):
         self.assertEqual(self.worker(), (1, 1, 0))
-        paths = list(self.cache.glob("v2/*/*.cubin"))
+        paths = list(self.cache.glob("v3/*/*.cubin"))
         self.assertEqual(len(paths), 1)
         self.assertRegex(paths[0].parent.name, r"^[0-9a-f]{32}$")
         self.assertRegex(paths[0].name, r"^[0-9a-f]{32}\.cubin$")
@@ -72,7 +72,7 @@ class CacheProcesses(unittest.TestCase):
         for variant, expected in (("project", 2), ("cccl", 3)):
             self.assertEqual(self.worker(variant, expected=expected), (1, 1, 0))
             self.assertEqual(self.worker(variant, expected=expected), (0, 1, 1))
-        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 3)
+        self.assertEqual(len(list(self.cache.glob("v3/*/*.cubin"))), 3)
         self.assertEqual(self.worker(), (0, 1, 1))
 
     def test_removed_override_does_not_change_reuse(self):
@@ -85,7 +85,7 @@ class CacheProcesses(unittest.TestCase):
         )
         self.assertEqual(self.worker(**settings), (1, 1, 0))
         self.assertEqual(self.worker(**settings), (0, 1, 1))
-        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 1)
+        self.assertEqual(len(list(self.cache.glob("v3/*/*.cubin"))), 1)
         self.assertEqual(self.worker(), (0, 1, 1))
 
     def test_removed_override_cannot_add_headers(self):
@@ -148,7 +148,7 @@ class CacheProcesses(unittest.TestCase):
         with builtin.open("ab") as output:
             output.write(b"\0")
         self.assertEqual(self.worker(**settings), (0, 1, 1))
-        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 1)
+        self.assertEqual(len(list(self.cache.glob("v3/*/*.cubin"))), 1)
         self.assertEqual(self.worker(), (0, 1, 1))
 
     def test_nvrtc_major_and_minor_invalidate_disk_reuse(self):
@@ -160,7 +160,7 @@ class CacheProcesses(unittest.TestCase):
             settings = {"SIMPATICO_TEST_NVRTC_VERSION": component}
             self.assertEqual(self.worker("version", **settings), (1, 1, 0))
             self.assertEqual(self.worker("version", **settings), (0, 1, 1))
-        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 3)
+        self.assertEqual(len(list(self.cache.glob("v3/*/*.cubin"))), 3)
         self.assertEqual(self.worker(), (0, 1, 1))
 
     def test_version_query_error_is_reported_without_cache_publication(self):
@@ -206,7 +206,7 @@ class CacheProcesses(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cache_fallback.cuh", result.stderr)
-        self.assertEqual(list(self.cache.glob("v2/*/*.cubin")), [])
+        self.assertEqual(list(self.cache.glob("v3/*/*.cubin")), [])
 
     def test_disabled_and_unwritable_cache(self):
         for value in ("off", "0", "", str(self.root / "file" / "child")):
@@ -216,9 +216,9 @@ class CacheProcesses(unittest.TestCase):
 
     def test_corrupt_truncated_and_unloadable_records_are_repaired(self):
         self.assertEqual(self.worker(), (1, 1, 0))
-        path = next(self.cache.glob("v2/*/*.cubin"))
+        path = next(self.cache.glob("v3/*/*.cubin"))
         original = path.read_bytes()
-        self.assertTrue(original.startswith(b"SIMPJIT2"))
+        self.assertTrue(original.startswith(b"SIMPJIT3"))
         self.assertEqual(len(original), 32 + int.from_bytes(original[8:16], "big"))
         self.assertEqual(original[16:32], checksum(original[32:]))
         changed = bytearray(original)
@@ -227,7 +227,7 @@ class CacheProcesses(unittest.TestCase):
         # driver's rejection path independently of the storage checksum.
         invalid_image = bytes(4096)
         unloadable = (
-            b"SIMPJIT2"
+            b"SIMPJIT3"
             + len(invalid_image).to_bytes(8, "big")
             + checksum(invalid_image)
             + invalid_image
@@ -237,19 +237,35 @@ class CacheProcesses(unittest.TestCase):
             self.assertEqual(self.worker(), (1, 1, 0))
             self.assertEqual(self.worker(), (0, 1, 1))
 
+    def test_record_without_the_requested_kernel_is_recompiled(self):
+        self.assertEqual(self.worker(mode="renamed"), (1, 1, 0))
+        foreign = next(self.cache.glob("v3/*/*.cubin"))
+        other_source = foreign.read_bytes()
+        foreign.unlink()
+        self.assertEqual(self.worker(), (1, 1, 0))
+        path = next(self.cache.glob("v3/*/*.cubin"))
+        # A valid, loadable record of another source at this source's path.
+        path.write_bytes(other_source)
+        self.assertEqual(self.worker(), (1, 1, 0))
+        self.assertNotEqual(path.read_bytes(), other_source)
+        self.assertEqual(self.worker(), (0, 1, 1))
+
     def test_simultaneous_processes_and_threads(self):
         # Each process starts six test threads; cap simultaneous workers at twelve.
         with ThreadPoolExecutor(max_workers=2) as workers:
             results = list(workers.map(lambda _: self.worker(mode="threads"), range(4)))
         self.assertGreaterEqual(sum(compiles for compiles, _, _ in results), 1)
+        # The six threads of a process share one compilation or one disk load.
+        for compiles, _, disk_hits in results:
+            self.assertEqual(compiles + disk_hits, 1)
         self.assertEqual(self.worker(), (0, 1, 1))
-        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 1)
+        self.assertEqual(len(list(self.cache.glob("v3/*/*.cubin"))), 1)
         self.assertEqual(list(self.cache.rglob("*.tmp.*")), [])
 
     def seed_old_environments(self):
         paths = []
         for index in range(5):
-            environment = self.cache / "v2" / f"{index:032x}"
+            environment = self.cache / "v3" / f"{index:032x}"
             environment.mkdir(parents=True)
             path = environment / ("b" * 32 + ".cubin")
             path.write_bytes(b"stale cache fixture")
@@ -260,7 +276,7 @@ class CacheProcesses(unittest.TestCase):
 
     def test_first_disk_hit_refreshes_current_and_prunes_stale_environments(self):
         self.assertEqual(self.worker(), (1, 1, 0))
-        current = next(self.cache.glob("v2/*/*.cubin"))
+        current = next(self.cache.glob("v3/*/*.cubin"))
         original = current.read_bytes()
         old = time.time() - 24 * 3600
         os.utime(current.parent, (old, old))
@@ -303,7 +319,7 @@ class CacheProcesses(unittest.TestCase):
             legacy.write_bytes(b"created after first-use maintenance")
             current = next(
                 path.parent
-                for path in self.cache.glob("v2/*/*.cubin")
+                for path in self.cache.glob("v3/*/*.cubin")
                 if path not in paths
             )
             old = time.time() - 24 * 3600
@@ -321,7 +337,7 @@ class CacheProcesses(unittest.TestCase):
         if "version" not in WORKERS:
             self.skipTest("version injection requires the Linux linker wrapper")
         with self.paused_worker() as process:
-            original = next(self.cache.glob("v2/*/*.cubin"))
+            original = next(self.cache.glob("v3/*/*.cubin"))
             self.assertEqual(self.worker("project", expected=2), (1, 1, 0))
             self.assertEqual(self.worker("cccl", expected=3), (1, 1, 0))
             for component in ("major", "minor"):
@@ -330,7 +346,7 @@ class CacheProcesses(unittest.TestCase):
                     (1, 1, 0),
                 )
             others = [
-                path for path in self.cache.glob("v2/*/*.cubin") if path != original
+                path for path in self.cache.glob("v3/*/*.cubin") if path != original
             ]
             self.assertEqual(len(others), 4)
             for index, path in enumerate([original, *others]):
@@ -363,7 +379,7 @@ class CacheProcesses(unittest.TestCase):
             # These four recent header/compiler environments all remain reusable.
             self.assertEqual(self.worker(), (0, 1, 1))
             self.assertEqual(self.worker("project", expected=2), (0, 1, 1))
-        paths = list(self.cache.glob("v2/*/*.cubin"))
+        paths = list(self.cache.glob("v3/*/*.cubin"))
         self.assertEqual(len(paths), 4 if "version" in WORKERS else 2)
         unknown = paths[0].parent / "keep.txt"
         unknown.write_text("not a cache record")
@@ -382,7 +398,7 @@ class CacheProcesses(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(legacy.exists())
         self.assertFalse(abandoned.exists())
-        self.assertEqual(list(self.cache.glob("v2/*/*.cubin")), [])
+        self.assertEqual(list(self.cache.glob("v3/*/*.cubin")), [])
         self.assertEqual(unrelated.read_text(), "preserve me")
         self.assertEqual(unknown.read_text(), "not a cache record")
         self.assertEqual(self.worker(), (1, 1, 0))

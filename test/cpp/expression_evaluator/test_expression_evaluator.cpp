@@ -60,16 +60,26 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/mr/cuda_memory_resource.hpp>
+
 #include <cuda_runtime_api.h>
 
 // standard library
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <random>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <tuple>
 #include <vector>
 
 using namespace cucascade;
@@ -4289,64 +4299,6 @@ TEST_CASE("nvrtc_jit - binary arithmetic, abs, round, and constant_or_null match
   }
 }
 
-TEST_CASE("nvrtc_jit - division and modulo by zero produce NULL without trapping",
-          "[expression_evaluator][nvrtc_jit][ticket6]")
-{
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = get_resource_ref(*space);
-
-  // Row 0: 20 / 4 -> 5
-  // Row 1: 20 / 0 (valid divisor 0) -> NULL
-  // Row 2: NULL / 0 (NULL dividend with garbage 0 divisor) -> NULL
-  // Row 3: 20 / NULL (NULL divisor with garbage 0 in buffer) -> NULL
-  // Row 4: -15 / 2 -> -7
-  std::vector<std::int32_t> a_vals = {20, 20, 99, 20, -15};
-  std::vector<bool> a_valids       = {true, true, false, true, true};
-  std::vector<std::int32_t> b_vals = {4, 0, 0, 0, 2};
-  std::vector<bool> b_valids       = {true, true, true, false, true};
-
-  auto batch = make_two_int32_batch_with_nulls(*space, a_vals, a_valids, b_vals, b_valids);
-  auto ro    = batch->to_read_only();
-  auto tv    = ro.get_data()->cast<gpu_table_representation>().get_table_view();
-
-  auto const int_t = logical_type::make(type_id::INTEGER);
-  auto make_bin    = [&](sirius::function_id fid) {
-    std::vector<std::unique_ptr<ast_node>> args;
-    args.push_back(make_ref_typed(0, int_t));
-    args.push_back(make_ref_typed(1, int_t));
-    return make_func(fid, std::move(args), int_t);
-  };
-
-  duckdb::vector<std::unique_ptr<ast_node>> exprs;
-  exprs.push_back(make_bin(sirius::function_id::div));
-  exprs.push_back(make_bin(sirius::function_id::int_div));
-  exprs.push_back(make_bin(sirius::function_id::mod));
-
-  exp_executor jit_exec(
-    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-  auto jit_out = jit_exec.evaluate(tv);
-  REQUIRE(jit_out != nullptr);
-  REQUIRE(jit_out->num_columns() == 3);
-
-  std::vector<bool> expected_valids = {true, false, false, false, true};
-  for (cudf::size_type c = 0; c < 3; ++c) {
-    auto const col = jit_out->view().column(c);
-    CHECK(col.null_count() == 3);
-    CHECK(copy_valids_to_host(col) == expected_valids);
-  }
-  auto const div_vals  = copy_column_to_host<std::int32_t>(jit_out->view().column(0));
-  auto const idiv_vals = copy_column_to_host<std::int32_t>(jit_out->view().column(1));
-  auto const mod_vals  = copy_column_to_host<std::int32_t>(jit_out->view().column(2));
-  CHECK(div_vals[0] == 5);
-  CHECK(div_vals[4] == -7);
-  CHECK(idiv_vals[0] == 5);
-  CHECK(idiv_vals[4] == -7);
-  CHECK(mod_vals[0] == 0);
-  CHECK(mod_vals[4] == -1);
-}
-
 TEST_CASE(
   "nvrtc_jit - checked integer overflow throws invalid_input_exception and TRY suppresses it",
   "[expression_evaluator][nvrtc_jit][ticket6]")
@@ -4403,7 +4355,7 @@ TEST_CASE(
     CHECK(try_vals[2] == -3);
   }
 
-  SECTION("signed sub, mul, INT_MIN / -1, and abs(INT_MIN) overflow and INT_MIN % -1 == 0")
+  SECTION("signed sub, mul, INT_MIN / -1, INT_MIN % -1 and abs(INT_MIN) overflow")
   {
     auto sub_expr = make_bin(sirius::function_id::sub);
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {1}, {true}, *sub_expr),
@@ -4421,11 +4373,16 @@ TEST_CASE(
     REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *idiv_expr),
                       sirius::invalid_input_exception);
 
-    // INT_MIN % -1 must yield 0 without trapping hardware %
+    // DuckDB raises for INT_MIN % -1 as it does for INT_MIN / -1, although the remainder is 0; the
+    // hardware % must not trap either way.
     auto mod_expr = make_bin(sirius::function_id::mod);
-    auto mod_out  = eval_two_col({int_min}, {true}, {-1}, {true}, *mod_expr);
+    REQUIRE_THROWS_AS(eval_two_col({int_min}, {true}, {-1}, {true}, *mod_expr),
+                      sirius::invalid_input_exception);
+    auto mod_out =
+      eval_two_col({int_min, int_min + 1}, {true, true}, {1, -1}, {true, true}, *mod_expr);
     CHECK(mod_out->view().column(0).null_count() == 0);
-    CHECK(copy_column_to_host<std::int32_t>(mod_out->view().column(0))[0] == 0);
+    CHECK(copy_column_to_host<std::int32_t>(mod_out->view().column(0)) ==
+          std::vector<std::int32_t>{0, 0});
 
     // abs(INT_MIN) throws, TRY(abs(INT_MIN)) yields NULL
     std::vector<std::unique_ptr<ast_node>> abs_args;
@@ -4761,6 +4718,229 @@ TEST_CASE(
     std::unique_ptr<cudf::table> survivors;
     REQUIRE_NOTHROW(survivors = filter.select(tv));
     CHECK(survivors->num_rows() == 1);
+  }
+}
+
+TEST_CASE("nvrtc_jit - the payload an operation computes for a NULL row decides nothing downstream",
+          "[expression_evaluator][nvrtc_jit][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto make_column = [&]<typename T>(cudf::data_type type, T row0, T row1, bool row0_null) {
+    auto col = cudf::make_fixed_width_column(
+      type, 2, row0_null ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED, stream, mr);
+    std::array<T, 2> const payloads{row0, row1};
+    REQUIRE(cudaMemcpy(col->mutable_view().template head<T>(),
+                       payloads.data(),
+                       sizeof(payloads),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    if (row0_null) {
+      cudf::set_null_mask(col->mutable_view().null_mask(), 0, 1, false, stream);
+      col->set_null_count(1);
+    }
+    return col;
+  };
+  // A column load zeroes the payload of a NULL, so a NULL operand with a chosen payload has to be
+  // computed: `null_column + payload_column` is NULL in row 0, where its payload is the payload
+  // column's value, and is that column's ordinary row 1 value in row 1.
+  constexpr auto int_low = std::numeric_limits<std::int32_t>::min();
+  constexpr auto dec_low = std::numeric_limits<std::int64_t>::min();
+  cudf::data_type const int_c{cudf::type_id::INT32};
+  cudf::data_type const dec_c{cudf::type_id::DECIMAL64, 0};
+  cudf::data_type const dbl_c{cudf::type_id::FLOAT64};
+  enum column : std::uint32_t {
+    null_int,
+    int_lowest,
+    int_minus_one,
+    int_zero,
+    int_nonzero,
+    int_lowest_or_zero,
+    null_dec,
+    dec_lowest,
+    dec_minus_one,
+    dec_zero,
+    dec_lowest_or_zero,
+    null_dbl,
+    dbl_huge,
+    dbl_nan
+  };
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_column(int_c, 0, 0, true));
+  columns.push_back(make_column(int_c, int_low, 7, false));
+  columns.push_back(make_column(int_c, -1, 2, false));
+  columns.push_back(make_column(int_c, 0, 3, false));
+  columns.push_back(make_column(int_c, 5, 0, false));
+  columns.push_back(make_column(int_c, int_low, 0, false));
+  columns.push_back(make_column(dec_c, std::int64_t{0}, std::int64_t{0}, true));
+  columns.push_back(make_column(dec_c, dec_low, std::int64_t{7}, false));
+  columns.push_back(make_column(dec_c, std::int64_t{-1}, std::int64_t{2}, false));
+  columns.push_back(make_column(dec_c, std::int64_t{0}, std::int64_t{3}, false));
+  columns.push_back(make_column(dec_c, dec_low, std::int64_t{0}, false));
+  columns.push_back(make_column(dbl_c, 0.0, 0.0, true));
+  columns.push_back(make_column(dbl_c, std::numeric_limits<double>::lowest(), 1.5, false));
+  columns.push_back(make_column(dbl_c, std::numeric_limits<double>::quiet_NaN(), 2.5, false));
+  std::vector<cudf::column_view> views;
+  for (auto const& col : columns) {
+    views.push_back(col->view());
+  }
+  cudf::table_view const tv{views};
+
+  auto const int_t      = logical_type::make(type_id::INTEGER);
+  auto const smallint_t = logical_type::make(type_id::SMALLINT);
+  auto const bool_t     = logical_type::make(type_id::BOOLEAN);
+  auto const dbl_t      = logical_type::make(type_id::DOUBLE);
+  auto const float_t    = logical_type::make(type_id::FLOAT);
+  auto const dec18_0    = logical_type::make_decimal(18, 0);
+  auto const dec18_2    = logical_type::make_decimal(18, 2);
+  auto const dec9_2     = logical_type::make_decimal(9, 2);
+  auto const dec9_9     = logical_type::make_decimal(9, 9);
+  using sirius::function_id;
+  auto call = [](function_id fid, logical_type ret, auto... operands) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    (args.push_back(std::move(operands)), ...);
+    return make_func(fid, std::move(args), ret);
+  };
+  auto int_col = [&](column c) { return make_ref_typed(c, int_t); };
+  auto dec_col = [&](column c) { return make_ref_typed(c, dec18_0); };
+  auto dbl_col = [&](column c) { return make_ref_typed(c, dbl_t); };
+
+  // The three kinds of operand under test. When `poisoned`, row 0 additionally carries the
+  // Overflow Poison of `lowest * lowest`, a term that is 0 in row 1.
+  auto int_operand = [&](column payload, bool poisoned) {
+    auto operand = call(function_id::add, int_t, int_col(null_int), int_col(payload));
+    if (!poisoned) { return operand; }
+    return call(
+      function_id::add,
+      int_t,
+      std::move(operand),
+      call(function_id::mul, int_t, int_col(int_lowest_or_zero), int_col(int_lowest_or_zero)));
+  };
+  auto dec_operand = [&](column payload, bool poisoned) {
+    auto operand = call(function_id::add, dec18_0, dec_col(null_dec), dec_col(payload));
+    if (!poisoned) { return operand; }
+    return call(
+      function_id::add,
+      dec18_0,
+      std::move(operand),
+      call(function_id::mul, dec18_0, dec_col(dec_lowest_or_zero), dec_col(dec_lowest_or_zero)));
+  };
+  auto dbl_operand = [&](column payload, bool poisoned) {
+    auto operand = call(function_id::add, dbl_t, dbl_col(null_dbl), dbl_col(payload));
+    if (!poisoned) { return operand; }
+    return call(
+      function_id::add,
+      dbl_t,
+      std::move(operand),
+      make_cast(
+        call(function_id::mul, int_t, int_col(int_lowest_or_zero), int_col(int_lowest_or_zero)),
+        dbl_t,
+        false));
+  };
+
+  // Each operation's own check would fire on the payload of row 0, or its divisor's payload there
+  // is zero.
+  auto make_cases = [&](bool poisoned) {
+    auto i = [&](column payload) { return int_operand(payload, poisoned); };
+    auto d = [&](column payload) { return dec_operand(payload, poisoned); };
+    auto f = [&](column payload) { return dbl_operand(payload, poisoned); };
+    std::vector<std::pair<char const*, std::unique_ptr<ast_node>>> cases;
+    cases.emplace_back("i + -1",
+                       call(function_id::add, int_t, i(int_lowest), int_col(int_minus_one)));
+    cases.emplace_back("i - 1", call(function_id::sub, int_t, i(int_lowest), make_int_const(1)));
+    cases.emplace_back("i * -1",
+                       call(function_id::mul, int_t, i(int_lowest), int_col(int_minus_one)));
+    cases.emplace_back("i / -1",
+                       call(function_id::div, int_t, i(int_lowest), int_col(int_minus_one)));
+    cases.emplace_back("i // -1",
+                       call(function_id::int_div, int_t, i(int_lowest), int_col(int_minus_one)));
+    cases.emplace_back("i % -1",
+                       call(function_id::mod, int_t, i(int_lowest), int_col(int_minus_one)));
+    cases.emplace_back("-1 / i",
+                       call(function_id::div, int_t, int_col(int_minus_one), i(int_zero)));
+    cases.emplace_back("-1 % i",
+                       call(function_id::mod, int_t, int_col(int_minus_one), i(int_zero)));
+    cases.emplace_back("-i", call(function_id::negate, int_t, i(int_lowest)));
+    cases.emplace_back("abs(i)", call(function_id::abs, int_t, i(int_lowest)));
+    cases.emplace_back("CAST(i AS SMALLINT)", make_cast(i(int_lowest), smallint_t, false));
+    cases.emplace_back("CAST(i AS DECIMAL(9, 2))", make_cast(i(int_lowest), dec9_2, false));
+    // 1 does not fit DECIMAL(9, 9), so casting TRUE overflows.
+    cases.emplace_back("CAST(CAST(i AS BOOLEAN) AS DECIMAL(9, 9))",
+                       make_cast(make_cast(i(int_nonzero), bool_t, false), dec9_9, false));
+    cases.emplace_back("d + -1",
+                       call(function_id::add, dec18_0, d(dec_lowest), dec_col(dec_minus_one)));
+    cases.emplace_back("d - 1",
+                       call(function_id::sub, dec18_0, d(dec_lowest), make_dec64_const(1, 18, 0)));
+    cases.emplace_back("d * -1",
+                       call(function_id::mul, dec18_0, d(dec_lowest), dec_col(dec_minus_one)));
+    cases.emplace_back("d / -1",
+                       call(function_id::div, dec18_0, d(dec_lowest), dec_col(dec_minus_one)));
+    cases.emplace_back("d % -1",
+                       call(function_id::mod, dec18_0, d(dec_lowest), dec_col(dec_minus_one)));
+    cases.emplace_back("-1 / d",
+                       call(function_id::div, dec18_0, dec_col(dec_minus_one), d(dec_zero)));
+    cases.emplace_back("-1 % d",
+                       call(function_id::mod, dec18_0, dec_col(dec_minus_one), d(dec_zero)));
+    cases.emplace_back("-d", call(function_id::negate, dec18_0, d(dec_lowest)));
+    cases.emplace_back("abs(d)", call(function_id::abs, dec18_0, d(dec_lowest)));
+    cases.emplace_back("CAST(d AS SMALLINT)", make_cast(d(dec_lowest), smallint_t, false));
+    cases.emplace_back("CAST(d AS DECIMAL(18, 2))", make_cast(d(dec_lowest), dec18_2, false));
+    // The inner cast hands its wrapped product to the cast that drops the scale digits again.
+    cases.emplace_back("CAST(CAST(d AS DECIMAL(18, 2)) AS DECIMAL(18, 0))",
+                       make_cast(make_cast(d(dec_lowest), dec18_2, false), dec18_0, false));
+    cases.emplace_back("f / x", call(function_id::div, dbl_t, f(dbl_huge), dbl_col(dbl_nan)));
+    cases.emplace_back("x / f", call(function_id::div, dbl_t, dbl_col(dbl_nan), f(dbl_huge)));
+    cases.emplace_back("CAST(f AS INTEGER)", make_cast(f(dbl_huge), int_t, false));
+    cases.emplace_back("CAST(NaN AS INTEGER)", make_cast(f(dbl_nan), int_t, false));
+    cases.emplace_back("CAST(f AS FLOAT)", make_cast(f(dbl_huge), float_t, false));
+    cases.emplace_back("CAST(f AS DECIMAL(9, 2))", make_cast(f(dbl_huge), dec9_2, false));
+    cases.emplace_back("CAST(NaN AS DECIMAL(9, 2))", make_cast(f(dbl_nan), dec9_2, false));
+    return cases;
+  };
+
+  auto const nvrtc = sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT};
+
+  SECTION("a NULL operand's payload raises nothing and leaves the row NULL")
+  {
+    for (auto& [name, expr] : make_cases(/*poisoned=*/false)) {
+      CAPTURE(name);
+      std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+      auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor project(*expr, mr, stream, nvrtc);
+      std::unique_ptr<cudf::table> projected;
+      REQUIRE_NOTHROW(projected = project.evaluate(tv));
+      CHECK(copy_valids_to_host(projected->view().column(0)) == std::vector<bool>{false, true});
+
+      // `<expr> IS NULL` keeps the value valid, so the FilterSink sees any poison of row 0.
+      auto const pred = make_unary(sirius::ast::unary_op::kind::op_is_null, std::move(expr));
+      REQUIRE(sirius::nvrtc::plan_filter_sink(*pred, tv).has_value());
+      exp_executor filter(*pred, mr, stream, nvrtc);
+      std::unique_ptr<cudf::table> survivors;
+      REQUIRE_NOTHROW(survivors = filter.select(tv));
+      CHECK(survivors->num_rows() == 1);
+    }
+  }
+
+  SECTION("every operation hands on the Overflow Poison of a NULL operand")
+  {
+    for (auto& [name, expr] : make_cases(/*poisoned=*/true)) {
+      CAPTURE(name);
+      std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+      auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor project(*expr, mr, stream, nvrtc);
+      CHECK_THROWS_AS(project.evaluate(tv), sirius::invalid_input_exception);
+
+      auto const pred = make_unary(sirius::ast::unary_op::kind::op_is_null, std::move(expr));
+      REQUIRE(sirius::nvrtc::plan_filter_sink(*pred, tv).has_value());
+      exp_executor filter(*pred, mr, stream, nvrtc);
+      CHECK_THROWS_AS(filter.select(tv), sirius::invalid_input_exception);
+    }
   }
 }
 
@@ -5233,6 +5413,142 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
       auto out = eval_one_col({10, 20}, {true, true}, *expr);
       CHECK(copy_column_to_host<std::int32_t>(out->view().column(0)) ==
             std::vector<std::int32_t>{0, 0});
+    }
+  }
+
+  SECTION(
+    "a filter runs an operand that can raise only on the rows the earlier operands leave "
+    "undecided, whatever the operands between them that cannot raise")
+  {
+    // An operand that cannot raise runs on every row, decided or not. It must leave an operand that
+    // can raise running exactly where DuckDB's Select evaluates it. col0 + INT_MAX overflows for
+    // every col0 > 0.
+    auto const conj = [&](sirius::ast::conjunction::kind kind, auto... operands) {
+      std::vector<std::unique_ptr<ast_node>> ch;
+      (ch.push_back(std::move(operands)), ...);
+      return make_conj(kind, std::move(ch));
+    };
+    auto const col0_cmp = [&](sirius::comparison_type op, std::int32_t constant) {
+      return make_cmp(op, make_ref_typed(0, int_t), make_int_const(constant));
+    };
+    constexpr auto op_and = sirius::ast::conjunction::kind::op_and;
+    constexpr auto op_or  = sirius::ast::conjunction::kind::op_or;
+    constexpr auto lt     = sirius::comparison_type::lt;
+    constexpr auto gt     = sirius::comparison_type::gt;
+
+    // 1. AND: the first operand is FALSE on the row that would overflow, TRUE on the other.
+    {
+      auto expr = conj(op_and, col0_cmp(lt, 0), col0_cmp(gt, -100), make_ovf_bool());
+      CHECK(select_one_col({10, -5}, {true, true}, *expr) == 1);
+    }
+    // 2. AND: the middle operand is the one that decides the row.
+    {
+      auto expr = conj(op_and, col0_cmp(gt, 0), col0_cmp(lt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
+    }
+    // 3. AND after a NULL: Select stops at the first operand that is not TRUE, whether the middle
+    // operand then makes the Kleene value FALSE or leaves it NULL.
+    {
+      auto expr = conj(op_and, make_null_const(bool_t), col0_cmp(lt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
+      expr = conj(op_and, make_null_const(bool_t), col0_cmp(gt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
+    }
+    // 4. AND with every earlier operand TRUE: the operand that can raise runs, and raises.
+    {
+      auto expr = conj(op_and, col0_cmp(gt, 0), col0_cmp(lt, 100), make_ovf_bool());
+      REQUIRE_THROWS_AS(select_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+    }
+    // 5. OR: the first or the middle operand is TRUE, so the last one never runs.
+    {
+      auto expr = conj(op_or, col0_cmp(gt, 0), col0_cmp(lt, -100), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 2);
+      expr = conj(op_or, col0_cmp(lt, 0), col0_cmp(gt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 2);
+      expr = conj(op_or, make_null_const(bool_t), col0_cmp(gt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 2);
+    }
+    // 6. OR with no earlier operand TRUE: the operand that can raise runs, and raises.
+    {
+      auto expr = conj(op_or, col0_cmp(lt, 0), col0_cmp(gt, 100), make_ovf_bool());
+      REQUIRE_THROWS_AS(select_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+      expr = conj(op_or, make_null_const(bool_t), col0_cmp(lt, 0), make_ovf_bool());
+      REQUIRE_THROWS_AS(select_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+    }
+    // 7. Nested: an inner AND or OR of operands that cannot raise decides for the outer one.
+    {
+      auto expr = conj(
+        op_and, conj(op_or, col0_cmp(gt, 0), col0_cmp(lt, -100)), col0_cmp(lt, 0), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 0);
+      expr = conj(op_or, conj(op_and, col0_cmp(gt, 0), col0_cmp(lt, 100)), make_ovf_bool());
+      CHECK(select_one_col({10, 20}, {true, true}, *expr) == 2);
+      expr = conj(op_or, conj(op_and, col0_cmp(lt, 0), col0_cmp(gt, -100)), make_ovf_bool());
+      REQUIRE_THROWS_AS(select_one_col({10, 20}, {true, true}, *expr),
+                        sirius::invalid_input_exception);
+    }
+    // 8. A CASE WHEN condition skips the operand like a filter does.
+    {
+      std::vector<sirius::ast::case_expr::when_then> cases;
+      cases.push_back(
+        {conj(op_and, col0_cmp(lt, 0), col0_cmp(gt, -100), make_ovf_bool()), make_int_const(1)});
+      auto expr = std::make_unique<ast_node>(
+        sirius::ast::case_expr{std::move(cases), make_int_const(0), int_t});
+      auto out = eval_one_col({10, -5}, {true, true}, *expr);
+      CHECK(copy_column_to_host<std::int32_t>(out->view().column(0)) ==
+            std::vector<std::int32_t>{0, 1});
+    }
+  }
+
+  SECTION(
+    "an operand that runs on a row the earlier operands decide still raises only for the work it "
+    "selects on that row")
+  {
+    // col0 = {10, -5}: col0 < 0 decides the AND for the first row, the only row on which
+    // col0 + INT_MAX overflows.
+    auto const decided_and = [&](std::unique_ptr<ast_node> later_value) {
+      std::vector<std::unique_ptr<ast_node>> ch;
+      ch.push_back(
+        make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(0)));
+      ch.push_back(
+        make_cmp(sirius::comparison_type::gt, std::move(later_value), make_int_const(0)));
+      return make_conj(sirius::ast::conjunction::kind::op_and, std::move(ch));
+    };
+    auto const projected = [&](ast_node const& expr) {
+      auto const out = eval_one_col({10, -5}, {true, true}, expr);
+      return copy_column_to_host<std::int8_t>(out->view().column(0));
+    };
+
+    // 1. TRY turns the overflow into NULL, so the operand cannot raise and a filter runs it on
+    // both rows.
+    {
+      auto expr = decided_and(make_unary(sirius::ast::unary_op::kind::op_try, make_ovf_int()));
+      CHECK(select_one_col({10, -5}, {true, true}, *expr) == 1);
+      CHECK(projected(*expr) == std::vector<std::int8_t>{0, 1});
+    }
+    // 2. A projection runs a CASE that can raise on both rows. The CASE does not take its
+    // overflowing branch on the first row.
+    {
+      std::vector<sirius::ast::case_expr::when_then> whens;
+      whens.push_back(
+        {make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(0)),
+         make_ovf_int()});
+      auto expr = decided_and(std::make_unique<ast_node>(
+        sirius::ast::case_expr{std::move(whens), make_int_const(0), int_t}));
+      CHECK(projected(*expr) == std::vector<std::int8_t>{0, 1});
+      CHECK(select_one_col({10, -5}, {true, true}, *expr) == 1);
+    }
+    // 3. A projection runs a COALESCE that can raise on both rows. Its first value is never NULL,
+    // so it never reaches the overflowing fallback.
+    {
+      std::vector<std::unique_ptr<ast_node>> values;
+      values.push_back(make_ref_typed(0, int_t));
+      values.push_back(make_ovf_int());
+      auto expr = decided_and(make_coalesce(std::move(values), int_t));
+      CHECK(projected(*expr) == std::vector<std::int8_t>{0, 0});
+      CHECK(select_one_col({10, -5}, {true, true}, *expr) == 0);
     }
   }
 
@@ -8057,7 +8373,7 @@ TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across select
 }
 
 // ============================================================================
-// Multi-tile compaction, unguarded projection tiles, multi-chunk SWAR literals,
+// Multi-tile compaction, projection tile boundaries, multi-chunk SWAR literals,
 // 64-bit boundaries, and the DuckDB rounding contracts
 // ============================================================================
 
@@ -8115,6 +8431,54 @@ std::unique_ptr<cudf::column> make_bulk_column(cudf::data_type type,
                      cudaMemcpyHostToDevice) == cudaSuccess);
   return col;
 }
+
+/**
+ * @brief Device memory resource that hands out every block filled with 0xFF bytes, so that code
+ *        which relies on new memory being zero fails whatever the upstream resource returns.
+ */
+class dirty_memory_resource {
+ public:
+  explicit dirty_memory_resource(rmm::device_async_resource_ref upstream) : _upstream(upstream) {}
+
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    auto* const block = _upstream.allocate(stream, bytes, alignment);
+    // A blocking fill, so that it precedes the caller's first use of the block on any stream.
+    if (bytes > 0 && cudaMemset(block, 0xFF, bytes) != cudaSuccess) {
+      _upstream.deallocate(stream, block, bytes, alignment);
+      throw std::runtime_error("dirty_memory_resource: cudaMemset failed");
+    }
+    return block;
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* block,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    _upstream.deallocate(stream, block, bytes, alignment);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+  }
+
+  void deallocate_sync(void* block, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, block, bytes, alignment);
+  }
+
+  bool operator==(dirty_memory_resource const& other) const noexcept
+  {
+    return _upstream == other._upstream;
+  }
+
+  friend void get_property(dirty_memory_resource const&, ::cuda::mr::device_accessible) noexcept {}
+
+ private:
+  rmm::device_async_resource_ref _upstream;
+};
 
 std::unique_ptr<cudf::column> make_bulk_strings(std::vector<std::string> const& strs,
                                                 std::vector<bool> const& valids,
@@ -8316,9 +8680,8 @@ TEST_CASE(
   }
 }
 
-TEST_CASE(
-  "nvrtc_jit - multi-tile FilterSink compaction (scan and scatter kernels) matches MATERIALIZE",
-  "[expression_evaluator][nvrtc_jit][filter_tiles]")
+TEST_CASE("nvrtc_jit - multi-tile FilterSink compaction (scatter kernel) matches MATERIALIZE",
+          "[expression_evaluator][nvrtc_jit][filter_tiles]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
@@ -8427,7 +8790,418 @@ TEST_CASE(
   }
 }
 
-TEST_CASE("nvrtc_jit - ProjectSink unguarded full tiles with a partial tail match MATERIALIZE",
+TEST_CASE("nvrtc_jit - FilterSink matches MATERIALIZE at every tile and warp boundary",
+          "[expression_evaluator][nvrtc_jit][filter_tiles]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t     = logical_type::make(type_id::INTEGER);
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  auto const bool_t    = logical_type::make(type_id::BOOLEAN);
+
+  // A ballot word covers 32 rows, a warp's 16 ballot words cover 512 rows, and a tile is 4096 rows:
+  // the row counts sit on and around each of those edges, down to a single row. Up to 4095 rows
+  // only the last-tile loop runs, at 4096 and 8192 only the full-tile loop, otherwise both. From
+  // 4097 rows on, the survivors are written by the scatter kernel, whose last tile ends on a warp
+  // edge at 4608 rows.
+  auto const n_rows = GENERATE(as<cudf::size_type>{},
+                               1,
+                               31,
+                               32,
+                               33,
+                               255,
+                               256,
+                               257,
+                               511,
+                               512,
+                               513,
+                               4095,
+                               4096,
+                               4097,
+                               4607,
+                               4608,
+                               4609,
+                               8192,
+                               9000);
+  // `no_mask` columns carry no null mask, so the predicate is statically non-null; `none` columns
+  // carry a mask with every row valid.
+  enum class null_pattern { no_mask, none, every_eleventh, last_row, all };
+  auto const pattern = GENERATE(null_pattern::no_mask,
+                                null_pattern::none,
+                                null_pattern::every_eleventh,
+                                null_pattern::last_row,
+                                null_pattern::all);
+  CAPTURE(n_rows, static_cast<int>(pattern));
+
+  std::vector<std::int32_t> col0_vals(n_rows);
+  std::vector<std::string> col1_strs(n_rows);
+  std::vector<bool> valids(pattern == null_pattern::no_mask ? 0 : n_rows);
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    col0_vals[i] = i % 1000;
+    col1_strs[i] = "row_" + std::to_string(i % 40) + "_v" + std::to_string(i % 7);
+    switch (pattern) {
+      case null_pattern::no_mask: break;
+      case null_pattern::none: valids[i] = true; break;
+      case null_pattern::every_eleventh: valids[i] = (i % 11) != 0; break;
+      case null_pattern::last_row: valids[i] = i != n_rows - 1; break;
+      case null_pattern::all: valids[i] = false; break;
+    }
+  }
+  auto col0 = make_bulk_column<std::int32_t>(
+    cudf::data_type{cudf::type_id::INT32}, col0_vals, valids, stream, mr);
+  auto col1 = make_bulk_strings(col1_strs, valids, stream, mr);
+  cudf::table_view tv{{col0->view(), col1->view()}};
+
+  auto const string_call = [&](sirius::function_id fid, std::string const& constant) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(1, varchar_t));
+    args.push_back(make_str_const(constant));
+    return make_func(fid, std::move(args), bool_t);
+  };
+
+  struct predicate_case {
+    char const* name;
+    std::unique_ptr<ast_node> pred;
+  };
+  std::vector<predicate_case> cases;
+  cases.push_back(
+    {"integer comparison",
+     make_cmp(sirius::comparison_type::ge, make_ref_typed(0, int_t), make_int_const(500))});
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_int_const(1));
+    cases.push_back({"comparison of a sum that can overflow",
+                     make_cmp(sirius::comparison_type::gt,
+                              make_func(sirius::function_id::add, std::move(args), int_t),
+                              make_int_const(250))});
+  }
+  cases.push_back(
+    {"string equality",
+     make_cmp(
+       sirius::comparison_type::equal, make_ref_typed(1, varchar_t), make_str_const("row_17_v3"))});
+  cases.push_back({"multi-literal LIKE", string_call(sirius::function_id::like, "%w_1%v%")});
+  cases.push_back({"backtracking LIKE", string_call(sirius::function_id::like, "row_3%_v_")});
+  {
+    std::vector<std::unique_ptr<ast_node>> or_ch;
+    or_ch.push_back(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref_typed(0, int_t)));
+    or_ch.push_back(
+      make_cmp(sirius::comparison_type::ge, make_ref_typed(0, int_t), make_int_const(0)));
+    cases.push_back(
+      {"every row survives", make_conj(sirius::ast::conjunction::kind::op_or, std::move(or_ch))});
+  }
+
+  std::array<cudf::size_type, 2> const out_indices{1, 0};
+  for (auto const& tc : cases) {
+    CAPTURE(tc.name);
+    exp_executor mat_exec(*tc.pred,
+                          mr,
+                          stream,
+                          sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE},
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/false);
+    exp_executor jit_exec(*tc.pred,
+                          mr,
+                          stream,
+                          sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT},
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/true);
+    std::unique_ptr<cudf::column> mat_survivors;
+    std::unique_ptr<cudf::column> jit_survivors;
+    auto mat_tbl = mat_exec.select_with_survivors(tv, out_indices, mat_survivors);
+    auto jit_tbl = jit_exec.select_with_survivors(tv, out_indices, jit_survivors);
+    expect_tables_equal(jit_tbl->view(), mat_tbl->view());
+    REQUIRE(jit_survivors != nullptr);
+    REQUIRE(mat_survivors != nullptr);
+    expect_columns_equal(jit_survivors->view(), mat_survivors->view());
+  }
+}
+
+TEST_CASE("nvrtc_jit - FilterSink keeps the survivors of a batch of many tiles in row order",
+          "[expression_evaluator][nvrtc_jit][filter_tiles]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  // The predicate kernel adds to the status words and to the group totals of its workspace, which
+  // therefore must not rely on the memory it is given being zero.
+  dirty_memory_resource dirty{get_resource_ref(*space)};
+  rmm::device_async_resource_ref mr{dirty};
+
+  auto const int_t     = logical_type::make(type_id::INTEGER);
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  // A scatter block finds where its tile's survivors start from the totals of the groups of 256
+  // tiles before its group and the counts of the tiles before it in its group. 256 tiles make one
+  // group and one more row starts a second. The batch that does not end on a tile edge ends in a
+  // partial tile and a partial ballot word.
+  constexpr cudf::size_type tile_rows = 4096;
+  auto const n_rows                   = GENERATE_COPY(as<cudf::size_type>{},
+                                    255 * tile_rows,
+                                    256 * tile_rows,
+                                    256 * tile_rows + 1,
+                                    513 * tile_rows + 1699);
+  CAPTURE(n_rows);
+
+  // The value is 0 in every row of each fifth tile and spread over [0, 1024) elsewhere, so the
+  // tile counts differ widely. Every seventh row of the nullable column is NULL.
+  std::vector<std::int32_t> vals(static_cast<std::size_t>(n_rows));
+  std::vector<bool> valids(static_cast<std::size_t>(n_rows));
+  std::vector<std::string> strs(static_cast<std::size_t>(n_rows));
+  std::vector<std::int32_t> expected_small;
+  std::vector<std::int32_t> expected_small_valid;
+  std::vector<std::int32_t> expected_zero;
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    auto const scrambled = (static_cast<std::uint32_t>(i) * 2654435761U) >> 22U;
+    vals[i]              = (i / tile_rows) % 5 == 0 ? 0 : static_cast<std::int32_t>(scrambled);
+    valids[i]            = i % 7 != 0;
+    strs[i]              = "v" + std::to_string(vals[i]);
+    if (vals[i] < 32) { expected_small.push_back(i); }
+    if (vals[i] < 32 && valids[i]) { expected_small_valid.push_back(i); }
+    if (vals[i] == 0) { expected_zero.push_back(i); }
+  }
+  auto const int32_type = cudf::data_type{cudf::type_id::INT32};
+  auto col0             = make_bulk_column<std::int32_t>(int32_type, vals, {}, stream, mr);
+  auto col1             = make_bulk_column<std::int32_t>(int32_type, vals, valids, stream, mr);
+  auto col2             = make_bulk_strings(strs, {}, stream, mr);
+  cudf::table_view const tv{{col0->view(), col1->view(), col2->view()}};
+
+  struct predicate_case {
+    char const* name;
+    std::unique_ptr<ast_node> pred;
+    std::vector<std::int32_t> const* expected;
+  };
+  std::vector<predicate_case> cases;
+  cases.push_back(
+    {"integer comparison",
+     make_cmp(sirius::comparison_type::lt, make_ref_typed(0, int_t), make_int_const(32)),
+     &expected_small});
+  cases.push_back(
+    {"nullable integer comparison",
+     make_cmp(sirius::comparison_type::lt, make_ref_typed(1, int_t), make_int_const(32)),
+     &expected_small_valid});
+  cases.push_back(
+    {"string equality",
+     make_cmp(sirius::comparison_type::equal, make_ref_typed(2, varchar_t), make_str_const("v0")),
+     &expected_zero});
+
+  std::array<cudf::size_type, 1> const out_indices{0};
+  for (auto const& tc : cases) {
+    CAPTURE(tc.name);
+    exp_executor jit_exec(
+      *tc.pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    std::unique_ptr<cudf::column> survivors;
+    auto const filtered = jit_exec.select_with_survivors(tv, out_indices, survivors);
+    REQUIRE(survivors != nullptr);
+    REQUIRE(filtered->num_rows() == static_cast<cudf::size_type>(tc.expected->size()));
+    CHECK(copy_column_to_host<std::int32_t>(survivors->view()) == *tc.expected);
+  }
+}
+
+// Hidden: the batch needs about 1.5 GB of device memory, which the test memory space does not
+// have, so the test allocates outside it. Run it with `sirius_unittest "[.filter_tile_groups]"`.
+TEST_CASE(
+  "nvrtc_jit - FilterSink keeps the survivors of a batch of more than 65536 tiles in row "
+  "order",
+  "[expression_evaluator][nvrtc_jit][filter_tiles][.filter_tile_groups]")
+{
+  auto stream = cudf::get_default_stream();
+  rmm::mr::cuda_memory_resource device_memory;
+  dirty_memory_resource dirty{device_memory};
+  rmm::device_async_resource_ref mr{dirty};
+
+  // Each thread of a scatter block reads every 256th total of the groups of 256 tiles before the
+  // block's group, so only from the 258th group on does a thread read a second total.
+  constexpr cudf::size_type tile_rows = 4096;
+  constexpr cudf::size_type n_rows    = (257 * 256 + 1) * tile_rows + 1699;
+
+  // Every row of each 997th tile survives and about 0.2 % of the rows elsewhere.
+  std::vector<std::int8_t> vals(static_cast<std::size_t>(n_rows));
+  std::vector<std::int32_t> expected;
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    auto const scrambled = (static_cast<std::uint32_t>(i) * 2654435761U) >> 22U;
+    vals[i]              = ((i / tile_rows) % 997 == 0 || scrambled < 2) ? 1 : 0;
+    if (vals[i] != 0) { expected.push_back(i); }
+  }
+  auto col =
+    make_bulk_column<std::int8_t>(cudf::data_type{cudf::type_id::BOOL8}, vals, {}, stream, mr);
+  auto const pred = make_ref_typed(0, logical_type::make(type_id::BOOLEAN));
+  exp_executor jit_exec(
+    *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+  std::array<cudf::size_type, 1> const out_indices{0};
+  std::unique_ptr<cudf::column> survivors;
+  auto const filtered =
+    jit_exec.select_with_survivors(cudf::table_view{{col->view()}}, out_indices, survivors);
+  REQUIRE(survivors != nullptr);
+  REQUIRE(filtered->num_rows() == static_cast<cudf::size_type>(expected.size()));
+  CHECK(copy_column_to_host<std::int32_t>(survivors->view()) == expected);
+}
+
+TEST_CASE("nvrtc_jit - FilterSink raises an overflow exactly when a row of the batch overflows",
+          "[expression_evaluator][nvrtc_jit][filter_tiles]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  // Up to 4095 rows only the partial-tile loop runs, at 4096 and 8192 only the full-tile loop,
+  // otherwise both: 4097 and 9000 rows end in a partial tile that follows full ones.
+  auto const n_rows = GENERATE(as<cudf::size_type>{}, 1, 33, 4095, 4096, 4097, 8192, 9000);
+  CAPTURE(n_rows);
+
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(make_ref_typed(0, int_t));
+  args.push_back(make_int_const(1));
+  auto const pred = make_cmp(sirius::comparison_type::gt,
+                             make_func(sirius::function_id::add, std::move(args), int_t),
+                             make_int_const(0));
+  exp_executor jit_exec(
+    *pred, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+  auto const int_max = std::numeric_limits<std::int32_t>::max();
+  auto const select  = [&](std::vector<std::int32_t> const& vals, std::vector<bool> const& valids) {
+    auto col = make_bulk_column<std::int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, vals, valids, stream, mr);
+    return jit_exec.select(cudf::table_view{{col->view()}});
+  };
+
+  SECTION("the first row overflows")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    vals.front() = int_max;
+    REQUIRE_THROWS_AS(select(vals, {}), sirius::invalid_input_exception);
+  }
+  SECTION("a row in the middle overflows")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    vals[n_rows / 2] = int_max;
+    REQUIRE_THROWS_AS(select(vals, {}), sirius::invalid_input_exception);
+  }
+  SECTION("the last row overflows")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    vals.back() = int_max;
+    REQUIRE_THROWS_AS(select(vals, {}), sirius::invalid_input_exception);
+  }
+  SECTION("NULL rows whose payload would overflow raise nothing")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    std::vector<bool> valids(n_rows, true);
+    for (auto const null_row : {cudf::size_type{0}, n_rows / 2, n_rows - 1}) {
+      vals[null_row]   = int_max;
+      valids[null_row] = false;
+    }
+    CHECK(select(vals, valids)->num_rows() == std::ranges::count(valids, true));
+  }
+  SECTION("overflowing rows of the column outside a sliced batch raise nothing")
+  {
+    // The batch is a slice with a full tile of overflowing rows after it, which a partial tile's
+    // items past the end of the batch would read if the row guard were missing.
+    constexpr cudf::size_type rows_before = 7;
+    constexpr cudf::size_type rows_after  = 4096;
+    std::vector<std::int32_t> vals(rows_before + n_rows + rows_after, int_max);
+    std::fill_n(vals.begin() + rows_before, n_rows, 0);
+    auto col =
+      make_bulk_column<std::int32_t>(cudf::data_type{cudf::type_id::INT32}, vals, {}, stream, mr);
+    auto const batch = cudf::slice(col->view(), {rows_before, rows_before + n_rows}, stream)[0];
+    CHECK(jit_exec.select(cudf::table_view{{batch}})->num_rows() == n_rows);
+  }
+}
+
+TEST_CASE("nvrtc_jit - word-wise LIKE matches up to the last character byte of a column",
+          "[expression_evaluator][nvrtc_jit][like_swar]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const varchar_t = logical_type::make(type_id::VARCHAR);
+  auto const bool_t    = logical_type::make(type_id::BOOLEAN);
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  auto const add_match = [&](sirius::function_id fid, std::string const& constant) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, varchar_t));
+    args.push_back(make_str_const(constant));
+    exprs.push_back(make_func(fid, std::move(args), bool_t));
+  };
+  add_match(sirius::function_id::contains, "needle");
+  add_match(sirius::function_id::like, "%ne%dle%");
+  add_match(sirius::function_id::contains, "le");
+  add_match(sirius::function_id::like, "%twelve-bytes%le%");
+  auto const expected_of = [](std::string const& s) {
+    auto const twelve = s.find("twelve-bytes");
+    return std::array<bool, 4>{
+      s.find("needle") != std::string::npos,
+      s.find("needle") != std::string::npos,
+      s.find("le") != std::string::npos,
+      twelve != std::string::npos && s.find("le", twelve + 12) != std::string::npos};
+  };
+
+  auto const expect_matches = [&](cudf::column_view const& col, std::span<std::string const> strs) {
+    cudf::table_view tv{{col}};
+    exp_executor jit_exec(exprs,
+                          mr,
+                          stream,
+                          sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT},
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/true);
+    auto const out = jit_exec.evaluate(tv);
+    REQUIRE(out->num_rows() == static_cast<cudf::size_type>(strs.size()));
+    for (cudf::size_type c = 0; c < out->num_columns(); ++c) {
+      auto const hits = copy_bool_column_to_host(out->view().column(c));
+      for (std::size_t r = 0; r < strs.size(); ++r) {
+        CAPTURE(c, r, strs[r]);
+        CHECK((hits[r] != 0) == expected_of(strs[r])[static_cast<std::size_t>(c)]);
+      }
+    }
+  };
+
+  SECTION("a column of one string shorter than or just past one word")
+  {
+    // 2 to 9 character bytes in the whole column: its only word, or its second, is cut short.
+    auto const len = GENERATE(as<std::size_t>{}, 2, 3, 4, 5, 6, 7, 8, 9);
+    CAPTURE(len);
+    for (std::string const& ending : {std::string{"le"}, std::string{"lx"}}) {
+      std::vector<std::string> const strs{std::string(len - 2, 'e') + ending};
+      auto const col = make_bulk_strings(strs, {}, stream, mr);
+      expect_matches(col->view(), strs);
+    }
+  }
+
+  SECTION("a match that ends at the last character byte, for every length of the last word")
+  {
+    // `tail` is the number of character bytes in the column's last 8-byte word (0: a whole word).
+    // The last row ends with the literal, so the match's final bytes come from that word: a word
+    // put together wrongly at any `tail` changes a result. The sliced column drops the last row,
+    // which moves the end of the characters into the row before it. Results cannot show whether a
+    // byte at or after the end of the characters was loaded, because a match that runs past the
+    // end of its row is rejected whatever those bytes hold.
+    auto const tail = GENERATE(as<std::size_t>{}, 0, 1, 2, 3, 4, 5, 6, 7);
+    CAPTURE(tail);
+    std::vector<std::string> strs{
+      "", "twelve-bytes then needle", "no match here", "twelve-bytes", "xxneed", "le-needle"};
+    std::size_t chars = 0;
+    for (auto const& s : strs) {
+      chars += s.size();
+    }
+    strs.front()   = std::string((8 + tail - chars % 8) % 8, 'p');
+    auto const col = make_bulk_strings(strs, {}, stream, mr);
+    expect_matches(col->view(), strs);
+
+    auto const sliced =
+      cudf::slice(col->view(), {0, static_cast<cudf::size_type>(strs.size()) - 1}, stream);
+    expect_matches(sliced.front(), std::span{strs}.first(strs.size() - 1));
+  }
+}
+
+TEST_CASE("nvrtc_jit - ProjectSink matches MATERIALIZE at every tile and warp boundary",
           "[expression_evaluator][nvrtc_jit][project_tiles]")
 {
   auto* space = get_default_gpu_space();
@@ -8438,69 +9212,187 @@ TEST_CASE("nvrtc_jit - ProjectSink unguarded full tiles with a partial tail matc
   auto const int_t    = logical_type::make(type_id::INTEGER);
   auto const bigint_t = logical_type::make(type_id::BIGINT);
   auto const dbl_t    = logical_type::make(type_id::DOUBLE);
+  auto const dec38_2  = logical_type::make_decimal(38, 2);
 
-  // 1024 = exactly one full tile, 1025 = one full tile plus a one-row tail, 2500 = two full
-  // tiles plus a 452-row tail, 4133 = four full tiles plus a 37-row tail (a partial warp).
-  for (cudf::size_type const n_rows : {1024, 1025, 2500, 4133}) {
-    CAPTURE(n_rows);
-    std::vector<std::int32_t> col0_vals(n_rows);
-    std::vector<bool> col0_valids(n_rows);
-    std::vector<std::int64_t> col1_vals(n_rows);
-    std::vector<double> col2_vals(n_rows);
-    for (cudf::size_type i = 0; i < n_rows; ++i) {
-      col0_vals[i]   = i % 1000;
-      col0_valids[i] = (i % 11) != 0;
-      col1_vals[i]   = static_cast<std::int64_t>(i) - 2000;
-      col2_vals[i]   = static_cast<double>(i) * 0.25;
-    }
-    auto col0 = make_bulk_column<std::int32_t>(
-      cudf::data_type{cudf::type_id::INT32}, col0_vals, col0_valids, stream, mr);
-    auto col1 = make_bulk_column<std::int64_t>(
-      cudf::data_type{cudf::type_id::INT64}, col1_vals, {}, stream, mr);
-    auto col2 =
-      make_bulk_column<double>(cudf::data_type{cudf::type_id::FLOAT64}, col2_vals, {}, stream, mr);
-    cudf::table_view tv{{col0->view(), col1->view(), col2->view()}};
+  // A validity word covers 32 rows, a thread's items are 256 rows apart, and a tile is 1024 rows:
+  // the row counts sit on and around each of those edges, down to a single row.
+  auto const n_rows = GENERATE(
+    as<cudf::size_type>{}, 1, 31, 32, 33, 255, 256, 257, 1023, 1024, 1025, 2048, 2500, 4133);
+  enum class null_pattern { none, every_eleventh, last_row, all };
+  auto const pattern = GENERATE(
+    null_pattern::none, null_pattern::every_eleventh, null_pattern::last_row, null_pattern::all);
+  CAPTURE(n_rows, static_cast<int>(pattern));
 
-    duckdb::vector<std::unique_ptr<ast_node>> exprs;
-    {
-      std::vector<std::unique_ptr<ast_node>> args;
-      args.push_back(make_ref_typed(0, int_t));
-      args.push_back(make_int_const(1));
-      exprs.push_back(make_func(sirius::function_id::add, std::move(args), int_t));  // nullable
+  std::vector<std::int32_t> col0_vals(n_rows);
+  std::vector<bool> col0_valids(n_rows);
+  std::vector<std::int64_t> col1_vals(n_rows);
+  std::vector<double> col2_vals(n_rows);
+  std::vector<__int128_t> col3_vals(n_rows);
+  for (cudf::size_type i = 0; i < n_rows; ++i) {
+    col0_vals[i] = i % 1000;
+    switch (pattern) {
+      case null_pattern::none: col0_valids[i] = true; break;
+      case null_pattern::every_eleventh: col0_valids[i] = (i % 11) != 0; break;
+      case null_pattern::last_row: col0_valids[i] = i != n_rows - 1; break;
+      case null_pattern::all: col0_valids[i] = false; break;
     }
-    {
-      std::vector<std::unique_ptr<ast_node>> args;
-      args.push_back(make_ref_typed(1, bigint_t));
-      args.push_back(make_bigint_const(2));
-      exprs.push_back(make_func(sirius::function_id::mul, std::move(args), bigint_t));  // non-null
-    }
-    {
-      std::vector<sirius::ast::case_expr::when_then> cases;
-      cases.push_back(sirius::ast::case_expr::when_then{
-        make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(500)),
-        make_ref_typed(0, int_t)});
-      exprs.push_back(std::make_unique<ast_node>(
-        sirius::ast::case_expr{std::move(cases), make_null_const(int_t), int_t}));  // nullable
-    }
-    exprs.push_back(
-      make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref_typed(0, int_t)));  // non-null
-    {
-      std::vector<std::unique_ptr<ast_node>> args;
-      args.push_back(make_ref_typed(2, dbl_t));
-      args.push_back(make_double_const(0.5));
-      exprs.push_back(make_func(sirius::function_id::mul, std::move(args), dbl_t));  // non-null
-    }
+    col1_vals[i] = static_cast<std::int64_t>(i) - 2000;
+    col2_vals[i] = static_cast<double>(i) * 0.25;
+    col3_vals[i] = static_cast<__int128_t>(i) * 1'000'000'000'000LL - 50'000;
+  }
+  auto const col0_nulls = static_cast<cudf::size_type>(std::ranges::count(col0_valids, false));
+  auto col0             = make_bulk_column<std::int32_t>(
+    cudf::data_type{cudf::type_id::INT32}, col0_vals, col0_valids, stream, mr);
+  auto col1 = make_bulk_column<std::int64_t>(
+    cudf::data_type{cudf::type_id::INT64}, col1_vals, {}, stream, mr);
+  auto col2 =
+    make_bulk_column<double>(cudf::data_type{cudf::type_id::FLOAT64}, col2_vals, {}, stream, mr);
+  auto col3 = make_bulk_column<__int128_t>(
+    cudf::data_type{cudf::type_id::DECIMAL128, -2}, col3_vals, {}, stream, mr);
+  cudf::table_view tv{{col0->view(), col1->view(), col2->view(), col3->view()}};
 
-    exp_executor mat_exec(
-      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
-    exp_executor jit_exec(
-      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
-    auto mat_out = mat_exec.evaluate(tv);
-    auto jit_out = jit_exec.evaluate(tv);
-    expect_tables_equal(jit_out->view(), mat_out->view());
-    CHECK(jit_out->view().column(1).null_count() == 0);
-    CHECK(jit_out->view().column(3).null_count() == 0);
-    CHECK(jit_out->view().column(0).null_count() == (n_rows + 10) / 11);
+  // CASE WHEN col1 <cmp> -5000 THEN col1 ELSE NULL END: a nullable output whose rows are all
+  // valid (gt) or all NULL (lt), since every col1 value is above -5000.
+  auto const bigint_or_null = [&](sirius::comparison_type cmp) {
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back(sirius::ast::case_expr::when_then{
+      make_cmp(cmp, make_ref_typed(1, bigint_t), make_bigint_const(-5000)),
+      make_ref_typed(1, bigint_t)});
+    return std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_null_const(bigint_t), bigint_t});
+  };
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_int_const(1));
+    exprs.push_back(make_func(sirius::function_id::add, std::move(args), int_t));  // nullable
+  }
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(1, bigint_t));
+    args.push_back(make_bigint_const(2));
+    exprs.push_back(make_func(sirius::function_id::mul, std::move(args), bigint_t));  // non-null
+  }
+  {
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back(sirius::ast::case_expr::when_then{
+      make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(500)),
+      make_ref_typed(0, int_t)});
+    exprs.push_back(std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_null_const(int_t), int_t}));  // nullable
+  }
+  exprs.push_back(
+    make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref_typed(0, int_t)));  // non-null
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(2, dbl_t));
+    args.push_back(make_double_const(0.5));
+    exprs.push_back(make_func(sirius::function_id::mul, std::move(args), dbl_t));  // non-null
+  }
+  exprs.push_back(bigint_or_null(sirius::comparison_type::gt));
+  exprs.push_back(bigint_or_null(sirius::comparison_type::lt));
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(3, dec38_2));
+    args.push_back(make_dec128_const(125, 38, 2));
+    exprs.push_back(make_func(sirius::function_id::add, std::move(args), dec38_2));  // non-null
+  }
+  {
+    std::vector<sirius::ast::case_expr::when_then> cases;
+    cases.push_back(sirius::ast::case_expr::when_then{
+      make_cmp(sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(500)),
+      make_ref_typed(3, dec38_2)});
+    exprs.push_back(std::make_unique<ast_node>(
+      sirius::ast::case_expr{std::move(cases), make_null_const(dec38_2), dec38_2}));  // nullable
+  }
+  exprs.push_back(make_cmp(
+    sirius::comparison_type::gt, make_ref_typed(0, int_t), make_int_const(500)));  // nullable
+
+  exp_executor mat_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::MATERIALIZE});
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+  auto mat_out = mat_exec.evaluate(tv);
+  auto jit_out = jit_exec.evaluate(tv);
+  expect_tables_equal(jit_out->view(), mat_out->view());
+  CHECK(jit_out->view().column(0).null_count() == col0_nulls);
+  CHECK(jit_out->view().column(1).null_count() == 0);
+  CHECK(jit_out->view().column(3).null_count() == 0);
+  CHECK(jit_out->view().column(5).null_count() == 0);
+  CHECK(jit_out->view().column(6).null_count() == n_rows);
+  CHECK(jit_out->view().column(7).null_count() == 0);
+  CHECK(jit_out->view().column(9).null_count() == col0_nulls);
+}
+
+TEST_CASE("nvrtc_jit - ProjectSink raises an overflow exactly when a row of the batch overflows",
+          "[expression_evaluator][nvrtc_jit][project_tiles]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const int_t = logical_type::make(type_id::INTEGER);
+  // 1025 and 2500 rows end in a tile whose items past the batch evaluate the last row again.
+  auto const n_rows = GENERATE(as<cudf::size_type>{}, 1, 33, 1024, 1025, 2500);
+  CAPTURE(n_rows);
+
+  duckdb::vector<std::unique_ptr<ast_node>> exprs;
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, int_t));
+    args.push_back(make_int_const(1));
+    exprs.push_back(make_func(sirius::function_id::add, std::move(args), int_t));
+  }
+  exp_executor jit_exec(
+    exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+
+  auto const int_max  = std::numeric_limits<std::int32_t>::max();
+  auto const evaluate = [&](std::vector<std::int32_t> const& vals,
+                            std::vector<bool> const& valids) {
+    auto col = make_bulk_column<std::int32_t>(
+      cudf::data_type{cudf::type_id::INT32}, vals, valids, stream, mr);
+    return jit_exec.evaluate(cudf::table_view{{col->view()}});
+  };
+
+  SECTION("the first row overflows")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    vals.front() = int_max;
+    REQUIRE_THROWS_AS(evaluate(vals, {}), sirius::invalid_input_exception);
+  }
+  SECTION("the last row overflows")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    vals.back() = int_max;
+    REQUIRE_THROWS_AS(evaluate(vals, {}), sirius::invalid_input_exception);
+  }
+  SECTION("a NULL last row whose payload would overflow raises nothing")
+  {
+    std::vector<std::int32_t> vals(n_rows, 0);
+    std::vector<bool> valids(n_rows, true);
+    vals.back()    = int_max;
+    valids.back()  = false;
+    auto const out = evaluate(vals, valids);
+    CHECK(out->view().column(0).null_count() == 1);
+    CHECK(copy_valids_to_host(out->view().column(0)) == valids);
+  }
+  SECTION("overflowing rows of the column outside a sliced batch raise nothing")
+  {
+    // The batch is a slice with a full tile of overflowing rows after it, where an item past the
+    // end of the batch would land if it read the row at its own position.
+    constexpr cudf::size_type rows_before = 7;
+    constexpr cudf::size_type rows_after  = 1024;
+    std::vector<std::int32_t> vals(rows_before + n_rows + rows_after, int_max);
+    std::fill_n(vals.begin() + rows_before, n_rows, 0);
+    auto col =
+      make_bulk_column<std::int32_t>(cudf::data_type{cudf::type_id::INT32}, vals, {}, stream, mr);
+    auto const batch = cudf::slice(col->view(), {rows_before, rows_before + n_rows}, stream)[0];
+    auto const out   = jit_exec.evaluate(cudf::table_view{{batch}});
+    CHECK(copy_column_to_host<std::int32_t>(out->view().column(0)) ==
+          std::vector<std::int32_t>(n_rows, 1));
   }
 }
 
@@ -8653,6 +9545,1010 @@ TEST_CASE(
     bool const expected = (i % 9 == 0) || (i % 9 == 6);
     if ((hit25[i] != 0) != expected) { FAIL("row " << i << " SWAR 25-byte literal mismatch"); }
   }
+}
+
+TEST_CASE("nvrtc_jit - integer arithmetic under TRY is exact up to the edges of every integer type",
+          "[expression_evaluator][nvrtc_jit][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  using sirius::function_id;
+  // The exact result of each operation, or nothing where DuckDB raises an error or returns NULL.
+  struct exact {
+    static std::optional<__int128_t> apply(function_id fid,
+                                           __int128_t a,
+                                           __int128_t b,
+                                           __int128_t lowest)
+    {
+      __int128_t result = 0;
+      switch (fid) {
+        case function_id::add: return a + b;
+        case function_id::sub: return a - b;
+        case function_id::mul:
+          if (__builtin_mul_overflow(a, b, &result)) { return std::nullopt; }
+          return result;
+        case function_id::div:
+          if (b == 0) { return std::nullopt; }
+          return a / b;
+        case function_id::mod:
+          // DuckDB raises for the lowest value modulo -1 as it does for their quotient.
+          if (b == 0 || (a == lowest && b == -1)) { return std::nullopt; }
+          return a % b;
+        case function_id::negate: return -a;
+        default: return a < 0 ? -a : a;
+      }
+    }
+  };
+
+  auto const check = [&]<typename T>(cudf::type_id carrier, type_id sql_type) {
+    CAPTURE(cudf::type_to_name(cudf::data_type{carrier}));
+    using limits            = std::numeric_limits<T>;
+    __int128_t const lowest = limits::min();
+    __int128_t const max    = limits::max();
+    // root * root is 2^bits, and for a signed type (root / 2) * root is one past the maximum while
+    // its negation is the lowest value.
+    __int128_t const root = __int128_t{1} << (sizeof(T) * 4);
+    std::vector<__int128_t> edges;
+    for (__int128_t const e : {__int128_t{0},
+                               __int128_t{1},
+                               __int128_t{2},
+                               __int128_t{3},
+                               root / 2 - 1,
+                               root / 2,
+                               root / 2 + 1,
+                               root - 1,
+                               root,
+                               root + 1,
+                               max / 2,
+                               max / 2 + 1,
+                               max - 1,
+                               max}) {
+      if (e <= max) { edges.push_back(e); }
+      if (limits::is_signed && e != 0) { edges.push_back(-e); }
+    }
+    if (limits::is_signed) { edges.push_back(lowest); }
+
+    std::vector<T> lhs;
+    std::vector<T> rhs;
+    for (__int128_t const a : edges) {
+      for (__int128_t const b : edges) {
+        lhs.push_back(static_cast<T>(a));
+        rhs.push_back(static_cast<T>(b));
+      }
+    }
+    auto col_a = make_bulk_column<T>(cudf::data_type{carrier}, lhs, {}, stream, mr);
+    auto col_b = make_bulk_column<T>(cudf::data_type{carrier}, rhs, {}, stream, mr);
+    cudf::table_view const tv{{col_a->view(), col_b->view()}};
+
+    auto const type = logical_type::make(sql_type);
+    std::vector<function_id> operations{
+      function_id::add, function_id::sub, function_id::mul, function_id::div, function_id::mod};
+    if (limits::is_signed) {
+      operations.push_back(function_id::negate);
+      operations.push_back(function_id::abs);
+    }
+    duckdb::vector<std::unique_ptr<ast_node>> exprs;
+    for (function_id const fid : operations) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, type));
+      if (fid != function_id::negate && fid != function_id::abs) {
+        args.push_back(make_ref_typed(1, type));
+      }
+      exprs.push_back(
+        make_unary(sirius::ast::unary_op::kind::op_try, make_func(fid, std::move(args), type)));
+    }
+    exp_executor exec(
+      exprs, mr, stream, sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT});
+    auto const out = exec.evaluate(tv);
+
+    for (std::size_t op = 0; op < operations.size(); ++op) {
+      CAPTURE(static_cast<int>(operations[op]));
+      auto const column = out->view().column(static_cast<cudf::size_type>(op));
+      auto const valids = copy_valids_to_host(column);
+      auto const values = copy_column_to_host<T>(column);
+      for (std::size_t row = 0; row < lhs.size(); ++row) {
+        auto const expected = exact::apply(operations[op], lhs[row], rhs[row], lowest);
+        bool const fits     = expected && *expected >= lowest && *expected <= max;
+        if (valids[row] != fits || (fits && values[row] != static_cast<T>(*expected))) {
+          FAIL("operation " << static_cast<int>(operations[op]) << " on row " << row << ": lhs "
+                            << static_cast<long double>(lhs[row]) << ", rhs "
+                            << static_cast<long double>(rhs[row]) << ", valid " << valids[row]
+                            << ", expected valid " << fits);
+        }
+      }
+    }
+  };
+  check.template operator()<std::int8_t>(cudf::type_id::INT8, type_id::TINYINT);
+  check.template operator()<std::int16_t>(cudf::type_id::INT16, type_id::SMALLINT);
+  check.template operator()<std::int32_t>(cudf::type_id::INT32, type_id::INTEGER);
+  check.template operator()<std::int64_t>(cudf::type_id::INT64, type_id::BIGINT);
+  check.template operator()<std::uint8_t>(cudf::type_id::UINT8, type_id::UTINYINT);
+  check.template operator()<std::uint16_t>(cudf::type_id::UINT16, type_id::USMALLINT);
+  check.template operator()<std::uint32_t>(cudf::type_id::UINT32, type_id::UINTEGER);
+  check.template operator()<std::uint64_t>(cudf::type_id::UINT64, type_id::UBIGINT);
+}
+
+TEST_CASE("nvrtc_jit - arithmetic and casts are exact up to the limits of their types",
+          "[expression_evaluator][nvrtc_jit][decimal][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  using sirius::function_id;
+  using int128     = __int128_t;
+  auto const nvrtc = sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT};
+  auto const pow10 = [](int exponent) {
+    int128 value = 1;
+    for (int i = 0; i < exponent; ++i) {
+      value *= 10;
+    }
+    return value;
+  };
+  // A SQL type together with the cuDF column type that carries it. `max` and `lowest` are the
+  // limits of the SQL type: a DECIMAL holds fewer than 10^precision in magnitude, which is less
+  // than its carrier holds, and DuckDB raises for a result outside it.
+  struct carried {
+    logical_type sql;
+    cudf::data_type column;
+    int scale;
+    int precision;  // 0 for an integer type
+
+    [[nodiscard]] int bits() const { return static_cast<int>(cudf::size_of(column)) * 8; }
+    [[nodiscard]] bool is_signed() const { return !cudf::is_unsigned(column); }
+    [[nodiscard]] int128 max() const
+    {
+      if (precision > 0) {
+        int128 limit = 1;
+        for (int i = 0; i < precision; ++i) {
+          limit *= 10;
+        }
+        return limit - 1;
+      }
+      if (!is_signed()) { return (int128{1} << bits()) - 1; }
+      return ((int128{1} << (bits() - 2)) - 1) * 2 + 1;
+    }
+    [[nodiscard]] int128 lowest() const
+    {
+      if (precision > 0) { return -max(); }
+      return is_signed() ? -(int128{1} << (bits() - 2)) * 2 : 0;
+    }
+    [[nodiscard]] bool holds(int128 v) const { return v >= lowest() && v <= max(); }
+  };
+  auto const decimal = [](int precision, int scale) {
+    auto const id = precision <= 9    ? cudf::type_id::DECIMAL32
+                    : precision <= 18 ? cudf::type_id::DECIMAL64
+                                      : cudf::type_id::DECIMAL128;
+    return carried{
+      logical_type::make_decimal(precision, scale), cudf::data_type{id, -scale}, scale, precision};
+  };
+  auto const integer = [](type_id sql, cudf::type_id column) {
+    return carried{logical_type::make(sql), cudf::data_type{column}, 0, 0};
+  };
+  auto const upload = [&](carried const& type, std::vector<int128> const& values) {
+    auto const as = [&]<typename T>() {
+      std::vector<T> narrowed(values.begin(), values.end());
+      return make_bulk_column<T>(type.column, narrowed, {}, stream, mr);
+    };
+    switch (cudf::size_of(type.column)) {
+      case 1:
+        return type.is_signed() ? as.template operator()<std::int8_t>()
+                                : as.template operator()<std::uint8_t>();
+      case 2:
+        return type.is_signed() ? as.template operator()<std::int16_t>()
+                                : as.template operator()<std::uint16_t>();
+      case 4:
+        return type.is_signed() ? as.template operator()<std::int32_t>()
+                                : as.template operator()<std::uint32_t>();
+      case 8:
+        return type.is_signed() ? as.template operator()<std::int64_t>()
+                                : as.template operator()<std::uint64_t>();
+      default: return as.template operator()<int128>();
+    }
+  };
+  auto const download = [](cudf::column_view const& column) {
+    auto const as = [&]<typename T>() {
+      auto const host = copy_column_to_host<T>(column);
+      return std::vector<int128>(host.begin(), host.end());
+    };
+    switch (cudf::size_of(column.type())) {
+      case 2: return as.template operator()<std::int16_t>();
+      case 4: return as.template operator()<std::int32_t>();
+      case 8: return as.template operator()<std::int64_t>();
+      default: return as.template operator()<int128>();
+    }
+  };
+  // Evaluates @p expr, which is NULL exactly where the operation under test fails, and compares
+  // every row with @p expected.
+  auto const check = [&](std::unique_ptr<ast_node> expr,
+                         cudf::table_view const& tv,
+                         std::vector<std::optional<int128>> const& expected) {
+    std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+    auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->is_direct());
+    exp_executor exec(*expr, mr, stream, nvrtc);
+    auto const out    = exec.evaluate(tv);
+    auto const valids = copy_valids_to_host(out->view().column(0));
+    auto const values = download(out->view().column(0));
+    for (std::size_t row = 0; row < expected.size(); ++row) {
+      if (valids[row] != expected[row].has_value() ||
+          (expected[row] && values[row] != *expected[row])) {
+        FAIL("row " << row << ": valid " << valids[row] << ", expected valid "
+                    << expected[row].has_value());
+      }
+    }
+  };
+  // Values at both ends of @p type, around the square root of its range, and around @p bound.
+  auto const edges = [](carried const& type, int128 bound = 0) {
+    int128 const root = int128{1} << (type.bits() / 2);
+    std::vector<int128> values;
+    for (int128 const e : {int128{0},
+                           int128{1},
+                           int128{2},
+                           int128{3},
+                           root / 2 - 1,
+                           root / 2,
+                           root / 2 + 1,
+                           root - 1,
+                           root,
+                           root + 1,
+                           type.max() / 2,
+                           type.max() / 2 + 1,
+                           type.max() - 1,
+                           type.max(),
+                           bound - 1,
+                           bound,
+                           bound + 1}) {
+      if (e < 0) { continue; }
+      if (type.holds(e)) { values.push_back(e); }
+      if (e != 0 && type.holds(-e)) { values.push_back(-e); }
+    }
+    values.push_back(type.lowest());
+    return values;
+  };
+
+  SECTION("addition, subtraction and multiplication")
+  {
+    struct shape {
+      function_id operation;
+      carried lhs;
+      carried rhs;
+      carried result;
+    };
+    std::vector<shape> shapes;
+    for (function_id const operation : {function_id::add, function_id::sub}) {
+      shapes.push_back({operation, decimal(9, 2), decimal(9, 2), decimal(9, 2)});
+      shapes.push_back({operation, decimal(9, 2), decimal(9, 2), decimal(18, 2)});
+      shapes.push_back({operation, decimal(18, 2), decimal(18, 2), decimal(18, 2)});
+      shapes.push_back({operation, decimal(9, 0), decimal(18, 2), decimal(18, 2)});
+      shapes.push_back({operation, decimal(18, 2), decimal(18, 4), decimal(18, 4)});
+      shapes.push_back({operation, decimal(38, 2), decimal(38, 2), decimal(38, 2)});
+      shapes.push_back({operation, decimal(18, 2), decimal(38, 2), decimal(38, 2)});
+      shapes.push_back({operation, decimal(38, 2), decimal(38, 4), decimal(38, 4)});
+      shapes.push_back({operation, decimal(38, 0), decimal(18, 2), decimal(38, 2)});
+      // An operand wider than the result.
+      shapes.push_back({operation, decimal(18, 2), decimal(9, 2), decimal(9, 2)});
+      shapes.push_back({operation, decimal(18, 2), decimal(38, 2), decimal(18, 2)});
+    }
+    shapes.push_back({function_id::mul, decimal(9, 0), decimal(9, 0), decimal(18, 0)});
+    shapes.push_back({function_id::mul, decimal(18, 0), decimal(18, 0), decimal(18, 0)});
+    shapes.push_back({function_id::mul, decimal(18, 0), decimal(18, 0), decimal(38, 0)});
+    shapes.push_back({function_id::mul, decimal(38, 0), decimal(18, 0), decimal(38, 0)});
+    shapes.push_back({function_id::mul, decimal(18, 0), decimal(38, 0), decimal(38, 0)});
+    shapes.push_back({function_id::mul, decimal(38, 0), decimal(9, 0), decimal(38, 0)});
+    shapes.push_back({function_id::mul, decimal(38, 0), decimal(38, 0), decimal(38, 0)});
+
+    for (std::size_t index = 0; index < shapes.size(); ++index) {
+      auto const& [operation, lhs, rhs, result] = shapes[index];
+      CAPTURE(index);
+      std::vector<int128> left;
+      std::vector<int128> right;
+      std::vector<std::optional<int128>> expected;
+      int const common     = std::max(lhs.scale, rhs.scale);
+      int128 const f_left  = pow10(common - lhs.scale);
+      int128 const f_right = pow10(common - rhs.scale);
+      for (int128 const a : edges(lhs)) {
+        for (int128 const b : edges(rhs)) {
+          left.push_back(a);
+          right.push_back(b);
+          int128 exact  = 0;
+          bool overflow = false;
+          if (operation == function_id::mul) {
+            overflow = __builtin_mul_overflow(a, b, &exact);
+          } else {
+            int128 scaled_a = 0;
+            int128 scaled_b = 0;
+            overflow =
+              __builtin_mul_overflow(a, f_left, &scaled_a) ||
+              __builtin_mul_overflow(b, f_right, &scaled_b) ||
+              (operation == function_id::add ? __builtin_add_overflow(scaled_a, scaled_b, &exact)
+                                             : __builtin_sub_overflow(scaled_a, scaled_b, &exact));
+          }
+          expected.push_back(!overflow && result.holds(exact) ? std::optional{exact}
+                                                              : std::nullopt);
+        }
+      }
+      auto col_l = upload(lhs, left);
+      auto col_r = upload(rhs, right);
+      cudf::table_view const tv{{col_l->view(), col_r->view()}};
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, lhs.sql));
+      args.push_back(make_ref_typed(1, rhs.sql));
+      check(make_unary(sirius::ast::unary_op::kind::op_try,
+                       make_func(operation, std::move(args), result.sql)),
+            tv,
+            expected);
+    }
+  }
+
+  SECTION("a cast to a DECIMAL fails exactly from its limit on")
+  {
+    struct shape {
+      carried source;
+      carried target;
+      int precision;
+    };
+    std::vector<shape> const shapes{
+      {decimal(9, 2), decimal(9, 4), 9},
+      {decimal(9, 0), decimal(18, 9), 18},
+      {decimal(9, 2), decimal(18, 2), 18},
+      {decimal(18, 2), decimal(9, 2), 9},
+      {decimal(18, 0), decimal(38, 20), 38},
+      {decimal(38, 0), decimal(38, 37), 38},
+      {decimal(38, 1), decimal(38, 2), 38},
+      {decimal(38, 2), decimal(18, 4), 18},
+      {integer(type_id::TINYINT, cudf::type_id::INT8), decimal(9, 7), 9},
+      {integer(type_id::SMALLINT, cudf::type_id::INT16), decimal(9, 5), 9},
+      {integer(type_id::INTEGER, cudf::type_id::INT32), decimal(9, 2), 9},
+      {integer(type_id::INTEGER, cudf::type_id::INT32), decimal(18, 9), 18},
+      {integer(type_id::BIGINT, cudf::type_id::INT64), decimal(18, 0), 18},
+      {integer(type_id::BIGINT, cudf::type_id::INT64), decimal(38, 20), 38},
+      {integer(type_id::BIGINT, cudf::type_id::INT64), decimal(9, 0), 9},
+      {integer(type_id::UINTEGER, cudf::type_id::UINT32), decimal(9, 0), 9},
+      {integer(type_id::UBIGINT, cudf::type_id::UINT64), decimal(38, 19), 38}};
+    for (std::size_t index = 0; index < shapes.size(); ++index) {
+      auto const& [source, target, precision] = shapes[index];
+      CAPTURE(index);
+      // The cast multiplies by `factor` and fails from the first source value whose product has
+      // more than `precision` digits.
+      int128 const factor = pow10(target.scale - source.scale);
+      int128 const bound  = pow10(precision) / factor;
+      auto const values   = edges(source, bound);
+      std::vector<std::optional<int128>> expected;
+      for (int128 const v : values) {
+        expected.push_back(v > -bound && v < bound ? std::optional{v * factor} : std::nullopt);
+      }
+      auto col = upload(source, values);
+      cudf::table_view const tv{{col->view()}};
+      check(make_cast(make_ref_typed(0, source.sql), target.sql, /*try_cast=*/true), tv, expected);
+    }
+  }
+
+  // The sections below run operations whose operands cannot make them overflow, at both ends of
+  // those operands, next to the nearest operation that can, at the first value that overflows.
+  auto const int32  = integer(type_id::INTEGER, cudf::type_id::INT32);
+  auto const bigint = integer(type_id::BIGINT, cudf::type_id::INT64);
+  auto const hugeint =
+    carried{logical_type::make(type_id::HUGEINT), cudf::data_type{cudf::type_id::DECIMAL128}, 0, 0};
+  auto const try_of = [](std::unique_ptr<ast_node> expr) {
+    return make_unary(sirius::ast::unary_op::kind::op_try, std::move(expr));
+  };
+  auto const binary = [](function_id operation,
+                         std::unique_ptr<ast_node> l,
+                         std::unique_ptr<ast_node> r,
+                         logical_type const& result) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(l));
+    args.push_back(std::move(r));
+    return make_func(operation, std::move(args), result);
+  };
+  auto const widened = [&](std::uint32_t column) {
+    return make_cast(make_ref_typed(column, int32.sql), bigint.sql, /*try_cast=*/false);
+  };
+  auto const in_type = [](carried const& type, int128 exact) {
+    return type.holds(exact) ? std::optional{exact} : std::nullopt;
+  };
+
+  SECTION("integers widened by a cast multiply exactly")
+  {
+    std::vector<int128> left;
+    std::vector<int128> right;
+    std::vector<std::optional<int128>> expected;
+    for (int128 const a : edges(int32)) {
+      for (int128 const b : edges(int32)) {
+        left.push_back(a);
+        right.push_back(b);
+        expected.emplace_back(a * b);
+      }
+    }
+    auto col_l = upload(int32, left);
+    auto col_r = upload(int32, right);
+    cudf::table_view const tv{{col_l->view(), col_r->view()}};
+    check(try_of(binary(function_id::mul, widened(0), widened(1), bigint.sql)), tv, expected);
+  }
+
+  SECTION("division and modulo by a literal")
+  {
+    auto const values = edges(int32);
+    auto col          = upload(int32, values);
+    cudf::table_view const tv{{col->view()}};
+    for (std::int32_t const divisor : {3, -3, 7, 1, -1}) {
+      CAPTURE(divisor);
+      for (function_id const operation : {function_id::int_div, function_id::mod}) {
+        std::vector<std::optional<int128>> expected;
+        for (int128 const v : values) {
+          // The lowest value by -1 raises for the quotient and for the remainder.
+          if (v == int32.lowest() && divisor == -1) {
+            expected.emplace_back(std::nullopt);
+          } else {
+            expected.emplace_back(operation == function_id::mod ? v % divisor : v / divisor);
+          }
+        }
+        check(try_of(binary(
+                operation, make_ref_typed(0, int32.sql), make_int_const(divisor), int32.sql)),
+              tv,
+              expected);
+      }
+    }
+  }
+
+  SECTION("a BIGINT column carried in 16 bits")
+  {
+    auto const carrier = carried{bigint.sql, cudf::data_type{cudf::type_id::INT16}, 0, 0};
+    auto const values  = edges(carrier);
+    auto col           = upload(carrier, values);
+    cudf::table_view const tv{{col->view()}};
+    auto const column = [&] { return make_ref_typed(0, bigint.sql); };
+    auto const run = [&](std::unique_ptr<ast_node> expr, auto const& exact, carried const& type) {
+      std::vector<std::optional<int128>> expected;
+      for (int128 const v : values) {
+        expected.push_back(in_type(type, exact(v)));
+      }
+      check(try_of(std::move(expr)), tv, expected);
+    };
+    auto const smallint = integer(type_id::SMALLINT, cudf::type_id::INT16);
+    run(
+      binary(function_id::mul, column(), column(), bigint.sql),
+      [](int128 v) { return v * v; },
+      bigint);
+    {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(column());
+      run(
+        make_func(function_id::abs, std::move(args), bigint.sql),
+        [](int128 v) { return v < 0 ? -v : v; },
+        bigint);
+    }
+    {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(column());
+      run(
+        make_func(function_id::negate, std::move(args), bigint.sql),
+        [](int128 v) { return -v; },
+        bigint);
+    }
+    run(make_cast(column(), int32.sql, false), [](int128 v) { return v; }, int32);
+    run(make_cast(column(), smallint.sql, false), [](int128 v) { return v; }, smallint);
+    // One more than the largest 16-bit value does not fit SMALLINT: this addition keeps its check.
+    run(
+      make_cast(
+        binary(function_id::add, column(), make_bigint_const(1), bigint.sql), smallint.sql, false),
+      [](int128 v) { return v + 1; },
+      smallint);
+  }
+
+  SECTION("a DECIMAL difference and its product are exact up to the precision of their types")
+  {
+    auto const price    = decimal(15, 2);
+    auto const factor   = decimal(16, 2);
+    auto const revenue  = decimal(18, 4);
+    auto const one      = [&] { return make_dec64_const(100, 16, 2); };
+    auto const discount = [&](std::uint32_t column) {
+      return binary(function_id::sub, one(), make_ref_typed(column, price.sql), factor.sql);
+    };
+    std::vector<int128> prices;
+    std::vector<int128> discounts;
+    for (int128 const a : edges(price, pow10(9))) {
+      for (int128 const b : edges(price, 100 - pow10(9))) {
+        prices.push_back(a);
+        discounts.push_back(b);
+      }
+    }
+    // 999999999 * 1000000001 is the largest 18-digit value; 10^9 * 10^9 has 19 digits and fits
+    // the 64-bit carrier.
+    prices.push_back(999999999);
+    discounts.push_back(100 - 1000000001);
+    auto col_p = upload(price, prices);
+    auto col_d = upload(price, discounts);
+    cudf::table_view const tv{{col_p->view(), col_d->view()}};
+
+    std::vector<std::optional<int128>> differences;
+    std::vector<std::optional<int128>> products;
+    for (std::size_t row = 0; row < prices.size(); ++row) {
+      differences.emplace_back(100 - discounts[row]);
+      int128 exact        = 0;
+      bool const overflow = __builtin_mul_overflow(prices[row], 100 - discounts[row], &exact);
+      products.push_back(overflow ? std::nullopt : in_type(revenue, exact));
+    }
+    REQUIRE(products.back() == std::optional{pow10(18) - 1});
+    check(try_of(discount(1)), tv, differences);
+    check(try_of(binary(function_id::mul, make_ref_typed(0, price.sql), discount(1), revenue.sql)),
+          tv,
+          products);
+  }
+
+  SECTION("a product by a literal overflows from the first literal that leaves the precision")
+  {
+    auto const dec14_0 = decimal(14, 0);
+    auto const dec18_3 = decimal(18, 3);
+    auto const values  = edges(int32);
+    auto col           = upload(int32, values);
+    cudf::table_view const tv{{col->view()}};
+    // 2^31 * 465661287 is the last product of 18 digits, so the next literal overflows.
+    for (std::int64_t const literal : {1000LL, 465661287LL, 465661288LL, 99999999999999LL}) {
+      CAPTURE(literal);
+      std::vector<std::optional<int128>> expected;
+      for (int128 const v : values) {
+        expected.push_back(in_type(dec18_3, v * literal));
+      }
+      check(try_of(binary(function_id::mul,
+                          make_cast(make_ref_typed(0, int32.sql), dec14_0.sql, false),
+                          make_dec64_const(literal, 14, 3),
+                          dec18_3.sql)),
+            tv,
+            expected);
+    }
+  }
+
+  SECTION("a product over COALESCE or CASE overflows by the values of every arm")
+  {
+    auto const values = edges(int32);
+    std::vector<std::int32_t> payloads(values.begin(), values.end());
+    std::vector<bool> valids(values.size(), true);
+    // NULL rows keep an extreme payload under the cleared validity bit.
+    for (std::size_t row = 0; row < valids.size(); row += 3) {
+      valids[row] = false;
+    }
+    auto col_n = make_bulk_column<std::int32_t>(int32.column, payloads, valids, stream, mr);
+    auto col_v = upload(int32, values);
+    cudf::table_view const tv{{col_n->view(), col_v->view()}};
+    // 2^31 * 2^32 is the lowest BIGINT, so that product never overflows; with 2^33 every value
+    // from 2^30 on does, whichever arm it comes from.
+    for (std::int64_t const multiplier : {std::int64_t{1} << 32, std::int64_t{1} << 33}) {
+      CAPTURE(multiplier);
+      std::vector<std::optional<int128>> coalesced;
+      std::vector<std::optional<int128>> selected;
+      for (std::size_t row = 0; row < values.size(); ++row) {
+        coalesced.push_back(in_type(bigint, (valids[row] ? values[row] : 7) * multiplier));
+        // CASE WHEN c1 > 0 THEN c1 ELSE c0 END is NULL where it selects a NULL c0.
+        bool const takes_first = values[row] > 0;
+        selected.push_back(takes_first || valids[row] ? in_type(bigint, values[row] * multiplier)
+                                                      : std::nullopt);
+      }
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(widened(0));
+      children.push_back(make_bigint_const(7));
+      check(try_of(binary(function_id::mul,
+                          make_coalesce(std::move(children), bigint.sql),
+                          make_bigint_const(multiplier),
+                          bigint.sql)),
+            tv,
+            coalesced);
+
+      std::vector<sirius::ast::case_expr::when_then> cases;
+      cases.push_back(
+        {make_cmp(sirius::comparison_type::gt, make_ref_typed(1, int32.sql), make_int_const(0)),
+         widened(1)});
+      check(try_of(binary(function_id::mul,
+                          std::make_unique<ast_node>(
+                            sirius::ast::case_expr{std::move(cases), widened(0), bigint.sql}),
+                          make_bigint_const(multiplier),
+                          bigint.sql)),
+            tv,
+            selected);
+    }
+  }
+
+  SECTION("an operation that cannot overflow passes on the Overflow Poison of its operand")
+  {
+    // abs overflows for the lowest INTEGER; the cast and the product after it cannot.
+    std::vector<int128> const values{0, -5, int32.lowest(), int32.max()};
+    auto col = upload(int32, values);
+    cudf::table_view const tv{{col->view()}};
+    auto const expr = [&] {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, int32.sql));
+      return binary(
+        function_id::mul,
+        make_cast(make_func(function_id::abs, std::move(args), int32.sql), bigint.sql, false),
+        make_bigint_const(2),
+        bigint.sql);
+    };
+    check(try_of(expr()), tv, {0, 10, std::nullopt, 2 * int32.max()});
+    auto const unguarded = expr();
+    exp_executor exec(*unguarded, mr, stream, nvrtc);
+    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
+  }
+
+  SECTION("a column that holds more digits than its DECIMAL type overflows like any value")
+  {
+    // Nothing holds a column to its precision: this evaluator's DECIMAL division and the
+    // materialize path pass on what the carrier holds. The second row has 19 digits.
+    auto const dec18_2 = decimal(18, 2);
+    auto col           = upload(dec18_2, {100, 1'999'999'999'999'999'998});
+    cudf::table_view const tv{{col->view()}};
+    auto const times_500 = [&] {
+      return binary(function_id::mul,
+                    make_cast(make_ref_typed(0, dec18_2.sql), bigint.sql, false),
+                    make_bigint_const(500),
+                    bigint.sql);
+    };
+    // 20000000000000000 * 500 does not fit a BIGINT.
+    check(try_of(times_500()), tv, {500, std::nullopt});
+    auto const unguarded = times_500();
+    exp_executor exec(*unguarded, mr, stream, nvrtc);
+    REQUIRE_THROWS_AS(exec.evaluate(tv), sirius::invalid_input_exception);
+
+    // DuckDB negates the storage integer and does not look at the precision.
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, dec18_2.sql));
+    check(try_of(make_func(function_id::negate, std::move(args), dec18_2.sql)),
+          tv,
+          {-100, -1'999'999'999'999'999'998});
+  }
+
+  SECTION("a negation or absolute value passes on more digits than its type has")
+  {
+    auto const unary =
+      [](function_id operation, std::unique_ptr<ast_node> operand, logical_type const& result) {
+        std::vector<std::unique_ptr<ast_node>> args;
+        args.push_back(std::move(operand));
+        return make_func(operation, std::move(args), result);
+      };
+    for (function_id const operation : {function_id::negate, function_id::abs}) {
+      CAPTURE(static_cast<int>(operation));
+      int128 const sign = operation == function_id::negate ? -1 : 1;
+      {
+        // 1.5 * 10^38 is a HUGEINT and has one digit too many for a DECIMAL(38,0).
+        auto col = upload(hugeint, {5, 15 * pow10(37), -15 * pow10(37)});
+        cudf::table_view const tv{{col->view()}};
+        check(make_cast(unary(operation, make_ref_typed(0, hugeint.sql), hugeint.sql),
+                        logical_type::make_decimal(38, 0),
+                        /*try_cast=*/true),
+              tv,
+              {sign * 5, std::nullopt, std::nullopt});
+      }
+      {
+        // 9999999999999999.99 / 0.50 has 19 digits in a DECIMAL(18,2), which the division does
+        // not check, and its integer part times 500 does not fit a BIGINT.
+        auto const dec18_2 = decimal(18, 2);
+        auto col           = upload(dec18_2, {100, dec18_2.max()});
+        cudf::table_view const tv{{col->view()}};
+        auto quotient = binary(function_id::div,
+                               make_ref_typed(0, dec18_2.sql),
+                               make_dec64_const(50, 18, 2),
+                               dec18_2.sql);
+        check(try_of(binary(
+                function_id::mul,
+                make_cast(unary(operation, std::move(quotient), dec18_2.sql), bigint.sql, false),
+                make_bigint_const(500),
+                bigint.sql)),
+              tv,
+              {sign * 1000, std::nullopt});
+      }
+    }
+  }
+
+  SECTION("HUGEINT arithmetic raises exactly where DuckDB does")
+  {
+    int128 const max    = hugeint.max();
+    int128 const lowest = hugeint.lowest();
+    int128 const pow126 = int128{1} << 126;
+    int128 const pow64  = int128{1} << 64;
+    int128 const pow63  = int128{1} << 63;
+    std::vector<std::array<int128, 2>> const rows{{6 * pow10(37), 6 * pow10(37)},
+                                                  {pow10(19), pow10(19)},
+                                                  {3 * pow10(19), 3 * pow10(19)},
+                                                  {max, 0},
+                                                  {max, 1},
+                                                  {max, -1},
+                                                  {-max, 1},
+                                                  {-max, -1},
+                                                  {lowest, 0},
+                                                  {0, lowest},
+                                                  {lowest, 1},
+                                                  {1, lowest},
+                                                  {lowest, -1},
+                                                  {-1, lowest},
+                                                  {lowest, 2},
+                                                  {lowest, lowest},
+                                                  {pow126, 2},
+                                                  {pow126 - 1, 2},
+                                                  {-pow126, 2},
+                                                  {2, -pow126},
+                                                  {-pow126, -2},
+                                                  {pow63, pow64},
+                                                  {-pow63, pow64},
+                                                  {pow64, pow64},
+                                                  {pow64 - 1, pow63},
+                                                  {-(pow64 - 1), pow63}};
+    std::vector<int128> left;
+    std::vector<int128> right;
+    for (auto const& row : rows) {
+      left.push_back(row[0]);
+      right.push_back(row[1]);
+    }
+    auto col_l = upload(hugeint, left);
+    auto col_r = upload(hugeint, right);
+    cudf::table_view const tv{{col_l->view(), col_r->view()}};
+    // DuckDB returns every sum and difference its 128 bits hold (`Hugeint::TryAddInPlace`,
+    // `Hugeint::TrySubtractInPlace`). It multiplies magnitudes (`Hugeint::TryMultiply`), so the
+    // lowest value, of magnitude 2^127, is a product only of itself by 1.
+    auto const duckdb_returns = [&](function_id operation, int128 l, int128 r) {
+      int128 exact = 0;
+      if (operation == function_id::add) {
+        return __builtin_add_overflow(l, r, &exact) ? std::nullopt : std::optional{exact};
+      }
+      if (operation == function_id::sub) {
+        return __builtin_sub_overflow(l, r, &exact) ? std::nullopt : std::optional{exact};
+      }
+      bool const overflow = __builtin_mul_overflow(l, r, &exact);
+      return overflow || (exact == lowest && l != lowest && r != lowest) ? std::nullopt
+                                                                         : std::optional{exact};
+    };
+    for (function_id const operation : {function_id::add, function_id::sub, function_id::mul}) {
+      CAPTURE(static_cast<int>(operation));
+      std::vector<std::optional<int128>> expected;
+      for (auto const& row : rows) {
+        expected.push_back(duckdb_returns(operation, row[0], row[1]));
+      }
+      check(
+        try_of(binary(
+          operation, make_ref_typed(0, hugeint.sql), make_ref_typed(1, hugeint.sql), hugeint.sql)),
+        tv,
+        expected);
+    }
+    // More than 38 digits, and the lowest value as a sum, a difference and a product.
+    REQUIRE(duckdb_returns(function_id::add, rows[0][0], rows[0][1]) == 12 * pow10(37));
+    REQUIRE(duckdb_returns(function_id::mul, rows[1][0], rows[1][1]) == pow10(38));
+    REQUIRE(duckdb_returns(function_id::add, -max, -1) == lowest);
+    REQUIRE(duckdb_returns(function_id::sub, -max, 1) == lowest);
+    REQUIRE(duckdb_returns(function_id::mul, lowest, 1) == lowest);
+    REQUIRE_FALSE(duckdb_returns(function_id::mul, -pow126, 2).has_value());
+  }
+
+  SECTION("without TRY the first value past a limit raises and the last one inside returns")
+  {
+    auto const raises_only_past = [&](std::unique_ptr<ast_node> expr,
+                                      carried const& type,
+                                      std::array<int128, 2> inside,
+                                      std::array<int128, 2> outside) {
+      exp_executor exec(*expr, mr, stream, nvrtc);
+      // The first row is 1 and 1, which raise under no operation, a modulo included.
+      auto const evaluate = [&](std::array<int128, 2> row) {
+        auto col_l = upload(type, {1, row[0]});
+        auto col_r = upload(type, {1, row[1]});
+        return exec.evaluate(cudf::table_view{{col_l->view(), col_r->view()}});
+      };
+      CHECK_NOTHROW(evaluate(inside));
+      CHECK_THROWS_AS(evaluate(outside), sirius::invalid_input_exception);
+    };
+    auto const columns = [&](function_id operation, carried const& type, carried const& result) {
+      return binary(
+        operation, make_ref_typed(0, type.sql), make_ref_typed(1, type.sql), result.sql);
+    };
+    // A difference of 10^38 fits the 128-bit carrier and not the 38 digits.
+    auto const dec38 = decimal(38, 2);
+    raises_only_past(
+      columns(function_id::sub, dec38, dec38), dec38, {dec38.max(), 0}, {dec38.max(), -1});
+    raises_only_past(
+      columns(function_id::add, dec38, dec38), dec38, {dec38.lowest(), 0}, {dec38.lowest(), -1});
+    auto const dec18 = decimal(18, 0);
+    raises_only_past(columns(function_id::add, dec18, dec18),
+                     dec18,
+                     {5 * pow10(17), 5 * pow10(17) - 1},
+                     {5 * pow10(17), 5 * pow10(17)});
+    raises_only_past(columns(function_id::mul, dec18, dec18),
+                     dec18,
+                     {999999999, 1000000001},
+                     {pow10(9), pow10(9)});
+    raises_only_past(
+      columns(function_id::mod, int32, int32), int32, {int32.lowest(), 1}, {int32.lowest(), -1});
+    raises_only_past(columns(function_id::mod, bigint, bigint),
+                     bigint,
+                     {bigint.lowest(), 1},
+                     {bigint.lowest(), -1});
+    raises_only_past(columns(function_id::mod, hugeint, hugeint),
+                     hugeint,
+                     {hugeint.lowest(), 1},
+                     {hugeint.lowest(), -1});
+    raises_only_past(columns(function_id::mod, hugeint, hugeint),
+                     hugeint,
+                     {hugeint.lowest() + 1, -1},
+                     {hugeint.lowest(), -1});
+    // A HUGEINT sum and difference raise only past the 128-bit carrier, far beyond 38 digits.
+    raises_only_past(
+      columns(function_id::add, hugeint, hugeint), hugeint, {hugeint.max(), 0}, {hugeint.max(), 1});
+    raises_only_past(columns(function_id::add, hugeint, hugeint),
+                     hugeint,
+                     {-hugeint.max(), -1},
+                     {hugeint.lowest(), -1});
+    raises_only_past(columns(function_id::sub, hugeint, hugeint),
+                     hugeint,
+                     {-hugeint.max(), 1},
+                     {hugeint.lowest(), 1});
+    raises_only_past(columns(function_id::sub, hugeint, hugeint),
+                     hugeint,
+                     {hugeint.max(), 0},
+                     {hugeint.max(), -1});
+    // A HUGEINT product raises from a magnitude of 2^127 on, unless an operand has it.
+    int128 const pow126 = int128{1} << 126;
+    raises_only_past(
+      columns(function_id::mul, hugeint, hugeint), hugeint, {pow126 - 1, 2}, {pow126, 2});
+    raises_only_past(
+      columns(function_id::mul, hugeint, hugeint), hugeint, {hugeint.lowest(), 1}, {-pow126, 2});
+    raises_only_past(
+      columns(function_id::mul, hugeint, hugeint), hugeint, {-hugeint.max(), 1}, {-pow126, 2});
+  }
+}
+
+TEST_CASE("nvrtc_jit - a zero divisor raises on the rows where the division is evaluated",
+          "[expression_evaluator][nvrtc_jit][sql_errors]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  using sirius::function_id;
+  using sirius::ast::unary_op;
+  auto const nvrtc = sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT};
+  enum column : std::uint32_t { dividend, divisor, zero, dividend_null_at_zero };
+
+  // `dividend` by `divisor` is 20 by 4, 20 by 0, NULL by 0, 20 by NULL (a NULL is loaded with the
+  // payload 0) and 15 by 2. `dividend_null_at_zero` is also NULL in the second row, which leaves no
+  // zero divisor on a row whose operands are both valid. `zero` holds no NULL.
+  auto const run = [&]<typename T>(
+                     char const* type_name, logical_type const& sql, cudf::data_type carrier) {
+    std::vector<T> const dividends{T(20), T(20), T(99), T(20), T(15)};
+    std::vector<T> const divisors{T(4), T(0), T(0), T(0), T(2)};
+    std::vector<T> const zeros(dividends.size(), T(0));
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+      make_bulk_column<T>(carrier, dividends, {true, true, false, true, true}, stream, mr));
+    columns.push_back(
+      make_bulk_column<T>(carrier, divisors, {true, true, true, false, true}, stream, mr));
+    columns.push_back(make_bulk_column<T>(carrier, zeros, {}, stream, mr));
+    columns.push_back(
+      make_bulk_column<T>(carrier, dividends, {true, false, false, true, true}, stream, mr));
+    std::vector<cudf::column_view> views;
+    for (auto const& col : columns) {
+      views.push_back(col->view());
+    }
+    cudf::table_view const tv{views};
+
+    auto const ref    = [&](column c) { return make_ref_typed(c, sql); };
+    auto const divide = [&](function_id operation, column left, column right) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(ref(left));
+      args.push_back(ref(right));
+      return make_func(operation, std::move(args), sql);
+    };
+    auto const project = [&](std::unique_ptr<ast_node> const& expr) {
+      std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+      auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor exec(*expr, mr, stream, nvrtc);
+      return exec.evaluate(tv);
+    };
+    auto const raises_division_by_zero = [&](auto const& evaluate) {
+      REQUIRE_THROWS_AS(evaluate(), sirius::invalid_input_exception);
+      REQUIRE_THROWS_WITH(evaluate(), Catch::Matchers::ContainsSubstring("division by zero"));
+    };
+
+    bool const floating = cudf::is_floating_point(carrier);
+    for (function_id const operation : {function_id::div, function_id::int_div, function_id::mod}) {
+      CAPTURE(type_name, sirius::to_duckdb_function_name(operation));
+      // DuckDB raises for `//` in every type, and for `/` and `%` in every type but DOUBLE and
+      // FLOAT, where they follow IEEE 754.
+      bool const raises = operation == function_id::int_div || !floating;
+      T const first     = operation == function_id::mod ? T(0) : T(5);
+      T const last      = operation == function_id::mod ? T(1) : floating ? T(7.5) : T(7);
+      auto const check  = [&](std::unique_ptr<cudf::table> const& out,
+                             std::vector<bool> const& valid) {
+        auto const col = out->view().column(0);
+        CHECK(copy_valids_to_host(col) == valid);
+        auto const values = copy_column_to_host<T>(col);
+        CHECK(values.front() == first);
+        CHECK(values.back() == last);
+        return values;
+      };
+
+      // A zero divisor decides nothing on a row where an operand is NULL.
+      check(project(divide(operation, dividend_null_at_zero, divisor)),
+            {true, false, false, false, true});
+
+      if (raises) {
+        raises_division_by_zero([&] {
+          auto const expr = divide(operation, dividend, divisor);
+          exp_executor exec(*expr, mr, stream, nvrtc);
+          return exec.evaluate(tv);
+        });
+      } else {
+        auto const values =
+          check(project(divide(operation, dividend, divisor)), {true, true, false, false, true});
+        CHECK((operation == function_id::div ? std::isinf(static_cast<double>(values[1]))
+                                             : std::isnan(static_cast<double>(values[1]))));
+      }
+
+      // TRY turns the raising row, and no other, into NULL.
+      check(project(make_unary(unary_op::kind::op_try, divide(operation, dividend, divisor))),
+            {true, !raises, false, false, true});
+
+      if (!raises) { continue; }
+
+      // DuckDB runs the later operand of a filter's AND only where the earlier one is TRUE, and a
+      // CASE branch only on the rows that select it, so a guard on the divisor keeps the division
+      // from the rows where it would raise. The same operands in the other order raise.
+      auto const divisor_is_not_zero = [&] {
+        return make_cmp(sirius::comparison_type::not_equal, ref(divisor), ref(zero));
+      };
+      auto const quotient_is_not_null = [&] {
+        return make_unary(unary_op::kind::op_is_not_null, divide(operation, dividend, divisor));
+      };
+      {
+        std::vector<std::unique_ptr<ast_node>> operands;
+        operands.push_back(divisor_is_not_zero());
+        operands.push_back(quotient_is_not_null());
+        auto const guarded = make_conj(sirius::ast::conjunction::kind::op_and, std::move(operands));
+        exp_executor exec(*guarded, mr, stream, nvrtc);
+        std::unique_ptr<cudf::table> kept;
+        REQUIRE_NOTHROW(kept = exec.select(tv));
+        CHECK(kept->num_rows() == 2);
+      }
+      raises_division_by_zero([&] {
+        std::vector<std::unique_ptr<ast_node>> operands;
+        operands.push_back(quotient_is_not_null());
+        operands.push_back(divisor_is_not_zero());
+        auto const unguarded =
+          make_conj(sirius::ast::conjunction::kind::op_and, std::move(operands));
+        exp_executor exec(*unguarded, mr, stream, nvrtc);
+        return exec.select(tv);
+      });
+      {
+        std::vector<sirius::ast::case_expr::when_then> cases;
+        cases.push_back(sirius::ast::case_expr::when_then{divisor_is_not_zero(),
+                                                          divide(operation, dividend, divisor)});
+        std::unique_ptr<ast_node> const guarded =
+          std::make_unique<ast_node>(sirius::ast::case_expr{std::move(cases), ref(zero), sql});
+        auto const values = check(project(guarded), {true, true, true, true, true});
+        CHECK(values[1] == T(0));
+        CHECK(values[2] == T(0));
+        CHECK(values[3] == T(0));
+      }
+    }
+  };
+
+  run.template operator()<std::int32_t>(
+    "INTEGER", logical_type::make(type_id::INTEGER), cudf::data_type{cudf::type_id::INT32});
+  run.template operator()<std::uint64_t>(
+    "UBIGINT", logical_type::make(type_id::UBIGINT), cudf::data_type{cudf::type_id::UINT64});
+  run.template operator()<std::int64_t>("DECIMAL(18,0)",
+                                        logical_type::make_decimal(18, 0),
+                                        cudf::data_type{cudf::type_id::DECIMAL64, 0});
+  run.template operator()<__int128_t>("DECIMAL(38,0)",
+                                      logical_type::make_decimal(38, 0),
+                                      cudf::data_type{cudf::type_id::DECIMAL128, 0});
+  run.template operator()<double>(
+    "DOUBLE", logical_type::make(type_id::DOUBLE), cudf::data_type{cudf::type_id::FLOAT64});
+  run.template operator()<float>(
+    "FLOAT", logical_type::make(type_id::FLOAT), cudf::data_type{cudf::type_id::FLOAT32});
 }
 
 TEST_CASE("nvrtc_jit - UINT64 add carry, sub underflow, and mul overflow at the 2^64 boundary",
@@ -8823,6 +10719,354 @@ TEST_CASE(
         std::vector<std::int64_t>{-2, 0, 1, -1, 0, ts_inf, -ts_inf, 0, 0, 0, 0});
   CHECK(copy_column_to_host<std::int64_t>(out->view().column(3)) ==
         std::vector<std::int64_t>{-1500, 500, 500, -500, 0, ts_inf, -ts_inf, 0, 0, 0, 0});
+}
+
+TEST_CASE("nvrtc_jit - dividing by a literal power of ten equals the hardware division bit for bit",
+          "[expression_evaluator][nvrtc_jit][decimal][round]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  auto const nvrtc   = sirius::expression_query_policy{exp_strategy_enum::NVRTC_JIT};
+  auto const dbl_t   = logical_type::make(type_id::DOUBLE);
+  auto const bits_of = [](std::vector<double> const& values) {
+    std::vector<std::uint64_t> bits;
+    bits.reserve(values.size());
+    for (double const v : values) {
+      bits.push_back(v != v ? ~std::uint64_t{0} : std::bit_cast<std::uint64_t>(v));
+    }
+    return bits;
+  };
+  std::mt19937_64 rng{20261117};
+
+  SECTION("CAST(DECIMAL AS DOUBLE) at every scale of every carrier")
+  {
+    // The payloads sit at both ends of the carrier, are spread over its magnitudes, and include
+    // the two representable neighbors of exact multiples of the divisor.
+    auto const payloads = [&]<typename Rep>(double divisor) {
+      std::vector<Rep> values{
+        0, 1, -1, 5, -5, std::numeric_limits<Rep>::max(), std::numeric_limits<Rep>::min()};
+      int const bits = static_cast<int>(sizeof(Rep)) * 8;
+      for (int i = 0; i < 4096; ++i) {
+        auto wide = (static_cast<unsigned __int128>(rng()) << 64) | rng();
+        values.push_back(
+          static_cast<Rep>(static_cast<__int128_t>(wide) >> (128 - bits + (i % bits))));
+        double const multiple =
+          std::ldexp(static_cast<double>(rng() >> 11), (i % 60) - 52) * divisor;
+        double const neighbor = std::nextafter(multiple, (i & 1) != 0 ? HUGE_VAL : -HUGE_VAL);
+        if (std::fabs(neighbor) < std::ldexp(1.0, bits - 1)) {
+          values.push_back(static_cast<Rep>(neighbor));
+        }
+      }
+      return values;
+    };
+    auto const check = [&]<typename Rep>(cudf::type_id carrier, int precision) {
+      for (int scale = 0; scale <= precision; ++scale) {
+        CAPTURE(precision, scale);
+        // 10^scale as `translation_context` computes the divisor it prints.
+        double divisor = 1.0;
+        for (int i = 0; i < scale; ++i) {
+          divisor *= 10.0;
+        }
+        auto const values = payloads.template operator()<Rep>(divisor);
+        auto col = make_bulk_column<Rep>(cudf::data_type{carrier, -scale}, values, {}, stream, mr);
+        cudf::table_view const tv{{col->view()}};
+        auto const expr =
+          make_cast(make_ref_typed(0, logical_type::make_decimal(precision, scale)), dbl_t, false);
+        std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+        auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+        REQUIRE(plan.has_value());
+        REQUIRE(plan->is_direct());
+        exp_executor exec(*expr, mr, stream, nvrtc);
+        auto const out = exec.evaluate(tv);
+        // The kernel's formula, not DuckDB's result: DuckDB returns the DOUBLE nearest to the exact
+        // decimal, which this quotient of two rounded values is only up to a magnitude of 2^53 of
+        // the integer and a scale of 22.
+        std::vector<double> expected;
+        expected.reserve(values.size());
+        for (Rep const v : values) {
+          expected.push_back(static_cast<double>(v) / divisor);
+        }
+        CHECK(bits_of(copy_column_to_host<double>(out->view().column(0))) == bits_of(expected));
+      }
+    };
+    check.template operator()<std::int32_t>(cudf::type_id::DECIMAL32, 9);
+    check.template operator()<std::int64_t>(cudf::type_id::DECIMAL64, 18);
+    check.template operator()<__int128_t>(cudf::type_id::DECIMAL128, 38);
+  }
+
+  SECTION("round(x, n) for every kind of precision")
+  {
+    // DuckDB's RoundOperatorPrecision.
+    auto const duckdb_round = [](double x, std::int32_t precision) {
+      if (precision < 0) {
+        double const modifier = std::pow(10.0, -static_cast<double>(precision));
+        if (std::isinf(modifier)) { return std::isfinite(x) ? 0.0 : x; }
+        double const rounded = std::round(x / modifier) * modifier;
+        return std::isfinite(rounded) ? rounded : x;
+      }
+      double const modifier = std::pow(10.0, static_cast<double>(precision));
+      double const rounded  = std::round(x * modifier) / modifier;
+      return std::isfinite(rounded) ? rounded : x;
+    };
+    // 22 is the last precision whose modifier a double holds exactly; 308 is the last finite one,
+    // at which the quotient of a small integer is subnormal; 400 has an infinite modifier.
+    for (std::int32_t const precision :
+         {0, 1, 2, 3, 7, 15, 16, 21, 22, 23, 24, 38, 300, 308, 400, -1, -2, -22, -308, -400}) {
+      CAPTURE(precision);
+      double const modifier = std::pow(10.0, std::abs(static_cast<double>(precision)));
+      std::vector<double> values{0.0,
+                                 -0.0,
+                                 0.004,
+                                 -0.004,
+                                 0.005,
+                                 -0.005,
+                                 1.0,
+                                 -1.0,
+                                 2.5,
+                                 -2.5,
+                                 1e15,
+                                 1e22,
+                                 1e300,
+                                 -1e300,
+                                 std::numeric_limits<double>::max(),
+                                 std::numeric_limits<double>::lowest(),
+                                 std::numeric_limits<double>::min(),
+                                 std::numeric_limits<double>::denorm_min(),
+                                 std::numeric_limits<double>::infinity(),
+                                 -std::numeric_limits<double>::infinity(),
+                                 std::numeric_limits<double>::quiet_NaN()};
+      for (int i = 0; i < 4096; ++i) {
+        // Any bit pattern, a value with few decimals, a neighbor of a rounding tie, and a small
+        // multiple of the modifier's reciprocal.
+        values.push_back(std::bit_cast<double>(rng()));
+        values.push_back(static_cast<double>(static_cast<std::int32_t>(rng())) / 1000.0);
+        double const tie =
+          (static_cast<double>(static_cast<std::int64_t>(rng()) >> 24) + 0.5) / modifier;
+        values.push_back(std::nextafter(tie, (i & 1) != 0 ? HUGE_VAL : -HUGE_VAL));
+        values.push_back(static_cast<double>(i - 2048) / modifier);
+      }
+      auto col =
+        make_bulk_column<double>(cudf::data_type{cudf::type_id::FLOAT64}, values, {}, stream, mr);
+      cudf::table_view const tv{{col->view()}};
+      std::vector<std::unique_ptr<ast_node>> args;
+      args.push_back(make_ref_typed(0, dbl_t));
+      args.push_back(make_int_const(precision));
+      auto const expr = make_func(sirius::function_id::round, std::move(args), dbl_t);
+      std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+      auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor exec(*expr, mr, stream, nvrtc);
+      auto const out = exec.evaluate(tv);
+      std::vector<double> expected;
+      expected.reserve(values.size());
+      for (double const v : values) {
+        expected.push_back(duckdb_round(v, precision));
+      }
+      CHECK(bits_of(copy_column_to_host<double>(out->view().column(0))) == bits_of(expected));
+    }
+  }
+}
+
+TEST_CASE("nvrtc_jit - a multiplication and an addition of its product are fused only on request",
+          "[expression_evaluator][nvrtc_jit][floating_point]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+
+  // How many rows of one result hold what the two separately rounded operations return, what only
+  // one fused multiply-add returns, and anything else.
+  struct tally {
+    std::size_t separate{0};
+    std::size_t fused{0};
+    std::size_t neither{0};
+  };
+  using tallies = std::map<std::string, tally>;
+
+  // Evaluates every expression over new columns a, b and c, where each product a * b needs more
+  // bits than the type holds and c is its rounded value. The differences of the product and c
+  // cancel to exactly 0 where a fused multiply-add, which rounds once, returns the rounding error
+  // of the product, which is never 0. The sum of the product and a is c + a where the fused one
+  // may return a neighbor of it: the last bit is all the two can differ in when nothing cancels.
+  auto const evaluate = [&]<typename T>(
+                          cudf::type_id id, type_id sql_id, bool nullable, bool fuse) -> tallies {
+    CAPTURE(sql_id, nullable, fuse);
+    sirius::expression_query_policy const policy{.strategy = exp_strategy_enum::NVRTC_JIT,
+                                                 .nvrtc_jit_fuse_multiply_add = fuse};
+    int const digits = std::numeric_limits<T>::digits;
+    std::mt19937_64 rng{20261118};
+    std::vector<T> a, b, c;
+    std::vector<bool> valids[3];
+    for (int i = 0; i < 4096; ++i) {
+      auto const significand = [&] {
+        return static_cast<T>(
+          1.0 + std::ldexp(static_cast<double>((rng() >> (65 - digits)) | 1U), 1 - digits));
+      };
+      a.push_back(significand());
+      b.push_back(significand());
+      c.push_back(a.back() * b.back());
+      if (nullable) {
+        valids[0].push_back(i % 7 != 0);
+        valids[1].push_back(i % 11 != 0);
+        valids[2].push_back(i % 13 != 0);
+      }
+    }
+    auto const is_valid = [&](std::size_t i) {
+      return !nullable || (valids[0][i] && valids[1][i] && valids[2][i]);
+    };
+    cudf::data_type const type{id};
+    auto const col_a = make_bulk_column<T>(type, a, valids[0], stream, mr);
+    auto const col_b = make_bulk_column<T>(type, b, valids[1], stream, mr);
+    auto const col_c = make_bulk_column<T>(type, c, valids[2], stream, mr);
+    cudf::table_view const tv{{col_a->view(), col_b->view(), col_c->view()}};
+    auto const sql_type = logical_type::make(sql_id);
+    auto const call     = [&](sirius::function_id fid, auto... operands) {
+      std::vector<std::unique_ptr<ast_node>> args;
+      (args.push_back(std::move(operands)), ...);
+      return make_func(fid, std::move(args), sql_type);
+    };
+    auto const ref     = [&](int column) { return make_ref_typed(column, sql_type); };
+    auto const product = [&] { return call(sirius::function_id::mul, ref(0), ref(1)); };
+    auto const project = [&](std::unique_ptr<ast_node> const& expr) {
+      std::array<sirius::ast::node const*, 1> const in = {expr.get()};
+      auto const plan                                  = sirius::nvrtc::plan_project_sink(in, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor exec(*expr, mr, stream, policy);
+      auto values = copy_column_to_host<T>(exec.evaluate(tv)->view().column(0));
+      REQUIRE(values.size() == a.size());
+      return values;
+    };
+
+    tallies result;
+    // Each has the value `sign * (a * b - c)`.
+    std::vector<std::tuple<std::string, T, std::unique_ptr<ast_node>>> differences;
+    differences.emplace_back("a * b - c", T{1}, call(sirius::function_id::sub, product(), ref(2)));
+    differences.emplace_back("c - a * b", T{-1}, call(sirius::function_id::sub, ref(2), product()));
+    differences.emplace_back(
+      "a * b + -c",
+      T{1},
+      call(sirius::function_id::add, product(), call(sirius::function_id::negate, ref(2))));
+    for (auto const& [name, sign, expr] : differences) {
+      auto const values = project(expr);
+      auto& counts      = result[name];
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        if (!is_valid(i)) { continue; }
+        if (values[i] == T{0}) {
+          ++counts.separate;
+        } else if (values[i] == sign * std::fma(a[i], b[i], -c[i])) {
+          ++counts.fused;
+        } else {
+          ++counts.neither;
+        }
+      }
+    }
+    {
+      auto const values = project(call(sirius::function_id::add, product(), ref(0)));
+      auto& counts      = result["a * b + a"];
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        if (!is_valid(i)) { continue; }
+        T const separate    = c[i] + a[i];
+        bool const neighbor = values[i] == std::nextafter(separate, T{0}) ||
+                              values[i] == std::nextafter(separate, std::numeric_limits<T>::max());
+        if (values[i] == separate) {
+          ++counts.separate;
+        } else if (neighbor && values[i] == std::fma(a[i], b[i], a[i])) {
+          ++counts.fused;
+        } else {
+          ++counts.neither;
+        }
+      }
+    }
+    {
+      auto const predicate =
+        make_cmp(sirius::comparison_type::not_equal,
+                 call(sirius::function_id::sub, product(), ref(2)),
+                 std::make_unique<ast_node>(sirius::ast::constant{sirius::value{T{0}}, sql_type}));
+      auto const plan = sirius::nvrtc::plan_filter_sink(*predicate, tv);
+      REQUIRE(plan.has_value());
+      REQUIRE(plan->is_direct());
+      exp_executor exec(*predicate, mr, stream, policy);
+      auto const kept        = static_cast<std::size_t>(exec.select(tv)->num_rows());
+      std::size_t valid_rows = 0;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        valid_rows += is_valid(i) ? 1 : 0;
+      }
+      REQUIRE(kept <= valid_rows);
+      result["WHERE a * b - c <> 0"] = {.separate = valid_rows - kept, .fused = kept};
+    }
+    return result;
+  };
+  auto const for_each_input = [&](bool fuse, auto const& check) {
+    for (bool const nullable : {false, true}) {
+      check(evaluate.template operator()<double>(
+        cudf::type_id::FLOAT64, type_id::DOUBLE, nullable, fuse));
+      check(evaluate.template operator()<float>(
+        cudf::type_id::FLOAT32, type_id::FLOAT, nullable, fuse));
+    }
+  };
+
+  SECTION("by default every result is that of the separately rounded operations")
+  {
+    for_each_input(/*fuse=*/false, [](tallies const& result) {
+      for (auto const& [name, counts] : result) {
+        CAPTURE(name);
+        CHECK(counts.separate > 0);
+        CHECK(counts.fused == 0);
+        CHECK(counts.neither == 0);
+      }
+    });
+  }
+
+  SECTION(
+    "with nvrtc_jit_fuse_multiply_add a result is the fused one or the separately rounded one")
+  {
+    // Which operations the compiler fuses is its choice, so only the results it may return are
+    // fixed. That the NVRTC of the pinned CUDA toolkit fuses in a projection and in the filter is
+    // the evidence that the option reached both kernels. Another NVRTC version or target
+    // architecture may fuse neither of these expressions without any defect in Sirius; the two
+    // checks below then need other expressions.
+    for_each_input(/*fuse=*/true, [](tallies const& result) {
+      std::size_t fused_projections = 0;
+      for (auto const& [name, counts] : result) {
+        CAPTURE(name);
+        CHECK(counts.neither == 0);
+        if (!name.starts_with("WHERE")) { fused_projections += counts.fused; }
+      }
+      CHECK(fused_projections > 0);
+      CHECK(result.at("WHERE a * b - c <> 0").fused > 0);
+    });
+  }
+
+  SECTION("a kernel compiled one way never serves an evaluation that asks for the other")
+  {
+    // The generated source is the same both ways, so only the compile option tells the kernels
+    // apart: in the evaluator's table of resolved kernels, in the in-memory kernel cache, and,
+    // after clear() has emptied both, in the disk cache when the process has one.
+    auto const check = [&](bool fuse) {
+      CAPTURE(fuse);
+      auto const result =
+        evaluate.template operator()<double>(cudf::type_id::FLOAT64, type_id::DOUBLE, false, fuse);
+      for (auto const* name : {"a * b - c", "WHERE a * b - c <> 0"}) {
+        CAPTURE(name);
+        auto const& counts = result.at(name);
+        CHECK(counts.neither == 0);
+        CHECK((fuse ? counts.separate : counts.fused) == 0);
+      }
+    };
+    for (bool const fuse : {false, true, false, true}) {
+      check(fuse);
+    }
+    codegen::jit::KernelCache::instance().clear();
+    for (bool const fuse : {true, false, true}) {
+      check(fuse);
+    }
+  }
 }
 
 TEST_CASE("nvrtc_jit - decimal division computes the extra output-scale digits exactly",

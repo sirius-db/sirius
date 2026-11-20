@@ -11,10 +11,10 @@ advance together.
 
 | Component | Current version | Canonical definition |
 | --- | --- | --- |
-| Request identity | `simpatico-request-v2` | `request_identity()` |
-| Environment identity | `simpatico-environment-v2` | `environment_identity()` |
-| Disk path layout | `v2/` | `CompilationIdentity::relative_path()` |
-| Disk record marker | `SIMPJIT2` | `disk_cache.cpp` (compile-time version check) |
+| Request identity | `simpatico-request-v3` | `request_identity()` |
+| Environment identity | `simpatico-environment-v3` | `environment_identity()` |
+| Disk path layout | `v3/` | `CompilationIdentity::relative_path()` |
+| Disk record marker | `SIMPJIT3` | `disk_cache.cpp` (compile-time version check) |
 
 The domains and path are derived from that constant in
 [cache_identity.cpp](src/jit/cache_identity.cpp).
@@ -23,10 +23,13 @@ The domains and path are derived from that constant in
 
 Bump `kCacheFormatVersion` for incompatible changes to identity fields, their
 order/encoding or meaning, the hash convention, or the disk layout/record contract.
-For example, `v2.1` would use `simpatico-request-v2.1`,
-`simpatico-environment-v2.1`, and `v2.1/` together. This is a format label, not
+For example, `v3.1` would use `simpatico-request-v3.1`,
+`simpatico-environment-v3.1`, and `v3.1/` together. This is a format label, not
 automatic semantic versioning. Update lookup/cleanup consumers, format expectations,
-and this document in the same change.
+and this document in the same change. One of those consumers is `superseded_versions`
+in [disk_cache.cpp](src/jit/disk_cache.cpp): add the outgoing version to it on every
+bump, or maintenance treats that version's directory as unknown and never reclaims
+its records.
 
 The host identity test uses the production request builder in
 [compilation_request.hpp](src/jit/compilation_request.hpp), including its program
@@ -34,9 +37,13 @@ name and effective options, and the production environment encoder. Expected
 digests stay hard-coded in the test. Changes to these inputs or their encoding
 fail the test; review the format version before updating the golden vectors.
 
-New source, entry/program names, options, header contents/inventory, or NVRTC
+New source, program names, options, header contents/inventory, or NVRTC
 versions change the digests automatically; they need no format bump. Neither do
 Sirius releases. An unreleased format can be revised in place.
+
+`v2` identified a request by its entry symbol as well, so a source with several
+kernels was compiled and stored once per kernel. `v3` removed that field and
+added whether the embedded headers are supplied.
 
 ## Identity encoding
 
@@ -45,20 +52,24 @@ from the table.
 Numbers are unsigned 64-bit big-endian. Strings are a byte length followed by
 those bytes, with no terminator. Remaining fields, in order:
 
-- **Request:** source, entry symbol, program name; option count; each effective
-  NVRTC option in order. Strings use the encoding above; the count is a number.
-  Target SM is included through `-arch=sm_...`.
+- **Request:** source, program name; option count; each effective NVRTC option
+  in order; then 1 if the embedded headers are supplied to the compilation and
+  0 if not. Strings use the encoding above; the count and the header flag are
+  numbers. Target SM is included through `-arch=sm_...`. The entry symbol is not
+  an input: NVRTC compiles the source as a whole, so one record holds every
+  kernel the source defines and each is resolved from the loaded cubin by name.
 - **Environment:** project-header digest string, CCCL-header digest string;
   NVRTC major, then minor, each encoded as a number.
 
 Records are streamed into XXH3-128 without concatenating the source. Runtime
 hashing is header-only, with no shared-library dependency or CLI invocation.
 Digests are 16 canonical big-endian bytes, represented by 32 lowercase hex digits
-in paths: `v2/<environment-digest>/<request-digest>.cubin`.
+in paths: `v3/<environment-digest>/<request-digest>.cubin`.
 
 Memory lookup needs only the request digest while the environment is immutable.
 Different environment directories may coexist. Legacy flat cubins lack sufficient
-identity information and must not be read. Hash collisions remain possible.
+identity information and must not be read; neither are `v2` records, which only
+an older build finds. Hash collisions remain possible.
 
 ## Compiler and reuse policy
 
@@ -72,6 +83,9 @@ Same-major/minor compiler patches retain reuse even if their binaries differ.
 A compatible CUDA driver is still required to load the CUBIN.
 
 We deliberately hash the source/options and named headers supplied to NVRTC.
+A request made with `CompileOptions::embedded_headers` off is compiled without
+any named header; its environment still carries the bundle digests, so a header
+change invalidates it too.
 Host-object epochs would also invalidate on build or host-code changes with
 unchanged compilation inputs. The tradeoff is maintaining the input contract:
 include new compilation inputs and bump the shared format version under the rules
@@ -108,11 +122,14 @@ shadowing headers regenerate the table.
 ## Storage and maintenance
 
 Each `.cubin` file is a checked record, not a raw ELF image: eight ASCII bytes
-`SIMPJIT2`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
+`SIMPJIT3`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
 payload XXH3-128, then that many cubin bytes. A zero-length payload, length/file-size
 mismatch, checksum mismatch, non-regular file, or cubin over 256 MiB is a miss.
 The cap bounds allocation on corrupt input; larger kernels still compile and
-reuse memory normally. CUDA loading remains the final compatibility check.
+reuse memory normally. CUDA loading remains the final compatibility check. The
+driver validates an image only when a kernel is first resolved from it, so the
+reader resolves the kernel being requested before it accepts a record; a record
+whose image is rejected or lacks that kernel is a miss.
 Raw legacy/intermediate records are never accepted by this reader.
 
 Writers use `mkostemp` in the destination directory, handle short writes and
@@ -134,6 +151,11 @@ best-effort storage fallback, not treated as an unreadable cache file.
 
 The payload checksum does not bind a record to its request/environment filename:
 moving a complete valid record to another request path still passes validation.
+Resolving the requested kernel does not bind it either: only the kernel whose
+request triggers the load is resolved, and sources may share kernel names. A
+misplaced record that defines that kernel is accepted, supplies its own code
+under that name, and fails every later request for a kernel it lacks until the
+record is removed.
 There is no record-binding or authentication guarantee.
 
 Automatic retention and explicit cleanup recognize only these regular files
@@ -141,8 +163,9 @@ under the configured root:
 
 - Legacy `<16 lowercase hex>_a<digits>_c<digits>_d<digits>.cubin`, and their
   `.tmp.<digits>` remnants.
-- `v2/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
+- `v3/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
   `.tmp.<six alphanumeric characters>` remnants.
+- The same layout under the superseded `v2/`.
 
 The configured root is trusted and may be a symlink to a directory. Both prune
 empty recognized directories but never remove that root or its alias, follow
@@ -156,6 +179,9 @@ recognized legacy flat files, and keeps the current environment plus the three
 newest other environments by directory modification time. Other environments
 also survive while their timestamp is within one hour (or in the future). Only
 older environments beyond that retained set have their recognized entries removed.
+The environments under `v2/` count among the others, so an older build that
+shares the directory keeps its recently used records; the emptied `v2/` directory
+is removed.
 A candidate's timestamp is checked again before deletion. Failures are best effort
 and do not prevent compilation or disk reuse. Disabled caching performs no scan.
 

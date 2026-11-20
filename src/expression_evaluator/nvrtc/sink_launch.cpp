@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,35 +72,36 @@ void maybe_dump_kernel_source(std::string_view entry, std::string const& source)
 }
 
 /**
- * @brief Kernels already resolved by this process, keyed by (entry, kernel body) so the
- *        evaluation-time cost is proportional to the generated body rather than to the ~50 KB
- *        preamble.
+ * @brief Kernels already resolved by this process, keyed by (entry, kernel body, compile options)
+ *        so the evaluation-time cost is proportional to the generated body rather than to the
+ *        ~50 KB preamble.
  *
  * @note The table is subordinate to @c KernelCache: it is dropped whenever @c KernelCache::clear()
  *       advances the generation, so a cleared cache compiles again exactly as before.
  */
 class compiled_sink_table {
  public:
-  std::shared_ptr<codegen::jit::CompiledKernel const> find(std::string_view entry,
-                                                           std::string const& body,
-                                                           int arch_cc,
-                                                           std::uint64_t generation)
+  std::shared_ptr<codegen::jit::CompiledKernel const> find(
+    std::string_view entry,
+    std::string const& body,
+    codegen::jit::CompileOptions const& options,
+    std::uint64_t generation)
   {
     std::lock_guard<std::mutex> const lock(_mutex);
     if (!adopt_generation(generation)) { return nullptr; }
-    auto const it = _entries.find(key(entry, body, arch_cc));
+    auto const it = _entries.find(key(entry, body, options));
     return it == _entries.end() ? nullptr : it->second;
   }
 
   void insert(std::string_view entry,
               std::string const& body,
-              int arch_cc,
+              codegen::jit::CompileOptions const& options,
               std::uint64_t generation,
               std::shared_ptr<codegen::jit::CompiledKernel const> kernel)
   {
     std::lock_guard<std::mutex> const lock(_mutex);
     if (!adopt_generation(generation)) { return; }
-    _entries.emplace(key(entry, body, arch_cc), std::move(kernel));
+    _entries.emplace(key(entry, body, options), std::move(kernel));
   }
 
  private:
@@ -116,9 +117,15 @@ class compiled_sink_table {
     return true;
   }
 
-  static std::string key(std::string_view entry, std::string const& body, int arch_cc)
+  // Every compile option takes part, as it does in the request identity of @c KernelCache, so the
+  // table never answers with a kernel built another way. The binding names every member of
+  // @c CompileOptions, so an option added there does not compile here until it joins the key.
+  static std::string key(std::string_view entry,
+                         std::string const& body,
+                         codegen::jit::CompileOptions const& options)
   {
-    std::string k = std::to_string(arch_cc);
+    auto const& [arch_cc, embedded_headers, fuse_multiply_add] = options;
+    std::string k = std::format("{}{:d}{:d}", arch_cc, embedded_headers, fuse_multiply_add);
     k.reserve(k.size() + entry.size() + 2 + body.size());
     k.push_back('\0');
     k.append(entry).push_back('\0');
@@ -213,16 +220,6 @@ void emit_kernel_head(std::string& out, std::string_view entry, kernel_abi const
   abi.emit_kernel_prelude(out);
 }
 
-void emit_item_loop_open(std::string& out, tile_config tile)
-{
-  out += std::format(
-    "  #pragma unroll\n"
-    "  for (int item = 0; item < {}; ++item) {{\n"
-    "    int32_t const row = tile_row0 + item * {} + static_cast<int32_t>(threadIdx.x);\n",
-    tile.items_per_thread,
-    tile.block_threads);
-}
-
 void emit_status_flag_or(std::string& out,
                          std::string_view flag_var,
                          std::string_view status_array,
@@ -238,35 +235,24 @@ void emit_status_flag_or(std::string& out,
 }
 
 std::shared_ptr<codegen::jit::CompiledKernel const> compile_sink_kernel(
-  std::string_view entry, std::string const& kernel_body, bool prepend_device_runtime)
+  std::string_view entry, std::string const& kernel_body, bool fuse_multiply_add)
 {
-  auto const arch_cc    = cached_arch_cc_for_current_device();
+  codegen::jit::CompileOptions const opts{.arch_cc           = cached_arch_cc_for_current_device(),
+                                          .embedded_headers  = false,
+                                          .fuse_multiply_add = fuse_multiply_add};
   auto const generation = codegen::jit::KernelCache::instance().generation();
-  if (auto found = sink_table().find(entry, kernel_body, arch_cc, generation)) { return found; }
+  if (auto found = sink_table().find(entry, kernel_body, opts, generation)) { return found; }
 
-  std::shared_ptr<codegen::jit::CompiledKernel const> kernel;
-  if (prepend_device_runtime) {
-    auto const runtime = nvrtc_device_runtime_source();
-    std::string source;
-    source.reserve(runtime.size() + kernel_body.size());
-    source.append(runtime).append(kernel_body);
-    kernel = compile_kernel_source(entry, source);
-  } else {
-    kernel = compile_kernel_source(entry, kernel_body);
-  }
-  sink_table().insert(entry, kernel_body, arch_cc, generation, kernel);
-  return kernel;
-}
-
-std::shared_ptr<codegen::jit::CompiledKernel const> compile_kernel_source(std::string_view entry,
-                                                                          std::string const& source)
-{
-  codegen::jit::CompileOptions opts;
-  opts.arch_cc = cached_arch_cc_for_current_device();
+  auto const runtime = nvrtc_device_runtime_source();
+  std::string source;
+  source.reserve(runtime.size() + kernel_body.size());
+  source.append(runtime).append(kernel_body);
   maybe_dump_kernel_source(entry, source);
   try {
-    return codegen::jit::KernelCache::instance().get_or_compile_plain(
-      source, std::string(entry), opts);
+    auto kernel =
+      codegen::jit::KernelCache::instance().get_or_compile_plain(source, std::string(entry), opts);
+    sink_table().insert(entry, kernel_body, opts, generation, kernel);
+    return kernel;
   } catch (codegen::jit::CompileError const& err) {
     throw internal_exception("[nvrtc] {}\nLog:\n{}\nSource:\n{}", err.what(), err.log, err.source);
   }

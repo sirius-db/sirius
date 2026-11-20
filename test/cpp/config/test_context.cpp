@@ -114,6 +114,7 @@ TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]"
 
   constexpr std::array settings{"expression_evaluator_strategy",
                                 "enable_regex_jit_impl",
+                                "nvrtc_jit_fuse_multiply_add",
                                 "enable_duckdb_fallback",
                                 "like_swar_fastpath"};
   for (auto const* name : settings) {
@@ -2614,15 +2615,20 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   execute(a, "SET scan_task_batch_size=12345");
   execute(a, "SET expression_evaluator_strategy='materialize'");
   execute(a, "SET enable_regex_jit_impl=false");
+  CHECK_FALSE(defaults.nvrtc_jit_fuse_multiply_add);
+  execute(a, "SET nvrtc_jit_fuse_multiply_add=true");
   execute(a, "SET pin_table_input_compression_plan_dir='/tmp/a-plans'");
   auto first = duckdb::query_operator_options(*a.context);
   CHECK(first->scan_task_batch_size == 12345);
   CHECK(first->expression_strategy == sirius::expression_evaluator_strategy::MATERIALIZE);
   CHECK_FALSE(first->enable_regex_jit);
+  CHECK(first->nvrtc_jit_fuse_multiply_add);
+  CHECK(first->expression_policy().nvrtc_jit_fuse_multiply_add);
   auto other = duckdb::query_operator_options(*b.context);
   CHECK(other->scan_task_batch_size == defaults.scan_task_batch_size);
   CHECK(other->expression_strategy == defaults.expression_strategy);
   CHECK(other->enable_regex_jit);
+  CHECK_FALSE(other->nvrtc_jit_fuse_multiply_add);
   CHECK(duckdb::session_compression_config(*b.context).input_plan_dir != "/tmp/a-plans");
   execute(a, "SET scan_task_batch_size=67890");
   CHECK(first->scan_task_batch_size == 12345);
@@ -2630,18 +2636,22 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   CHECK(runtime->get_config().get_operator_params().scan_task_batch_size ==
         defaults.scan_task_batch_size);
   for (auto sql : {"SET GLOBAL expression_evaluator_strategy='ast_jit'",
-                   "SET GLOBAL enable_regex_jit_impl=true"}) {
+                   "SET GLOBAL enable_regex_jit_impl=true",
+                   "SET GLOBAL nvrtc_jit_fuse_multiply_add=true"}) {
     auto rejected = a.Query(sql);
     REQUIRE(rejected->HasError());
   }
   execute(a, "RESET expression_evaluator_strategy");
   execute(a, "RESET enable_regex_jit_impl");
+  execute(a, "RESET nvrtc_jit_fuse_multiply_add");
   auto reset_policy = duckdb::query_operator_options(*a.context)->expression_policy();
   CHECK(reset_policy.strategy == defaults.expression_strategy);
   CHECK(reset_policy.regex_jit == defaults.enable_regex_jit);
+  CHECK(reset_policy.nvrtc_jit_fuse_multiply_add == defaults.nvrtc_jit_fuse_multiply_add);
   // RESET affects future queries, not the snapshot already handed to an evaluator.
   CHECK(first->expression_strategy == sirius::expression_evaluator_strategy::MATERIALIZE);
   CHECK_FALSE(first->enable_regex_jit);
+  CHECK(first->nvrtc_jit_fuse_multiply_add);
   auto global = a.Query("SET GLOBAL scan_task_batch_size=1");
   REQUIRE(global->HasError());
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size == 67890);

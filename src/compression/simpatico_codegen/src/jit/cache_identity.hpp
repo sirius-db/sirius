@@ -10,16 +10,16 @@
 namespace codegen::jit::detail {
 
 // Request/environment domains and the disk namespace advance together.
-inline constexpr std::string_view kCacheFormatVersion = "v2";
+inline constexpr std::string_view kCacheFormatVersion = "v3";
 
 // XXH3-128 in canonical (big-endian) byte order, matching xxhsum -H128.
 using Digest = std::array<unsigned char, 16>;
 
 struct RequestView {
   std::string_view source;
-  std::string_view entry;
   std::string_view program;
   std::span<const std::string_view> options;
+  bool embedded_headers;
 };
 
 struct EnvironmentView {

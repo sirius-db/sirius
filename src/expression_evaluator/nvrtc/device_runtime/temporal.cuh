@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,8 +33,6 @@
  *
  * Fragment 6 of the NVRTC expression evaluator device runtime.
  */
-
-#include "codegen/stdint_shim.hpp"
 
 using extract_component = sirius::nvrtc::abi::extract_component;
 

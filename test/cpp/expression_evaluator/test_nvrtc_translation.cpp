@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -171,12 +171,17 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     auto const body = ctx.body_code();
     CHECK(count_occurrences(body, "eval_kleene_and(") == 2);
     CHECK(count_occurrences(body, "eval_kleene_or(") == 0);
-    // As a value, the operand that can overflow runs on every row; only the IS NOT NULL is skipped.
-    CHECK(count_occurrences(body, "if (kleene_and_may_change(") == 1);
-    // As a condition, both later operands run only on rows where the earlier ones are TRUE.
+    // As a value, every operand runs on every row: the sum can overflow, and the IS NOT NULL is
+    // cheaper to run than to skip.
+    CHECK(count_occurrences(body, "if (") == 0);
+    // As a condition, the operand that can overflow runs only on rows where the earlier ones are
+    // TRUE, and the IS NOT NULL still runs on every row.
     sirius::nvrtc::translation_context condition_ctx(table.view);
     (void)condition_ctx.produce_condition(*pred);
-    CHECK(count_occurrences(condition_ctx.body_code(), "if (condition_and_continues(") == 2);
+    auto const condition_body = condition_ctx.body_code();
+    CHECK(count_occurrences(condition_body, "if (condition_and_continues(") == 1);
+    CHECK(count_occurrences(condition_body, "if (") == 1);
+    CHECK(condition_body.find("if (condition_and_continues(") < condition_body.find("eval_add<"));
     // The constants 100, 1 and 0 are bound once each: no duplicate `c_N_val` parameter.
     CHECK(ctx.constants().size() == 3);
     CHECK(count_occurrences(body, " < ") == 1);
@@ -184,21 +189,115 @@ TEST_CASE("nvrtc_codegen - each conjunction and coalesce operand is produced exa
     CHECK(reg.device_type.id() == cudf::type_id::BOOL8);
   }
 
-  SECTION("OR skips a later operand that cannot raise once the accumulator is TRUE")
+  SECTION(
+    "OR runs a later operand that cannot raise on every row unless it computes a value or reads a "
+    "string")
   {
-    std::vector<std::unique_ptr<ast_node>> children;
-    children.push_back(make_ref_typed(8, bool_t));
-    children.push_back(make_ref_typed(8, bool_t));
-    auto const pred = std::make_unique<ast_node>(
-      sirius::ast::conjunction{sirius::ast::conjunction::kind::op_or, std::move(children)});
-    sirius::nvrtc::translation_context ctx(table.view);
-    auto const reg  = ctx.produce(*pred);
-    auto const body = ctx.body_code();
-    CHECK(count_occurrences(body, "eval_kleene_or(") == 1);
-    CHECK(count_occurrences(body, "if (kleene_or_may_change(" + reg.var_name + ")) {") == 1);
-    // The same column is loaded once however often it is referenced.
-    CHECK(ctx.input_columns().size() == 1);
-    CHECK(count_occurrences(body, "in_0_data[row]") == 1);
+    auto const or_of = [](std::unique_ptr<ast_node> first, std::unique_ptr<ast_node> second) {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(std::move(first));
+      children.push_back(std::move(second));
+      return std::make_unique<ast_node>(
+        sirius::ast::conjunction{sirius::ast::conjunction::kind::op_or, std::move(children)});
+    };
+    auto const string_equals = [] {
+      return make_cmp(
+        sirius::comparison_type::equal, make_ref_typed(3, varchar_t), make_str_const("x"));
+    };
+
+    auto const booleans = or_of(make_ref_typed(8, bool_t), make_ref_typed(8, bool_t));
+    // Tests of fixed-width inputs: a comparison, a BETWEEN and an IS NULL.
+    auto const tests = or_of(
+      make_cmp(sirius::comparison_type::lt, make_ref_typed(1, bigint_t), make_bigint_const(7)),
+      or_of(make_between(make_ref_typed(1, bigint_t),
+                         make_bigint_const(1),
+                         make_bigint_const(5),
+                         /*lower_inclusive=*/true,
+                         /*upper_inclusive=*/true),
+            make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref_typed(0, int_t))));
+    // Operands that compare a computed value: a date part and a DOUBLE quotient.
+    auto const date_part = or_of(
+      make_ref_typed(8, bool_t),
+      make_cmp(sirius::comparison_type::equal,
+               make_unary_func(sirius::function_id::year, make_ref_typed(6, date_t), bigint_t),
+               make_bigint_const(1995)));
+    auto const quotient = or_of(
+      make_ref_typed(8, bool_t),
+      make_cmp(
+        sirius::comparison_type::gt,
+        make_binary(
+          sirius::function_id::div, make_ref_typed(2, dbl_t), make_ref_typed(2, dbl_t), dbl_t),
+        make_double_const(1.0)));
+    auto const strings = or_of(make_ref_typed(8, bool_t), string_equals());
+    // A string operand is skipped although an earlier operand already loaded the same column.
+    auto const same_string = or_of(string_equals(), string_equals());
+    for (bool const as_condition : {false, true}) {
+      CAPTURE(as_condition);
+      auto const body_of = [&](ast_node const& pred) {
+        sirius::nvrtc::translation_context ctx(table.view);
+        (void)(as_condition ? ctx.produce_condition(pred) : ctx.produce(pred));
+        return ctx.body_code();
+      };
+      auto const boolean_body = body_of(*booleans);
+      CHECK(count_occurrences(boolean_body, "eval_kleene_or(") == 1);
+      CHECK(count_occurrences(boolean_body, "if (") == 0);
+      // The same column is loaded once however often it is referenced.
+      CHECK(count_occurrences(boolean_body, "in_0_data[row]") == 1);
+      auto const tests_body = body_of(*tests);
+      CHECK(count_occurrences(tests_body, "eval_kleene_or(") == 2);
+      CHECK(count_occurrences(tests_body, "if (") == 0);
+      CHECK(count_occurrences(body_of(*date_part), "if (kleene_or_may_change(") == 1);
+      CHECK(count_occurrences(body_of(*quotient), "if (kleene_or_may_change(") == 1);
+      CHECK(count_occurrences(body_of(*strings), "if (kleene_or_may_change(") == 1);
+      CHECK(count_occurrences(body_of(*same_string), "if (kleene_or_may_change(") == 1);
+    }
+  }
+
+  SECTION(
+    "IN skips a later list value for the decided rows only when it reads a string or computes a "
+    "value that cannot raise")
+  {
+    auto const in_list_body = [&](std::unique_ptr<ast_node> probe,
+                                  std::vector<std::unique_ptr<ast_node>> values) {
+      auto const expr = std::make_unique<ast_node>(
+        sirius::ast::in_list{std::move(probe), std::move(values), /*negated=*/false});
+      sirius::nvrtc::translation_context ctx(table.view);
+      (void)ctx.produce(*expr);
+      return ctx.body_code();
+    };
+    {
+      std::vector<std::unique_ptr<ast_node>> values;
+      values.push_back(make_int_const(1));
+      values.push_back(make_int_const(2));
+      values.push_back(make_int_const(3));
+      CHECK(count_occurrences(in_list_body(make_ref_typed(0, int_t), std::move(values)), "if (") ==
+            0);
+    }
+    {
+      std::vector<std::unique_ptr<ast_node>> values;
+      values.push_back(make_str_const("a"));
+      values.push_back(make_str_const("b"));
+      values.push_back(make_str_const("c"));
+      CHECK(count_occurrences(in_list_body(make_ref_typed(3, varchar_t), std::move(values)),
+                              "if (kleene_or_may_change(") == 2);
+    }
+    {
+      std::vector<std::unique_ptr<ast_node>> values;
+      values.push_back(make_double_const(1.0));
+      values.push_back(make_binary(
+        sirius::function_id::div, make_ref_typed(2, dbl_t), make_ref_typed(2, dbl_t), dbl_t));
+      CHECK(count_occurrences(in_list_body(make_ref_typed(2, dbl_t), std::move(values)),
+                              "if (kleene_or_may_change(") == 1);
+    }
+    {
+      // A list value that can overflow runs on every row, as DuckDB evaluates it.
+      std::vector<std::unique_ptr<ast_node>> values;
+      values.push_back(make_int_const(1));
+      values.push_back(
+        make_binary(sirius::function_id::add, make_ref_typed(0, int_t), make_int_const(1), int_t));
+      CHECK(count_occurrences(in_list_body(make_ref_typed(0, int_t), std::move(values)), "if (") ==
+            0);
+    }
   }
 
   SECTION("COALESCE over three children evaluates the fallbacks only while the result is NULL")
@@ -581,6 +680,35 @@ TEST_CASE("nvrtc_codegen - compile planning names the Materialization Boundaries
   }
 }
 
+TEST_CASE("nvrtc_codegen - a division or modulo makes no NULL and can raise for a zero divisor",
+          "[expression_evaluator][nvrtc_codegen]")
+{
+  fake_table table;
+  auto const produce = [&](sirius::function_id operation, std::uint32_t column, logical_type type) {
+    sirius::nvrtc::translation_context ctx(table.view);
+    return ctx.produce(
+      *make_binary(operation, make_ref_typed(column, type), make_ref_typed(column, type), type));
+  };
+  for (auto const operation :
+       {sirius::function_id::div, sirius::function_id::int_div, sirius::function_id::mod}) {
+    CAPTURE(sirius::to_duckdb_function_name(operation));
+    // Columns 1, 5 and 2 hold no NULL, so their quotient and remainder hold none either: a zero
+    // divisor raises instead of making one, and no null mask is allocated for the result.
+    auto const bigint_result  = produce(operation, 1, bigint_t);
+    auto const decimal_result = produce(operation, 5, dec64_2);
+    auto const double_result  = produce(operation, 2, dbl_t);
+    CHECK(bigint_result.is_statically_non_null);
+    CHECK(decimal_result.is_statically_non_null);
+    CHECK(double_result.is_statically_non_null);
+    CHECK(bigint_result.can_overflow);
+    CHECK(decimal_result.can_overflow);
+    // A DOUBLE `/` or `%` follows IEEE 754; `//` raises in every type.
+    CHECK(double_result.can_overflow == (operation == sirius::function_id::int_div));
+    // Column 0 holds NULLs.
+    CHECK_FALSE(produce(operation, 0, int_t).is_statically_non_null);
+  }
+}
+
 TEST_CASE("nvrtc_codegen - an overflow message names the operations that can overflow",
           "[expression_evaluator][nvrtc_codegen][overflow_message]")
 {
@@ -665,5 +793,31 @@ TEST_CASE("nvrtc_codegen - an overflow message names the operations that can ove
     auto const sum = make_binary(
       sirius::function_id::add, make_ref_typed(2, dbl_t), make_ref_typed(2, dbl_t), dbl_t);
     CHECK(overflow_message_of(*sum) == generic);
+  }
+
+  SECTION("a division or modulo that raises for a zero divisor is named with that error")
+  {
+    std::string const dividing =
+      "[expression_evaluator]: Overflow or division by zero in NVRTC evaluation";
+    auto const of = [](sirius::function_id operation, std::uint32_t column, logical_type type) {
+      return make_binary(
+        operation, make_ref_typed(column, type), make_ref_typed(column, type), type);
+    };
+    CHECK(overflow_message_of(*of(sirius::function_id::mod, 0, int_t)) ==
+          dividing + " of INTEGER % INTEGER -> INTEGER");
+    CHECK(overflow_message_of(*of(sirius::function_id::int_div, 0, int_t)) ==
+          dividing + " of INTEGER // INTEGER -> INTEGER");
+    CHECK(overflow_message_of(*of(sirius::function_id::int_div, 2, dbl_t)) ==
+          dividing + " of DOUBLE // DOUBLE -> DOUBLE");
+    CHECK(overflow_message_of(*make_binary(sirius::function_id::add,
+                                           of(sirius::function_id::mod, 0, int_t),
+                                           make_int_const(1),
+                                           int_t)) ==
+          dividing + " of one of: INTEGER % INTEGER -> INTEGER; INTEGER + INTEGER -> INTEGER");
+    // A DOUBLE `/` or `%` follows IEEE 754 and raises nothing.
+    CHECK(overflow_message_of(*of(sirius::function_id::div, 2, dbl_t)) == generic);
+    CHECK(overflow_message_of(*of(sirius::function_id::mod, 2, dbl_t)) == generic);
+    CHECK(overflow_message_of(*make_unary(sirius::ast::unary_op::kind::op_try,
+                                          of(sirius::function_id::mod, 0, int_t))) == generic);
   }
 }

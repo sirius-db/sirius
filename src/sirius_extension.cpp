@@ -2567,6 +2567,16 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated session enable_regex_jit_impl to {}", BooleanValue::Get(parameter));
 }
 
+static void SetNvrtcJitFuseMultiplyAdd(ClientContext& context, SetScope scope, Value& parameter)
+{
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("nvrtc_jit_fuse_multiply_add is a session setting");
+  duckdb::session_operator_params(context).nvrtc_jit_fuse_multiply_add =
+    BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated session nvrtc_jit_fuse_multiply_add to {}",
+                   BooleanValue::Get(parameter));
+}
+
 static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
                                       SetScope /*scope*/,
                                       Value& /*parameter*/)
@@ -3367,6 +3377,19 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_regex_jit),
                     SetEnableRegexJitImpl);
+
+  add_sirius_option(
+    config,
+    option_visibility::user,
+    "nvrtc_jit_fuse_multiply_add",
+    "Whether nvrtc_jit kernels may fuse a floating-point multiplication with an addition or "
+    "subtraction of its product. Multiply-add chains run faster. The product is no longer rounded "
+    "before the addition, so the sum can differ from DuckDB and from the other expression "
+    "evaluator strategies, and where its terms cancel so can its sign, whether it is zero, and "
+    "every comparison, cast or key computed from it",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.nvrtc_jit_fuse_multiply_add),
+    SetNvrtcJitFuseMultiplyAdd);
 
   // Add in config option for the multi-literal LIKE SWAR fast path
   config.AddExtensionOption(

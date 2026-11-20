@@ -381,10 +381,11 @@ nvrtc::sink_options expression_evaluator::nvrtc_sink_options(
   nvrtc::boundary_column_map const* boundary_map)
 {
   return nvrtc::sink_options{
-    boundary_map,
-    _like_swar_fastpath,
-    [this](std::string_view pattern) { return get_or_classify_like(pattern); },
-    &_expression_caches->string_constants};
+    .boundary_map       = boundary_map,
+    .like_swar_fastpath = _like_swar_fastpath,
+    .classify_like     = [this](std::string_view pattern) { return get_or_classify_like(pattern); },
+    .string_constants  = &_expression_caches->string_constants,
+    .fuse_multiply_add = _policy.nvrtc_jit_fuse_multiply_add};
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view input)

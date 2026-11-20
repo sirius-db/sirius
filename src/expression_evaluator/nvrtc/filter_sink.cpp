@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,8 +31,10 @@
 #include <sirius/exception.hpp>
 
 #include <array>
+#include <concepts>
 #include <format>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace sirius::nvrtc {
@@ -40,126 +42,150 @@ namespace sirius::nvrtc {
 namespace {
 
 constexpr tile_config filter_tile{256, 16};
-constexpr int filter_scan_threads   = 1024;
 constexpr char const* filter_entry  = "sirius_nvrtc_filter_kernel";
-constexpr char const* scan_entry    = "sirius_nvrtc_filter_scan_kernel";
 constexpr char const* scatter_entry = "sirius_nvrtc_filter_scatter_kernel";
 constexpr std::size_t status_words  = 2;  // [0] = status bits, [1] = total survivors
-static_assert(filter_tile.block_threads == 256 && filter_tile.items_per_thread == 16,
-              "the scatter kernel source hard-codes the filter tile geometry");
+
+// A warp of the predicate kernel and of the scatter kernel owns `words_per_warp` consecutive ballot
+// words, each covering 32 consecutive rows: lane `i` holds word `i` of its warp in a register.
+constexpr int words_per_warp = filter_tile.items_per_thread;
+constexpr int rows_per_warp  = words_per_warp * 32;
+constexpr int words_per_tile = words_per_warp * filter_tile.num_warps();
+static_assert(words_per_warp <= 32, "a lane holds at most one ballot word of its warp");
+static_assert(filter_tile.block_threads % 32 == 0, "a tile is made of whole warps");
+
+// The predicate kernel adds every tile's survivor count to the total of the tile's group. A group
+// holds as many tiles as a scatter block has threads, so that each thread reads the count of at
+// most one tile of the block's group.
+constexpr int tiles_per_group = filter_tile.block_threads;
+
+/** @brief Appends the statements that replace @p var in every lane by its sum over the warp. */
+void emit_warp_sum(std::string& out, std::string_view var)
+{
+  out += std::format(
+    "  #pragma unroll\n"
+    "  for (int off = 16; off > 0; off >>= 1) {{\n"
+    "    {0} += __shfl_xor_sync(0xFFFFFFFFu, {0}, off);\n"
+    "  }}\n",
+    var);
+}
 
 /**
- * @brief Fixed kernels completing the compaction for multi-tile batches: an exclusive scan over the
- *        per-tile survivor counts, and a warp-cooperative scatter of the surviving row indices from
- *       the per-warp ballot words.
+ * @brief Appends the statements that define `warp_total`, the number of survivors in a warp's
+ *        ballot words. Expects each lane's word in @p word_var (zero in a lane that owns none).
+ */
+void emit_warp_total(std::string& out, std::string_view word_var)
+{
+  out += std::format("  uint32_t warp_total = static_cast<uint32_t>(__popc({}));\n", word_var);
+  emit_warp_sum(out, "warp_total");
+}
+
+/** @brief Whether the compiler must unroll a generated loop in full or must keep it a loop. */
+enum class loop_unroll : bool { full, never };
+
+/**
+ * @brief Appends the loop in which a warp writes the row index of every survivor in its ballot
+ *        words, in ascending order from `survivors[warp_base]`. Expects each lane's word in
+ *        @p word_var and the warp's first row in @p warp_row0.
+ *
+ * Each word is handed to the whole warp by one shuffle, so the loop reads no memory, and the lanes
+ * whose bit is set store to consecutive slots.
+ */
+void emit_warp_survivor_writes(std::string& out,
+                               std::string_view word_var,
+                               std::string_view warp_row0,
+                               loop_unroll unroll)
+{
+  out += std::format(
+    "  uint32_t const lanes_below = (1u << lane) - 1u;\n"
+    "  uint32_t out = warp_base;\n"
+    "  {3}\n"
+    "  for (int i = 0; i < {0}; ++i) {{\n"
+    "    uint32_t const word = __shfl_sync(0xFFFFFFFFu, {1}, i);\n"
+    "    if ((word >> lane) & 1u) {{\n"
+    "      survivors[out + static_cast<uint32_t>(__popc(word & lanes_below))] = {2} + i * 32 + "
+    "lane;\n"
+    "    }}\n"
+    "    out += static_cast<uint32_t>(__popc(word));\n"
+    "  }}\n",
+    words_per_warp,
+    word_var,
+    warp_row0,
+    unroll == loop_unroll::full ? "#pragma unroll" : "#pragma unroll 1");
+}
+
+/**
+ * @brief Returns the source of the fixed kernel that completes the compaction of a multi-tile
+ *        batch: it writes the surviving row indices from the ballot words.
  *
  * @note Compiled once per process.
  */
-constexpr char const* filter_compaction_source = R"(
-#include "codegen/stdint_shim.hpp"
-
-// One block: exclusive prefix sum of tile_counts in place; status_and_counts[1] = total.
-extern "C" __global__ void sirius_nvrtc_filter_scan_kernel(
-    uint32_t* __restrict__ tile_counts,
-    int32_t num_tiles,
-    uint32_t* __restrict__ status_and_counts)
+[[nodiscard]] std::string const& filter_scatter_source()
 {
-  constexpr int kThreads = 1024;
-  __shared__ uint32_t s_warp_sums[kThreads / 32];
-  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
-  int32_t const warp = static_cast<int32_t>(threadIdx.x) >> 5;
-  uint32_t carry = 0u;
-  for (int32_t base = 0; base < num_tiles; base += kThreads) {
-    int32_t const idx = base + static_cast<int32_t>(threadIdx.x);
-    uint32_t const v = (idx < num_tiles) ? tile_counts[idx] : 0u;
-    uint32_t incl = v;
-    #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) {
-      uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);
-      if (lane >= off) { incl += n; }
-    }
-    if (lane == 31) { s_warp_sums[warp] = incl; }
-    __syncthreads();
-    uint32_t warp_prefix = 0u;
-    #pragma unroll
-    for (int w = 0; w < kThreads / 32; ++w) {
-      if (w < warp) { warp_prefix += s_warp_sums[w]; }
-    }
-    uint32_t chunk_total = 0u;
-    #pragma unroll
-    for (int w = 0; w < kThreads / 32; ++w) {
-      chunk_total += s_warp_sums[w];
-    }
-    if (idx < num_tiles) { tile_counts[idx] = carry + warp_prefix + incl - v; }
-    carry += chunk_total;
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) { status_and_counts[1] = carry; }
-}
-
-// One block per tile: each warp walks its share of the tile's 32-row ballot words and writes the
-// surviving row indices contiguously (lane rank within the word, word rank within the tile,
-// tile prefix from the scan), so the output is ascending and every store instruction is coalesced.
+  static std::string const source = [] {
+    std::string src = std::format(R"(
+// One block per tile: lane i of a warp loads ballot word i of the warp once, and the warp writes
+// its survivors after those of the tiles and of the warps before it. The survivors before the tile
+// are the totals of the groups before its group plus the counts of the tiles before it in its
+// group: every thread loads at most one such count and every {2}th group total, and the block sums
+// them. The block of the last tile stores the batch total in status_and_counts[1].
 extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
     uint32_t const* __restrict__ ballots,
-    uint32_t const* __restrict__ tile_prefix,
+    uint32_t const* __restrict__ tile_counts,
+    uint32_t const* __restrict__ group_counts,
     int32_t num_rows,
-    int32_t* __restrict__ survivors)
-{
-  constexpr int kThreads = 256;
-  constexpr int kWarps = kThreads / 32;
-  constexpr int kWordsPerTile = kThreads * 16 / 32;
-  constexpr int kWordsPerWarp = kWordsPerTile / kWarps;
-  __shared__ uint32_t s_word_prefix[kWordsPerTile];
-  __shared__ uint32_t s_warp_sums[kWarps];
+    int32_t* __restrict__ survivors,
+    uint32_t* __restrict__ status_and_counts)
+{{
+  __shared__ uint32_t s_warp_totals[{0}];
+  __shared__ uint32_t s_warp_preceding[{0}];
   int32_t const tile = static_cast<int32_t>(blockIdx.x);
-  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
-  int32_t const warp = static_cast<int32_t>(threadIdx.x) >> 5;
+  int32_t const thread = static_cast<int32_t>(threadIdx.x);
+  int32_t const lane = thread & 31;
+  int32_t const warp = thread >> 5;
   int32_t const num_words = (num_rows >> 5) + ((num_rows & 31) != 0 ? 1 : 0);
-  int32_t const word0 = tile * kWordsPerTile;
-
-  // Popcount of every ballot word of the tile (kWordsPerTile <= kThreads: one word per thread).
-  static_assert(kWordsPerTile <= kThreads, "one ballot word per thread");
-  if (threadIdx.x < kWordsPerTile) {
-    int32_t const gw = word0 + static_cast<int32_t>(threadIdx.x);
-    s_word_prefix[threadIdx.x] = (gw < num_words) ? static_cast<uint32_t>(__popc(ballots[gw])) : 0u;
-  }
-  __syncthreads();
-  // Each warp turns its contiguous run of kWordsPerWarp counts into exclusive offsets. Every lane
-  // takes part in each shuffle round (idle lanes contribute zero) so the warp never diverges.
-  uint32_t run_total = 0u;
-  for (int k = 0; k < kWordsPerWarp; k += 32) {
-    bool const in_run = (k + lane) < kWordsPerWarp;
-    int32_t const wi = warp * kWordsPerWarp + k + lane;
-    uint32_t const c = in_run ? s_word_prefix[wi] : 0u;
-    uint32_t incl = c;
-    #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) {
-      uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);
-      if (lane >= off) { incl += n; }
-    }
-    if (in_run) { s_word_prefix[wi] = run_total + incl - c; }
-    run_total += __shfl_sync(0xFFFFFFFFu, incl, 31);
-  }
-  if (lane == 0) { s_warp_sums[warp] = run_total; }
-  __syncthreads();
-  uint32_t warp_base = tile_prefix[tile];
-  for (int w = 0; w < warp; ++w) {
-    warp_base += s_warp_sums[w];
-  }
-  for (int32_t wi = warp * kWordsPerWarp; wi < (warp + 1) * kWordsPerWarp; ++wi) {
-    int32_t const gw = word0 + wi;
-    if (gw >= num_words) { break; }
-    uint32_t const ballot = ballots[gw];
-    if (ballot == 0u) { continue; }
-    uint32_t const base = warp_base + s_word_prefix[wi];
-    if ((ballot >> lane) & 1u) {
-      uint32_t const rank = static_cast<uint32_t>(__popc(ballot & ((1u << lane) - 1u)));
-      survivors[base + rank] = (gw << 5) + lane;
-    }
-  }
+  int32_t const warp_word0 = tile * {1} + warp * {3};
+  int32_t const my_index = warp_word0 + lane;
+  int32_t const group = tile / {2};
+  int32_t const my_tile = group * {2} + thread;
+  uint32_t const my_word = (lane < {3} && my_index < num_words) ? ballots[my_index] : 0u;
+  uint32_t preceding = (my_tile < tile) ? tile_counts[my_tile] : 0u;
+  #pragma unroll 1
+  for (int32_t g = thread; g < group; g += {2}) {{ preceding += group_counts[g]; }}
+)",
+                                  filter_tile.num_warps(),
+                                  words_per_tile,
+                                  tiles_per_group,
+                                  words_per_warp);
+    emit_warp_total(src, "my_word");
+    emit_warp_sum(src, "preceding");
+    src += std::format(
+      "  if (lane == 0) {{\n"
+      "    s_warp_totals[warp] = warp_total;\n"
+      "    s_warp_preceding[warp] = preceding;\n"
+      "  }}\n"
+      "  __syncthreads();\n"
+      "  uint32_t warp_base = 0u;\n"
+      "  uint32_t tile_end = 0u;\n"
+      "  #pragma unroll\n"
+      "  for (int w = 0; w < {}; ++w) {{\n"
+      "    uint32_t const p = s_warp_preceding[w];\n"
+      "    uint32_t const c = s_warp_totals[w];\n"
+      "    warp_base += p;\n"
+      "    tile_end += p + c;\n"
+      "    if (w < warp) {{ warp_base += c; }}\n"
+      "  }}\n"
+      "  if (thread == 0 && tile == static_cast<int32_t>(gridDim.x) - 1) {{\n"
+      "    status_and_counts[1] = tile_end;\n"
+      "  }}\n"
+      "  if (warp_total == 0u) {{ return; }}\n",
+      filter_tile.num_warps());
+    emit_warp_survivor_writes(src, "my_word", "(warp_word0 << 5)", loop_unroll::full);
+    src += "}\n";
+    return src;
+  }();
+  return source;
 }
-)";
 
 [[nodiscard]] std::unique_ptr<cudf::table> make_empty_projected_table(
   cudf::table_view const& projected_input,
@@ -180,22 +206,59 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
     cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
 }
 
+/** @brief Whether a tile holds all of its rows or is cut short by the end of the batch. */
+enum class tile_fill : bool { full, partial };
+
+/**
+ * @brief Appends the full-tile / partial-tile dispatch to @p out: the block's tile is processed by
+ *        @c emit_items(tile_fill::full) when it is complete and by
+ *        @c emit_items(tile_fill::partial) (which must guard each row by the number of rows)
+ *        otherwise. Expects `tile_row0` and `num_rows` in scope.
+ */
+void emit_full_and_partial_tiles(std::string& out, std::invocable<tile_fill> auto const& emit_items)
+{
+  out += std::format("  if (num_rows - tile_row0 >= {}) {{\n", filter_tile.tile_rows());
+  emit_items(tile_fill::full);
+  out += "  } else {\n";
+  emit_items(tile_fill::partial);
+  out += "  }\n";
+}
+
+/**
+ * @brief Appends the head of the per-thread item loop to @p out. The caller closes the loop body.
+ *
+ * Item `i` of a warp covers the 32 rows of the warp's ballot word `i`, one row per lane.
+ *
+ * Neither loop forces the row body to be unrolled. The loop over a full tile carries no unroll
+ * pragma, so unrolling is the compiler's choice and a large row body is not forced through it once
+ * per item. The loop over a partial tile runs in at most one block per batch (the last), so it is
+ * marked never to be unrolled.
+ */
+void emit_item_loop_open(std::string& out, tile_fill fill)
+{
+  out += std::format(
+    "{}"
+    "  for (int item = 0; item < {}; ++item) {{\n"
+    "    int32_t const row = warp_row0 + item * 32 + lane;\n",
+    fill == tile_fill::partial ? "  #pragma unroll 1\n" : "",
+    filter_tile.items_per_thread);
+}
+
 /**
  * @brief Kernel body for one predicate.
  *
- *  - Phase 1 evaluates the predicate for every row of the tile (one survive bit per item per
- *    thread, one count per (item, warp) in shared memory);
- *  - Phase 2 scans the counts in warp 0 and, for a single-tile batch, scatters the survivors
- *    directly. A multi-tile batch publishes its tile count and ballot words for the scan and
- *    scatter kernels instead, which avoids serializing tiles on a prefix chain.
+ *  - Phase 1 evaluates the predicate for every row of the tile. A warp votes once per item, and
+ *    lane `i` keeps the ballot word of item `i` in a register, so the loop writes no memory.
+ *  - Phase 2 counts the survivors: each warp sums its words in registers and the block reduces the
+ *    warp totals through shared memory. A single-tile batch then writes its survivors directly. A
+ *    multi-tile batch publishes its ballot words (one coalesced store per warp) and its tile count
+ *    for the scatter kernel instead, and adds the count to the total of its group of tiles, so no
+ *    tile waits for the counts of the tiles before it.
  */
 [[nodiscard]] std::string filter_kernel_body(translation_context const& ctx,
                                              register_value const& pred_reg,
                                              kernel_abi const& abi)
 {
-  constexpr int scan_entries = filter_tile.items_per_thread * filter_tile.num_warps();
-  static_assert(scan_entries % 32 == 0, "the warp scan below consumes whole 32-entry chunks");
-
   std::string src;
   emit_kernel_head(src, filter_entry, abi);
   src += std::format(
@@ -204,18 +267,20 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
     "  int32_t const tile_row0 = tile * {};\n"
     "  int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;\n"
     "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n"
-    "  __shared__ uint32_t s_counts[{}];\n"
-    "  __shared__ uint32_t s_block_count;\n"
-    "  uint32_t survive_bits = 0u;\n",
+    "  int32_t const warp_row0 = tile_row0 + warp_in_block * {};\n"
+    "  __shared__ uint32_t s_warp_totals[{}];\n"
+    "  uint32_t my_ballot = 0u;\n",
     filter_tile.tile_rows(),
-    scan_entries);
+    rows_per_warp,
+    filter_tile.num_warps());
   if (pred_reg.can_overflow) { src += "  bool row_overflow = false;\n"; }
   if (ctx.has_subquery_error()) { src += "  bool row_subquery_error = false;\n"; }
 
   auto const body_code = ctx.body_code();
-  emit_full_and_partial_tiles(src, filter_tile, [&](bool guarded) {
+  emit_full_and_partial_tiles(src, [&](tile_fill fill) {
+    bool const guarded       = fill == tile_fill::partial;
     std::string const indent = guarded ? "      " : "    ";
-    emit_item_loop_open(src, filter_tile);
+    emit_item_loop_open(src, fill);
     src += "    bool survives = false;\n";
     if (guarded) { src += "    if (row < num_rows) {\n"; }
     src += body_code;
@@ -234,16 +299,10 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
       src += std::format("{0}survives = ({1}.valid && {1}.val);\n", indent, v);
     }
     if (guarded) { src += "    }\n"; }
-    src += std::format(
+    src +=
       "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
-      "    survive_bits |= (survives ? 1u : 0u) << item;\n"
-      "    if (lane == 0) {{\n"
-      "      s_counts[item * {0} + warp_in_block] = static_cast<uint32_t>(__popc(warp_ballot));\n"
-      "      if (!single_tile{1}) {{ ballots[(row - lane) >> 5] = warp_ballot; }}\n"
-      "    }}\n"
-      "  }}\n",
-      filter_tile.num_warps(),
-      guarded ? " && row - lane < num_rows" : "");
+      "    my_ballot = (lane == item) ? warp_ballot : my_ballot;\n"
+      "  }\n";
   });
 
   if (pred_reg.can_overflow) {
@@ -257,46 +316,39 @@ extern "C" __global__ void sirius_nvrtc_filter_scatter_kernel(
                         "sirius::nvrtc::abi::status_subquery_error_bit");
   }
 
+  emit_warp_total(src, "my_ballot");
+  // A row past the end of the batch never survives, so a ballot word that starts there is zero and
+  // is not stored: the workspace holds no word for it.
   src += std::format(
-    "  __syncthreads();\n"
-    "  if (warp_in_block == 0) {{\n"
-    "    uint32_t carry = 0u;\n"
-    "    #pragma unroll\n"
-    "    for (int chunk = 0; chunk < {0}; ++chunk) {{\n"
-    "      uint32_t const c = s_counts[chunk * 32 + lane];\n"
-    "      uint32_t incl = c;\n"
-    "      #pragma unroll\n"
-    "      for (int off = 1; off < 32; off <<= 1) {{\n"
-    "        uint32_t const n = __shfl_up_sync(0xFFFFFFFFu, incl, off);\n"
-    "        if (lane >= off) {{ incl += n; }}\n"
-    "      }}\n"
-    "      s_counts[chunk * 32 + lane] = carry + incl - c;\n"
-    "      carry += __shfl_sync(0xFFFFFFFFu, incl, 31);\n"
-    "    }}\n"
-    "    if (lane == 0) {{\n"
-    "      s_block_count = carry;\n"
-    "      if (single_tile) {{ status_and_counts[1] = carry; }} else {{ tile_counts[tile] = carry; "
-    "}}\n"
-    "    }}\n"
+    "  if (lane == 0) {{ s_warp_totals[warp_in_block] = warp_total; }}\n"
+    "  if (!single_tile && lane < {0}) {{\n"
+    "    int32_t const word = (warp_row0 >> 5) + lane;\n"
+    "    if ((word << 5) < num_rows) {{ ballots[word] = my_ballot; }}\n"
     "  }}\n"
-    "  if (!single_tile) {{ return; }}\n"
     "  __syncthreads();\n"
+    "  uint32_t warp_base = 0u;\n"
+    "  uint32_t tile_total = 0u;\n"
     "  #pragma unroll\n"
-    "  for (int item = 0; item < {1}; ++item) {{\n"
-    "    bool const survives = ((survive_bits >> item) & 1u) != 0u;\n"
-    "    uint32_t const warp_ballot = __ballot_sync(0xFFFFFFFFu, survives);\n"
-    "    if (survives) {{\n"
-    "      uint32_t const lane_rank = static_cast<uint32_t>(__popc(warp_ballot & ((1u << lane) - "
-    "1u)));\n"
-    "      survivors[s_counts[item * {2} + warp_in_block] + lane_rank] = tile_row0 + item * {3} + "
-    "static_cast<int32_t>(threadIdx.x);\n"
-    "    }}\n"
+    "  for (int w = 0; w < {1}; ++w) {{\n"
+    "    uint32_t const c = s_warp_totals[w];\n"
+    "    if (w < warp_in_block) {{ warp_base += c; }}\n"
+    "    tile_total += c;\n"
     "  }}\n"
-    "}}\n",
-    scan_entries / 32,
-    filter_tile.items_per_thread,
+    "  if (!single_tile) {{\n"
+    "    if (threadIdx.x == 0) {{\n"
+    "      tile_counts[tile] = tile_total;\n"
+    "      atomicAdd(&group_counts[tile / {2}], tile_total);\n"
+    "    }}\n"
+    "    return;\n"
+    "  }}\n"
+    "  if (threadIdx.x == 0) {{ status_and_counts[1] = tile_total; }}\n",
+    words_per_warp,
     filter_tile.num_warps(),
-    filter_tile.block_threads);
+    tiles_per_group);
+  // Every predicate kernel compiles this loop and only the one block of a single-tile batch runs
+  // it, so it is never unrolled.
+  emit_warp_survivor_writes(src, "my_ballot", "warp_row0", loop_unroll::never);
+  src += "}\n";
   return src;
 }
 
@@ -323,34 +375,47 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
 
   // status_and_counts: [0] = status flags,
   //                    [1] = total survivors (written by the predicate kernel for a single tile, by
-  //                                           the scan otherwise).
+  //                                           the scatter kernel otherwise).
   kernel_abi abi(ctx);
   abi.add_sink_parameter("int32_t", "num_rows");
   abi.add_sink_parameter("uint32_t* __restrict__", "status_and_counts");
+  abi.add_sink_parameter("uint32_t* __restrict__", "group_counts");
   abi.add_sink_parameter("uint32_t* __restrict__", "tile_counts");
   abi.add_sink_parameter("uint32_t* __restrict__", "ballots");
   abi.add_sink_parameter("int32_t* __restrict__", "survivors");
-
-  auto const compiled = compile_sink_kernel(filter_entry, filter_kernel_body(ctx, pred_reg, abi));
-  CUfunction const fn = compiled->func_for_current_device();
 
   auto const grid_dim_x  = utils::ceil_div(static_cast<std::uint32_t>(num_rows),
                                           static_cast<std::uint32_t>(filter_tile.tile_rows()));
   bool const single_tile = std::cmp_equal(grid_dim_x, 1);
 
-  // Workspace: the status words, then (multi-tile only) one count per tile and one ballot word per
-  //            32 rows
-  auto const num_words = utils::ceil_div(static_cast<std::size_t>(num_rows), std::size_t{32});
+  // Both kernels are compiled before the first launch and their handles live until this function
+  // returns, after the status readback has waited for every launch.
+  auto const compiled = compile_sink_kernel(
+    filter_entry, filter_kernel_body(ctx, pred_reg, abi), options.fuse_multiply_add);
+  auto const scatter =
+    single_tile
+      ? nullptr
+      : compile_sink_kernel(scatter_entry, filter_scatter_source(), options.fuse_multiply_add);
+
+  // Workspace: the status words, then (multi-tile only) one total per group of tiles, one count per
+  //            tile and one ballot word per 32 rows. The predicate kernel accumulates into the
+  //            status words and the group totals, so both start at zero.
+  auto const num_words  = utils::ceil_div(static_cast<std::size_t>(num_rows), std::size_t{32});
+  auto const num_groups = single_tile ? std::size_t{0}
+                                      : utils::ceil_div(static_cast<std::size_t>(grid_dim_x),
+                                                        static_cast<std::size_t>(tiles_per_group));
   auto const workspace_words =
-    status_words +
+    status_words + num_groups +
     (single_tile ? std::size_t{0} : (static_cast<std::size_t>(grid_dim_x) + num_words));
   rmm::device_uvector<std::uint32_t> d_workspace(workspace_words, stream, mr);
   rmm::device_uvector<std::int32_t> d_survivors(static_cast<std::size_t>(num_rows), stream, mr);
   auto* status_ptr = d_workspace.data();
   simpatico::throw_if_cuda_error(
-    cudaMemsetAsync(status_ptr, 0, status_words * sizeof(std::uint32_t), stream.get()),
+    cudaMemsetAsync(
+      status_ptr, 0, (status_words + num_groups) * sizeof(std::uint32_t), stream.get()),
     "cudaMemsetAsync(filter_status)");
-  std::uint32_t* tile_counts_ptr  = single_tile ? nullptr : (d_workspace.data() + status_words);
+  std::uint32_t* group_counts_ptr = single_tile ? nullptr : (d_workspace.data() + status_words);
+  std::uint32_t* tile_counts_ptr  = single_tile ? nullptr : (group_counts_ptr + num_groups);
   std::uint32_t* ballots_ptr      = single_tile ? nullptr : (tile_counts_ptr + grid_dim_x);
   std::int32_t* survivors_scratch = d_survivors.data();
   auto num_rows_arg               = static_cast<std::int32_t>(num_rows);
@@ -358,10 +423,11 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
   kernel_arguments args(abi, ctx, input, options.string_constants, stream);
   args.add_sink_argument(&num_rows_arg);
   args.add_sink_argument(&status_ptr);
+  args.add_sink_argument(&group_counts_ptr);
   args.add_sink_argument(&tile_counts_ptr);
   args.add_sink_argument(&ballots_ptr);
   args.add_sink_argument(&survivors_scratch);
-  launch_sink_kernel(fn,
+  launch_sink_kernel(compiled->func_for_current_device(),
                      grid_dim_x,
                      static_cast<unsigned>(filter_tile.block_threads),
                      stream,
@@ -369,20 +435,12 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
                      "cuLaunchKernel(sirius_nvrtc_filter_kernel)");
 
   if (!single_tile) {
-    auto const scan =
-      compile_sink_kernel(scan_entry, filter_compaction_source, /*prepend_device_runtime=*/false);
-    auto const scatter = compile_sink_kernel(
-      scatter_entry, filter_compaction_source, /*prepend_device_runtime=*/false);
-    auto num_tiles_arg = static_cast<std::int32_t>(grid_dim_x);
-    std::array<void*, 3> scan_args{&tile_counts_ptr, &num_tiles_arg, &status_ptr};
-    launch_sink_kernel(scan->func_for_current_device(),
-                       1,
-                       filter_scan_threads,
-                       stream,
-                       scan_args.data(),
-                       "cuLaunchKernel(sirius_nvrtc_filter_scan_kernel)");
-    std::array<void*, 4> scatter_args{
-      &ballots_ptr, &tile_counts_ptr, &num_rows_arg, &survivors_scratch};
+    std::array<void*, 6> scatter_args{&ballots_ptr,
+                                      &tile_counts_ptr,
+                                      &group_counts_ptr,
+                                      &num_rows_arg,
+                                      &survivors_scratch,
+                                      &status_ptr};
     launch_sink_kernel(scatter->func_for_current_device(),
                        grid_dim_x,
                        static_cast<unsigned>(filter_tile.block_threads),
@@ -391,7 +449,6 @@ filter_sink_result evaluate_filter_sink(sirius::ast::node const& predicate,
                        "cuLaunchKernel(sirius_nvrtc_filter_scatter_kernel)");
   }
 
-  // The readback waits for every launch above, so the kernel handles outlive their launches.
   std::array<std::uint32_t, status_words> h_status{};
   read_status_words(h_status, status_ptr, stream, ctx.overflow_sites());
   auto const survivor_count = static_cast<cudf::size_type>(h_status[1]);

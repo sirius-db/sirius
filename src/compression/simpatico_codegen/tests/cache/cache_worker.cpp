@@ -35,6 +35,10 @@ static const std::string external_source = R"(
 #include <cache_fallback.cuh>
 extern "C" __global__ void cache_test(int* out) { *out = CACHE_FALLBACK_VALUE; }
 )";
+// A valid kernel whose cubin does not define cache_test.
+static const std::string renamed_source = R"(
+extern "C" __global__ void cache_renamed(int* out) { *out = 1; }
+)";
 
 static int launch(const jit::CompiledKernel* kernel)
 {
@@ -102,21 +106,24 @@ int main(int argc, char** argv)
       std::puts("RESULT value=1");
       return 0;
     }
-    const auto& source = mode == "external" ? external_source : embedded_source;
-    auto first         = cache.get_or_compile_plain(source, "cache_test", options);
-    const int value    = launch(first.get());
+    const auto& source      = mode == "external"  ? external_source
+                              : mode == "renamed" ? renamed_source
+                                                  : embedded_source;
+    const std::string entry = mode == "renamed" ? "cache_renamed" : "cache_test";
+    auto first              = cache.get_or_compile_plain(source, entry, options);
+    const int value         = launch(first.get());
     if (mode == "prune-once") {
       // Let the process harness seed stale entries after first-use maintenance.
       std::puts("READY first lookup");
       std::fflush(stdout);
       if (std::getchar() != '\n') throw std::runtime_error("missing test continuation");
     }
-    auto second = cache.get_or_compile_plain(source, "cache_test", options);
+    auto second = cache.get_or_compile_plain(source, entry, options);
     if (launch(second.get()) != value) throw std::runtime_error("second launch changed result");
     if (first != second || cache.size() != 1) throw std::runtime_error("unexpected memory reuse");
     if (mode == "prune-once") {
       cache.clear();
-      const auto reloaded = cache.get_or_compile_plain(source, "cache_test", options);
+      const auto reloaded = cache.get_or_compile_plain(source, entry, options);
       if (launch(reloaded.get()) != value)
         throw std::runtime_error("post-maintenance disk lookup changed result");
     }

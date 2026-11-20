@@ -804,9 +804,10 @@ leaving the previous sink active.
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, `ast_jit`, or `nvrtc_jit` (compiles each expression tree into one fused CUDA kernel with NVRTC; see [expression-executor.md](expression-executor.md)) |
 | `enable_regex_jit_impl` | true | Enable the specialized JIT implementation for supported regex patterns |
+| `nvrtc_jit_fuse_multiply_add` | false | Let `nvrtc_jit` kernels fuse a DOUBLE or FLOAT multiplication with an addition or subtraction of its product. Multiply-add chains run faster. The product is no longer rounded before the addition, so the sum can differ from DuckDB and from the other strategies, and where its terms cancel so can its sign, whether it is zero, and whatever is computed from it: comparisons and filter results, CASE branches, casts, join and group keys (see [expression-executor.md](expression-executor.md#setting-the-strategy)). Ignored by the other strategies |
 
 These settings are connection-local: use `SET` or `SET SESSION`; `SET GLOBAL` is
-rejected. `RESET` restores the registered default. Query initialization captures both
+rejected. `RESET` restores the registered default. Query initialization captures these
 settings in an immutable snapshot, so later changes do not affect an existing query.
 Evaluators retain their own policy values rather than reading mutable global defaults.
 

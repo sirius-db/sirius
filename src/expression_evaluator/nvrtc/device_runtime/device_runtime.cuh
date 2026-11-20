@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,8 @@
  * `nvrtc_device_runtime_source()` (see `cmake/embed_nvrtc_device_runtime.cmake`), and this umbrella
  * header exists so the identical text can be compiled offline with nvcc (`device_runtime_check.cu`
  * does so on every build) and unit-tested as ordinary device code. A `.cuh` fragment must not
- * `#include` a sibling fragment: NVRTC resolves only the embedded `codegen/stdint_shim.hpp`.
+ * `#include` anything NVRTC would have to resolve, a sibling fragment included: the kernels are
+ * compiled without include paths or named headers.
  *
  * Many of these fragments reproduce library code found elsewhere, but the goal is to minimize
  * compilation latency and pre-compiled binary loading, which including library headers increases

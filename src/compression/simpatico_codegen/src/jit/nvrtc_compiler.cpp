@@ -8,8 +8,13 @@
 
 #include <nvrtc.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -57,7 +62,52 @@ namespace {
     if (_r != NVRTC_SUCCESS) throw_nvrtc(#call, _r); \
   } while (0)
 
+struct StageCounters {
+  std::atomic<std::uint64_t> compiles{0};
+  std::atomic<std::uint64_t> source_bytes{0};
+  std::atomic<std::uint64_t> create_program_us{0};
+  std::atomic<std::uint64_t> compile_program_us{0};
+  std::atomic<std::uint64_t> get_cubin_us{0};
+  std::atomic<std::uint64_t> loads{0};
+  std::atomic<std::uint64_t> load_us{0};
+};
+
+StageCounters g_stage_counters;
+
+/** @brief Adds the wall time of its own lifetime, in microseconds, to a stage counter. */
+class StageTimer {
+ public:
+  explicit StageTimer(std::atomic<std::uint64_t>& total_us) noexcept : total_us_(total_us) {}
+  ~StageTimer()
+  {
+    const auto elapsed = std::chrono::steady_clock::now() - start_;
+    total_us_.fetch_add(static_cast<std::uint64_t>(
+                          std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
+                        std::memory_order_relaxed);
+  }
+  StageTimer(const StageTimer&)            = delete;
+  StageTimer& operator=(const StageTimer&) = delete;
+
+ private:
+  std::atomic<std::uint64_t>& total_us_;
+  std::chrono::steady_clock::time_point start_{std::chrono::steady_clock::now()};
+};
+
 }  // namespace
+
+CompileStats compile_stats() noexcept
+{
+  const auto read = [](const std::atomic<std::uint64_t>& counter) {
+    return counter.load(std::memory_order_relaxed);
+  };
+  return {read(g_stage_counters.compiles),
+          read(g_stage_counters.source_bytes),
+          read(g_stage_counters.create_program_us),
+          read(g_stage_counters.compile_program_us),
+          read(g_stage_counters.get_cubin_us),
+          read(g_stage_counters.loads),
+          read(g_stage_counters.load_us)};
+}
 
 const detail::Digest& detail::cache_environment()
 {
@@ -76,7 +126,7 @@ const detail::Digest& detail::cache_environment()
 
 CUfunction CompiledKernel::func_for_current_device() const
 {
-  if (!kern) return nullptr;
+  if (!kern_) return nullptr;
 
   // cuKernelGetFunction binds the kernel to the calling thread's current context,
   // and cuLaunchKernel rejects the result from any other context
@@ -99,92 +149,106 @@ CUfunction CompiledKernel::func_for_current_device() const
   }
 
   CUfunction fn = nullptr;
-  if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
+  if (cuKernelGetFunction(&fn, kern_) != CUDA_SUCCESS) return nullptr;
 
   std::lock_guard<std::mutex> lock(func_mu_);
   func_per_ctx_[ctx] = fn;
   return fn;
 }
 
-CompiledKernel::~CompiledKernel()
+CompiledModule::CompiledModule(ConstructionKey,
+                               std::vector<char> cubin,
+                               std::string rendered_source)
+  : cubin_(std::move(cubin)), rendered_source_(std::move(rendered_source))
 {
-  if (library) {
-    cuLibraryUnload(library);
-    library = nullptr;
-    kern    = nullptr;
+  if (cubin_.empty()) { throw std::runtime_error("CompiledModule::load: empty cubin"); }
+
+  // cuLibraryLoadData is multi-device and does not require a specific context.
+  {
+    const StageTimer timer(g_stage_counters.load_us);
+    simpatico::throw_if_cu_error(
+      cuLibraryLoadData(&library_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
+      "cuLibraryLoadData");
   }
+  g_stage_counters.loads.fetch_add(1, std::memory_order_relaxed);
 }
 
-CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
-  : library(other.library),
-    kern(other.kern),
-    cubin(std::move(other.cubin)),
-    rendered_source(std::move(other.rendered_source))
+CompiledModule::~CompiledModule() { cuLibraryUnload(library_); }
+
+std::shared_ptr<const CompiledModule> CompiledModule::load(std::vector<char> cubin,
+                                                           std::string rendered_source)
 {
-  func_per_ctx_ = std::move(other.func_per_ctx_);
-  other.library = nullptr;
-  other.kern    = nullptr;
+  return std::make_shared<CompiledModule>(
+    ConstructionKey{}, std::move(cubin), std::move(rendered_source));
 }
 
-CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
+std::shared_ptr<const CompiledKernel> CompiledModule::kernel(const std::string& entry_symbol) const
 {
-  if (this != &other) {
-    if (library) cuLibraryUnload(library);
-    library         = other.library;
-    kern            = other.kern;
-    cubin           = std::move(other.cubin);
-    rendered_source = std::move(other.rendered_source);
-    func_per_ctx_   = std::move(other.func_per_ctx_);
-    other.library   = nullptr;
-    other.kern      = nullptr;
+  const std::lock_guard<std::mutex> lock(kernels_mu_);
+  auto it = kernels_.find(entry_symbol);
+  if (it == kernels_.end()) {
+    // cuLibraryGetKernel returns a device-independent CUkernel handle; the
+    // per-device CUfunction is derived lazily via func_for_current_device().
+    CUkernel kern = nullptr;
+    simpatico::throw_if_cu_error(cuLibraryGetKernel(&kern, library_, entry_symbol.c_str()),
+                                 ("cuLibraryGetKernel(" + entry_symbol + ")").c_str());
+    it = kernels_.try_emplace(entry_symbol, CompiledKernel::ConstructionKey{}, *this, kern).first;
   }
-  return *this;
+  return {shared_from_this(), &it->second};
 }
 
-CompiledKernel compile_plain_kernel(const std::string& source,
-                                    const std::string& entry_symbol,
-                                    const CompileOptions& opts)
+std::shared_ptr<const CompiledKernel> compile_plain_kernel(const std::string& source,
+                                                           const std::string& entry_symbol,
+                                                           const CompileOptions& opts)
 {
-  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+  return detail::compile_request(detail::CompilationRequest(source, opts))->kernel(entry_symbol);
 }
 
-CompiledKernel detail::compile_request(const CompilationRequest& request)
+std::shared_ptr<const CompiledModule> detail::compile_request(const CompilationRequest& request)
 {
-  const auto& source       = request.source;
-  const auto& entry_symbol = request.entry;
+  const auto& source = request.source;
   if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
-  if (entry_symbol.empty()) {
-    throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
-  }
 
   // All headers the rendered kernels #include are supplied to NVRTC as named
   // in-memory headers (embedded in the binary): the project headers plus the
   // complete CCCL bundle. So no header tree is needed
   // on disk at runtime. The include NAMES must match the `#include` strings
   // seen by NVRTC (the renderers' `"codegen/..."` and CCCL's `<...>`).
+  // A request that includes none of them is given none: NVRTC takes a few
+  // milliseconds to register the bundle whether or not the source uses it.
   std::vector<const char*> hdr_sources;
   std::vector<const char*> hdr_names;
-  hdr_sources.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
-  hdr_names.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
-  for (int i = 0; i < kEmbeddedJitHeaderCount; ++i) {
-    hdr_sources.push_back(kEmbeddedJitHeaders[i].source);
-    hdr_names.push_back(kEmbeddedJitHeaders[i].name);
-  }
-  for (int i = 0; i < kCcclEmbeddedHeaderCount; ++i) {
-    hdr_sources.push_back(kCcclEmbeddedHeaders[i].source);
-    hdr_names.push_back(kCcclEmbeddedHeaders[i].name);
+  if (request.embedded_headers) {
+    hdr_sources.reserve(
+      static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+    hdr_names.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+    for (int i = 0; i < kEmbeddedJitHeaderCount; ++i) {
+      hdr_sources.push_back(kEmbeddedJitHeaders[i].source);
+      hdr_names.push_back(kEmbeddedJitHeaders[i].name);
+    }
+    for (int i = 0; i < kCcclEmbeddedHeaderCount; ++i) {
+      hdr_sources.push_back(kCcclEmbeddedHeaders[i].source);
+      hdr_names.push_back(kCcclEmbeddedHeaders[i].name);
+    }
   }
 
   nvrtcProgram prog = nullptr;
-  NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
-                                    source.c_str(),
-                                    CompilationRequest::program_name,
-                                    static_cast<int>(hdr_names.size()),
-                                    hdr_sources.data(),
-                                    hdr_names.data()));
+  {
+    const StageTimer timer(g_stage_counters.create_program_us);
+    NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
+                                      source.c_str(),
+                                      CompilationRequest::program_name,
+                                      static_cast<int>(hdr_names.size()),
+                                      hdr_sources.data(),
+                                      hdr_names.data()));
+  }
 
-  nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
+  nvrtcResult compile_result = NVRTC_SUCCESS;
+  {
+    const StageTimer timer(g_stage_counters.compile_program_us);
+    compile_result =
+      nvrtcCompileProgram(prog, static_cast<int>(request.options.size()), request.options.data());
+  }
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.
@@ -205,15 +269,21 @@ CompiledKernel detail::compile_request(const CompilationRequest& request)
   }
 
   // nvrtc emits PTX/SASS directly into the cubin stream.
-  std::size_t cubin_size = 0;
-  NVRTC_OR_THROW(nvrtcGetCUBINSize(prog, &cubin_size));
-  if (cubin_size == 0) {
-    nvrtcDestroyProgram(&prog);
-    throw CompileError("nvrtc produced empty cubin", std::move(log), source);
+  std::vector<char> cubin;
+  {
+    const StageTimer timer(g_stage_counters.get_cubin_us);
+    std::size_t cubin_size = 0;
+    NVRTC_OR_THROW(nvrtcGetCUBINSize(prog, &cubin_size));
+    if (cubin_size == 0) {
+      nvrtcDestroyProgram(&prog);
+      throw CompileError("nvrtc produced empty cubin", std::move(log), source);
+    }
+    cubin.resize(cubin_size);
+    NVRTC_OR_THROW(nvrtcGetCUBIN(prog, cubin.data()));
+    NVRTC_OR_THROW(nvrtcDestroyProgram(&prog));
   }
-  std::vector<char> cubin(cubin_size);
-  NVRTC_OR_THROW(nvrtcGetCUBIN(prog, cubin.data()));
-  NVRTC_OR_THROW(nvrtcDestroyProgram(&prog));
+  g_stage_counters.compiles.fetch_add(1, std::memory_order_relaxed);
+  g_stage_counters.source_bytes.fetch_add(source.size(), std::memory_order_relaxed);
 
   if (const char* dump = std::getenv("CODEGEN_JIT_DUMP_CUBIN")) {
     FILE* fp = std::fopen(dump, "wb");
@@ -224,36 +294,7 @@ CompiledKernel detail::compile_request(const CompilationRequest& request)
     }
   }
 
-  return load_kernel_from_cubin(std::move(cubin), entry_symbol, source);
-}
-
-CompiledKernel load_kernel_from_cubin(std::vector<char> cubin,
-                                      const std::string& entry_symbol,
-                                      std::string rendered_source)
-{
-  if (cubin.empty()) { throw std::runtime_error("load_kernel_from_cubin: empty cubin"); }
-
-  // cuLibraryLoadData is multi-device and does not require a specific context.
-  // cuLibraryGetKernel returns a device-independent CUkernel handle; the
-  // per-device CUfunction is derived lazily via func_for_current_device().
-  CUlibrary lib = nullptr;
-  simpatico::throw_if_cu_error(
-    cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0),
-    "cuLibraryLoadData");
-
-  CUkernel kern = nullptr;
-  CUresult r    = cuLibraryGetKernel(&kern, lib, entry_symbol.c_str());
-  if (r != CUDA_SUCCESS) {
-    cuLibraryUnload(lib);
-    simpatico::throw_if_cu_error(r, "cuLibraryGetKernel");
-  }
-
-  CompiledKernel out;
-  out.library         = lib;
-  out.kern            = kern;
-  out.cubin           = std::move(cubin);
-  out.rendered_source = std::move(rendered_source);
-  return out;
+  return CompiledModule::load(std::move(cubin), source);
 }
 
 }  // namespace codegen::jit

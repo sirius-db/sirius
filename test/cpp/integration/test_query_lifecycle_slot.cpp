@@ -1722,6 +1722,7 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
                    "SET expression_evaluator_strategy='ast_jit'",
                    "SET expression_executor_strategy='materialize'",
                    "SET enable_regex_jit_impl=false",
+                   "SET nvrtc_jit_fuse_multiply_add=true",
                    "SET pin_table_compression=true",
                    "SET pin_table_input_compression_plan_dir='/tmp/ac10-plans'",
                    "SET pin_table_compression_min_batch_size_bytes=123",
@@ -1732,7 +1733,8 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
   auto const& compression = duckdb::session_compression_config(*connection.context);
   if (options->scan_task_batch_size != 12345 ||
       options->expression_strategy != sirius::expression_evaluator_strategy::MATERIALIZE ||
-      options->enable_regex_jit || !compression.enable_pin_table_compression ||
+      options->enable_regex_jit || !options->nvrtc_jit_fuse_multiply_add ||
+      !compression.enable_pin_table_compression ||
       compression.input_plan_dir != "/tmp/ac10-plans" || compression.min_batch_size_bytes != 123 ||
       compression.max_compressed_fraction != 0.25) {
     out.error = "AC-10 session SET did not update the stored options";
@@ -1744,6 +1746,7 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
     return params.scan_task_batch_size == default_options.scan_task_batch_size &&
            params.expression_strategy == default_options.expression_strategy &&
            params.enable_regex_jit == default_options.enable_regex_jit &&
+           params.nvrtc_jit_fuse_multiply_add == default_options.nvrtc_jit_fuse_multiply_add &&
            comp.enable_pin_table_compression == default_compression.enable_pin_table_compression &&
            comp.input_plan_dir == default_compression.input_plan_dir &&
            comp.min_batch_size_bytes == default_compression.min_batch_size_bytes &&
@@ -1756,6 +1759,7 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
   for (auto sql : {"SET GLOBAL scan_task_batch_size=12345",
                    "SET GLOBAL expression_evaluator_strategy='materialize'",
                    "SET GLOBAL enable_regex_jit_impl=false",
+                   "SET GLOBAL nvrtc_jit_fuse_multiply_add=true",
                    "SET GLOBAL pin_table_compression=true"}) {
     if (!run_query_expect_error(connection, sql, "AC-10 GLOBAL SET", "session", out.error)) return;
   }
@@ -1763,6 +1767,7 @@ void run_ac10_unavailable_matrix(duckdb::Connection& connection,
                    "RESET expression_evaluator_strategy",
                    "RESET expression_executor_strategy",
                    "RESET enable_regex_jit_impl",
+                   "RESET nvrtc_jit_fuse_multiply_add",
                    "RESET pin_table_compression",
                    "RESET pin_table_input_compression_plan_dir",
                    "RESET pin_table_compression_min_batch_size_bytes",

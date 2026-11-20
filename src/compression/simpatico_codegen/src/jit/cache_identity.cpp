@@ -59,11 +59,11 @@ Digest request_identity(const RequestView& request)
 {
   Encoder hash("simpatico-request-");
   hash.field(request.source);
-  hash.field(request.entry);
   hash.field(request.program);
   hash.number(request.options.size());
   for (const auto option : request.options)
     hash.field(option);
+  hash.number(request.embedded_headers ? 1 : 0);
   return hash.finish();
 }
 

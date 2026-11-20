@@ -68,10 +68,10 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k1 || !k1->kern) return report_fail("first compile returned null");
+  if (!k1 || !k1->kern()) return report_fail("first compile returned null");
   if (cache.size() != 1) return report_fail("cache size != 1 after first insert");
 
-  if (k1->rendered_source.find("simpatico_bp_at") == std::string::npos) {
+  if (k1->module().rendered_source().find("simpatico_bp_at") == std::string::npos) {
     return report_fail("rendered_source missing simpatico_bp_at decode primitive");
   }
 
@@ -133,9 +133,9 @@ int main()
   if (cache.size() != 0) return report_fail("cache not empty after clear with retained handles");
   if (retained.expired()) return report_fail("clear destroyed a retained kernel");
   CUkernel retained_kernel = nullptr;
-  if (cuLibraryGetKernel(&retained_kernel, k1->library, spec_a.entry_symbol.c_str()) !=
+  if (cuLibraryGetKernel(&retained_kernel, k1->module().library(), spec_a.entry_symbol.c_str()) !=
         CUDA_SUCCESS ||
-      retained_kernel != k1->kern) {
+      retained_kernel != k1->kern()) {
     return report_fail("retained CUDA library is invalid after clear");
   }
 

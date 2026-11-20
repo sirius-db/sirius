@@ -1,6 +1,7 @@
 #include "jit/cache_identity.hpp"
 #include "jit/compilation_request.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <filesystem>
@@ -36,12 +37,12 @@ int main(int argc, char** argv)
     require(hex_digest(content_identity("abc")) == "06b05ab6733a618578af5f94892f3950",
             "XXH3-128 canonical known vector");
     require(sizeof(Digest) == 16, "128-bit binary digest");
-    const std::string source = "kernel", entry = "entry";
-    const CompilationRequest prepared(source, entry, codegen::jit::CompileOptions{90});
+    const std::string source = "kernel";
+    const CompilationRequest prepared(source, codegen::jit::CompileOptions{90});
     auto request        = prepared.identity_view();
     const auto expected = request_identity(request);
-    // Golden v2 records: review kCacheFormatVersion before updating either digest.
-    require(hex_digest(expected) == "38ae0456c7a3d5e98687ff67480d5246",
+    // Golden v3 records: review kCacheFormatVersion before updating either digest.
+    require(hex_digest(expected) == "61c92e8426593a218aa415499d593f77",
             "request inputs or encoding changed: review kCacheFormatVersion and golden vectors");
     auto options    = prepared.option_views;
     request.options = options;
@@ -50,12 +51,12 @@ int main(int argc, char** argv)
     auto changed   = request;
     changed.source = "kerneL";
     require(expected != request_identity(changed), "source bytes");
-    changed       = request;
-    changed.entry = "other";
-    require(expected != request_identity(changed), "entry symbol");
     changed         = request;
     changed.program = "other.cu";
     require(expected != request_identity(changed), "program name");
+    changed                  = request;
+    changed.embedded_headers = !request.embedded_headers;
+    require(expected != request_identity(changed), "embedded header availability");
     options[1] = "-arch=sm_80";
     require(expected != request_identity(request), "architecture option");
     options[1] = prepared.option_views[1];
@@ -68,20 +69,46 @@ int main(int argc, char** argv)
     changed         = request;
     changed.options = std::span(options).first(2);
     require(expected != request_identity(changed), "option count");
-    changed        = request;
-    request.source = "a|b";
-    request.entry  = "c";
-    changed.source = "a";
-    changed.entry  = "b|c";
+    // Only a source that includes no header is compiled with --minimal, which is part of its
+    // identity like every other option.
+    const auto has_minimal = [](const CompilationRequest& r) {
+      return std::ranges::count(r.option_views, std::string_view("--minimal")) == 1 &&
+             std::ranges::count(r.options, std::string_view("--minimal"), [](const char* option) {
+               return std::string_view(option);
+             }) == 1;
+    };
+    const CompilationRequest header_free(
+      source, codegen::jit::CompileOptions{.arch_cc = 90, .embedded_headers = false});
+    require(!has_minimal(prepared), "--minimal on a source that may include headers");
+    require(has_minimal(header_free), "--minimal missing for a header-free source");
+    changed                  = request;
+    changed.embedded_headers = false;
+    require(request_identity(header_free.identity_view()) != request_identity(changed),
+            "--minimal is not part of the request identity");
+    // Whether NVRTC may fuse a multiplication and an addition changes the floating-point results of
+    // a kernel, so the option that forbids it is part of the request identity.
+    const CompilationRequest unfused(
+      source, codegen::jit::CompileOptions{.arch_cc = 90, .fuse_multiply_add = false});
+    require(std::ranges::count(prepared.option_views, std::string_view("-fmad=false")) == 0,
+            "-fmad=false on a source that may fuse");
+    require(std::ranges::count(unfused.option_views, std::string_view("-fmad=false")) == 1,
+            "-fmad=false missing for a source that must not fuse");
+    require(request_identity(unfused.identity_view()) != expected,
+            "-fmad=false is not part of the request identity");
+    changed         = request;
+    request.source  = "a|b";
+    request.program = "c";
+    changed.source  = "a";
+    changed.program = "b|c";
     require(request_identity(request) != request_identity(changed), "field boundaries");
-    request.source = std::string_view("a\0b", 3);
-    changed.source = "a";
-    changed.entry  = request.entry;
+    request.source  = std::string_view("a\0b", 3);
+    changed.source  = "a";
+    changed.program = request.program;
     require(request_identity(request) != request_identity(changed), "embedded NUL boundary");
 
     EnvironmentView environment{"project-bytes", "cccl-bytes", 13, 4};
     const auto env = environment_identity(environment);
-    require(hex_digest(env) == "53fbd8bb1756e5116ad915d7c949ea87",
+    require(hex_digest(env) == "8b7e1c428f61ec8654fcc8f69bb0e441",
             "environment encoding changed: review kCacheFormatVersion and golden vectors");
     require(env == environment_identity(environment), "environment stability");
     for (int component = 0; component < 4; ++component) {
@@ -102,7 +129,7 @@ int main(int argc, char** argv)
     require(environment_identity({"project-bytes", "cccl-bytes", 1, 34}) != env,
             "NVRTC major/minor boundaries");
     require(CompilationIdentity{env, expected}.relative_path() ==
-              "v2/" + hex_digest(env) + "/" + hex_digest(expected) + ".cubin",
+              "v3/" + hex_digest(env) + "/" + hex_digest(expected) + ".cubin",
             "versioned path");
     require(CompilationIdentity{env, expected}.relative_path() !=
               CompilationIdentity{env, request_identity(changed)}.relative_path(),

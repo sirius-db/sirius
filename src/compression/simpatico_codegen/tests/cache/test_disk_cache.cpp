@@ -161,7 +161,7 @@ void publication_and_faults(const fs::path& root)
     std::array<char, header_size> header{};
     std::ifstream input(path, std::ios::binary);
     require(bool(input.read(header.data(), header.size())), "record header read");
-    require(std::string_view(header.data(), 8) == "SIMPJIT2", "record format marker");
+    require(std::string_view(header.data(), 8) == "SIMPJIT3", "record format marker");
     const auto digest = cache::content_identity({original.data(), original.size()});
     require(
       std::equal(
@@ -290,7 +290,8 @@ void environment_namespaces(const fs::path& root)
 {
   const auto location = root / "environments";
   const std::array<std::string_view, 1> options{"-arch=sm_120"};
-  const auto request = cache::request_identity({"kernel", "entry", "test.cu", options});
+  const auto request = cache::request_identity(
+    {.source = "kernel", .program = "test.cu", .options = options, .embedded_headers = true});
   const std::array<cache::EnvironmentView, 5> environments{{
     {"project", "cccl", 13, 4},
     {"project-edited", "cccl", 13, 4},
@@ -322,7 +323,7 @@ void environment_namespaces(const fs::path& root)
 void cleanup(const fs::path& root)
 {
   const auto location    = root / "cleanup";
-  const auto environment = location / "v2" / std::string(hex_size, 'a');
+  const auto environment = location / "v3" / std::string(hex_size, 'a');
   const auto request     = std::string(hex_size, 'b') + ".cubin";
   const auto legacy      = "0123456789abcdef_a120_c13030_d13030.cubin";
   touch(environment / request);
@@ -331,30 +332,34 @@ void cleanup(const fs::path& root)
   touch(location / (std::string(legacy) + ".tmp.123"));
   const auto outside = root / "outside";
   touch(outside / request);
-  fs::create_directory_symlink(outside, location / "v2" / std::string(hex_size, 'c'));
+  fs::create_directory_symlink(outside, location / "v3" / std::string(hex_size, 'c'));
   fs::create_symlink(outside / request, environment / (std::string(hex_size, 'd') + ".cubin"));
   touch(environment / "keep.txt");
   touch(environment / "nested" / request);
   touch(location / "unrelated.cubin");
-  touch(location / "v3" / std::string(hex_size, 'a') / request);
-  touch(location / "v2" / "unknown-namespace" / request);
+  touch(location / "v4" / std::string(hex_size, 'a') / request);
+  touch(location / "v3" / "unknown-namespace" / request);
+  const auto superseded = location / "v2" / std::string(hex_size, 'a');
+  touch(superseded / request);
+  touch(superseded / (request + ".tmp.Abc123"));
   const auto root_link = root / "cleanup-root-link";
   fs::create_directory_symlink(location, root_link);
   cache::clear_disk_cache(root_link.string());
   require(fs::is_symlink(root_link), "cleanup removed the trusted root symlink");
   require(!fs::exists(environment / request) && !fs::exists(location / legacy),
           "recognized entries retained");
+  require(!fs::exists(location / "v2"), "superseded version namespace retained");
   require(!fs::exists(environment / (request + ".tmp.Abc123")), "abandoned temporary retained");
   require(!fs::exists(location / (std::string(legacy) + ".tmp.123")), "legacy temporary retained");
   for (const auto& path : {outside / request,
                            environment / "keep.txt",
                            environment / "nested" / request,
                            location / "unrelated.cubin",
-                           location / "v3" / std::string(hex_size, 'a') / request,
-                           location / "v2" / "unknown-namespace" / request}) {
+                           location / "v4" / std::string(hex_size, 'a') / request,
+                           location / "v3" / "unknown-namespace" / request}) {
     require(fs::exists(path), "cleanup removed unrelated content");
   }
-  require(fs::is_symlink(location / "v2" / std::string(hex_size, 'c')),
+  require(fs::is_symlink(location / "v3" / std::string(hex_size, 'c')),
           "cleanup removed namespace symlink");
   require(fs::is_symlink(environment / (std::string(hex_size, 'd') + ".cubin")),
           "cleanup removed file symlink");
@@ -362,9 +367,12 @@ void cleanup(const fs::path& root)
   cache::clear_disk_cache((root / "missing").string());
 }
 
-fs::path seed_environment(const fs::path& root, std::string_view label, fs::file_time_type modified)
+fs::path seed_environment(const fs::path& root,
+                          std::string_view label,
+                          fs::file_time_type modified,
+                          std::string_view version = "v3")
 {
-  const auto path = root / "v2" / cache::hex_digest(cache::content_identity(label));
+  const auto path = root / version / cache::hex_digest(cache::content_identity(label));
   touch(path / (std::string(hex_size, 'b') + ".cubin"));
   fs::last_write_time(path, modified);
   return path;
@@ -391,9 +399,9 @@ void pruning(const fs::path& root)
   touch(preserved / "nested" / request);
   touch(preserved / (request + ".tmp.Abc123"));
   fs::create_symlink(outside / request, preserved / (std::string(hex_size, 'd') + ".cubin"));
-  fs::create_directory_symlink(outside, location / "v2" / std::string(hex_size, 'c'));
-  touch(location / "v2" / "unknown-namespace" / request);
-  touch(location / "v3" / std::string(hex_size, 'e') / request);
+  fs::create_directory_symlink(outside, location / "v3" / std::string(hex_size, 'c'));
+  touch(location / "v3" / "unknown-namespace" / request);
+  touch(location / "v4" / std::string(hex_size, 'e') / request);
   touch(location / "unrelated.cubin");
   const auto legacy = location / "0123456789abcdef_a120_c13030_d13030.cubin";
   touch(legacy);
@@ -417,12 +425,12 @@ void pruning(const fs::path& root)
   for (const auto& path : {preserved / "keep.txt",
                            preserved / "nested" / request,
                            outside / request,
-                           location / "v2" / "unknown-namespace" / request,
-                           location / "v3" / std::string(hex_size, 'e') / request,
+                           location / "v3" / "unknown-namespace" / request,
+                           location / "v4" / std::string(hex_size, 'e') / request,
                            location / "unrelated.cubin"})
     require(fs::exists(path), "automatic pruning removed unrelated content");
   for (const auto& path : {legacy_link,
-                           location / "v2" / std::string(hex_size, 'c'),
+                           location / "v3" / std::string(hex_size, 'c'),
                            preserved / (std::string(hex_size, 'd') + ".cubin")})
     require(fs::is_symlink(path), "automatic pruning removed a symlink");
 
@@ -436,20 +444,38 @@ void pruning(const fs::path& root)
     require(fs::exists(recent[index] / request) == (index < recent.size() - 1),
             "one-hour grace or future timestamp not respected");
 
+  // Environments of the superseded version are ranked with the current version's others, and
+  // the superseded version directory goes once its last environment does.
+  const auto mixed_root = root / "superseded";
+  const auto reused     = seed_environment(mixed_root, "reused", now - hours(2), "v2");
+  const auto abandoned  = seed_environment(mixed_root, "abandoned", now - hours(7), "v2");
+  std::vector<fs::path> newer;
+  for (int index = 0; index < 3; ++index)
+    newer.push_back(seed_environment(mixed_root, std::to_string(index), now - hours(3 + index)));
+  cache::prune_disk_cache(mixed_root.string(), cache::content_identity("current"));
+  require(fs::exists(reused / request) && !fs::exists(abandoned),
+          "superseded environments not retained by recency");
+  require(fs::exists(newer[0] / request) && fs::exists(newer[1] / request) && !fs::exists(newer[2]),
+          "superseded environment not counted among the retained others");
+  fs::last_write_time(reused, now - hours(8));
+  seed_environment(mixed_root, "newest", now - hours(2));
+  cache::prune_disk_cache(mixed_root.string(), cache::content_identity("current"));
+  require(!fs::exists(mixed_root / "v2"), "empty superseded version directory retained");
+
   // Only the trusted root may be a symlink; descendants are never followed.
   fs::last_write_time(outside, now - hours(24));
   const auto outside_time = fs::last_write_time(outside);
   fs::create_directories(root / "version-link");
-  fs::create_directory_symlink(outside, root / "version-link" / "v2");
-  fs::create_directories(root / "current-link" / "v2");
+  fs::create_directory_symlink(outside, root / "version-link" / "v3");
+  fs::create_directories(root / "current-link" / "v3");
   fs::create_directory_symlink(
-    outside, root / "current-link" / "v2" / cache::hex_digest(cache::content_identity("current")));
+    outside, root / "current-link" / "v3" / cache::hex_digest(cache::content_identity("current")));
   for (const auto& path : {root / "version-link", root / "current-link"}) {
     cache::prune_disk_cache(path.string(), cache::content_identity("current"));
     cache::clear_disk_cache(path.string());
   }
-  require(fs::is_symlink(root / "version-link" / "v2"), "maintenance removed version symlink");
-  require(fs::is_symlink(root / "current-link" / "v2" /
+  require(fs::is_symlink(root / "version-link" / "v3"), "maintenance removed version symlink");
+  require(fs::is_symlink(root / "current-link" / "v3" /
                          cache::hex_digest(cache::content_identity("current"))),
           "maintenance removed current environment symlink");
   require(fs::last_write_time(outside) == outside_time, "maintenance touched a symlink target");

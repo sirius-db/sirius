@@ -170,22 +170,62 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   compiles, and the per-subexpression retry in `evaluate(node, MATERIALIZE)` costs one host walk
   when it fails.
 - **Kernel shape.** Blocks of 256 threads process a tile of rows, each thread handling several
-  rows strided by the block width (4 per thread for projections, 16 for filters) so loads and
-  stores stay coalesced and every thread has several memory requests in flight. Full tiles run an
-  unguarded copy of the row body; only the last tile checks `row < num_rows`.
+  rows (4 per thread for projections, 16 for filters) so every thread has several memory requests
+  in flight. A projection thread's rows are strided by the block width and a filter thread's by
+  the warp width (a filter warp covers 512 consecutive rows, 32 per item), which keeps loads and
+  stores coalesced. A projection kernel holds one copy of the row body and never checks
+  `row < num_rows` around it: an item past the end of the batch evaluates the last row again,
+  which stores the same bytes and raises the same Overflow Poison as that row's own thread, and
+  only the validity words tell such an item apart. A filter kernel holds two copies of the row
+  body: full tiles run an unguarded one and only a tile cut short by the end of the batch checks
+  `row < num_rows`. Neither kernel forces a row body to be unrolled: the item loops over full
+  tiles carry no unroll pragma, so unrolling is the compiler's choice and a large body (a LIKE, a
+  long IN list or OR chain of string comparisons) is not forced through it once per item. The
+  filter's partial-tile loop runs in at most one block per batch and is marked never to be
+  unrolled. The speed of a light body rests on that choice, which was measured on NVRTC 13.4: it
+  unrolls a comparison or two, and the same body kept rolled ran about twice as long, so
+  re-measure the kernel time of the `LC_conj1` and `F03_rare_1pct` benchmark cases when the CUDA
+  toolkit changes. It keeps a body of one to three string equalities rolled, and such a filter's
+  kernels take 14 to 50 % longer than under a forced unroll. Forcing the unroll is no remedy: a
+  LIKE or a long string IN list then takes several times longer to compile and to run.
 - **Null masks.** Input validity bits are loaded independently of the payload (a null row's slot
-  still exists). Output validity words come from one `__ballot_sync` per warp and row group; null
-  counts are accumulated per warp in registers and reduced once per block. A column with no
-  nulls in the batch, and any expression over such columns and non-NULL constants, is statically
-  non-null: no mask is allocated and no null count is read back.
-- **Overflow Poison.** An operation sets a Register Value's `overflow` bit only by propagating an operand's poison, or from its own computation over operands that are all valid and unpoisoned; a NULL value's payload never decides overflow. Every function in `device_runtime/*.cuh` and every statement `translation_context.cpp` emits keeps this invariant (`reg_val` in `device_runtime/reg_val.cuh` states it for new code), so poison always comes from an Evaluated Operation. The `ProjectSink` and `FilterSink` kernels therefore report every poison that reaches them, whatever the value's final validity: `n + abs(x)` with `n` NULL raises, as rule 2 of [SQL errors](#sql-errors) requires. Poison is kept away only where DuckDB does not evaluate an operation: CASE and COALESCE skip a branch the row does not select, and AND or OR in a filter predicate or CASE WHEN condition skip an operand the row has already decided (rule 1 of [SQL errors](#sql-errors)). TRY clears the bit, and TRY_CAST clears it only for its own conversion.
+  still exists). A nullable output stores its payload for every row, valid or not. Its validity
+  words come from one `__ballot_sync` per warp and row group, in which an item past the end of
+  the batch votes invalid. Valid rows are counted per warp in registers and reduced once per
+  block, and a block adds the rows it holds that are not valid to the null count, so a block
+  without nulls issues no atomic. A column with no nulls in the batch, and any expression over
+  such columns and non-NULL constants, is statically non-null: no mask is allocated and no null
+  count is read back.
+- **Overflow Poison.** An operation sets a Register Value's `overflow` bit only by propagating an operand's poison, or from its own computation over operands that are all valid and unpoisoned; a NULL value's payload never decides overflow. Every function in `device_runtime/*.cuh` and every statement `translation_context.cpp` emits keeps this invariant (`reg_val` in `device_runtime/reg_val.cuh` states it for new code), so poison always comes from an Evaluated Operation. The arithmetic and the numeric casts of the device runtime compute every row and apply the invariant to the flags (`operation_result`) instead of returning early for a NULL or poisoned operand: a branch per operation made a chain of them slower. The payload of a NULL or poisoned value is therefore unspecified, a nullable output column holds such payloads under its NULL rows, and whatever reads a payload is defined for every bit pattern: integer arithmetic wraps, a division runs with the divisor 1 where the hardware operation is undefined, and a float-to-integer conversion out of range converts 0. A DOUBLE or FLOAT division divides 1 by 1 on a NULL row: a column load gives a NULL the payload 0, and the hardware division takes a slow path for a zero operand that every other row of the warp waits for. The `ProjectSink` and `FilterSink` kernels therefore report every poison that reaches them, whatever the value's final validity: `n + abs(x)` with `n` NULL raises, as rule 2 of [SQL errors](#sql-errors) requires. Poison is kept away only where DuckDB does not evaluate an operation: CASE and COALESCE skip a branch the row does not select, and AND or OR in a filter predicate or CASE WHEN condition skip an operand that can raise on the rows the earlier operands already decide (rule 1 of [SQL errors](#sql-errors)). TRY clears the bit, and TRY_CAST clears it only for its own conversion.
+- **Division by a power of ten.** A DECIMAL to DOUBLE cast and `round(x, n)` with `0 <= n <= 38` divide by a literal power of ten. `div_by_pow10` multiplies by the reciprocal, which the compiler folds, and corrects the product with two fused multiply-adds, which gives the correctly rounded quotient, bit for bit that of the hardware division it replaces. `translation_context` prints ROUND's modifier into the source for that, so kernels that differ only in the precision are compiled separately.
+- **DECIMAL to DOUBLE or FLOAT.** The cast converts the DECIMAL's integer to the destination type and then divides by 10^scale, so it rounds twice. DuckDB returns the value nearest to the exact decimal. The two agree where the integer and 10^scale are exact in the destination type (a magnitude of at most 2^53 and a scale of at most 22 for DOUBLE, 2^24 and 10 for FLOAT); beyond that the last bit can differ.
+- **Floating-point results.** By default the kernels are compiled with `-fmad=false` (`CompileOptions::fuse_multiply_add`), so the compiler never contracts a multiplication and an addition or subtraction of its product into one fused multiply-add. The fused operation rounds once where DuckDB and the cuDF strategies round twice, and whether the compiler fuses depends on the shape of the kernel, so with it a DOUBLE or FLOAT result would vary with the surrounding expression and the nullability of its inputs. The `nvrtc_jit_fuse_multiply_add` setting (off by default) lets the compiler fuse: multiply-add chains over DOUBLE or FLOAT run faster, and their results, with everything computed from them, can differ from DuckDB and from the other strategies as [Setting the strategy](#setting-the-strategy) describes. The choice is a compile option, so it is part of the kernel's identity in every cache and a kernel built one way never serves the other. The explicit `fma` calls of `div_by_pow10` are fused either way.
+- **Decimal addition.** A DECIMAL addition or subtraction whose operands are at the result's scale and no wider than its carrier is the checked integer operation in that carrier, with no 128-bit intermediate.
+- **Limits of DECIMAL and HUGEINT `+`, `-` and `*`.** A sum, difference or product raises where its result leaves its SQL type. `translation_context` passes the lowest and the highest value of that type to `eval_dec_add`, `eval_dec_sub` and `eval_dec_mul`. A DECIMAL(P,S) holds fewer than 10^P in magnitude, which is less than its carrier holds: a DECIMAL(18,0) product of 10^18 raises although it fits 64 bits. A HUGEINT holds everything its 128-bit carrier holds, so `6e37 + 6e37` returns its 39 digits and a sum or difference raises only past the carrier. A 128-bit product follows DuckDB's `Hugeint::TryMultiply` (`checked_mul128`), which multiplies the magnitudes of the operands and raises for a product of 2^127 or more: the lowest value is a product only of itself by 1, and `-2^126 * 2` raises although the carrier holds -2^127. A cast to HUGEINT is still checked for 38 digits, which is stricter than DuckDB for a DOUBLE or FLOAT of 39 digits; CPU Replay answers it. For a HUGEINT, and for a DECIMAL whose result precision DuckDB clamped to 18 or 38 digits, these limits are exactly where DuckDB raises. DuckDB does not check any other DECIMAL result, which operands within their declared precisions cannot exceed; Sirius checks it too, so it is stricter than DuckDB only for an operand that holds more digits than its type, and CPU Replay answers that. Such operands exist: nothing holds a column to its declared DECIMAL precision, and the materialize path, a scan, and the DECIMAL division, modulo and ROUND of this evaluator all pass on whatever the carrier holds. Negation and `abs` pass them on as well: they raise only for the lowest value of the carrier, for a DECIMAL too, whose storage integer DuckDB negates without looking at the precision.
+- **Division by zero.** `//` in every type, and `%` and Sirius's own `/` in the integer and DECIMAL types, raise for a zero divisor, as DuckDB does under its default `error_on_division_by_zero = true`: a row whose operands are both valid carries Overflow Poison, so CPU Replay returns DuckDB's error and TRY returns NULL. The evaluator does not read `error_on_division_by_zero`. With it off DuckDB returns NULL for such a row, and the query still gets DuckDB's answer, through CPU Replay. A DOUBLE or FLOAT `/` or `%` follows IEEE 754 and returns an infinity or NaN, as DuckDB does under its default `ieee_floating_point_ops = true`; with that setting off DuckDB raises or returns NULL instead, and Sirius, which does not read it, still returns the IEEE value. Only `NVRTC_JIT` kernels check a divisor. The `MATERIALIZE` and cuDF AST strategies hand it to cuDF, which leaves the row of a zero divisor undefined, as it lets an integer sum wrap: under them such a query returns a wrong value instead of DuckDB's error.
+- **AND, OR and IN.** Only a later operand that can raise a SQL error has to run on exactly the
+  rows where DuckDB evaluates it. Any other later AND or OR operand or IN list value changes no
+  result wherever it runs, so `translation_context::skips_decided_rows` chooses by cost alone.
+  Input loads are unconditional, so a branch around an operand saves only the work on its
+  Register Values, and only in a warp whose 32 rows are all decided. An operand that only tests
+  fixed-width inputs (comparisons, BETWEEN, IN and IS NULL over columns and constants, and AND,
+  OR and NOT of those) has next to no such work and runs on every row without a branch: with the
+  branch, the predicate kernel of the `F01_q6_pred` benchmark case took 74 us instead of 56 us at
+  16M rows and that of `DS28_q28_filter` 125 us instead of 57 us. An operand that computes a
+  value (any other node whose result is not BOOLEAN, such as arithmetic, a cast, a date part or a
+  CASE) or reads a string, whose bytes the device runtime walks in a loop, is skipped for the
+  decided rows: `LG_rare_and_costly`, whose first operand leaves 1 % of the rows undecided, takes
+  202 us with the branches and 681 us without. The branch is a loss where few warps are fully
+  decided: `H16_q16_filter_part` takes 245 us with its string operands skipped and 218 us with
+  every operand run on every row.
 - **Constants** travel as kernel parameters so one compiled kernel serves every literal value;
-  only a constant's NULL-ness is baked into the source. Overflow and the null counts are read
-  back once per evaluation through a pinned staging slab (`read_status_words`), which is the one
-  host synchronization of an evaluation; a projection whose outputs are statically non-null and
-  cannot overflow does not synchronize at all. Binding a string column reads nothing from the
-  device: the end of its characters is derived in-kernel from `offsets[num_rows]`.
-- **Overflow messages.** The status words say only that Overflow Poison reached the NVRTC Sink. `translation_context` records each Overflow Site it emits outside TRY, other than a TRY_CAST's own conversion, and `read_status_words` names it in the error (`Overflow in NVRTC evaluation of abs(INTEGER) -> INTEGER`), or lists up to four candidates when the kernel holds several distinct sites. The record stays on the host: the kernel source, its registers and its cache key do not change.
+  only a constant's NULL-ness and the precision of a ROUND are baked into the source. Overflow
+  and the null counts are read back once per evaluation through a pinned staging slab
+  (`read_status_words`), which is the one host synchronization of an evaluation; a projection
+  whose outputs are statically non-null and cannot overflow does not synchronize at all. Binding
+  a string column reads nothing from the device: the end of its characters is derived in-kernel
+  from `offsets[num_rows]`.
+- **Overflow messages.** The status words say only that Overflow Poison reached the NVRTC Sink. `translation_context` records each Overflow Site it emits outside TRY, other than a TRY_CAST's own conversion, and `read_status_words` names it in the error (`Overflow in NVRTC evaluation of abs(INTEGER) -> INTEGER`), or lists up to four candidates when the kernel holds several distinct sites. The error reads `Overflow or division by zero` when one of them is a division or modulo. The record stays on the host: the kernel source, its registers and its cache key do not change.
 - **String constants** are passed as a device pointer and a length (`c_N_ptr`, `c_N_len`). A
   kernel's string constants are concatenated into one pool, which the query's
   `nvrtc::string_constant_cache` (in the `expression_query_caches` shared through the pipeline
@@ -194,21 +234,34 @@ array from one parameter table; `sink_launch.cpp` compiles, launches and reads s
   copies them or blocks the host on them. Each copy is charged to its device's GPU memory space,
   not to the reservation of the task that first needed it, and is freed when the query ends, on
   the cache's stream once every launch that read it has finished, without a host wait.
-- **Filters** compact survivors in a single pass for a one-tile batch, otherwise in three
-  launches: the predicate kernel writes a survivor count per tile plus the per-warp ballot words,
-  a one-block scan turns the counts into tile offsets, and a scatter kernel writes the surviving
-  row indices in ascending order with coalesced stores. The survivors feed `cudf::gather` (or are
-  returned to late materialization).
-- **Strings** are `str_view{ptr, len, limit}` registers; `limit` bounds word-at-a-time loads.
+- **Filters.** A filter warp votes once per item with `__ballot_sync`, and lane `i` keeps the
+  ballot word of item `i` in a register, so the item loop writes no memory and a warp's 16 words
+  cover consecutive rows. A one-tile batch writes its survivors from those registers in a single
+  pass. Any other batch takes two launches. The predicate kernel stores each warp's ballot words
+  (one coalesced store) and a survivor count per tile, and adds that count to the total of the
+  tile's group of 256 tiles. The scatter kernel, whose warps load their 16 words back into
+  registers, writes the surviving row indices in ascending order with coalesced stores: a block
+  finds where its tile's survivors start by summing the totals of the groups before its own and
+  the counts of the tiles before it in its group, so no tile waits for another and no launch runs
+  a prefix sum over all tiles. The block of the last tile publishes the survivor total. The
+  survivors feed `cudf::gather` (or are returned to late materialization).
+- **Strings** are `str_view{ptr, len, limit}` registers; `limit` bounds word-at-a-time loads:
+  `load_bounded_word` loads no byte at or after it and reads the buffer's last, cut-short word
+  with narrower aligned loads, so the matchers need no padding after a column's characters.
   `%lit1%...%litN%` LIKE patterns and `contains` use a SWAR digram matcher (the literal
   descriptor is a kernel parameter) when the `like_swar_fastpath` setting is on, classified once
   per query through the query's shared LIKE cache and capped at eight descriptors per kernel;
   other patterns use a byte-wise backtracking matcher.
-- **Compile time.** The device runtime preamble is self-contained (its own limits, traits,
-  checked 128-bit arithmetic and civil-calendar helpers; no CCCL includes), because parsing
-  `<cuda/std/chrono>` and `<cuda/numeric>` dominated every kernel compile. Compiled kernels are
-  cached in memory and on disk (`SIMPATICO_JIT_CACHE_DIR`). `SIRIUS_NVRTC_DUMP_DIR` writes every
-  generated source for inspection.
+- **Compile time.** The device runtime preamble is self-contained (its own fixed-width integer
+  types, limits, traits, checked 128-bit arithmetic and civil-calendar helpers; no includes),
+  because parsing `<cuda/std/chrono>` and `<cuda/numeric>` dominated every kernel compile and
+  even `<cuda/std/cstdint>` cost each one about 12 ms. The kernels are therefore compiled without
+  named headers (`CompileOptions::embedded_headers` off), which also spares NVRTC registering the
+  embedded CCCL bundle, and such a compilation passes NVRTC `--minimal`, which leaves out its
+  built-in declarations of the CUDA runtime API that no kernel here uses. Compiled kernels are
+  cached in memory and on disk (`SIMPATICO_JIT_CACHE_DIR`), one module per source: pipeline
+  threads that need the same kernel at once wait for a single compilation.
+  `SIRIUS_NVRTC_DUMP_DIR` writes every generated source for inspection.
 - **Benchmarking.** `sirius_unittest "[expr_bench]"` times a fixed set of projections and
   filters across all four strategies (see the header of
   `test/cpp/expression_evaluator/bench_expression_evaluator.cpp`).
@@ -237,6 +290,14 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 SET expression_evaluator_strategy = 'nvrtc_jit';   -- or 'ast_jit', 'ast_interpret', 'materialize'
 ```
 
+`NVRTC_JIT` has one further setting, registered next to it and off by default:
+
+```sql
+SET nvrtc_jit_fuse_multiply_add = true;
+```
+
+With it NVRTC may fuse a DOUBLE or FLOAT multiplication with an addition or subtraction of its product into one operation, which does not round the product before it adds. Multiply-add chains run faster. The sum then differs from DuckDB's and the other strategies' by up to one rounding of the product, and which operations are fused changes with the shape of the surrounding expression. Where nothing cancels that is at most the last bit of the sum. Where the terms cancel it is the whole result: with `c` holding the rounded product of `a` and `b`, `a * b - c` is 0 on DuckDB and the rounding error of the product, of either sign, when fused. Whatever is computed from such a value can then differ too: a comparison and so the rows of a filter, the branch of a CASE, a cast to an integer or DECIMAL, a join or group key. The other strategies ignore the setting.
+
 ### Policy ownership
 
 At query initialization, Sirius snapshots the connection's settings into immutable
@@ -244,11 +305,12 @@ At query initialization, Sirius snapshots the connection's settings into immutab
 pass it to their evaluators. Scan materialization and residual filtering forward the
 same policy explicitly; pin operations supply their own settings snapshot.
 
-Each evaluator owns a constant copy of both the execution strategy and the regex JIT
-flag. Evaluation therefore uses the settings captured at construction, including when
-it runs on a different worker thread. It does not consult thread-local settings or
-mutable process globals. Standalone callers may omit the policy to use fixed defaults
-(`AST_INTERPRET`, regex JIT enabled), or pass an explicit policy.
+Each evaluator owns a constant copy of the execution strategy, the regex JIT flag and
+the fused multiply-add choice. Evaluation therefore uses the settings captured at
+construction, including when it runs on a different worker thread. It does not consult
+thread-local settings or mutable process globals. Standalone callers may omit the policy
+to use fixed defaults (`AST_INTERPRET`, regex JIT enabled, no fused multiply-add), or
+pass an explicit policy.
 
 ## SQL errors
 

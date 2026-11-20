@@ -2079,6 +2079,7 @@ TEST_CASE("scan forwards its pipeline expression policy to residual filtering",
     sirius::operator_params options;
     options.expression_strategy = strategy;
     options.enable_regex_jit    = strategy != sirius::expression_evaluator_strategy::MATERIALIZE;
+    options.nvrtc_jit_fuse_multiply_add = !options.enable_regex_jit;
     sirius::pipeline::pipeline_build_context ctx{
       nullptr, true, 1, std::make_shared<const sirius::operator_params>(options)};
     scan.set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
@@ -2090,6 +2091,8 @@ TEST_CASE("scan forwards its pipeline expression policy to residual filtering",
     REQUIRE(ingestible->observed_policy.has_value());
     CHECK(ingestible->observed_policy->strategy == strategy);
     CHECK(ingestible->observed_policy->regex_jit == options.enable_regex_jit);
+    CHECK(ingestible->observed_policy->nvrtc_jit_fuse_multiply_add ==
+          options.nvrtc_jit_fuse_multiply_add);
     e.stream().sync();
   }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -105,34 +105,37 @@ struct like_policy {
 inline constexpr std::size_t max_like_pattern_parameters = 8;
 
 /**
- * @brief Compile-time state passed through produce/consume tracking input column bindings, loaded
+ * @brief Compile-time state passed through produce/consume, tracking input column bindings, loaded
  *        per-row Register Values, runtime scalar constant parameters, and emitted CUDA statements.
  *
  * The @c translation_context produces, and the sinks (@c evaluate_project_sink,
  * @c evaluate_filter_sink) consume. The contract between them is the generated text:
  *   - @c body_code() is a sequence of statements that evaluate the produced expressions for one
- *     row. It expects the row number in scope and the kernel parameters that @c kernel_abi
+ *     row. It expects the row number `row` in scope and the kernel parameters that @c kernel_abi
  *     emits for this context (`in_N_*`, `c_N_*`, `lp_N`, and `in_N_chars_end` from the kernel
- *     prelude), plus `bool row_subquery_error` when @c has_subquery_error() is true.
+ *     prelude), plus `bool row_subquery_error` when @c has_subquery_error() is true. The
+ *     statements depend on nothing else a kernel has in scope (its thread, lane or item index)
+ *     and store to no memory, so evaluating the same `row` again, in any thread, gives the same
+ *     Register Values. @c evaluate_project_sink() relies on this to evaluate the last row in place
+ *     of an item past the end of the batch.
  *   - Every statement produced for a node defines a local `reg_val<T> v_N` named by the returned
  *     @c register_value::var_name; its `.val`, `.valid` and `.overflow` are what a sink reads.
  *   - Input loads and constant initializations go to a prelude that runs before any branch, so a
  *     later `if` arm never introduces a load; node statements follow in the body.
  *
- * The generated code evaluates an operation for a row exactly when DuckDB's `ExpressionExecutor`
- * does for the operands' given order, so it raises a SQL error where DuckDB does. DuckDB evaluates
- * a filter predicate and a CASE WHEN condition with `Select`, which recurses into AND and OR and
- * runs a later operand only on the rows the earlier operands leave undecided (for AND, only where
- * all of them are TRUE). It evaluates every other node with `Execute`, which runs every AND or OR
- * operand and every IN list value on every row. `produce_condition` emits a node in the first
- * position and `produce` in the second, where a later AND or OR operand or IN list value is still
- * skipped for a decided row when it cannot raise a SQL error, because skipping it then changes no
- * result.
+ * `produce_condition` follows DuckDB's `Select` for filter predicates and CASE WHEN
+ * conditions. Through an AND/OR chain, it evaluates a later AND operand only if
+ * all earlier operands are TRUE, and a later OR operand only if none is TRUE.
+ * `produce` follows DuckDB's `Execute`, which evaluates every AND/OR operand and
+ * every IN list value.
  *
- * The @c overflow_sites() point into the expression trees the context produced, so a context must
- * not outlive those trees, and its sites must never be cached with a compiled kernel in
- * `codegen::jit::KernelCache`, which outlives every tree. `evaluate_project_sink` and
- * `evaluate_filter_sink` create one context per launch.
+ * These rules determine which rows must evaluate operands that can raise a SQL
+ * error. The generated code may skip other operands once the result is known.
+ * Input columns are loaded before any branch.
+ *
+ * `overflow_sites()` borrows nodes from the input expression trees. The trees
+ * must outlive the context, and the sites must stay out of the compiled kernel
+ * cache.
  */
 class translation_context {
  public:
@@ -194,6 +197,10 @@ class translation_context {
   [[nodiscard]] std::string body_code() const { return _prelude + _body; }
 
  private:
+  /** @brief Returns whether @p expr is read from a Materialization Boundary column. */
+  [[nodiscard]] bool is_boundary_column(sirius::ast::node const& expr) const;
+  /** @brief Dispatches @p expr to the `produce_*` method of its node type. */
+  [[nodiscard]] register_value produce_node(sirius::ast::node const& expr);
   [[nodiscard]] register_value produce_reference(sirius::ast::reference const& expr);
   [[nodiscard]] register_value produce_constant(sirius::ast::constant const& expr);
   [[nodiscard]] register_value produce_comparison(sirius::ast::comparison const& expr);
@@ -207,6 +214,7 @@ class translation_context {
   struct operand_mark {
     std::size_t body_size;
     std::size_t subquery_error_checks;
+    std::size_t computed_values;
   };
 
   [[nodiscard]] register_value produce_conjunction(sirius::ast::conjunction const& expr,
@@ -241,10 +249,13 @@ class translation_context {
                            std::string_view name,
                            std::string_view expr);
 
-  /** @brief Records the current end of the body and the number of subquery-error checks so far. */
+  /**
+   * @brief Records the current end of the body and the numbers of subquery-error checks and of
+   * computed values produced so far.
+   */
   [[nodiscard]] operand_mark mark_operand() const noexcept
   {
-    return operand_mark{_body.size(), _subquery_error_checks};
+    return operand_mark{_body.size(), _subquery_error_checks, _computed_values};
   }
 
   /**
@@ -255,6 +266,23 @@ class translation_context {
                                      register_value const& operand) const noexcept
   {
     return operand.can_overflow || _subquery_error_checks > mark.subquery_error_checks;
+  }
+
+  /**
+   * @brief Returns whether the later AND or OR operand or IN list value produced since @p mark,
+   * whose result is @p operand, runs only for the rows that the earlier operands leave undecided.
+   *
+   * In @p position `condition` an operand that can raise must be skipped for the other rows, and
+   * as a value it must run on every row. An operand that cannot raise is skipped for them when it
+   * computes a value or reads a string, and runs on every row when it only tests fixed-width
+   * inputs.
+   */
+  [[nodiscard]] bool skips_decided_rows(operand_mark mark,
+                                        register_value const& operand,
+                                        operand_position position) const noexcept
+  {
+    if (can_raise_since(mark, operand)) { return position == operand_position::condition; }
+    return _computed_values > mark.computed_values;
   }
 
   /** @brief Wraps the statements emitted since @p mark in `if (condition) { ... }`. */
@@ -357,6 +385,7 @@ class translation_context {
   std::vector<overflow_site> _overflow_sites;
   std::size_t _narrow_domain_comparison_count{0};
   std::size_t _subquery_error_checks{0};
+  std::size_t _computed_values{0};  ///< Nodes produced that compute a value or yield a string.
   std::string _prelude;
   std::string _body;
   std::size_t _next_var_id{0};

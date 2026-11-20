@@ -193,21 +193,23 @@ beam-search explorer enumerates hundreds of thousands of candidate shapes, so th
 what makes runtime codegen practical.
 
 Both cache levels use one compilation identity, specified in [CACHE_FORMAT.md](CACHE_FORMAT.md).
-The request identifies the rendered source, entry symbol, program name, architecture, and
-actual ordered NVRTC options. The environment identifies both project JIT headers and the
-complete CCCL bundle, plus the reported NVRTC major/minor version. XXH3-128 makes
-accidental collisions unlikely, not impossible.
+The request identifies the rendered source, program name, architecture, actual ordered NVRTC
+options, and whether the embedded headers are supplied; a source that defines several kernels
+is one request, and each kernel is resolved from its compiled module by entry symbol. The
+environment identifies both project JIT headers and the complete CCCL bundle, plus the reported
+NVRTC major/minor version. XXH3-128 makes accidental collisions unlikely, not impossible.
 
-1. **In-memory** (per process, thread-safe): request digest → compiled kernel. The embedded
+1. **In-memory** (per process, thread-safe): request digest → compiled module. The embedded
    environment is fixed within the binary, so it is not copied or rehashed on warm lookups.
 2. **On-disk** (persistent, shared across processes and runs): each cubin is stored as
-   `<dir>/v2/<environment-id>/<request-id>.cubin`. On a hit the cubin is loaded directly,
+   `<dir>/v3/<environment-id>/<request-id>.cubin`. On a hit the cubin is loaded directly,
    skipping compilation of the requested kernel. The reader validates the record's length,
    size limit and payload checksum before CUDA loading. Invalid storage records and
    reported CUDA load errors fall through to a fresh compile.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
-both levels). Concurrent cold requests may compile redundantly.
+both levels). Concurrent cold requests for one shape share a single disk load or compile within
+a process; separate processes may still compile redundantly.
 
 Shared and static builds use `nvrtcVersion` major/minor; same-version compiler patches
 intentionally retain disk reuse. Compiler/builtins files and static archives are not hashed,
@@ -221,14 +223,14 @@ Replacing the compiler or runtime while a process is running is not supported.
 
 First disk use in each process touches the current environment, removes recognized legacy
 flat entries, and prunes old environments. Keep the current environment plus the three newest
-others, with a one-hour grace period for additional environments. Only recognized v2 records
+others, with a one-hour grace period for additional environments. Only recognized v2/v3 records
 and cache temporaries are removed; unrelated files, nested content, unknown versions, and
 symlinks are preserved. Pruning is best effort, not a strict directory/byte cap or live-process
 lease: a long-running older process can lose disk reuse or a pending publication and recompile.
 Memory hits and later disk hits neither refresh timestamps nor rerun pruning.
 
 `codegen::jit::clear_jit_disk_cache()` remains explicit maintenance with writers stopped.
-It removes recognized legacy/v2 records and abandoned temporaries across all environments,
+It removes recognized legacy/v2/v3 records and abandoned temporaries across all environments,
 including the current one, regardless of age. Already-loaded kernels are unaffected.
 
 Disk records carry a length and payload checksum, validated before CUDA loading.
@@ -257,6 +259,10 @@ headers (`nvrtcCreateProgram`):
 - the complete installed CCCL library trees (`cuda/`, `cub/`, `thrust/`, and `nv/`),
   embedded by `cmake/embed_cccl_headers.cmake`, including internal and extensionless headers.
 
+A source that includes none of these headers is compiled without them when its caller sets
+`CompileOptions::embedded_headers = false`; NVRTC otherwise spends a few milliseconds of every
+compilation registering the bundle.
+
 Simpatico links to `cudf::cudf`, inheriting libcudf's CCCL headers and namespace/feature
 definitions through its exported CMake targets. CMake also supplies the embedding script
 with the evaluated include directories from `CCCL::CCCL`. This supports both installed
@@ -282,7 +288,7 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 | Variable | Effect |
 | --- | --- |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
-| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` for requested kernels at exit. |
+| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms / joined` for requested kernels at exit (`joined` = requests that waited for an identical request already compiling or loading). |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
 | `CODEGEN_JIT_DUMP_ENCODE_SOURCE` / `CODEGEN_JIT_DUMP_DECODE_SOURCE` | Debug: if set to a path, writes the rendered encode/decode CUDA source there. |
 

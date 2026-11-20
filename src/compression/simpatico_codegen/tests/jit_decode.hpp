@@ -77,7 +77,7 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
     throw std::runtime_error(std::string("decode compile: ") + e.what() + "\n--- log ---\n" +
                              e.log);
   }
-  if (kernel == nullptr || kernel->kern == nullptr) {
+  if (kernel == nullptr || kernel->kern() == nullptr) {
     throw std::runtime_error("decode compile returned null kernel");
   }
 

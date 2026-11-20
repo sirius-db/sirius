@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,15 +25,12 @@
  * Fragment 5 of the NVRTC expression evaluator device runtime.
  */
 
-#include "codegen/stdint_shim.hpp"
-
 //===----------STR_VIEW REGISTER----------===//
 struct str_view {
   char const* ptr;
   int32_t len;
-  char const*
-    limit;  ///< End of the readable allocation the string lives in; word-at-a-time matchers may
-            ///< read the aligned words that overlap [ptr, ptr + len) only up to this bound.
+  char const* limit;  ///< Read bound: the end of the characters of the column slice, or of the
+                      ///< constant, the string lives in.
 };
 
 //===-------------------------------------------------------------------------===//
@@ -81,13 +78,33 @@ __device__ __forceinline__ uint64_t swar_byte_eq_mask(uint64_t x, uint64_t bcast
   return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;
 }
 
-/// @brief Aligned 8-byte word at @p addr, zero-padded past the allocation bound @p limit.
+/**
+ * @brief 8-byte word at @p addr, a multiple of 8, with every byte at or after the read bound
+ *        @p limit (see @c str_view::limit) read as zero.
+ *
+ * No byte at or after @p limit is loaded. A word that @p limit cuts short is assembled from at most
+ * one 4-byte, one 2-byte and one 1-byte load, selected by the bits of the number of readable bytes;
+ * each is aligned because @p addr is.
+ */
 __device__ __forceinline__ uint64_t load_bounded_word(uintptr_t addr, uintptr_t limit)
 {
   if (addr + 8U <= limit) { return *reinterpret_cast<uint64_t const*>(addr); }
-  uint64_t value = 0ULL;
-  for (uintptr_t b = addr; b < limit; ++b) {
-    value |= static_cast<uint64_t>(*reinterpret_cast<uint8_t const*>(b)) << ((b - addr) << 3);
+  if (addr >= limit) { return 0ULL; }
+  uint32_t const readable = static_cast<uint32_t>(limit - addr);
+  uint64_t value          = 0ULL;
+  uintptr_t offset        = 0U;
+  if ((readable & 4U) != 0U) {
+    value  = *reinterpret_cast<uint32_t const*>(addr);
+    offset = 4U;
+  }
+  if ((readable & 2U) != 0U) {
+    value |= static_cast<uint64_t>(*reinterpret_cast<uint16_t const*>(addr + offset))
+             << (offset << 3);
+    offset += 2U;
+  }
+  if ((readable & 1U) != 0U) {
+    value |= static_cast<uint64_t>(*reinterpret_cast<uint8_t const*>(addr + offset))
+             << (offset << 3);
   }
   return value;
 }

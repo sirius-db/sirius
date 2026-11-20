@@ -120,7 +120,7 @@ int main()
     return report_fail(e.what());
   }
   if (!k1) return report_fail("first get_or_compile_plain returned null");
-  if (!k1->kern) return report_fail("CUkernel is null after cold compile");
+  if (!k1->kern()) return report_fail("CUkernel is null after cold compile");
   if (cache.size() != 1) return report_fail("cache size != 1 after first insert");
 
   // --- 2. Warm lookup of spec_a — same pointer, fast. ----------------
@@ -206,7 +206,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k_for_i32 || !k_for_i32->kern) {
+  if (!k_for_i32 || !k_for_i32->kern()) {
     return report_fail("For{Bitpack}<int32_t> compile returned null");
   }
 
@@ -219,7 +219,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail(e.what());
   }
-  if (!k_for_i64 || !k_for_i64->kern) {
+  if (!k_for_i64 || !k_for_i64->kern()) {
     return report_fail("For{Bitpack}<int64_t> compile returned null");
   }
   if (k_for_i64 == k_for_i32) { return report_fail("int64 For slot collided with int32 For slot"); }
@@ -248,6 +248,101 @@ int main()
   }
 
   const std::size_t final_size = cache.size();
+
+  // --- Several entry symbols of one source: one module, one load. ----
+  // The cache keys the compiled source, not the entry symbol, so a source
+  // that defines several kernels is compiled (or read from disk) once and
+  // every entry symbol resolves from that module.
+  {
+    const std::string two_kernels =
+      "extern \"C\" __global__ void cache_plain_first(int* out) { *out = 1; }\n"
+      "extern \"C\" __global__ void cache_plain_second(int* out) { *out = 2; }\n";
+    const auto loads_before = cjj::compile_stats().loads;
+    std::shared_ptr<const cjj::CompiledKernel> first;
+    std::shared_ptr<const cjj::CompiledKernel> second;
+    bool missing_rejected = false;
+    try {
+      first  = cache.get_or_compile_plain(two_kernels, "cache_plain_first", opts);
+      second = cache.get_or_compile_plain(two_kernels, "cache_plain_second", opts);
+      try {
+        (void)cache.get_or_compile_plain(two_kernels, "cache_plain_missing", opts);
+      } catch (const cjj::CompileError&) {
+        throw;
+      } catch (const std::runtime_error&) {
+        missing_rejected = true;
+      }
+    } catch (const cjj::CompileError& e) {
+      return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
+    } catch (const std::exception& e) {
+      return report_fail(e.what());
+    }
+    if (!first || !second || !first->kern() || !second->kern()) {
+      return report_fail("two-kernel source returned a null kernel");
+    }
+    if (first == second || first->kern() == second->kern()) {
+      return report_fail("two entry symbols resolved to the same kernel");
+    }
+    if (&first->module() != &second->module()) {
+      return report_fail("kernels of one source belong to different modules");
+    }
+    if (cjj::compile_stats().loads != loads_before + 1) {
+      return report_fail("a second entry symbol loaded its source again");
+    }
+    if (!missing_rejected) return report_fail("an entry symbol the source lacks returned a kernel");
+    if (cache.size() != final_size + 1) {
+      return report_fail("two-kernel source did not add exactly one cache entry");
+    }
+    if (cache.get_or_compile_plain(two_kernels, "cache_plain_first", opts) != first) {
+      return report_fail("repeated lookup of an entry symbol returned a different kernel");
+    }
+
+    // A kernel handle keeps its whole module loaded, and with it the other kernels.
+    std::weak_ptr<const cjj::CompiledKernel> released = second;
+    second.reset();
+    cache.clear();
+    if (released.expired()) return report_fail("module unloaded while one of its kernels is held");
+    first.reset();
+    if (!released.expired()) return report_fail("module survived the release of its last kernel");
+  }
+
+  // --- Embedded headers are a compile input. --------------------------
+  // A source that includes none of them compiles without the bundle, as a
+  // cache entry of its own; one that includes any fails without it.
+  {
+    cjj::CompileOptions without_headers = opts;
+    without_headers.embedded_headers    = false;
+    const std::string self_contained =
+      "extern \"C\" __global__ void cache_plain_bare(int* out) { *out = 3; }\n";
+    const std::string needs_header =
+      "#include \"codegen/stdint_shim.hpp\"\n"
+      "extern \"C\" __global__ void cache_plain_shim(int32_t* out) { *out = 4; }\n";
+    const auto size_before = cache.size();
+    bool missing_header    = false;
+    try {
+      const auto bare =
+        cache.get_or_compile_plain(self_contained, "cache_plain_bare", without_headers);
+      const auto bundle = cache.get_or_compile_plain(self_contained, "cache_plain_bare", opts);
+      if (!bare || !bundle || !bare->kern() || !bundle->kern()) {
+        return report_fail("header-free source returned a null kernel");
+      }
+      if (bare == bundle || cache.size() != size_before + 2) {
+        return report_fail("header availability is not part of the cache key");
+      }
+      if (!cache.get_or_compile_plain(needs_header, "cache_plain_shim", opts)) {
+        return report_fail("source with an embedded header returned a null kernel");
+      }
+      try {
+        (void)cache.get_or_compile_plain(needs_header, "cache_plain_shim", without_headers);
+      } catch (const cjj::CompileError&) {
+        missing_header = true;
+      }
+    } catch (const cjj::CompileError& e) {
+      return report_fail(e.what(), "log:\n" + e.log + "\n--- source ---\n" + e.source);
+    } catch (const std::exception& e) {
+      return report_fail(e.what());
+    }
+    if (!missing_header) return report_fail("a source compiled against a header it was not given");
+  }
   std::printf(
     "test_jit_kernel_cache_plain: OK "
     "(cold=%.1f ms, warm=%.3f ms, speedup=%.0fx, size=%zu)\n",

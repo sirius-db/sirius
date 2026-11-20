@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include <sirius/exception.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <format>
 #include <iterator>
@@ -49,10 +50,9 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
   return -type.scale();
 }
 
-/** @brief 10^exp as an __int128_t literal, for resolving scale gaps between decimals. */
 /**
- * @brief Decimal digits available to @p type: its SQL precision, or the 38 digits of the DECIMAL128
- *        carrier for HUGEINT, which has no SQL precision of its own.
+ * @brief Decimal digits a cast to @p type is checked for: its SQL precision, or the 38 digits of
+ * the DECIMAL128 carrier for HUGEINT, which has no SQL precision of its own.
  */
 [[nodiscard]] int target_decimal_precision(sirius::logical_type const& type)
 {
@@ -60,19 +60,50 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
   return static_cast<int>(type.decimal_precision());
 }
 
-[[nodiscard]] std::string format_int128_pow10(int exp)
+/** @brief @p val as an __int128_t literal built from the two 64-bit halves of its bits. */
+[[nodiscard]] std::string format_int128(__int128_t val)
 {
-  if (exp <= 0) { return "static_cast<__int128_t>(1)"; }
-  __int128_t val = 1;
-  for (int i = 0; i < exp; ++i) {
-    val *= 10;
-  }
   auto const uval = static_cast<unsigned __int128>(val);
   auto const hi   = static_cast<std::uint64_t>(uval >> 64);
   auto const lo   = static_cast<std::uint64_t>(uval);
   if (hi == 0) { return format("static_cast<__int128_t>({}ULL)", lo); }
   return format(
-    "((static_cast<__int128_t>({}ULL) << 64) | static_cast<__int128_t>({}ULL))", hi, lo);
+    "static_cast<__int128_t>((static_cast<unsigned __int128>({}ULL) << 64) | {}ULL)", hi, lo);
+}
+
+/**
+ * @brief 10^exp.
+ *
+ * @pre `0 <= exp <= 38`, the widest DECIMAL scale: 128 bits hold no higher power of ten.
+ */
+[[nodiscard]] __int128_t pow10_int128(int exp) noexcept
+{
+  __int128_t val = 1;
+  for (int i = 0; i < exp; ++i) {
+    val *= 10;
+  }
+  return val;
+}
+
+/** @brief 10^exp as an __int128_t literal, for resolving scale gaps between decimals. */
+[[nodiscard]] std::string format_int128_pow10(int exp) { return format_int128(pow10_int128(exp)); }
+
+/**
+ * @brief The lowest and the highest value DuckDB returns for a sum, difference or product of @p
+ *        type, as the two __int128_t literals that `eval_dec_add`, `eval_dec_sub` and
+ *        `eval_dec_mul` take.
+ *
+ * A DECIMAL holds fewer than 10^precision in magnitude, which is less than its carrier holds.
+ * HUGEINT holds everything its 128-bit carrier holds.
+ */
+[[nodiscard]] std::string format_value_limits(sirius::logical_type const& type)
+{
+  auto const carrier_max = static_cast<__int128_t>(~static_cast<unsigned __int128>(0) >> 1);
+  bool const is_hugeint  = type.id() == sirius::type_id::HUGEINT;
+  auto const highest =
+    is_hugeint ? carrier_max : pow10_int128(static_cast<int>(type.decimal_precision())) - 1;
+  auto const lowest = is_hugeint ? -carrier_max - 1 : -highest;
+  return format("{}, {}", format_int128(lowest), format_int128(highest));
 }
 
 /** @brief 10^exp as a double literal, for casts that multiply or divide in floating point. */
@@ -83,6 +114,16 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
     val *= 10.0;
   }
   return format("{:.17e}", val);
+}
+
+/**
+ * @brief An expression whose value has exactly the bits of @p value, an infinity included, and
+ *        that the device compiler folds to a constant.
+ */
+[[nodiscard]] std::string format_double_bits(double value)
+{
+  return format("__longlong_as_double(static_cast<long long>(0x{:016x}ULL))",
+                std::bit_cast<std::uint64_t>(value));
 }
 
 [[nodiscard]] std::int64_t date_trunc_divisor(cudf::type_id id,
@@ -124,7 +165,8 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
 
 /**
  * @brief static_cast<T>(v_N.val), multiplied by 10^(target_scale - own_scale) for a decimal that
- *        must be brought to a larger scale.
+ *        must be brought to a larger scale. The multiplication wraps: the comparison also runs on
+ *        a payload that carries Overflow Poison, which is unspecified.
  */
 [[nodiscard]] std::string comparison_operand(register_value const& reg,
                                              std::string const& cmp_type,
@@ -133,7 +175,8 @@ cudf::data_type const bool8_type{cudf::type_id::BOOL8};
 {
   auto operand = format("static_cast<{}>({}.val)", cmp_type, reg.var_name);
   if (target_scale > own_scale) {
-    operand = format("({} * {})", operand, format_int128_pow10(target_scale - own_scale));
+    operand =
+      format("rescale_wrapping({}, {})", operand, format_int128_pow10(target_scale - own_scale));
   }
   return operand;
 }
@@ -717,7 +760,7 @@ register_value translation_context::produce_conjunction(sirius::ast::conjunction
     auto const mark = mark_operand();
     auto const rhs  = produce_operand(**it);
     emit_line(format("{0} = {1}({0}, {2});", var_name, fn_name, rhs.var_name));
-    if (in_condition || !can_raise_since(mark, rhs)) { guard_since(mark, guard); }
+    if (skips_decided_rows(mark, rhs, position)) { guard_since(mark, guard); }
     non_null = non_null && rhs.is_statically_non_null;
     can_ovf  = can_ovf || rhs.can_overflow;
   }
@@ -837,7 +880,7 @@ register_value translation_context::produce_in_list(sirius::ast::in_list const& 
       emit_line(format("{} = {};", var_name, eq_var));
     } else {
       emit_line(format("{0} = eval_kleene_or({0}, {1});", var_name, eq_var));
-      if (!can_raise_since(mark, val_reg)) { guard_since(mark, guard); }
+      if (skips_decided_rows(mark, val_reg, operand_position::value)) { guard_since(mark, guard); }
     }
   }
   if (expr.negated) { emit_line(format("{0}.val = !{0}.val;", var_name)); }
@@ -1046,34 +1089,35 @@ register_value translation_context::produce_unary_op(sirius::ast::unary_op const
 //===----------BINARY ARITHMETIC FUNCTIONS----------===//
 register_value translation_context::produce_arithmetic(sirius::ast::function_call const& expr)
 {
-  auto const fid           = expr.function();
-  auto const& args         = expr.arguments();
-  auto const ret_type      = sirius::require_cudf_type(expr.return_type());
-  auto const type_str      = cuda_type_name(ret_type);
-  auto const var_name      = next_var_name();
-  auto const lhs           = produce(*args[0]);
-  auto const rhs           = produce(*args[1]);
-  bool const is_div_or_mod = fid == sirius::function_id::div ||
-                             fid == sirius::function_id::int_div || fid == sirius::function_id::mod;
+  auto const fid      = expr.function();
+  auto const& args    = expr.arguments();
+  auto const ret_type = sirius::require_cudf_type(expr.return_type());
+  auto const type_str = cuda_type_name(ret_type);
+  auto const var_name = next_var_name();
+  auto const lhs      = produce(*args[0]);
+  auto const rhs      = produce(*args[1]);
 
   if (cudf::is_fixed_point(ret_type)) {
-    int const s_l   = sql_decimal_scale(lhs.device_type);
-    int const s_r   = sql_decimal_scale(rhs.device_type);
-    int const s_max = std::max(s_l, s_r);
+    int const s_l     = sql_decimal_scale(lhs.device_type);
+    int const s_r     = sql_decimal_scale(rhs.device_type);
+    int const s_max   = std::max(s_l, s_r);
+    auto const limits = format_value_limits(expr.return_type());
     if (fid == sirius::function_id::add || fid == sirius::function_id::sub) {
       emit_reg_val_assign(type_str,
                           var_name,
-                          format("{}<{}>({}, {}, {}, {})",
+                          format("{}<{}>({}, {}, {}, {}, {})",
                                  fid == sirius::function_id::add ? "eval_dec_add" : "eval_dec_sub",
                                  type_str,
                                  lhs.var_name,
                                  rhs.var_name,
                                  format_int128_pow10(s_max - s_l),
-                                 format_int128_pow10(s_max - s_r)));
+                                 format_int128_pow10(s_max - s_r),
+                                 limits));
     } else if (fid == sirius::function_id::mul) {
-      emit_reg_val_assign(type_str,
-                          var_name,
-                          format("eval_dec_mul<{}>({}, {})", type_str, lhs.var_name, rhs.var_name));
+      emit_reg_val_assign(
+        type_str,
+        var_name,
+        format("eval_dec_mul<{}>({}, {}, {})", type_str, lhs.var_name, rhs.var_name, limits));
     } else if (fid == sirius::function_id::div || fid == sirius::function_id::int_div) {
       int const s_diff = sql_decimal_scale(ret_type) - (s_l - s_r);
       emit_reg_val_assign(type_str,
@@ -1094,10 +1138,9 @@ register_value translation_context::produce_arithmetic(sirius::ast::function_cal
                                  format_int128_pow10(s_max - s_l),
                                  format_int128_pow10(s_max - s_r)));
     }
-    // Every decimal operation narrows a 128-bit intermediate to the output representation.
-    bool const can_ovf  = record_overflow_site(&expr, true, any_can_overflow({&lhs, &rhs}));
-    bool const non_null = all_statically_non_null({&lhs, &rhs}) && !is_div_or_mod;
-    return register_value{var_name, ret_type, non_null, can_ovf};
+    // Every decimal operation can leave the output representation.
+    bool const can_ovf = record_overflow_site(&expr, true, any_can_overflow({&lhs, &rhs}));
+    return register_value{var_name, ret_type, all_statically_non_null({&lhs, &rhs}), can_ovf};
   }
 
   char const* fn_name = nullptr;
@@ -1105,8 +1148,8 @@ register_value translation_context::produce_arithmetic(sirius::ast::function_cal
     case sirius::function_id::add: fn_name = "eval_add"; break;
     case sirius::function_id::sub: fn_name = "eval_sub"; break;
     case sirius::function_id::mul: fn_name = "eval_mul"; break;
-    case sirius::function_id::div:
-    case sirius::function_id::int_div: fn_name = "eval_div"; break;
+    case sirius::function_id::div: fn_name = "eval_div"; break;
+    case sirius::function_id::int_div: fn_name = "eval_int_div"; break;
     case sirius::function_id::mod: fn_name = "eval_mod"; break;
     default:
       throw internal_exception("[nvrtc] function {} is not arithmetic", static_cast<int>(fid));
@@ -1114,15 +1157,12 @@ register_value translation_context::produce_arithmetic(sirius::ast::function_cal
   emit_reg_val_assign(
     type_str, var_name, format("{}<{}>({}, {})", fn_name, type_str, lhs.var_name, rhs.var_name));
 
-  bool const is_int_type = cudf::is_integral(ret_type);
-  bool const op_can_ovf =
-    is_int_type && (fid == sirius::function_id::add || fid == sirius::function_id::sub ||
-                    fid == sirius::function_id::mul ||
-                    ((fid == sirius::function_id::div || fid == sirius::function_id::int_div) &&
-                     !cudf::is_unsigned(ret_type)));
-  bool const can_ovf  = record_overflow_site(&expr, op_can_ovf, any_can_overflow({&lhs, &rhs}));
-  bool const non_null = all_statically_non_null({&lhs, &rhs}) && !(is_div_or_mod && is_int_type);
-  return register_value{var_name, ret_type, non_null, can_ovf};
+  // Integer `+`, `-` and `*` can leave their type. `//` raises for a zero divisor in every type,
+  // and `/` and `%` in every type but DOUBLE and FLOAT, where they follow IEEE 754.
+  bool const is_floating = cudf::is_floating_point(ret_type);
+  bool const op_can_ovf  = fid == sirius::function_id::int_div || !is_floating;
+  bool const can_ovf     = record_overflow_site(&expr, op_can_ovf, any_can_overflow({&lhs, &rhs}));
+  return register_value{var_name, ret_type, all_statically_non_null({&lhs, &rhs}), can_ovf};
 }
 
 //===----------DATE/TIME EXTRACT----------===//
@@ -1356,13 +1396,15 @@ register_value translation_context::produce_function_call(sirius::ast::function_
     bool const neg_prec   = precision < 0;
     double const modifier = std::pow(
       10.0, static_cast<double>(neg_prec ? -static_cast<std::int64_t>(precision) : precision));
-    auto const mod_reg = produce_constant(sirius::ast::constant{
-      sirius::value{modifier}, sirius::logical_type::make(sirius::type_id::DOUBLE)});
-    emit_reg_val_assign(
-      type_str,
-      var_name,
-      format(
-        "eval_round<{}, {}>({}, {}.val)", type_str, neg_prec, child.var_name, mod_reg.var_name));
+    // The modifier is printed, not passed as a constant: the runtime divides by a literal power of
+    // ten without a hardware division.
+    emit_reg_val_assign(type_str,
+                        var_name,
+                        format("eval_round<{}, {}>({}, {})",
+                               type_str,
+                               neg_prec,
+                               child.var_name,
+                               format_double_bits(modifier)));
     return register_value{var_name, ret_type, child.is_statically_non_null, child.can_overflow};
   }
 
@@ -1406,14 +1448,30 @@ register_value translation_context::produce_function_call(sirius::ast::function_
                                   static_cast<int>(fid));
 }
 
+bool translation_context::is_boundary_column(sirius::ast::node const& expr) const
+{
+  return _boundary_map != nullptr && _boundary_map->contains(&expr);
+}
+
 register_value translation_context::produce_condition(sirius::ast::node const& expr)
 {
-  bool const is_boundary = _boundary_map != nullptr && _boundary_map->contains(&expr);
-  if (!expr.holds<sirius::ast::conjunction>() || is_boundary) { return produce(expr); }
+  if (!expr.holds<sirius::ast::conjunction>() || is_boundary_column(expr)) { return produce(expr); }
   return produce_conjunction(expr.get<sirius::ast::conjunction>(), operand_position::condition);
 }
 
 register_value translation_context::produce(sirius::ast::node const& expr)
+{
+  auto const reg      = produce_node(expr);
+  auto const type     = reg.device_type.id();
+  bool const is_input = expr.holds<sirius::ast::reference>() ||
+                        expr.holds<sirius::ast::constant>() || is_boundary_column(expr);
+  if (type == cudf::type_id::STRING || (!is_input && type != cudf::type_id::BOOL8)) {
+    ++_computed_values;
+  }
+  return reg;
+}
+
+register_value translation_context::produce_node(sirius::ast::node const& expr)
 {
   if (_boundary_map != nullptr) {
     if (auto const it = _boundary_map->find(&expr); it != _boundary_map->end()) {

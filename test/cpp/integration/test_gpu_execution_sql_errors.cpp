@@ -25,10 +25,11 @@
  * DuckDB's error even where the row's value is NULL or another AND, OR or IN operand decides it,
  * unless a filter predicate or CASE WHEN condition skips that operand for the row as DuckDB does;
  * an unguarded conversion overflow returns DuckDB's error, as does an overflow in a TRY_CAST's
- * input; and a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value.
- * Each case asserts whether the query completed on the GPU or through CPU Replay, so a replay
- * cannot hide a broken GPU path. Overflow of abs and negation is covered beside their other cases
- * in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
+ * input; a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value; and
+ * a zero divisor returns DuckDB's error, or DuckDB's NULL under `error_on_division_by_zero =
+ * false`. Each case asserts whether the query completed on the GPU or through CPU Replay, so a
+ * replay cannot hide a broken GPU path. Overflow of abs and negation is covered beside their other
+ * cases in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
  */
 
 #include <catch.hpp>
@@ -190,6 +191,60 @@ TEST_CASE_METHOD(SqlErrorFixture,
                             execution_path::gpu);
   expect_error_matches_cpu("SELECT id, TRY_CAST(z + 1 AS INTEGER) FROM try_inputs;",
                            execution_path::cpu_replay);
+}
+
+TEST_CASE_METHOD(SqlErrorFixture,
+                 "a zero divisor returns DuckDB's error wherever DuckDB evaluates the division",
+                 "[integration][gpu_execution][sql_errors]")
+{
+  // Row 1 divides by zero in every type, row 3 has a NULL dividend over a zero divisor and row 4 a
+  // NULL divisor.
+  run_ok(
+    "CREATE TABLE divisions AS SELECT * FROM (VALUES"
+    " (1, 10::BIGINT, 0::BIGINT, 10::INTEGER, 0::INTEGER, 10.5::DOUBLE, 0.0::DOUBLE,"
+    "  1.50::DECIMAL(18,2), 0.00::DECIMAL(18,2)),"
+    " (2, 7, 2, 7, 2, 7.5, 2.0, 7.25, 2.00),"
+    " (3, NULL, 0, NULL, 0, NULL, 0.0, NULL, 0.00),"
+    " (4, 5, NULL, 5, NULL, 5.5, NULL, 5.25, NULL)) v(id, a, b, ia, ib, fa, fb, da, db);");
+  run_ok("CHECKPOINT;");
+  // Only `nvrtc_jit` checks a divisor: the other strategies hand it to cuDF, which leaves the row
+  // of a zero divisor undefined, so they return a wrong value for these queries.
+  sirius::test::scoped_expression_evaluator_strategy strategy_guard{
+    *con, sirius::expression_evaluator_strategy::NVRTC_JIT};
+
+  // `//` raises in every type, `%` in the integer and DECIMAL types.
+  for (auto const* query : {"SELECT id, a % b FROM divisions;",
+                            "SELECT id, a // b FROM divisions;",
+                            "SELECT id, ia % ib FROM divisions;",
+                            "SELECT id, ia // ib FROM divisions;",
+                            "SELECT id, da % db FROM divisions;",
+                            "SELECT id, fa // fb FROM divisions;",
+                            "SELECT id, a % 0 FROM divisions;",
+                            "SELECT id FROM divisions WHERE a % b = 1;"}) {
+    expect_error_matches_cpu(query, execution_path::cpu_replay);
+  }
+
+  // A NULL operand, a CASE branch the row does not select and a filter's AND operand that an
+  // earlier one decides keep the division from the zero divisor, as they do in DuckDB.
+  expect_result_matches_cpu(
+    "SELECT id, a % b, a // b, da % db, fa // fb FROM divisions"
+    " WHERE id <> 1;",
+    execution_path::gpu);
+  expect_result_matches_cpu(
+    "SELECT id, CASE WHEN b <> ib - ib THEN a % b ELSE -1 END FROM divisions;",
+    execution_path::gpu);
+  expect_result_matches_cpu("SELECT id FROM divisions WHERE (b <> ib - ib) AND a % b = 1;",
+                            execution_path::gpu);
+
+  // DOUBLE `/` follows IEEE 754, and BIGINT and DECIMAL `/` are DOUBLE divisions.
+  expect_result_matches_cpu("SELECT id, fa / fb, a / b, da / db FROM divisions;",
+                            execution_path::gpu);
+
+  // With the setting off DuckDB returns NULL for a zero divisor. Sirius does not read the setting:
+  // it still detects the zero divisor, and CPU Replay returns DuckDB's NULL.
+  run_ok("SET error_on_division_by_zero = false;");
+  expect_result_matches_cpu("SELECT id, a % b, a // b, da % db, fa // fb FROM divisions;",
+                            execution_path::cpu_replay);
 }
 
 TEST_CASE_METHOD(SqlErrorFixture,

@@ -25,7 +25,7 @@
 namespace codegen::jit::detail {
 namespace {
 
-constexpr std::string_view magic = "SIMPJIT2";
+constexpr std::string_view magic = "SIMPJIT3";
 static_assert(magic.substr(7) == kCacheFormatVersion.substr(1),
               "record marker must match the cache format version");
 constexpr std::size_t length_offset = magic.size();
@@ -37,6 +37,10 @@ constexpr uint64_t max_cubin_bytes = 256ULL * 1024 * 1024;
 // Retention policy from #2088, applied to input-environment namespaces.
 constexpr std::size_t kept_environments = 4;
 constexpr auto environment_grace        = std::chrono::hours(1);
+// Earlier format versions with the same layout below their version directory. This build never
+// reads their records, but an older build sharing the cache still may, so maintenance treats
+// their environments like the current version's other environments.
+constexpr std::array<std::string_view, 1> superseded_versions{"v2"};
 
 class Descriptor {
  public:
@@ -160,12 +164,25 @@ void clear_legacy_files(const std::filesystem::path& root)
   remove_matching_files(root, legacy);
 }
 
+void remove_directory_if_empty(const std::filesystem::path& path)
+{
+  if (is_directory_no_follow(path)) remove_entry(path);
+}
+
 void clear_environment(const std::filesystem::path& path)
 {
   const auto hex = "[0-9a-f]{" + std::to_string(Digest{}.size() * 2) + "}";
   const std::regex request(hex + "\\.cubin(\\.tmp\\.[A-Za-z0-9]{6})?");
   remove_matching_files(path, request);
-  if (is_directory_no_follow(path)) remove_entry(path);
+  remove_directory_if_empty(path);
+}
+
+void clear_version(const std::filesystem::path& spaces)
+{
+  visit_directory(spaces, [&](const auto& entry) {
+    if (is_environment(entry)) clear_environment(entry.path());
+  });
+  remove_directory_if_empty(spaces);
 }
 
 }  // namespace
@@ -257,12 +274,16 @@ void prune_disk_cache(const std::string& root, const Digest& current_environment
     clear_legacy_files(base);
 
     std::vector<std::pair<fs::file_time_type, fs::path>> others;
-    if (!visit_directory(spaces, [&](const auto& entry) {
-          if (entry.path() == current || !is_environment(entry)) return;
-          const auto modified = entry.last_write_time(error);
-          if (!error) others.emplace_back(modified, entry.path());
-        }))
-      return;
+    const auto collect_others = [&](const fs::path& version) {
+      return visit_directory(version, [&](const auto& entry) {
+        if (entry.path() == current || !is_environment(entry)) return;
+        const auto modified = entry.last_write_time(error);
+        if (!error) others.emplace_back(modified, entry.path());
+      });
+    };
+    if (!collect_others(spaces)) return;
+    for (const auto version : superseded_versions)
+      collect_others(base / version);
     std::ranges::sort(others, std::greater<>{});
     const auto cutoff = now - environment_grace;
     for (std::size_t index = kept_environments - 1; index < others.size(); ++index) {
@@ -273,6 +294,8 @@ void prune_disk_cache(const std::string& root, const Digest& current_environment
       const auto latest = fs::last_write_time(path, error);
       if (!error && latest < cutoff) clear_environment(path);
     }
+    for (const auto version : superseded_versions)
+      remove_directory_if_empty(base / version);
   } catch (...) {
     // Retention must never prevent cache lookup, compilation or publication.
   }
@@ -286,11 +309,9 @@ void clear_disk_cache(const std::string& root) noexcept
     const auto base = std::filesystem::canonical(root, error);
     if (error || !is_directory_no_follow(base)) return;
     clear_legacy_files(base);
-    const auto spaces = base / kCacheFormatVersion;
-    visit_directory(spaces, [&](const auto& entry) {
-      if (is_environment(entry)) clear_environment(entry.path());
-    });
-    if (is_directory_no_follow(spaces)) remove_entry(spaces);
+    clear_version(base / kCacheFormatVersion);
+    for (const auto version : superseded_versions)
+      clear_version(base / version);
   } catch (...) {
     // An unavailable root or individual entry is not fatal.
   }

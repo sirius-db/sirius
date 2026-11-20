@@ -78,9 +78,9 @@ This document contains definitions of key terms and concepts used throughout the
 
 **Operators** - Parts of the physical plan that are used to build a pipeline. Operators that can be pipelined are used to create a pipeline that then gets wrapped into a task and executed.
 
-**Overflow Poison** - The per-value mark that an Evaluated Operation, or one of its inputs, overflowed. It flows to every value computed from it, and reaching the NVRTC Sink makes it a SQL error. Avoid: "poison" alone (clashes with stream failure).
+**Overflow Poison** - The per-value mark that an Evaluated Operation, or one of its inputs, overflowed or divided by zero where DuckDB raises for it. It flows to every value computed from it, and reaching the NVRTC Sink makes it a SQL error. Avoid: "poison" alone (clashes with stream failure).
 
-**Overflow Site** - An operation in a fused NVRTC kernel that can raise Overflow Poison itself rather than only pass on its inputs' poison, such as an integer addition or a narrowing cast. Recorded on the host at translation so an overflow error can name its candidate operations.
+**Overflow Site** - An operation in a fused NVRTC kernel that can raise Overflow Poison itself rather than only pass on its inputs' poison, such as an integer addition, a narrowing cast, or an integer division, which raises for a zero divisor too. Recorded on the host at translation so an overflow error can name its candidate operations.
 
 ## P
 

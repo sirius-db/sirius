@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ enum class extract_component : int {
  * @brief Bit set in status word 0 by a kernel when a poisoned (overflowed) value reached a sink.
  */
 inline constexpr unsigned status_overflow_bit = 1U;
+
 /**
  * @brief Bit set in status word 0 when a `CASE ... THEN error(...)` arm was selected on some row.
  */

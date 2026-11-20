@@ -146,10 +146,13 @@ struct operator_params {
   bool like_swar_fastpath                           = false;
   expression_evaluator_strategy expression_strategy = expression_query_policy{}.strategy;
   bool enable_regex_jit                             = expression_query_policy{}.regex_jit;
+  bool nvrtc_jit_fuse_multiply_add = expression_query_policy{}.nvrtc_jit_fuse_multiply_add;
 
   [[nodiscard]] expression_query_policy expression_policy() const noexcept
   {
-    return {expression_strategy, enable_regex_jit};
+    return {.strategy                    = expression_strategy,
+            .regex_jit                   = enable_regex_jit,
+            .nvrtc_jit_fuse_multiply_add = nvrtc_jit_fuse_multiply_add};
   }
 
   /// Target batch size (bytes) for DuckDB scan tasks.

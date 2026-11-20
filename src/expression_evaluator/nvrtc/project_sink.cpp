@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,8 +92,21 @@ constexpr char const* project_entry = "sirius_nvrtc_project_kernel";
   }
 }
 
-// Kernel body for one projection list: one output column per register, validity words from one
-// ballot per warp and row group, null counts accumulated per warp and reduced once per block.
+/**
+ * @brief Kernel body for one projection list: one output column per register.
+ *
+ * Every thread runs the same unchecked row statements for each of its items. An item past the end
+ * of the batch evaluates the batch's last row again and is marked not `live`. This is sound because
+ * the row statements depend only on `row` and store nothing (the contract of
+ * `translation_context::body_code()`) and each output store overwrites one fixed-width slot: the
+ * repeated evaluation stores the bytes the row's own thread stores, and raises only the Overflow
+ * Poison that row raises.
+ *
+ * A nullable output stores its payload for every row and takes its validity word from one ballot of
+ * `valid && live` per warp and item, so an item past the end of the batch is never counted as a
+ * valid row. The kernel counts the valid rows per warp, and each block adds its rows that are not
+ * valid to the output's null count, issuing no atomic when it has none.
+ */
 [[nodiscard]] std::string project_kernel_body(translation_context const& ctx,
                                               std::vector<register_value> const& out_regs,
                                               kernel_abi const& abi,
@@ -108,79 +121,44 @@ constexpr char const* project_entry = "sirius_nvrtc_project_kernel";
     "  int32_t const warp_in_block = static_cast<int32_t>(threadIdx.x) >> 5;\n",
     project_tile.tile_rows());
 
-  // Per-warp null counters live in lane 0's registers across the tile's items and are reduced
-  // once per block, so the block issues at most one atomic per nullable output for the null counts.
   for (std::size_t k = 0; k < out_regs.size(); ++k) {
     if (!out_regs[k].is_statically_non_null) {
-      src += std::format("  uint32_t warp_nulls_{} = 0u;\n", k);
+      src += std::format("  uint32_t warp_valid_{} = 0u;\n", k);
     }
   }
   if (any_can_overflow) { src += "  bool row_overflow = false;\n"; }
   if (ctx.has_subquery_error()) { src += "  bool row_subquery_error = false;\n"; }
 
-  auto const body_code = ctx.body_code();
-  emit_full_and_partial_tiles(src, project_tile, [&](bool guarded) {
-    std::string const indent = guarded ? "      " : "    ";
-    emit_item_loop_open(src, project_tile);
-    for (std::size_t k = 0; k < out_regs.size(); ++k) {
-      if (!out_regs[k].is_statically_non_null) {
-        src += std::format("    bool out_{}_valid = false;\n", k);
-      }
+  // The loop carries no unroll pragma, so a large row body is not forced through the compiler once
+  // per item.
+  src += std::format(
+    "  for (int item = 0; item < {}; ++item) {{\n"
+    "    int32_t const tile_row = tile_row0 + item * {} + static_cast<int32_t>(threadIdx.x);\n"
+    "    bool const live = tile_row < num_rows;\n"
+    "    int32_t const row = live ? tile_row : num_rows - 1;\n",
+    project_tile.items_per_thread,
+    project_tile.block_threads);
+  src += ctx.body_code();
+  for (std::size_t k = 0; k < out_regs.size(); ++k) {
+    auto const& reg = out_regs[k];
+    src += std::format("    out_{}_data[row] = {}.val;\n", k, reg.var_name);
+    if (reg.can_overflow) {
+      // A NULL value's Overflow Poison counts too: see the invariant on `reg_val` in
+      // `device_runtime/reg_val.cuh`.
+      src += std::format("    row_overflow = row_overflow || {}.overflow;\n", reg.var_name);
     }
-    if (guarded) { src += "    if (row < num_rows) {\n"; }
-    src += body_code;
-    for (std::size_t k = 0; k < out_regs.size(); ++k) {
-      auto const& reg = out_regs[k];
-      if (reg.is_statically_non_null) {
-        src += std::format("{}out_{}_data[row] = {}.val;\n", indent, k, reg.var_name);
-      } else {
-        src += std::format(
-          "{0}if ({2}.valid) {{\n"
-          "{0}  out_{1}_data[row] = {2}.val;\n"
-          "{0}}}\n"
-          "{0}out_{1}_valid = {2}.valid;\n",
-          indent,
-          k,
-          reg.var_name);
-      }
-      if (reg.can_overflow) {
-        // A NULL value's Overflow Poison counts too: see the invariant on `reg_val` in
-        // `device_runtime/reg_val.cuh`.
-        src +=
-          std::format("{0}row_overflow = row_overflow || {1}.overflow;\n", indent, reg.var_name);
-      }
-    }
-    if (guarded) { src += "    }\n"; }
-
-    if (any_nullable_output) {
-      // The warp's 32 rows map to one validity bitmask word; a partial last warp masks off the
-      // lanes past `num_rows` and counts only its live rows.
-      src += "    int32_t const warp_base_row = row - lane;\n";
-      if (guarded) {
-        src +=
-          "    int32_t const rem = num_rows - warp_base_row;\n"
-          "    int32_t const active_in_warp = rem <= 0 ? 0 : (rem < 32 ? rem : 32);\n"
-          "    uint32_t const valid_row_mask = (active_in_warp == 32) ? 0xFFFFFFFFu : "
-          "((active_in_warp <= 0) ? 0u : ((1u << active_in_warp) - 1u));\n";
-      } else {
-        src +=
-          "    constexpr int32_t active_in_warp = 32;\n"
-          "    constexpr uint32_t valid_row_mask = 0xFFFFFFFFu;\n";
-      }
-      for (std::size_t k = 0; k < out_regs.size(); ++k) {
-        if (out_regs[k].is_statically_non_null) { continue; }
-        src += std::format(
-          "    uint32_t const ballot_{0} = __ballot_sync(0xFFFFFFFFu, out_{0}_valid) & "
-          "valid_row_mask;\n"
-          "    if (lane == 0 && active_in_warp > 0) {{\n"
-          "      out_{0}_mask[warp_base_row >> 5] = ballot_{0};\n"
-          "      warp_nulls_{0} += static_cast<uint32_t>(active_in_warp - __popc(ballot_{0}));\n"
-          "    }}\n",
-          k);
-      }
-    }
-    src += "  }\n";
-  });
+  }
+  for (std::size_t k = 0; k < out_regs.size(); ++k) {
+    if (out_regs[k].is_statically_non_null) { continue; }
+    // A warp's 32 rows of one item are one validity word, which lane 0 owns.
+    src += std::format(
+      "    uint32_t const ballot_{0} = __ballot_sync(0xFFFFFFFFu, {1}.valid && live);\n"
+      "    if (lane == 0 && live) {{ out_{0}_mask[tile_row >> 5] = ballot_{0}; }}\n"
+      "    warp_valid_{0} += static_cast<uint32_t>(__popc(ballot_{0}));\n",
+      k,
+      out_regs[k].var_name);
+  }
+  src += "  }\n";
 
   if (any_can_overflow) {
     emit_status_flag_or(
@@ -197,22 +175,29 @@ constexpr char const* project_entry = "sirius_nvrtc_project_kernel";
     for (std::size_t k = 0; k < out_regs.size(); ++k) {
       if (out_regs[k].is_statically_non_null) { continue; }
       src += std::format(
-        "  __shared__ uint32_t s_nulls_{0}[{1}];\n"
-        "  if (lane == 0) {{ s_nulls_{0}[warp_in_block] = warp_nulls_{0}; }}\n",
+        "  __shared__ uint32_t s_valid_{0}[{1}];\n"
+        "  if (lane == 0) {{ s_valid_{0}[warp_in_block] = warp_valid_{0}; }}\n",
         k,
         project_tile.num_warps());
     }
-    src += "  __syncthreads();\n  if (threadIdx.x == 0) {\n";
+    // `rows_left` is positive: `grid_dim_x` in `evaluate_project_sink` launches no block past the
+    // end of the batch.
+    src += std::format(
+      "  __syncthreads();\n"
+      "  if (threadIdx.x == 0) {{\n"
+      "    int32_t const rows_left = num_rows - tile_row0;\n"
+      "    uint32_t const block_rows = static_cast<uint32_t>(rows_left < {0} ? rows_left : {0});\n",
+      project_tile.tile_rows());
     for (std::size_t k = 0; k < out_regs.size(); ++k) {
       if (out_regs[k].is_statically_non_null) { continue; }
       src += std::format(
-        "    uint32_t block_nulls_{0} = 0u;\n"
+        "    uint32_t block_valid_{0} = 0u;\n"
         "    #pragma unroll\n"
         "    for (int w = 0; w < {1}; ++w) {{\n"
-        "      block_nulls_{0} += s_nulls_{0}[w];\n"
+        "      block_valid_{0} += s_valid_{0}[w];\n"
         "    }}\n"
-        "    if (block_nulls_{0} > 0u) {{\n"
-        "      atomicAdd(&status_and_null_counts[{2}], block_nulls_{0});\n"
+        "    if (block_valid_{0} < block_rows) {{\n"
+        "      atomicAdd(&status_and_null_counts[{2}], block_rows - block_valid_{0});\n"
         "    }}\n",
         k,
         project_tile.num_warps(),
@@ -267,7 +252,9 @@ project_sink_result evaluate_project_sink(std::span<sirius::ast::node const* con
   abi.add_sink_parameter("uint32_t* __restrict__", "status_and_null_counts");
 
   auto const compiled = compile_sink_kernel(
-    project_entry, project_kernel_body(ctx, out_regs, abi, any_nullable_output, any_can_overflow));
+    project_entry,
+    project_kernel_body(ctx, out_regs, abi, any_nullable_output, any_can_overflow),
+    options.fuse_multiply_add);
   CUfunction const fn = compiled->func_for_current_device();
 
   struct output_column_staging {

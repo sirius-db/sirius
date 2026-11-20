@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,7 +38,8 @@
 /**
  * @file
  * @brief The `NVRTC_JIT` entry points of @c expression_evaluator that run one fused kernel:
- * `evaluate_project_sink` for a projection list and `evaluate_filter_sink` for a filter predicate.
+ *        `evaluate_project_sink` for a projection list and `evaluate_filter_sink` for a filter
+ * predicate.
  *
  * `expression_evaluator` first plans each kernel with `plan_project_sink` or `plan_filter_sink`
  * (`supportability.hpp`), evaluates the plan's Materialization Boundaries, and passes their columns
@@ -59,6 +60,8 @@ struct sink_options {
   string_constant_cache const* string_constants{
     nullptr};  ///< The query's string-constant copies; required when a kernel has a non-empty
                ///< string constant.
+  bool fuse_multiply_add{false};  ///< Whether the kernels are compiled with fused multiply-add
+                                  ///< (the `nvrtc_jit_fuse_multiply_add` setting).
 };
 
 /** @brief Result of @c evaluate_project_sink. */
@@ -82,7 +85,7 @@ struct filter_sink_result {
  * @param input The input table view.
  * @param stream The CUDA stream on which to allocate outputs and launch the kernel.
  * @param mr The device memory resource used for output column allocations.
- * @param options Boundary map, LIKE policy, and string-constant cache.
+ * @param options Boundary map, LIKE policy, string-constant cache, and fused multiply-add choice.
  * @return The projected table and the translation statistics.
  */
 [[nodiscard]] project_sink_result evaluate_project_sink(
@@ -103,7 +106,7 @@ struct filter_sink_result {
  *                       `select_with_survivors`).
  * @param stream The CUDA stream on which to allocate outputs and launch the kernel.
  * @param mr The device memory resource used for output column allocations.
- * @param options Boundary map, LIKE policy, and string-constant cache.
+ * @param options Boundary map, LIKE policy, string-constant cache, and fused multiply-add choice.
  * @return The surviving rows of @p projected_input, the survivors when requested, and the
  *         translation statistics.
  */

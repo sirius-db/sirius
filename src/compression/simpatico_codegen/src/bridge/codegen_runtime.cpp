@@ -183,7 +183,7 @@ std::shared_ptr<jit::CompiledKernel const> compile_rendered(const std::string& s
   jit::CompileOptions opts;
   opts.arch_cc = jit::arch_cc_for_current_device();
   auto kernel  = jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
-  if (!kernel || !kernel->kern)
+  if (!kernel || !kernel->kern())
     throw std::runtime_error("simpatico::codegen: null compiled kernel");
   return kernel;
 }

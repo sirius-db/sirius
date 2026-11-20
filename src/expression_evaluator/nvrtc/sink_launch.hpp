@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,10 +32,10 @@
 
 /**
  * @file
- * @brief What every `NVRTC_JIT` sink shares around its generated kernel: the tile shape and the
- *        emitters for the full/partial tile dispatch and the status flags, compiling or fetching
- *        the kernel behind the device runtime preamble, launching it, keeping its handle alive, and
- *        reading the status words back.
+ * @brief What every `NVRTC_JIT` sink shares around its generated kernel: the tile shape, the
+ *        emitters for the kernel head and the status flags, compiling or fetching the kernel behind
+ *        the device runtime preamble, launching it, keeping its handle alive, and reading the
+ *        status words back.
  *
  * All functions here are stream-ordered on the stream they are given and throw `sirius` exceptions
  * on failure.
@@ -64,27 +64,6 @@ struct tile_config {
 void emit_kernel_head(std::string& out, std::string_view entry, kernel_abi const& abi);
 
 /**
- * @brief Appends the full-tile / partial-tile dispatch to @p out: the block's tile is processed by
- *        @c emit_items(false) when it is complete and by @c emit_items(true) (which must guard each
- *        row by the number of rows) otherwise. Expects `tile_row0` and `num_rows` in scope.
- */
-template <typename EmitItems>
-void emit_full_and_partial_tiles(std::string& out, tile_config tile, EmitItems&& emit_items)
-{
-  out += "  if (num_rows - tile_row0 >= " + std::to_string(tile.tile_rows()) + ") {\n";
-  emit_items(false);
-  out += "  } else {\n";
-  emit_items(true);
-  out += "  }\n";
-}
-
-/**
- * @brief Appends the head of the per-thread item loop to @p out: an unrolled loop over
- *        @p items_per_thread. The caller closes the loop body.
- */
-void emit_item_loop_open(std::string& out, tile_config tile);
-
-/**
  * @brief Appends the end-of-kernel reduction of a per-thread flag: one warp ballot of @p flag_var,
  *        then lane 0 ORs @p status_bit into `<status_array>[0]`.
  */
@@ -95,26 +74,25 @@ void emit_status_flag_or(std::string& out,
 
 /**
  * @brief Returns the compiled kernel @p entry whose source is the device runtime preamble followed
- *        by @p kernel_body (or @p kernel_body alone when @p prepend_device_runtime is false),
- *        compiling it with NVRTC when neither this process nor the disk cache has it.
- *        `SIRIUS_NVRTC_DUMP_DIR` receives the full source of every compile.
+ *        by @p kernel_body, compiling it with NVRTC when neither this process nor the disk cache
+ *        has it. `SIRIUS_NVRTC_DUMP_DIR` receives the full source of every compile.
  *
- * The in-process lookup is keyed by (entry, body, device architecture), so it is proportional to
- * the generated body rather than the preamble and never hands a kernel built for one SM to another.
+ * The in-process lookup is keyed by (entry, body, device architecture, @p fuse_multiply_add), so it
+ * is proportional to the generated body rather than the preamble and never hands out a kernel built
+ * for another SM or with the other multiply-add choice.
+ *
+ * The source is compiled without named headers: it cannot `#include` anything, and takes its
+ * fixed-width integer types from the device runtime.
+ *
+ * @param fuse_multiply_add Whether NVRTC may fuse a floating-point multiplication with an addition
+ * or subtraction of its product (`CompileOptions::fuse_multiply_add`). Without it a DOUBLE or FLOAT
+ * result is that of the separately rounded operations DuckDB and the cuDF strategies run, whatever
+ * multiply-add chain the expression holds.
  *
  * @throws internal_exception with the NVRTC log and the source when compilation fails.
  */
 [[nodiscard]] std::shared_ptr<codegen::jit::CompiledKernel const> compile_sink_kernel(
-  std::string_view entry, std::string const& kernel_body, bool prepend_device_runtime = true);
-
-/**
- * @brief Returns the compiled kernel @p entry of the complete, self-contained @p source (no device
- *        runtime preamble is added), compiling it with NVRTC when no cache has it.
- *
- * @throws internal_exception with the NVRTC log and the source when compilation fails.
- */
-[[nodiscard]] std::shared_ptr<codegen::jit::CompiledKernel const> compile_kernel_source(
-  std::string_view entry, std::string const& source);
+  std::string_view entry, std::string const& kernel_body, bool fuse_multiply_add);
 
 /**
  * @brief Launches @p fn with a 1-D grid and block on @p stream; @p what names the kernel in

@@ -8,14 +8,14 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 
 namespace codegen::jit::detail {
 
 struct CompilationRequest {
-  CompilationRequest(const std::string& source,
-                     const std::string& entry,
-                     const CompileOptions& opts)
-    : source(source), entry(entry)
+  CompilationRequest(const std::string& source, const CompileOptions& opts)
+    : source(source), embedded_headers(opts.embedded_headers)
   {
     if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
     std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
@@ -27,24 +27,32 @@ struct CompilationRequest {
                "--no-source-include",
                "-default-device",
                "--device-int128"};
-    for (std::size_t i = 0; i < options.size(); ++i)
-      option_views[i] = options[i];
+    // A source that includes no header is compiled without NVRTC's built-in declarations of the
+    // CUDA runtime API, the device runtime API and the texture and surface functions, which such a
+    // source must not use: parsing them costs every compilation a few milliseconds. NVRTC accepts
+    // the option from CUDA 12.4 on.
+    if (!embedded_headers) options.push_back("--minimal");
+    if (!opts.fuse_multiply_add) options.push_back("-fmad=false");
+    option_views.assign(options.begin(), options.end());
   }
   CompilationRequest(const CompilationRequest&)            = delete;
   CompilationRequest& operator=(const CompilationRequest&) = delete;
 
-  RequestView identity_view() const { return {source, entry, program_name, option_views}; }
+  [[nodiscard]] RequestView identity_view() const
+  {
+    return {source, program_name, option_views, embedded_headers};
+  }
 
   const std::string& source;
-  const std::string& entry;
+  bool embedded_headers;
   static constexpr const char* program_name = "codegen_jit.cu";
   // Prefix, every possible decimal int digit, sign, and terminator.
   std::array<char, sizeof("-arch=sm_") + std::numeric_limits<int>::digits10 + 2> architecture{};
-  std::array<const char*, 5> options{};
-  std::array<std::string_view, 5> option_views{};
+  std::vector<const char*> options;
+  std::vector<std::string_view> option_views;
 };
 
-CompiledKernel compile_request(const CompilationRequest& request);
+std::shared_ptr<const CompiledModule> compile_request(const CompilationRequest& request);
 
 // Fixed for this process: embedded header digests and NVRTC major/minor.
 // Throws on a failed version query; never silently identifies a version as 0.0.
