@@ -8,7 +8,8 @@ an installed shared or static Sirius CMake package and runs GPU SQL tests
 through the normal DuckDB extension test target. The root CMake project builds
 the Sirius libraries and C++ tests.
 
-For local development, `pixi run make` builds Sirius and its C++ tests, installs
+For local development, install [Pixi](https://pixi.sh/latest/installation/) 0.84.1 or newer.
+`pixi run make` builds Sirius and its C++ tests, installs
 Sirius under `build/release/install`, and builds the shared DuckDB extension in
 `sirius-duckdb/`. Use `pixi run make release` for just Sirius and its C++ tests,
 or invoke standalone CMake directly:

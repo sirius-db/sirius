@@ -66,7 +66,7 @@ Build from source to use the latest code on `main`, make changes to Sirius, or r
 ### Build Requirements
 
 - Git (to clone the repo)
-- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+- Pixi 0.84.1 or newer (install instructions [here](https://pixi.sh/latest/installation/))
 
 ### Quick Start
 

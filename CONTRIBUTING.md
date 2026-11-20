@@ -2,7 +2,11 @@
 
 ## Getting started
 
-**Prerequisites:** [pixi](https://prefix.dev/) for environment management.
+**Prerequisites:** [Pixi](https://prefix.dev/) 0.84.1 or newer for environment management.
+
+Keep the workspace `requires-pixi` minimums, the nightly launcher's Pixi dependency,
+and CI's `pixi-version` pins in sync when upgrading Pixi. Older Pixi versions can
+reject lockfiles written by newer releases even when dependency versions are unchanged.
 
 ```bash
 git clone --recurse-submodules <repo>
