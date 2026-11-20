@@ -18,7 +18,7 @@ as follows:
     - Check [conda-forge channel](https://anaconda.org/channels/conda-forge/packages/python-duckdb/overview) for packages first
     - Open PRs if needed for missing/new versions [conda-forge/python-duckdb-feedstock](https://github.com/conda-forge/python-duckdb-feedstock/pulls)
 3. Bump versions in `.github/workflows`
-    - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.0`) or matching SHA with submodules in 1
+    - `duckdb_version` input in `distribution.yml` should be set to latest tagged release (e.g. `v2.0.1`) or matching SHA with submodules in 1
     - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes
 4. Map the submodule commit to its release version (`DUCKDB_EXPLICIT_VERSION`) in
    `sirius-duckdb/Makefile` and `cmake/sirius-duckdb-provider.cmake`, and update the

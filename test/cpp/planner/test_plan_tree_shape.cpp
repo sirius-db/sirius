@@ -65,6 +65,7 @@
 #include <catch.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/column_lifetime_analyzer.hpp>
 #include <duckdb/optimizer/cte_filter_pusher.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -138,18 +139,44 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
+/// Flip every unflipped LOGICAL_DELIM_JOIN whose join type has an inverse, so that it plans as a
+/// RIGHT_DELIM_JOIN. DuckDB's BuildProbeSideOptimizer flips a delim join only where its cost model
+/// prefers building on the duplicate-eliminated side, which follows its cardinality estimates.
+/// These are the steps of its FlipChildren (build_probe_side_optimizer.cpp), which is not
+/// exported. The plan must still hold column bindings: they survive the child swap, resolved
+/// column positions would not. A flipped join emits its columns in the other order, so the
+/// projection maps of the operators above it have to be regenerated afterwards.
+void flip_delim_joins(duckdb::LogicalOperator& op)
+{
+  for (auto& child : op.children) {
+    flip_delim_joins(*child);
+  }
+  if (op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) { return; }
+  auto& join = op.Cast<LogicalComparisonJoin>();
+  if (join.delim_flipped || !HasInverseJoinType(join.join_type)) { return; }
+  std::swap(join.children[0], join.children[1]);
+  join.join_type = InverseJoinType(join.join_type);
+  for (auto& condition : join.conditions) {
+    if (condition.IsComparison()) { condition.Swap(); }
+  }
+  std::swap(join.left_projection_map, join.right_projection_map);
+  join.delim_flipped = true;
+}
+
 /// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 /// As in production, the generator gets the CTE reader proofs that Sirius's optimizer hooks
-/// captured with the plan, unless `with_cte_reader_proofs` is false.
+/// captured with the plan, unless `with_cte_reader_proofs` is false. `right_delim_joins` flips the
+/// optimized plan's delim joins (see flip_delim_joins) before the generator sees it.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   Connection& con,
   const std::string& query,
   const std::vector<OptimizerType>& also_disabled = {},
   bool pre_resolve                                = true,
   std::string* logical_plan_text                  = nullptr,
-  bool with_cte_reader_proofs                     = true)
+  bool with_cte_reader_proofs                     = true,
+  bool right_delim_joins                          = false)
 {
   auto& context = *con.context;
 
@@ -181,6 +208,11 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
     if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
+      if (right_delim_joins) {
+        flip_delim_joins(*plan);
+        // DuckDB likewise reruns COLUMN_LIFETIME after BUILD_SIDE_PROBE_SIDE.
+        ColumnLifetimeAnalyzer(optimizer, *plan, /*is_root=*/true).VisitOperator(*plan);
+      }
     }
     std::shared_ptr<sirius::planner::delim_cte_proofs const> cte_reader_proofs;
     if (auto state = duckdb::get_sirius_connection_state(context)) {
@@ -211,6 +243,20 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   con.Query("COMMIT");
   DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
   return result;
+}
+
+/// generate_sirius_plan with the query's delim joins flipped, for cases that need a
+/// RIGHT_DELIM_JOIN whichever variant DuckDB's cardinality estimates select.
+duckdb::unique_ptr<sirius_physical_operator> generate_right_delim_plan(Connection& con,
+                                                                       const std::string& query)
+{
+  return generate_sirius_plan(con,
+                              query,
+                              /*also_disabled=*/{},
+                              /*pre_resolve=*/true,
+                              /*logical_plan_text=*/nullptr,
+                              /*with_cte_reader_proofs=*/true,
+                              /*right_delim_joins=*/true);
 }
 
 /// Visit every operator in the tree, including DELIM JOIN internal `join`/`distinct_root`
@@ -246,6 +292,14 @@ sirius_physical_operator* find_first(sirius_physical_operator* root,
 {
   auto all = collect(root, type);
   return all.empty() ? nullptr : all.front();
+}
+
+/// The first delim join of either variant, or nullptr when the tree has none.
+sirius::op::sirius_physical_delim_join* find_delim_join(sirius_physical_operator* root)
+{
+  auto* node = find_first(root, SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
+  if (node == nullptr) { node = find_first(root, SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN); }
+  return node == nullptr ? nullptr : &node->Cast<sirius::op::sirius_physical_delim_join>();
 }
 
 bool contains(sirius_physical_operator* root, const sirius_physical_operator* target)
@@ -448,11 +502,10 @@ struct plan_tree_shape_fixture {
     con->Query("CREATE TABLE small_c (ckey INTEGER, cother INTEGER)");
     con->Query("INSERT INTO small_c VALUES (0, 0), (1, 1)");
 
-    // parts/items reproduce TPC-H q17's RIGHT_DELIM_JOIN: the filter on the correlated
-    // table keeps the deliminator from rewriting the correlated aggregate into a plain
-    // join + group-by, and the items-side fan-out (20 rows per fk) plus the cardinality
-    // skew make the physical planner pick the RIGHT variant (tiny symmetric tables get
-    // a LEFT_DELIM_JOIN instead).
+    // parts/items reproduce TPC-H q17's delim join: the filter on the correlated table keeps
+    // the deliminator from rewriting the correlated aggregate into a plain join + group-by.
+    // DuckDB picks the LEFT or RIGHT variant from its cardinality estimates, so cases that
+    // need the RIGHT variant plan with generate_right_delim_plan.
     con->Query("CREATE TABLE parts (pk INTEGER, pname VARCHAR)");
     con->Query("INSERT INTO parts SELECT range, concat('p', range % 3) FROM range(500)");
     con->Query("CREATE TABLE items (fk INTEGER, qty INTEGER)");
@@ -996,9 +1049,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, delim_query);
     INFO(tree_to_string(plan.get()));
 
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+    auto* node = find_delim_join(plan.get());
     REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
+    auto& delim = *node;
 
     auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     REQUIRE(endpoints.size() == 2);
@@ -1035,7 +1088,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, delim_query);
     INFO(tree_to_string(plan.get()));
 
-    REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
+    REQUIRE(find_delim_join(plan.get()) != nullptr);
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 }
@@ -2989,7 +3042,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("RIGHT_DELIM_JOIN: the inner join is sized from its build side")
   {
-    auto plan = generate_sirius_plan(
+    auto plan = generate_right_delim_plan(
       *con,
       "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
       "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
@@ -3011,7 +3064,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("RIGHT_DELIM_JOIN: partition_join points at the build-side PARTITION")
   {
     // TPC-H q17 shape: correlated aggregate whose outer is a filtered join.
-    auto plan = generate_sirius_plan(
+    auto plan = generate_right_delim_plan(
       *con,
       "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
       "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
@@ -3064,22 +3117,32 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - set_parent_ops links every operator",
                  "[plan_tree_shape][isolated_context]")
 {
-  const std::string queries[] = {
-    "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid",
-    "SELECT val, count(*) FROM big_left GROUP BY val ORDER BY val",
+  struct linked_query {
+    std::string query;
+    // The delim join variant the plan must contain, if any.
+    std::optional<SiriusPhysicalOperatorType> delim_join;
+  };
+  const linked_query cases[] = {
+    {"SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid", std::nullopt},
+    {"SELECT val, count(*) FROM big_left GROUP BY val ORDER BY val", std::nullopt},
     // RIGHT and LEFT delim joins: parent stamping must descend into the internal
     // `join`/`distinct_root` subtrees.
-    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
-    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)",
-    "SELECT l.id FROM big_left l "
-    "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)",
+    {"SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)",
+     SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN},
+    {"SELECT l.id FROM big_left l "
+     "WHERE EXISTS (SELECT 1 FROM small_right r WHERE r.rid = l.id AND r.other < l.val)",
+     SiriusPhysicalOperatorType::LEFT_DELIM_JOIN},
   };
 
-  for (const auto& query : queries) {
-    DYNAMIC_SECTION("query: " << query)
+  for (const auto& c : cases) {
+    DYNAMIC_SECTION("query: " << c.query)
     {
-      auto plan = generate_sirius_plan(*con, query);
+      auto plan = c.delim_join == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN
+                    ? generate_right_delim_plan(*con, c.query)
+                    : generate_sirius_plan(*con, c.query);
       INFO(tree_to_string(plan.get()));
+      if (c.delim_join) { REQUIRE(find_first(plan.get(), *c.delim_join) != nullptr); }
 
       // Root has no parent; every other operator's parent is its tree position, including
       // the delim-join internal subtrees.
@@ -3473,7 +3536,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
   INFO(tree_to_string(plan.get()));
 
-  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
+  auto* delim = find_delim_join(plan.get());
+  REQUIRE(delim != nullptr);
+  // A scan must sit inside the delim join's own subtree for the cross-check to mean anything.
+  REQUIRE_FALSE(collect(delim->join.get(), SiriusPhysicalOperatorType::GPU_SCAN).empty());
 
   auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
   REQUIRE_FALSE(expected.empty());

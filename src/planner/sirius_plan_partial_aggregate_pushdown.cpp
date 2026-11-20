@@ -246,10 +246,10 @@ bool sum_combines_exactly(LogicalType const& argument)
   }
 }
 
-/// Whether @p expression is safe to evaluate on rows a join above would have removed: it cannot
-/// throw, or it only adds, subtracts and multiplies such values. Arithmetic can still overflow on
-/// a row the unrewritten plan never evaluates it on; DuckDB's own partial aggregate pushdown
-/// accepts the same.
+/// Whether @p expression is accepted on rows a join above would have removed: it cannot throw, or
+/// it only adds, subtracts and multiplies such values. Accepting that arithmetic is Sirius's own
+/// rule: it can still overflow on a row the unrewritten plan never evaluates it on, and DuckDB's
+/// partial aggregate pushdown declines it unless column statistics rule the overflow out.
 bool arithmetic_or_infallible(Expression const& expression)
 {
   if (!expression.CanThrow()) { return true; }

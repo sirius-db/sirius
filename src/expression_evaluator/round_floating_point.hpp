@@ -36,9 +36,11 @@ namespace sirius {
  *
  * Matches DuckDB's `round(x, precision)`. Each value is rounded in double precision as
  * `round(x * 10^precision) / 10^precision`, or as `round(x / 10^-precision) * 10^-precision` for a
- * negative @p precision, with ties rounded away from zero. A non-finite result yields the input
- * value for a non-negative @p precision and 0 for a negative one. NULLs propagate. `round(x)` is
- * `round(x, 0)`.
+ * negative @p precision, with ties rounded away from zero. For a @p precision of 1 to 22, a product
+ * `x * 10^precision` that lands on a midpoint only through its own rounding is rounded to the side
+ * the exact product lies on, so 2.675, stored just below the midpoint, rounds to 2.67 at 2 places.
+ * A non-finite result yields the input value; a negative @p precision whose `10^-precision`
+ * overflows rounds finite values to 0. NULLs propagate. `round(x)` is `round(x, 0)`.
  *
  * @param input     FLOAT32 or FLOAT64 column.
  * @param precision Number of decimal places. Negative values round to the left of the decimal

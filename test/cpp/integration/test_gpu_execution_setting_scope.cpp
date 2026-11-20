@@ -126,7 +126,7 @@ TEST_CASE_METHOD(scope_fixture,
 }
 
 TEST_CASE_METHOD(scope_fixture,
-                 "gpu_execution RESET SESSION writes a session value equal to the default",
+                 "gpu_execution RESET SESSION returns the connection to the global value",
                  "[integration][transparent][scope]")
 {
   auto& c = make_connection();
@@ -134,20 +134,20 @@ TEST_CASE_METHOD(scope_fixture,
   query(d, "SET SESSION gpu_execution = false");
   query(a, "SET GLOBAL gpu_execution = false");
   query(d, "RESET SESSION gpu_execution");
-  REQUIRE(enabled(d));
+  REQUIRE_FALSE(enabled(d));
   REQUIRE_FALSE(enabled(c));
   query(a, "SET GLOBAL gpu_execution = true");
   REQUIRE(enabled(c));
   REQUIRE(enabled(d));
   query(a, "SET GLOBAL gpu_execution = false");
   REQUIRE_FALSE(enabled(c));
-  REQUIRE(enabled(d));
+  REQUIRE_FALSE(enabled(d));
   check_routing(c, false);
-  check_routing(d, true);
+  check_routing(d, false);
 }
 
 TEST_CASE_METHOD(scope_fixture,
-                 "gpu_execution unqualified RESET resets only the session to the default",
+                 "gpu_execution unqualified RESET returns only its connection to the global value",
                  "[integration][transparent][scope]")
 {
   auto& c = make_connection();
@@ -155,13 +155,15 @@ TEST_CASE_METHOD(scope_fixture,
   query(d, "SET gpu_execution = false");
   query(a, "SET GLOBAL gpu_execution = false");
   query(d, "RESET gpu_execution");
-  REQUIRE(enabled(d));
+  REQUIRE_FALSE(enabled(d));
   REQUIRE_FALSE(enabled(c));
   query(a, "SET GLOBAL gpu_execution = true");
-  query(a, "SET GLOBAL gpu_execution = false");
   REQUIRE(enabled(d));
+  REQUIRE(enabled(c));
+  query(a, "SET GLOBAL gpu_execution = false");
+  REQUIRE_FALSE(enabled(d));
   REQUIRE_FALSE(enabled(c));
-  check_routing(d, true);
+  check_routing(d, false);
   check_routing(c, false);
 }
 

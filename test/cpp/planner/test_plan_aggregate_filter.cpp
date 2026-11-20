@@ -218,6 +218,32 @@ struct plan_aggregate_filter_fixture {
     con->Query("INSERT INTO events SELECT range, NULLIF(range * 3 % 7, 0) FROM range(100)");
   }
 
+  /// Plan `min(val)` and `max(val)` under one FILTER with a synthetic abs wrapped around each
+  /// aggregate's input or, when @p predicate is set, compared in a filter that replaces theirs.
+  duckdb::unique_ptr<sirius_physical_operator> plan_with_synthetic_abs(bool predicate,
+                                                                       FunctionStability stability,
+                                                                       bool ordered)
+  {
+    return generate_sirius_plan(
+      *con,
+      "SELECT min(val) FILTER (WHERE id < 50), max(val) FILTER (WHERE id < 50) FROM events",
+      [&](LogicalOperator& root) {
+        visit_aggregates(root, [&](BoundAggregateExpression& agg) {
+          REQUIRE(agg.GetChildren().size() == 1);
+          // Planner-only functions use supported names but never execute synthetic callbacks.
+          if (predicate) {
+            agg.GetFilterMutable() = BoundComparisonExpression::Create(
+              ExpressionType::COMPARE_GREATERTHAN,
+              synthetic_abs(agg.GetChildren()[0]->Copy(), stability, ordered),
+              duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+          } else {
+            agg.GetChildrenMutable()[0] =
+              synthetic_abs(agg.GetChildren()[0]->Copy(), stability, ordered);
+          }
+        });
+      });
+  }
+
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;
   std::unique_ptr<DuckDB> db;
@@ -651,29 +677,10 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
                  "[aggregate_filter][isolated_context]")
 {
   for (bool predicate : {false, true}) {
-    for (auto stability : {FunctionStability::CONSISTENT,
-                           FunctionStability::VOLATILE,
-                           FunctionStability::CONSISTENT_WITHIN_QUERY}) {
+    for (auto stability : {FunctionStability::CONSISTENT, FunctionStability::VOLATILE}) {
       bool const ordered = stability == FunctionStability::CONSISTENT;
       CAPTURE(predicate, ordered, static_cast<int>(stability));
-      auto plan = generate_sirius_plan(
-        *con,
-        "SELECT min(val) FILTER (WHERE id < 50), max(val) FILTER (WHERE id < 50) FROM events",
-        [&](LogicalOperator& root) {
-          visit_aggregates(root, [&](BoundAggregateExpression& agg) {
-            REQUIRE(agg.GetChildren().size() == 1);
-            // Planner-only functions use supported names but never execute synthetic callbacks.
-            if (predicate) {
-              agg.GetFilterMutable() = BoundComparisonExpression::Create(
-                ExpressionType::COMPARE_GREATERTHAN,
-                synthetic_abs(agg.GetChildren()[0]->Copy(), stability, ordered),
-                duckdb::make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
-            } else {
-              agg.GetChildrenMutable()[0] =
-                synthetic_abs(agg.GetChildren()[0]->Copy(), stability, ordered);
-            }
-          });
-        });
+      auto plan       = plan_with_synthetic_abs(predicate, stability, ordered);
       auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
       REQUIRE(aggregate);
       auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
@@ -699,6 +706,40 @@ TEST_CASE_METHOD(plan_aggregate_filter_fixture,
                                  ->get<sirius::ast::reference>()
                                  .column_index);
     }
+  }
+}
+
+TEST_CASE_METHOD(plan_aggregate_filter_fixture,
+                 "aggregate filter - trees consistent within a query are shared",
+                 "[aggregate_filter][isolated_context]")
+{
+  auto const stability = FunctionStability::CONSISTENT_WITHIN_QUERY;
+  for (bool predicate : {false, true}) {
+    CAPTURE(predicate);
+    auto plan       = plan_with_synthetic_abs(predicate, stability, false);
+    auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    REQUIRE(aggregate);
+    auto* projection = find_first(aggregate, SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projection);
+    // Both aggregates read one mask, so its predicate stays in it and needs no lower projection.
+    auto const& masks = projection->Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(masks.select_list.size() == 1);
+    auto const& mask = masks.select_list[0]->get<sirius::ast::case_expr>();
+    CHECK(mask.cases[0].when_->holds<sirius::ast::comparison>());
+    REQUIRE(masks.children.size() == 1);
+    CHECK(masks.children[0]->type != SiriusPhysicalOperatorType::PROJECTION);
+    auto const& aggs =
+      aggregate->Cast<sirius::op::sirius_physical_ungrouped_aggregate>().aggregates;
+    REQUIRE(aggs.size() == 2);
+    CHECK(aggs[0]
+            ->get<sirius::ast::aggregate>()
+            .arguments()[0]
+            ->get<sirius::ast::reference>()
+            .column_index == aggs[1]
+                               ->get<sirius::ast::aggregate>()
+                               .arguments()[0]
+                               ->get<sirius::ast::reference>()
+                               .column_index);
   }
 }
 
