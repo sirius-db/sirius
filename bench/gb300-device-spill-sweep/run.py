@@ -203,7 +203,7 @@ def run_query(sf, cap, host_cap_gib, query, output, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sf", type=int, default=10000)
-    parser.add_argument("--caps", default="16,32,64,128,256")
+    parser.add_argument("--caps", default="32,64,128,256")
     parser.add_argument("--host-cap-gib", type=int, default=384)
     parser.add_argument("--queries", default=",".join(map(str, range(1, 23))))
     parser.add_argument(
