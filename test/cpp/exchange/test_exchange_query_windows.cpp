@@ -14,14 +14,17 @@
  * limitations under the License.
  */
 
+#include "exchange/rank_control.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
 #include <memory>
+#include <tuple>
 
 using window = duckdb::SiriusContext::StandaloneQueryScope;
 
@@ -65,4 +68,55 @@ TEST_CASE("distributed queries are numbered on one connection and tied to their 
   auto later =
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
   CHECK_THROWS_AS(ctx->next_distributed_query(*later->context), sirius::invalid_input_exception);
+}
+
+TEST_CASE("a gateway-assigned query number is used and must increase", "[exchange][query_windows]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto conn = sirius::test::g_integration_env->make_connection();
+  auto ctx  = conn.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+
+  auto const last = ctx->next_distributed_query(*conn.context);
+  // Gaps are fine: statements that never plan a distributed query still use up a number.
+  CHECK(ctx->next_distributed_query(*conn.context, last + 10) == last + 10);
+  CHECK_THROWS_AS(ctx->next_distributed_query(*conn.context, last + 10),
+                  sirius::invalid_input_exception);
+  CHECK_THROWS_AS(ctx->next_distributed_query(*conn.context, last + 5),
+                  sirius::invalid_input_exception);
+  // Without one, numbering continues after the assigned number.
+  CHECK(ctx->next_distributed_query(*conn.context) == last + 11);
+}
+
+TEST_CASE("sirius_rank_info names this process, one boot id for its life, and whether it joined",
+          "[exchange][query_windows]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto conn       = sirius::test::g_integration_env->make_connection();
+  auto const info = [&] {
+    auto result = conn.Query("SELECT pid, boot_id, joined FROM sirius_rank_info()");
+    REQUIRE_FALSE(result->HasError());
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+    return std::tuple{chunk->GetValue(0, 0).GetValue<int64_t>(),
+                      chunk->GetValue(1, 0).ToString(),
+                      chunk->GetValue(2, 0).GetValue<bool>()};
+  };
+  auto const [pid, boot_id, joined] = info();
+  CHECK(pid == static_cast<int64_t>(getpid()));
+  CHECK(boot_id.size() == 32);
+  // No unit test connects a real exchange.
+  CHECK_FALSE(joined);
+  // So this process, like any that runs alone, cannot be told to exit.
+  auto const refused = conn.Query("CALL sirius_rank_exit()");
+  REQUIRE(refused->HasError());
+  CHECK(refused->GetError().find("has not joined an exchange") != std::string::npos);
+  // A gateway reuses a process that never joined; one that has must restart to join again.
+  sirius::exchange::note_exchange_joined();
+  auto const after = info();
+  CHECK(std::get<1>(after) == boot_id);
+  CHECK(std::get<2>(after));
 }

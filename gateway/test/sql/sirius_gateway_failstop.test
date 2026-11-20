@@ -1,0 +1,196 @@
+# name: test/sql/sirius_gateway_failstop.test
+# description: fail-stop over CPU ranks: what keeps the ranks serving, what restarts them, and the cancel ladder
+# group: [sirius_gateway]
+
+require sirius_gateway
+
+require quack
+
+# Quack's errors mention HTTP, which the runner would otherwise take as a reason to skip the file.
+set ignore_error_messages
+
+statement ok
+SET GLOBAL sirius_gateway_duckdb_binary = '{BUILD_DIRECTORY}/duckdb';
+
+statement ok
+SET GLOBAL sirius_gateway_query_id_setting = 'VARIABLE sirius_query_id';
+
+statement ok
+SET GLOBAL sirius_gateway_log_dir = '{TEST_DIR}/sirius_gateway_failstop';
+
+query I
+SELECT count(*) FROM sirius_gateway_start(2, quack_base_port := 19800) WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+statement ok
+FROM sirius_gateway_run('CREATE VIEW v AS SELECT 42 AS x');
+
+# A read that fails on some ranks only changes nothing: an error, and the ranks keep serving.
+statement error
+FROM sirius_gateway_run('SELECT CASE WHEN (SELECT port FROM quack_server_list()) = 19801 THEN error(''only rank 1'') ELSE 1 END');
+----
+the ranks disagree
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'ready' AND error IS NULL;
+----
+2
+
+# The error reported is the one at its root: rank 0 blames rank 1, so rank 1's own comes back.
+statement error
+FROM sirius_gateway_run('SELECT CASE WHEN (SELECT port FROM quack_server_list()) = 19800 THEN error(''exchange: query 9 failed on rank 1: peer'') ELSE error(''boom on rank 1'') END');
+----
+rank 1: boom on rank 1
+
+# A state change that only some ranks made leaves them out of step: failed, and the next
+# statement restarts the ranks and replays the DDL log.
+statement error
+FROM sirius_gateway_run('CREATE TABLE half AS SELECT CASE WHEN (SELECT port FROM quack_server_list()) = 19801 THEN error(''only rank 1'') ELSE 1 END AS x');
+----
+disagree on a statement that changes state
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed' AND error LIKE '%restarts the ranks%';
+----
+2
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'ready';
+----
+2
+
+statement error
+FROM sirius_gateway_run('FROM half');
+----
+half
+
+# A broken exchange on any rank is fatal: its transport is gone for every later query.
+statement error
+FROM sirius_gateway_run('SELECT error(''exchange: the transport to the other ranks failed (test); restart every rank'')');
+----
+the exchange between the ranks failed
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed';
+----
+2
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+# A rank that dies between statements: the next statement restarts every rank first. (One
+# that dies during a statement fails it as a lost rank, like the stopped rank below.)
+query T
+SELECT state FROM sirius_gateway_test_signal(1, 9) WHERE rank = 1;
+----
+exited
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+# The status keeps each rank's last failure.
+query IT
+SELECT rank, regexp_replace(last_error, ';.*', '') FROM sirius_gateway_status() WHERE last_error IS NOT NULL;
+----
+1	rank 1 exited
+
+# A rank that stops answering ignores the cancel: after the grace period the gateway kills it.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement ok
+SET sirius_gateway_cancel_grace = 2;
+
+statement ok
+FROM sirius_gateway_test_signal(1, 19);
+
+statement error
+FROM sirius_gateway_run('SELECT 1');
+----
+did not stop within 2 s of the cancel
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'failed';
+----
+2
+
+statement ok
+SET sirius_gateway_statement_timeout = 3600;
+
+query I
+FROM sirius_gateway_run('FROM v');
+----
+42
+
+# A rank that answers the cancel stops, and nothing restarts.
+statement ok
+SET sirius_gateway_statement_timeout = 1;
+
+statement error
+FROM sirius_gateway_run('SELECT sum(i) FROM range(1000000000000) r(i)');
+----
+cancelled on every rank
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE cluster = 'ready';
+----
+2
+
+statement ok
+SET sirius_gateway_statement_timeout = 3600;
+
+query I
+SELECT state FROM sirius_gateway_stop();
+----
+stopped
+
+# A start that fails partway leaves no ranks. The next statement starts them again: here it
+# succeeds once the file their session setup reads exists.
+statement ok
+SET GLOBAL sirius_gateway_rank_init = 'FROM read_csv(''{TEST_DIR}/sirius_gateway_failstop/allow.csv'')';
+
+statement error
+FROM sirius_gateway_start(2, quack_base_port := 19810);
+----
+failed its session setup
+
+statement error
+FROM sirius_gateway_run('SELECT 42');
+----
+failed its session setup
+
+statement ok
+COPY (SELECT 1 AS allowed) TO '{TEST_DIR}/sirius_gateway_failstop/allow.csv';
+
+query I
+FROM sirius_gateway_run('SELECT 42');
+----
+42
+
+query I
+SELECT count(*) FROM sirius_gateway_status() WHERE state = 'up' AND cluster = 'ready';
+----
+2
+
+statement ok
+SET GLOBAL sirius_gateway_rank_init = '';
+
+query I
+SELECT state FROM sirius_gateway_stop();
+----
+stopped

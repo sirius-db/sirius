@@ -277,7 +277,7 @@ TEST_CASE("a cancelled query's sender stops waiting for room, and the transport 
   }
 
   // Once forgotten, the number carries batches again.
-  sender.forget(query);
+  sender.forget(query, query);
   stream_id const again = sirius::exchange::make_stream_id(5, 2);
   sender.send(again, 1, gpu_batch(sample_table(5'000)));
   sender.close(again, 1);
@@ -285,6 +285,31 @@ TEST_CASE("a cancelled query's sender stops waiting for room, and the transport 
   std::lock_guard lock{got.mutex};
   REQUIRE_FALSE(got.error);
   CHECK(got.batches[{0, again}].size() == 1);
+}
+
+TEST_CASE("a stopped transport wakes a sender waiting for room, which drops its batch",
+          "[exchange][transport]")
+{
+  // As above: the second send waits for room that the first never frees.
+  cluster c(2, 4, 4, {}, /*host=*/nullptr, {.max_queued_bytes = 64 * KiB});
+  auto& sender           = *c.ranks[0].t;
+  stream_id const stream = sirius::exchange::make_stream_id(5, 1);
+  auto const query       = sirius::exchange::query_of(stream);
+  auto first             = gpu_batch(sample_table(30'000));
+  auto second            = gpu_batch(sample_table(30'001));
+  auto const hold        = hold_gpu();
+  sender.send(stream, 1, std::move(first));
+  auto blocked = std::async(std::launch::async, [&] { sender.send(stream, 1, std::move(second)); });
+  CHECK(blocked.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+  // The owner shuts down while the sender is still inside the transport.
+  sender.stop();
+  REQUIRE(blocked.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+  CHECK_NOTHROW(blocked.get());
+  CHECK_NOTHROW(sender.send(stream, 1, gpu_batch(sample_table(1'000))));
+  // The first batch is still queued, and nothing will send it: the wait returns at once.
+  auto const before = std::chrono::steady_clock::now();
+  CHECK_FALSE(sender.wait_sent(query, std::chrono::seconds{30}));
+  CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds{5});
 }
 
 TEST_CASE("a batch with no room asks for it once, and lands once it has it",

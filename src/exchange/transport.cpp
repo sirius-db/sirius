@@ -506,14 +506,20 @@ transport::transport(fabric& fabric,
 
 transport::~transport()
 {
+  stop();
+  // The engine still holds unsent batches, whose deleters use the members declared after it.
+  _engine.reset();
+}
+
+void transport::stop()
+{
   {
     std::lock_guard lock{_mutex};
     _stop = true;
   }
   _room.notify_all();
-  _thread.join();
-  // The engine still holds unsent batches, whose deleters use the members declared after it.
-  _engine.reset();
+  _released.notify_all();
+  if (_thread.joinable()) { _thread.join(); }
 }
 
 rank_t transport::rank() const noexcept { return _engine->fab.rank(); }
@@ -569,8 +575,9 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   });
   if (_error) { std::rethrow_exception(_error); }
   // Nothing more is queued for a cancelled query, so its senders do not wait for room that only
-  // its own cleanup frees. `held` is dropped after `lock`, as below.
-  if (_cancelled.contains(query)) { return; }
+  // its own cleanup frees; nor once stopped, when nothing drains the queues. `held` is dropped
+  // after `lock`, as below.
+  if (_stop || _cancelled.contains(query)) { return; }
   // A copy, not a move: if the push throws, `held` stays the last owner and is dropped after `lock`
   // is released, since its deleter takes _mutex.
   auto& next = e.sent[to][stream];
@@ -591,7 +598,7 @@ void transport::released(distributed_query_id query)
 bool transport::wait_sent(distributed_query_id query, std::chrono::milliseconds timeout)
 {
   std::unique_lock lock{_mutex};
-  _released.wait_for(lock, timeout, [&] { return !_held.contains(query); });
+  _released.wait_for(lock, timeout, [&] { return _stop || !_held.contains(query); });
   return !_held.contains(query);
 }
 
@@ -630,10 +637,10 @@ void transport::cancel(distributed_query_id query)
   _room.notify_all();
 }
 
-void transport::forget(distributed_query_id query)
+void transport::forget(distributed_query_id first, distributed_query_id last)
 {
   std::lock_guard lock{_mutex};
-  _cancelled.erase(query);
+  _cancelled.erase(_cancelled.lower_bound(first), _cancelled.upper_bound(last));
 }
 
 void transport::run()

@@ -1,0 +1,27 @@
+# Config for scripts/sirius_rank_node.sh --config <file>: one file per rank, sourced by bash.
+# sirius_node.sh writes these for you, one per GPU; write one yourself only to run a rank alone.
+# Arguments given on the command line win over these; exported UCX_* win over the ucx_* lines.
+
+gpu=0                  # or slurm: keep the CUDA_VISIBLE_DEVICES Slurm gives the task
+quack_port=9500
+exchange_port=27000
+
+# The gateway to register with: sirius_gateway.sh writes ~/.sirius/gateways/<cluster>/gateway.conf.
+# The script waits for it, takes the gateway's address, token, fingerprint and networks from it,
+# and registers again when a new gateway starts.
+gateway_conf=$HOME/.sirius/gateways/default/gateway.conf
+# Or, on a node without that file (then keep this file mode 600: it holds the token):
+# gateway=10.87.140.52:9494
+# gateway_token=...
+# gateway_fingerprint=...
+
+# This host's first address in these CIDRs is the rank's listen and exchange address, and its
+# interface UCX_NET_DEVICES (for TCP; set ucx_net_devices for RDMA devices such as mlx5_0:1).
+# Default: the networks line of gateway.conf, the gateway's own subnet.
+# priority_networks=10.87.140.0/24
+# listen_host=10.87.140.52
+# dir=/tmp/sirius_rank_9500
+
+# UCX transports and network devices; scripts/launcher_env.sh and priority_networks set defaults.
+# ucx_tls=cuda_copy,cuda_ipc,tcp,self
+# ucx_net_devices=bond0

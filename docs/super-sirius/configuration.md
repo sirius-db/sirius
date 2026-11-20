@@ -32,6 +32,24 @@ connections to one DatabaseInstance. It bounds initialization through retirement
 queries wait in a cancellable FIFO queue. See [Concurrent queries](concurrent-queries.md) for
 the maintenance, error and multi-GPU contracts.
 
+### Distributed launch section (`sirius.distributed`)
+
+Sirius accepts a `sirius.distributed` section and ignores it. The distributed launch scripts
+(`pixi run sirius-gateway`, `sirius-node`, `sirius-client`) read it, through
+`scripts/sirius_distributed_config.py`, from the same file Sirius loads: the gateway's name,
+ports, networks, the GPUs per node, and UCX transports. Each key sets an environment variable;
+one you export wins over the file. Any error in the section, such as an unknown key, stops the
+scripts with nothing applied. See the
+[distributed quick start](distributed-quickstart.md#configure) for every key.
+
+```yaml
+sirius:
+  distributed:
+    cluster: tpch
+    gateway: { min_ranks: 8, networks: 10.87.140.0/24 }
+    node: { gpus: all }
+```
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -89,7 +107,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 ```yaml
 sirius:
   max_concurrent_queries: 1
-  topology: { num_gpus: 1 }
+  topology: { num_gpus: all }
   memory:
     gpu:
       usage_limit_fraction: 0.95
@@ -136,7 +154,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | all visible GPUs | Non-negative number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
+| `num_gpus` | `all` or int | `all` | `all` uses every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`). A positive count uses that many. `0`, a negative count, or any other value is an error. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Non-empty list of unique, non-negative GPU device IDs. Mutually exclusive with `num_gpus`. |
 | `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
@@ -1153,6 +1171,7 @@ connected, none of these settings can change, on any connection.
 | `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
 | `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
 | `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
+| `sirius_distributed_query_id` | 0 | Number of the next distributed query, which numbers its exchange streams. Set by the [gateway](distributed-gateway.md) on every rank; it must increase, and gaps are fine. 0 numbers queries per process. |
 
 ### Pinned Tables
 

@@ -102,6 +102,10 @@ class exchange_service {
   /// on. Queries are numbered when planned, so one run later (a prepared statement) can retire
   /// after higher-numbered ones.
   void forget(distributed_query_id query);
+  /// Retires every query from @p first to @p last, as forget() does each: numbers this rank
+  /// skipped (a gateway numbers each statement, and not every one runs here), so they never hold
+  /// the retired watermark back. Cost does not grow with the range's length.
+  void forget_range(distributed_query_id first, distributed_query_id last);
 
  private:
   struct held {
@@ -112,6 +116,8 @@ class exchange_service {
 
   [[nodiscard]] std::shared_ptr<inbound> receiver_of(stream_id stream, held event);
   void throw_if_failed();
+  /// The transport, held for the length of a call into it; null once shut down.
+  [[nodiscard]] std::shared_ptr<transport> running_transport();
   /// Fails @p query's receivers with @p error. @return false if it had already ended.
   bool end_query(distributed_query_id query, std::exception_ptr error);
   [[nodiscard]] bool retired(distributed_query_id query) const;
@@ -124,16 +130,17 @@ class exchange_service {
   std::map<stream_id, std::vector<held>> _held;
   std::set<stream_id> _detached;
   std::map<distributed_query_id, std::exception_ptr> _aborted;
-  /// Every query from 1 to this one has retired here, and so has each in _retired_above.
+  /// Every query from 1 to this one has retired here, and so has each range in _retired_above.
   distributed_query_id _retired{0};
-  std::set<distributed_query_id> _retired_above;
+  /// Disjoint, non-adjacent ranges above _retired + 1: first query to last query, both retired.
+  std::map<distributed_query_id, distributed_query_id> _retired_above;
   /// The transport's failure, worded for the queries after it.
   std::exception_ptr _error;
   /// shutdown() has begun: nothing that arrives from here on is kept.
   bool _shut_down{false};
-  // Last: its engine thread calls back into the members above until it is destroyed. Null once
-  // shut down.
-  std::unique_ptr<transport> _transport;
+  // Last: its engine thread calls back into the members above until it is stopped. Null once
+  // shut down. Shared, so that a sender still inside it when shutdown() runs keeps it alive.
+  std::shared_ptr<transport> _transport;
 };
 
 }  // namespace sirius::exchange

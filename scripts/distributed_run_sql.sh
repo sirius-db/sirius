@@ -12,9 +12,7 @@ sql=$2
 port=${3:-27000}
 logs=${4:-/tmp}
 here=$(cd "$(dirname "$0")" && pwd)
-# Every rank is on this host. Left to itself, UCX also picks the host's InfiniBand ports, and on
-# multi-rail GB200 hosts the ranks then fail to connect ("Endpoint timeout").
-export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
+source "$here/launcher_env.sh"
 build="$here/../sirius-duckdb/build/release"
 gpus=$(nvidia-smi -L | wc -l)
 if ((ranks > gpus)); then echo "$ranks ranks need $ranks GPUs; this host has $gpus" >&2; exit 2; fi
