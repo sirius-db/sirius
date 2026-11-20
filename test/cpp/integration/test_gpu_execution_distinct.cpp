@@ -25,7 +25,8 @@
  * would still compare equal.
  *
  * A carried `DISTINCT ON` column may come from any row of its group on either engine, so a full row
- * comparison is valid only where the key fixes the carried value, as in `dist_fd`. Elsewhere
+ * comparison is valid only where the key fixes the carried value, as in `dist_fd`, or where an
+ * ORDER BY names a single row per group, as in `dist_ord`. Elsewhere
  * `compare_gpu_vs_cpu_on_columns` compares the row count and the columns the query determines.
  *
  * The floating-point cases use `compare_gpu_vs_cpu_canonical` instead: a group holding both 0.0 and
@@ -93,6 +94,24 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     run_ok(
       "INSERT INTO dist_agg VALUES (1, 'x', 10), (1, 'x', 5), (1, 'y', 7), "
       "(2, 'z', 3), (2, 'z', 4), (3, 'p', 1), (3, 'q', 1), (3, 'r', 2);");
+    // Every ORDER BY an ordered case uses names one row per `k`, so the CPU answer is fixed, and
+    // the ascending winner of `t`, `s`, `d` and `(u DESC, t)` is its group's last row, which the
+    // unordered route would not pick. `v` names the row. Groups 1 and 2 each hold one NULL `t`
+    // in the middle; group 4 is a single all-NULL row. `d` holds NaN, infinities and at most one
+    // zero per group, and `s` prefixes and upper case.
+    run_ok(
+      "CREATE TABLE dist_ord (k INTEGER, v INTEGER, t INTEGER, u INTEGER, s VARCHAR, d DOUBLE);");
+    run_ok(
+      "INSERT INTO dist_ord VALUES "
+      "(1, 1, 50, 1, 'b', 2.0), (1, 2, 40, 1, 'c', 'inf'::DOUBLE),"
+      "(1, 3, NULL, 1, 'bb', 'nan'::DOUBLE), (1, 4, 30, 5, 'ab', 0.0),"
+      "(1, 5, 20, 5, 'a', '-inf'::DOUBLE),"
+      "(2, 6, 45, 2, 'B', 1.0), (2, 7, 35, 2, 'abc', 'nan'::DOUBLE),"
+      "(2, 8, 25, 9, 'A', '-0.0'::DOUBLE), (2, 9, NULL, 9, 'Ba', 3.0), (2, 10, 15, 9, '9', -5.0),"
+      "(3, 11, 60, 3, 'x', 'inf'::DOUBLE), (3, 12, 55, 3, 'xy', 0.0),"
+      "(3, 13, 52, 7, 'w', 'nan'::DOUBLE), (3, 14, 51, 7, '', -1.0),"
+      "(NULL, 15, 70, 4, 'm', 7.0), (NULL, 16, 65, 4, 'n', 8.0), (NULL, 17, 61, 4, 'l', 6.0),"
+      "(4, 18, NULL, NULL, NULL, NULL);");
     run_ok("CHECKPOINT;");
   }
 };
@@ -758,30 +777,207 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// Ordered carried rows: DISTINCT ON under an ORDER BY, and first(v ORDER BY ...)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON keeps each group's first row under the ORDER BY",
+                 "[integration][gpu_execution][distinct]")
+{
+  // Each group's first row under `t` is its last row, so a dropped order returns other rows.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON honors direction and NULL placement",
+                 "[integration][gpu_execution][distinct]")
+{
+  // The descending winners of `t` are first rows, which the unordered route also keeps, so this
+  // pins the direction only; `v` rises within each group, so its descending winners are last rows.
+  SECTION("DESC")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t DESC");
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, t FROM dist_ord ORDER BY v DESC");
+  }
+
+  SECTION("NULLS FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t NULLS FIRST");
+  }
+
+  SECTION("DESC NULLS FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY t DESC NULLS FIRST");
+  }
+
+  // Mixed directions over two keys: `u` ties at its maximum and `t` breaks the tie.
+  SECTION("two keys")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY u DESC, t");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON drops ORDER BY terms that are its keys",
+                 "[integration][gpu_execution][distinct]")
+{
+  // `ORDER BY k, t` orders each group by `t` alone.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY k, t");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON carries its ORDER BY column",
+                 "[integration][gpu_execution][distinct]")
+{
+  // `t` is carried and is also the order key.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v, t FROM dist_ord ORDER BY t");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON over a GROUP BY ordered by an aggregate",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The top and bottom group per key, ordered by an integer SUM, ties broken by `b`. Keys 1 and 3
+  // keep different groups in the two directions, so one of the two fails whichever group an
+  // unordered route keeps.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC, b");
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c), b");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON orders by a computed key",
+                 "[integration][gpu_execution][distinct]")
+{
+  // `100 - t DESC` orders as `t` ascending, so the winners are last rows; sorting `t` itself
+  // descending would keep the first rows.
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord ORDER BY 100 - t DESC");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution grouped first(v ORDER BY ...) runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  SECTION("beside a SUM and a COUNT(DISTINCT)")
+  {
+    // COLLECT_SET puts the groupby, and its ranked row selector, on cuDF's sort path.
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), sum(v), count(DISTINCT u) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("VARCHAR key")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s DESC) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("DOUBLE key with NaN and infinities")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d DESC) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("beside an unordered FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY t), first(k) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("two keys")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY u DESC, t) FROM dist_ord GROUP BY k");
+  }
+
+  // The rewrites share one create_sort_key, which DuckDB projects below the aggregate.
+  SECTION("two FIRSTs sharing an ORDER BY")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), first(s ORDER BY t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY u DESC, t), first(d ORDER BY u DESC, t) FROM dist_ord GROUP BY "
+      "k");
+  }
+
+  // `100 - t DESC` orders as `t` ascending; a key column holding `t` would keep the first rows.
+  SECTION("a computed key, alone and shared by two FIRSTs")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY 100 - t DESC) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY 100 - t DESC), first(s ORDER BY 100 - t DESC) FROM dist_ord "
+      "GROUP BY k");
+  }
+
+  // The FILTER masks groups 1 and 2's winners (`t` 20, 15) for the sum only; a key column shared
+  // with the masked input would sort them last and keep another row.
+  SECTION("beside a FILTERed aggregate over the key column")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), sum(t) FILTER (WHERE t > 25) FROM dist_ord GROUP BY k");
+  }
+
+  // NOCASE lowers `s` before the sort. Under binary order group 2's descending winner is 'abc'
+  // (v 7); under NOCASE it is 'Ba' (v 9). Lower-cased values are unique in every group.
+  SECTION("a collated key")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY s COLLATE NOCASE DESC, t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s COLLATE NOCASE, t) FROM dist_ord GROUP BY k");
+  }
+
+  // `t` as DECIMAL and as DATE, so the sort runs on fixed-point and timestamp-days storage.
+  SECTION("DECIMAL and DATE keys")
+  {
+    run_ok(
+      "CREATE TABLE dist_ord_types AS SELECT k, v, t::DECIMAL(10, 2) AS dec, "
+      "DATE '2024-01-01' + t AS dt FROM dist_ord ORDER BY v;");
+    run_ok("CHECKPOINT;");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dec) FROM dist_ord_types GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dt DESC) FROM dist_ord_types GROUP BY k");
+  }
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered carried rows over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Each key's largest payload sits in the last scan batch, so the merge must rank the partials
+  // again; the unordered route keeps the smallest.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup "
+    "ORDER BY payload DESC) WHERE payload <> 999990 + k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY payload) "
+    "WHERE payload <> k");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY payload DESC");
+  // MERGE_SETS puts the merge groupby, and its ranked row selector, on cuDF's sort path.
+  compare_gpu_vs_cpu(
+    "SELECT k, first(payload ORDER BY payload DESC), count(*), count(DISTINCT payload % 7) "
+    "FROM dist_dup GROUP BY k");
+}
+
+//===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution DISTINCT ON with ORDER BY falls back at plan time",
-                 "[integration][gpu_execution][distinct]")
+                 "gpu_execution ordered FIRST with a different ORDER BY falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
 {
-  // This names a specific row per group, and a hash-partitioned dedup would return an arbitrary
-  // one: a plausible wrong answer rather than an error.
+  // One carried row per group cannot answer two row orders.
   expect_plan_fallback_matches_cpu(
-    "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
-  // A key term ahead of the carried one does not lift the refusal.
-  expect_plan_fallback_matches_cpu(
-    "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY k NULLS LAST, v NULLS LAST");
+    "SELECT k, first(v ORDER BY t), first(v ORDER BY s) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution DISTINCT ON over a GROUP BY ordered by an aggregate falls back",
+                 "gpu_execution ungrouped ordered FIRST and ordered LAST fall back at plan time",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The top group per key: the order names the row, so this waits for ordered DISTINCT ON. No
-  // key has tied sums, so the two CPU runs agree.
-  expect_plan_fallback_matches_cpu(
-    "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC");
+  // The smallest `t` is unique, and every group's last row under `t` is its NULL `t` row or a
+  // unique largest one, so both CPU runs agree.
+  expect_plan_fallback_matches_cpu("SELECT first(v ORDER BY t) FROM dist_ord");
+  expect_plan_fallback_matches_cpu("SELECT k, last(v ORDER BY t) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,

@@ -391,6 +391,7 @@ std::optional<pushdown> match(duckdb::ClientContext& context,
     auto const& original = expression->Cast<duckdb::BoundAggregateExpression>();
     auto const* combine  = combining_aggregate(original.Function().GetName().GetIdentifierName());
     if (!combine || original.IsDistinct() || original.GetFilter() || original.GetOrderBys() ||
+        original.StateExportMode() == duckdb::AggregateStateExportMode::STATE_EXPORT ||
         original.GetChildren().size() != 1) {
       return std::nullopt;
     }

@@ -68,6 +68,7 @@
 #include <duckdb/optimizer/cte_filter_pusher.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
@@ -91,6 +92,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -142,14 +144,16 @@ class scoped_temp_db_path {
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
 /// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 /// As in production, the generator gets the CTE reader proofs that Sirius's optimizer hooks
-/// captured with the plan, unless `with_cte_reader_proofs` is false.
+/// captured with the plan, unless `with_cte_reader_proofs` is false. `inspect_logical`, when set,
+/// sees the optimized logical plan the generator receives.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   Connection& con,
   const std::string& query,
-  const std::vector<OptimizerType>& also_disabled = {},
-  bool pre_resolve                                = true,
-  std::string* logical_plan_text                  = nullptr,
-  bool with_cte_reader_proofs                     = true)
+  const std::vector<OptimizerType>& also_disabled                    = {},
+  bool pre_resolve                                                   = true,
+  std::string* logical_plan_text                                     = nullptr,
+  bool with_cte_reader_proofs                                        = true,
+  std::function<void(LogicalOperator const&)> const& inspect_logical = {})
 {
   auto& context = *con.context;
 
@@ -199,6 +203,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
     }
 
     if (logical_plan_text) { *logical_plan_text = plan->ToString(); }
+    if (inspect_logical) { inspect_logical(*plan); }
     sirius::planner::sirius_physical_plan_generator gen(context);
     if (with_cte_reader_proofs) { gen.cte_reader_proofs = std::move(cte_reader_proofs); }
     result = gen.create_plan(std::move(plan));
@@ -2596,7 +2601,7 @@ TEST_CASE_METHOD(
       actual_inputs.push_back(first->input_idx);
     }
     CHECK(actual_inputs == first_inputs);
-    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == first_inputs);
+    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == first_inputs);
     return &aggregate;
   };
 
@@ -2711,7 +2716,7 @@ TEST_CASE_METHOD(
     auto const* sum = std::get_if<sirius::op::plain_slot>(&aggregate.aggregate_slots[1]);
     REQUIRE(sum != nullptr);
     CHECK(sum->partial_idx == 0);
-    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == std::vector<int>{1});
+    CHECK(sirius::op::make_carried_block(aggregate.aggregate_slots).inputs == std::vector<int>{1});
     // The local and PARTITION schemas are the partial layout, not the declared one.
     CHECK(hgb->get_types() == aggregate.local_types);
     auto* partition = find_first(plan.get(), SiriusPhysicalOperatorType::PARTITION);
@@ -2822,18 +2827,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     FAIL("expected an exception containing: " << message_fragment);
   };
 
-  SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
-                     "DISTINCT ON with ORDER BY");
-  }
-
-  SECTION("a key term ahead of a carried column's term does not lift the ORDER BY refusal")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val",
-                     "DISTINCT ON with ORDER BY");
-  }
-
   SECTION("a collated distinct target is not a plain reference to any output column")
   {
     // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
@@ -2903,15 +2896,320 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                      "grouped FIRST is not supported over several grouping sets");
   }
 
-  SECTION("an ordered FIRST is refused when both aggregate rewriters leave it in place")
+  SECTION("an exported aggregate state is refused")
   {
-    // EXPRESSION_REWRITER and AGGREGATE_FUNCTION_REWRITER each turn this into arg_min_null, which
-    // Sirius does not translate. With both off, the aggregate stays `first` with one bare-reference
-    // child.
+    auto const* query = GENERATE("SELECT id, first(val) EXPORT_STATE FROM big_left GROUP BY id",
+                                 "SELECT id, first(val ORDER BY val) EXPORT_STATE FROM big_left "
+                                 "GROUP BY id",
+                                 "SELECT id, sum(val) EXPORT_STATE FROM big_left GROUP BY id",
+                                 "SELECT sum(val) EXPORT_STATE FROM big_left");
+    require_rejected(query, "Aggregate EXPORT_STATE is not supported on the GPU");
+  }
+
+  SECTION("a collated DISTINCT ON ORDER BY key is refused")
+  {
+    // The binder wraps the key in its collation, so it is not a plain reference to a child column.
+    require_rejected("SELECT DISTINCT ON (pk) pk, pname FROM parts ORDER BY pname COLLATE NOCASE",
+                     "is not a plain reference to a child column");
+  }
+
+  SECTION("an ungrouped ordered FIRST is refused")
+  {
+    // The ungrouped operator takes the first row of each batch, which no ORDER BY steers.
+    require_rejected("SELECT first(val ORDER BY val) FROM big_left",
+                     "first() with an ORDER BY clause");
+  }
+
+  SECTION("two FIRSTs with different ORDER BYs are refused")
+  {
     require_rejected(
+      "SELECT id, first(val ORDER BY val), first(id ORDER BY val DESC) FROM big_left "
+      "GROUP BY id",
+      "first() with different ORDER BYs");
+  }
+
+  SECTION("an ordered FIRST over several grouping sets is refused")
+  {
+    require_rejected("SELECT id, first(val ORDER BY val) FROM big_left GROUP BY ROLLUP (id)",
+                     "grouped FIRST is not supported over several grouping sets");
+  }
+
+  SECTION("an ordered FIRST with a FILTER is refused")
+  {
+    // The decode keeps the FILTER, so the FIRST meets the same gate as an unordered one.
+    require_rejected(
+      "SELECT id, first(val ORDER BY val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
+      "Aggregate FILTER not supported on GPU");
+  }
+
+  SECTION("a nested aggregate ORDER BY key is refused")
+  {
+    auto create = con->Query("CREATE TABLE nested_order (id INTEGER, s STRUCT(x INTEGER))");
+    REQUIRE(create);
+    REQUIRE_FALSE(create->HasError());
+    require_rejected_any("SELECT id, first(id ORDER BY s) FROM nested_order GROUP BY id",
+                         "is unsupported in an aggregate ORDER BY");
+  }
+
+  SECTION("a sort key DuckDB moved below the aggregate falls back when another aggregate reads it")
+  {
+    // The shared create_sort_key is also max()'s input, so it cannot become the FIRSTs' key
+    // columns.
+    require_rejected(
+      "SELECT id, first(val ORDER BY val), first(id ORDER BY val), "
+      "max(create_sort_key(val, 'ASC NULLS LAST')) FROM big_left GROUP BY id",
+      "create_sort_key");
+  }
+
+  SECTION("an ordered LAST still falls back")
+  {
+    // Only FIRST's rewrite is decoded; LAST's arg_max_null leaves create_sort_key untranslatable.
+    require_rejected("SELECT id, last(val ORDER BY val) FROM big_left GROUP BY id",
+                     "Unsupported expression in aggregate");
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - an ordered FIRST carries its ORDER BY keys",
+                 "[plan_tree_shape][isolated_context][distinct]")
+{
+  using sirius::op::order_key;
+  constexpr auto ascending  = cudf::order::ASCENDING;
+  constexpr auto descending = cudf::order::DESCENDING;
+  // DuckDB sorts NULLs last by default; cuDF's frame reverses a descending key's null order.
+  constexpr auto nulls_last_ascending  = cudf::null_order::AFTER;
+  constexpr auto nulls_last_descending = cudf::null_order::BEFORE;
+
+  // The local aggregate's FIRST slots, the merge above it, and the carried block they share.
+  struct ordered_chain {
+    sirius::op::sirius_physical_grouped_aggregate const* local;
+    sirius::op::carried_block block;
+    std::vector<sirius::op::first_slot> firsts;
+  };
+  auto require_ordered_chain = [](sirius_physical_operator* plan) {
+    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    auto const& merge_op = merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>();
+    // The order keys trail the FIRST columns, so the merge must drop them.
+    CHECK_FALSE(merge_op.partials_are_output());
+    auto* hgb = find_first(plan, SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    auto const& local = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    ordered_chain chain{&local, sirius::op::make_carried_block(local.aggregate_slots), {}};
+    for (auto const& slot : local.aggregate_slots) {
+      if (auto const* first = std::get_if<sirius::op::first_slot>(&slot)) {
+        chain.firsts.push_back(*first);
+      }
+    }
+    CHECK(merge_op.partial_layout().num_carried() == chain.block.inputs.size());
+    CHECK(hgb->get_types() == local.local_types);
+    CHECK(local.local_types.size() == local.partial_layout().num_columns());
+    return chain;
+  };
+
+  SECTION("the GROUP BY form is decoded from arg_min_null")
+  {
+    // Columns: id 0, the FIRST's value 1, its ORDER BY key 2.
+    auto plan = generate_sirius_plan(
+      *con, "SELECT id, first(val ORDER BY val DESC) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    CHECK(chain.local->cudf_aggregates.empty());
+    REQUIRE(chain.firsts.size() == 1);
+    CHECK(chain.firsts[0].input_idx == 1);
+    CHECK(
+      chain.firsts[0].order ==
+      std::vector<order_key>{
+        {.input_idx = 2, .column_order = descending, .null_precedence = nulls_last_descending}});
+    CHECK(chain.block.inputs == std::vector<int>{1, 2});
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{1});
+  }
+
+  SECTION("with both aggregate rewriters off the ORDER BY arrives on the FIRST")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
       "SELECT id, first(val ORDER BY val DESC) FROM big_left GROUP BY id",
-      "first() with an ORDER BY clause",
       {OptimizerType::EXPRESSION_REWRITER, OptimizerType::AGGREGATE_FUNCTION_REWRITER});
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 1);
+    CHECK(
+      chain.firsts[0].order ==
+      std::vector<order_key>{
+        {.input_idx = 2, .column_order = descending, .null_precedence = nulls_last_descending}});
+  }
+
+  SECTION("with both aggregate rewriters off a FIRST ordered by its group key is unordered")
+  {
+    // Only the hoist's own Simplify removes the key here; without it the list loses the shortcut.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT id, first(val ORDER BY id) FROM big_left GROUP BY id",
+      {OptimizerType::EXPRESSION_REWRITER, OptimizerType::AGGREGATE_FUNCTION_REWRITER});
+    INFO(tree_to_string(plan.get()));
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    CHECK(sirius::op::make_carried_block(
+            hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_slots)
+            .order.empty());
+  }
+
+  SECTION("with both aggregate rewriters off FIRSTs sharing an ORDER BY project its key once")
+  {
+    // Columns: id 0, the first FIRST's value 1, the shared key 2, the second FIRST's value 3.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT id, first(val ORDER BY val), first(id ORDER BY val) FROM big_left GROUP BY id",
+      {OptimizerType::EXPRESSION_REWRITER, OptimizerType::AGGREGATE_FUNCTION_REWRITER});
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    CHECK(chain.firsts[0].order == chain.firsts[1].order);
+    CHECK(chain.block.inputs == std::vector<int>{1, 3, 2});
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{2});
+  }
+
+  SECTION("a user-written arg_min_null over create_sort_key is decoded")
+  {
+    // Columns: id 0, the value 1, the key 2. DESC NULLS FIRST maps to cuDF's AFTER.
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT id, arg_min_null(val, create_sort_key(val, 'DESC NULLS "
+                           "FIRST')) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 1);
+    CHECK(
+      chain.firsts[0].order ==
+      std::vector<order_key>{
+        {.input_idx = 2, .column_order = descending, .null_precedence = cudf::null_order::AFTER}});
+  }
+
+  SECTION("an ordered FIRST beside a SUM carries its key after the FIRST")
+  {
+    // Columns: id 0, the FIRST's value 1, its key 2, the SUM's input 3.
+    auto plan = generate_sirius_plan(
+      *con, "SELECT id, first(val ORDER BY val), sum(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    CHECK(chain.local->cudf_aggregates ==
+          std::vector<cudf::aggregation::Kind>{cudf::aggregation::Kind::SUM});
+    CHECK(chain.block.inputs == std::vector<int>{1, 2});
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{1});
+    CHECK(chain.block.order.column_order == std::vector<cudf::order>{ascending});
+    CHECK(chain.block.order.null_precedence == std::vector<cudf::null_order>{nulls_last_ascending});
+  }
+
+  SECTION("FIRSTs sharing an ORDER BY get the key DuckDB moved below the aggregate")
+  {
+    // The common-subexpression pass projects the one create_sort_key both rewrites share, so the
+    // planner must inline it; the logical check fails if DuckDB stops producing that shape.
+    bool key_below_aggregate = false;
+    auto const inspect       = [&](LogicalOperator const& root) {
+      auto const* node = &root;
+      while (node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+             !node->children.empty()) {
+        node = node->children[0].get();
+      }
+      REQUIRE(node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY);
+      REQUIRE(node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION);
+      for (auto const& expression : node->children[0]->expressions) {
+        if (expression->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+            expression->Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName() ==
+              "create_sort_key") {
+          key_below_aggregate = true;
+        }
+      }
+      for (auto const& expression : node->expressions) {
+        auto const& aggregate = expression->Cast<BoundAggregateExpression>();
+        CHECK(aggregate.Function().GetName().GetIdentifierName() == "arg_min_null");
+        CHECK(aggregate.GetChildren()[1]->GetExpressionClass() == ExpressionClass::BOUND_REF);
+      }
+    };
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT id, first(val ORDER BY val), first(id ORDER BY val) FROM big_left GROUP BY id",
+      {},
+      true,
+      nullptr,
+      true,
+      inspect);
+    CHECK(key_below_aggregate);
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    CHECK(chain.firsts[0].order.size() == 1);
+    CHECK(chain.firsts[0].order == chain.firsts[1].order);
+    CHECK(chain.firsts[0].order[0].column_order == ascending);
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{2});
+  }
+
+  SECTION("FIRSTs sharing a two-key ORDER BY keep both keys")
+  {
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT id % 2 AS g, first(val ORDER BY val, id DESC), "
+                           "first(id ORDER BY val, id DESC) FROM big_left GROUP BY id % 2");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    REQUIRE(chain.firsts[0].order.size() == 2);
+    CHECK(chain.firsts[0].order == chain.firsts[1].order);
+    CHECK(chain.firsts[0].order[0].column_order == ascending);
+    CHECK(chain.firsts[0].order[1].column_order == descending);
+    CHECK(chain.firsts[0].order[1].null_precedence == nulls_last_descending);
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{2, 3});
+  }
+
+  SECTION("an unordered FIRST rides the ordered FIRST's row")
+  {
+    // Columns: id 0, the ordered FIRST's value 1, its key 2, the unordered FIRST's value 3.
+    auto plan = generate_sirius_plan(
+      *con, "SELECT id, first(val ORDER BY val), first(id) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    CHECK(chain.firsts[1].order.empty());
+    CHECK(chain.block.inputs == std::vector<int>{1, 3, 2});
+    CHECK(chain.block.order.positions == std::vector<cudf::size_type>{2});
+  }
+
+  SECTION("a GROUP BY FIRST ordered by its key is unordered")
+  {
+    // The optimizer drops an ORDER BY term that is a group key before it rewrites the FIRST.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, first(val ORDER BY id) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    CHECK(sirius::op::make_carried_block(
+            hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_slots)
+            .order.empty());
+  }
+
+  SECTION("DISTINCT ON orders its carried column")
+  {
+    // `ORDER BY id, val` simplifies to `val`: a key term is constant within its group.
+    auto const* query = GENERATE("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
+                                 "SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val");
+    CAPTURE(query);
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    CHECK(chain.local->group_idx == std::vector<int>{0});
+    REQUIRE(chain.firsts.size() == 1);
+    CHECK(chain.firsts[0].input_idx == 1);
+    CHECK(chain.firsts[0].order ==
+          std::vector<order_key>{
+            {.input_idx = 1, .column_order = ascending, .null_precedence = nulls_last_ascending}});
+    CHECK(chain.block.inputs == std::vector<int>{1, 1});
   }
 }
 
@@ -3219,7 +3517,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_wrap_grou
     sirius::ast::aggregate{sirius::aggregate_id::sum,
                            std::move(sum_arguments),
                            sirius::logical_type::make(sirius::type_id::BIGINT),
-                           /*distinct=*/false}));
+                           /*distinct=*/false,
+                           /*order=*/{}}));
   auto aggregate =
     duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(std::move(output_types),
                                                                      std::move(expressions),

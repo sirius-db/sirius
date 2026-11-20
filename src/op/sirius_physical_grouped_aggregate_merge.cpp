@@ -304,6 +304,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
                                                      num_group_cols,
                                                      cudf_aggregates,
                                                      static_cast<int>(layout.num_carried()),
+                                                     make_carried_block(aggregate_slots).order,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
                                                      batch_telemetry(),
