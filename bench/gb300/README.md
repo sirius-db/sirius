@@ -9,12 +9,16 @@ bash bench/gb300/replay.sh 1000 hot --dry-run
 bash bench/gb300/replay.sh 1000 pinned --dry-run
 ```
 
-GB300 replay requires CDMM (`driver`) mode. The saved cold/hot protocol uses
-one process for the full query suite, with two iterations. Cold resets the
-cache before each measurement; hot groups iterations by query. These process
-lifetimes preserve the existing GB300 replay and differ from G7e's protocol.
-SF10000 uses a separate process and config for Q10, reproducing the saved
-composite suite. The pinned protocol uses per-query host pinning inside one
+GB300 replay requires CDMM (`driver`) mode. New cold runs start a fresh Sirius
+process for every query iteration and clear both the local dataset-file OS
+cache and Sirius cache before timing. They follow suite order, Q1(1) through
+Q22(1), then Q1(2) through Q22(2). SF10000 cold applies its separate Q10 config
+in that order without grouping Q10's iterations in one process.
+
+Hot keeps one process for the suite and groups iterations by query; SF10000
+hot runs Q10 separately with its own config. The selected historical cold
+measurements reused one process and are unchanged: the new cold protocol is
+not a rerun of those timings. The pinned protocol uses per-query host pinning inside one
 session, with explicit compression plans only for `lineitem` and `orders`.
 There is no successful selected SF10000 pinned run.
 

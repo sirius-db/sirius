@@ -16,11 +16,17 @@ bash bench/gb300/replay.sh 1000 pin
 The script accepts SF100, SF300, SF1000, SF3000, and SF10000 for cold/hot and
 SF100 through SF3000 for host pin. It requires GB300 CDMM (`driver`) mode for
 Sirius and refuses to run in NUMA mode. Cold/hot execute all 22 queries twice
-with their saved YAMLs. Host pin executes all 22 queries once, per-query, with
+with their saved YAMLs. New cold replays use a fresh Sirius process for every
+query iteration, dropping the local dataset-file OS cache and resetting the
+Sirius cache before timing. The saved historical cold measurements reused one
+process; their timings and provenance remain unchanged. Hot retains its existing
+process lifetime. Host pin executes all 22 queries once, per-query, with
 `--profile hot --pin host --pin-compression`; only `lineitem` and `orders` use
 the explicit Simpatico plans, matching the selected results. For SF10000, the
-script runs Q1–Q9 and Q11–Q22 with the regular config and Q10 separately with
-the saved 8 GiB hash-table config. This matches the composite saved totals.
+script uses the regular config except for Q10's saved 8 GiB hash-table config.
+Cold keeps Q1–Q22 suite order with a fresh process per measurement; hot runs
+Q1–Q9 and Q11–Q22 in one session and Q10 in another. The saved totals below
+remain the original composite measurements.
 Output is timestamped under `test_datasets/gb300-replay-output/`; set
 `GB300_REPLAY_OUTPUT` to change that directory. Add `--dry-run` to print the
 commands without executing them. The replay script uses

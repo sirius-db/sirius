@@ -57,6 +57,14 @@ alias for `pinned`. Pinning selects host memory by default; G7e also accepts
 protocol always uses host pinning and compressed `lineitem`/`orders` plans.
 Neither the profile nor pinning changes the saved YAML cache policy.
 
+On both hardware types, cold starts a fresh Sirius process for every query
+iteration and uses `performance_test.py --profile cold` to drop the local
+dataset-file OS cache and reset Sirius's cache before the measurement. Order is
+Q1(1), ..., Q22(1), Q1(2), ..., Q22(2), with each worker exiting before the next
+starts. Engine startup and cache clearing are outside query timing. The EC2
+instance remains running. This cold protocol applies to new runs; stored
+measurements retain their original process lifetimes.
+
 G7e checks EC2 identity and the actual spill mount before running. Every S3
 input must be in the instance's actual region, verified using AWS bucket
 metadata. Each table must contain Parquet objects; verify the generation

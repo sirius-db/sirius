@@ -41,7 +41,7 @@ def schedule(hardware, profile, selected, iterations, sf):
     if hardware == "gb300" and sf == 10000 and profile == "pinned":
         raise ValueError("There is no successful saved GB300 SF10000 host-pin result")
     config = ROOT / "bench" / hardware / "configs" / f"{profile}.yaml"
-    if hardware == "g7e" and profile == "cold":
+    if profile == "cold":
         groups = [([q], [i]) for i in range(1, iterations + 1) for q in selected]
     elif hardware == "g7e":
         groups = [([q], list(range(1, iterations + 1))) for q in selected]
@@ -50,7 +50,11 @@ def schedule(hardware, profile, selected, iterations, sf):
     steps = [
         {"queries": qs, "iterations": its, "config": str(config)} for qs, its in groups
     ]
-    if hardware == "gb300" and sf == 10000:
+    if hardware == "gb300" and sf == 10000 and profile == "cold":
+        for step in steps:
+            if step["queries"] == [10]:
+                step["config"] = str(config.with_name("sf10k-q10-cold.yaml"))
+    elif hardware == "gb300" and sf == 10000:
         steps = []
         if others := [q for q in selected if q != 10]:
             steps.append(

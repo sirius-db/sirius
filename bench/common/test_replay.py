@@ -28,6 +28,7 @@ for name in ("input","scale-factor","engine","profile","iterations","queries","c
     p.add_argument("--"+name)
 a=p.parse_args()
 assert os.environ["SIRIUS_PRE_SQL"]=="SET enable_duckdb_fallback = false;"
+assert a.profile=="cold" and a.iterations=="1"
 r=Path(a.output)/"fake"
 (r/"csv").mkdir(parents=True)
 (r/"pid").write_text(str(os.getpid()))
@@ -40,10 +41,14 @@ with (r/"csv/runtimes.csv").open("w") as f:
         log.parent.mkdir(parents=True)
         log.write_text("Transparent execution: physical plan replaced with GPU operator\\n"*int(a.iterations))
 """
-        for failed in (False, True):
-            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+        for hardware, failed in (
+            (h, f) for h in ("gb300", "g7e") for f in (False, True)
+        ):
+            with self.subTest(
+                hardware=hardware, failed=failed
+            ), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                config = root / "bench/g7e/configs/cold.yaml"
+                config = root / "bench" / hardware / "configs/cold.yaml"
                 config.parent.mkdir(parents=True)
                 original = "sirius:\n  executor:\n    pipeline: {num_threads: 4}\n"
                 config.write_text(original)
@@ -68,7 +73,7 @@ with (r/"csv/runtimes.csv").open("w") as f:
                     code = replay.main(
                         [
                             "--hardware",
-                            "g7e",
+                            hardware,
                             "--sf",
                             "1000",
                             "--profile",
@@ -92,12 +97,31 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 self.assertEqual(len(pids), 2 if failed else 4)
                 self.assertEqual(len(set(pids)), len(pids))
 
-    def test_g7e_cold_restarts_every_measurement(self):
-        steps = replay.schedule("g7e", "cold", [3, 6], 2, 1000)
+    def test_cold_restarts_every_measurement_on_both_hardware_types(self):
+        for hardware in ("gb300", "g7e"):
+            with self.subTest(hardware=hardware):
+                steps = replay.schedule(hardware, "cold", [3, 6], 2, 1000)
+                self.assertEqual(
+                    [(s["queries"], s["iterations"]) for s in steps],
+                    [([3], [1]), ([6], [1]), ([3], [2]), ([6], [2])],
+                )
+
+    def test_gb300_cold_q10_override_preserves_fresh_process_order(self):
+        steps = replay.schedule("gb300", "cold", [3, 10, 18], 2, 10000)
         self.assertEqual(
             [(s["queries"], s["iterations"]) for s in steps],
-            [([3], [1]), ([6], [1]), ([3], [2]), ([6], [2])],
+            [
+                ([3], [1]),
+                ([10], [1]),
+                ([18], [1]),
+                ([3], [2]),
+                ([10], [2]),
+                ([18], [2]),
+            ],
         )
+        for step in steps:
+            expected = "sf10k-q10-cold.yaml" if step["queries"] == [10] else "cold.yaml"
+            self.assertEqual(Path(step["config"]).name, expected)
 
     def test_g7e_hot_and_pinned_reuse_only_within_query(self):
         for profile in ("hot", "pinned"):
@@ -107,8 +131,8 @@ with (r/"csv/runtimes.csv").open("w") as f:
                 [([3], [1, 2]), ([6], [1, 2])],
             )
 
-    def test_gb300_preserves_session_and_q10_override(self):
-        steps = replay.schedule("gb300", "cold", [3, 6], 2, 1000)
+    def test_gb300_hot_preserves_session_and_q10_override(self):
+        steps = replay.schedule("gb300", "hot", [3, 6], 2, 1000)
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0]["queries"], [3, 6])
         steps = replay.schedule("gb300", "hot", [3, 10, 18], 2, 10000)

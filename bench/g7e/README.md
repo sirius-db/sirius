@@ -25,7 +25,8 @@ bash bench/g7e/replay.sh 10000 cold --iterations 1 --dry-run
 bash bench/g7e/replay.sh 1000 pinned --pin-tier host --dry-run
 ```
 
-G7e cold starts a fresh Sirius process for **every query iteration**, in suite
+G7e cold starts a fresh Sirius process and clears the local dataset-file OS
+cache and Sirius cache before **every query iteration**, in suite
 order: Q1(1), ..., Q22(1), Q1(2), ..., Q22(2). Hot starts a fresh process for
 **each query** and reuses that process for its iterations: Q1(1), Q1(2), restart,
 Q2(1), Q2(2), and so on. Pinned uses hot's process lifetime with explicit host
