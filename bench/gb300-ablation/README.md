@@ -59,6 +59,13 @@ switching only `--no-pin-compression` to `--pin-compression`. Summarize with
 `summarize.py --all-on-vs-simpatico <output-directory>`. With uncompressed
 pins, the fused-decode switch is still on but has no compressed input to act on.
 
+For the alternative cumulative order requested on the GB300, use
+`--join-first-order`. This runs a fresh all-off baseline, then enables
+BUILD_PROBE admission, dynamic filters, type narrowing, compressed pinning,
+and fused filtering during decode, in that order. Summarize with
+`summarize.py --join-first-order <output-directory>`.
+The untimed path checks accept the same `--join-first-order` switch.
+
 After the run, generate a six-stage total and a per-query comparison with:
 
 ```bash

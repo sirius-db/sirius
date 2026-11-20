@@ -56,6 +56,11 @@ def main() -> None:
         action="store_true",
         help="summarize all-on runs with host pin compression off and on",
     )
+    comparison.add_argument(
+        "--join-first-order",
+        action="store_true",
+        help="summarize the BUILD_PROBE, dynamic filter, narrowing, compression, fused-decode order",
+    )
     args = parser.parse_args()
     root = args.output.resolve()
     if not root.is_dir():
@@ -65,6 +70,15 @@ def main() -> None:
         stages = ((0, "all_off"), (6, "simpatico_only"))
     elif args.all_on_vs_simpatico:
         stages = ((7, "all_on_uncompressed"), (8, "all_on_compressed"))
+    elif args.join_first_order:
+        stages = (
+            (9, "all_off"),
+            (10, "build_probe"),
+            (11, "dynamic_filter"),
+            (12, "type_narrow"),
+            (13, "compressed_pin"),
+            (14, "fused_decode"),
+        )
     else:
         stages = tuple(enumerate(STAGES))
     all_times = [read_stage(root, stage, label) for stage, label in stages]

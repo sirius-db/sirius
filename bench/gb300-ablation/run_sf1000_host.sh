@@ -6,16 +6,22 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 dry_run=false
 comparison=false
 all_on_comparison=false
+join_first_order=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=true ;;
     --baseline-vs-simpatico) comparison=true ;;
     --all-on-vs-simpatico) all_on_comparison=true ;;
-    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
+    --join-first-order) join_first_order=true ;;
+    *) echo "usage: $0 [--dry-run] [--baseline-vs-simpatico|--all-on-vs-simpatico|--join-first-order] (set ABLATION_OUTPUT to choose the output directory)" >&2; exit 2 ;;
   esac
 done
-if [[ "$comparison" == true && "$all_on_comparison" == true ]]; then
-  echo "Choose only one comparison" >&2
+selected_modes=0
+for selected in "$comparison" "$all_on_comparison" "$join_first_order"; do
+  if [[ "$selected" == true ]]; then ((selected_modes+=1)); fi
+done
+if (( selected_modes > 1 )); then
+  echo "Choose only one run mode" >&2
   exit 2
 fi
 dataset="${DATASET_ROOT:-/mnt/datasets}/tpch_parquet_sf1000"
@@ -65,6 +71,7 @@ failed=0
 stages=(0 1 2 3 4 5)
 if [[ "$comparison" == true ]]; then stages=(0 6); fi
 if [[ "$all_on_comparison" == true ]]; then stages=(7 8); fi
+if [[ "$join_first_order" == true ]]; then stages=(9 10 11 12 13 14); fi
 for stage in "${stages[@]}"; do
   case "$stage" in
     0) label=all_off;       narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
@@ -76,6 +83,12 @@ for stage in "${stages[@]}"; do
     6) label=simpatico_only;narrow=false; compress=true;  fused=false; build_probe=false; dynamic=false ;;
     7) label=all_on_uncompressed;narrow=true; compress=false; fused=true; build_probe=true; dynamic=true ;;
     8) label=all_on_compressed;narrow=true; compress=true; fused=true; build_probe=true; dynamic=true ;;
+    9) label=all_off;        narrow=false; compress=false; fused=false; build_probe=false; dynamic=false ;;
+    10) label=build_probe;   narrow=false; compress=false; fused=false; build_probe=true; dynamic=false ;;
+    11) label=dynamic_filter;narrow=false; compress=false; fused=false; build_probe=true; dynamic=true ;;
+    12) label=type_narrow;   narrow=true;  compress=false; fused=false; build_probe=true; dynamic=true ;;
+    13) label=compressed_pin;narrow=true;  compress=true;  fused=false; build_probe=true; dynamic=true ;;
+    14) label=fused_decode;  narrow=true;  compress=true;  fused=true;  build_probe=true; dynamic=true ;;
   esac
   stage_dir="$output/stage${stage}-${label}"
   sql="SET enable_duckdb_fallback = false;"

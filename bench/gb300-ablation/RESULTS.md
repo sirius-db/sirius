@@ -88,3 +88,38 @@ Query time excludes pinning and unpinning. The fused-decode switch remains on
 in both YAMLs, but its compressed-input path cannot run with raw pins, so this
 pair measures the combined execution effect of compressed pinning and the
 enabled consumers of compressed input. This is one pass per condition.
+
+## BUILD_PROBE-first cumulative order
+
+A separate six-stage SF1000 host-pin run started with all five switches off,
+then enabled BUILD_PROBE admission, dynamic filters, type narrowing, Simpatico
+pinning, and fused filtering during decode in that order. The GB300 pin YAML,
+explicit `lineitem` and `orders` plans, hot profile, and 22-query workload were
+the same as the first cumulative study. Each stage used one fresh Sirius
+process and one iteration per query.
+
+| Stage | Optimization added | 22-query total | Change from prior stage |
+| ---: | :--- | ---: | ---: |
+| 9 | All five off | 12.343 s | — |
+| 10 | BUILD_PROBE admission | 11.203 s | −1.140 s (−9.2%) |
+| 11 | Dynamic filters | 9.107 s | −2.096 s (−18.7%) |
+| 12 | Type narrowing | 8.950 s | −0.157 s (−1.7%) |
+| 13 | Compressed pinning | 8.597 s | −0.353 s (−3.9%) |
+| 14 | Fused filtering during decode | 6.945 s | −1.652 s (−19.2%) |
+
+All six stages completed. Results matched exactly for 21 queries; Q11 had the
+same rows in a different tied-row order. Stages 9–12 logged no pin compression,
+while stages 13–14 each logged 29 compression events for `lineitem` and
+`orders`. Query totals exclude pinning and unpinning. The
+[exact totals](results/join-first-summary.csv) and
+[per-query times](results/join-first-per-query.csv) are saved here, along with
+the [run manifest](results/join-first-manifest.json). Untimed diagnostics
+confirmed two BUILD_PROBE selections and two dynamic-filter publications for
+Q3, plus 32 filtered decodes for Q6. These diagnostic runs are excluded from
+the timing table.
+
+This is one pass per stage. The increments depend on their order and should
+not be treated as independent effects. In particular, the final 19.2% step
+measures enabling fused filtering on top of compressed pinning, BUILD_PROBE,
+dynamic filters, and type narrowing. It does not describe Simpatico compression
+alone.

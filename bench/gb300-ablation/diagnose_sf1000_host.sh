@@ -2,12 +2,20 @@
 # Untimed checks that the enabled scan and join paths were actually selected.
 set -euo pipefail
 
-if (( $# != 1 )); then
-  echo "usage: $0 ABLATION_OUTPUT" >&2
+if (( $# == 1 )); then
+  output_arg="$1"
+  join_first=false
+  specs=(fused_decode:3:6 build_probe:4:3 dynamic_filter:5:3)
+elif (( $# == 2 )) && [[ "$1" == --join-first-order ]]; then
+  output_arg="$2"
+  join_first=true
+  specs=(build_probe:10:3 dynamic_filter:11:3 fused_decode:14:6)
+else
+  echo "usage: $0 [--join-first-order] ABLATION_OUTPUT" >&2
   exit 2
 fi
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-output="$(cd "$1" && pwd)"
+output="$(cd "$output_arg" && pwd)"
 dataset="${DATASET_ROOT:-/mnt/datasets}/tpch_parquet_sf1000"
 if [[ -n "${PIXI_BIN:-}" ]]; then
   pixi="$PIXI_BIN"
@@ -24,7 +32,7 @@ export SIRIUS_PRE_SQL='SET enable_duckdb_fallback = false;'
 export SIRIUS_LOG_LEVEL=debug
 cd "$repo"
 
-for spec in fused_decode:3:6 build_probe:4:3 dynamic_filter:5:3; do
+for spec in "${specs[@]}"; do
   IFS=: read -r label stage query <<< "$spec"
   case_dir="$output/diagnostics/$label"
   if [[ -e "$case_dir" ]]; then
@@ -37,13 +45,17 @@ for spec in fused_decode:3:6 build_probe:4:3 dynamic_filter:5:3; do
   if [[ "$label" == fused_decode ]]; then
     printf '    fused_scan_diagnostics: true\n' >> "$case_dir/config.yaml"
   fi
+  pin_option=--pin-compression
+  if [[ "$join_first" == true && "$stage" -lt 13 ]]; then
+    pin_option=--no-pin-compression
+  fi
   echo "Checking $label with Q$query"
   set +e
   timeout --signal=TERM --kill-after=30s 180s "$pixi" run --locked python \
     test/tpch_performance/performance_test.py \
     --input "$dataset" --scale-factor 1000 --engine gpu --profile hot \
     --iterations 1 --queries "$query" --config "$case_dir/config.yaml" \
-    --pin host --pin-compression --output "$case_dir" \
+    --pin host "$pin_option" --output "$case_dir" \
     --name "sf1000_host_ablation_diagnostic_$label" \
     > "$case_dir/progress.log" 2>&1
   status=$?
