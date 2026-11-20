@@ -26,6 +26,14 @@ struct entry {
 /// changes.
 using scope_set = std::vector<std::shared_ptr<const entry>>;
 
+/// A copy of @p current in which the entry published for @p key (the exact bytes of its
+/// `uri_prefix`) is replaced by @p replacement, or removed when @p replacement is null. The other
+/// entries are kept, and the result is ordered as a `scope_set` is. A non-null @p replacement
+/// carries @p key as its `uri_prefix`.
+[[nodiscard]] std::shared_ptr<const scope_set> with_entry(const scope_set& current,
+                                                          std::string_view key,
+                                                          std::shared_ptr<const entry> replacement);
+
 /// Why a read is not served.
 enum class refusal_kind : std::uint8_t {
   unconfigured,
