@@ -31,6 +31,7 @@
 #include "exchange/exchange_runtime.hpp"
 #include "exchange/exchange_service.hpp"
 #include "exec/stream_bind_catalog.hpp"
+#include "exec/thread_util.hpp"
 #include "helper/transaction_utils.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
@@ -931,6 +932,8 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("Cannot reinitialize a context after a fatal runtime failure");
   }
 
+  // Keep rollback inside the startup affinity scope as well.
+  std::optional<cucascade::exec::thread_util::scoped_thread_affinity> startup_affinity;
   // Roll back even when initialize() is called on an existing engine object.
   struct initialization_guard {
     SiriusContext* self;
@@ -954,6 +957,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  startup_affinity.emplace(config_.get_worker_startup_cpus());
   // The spill converters run on downgrade threads with no client context, so they
   // read process-wide settings rather than this configuration.
   sirius::compression::apply_spill_compression_config(config_.get_compression_config());
@@ -1362,6 +1366,8 @@ std::shared_ptr<sirius::exchange::exchange_service> SiriusContext::get_exchange_
         static_cast<void>(downgrade.request_downgrade(
           [gpu, bytes] { return gpu->get_available_memory() >= bytes; }));
       };
+      cucascade::exec::thread_util::scoped_thread_affinity startup_affinity(
+        config_.get_worker_startup_cpus());
       return sirius::exchange::make_nixl_exchange(
         params.exchange_rank, params.exchange_peers, *gpu, host, opts);
     });
