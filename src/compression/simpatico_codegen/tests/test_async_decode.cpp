@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "api/simpatico_codegen.hpp"
+#include "codegen/bridge/meld_backend.hpp"
 #include "codegen/decode/jit/renderer.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "decode/decode_session.hpp"
@@ -1683,6 +1684,10 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   codegen::jit::CompileOptions options;
   options.arch_cc = codegen::jit::arch_cc_for_current_device();
   auto handle     = cache.get_or_compile_plain(spec.source, spec.entry_symbol, options);
+  // The kernel the session launches, which is Meld's where SIMPATICO_CODEGEN_BACKEND says so.
+  if (simpatico::meld::decode_backend() == simpatico::meld::Backend::meld) {
+    handle = simpatico::meld::plain_decode_kernel(*shape, "int32_t").value().kernel;
+  }
   std::weak_ptr<codegen::jit::CompiledKernel const> retained = handle;
   handle.reset();
 

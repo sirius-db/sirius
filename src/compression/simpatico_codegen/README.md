@@ -277,12 +277,23 @@ To change the library headers, rebuild Sirius. This is not a compiler security s
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).
 
+### Meld decode backend
+
+`SIMPATICO_CODEGEN_BACKEND=meld` compiles plain decoders of bitpack, FOR, zigzag and raw
+trees with Meld instead of NVRTC; everything else stays with NVRTC. `shadow` runs both and
+throws where they differ, synchronizing on each decode. Build with Meld beside Sirius:
+
+```bash
+pixi run -e meld make release-meld
+```
+
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
-| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` for requested kernels at exit. |
+| `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` for requested kernels at exit, and Meld's counts in a build with Meld. |
+| `SIMPATICO_CODEGEN_BACKEND` | `nvrtc` (default), `meld` or `shadow`; see "Meld decode backend". |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
 | `CODEGEN_JIT_DUMP_ENCODE_SOURCE` / `CODEGEN_JIT_DUMP_DECODE_SOURCE` | Debug: if set to a path, writes the rendered encode/decode CUDA source there. |
 
