@@ -244,6 +244,11 @@ def main(argv=None):
     parser.add_argument("--queries", type=queries, default=list(range(1, 23)))
     parser.add_argument("--iterations", type=int)
     parser.add_argument(
+        "--config",
+        type=Path,
+        help="Use this exact YAML instead of hardware presets for every selected query",
+    )
+    parser.add_argument(
         "--source-dir",
         type=Path,
         default=ROOT,
@@ -301,6 +306,8 @@ def main(argv=None):
         args.hardware, args.profile, args.queries, args.iterations, args.sf
     )
     for i, step in enumerate(steps):
+        if args.config is not None:
+            step["config"] = str(args.config.resolve())
         step["directory"] = str(args.output / f"worker{i + 1:03}")
         step["source_sha256"] = digest(step["config"])
         step["command"] = command(

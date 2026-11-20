@@ -222,6 +222,41 @@ with (r/"csv/runtimes.csv").open("w") as f:
             )
             self.assertFalse(engine.exists())
 
+    def test_explicit_config_is_preserved_for_every_query_and_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "custom.yaml"
+            original = "sirius:\n  executor:\n    pipeline: {num_threads: 4}\n"
+            config.write_text(original)
+            for hardware, profile in (
+                ("g7e", "cold"),
+                ("g7e", "hot"),
+                ("gb300", "cold"),
+                ("gb300", "hot"),
+            ):
+                with self.subTest(hardware=hardware, profile=profile):
+                    captured = io.StringIO()
+                    with redirect_stdout(captured):
+                        replay.main(
+                            [
+                                "--hardware",
+                                hardware,
+                                "--sf",
+                                "10000",
+                                "--profile",
+                                profile,
+                                "--queries",
+                                "3,10",
+                                "--config",
+                                str(config),
+                                "--dry-run",
+                            ]
+                        )
+                    plan = json.loads(captured.getvalue())
+                    self.assertTrue(
+                        all(s["config"] == str(config) for s in plan["steps"])
+                    )
+                    self.assertEqual(config.read_text(), original)
+
     def test_sums_keep_missing_measurements_missing(self):
         report = replay.summarize([3, 6], 2, {(3, 1): 4.0, (3, 2): 2.0, (6, 1): 7.0})
         self.assertEqual(report["sum_best_s"], 9.0)

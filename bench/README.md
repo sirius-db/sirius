@@ -61,6 +61,9 @@ alias for `pinned`. Pinning selects host memory by default; G7e also accepts
 `--pin-tier gpu` and optional `--pin-compression`. GB300's selected pinned
 protocol always uses host pinning and compressed `lineitem`/`orders` plans.
 Neither the profile nor pinning changes the saved YAML cache policy.
+Use `--config /path/to/custom.yaml` to measure a run-specific config without
+editing the hardware presets. This explicit file applies to every selected
+query, including GB300 SF10000 Q10; implicit preset overrides do not replace it.
 
 On both hardware types, cold starts a fresh Sirius process for every query
 iteration and uses `performance_test.py --profile cold` to drop the local
