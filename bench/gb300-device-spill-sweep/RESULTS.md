@@ -9,6 +9,8 @@ skipped the already completed 32 GB results and then ran 64, 128, and 256 GB.
 Each of the 22 TPC-H queries ran once at each limit, unpinned, in a fresh Sirius
 process against the same Parquet datasets used by the host-memory sweep.
 All 264 queries finished with GPU plans.
+The [SF1000 and SF3000 reproduction script](reproduce_sf1k_sf3k.sh) runs both
+smaller scale factors sequentially into a fresh output directory.
 
 The base was `bench/gb300-cold/config.yaml`, with
 `memory.gpu.usage_limit_bytes` set to the indicated decimal GB limit, host cap

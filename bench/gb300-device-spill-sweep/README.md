@@ -16,7 +16,25 @@ keeping the GPU cap as the swept variable. The
 host initial pool count scales from 225 to 192 to retain the same preallocation
 ratio. No `--profile` override is used.
 
-From the repository root:
+The runner requires the built Sirius extension, the Parquet dataset under
+`test_datasets/tpch_parquet_sf<SCALE>/`, and Pixi at
+`test_datasets/.generation-tools/pixi`. To reproduce SF1000 and SF3000 together
+from the repository root:
+
+```bash
+tmux new-session -d -s gb300-device-spill-sf1k-sf3k \
+  'bash bench/gb300-device-spill-sweep/reproduce_sf1k_sf3k.sh'
+```
+
+The script runs SF1000 followed by SF3000, with one iteration of all 22 queries
+at each of the four GPU limits. It creates a fresh timestamped output directory
+under `test_datasets/gb300-device-spill-sweep/reproductions/`, so an existing
+result cannot cause queries to be skipped. `run.log` gives the output directory
+and completion status; each scale factor has its own `progress.log`,
+`per-query.csv`, and `totals.csv`. Set `SWEEP_OUTPUT` to an absolute directory
+if you want a stable output path or need to resume an interrupted run.
+
+To run SF10000 on its own:
 
 ```bash
 tmux new-session -d -s gb300-device-spill-sf10k \
