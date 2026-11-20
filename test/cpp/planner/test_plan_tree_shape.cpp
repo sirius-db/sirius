@@ -2822,18 +2822,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     FAIL("expected an exception containing: " << message_fragment);
   };
 
-  SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
-                     "DISTINCT ON with ORDER BY");
-  }
-
-  SECTION("a key term ahead of a carried column's term does not lift the ORDER BY refusal")
-  {
-    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val",
-                     "DISTINCT ON with ORDER BY");
-  }
-
   SECTION("a collated distinct target is not a plain reference to any output column")
   {
     // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
@@ -3113,6 +3101,24 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(sirius::op::make_carried_block(
             hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_slots)
             .order.empty());
+  }
+
+  SECTION("DISTINCT ON orders its carried column")
+  {
+    // `ORDER BY id, val` simplifies to `val`: a key term is constant within its group.
+    auto const* query = GENERATE("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
+                                 "SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY id, val");
+    CAPTURE(query);
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    CHECK(chain.local->group_idx == std::vector<int>{0});
+    REQUIRE(chain.firsts.size() == 1);
+    CHECK(chain.firsts[0].input_idx == 1);
+    CHECK(chain.firsts[0].order ==
+          std::vector<order_key>{
+            {.input_idx = 1, .column_order = ascending, .null_precedence = nulls_last_ascending}});
+    CHECK(chain.block.inputs == std::vector<int>{1, 1});
   }
 }
 

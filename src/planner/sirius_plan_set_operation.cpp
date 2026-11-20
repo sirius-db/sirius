@@ -130,7 +130,7 @@ sirius_physical_plan_generator::plan_full_row_dedup(
 {
   duckdb::vector<duckdb::idx_t> key_columns(child->get_types().size());
   std::iota(key_columns.begin(), key_columns.end(), duckdb::idx_t{0});
-  return plan_dedup(std::move(child), key_columns, {}, estimated_cardinality);
+  return plan_dedup(std::move(child), key_columns, {}, {}, estimated_cardinality);
 }
 
 namespace {
