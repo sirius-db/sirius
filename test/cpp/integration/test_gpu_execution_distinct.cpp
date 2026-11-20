@@ -25,7 +25,8 @@
  * would still compare equal.
  *
  * A carried `DISTINCT ON` column may come from any row of its group on either engine, so a full row
- * comparison is valid only where the key fixes the carried value, as in `dist_fd`. Elsewhere
+ * comparison is valid only where the key fixes the carried value, as in `dist_fd`, or where an
+ * ORDER BY names a single row per group, as in `dist_ord`. Elsewhere
  * `compare_gpu_vs_cpu_on_columns` compares the row count and the columns the query determines.
  *
  * The floating-point cases use `compare_gpu_vs_cpu_canonical` instead: a group holding both 0.0 and
@@ -93,6 +94,24 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     run_ok(
       "INSERT INTO dist_agg VALUES (1, 'x', 10), (1, 'x', 5), (1, 'y', 7), "
       "(2, 'z', 3), (2, 'z', 4), (3, 'p', 1), (3, 'q', 1), (3, 'r', 2);");
+    // Every ORDER BY an ordered case uses names one row per `k`, so the CPU answer is fixed, and
+    // the ascending winner of `t`, `s`, `d` and `(u DESC, t)` is its group's last row, which the
+    // unordered route would not pick. `v` names the row. Groups 1 and 2 each hold one NULL `t`
+    // in the middle; group 4 is a single all-NULL row. `d` holds NaN, infinities and at most one
+    // zero per group, and `s` prefixes and upper case.
+    run_ok(
+      "CREATE TABLE dist_ord (k INTEGER, v INTEGER, t INTEGER, u INTEGER, s VARCHAR, d DOUBLE);");
+    run_ok(
+      "INSERT INTO dist_ord VALUES "
+      "(1, 1, 50, 1, 'b', 2.0), (1, 2, 40, 1, 'c', 'inf'::DOUBLE),"
+      "(1, 3, NULL, 1, 'bb', 'nan'::DOUBLE), (1, 4, 30, 5, 'ab', 0.0),"
+      "(1, 5, 20, 5, 'a', '-inf'::DOUBLE),"
+      "(2, 6, 45, 2, 'B', 1.0), (2, 7, 35, 2, 'abc', 'nan'::DOUBLE),"
+      "(2, 8, 25, 9, 'A', '-0.0'::DOUBLE), (2, 9, NULL, 9, 'Ba', 3.0), (2, 10, 15, 9, '9', -5.0),"
+      "(3, 11, 60, 3, 'x', 'inf'::DOUBLE), (3, 12, 55, 3, 'xy', 0.0),"
+      "(3, 13, 52, 7, 'w', 'nan'::DOUBLE), (3, 14, 51, 7, '', -1.0),"
+      "(NULL, 15, 70, 4, 'm', 7.0), (NULL, 16, 65, 4, 'n', 8.0), (NULL, 17, 61, 4, 'l', 6.0),"
+      "(4, 18, NULL, NULL, NULL, NULL);");
     run_ok("CHECKPOINT;");
   }
 };
@@ -758,6 +777,68 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// Ordered carried rows: DISTINCT ON under an ORDER BY, and first(v ORDER BY ...)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution grouped first(v ORDER BY ...) runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  SECTION("beside a SUM and a COUNT(DISTINCT)")
+  {
+    // COLLECT_SET puts the groupby, and its ranked row selector, on cuDF's sort path.
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), sum(v), count(DISTINCT u) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("VARCHAR key")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s DESC) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("DOUBLE key with NaN and infinities")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d DESC) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("beside an unordered FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY t), first(k) FROM dist_ord GROUP BY k");
+  }
+
+  SECTION("two keys")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY u DESC, t) FROM dist_ord GROUP BY k");
+  }
+
+  // The rewrites share one create_sort_key, which DuckDB projects below the aggregate.
+  SECTION("two FIRSTs sharing an ORDER BY")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), first(s ORDER BY t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY u DESC, t), first(d ORDER BY u DESC, t) FROM dist_ord GROUP BY "
+      "k");
+  }
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered carried rows over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Each key's largest payload sits in the last scan batch, so the merge must rank the partials
+  // again; the unordered route keeps the smallest.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  // MERGE_SETS puts the merge groupby, and its ranked row selector, on cuDF's sort path.
+  compare_gpu_vs_cpu(
+    "SELECT k, first(payload ORDER BY payload DESC), count(*), count(DISTINCT payload % 7) "
+    "FROM dist_dup GROUP BY k");
+}
+
+//===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
 
@@ -782,6 +863,25 @@ TEST_CASE_METHOD(DistinctFixture,
   // key has tied sums, so the two CPU runs agree.
   expect_plan_fallback_matches_cpu(
     "SELECT DISTINCT ON (a) a, b, sum(c) FROM dist_agg GROUP BY a, b ORDER BY a, sum(c) DESC");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ordered FIRST with a different ORDER BY falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // One carried row per group cannot answer two row orders.
+  expect_plan_fallback_matches_cpu(
+    "SELECT k, first(v ORDER BY t), first(v ORDER BY s) FROM dist_ord GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ungrouped ordered FIRST and ordered LAST fall back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The smallest `t` is unique, and every group's last row under `t` is its NULL `t` row or a
+  // unique largest one, so both CPU runs agree.
+  expect_plan_fallback_matches_cpu("SELECT first(v ORDER BY t) FROM dist_ord");
+  expect_plan_fallback_matches_cpu("SELECT k, last(v ORDER BY t) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
