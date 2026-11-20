@@ -41,6 +41,7 @@
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
@@ -91,6 +92,8 @@
 #include "transparent/read_view_registry.hpp"
 
 #include <cudf/cudf_utils.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uri_parser.hpp>
@@ -430,6 +433,36 @@ void widen_scan_for_equality_keys(sirius::op::scan::parquet_ingestible_table_inf
 
 namespace {
 
+//! Load a scan's delete payload. Equality-delete tables are built here, at plan time, for the one
+//! GPU the plan gate admitted: on its device, from its memory space, on one of its streams.
+std::shared_ptr<const sirius::op::scan::IcebergDeleteData> load_scan_delete_payload(
+  duckdb::ClientContext& context,
+  duckdb::SiriusContext& sirius_ctx,
+  std::string const& table_path,
+  sirius::op::scan::iceberg_delete_discovery const& discovery)
+{
+  auto const& ioctx = sirius_ctx.get_scan_manager().shared_io_ctx();
+  if (discovery.equality_delete_entries.empty())
+    return sirius::op::scan::load_delete_payload(context, table_path, ioctx, discovery);
+  auto const spaces =
+    sirius_ctx.get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (spaces.size() != 1) {
+    throw duckdb::NotImplementedException(
+      "iceberg_scan with equality deletes builds its delete tables for one GPU, but %llu are "
+      "configured",
+      static_cast<unsigned long long>(spaces.size()));
+  }
+  auto const& space = *spaces.front();
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
+  auto stream = sirius::memory::runtime_stream_pool::acquire(space);
+  return sirius::op::scan::load_delete_payload(
+    context,
+    table_path,
+    ioctx,
+    discovery,
+    sirius::op::scan::equality_build_resources{stream.get(), space.get_default_allocator()});
+}
+
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
 //! data, resolved here at plan time.
 //!
@@ -530,8 +563,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   if (supplied_discovery)
     *supplied_discovery = std::move(discovery);
   else
-    info->delete_data = sirius::op::scan::load_delete_payload(
-      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), discovery);
+    info->delete_data = load_scan_delete_payload(context, *sirius_ctx, info->table_path, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -807,9 +839,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started        = std::chrono::steady_clock::now();
-      c.info->delete_data = load_delete_payload(
-        context, c.info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), *c.discovery);
+      auto started = std::chrono::steady_clock::now();
+      c.info->delete_data =
+        load_scan_delete_payload(context, *sirius_ctx, c.info->table_path, *c.discovery);
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();

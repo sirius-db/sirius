@@ -99,12 +99,10 @@ bool names_remote_object(std::string const& path)
 std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                                                  duckdb::ClientContext& context,
                                                  duckdb::SiriusContext& sirius_ctx,
-                                                 std::string const& table_path,
-                                                 int64_t snapshot_id,
                                                  op::scan::iceberg_delete_inventory& inventory)
 {
-  // The delete hash tables are built once, on the planning thread's device. A scan task on
-  // another device would probe memory it cannot address.
+  // The delete hash tables are built once, on one device. A scan task on another device would
+  // probe memory it cannot address.
   auto const counters = sirius_ctx.physical_counters();
   auto const gpus = counters && counters->track_units && counters->equality_gpu_count_for_testing
                       ? *counters->equality_gpu_count_for_testing
@@ -118,9 +116,13 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
       "GPU only");
   }
 
+  auto const files_limit =
+    counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
+      ? *counters->equality_files_per_data_file_limit_for_testing
+      : op::scan::kMaxEqualityDeleteFilesPerDataFile;
   op::scan::iceberg_equality_plan plan;
   try {
-    plan = op::scan::read_equality_plan(context, table_path, snapshot_id, inventory);
+    plan = op::scan::read_equality_plan(context, inventory, files_limit);
   } catch (op::scan::equality_plan_error const& e) {
     return iceberg_decline(scan_reason::iceberg_equality_plan_unproven, e.what());
   }
@@ -141,6 +143,7 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                            "keys cannot be resolved to columns");
   }
   auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  auto const names    = scan_source_names(op);
   for (auto const& file : plan.files) {
     for (auto const id : file.equality_ids) {
       if (plan.keys.contains(id)) continue;
@@ -170,8 +173,8 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                            "; keys must be BOOLEAN, INTEGER, BIGINT, DATE, TIMESTAMP, "
                            "TIMESTAMP_NS or VARCHAR");
       std::optional<std::size_t> primary;
-      for (std::size_t p = 0; p < op.names.size() && p < op.returned_types.size(); ++p) {
-        if (op.names[p].GetIdentifierName() != found->name.GetIdentifierName()) continue;
+      for (std::size_t p = 0; p < names.size() && p < op.returned_types.size(); ++p) {
+        if (names[p] != found->name.GetIdentifierName()) continue;
         if (primary) return unsupported("whose column name is ambiguous in the scan schema");
         primary = p;
       }
@@ -197,16 +200,12 @@ std::optional<pre_decline> plan_equality_deletes(duckdb::LogicalGet& op,
                              std::to_string(op::scan::kMaxEqualityDeleteBytesPerStatement) +
                              " bytes per statement the GPU scan path loads while planning");
   }
-  auto const files_limit =
-    counters && counters->track_units && counters->equality_files_per_data_file_limit_for_testing
-      ? *counters->equality_files_per_data_file_limit_for_testing
-      : op::scan::kMaxEqualityDeleteFilesPerDataFile;
   for (auto const& [data_file, files] : plan.by_data_file) {
     if (files.size() > files_limit) {
       return iceberg_decline(scan_reason::iceberg_equality_budget,
-                             "data file '" + data_file + "' is subject to " +
-                               std::to_string(files.size()) + " equality-delete files, above the " +
-                               std::to_string(files_limit) + " the GPU scan path probes per batch");
+                             "data file '" + data_file + "' is subject to more than the " +
+                               std::to_string(files_limit) +
+                               " equality-delete files the GPU scan path probes per batch");
     }
   }
   inventory.equality = std::move(plan);
@@ -359,14 +358,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
       bound ? std::string_view(bound->table_uuid) : std::string_view{});
     auto const n_delete_files = result.equality_count;
     if (n_delete_files > 0) {
-      if (!result.inventory || !snapshot_id) {
-        return iceberg_decline(
-          scan_reason::iceberg_equality_deletes,
-          "this iceberg table has " + std::to_string(n_delete_files) +
-            " equality-delete file(s), but no inventory or snapshot id to plan them against");
+      if (!result.inventory) {
+        return iceberg_decline(scan_reason::iceberg_equality_deletes,
+                               "this iceberg table has " + std::to_string(n_delete_files) +
+                                 " equality-delete file(s), but no inventory to plan them against");
       }
-      if (auto decline = plan_equality_deletes(
-            op, context, *sirius_ctx, table_path, *snapshot_id, *result.inventory)) {
+      if (auto decline = plan_equality_deletes(op, context, *sirius_ctx, *result.inventory)) {
         return decline;
       }
     }
