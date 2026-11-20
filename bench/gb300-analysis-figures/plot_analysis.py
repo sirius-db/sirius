@@ -25,11 +25,11 @@ ABLATION_STAGES = (
 )
 ABLATION_LABELS = (
     "All off",
-    "Adaptive\nJoin",
-    "Dynamic\nFilter",
-    "Type\nNarrowing",
-    "Compression",
-    "Operating on\nCompressed Data",
+    "+ Adaptive\nJoin",
+    "+ Dynamic\nFilter",
+    "+ Type\nNarrowing",
+    "+ Compression",
+    "+ Operating on\nCompressed Data",
 )
 
 
@@ -160,17 +160,17 @@ def ablation_figure(times: list[float], stem: Path) -> None:
             fontsize=9,
         )
     ax.set_xticks(positions, ABLATION_LABELS)
-    ax.set_xlim(-0.25, 5.65)
+    ax.set_xlim(-0.25, 5.75)
     ax.set_ylim(0, 25.5)
     ax.yaxis.set_major_locator(MultipleLocator(5))
     ax.grid(axis="y", color="#DDDDDD", linewidth=0.7)
     ax.set_axisbelow(True)
-    ax.set_xlabel("Optimization enabled at this step")
+    ax.set_xlabel("Optimization added at each step")
     ax.set_ylabel("Sum of 22 query times (s)")
     fig.text(
         0.11,
         0.055,
-        "Each stage runs once in a fresh process; pin/unpin excluded. Gains depend on the order and enabled context.",
+        "Each step keeps earlier optimizations; one fresh-process pass per stage; pin/unpin excluded.",
         ha="left",
         fontsize=8,
         color="#444444",
