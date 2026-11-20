@@ -375,10 +375,12 @@ Tests are tagged `[decimal_integer_cast]`.
 
 ### Division and modulo
 
-`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 overflow before
-calling cuDF. Both operators raise for the latter pair in the pinned DuckDB version. NULLs in
-either operand suppress the check for that row. A detected exceptional pair triggers CPU replay,
-which preserves DuckDB's `error_on_division_by_zero` setting. A guarded
+`//` and `%` check valid operand pairs for zero divisors and signed-minimum/-1 pairs before
+calling cuDF. NULLs in either operand suppress the check for that row. A zero divisor triggers CPU
+replay, which preserves DuckDB's `error_on_division_by_zero` setting. So does a signed-minimum/-1
+pair under `//`, whose quotient overflows and raises in DuckDB. Its remainder is 0, so `%` stays on
+the GPU and matches DuckDB: when such a pair occurs without a zero divisor, the kernel divides by 1
+wherever the divisor is -1, which leaves every remainder unchanged. A guarded
 `CASE WHEN b = 0 THEN NULL ELSE a // b END` stays on the GPU: the division is retried on the rows
 that ELSE selects (see [Conditional evaluation](#conditional-evaluation-and-row-dependent-errors)).
 With fallback disabled, the GPU reports the unsupported exceptional pair without executing it.
