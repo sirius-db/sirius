@@ -26,10 +26,10 @@ Analyze build errors, suggest fixes, rebuild, and iterate until the build succee
    ```bash
    git submodule status
    ```
-   Check that all submodules (`duckdb`, `cucascade`, `substrait`, `sirius-duckdb/vcpkg`) are at expected commits. If any show a `+` prefix (out of sync), warn the user and offer:
-   ```bash
-   git submodule update --init --recursive
-   ```
+   Check that the submodules needed for the build are at the expected commits.
+   Use `git submodule update --init -- <path>` for required checkouts with a
+   `-` prefix. A `+` prefix indicates a different commit. Flag those revisions
+   and ask before switching them back to the pin.
 
    b. **Pixi environment:**
    Verify running inside pixi. If not, remind user to run `pixi shell` first.

@@ -39,10 +39,12 @@ sccache --start-server
 
 **Cause:** Git submodules not at the expected commits.
 
-**Fix:**
+**Fix:** Run `git submodule status`. For each required submodule marked `-`,
+initialize its checkout.
 ```bash
-git submodule update --init --recursive
+git submodule update --init -- path/to/submodule
 ```
+Flag submodules marked `+` and ask before switching them back to the pin.
 
 ## cuDF API Changes
 
