@@ -10,6 +10,11 @@ one query iteration, and CPU fallback disabled. Query runtime excludes pin and
 unpin time. Only `lineitem` and `orders` are Simpatico-compressed when pin
 compression is on; the other tables pin raw. The baseline turns off the five
 features under study, while all unrelated Sirius settings remain fixed.
+The runner sets `SIRIUS_PIN_COMPRESSION_TABLES` separately for each stage:
+an empty allowlist forces every `pin_table` call to `compression=false` in
+uncompressed stages, while `lineitem,orders` enables those two tables in
+compressed stages. The empty allowlist is necessary because a per-table
+`compression=true` overrides `SET pin_table_compression=false`.
 
 | Stage | Type narrowing | Compressed pinning | Fused decode filter | BUILD_PROBE | Dynamic filter |
 | ---: | :---: | :---: | :---: | :---: | :---: |
@@ -65,6 +70,12 @@ BUILD_PROBE admission, dynamic filters, type narrowing, compressed pinning,
 and fused filtering during decode, in that order. Summarize with
 `summarize.py --join-first-order <output-directory>`.
 The untimed path checks accept the same `--join-first-order` switch.
+
+To enable type narrowing before BUILD_PROBE while keeping the remaining order,
+use `--narrow-first-order`. This runs narrowing, BUILD_PROBE admission,
+dynamic filters, compressed pinning, and fused filtering during decode after a
+fresh all-off baseline. Pass the same switch to `summarize.py` and the untimed
+path checks.
 
 After the run, generate a six-stage total and a per-query comparison with:
 

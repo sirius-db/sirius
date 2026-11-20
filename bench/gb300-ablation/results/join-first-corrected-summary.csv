@@ -1,0 +1,7 @@
+stage,optimization_added,status,query_total_s,change_from_previous_s,change_from_previous_pct
+9,all_off,success,22.152274,,
+10,build_probe,success,21.170396,-0.981878,-4.432
+11,dynamic_filter,success,14.652578,-6.517818,-30.787
+12,type_narrow,success,11.715702,-2.936876,-20.043
+13,compressed_pin,success,8.568849,-3.146853,-26.860
+14,fused_decode,success,7.032793,-1.536056,-17.926

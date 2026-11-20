@@ -1,0 +1,55 @@
+{
+  "all_query_results_match_baseline": true,
+  "dataset": "/mnt/datasets/tpch_parquet_sf1000",
+  "engine_source_commit": "3af97b727b99ee3d387436353d90b7ecf7b0ba44",
+  "extension_sha256": "7ed19c6e8530c18a99303e381e85f67d4b33f029107f5dfba693936b298091a0",
+  "gb300_pin_config_sha256": "b671547162bcdda552607662901c0cfdebf7f71c6a6bee5be0fe91b9d20fa191",
+  "iterations_per_query": 1,
+  "machine": "NVIDIA GB300, one GPU, CDMM driver mode",
+  "optimization_order": [
+    "type narrowing",
+    "BUILD_PROBE admission",
+    "dynamic filters",
+    "compressed pinning",
+    "fused filtering during decode"
+  ],
+  "output_directory_on_measurement_machine": "test_datasets/gb300-ablation/sf1000-host-narrow-first-corrected-20261120",
+  "pin_audit": {
+    "compressed_stages": {
+      "compressed_pin_events": 26,
+      "compressed_tables": [
+        "lineitem",
+        "orders"
+      ],
+      "compression_true_calls": 29
+    },
+    "uncompressed_stages": {
+      "compressed_pin_events": 0,
+      "compression_true_calls": 0
+    }
+  },
+  "pin_control": "SIRIUS_PIN_COMPRESSION_TABLES is empty for compressed_pin=false stages, yielding explicit compression=false on all pin_table calls; lineitem,orders for compressed_pin=true stages.",
+  "pin_tier": "host",
+  "profile": "hot",
+  "queries": "Q1-Q22",
+  "runtime_excludes": "pin and unpin",
+  "simpatico_plan_sha256": {
+    "lineitem": "288cd2b875e809bff33cea675eb5a6c676acbb81ffb5198d049b4e08ebcfb555",
+    "orders": "eb4b3be1de77fc613f84ebd454897668d8494c5e01e346f9047b3eeb227e8aeb"
+  },
+  "stage_config_sha256": {
+    "stage15-all_off": "9f4a961d29832b71fdf60e8f29710b8bc4b4db70bc66562a80900b9b24fcf933",
+    "stage16-type_narrow": "ba986cd484b365d00c772a95e198d757be901fb78098701dc9b4c8d2e9d027bd",
+    "stage17-build_probe": "48d987a1a8aa9d82af4f7ae281e7b69e0a9903f5179fc2004699a1da168d8c93",
+    "stage18-dynamic_filter": "d8af34a2a53dd5796d21d9ab4dbed8a02d64ffc1969013946ab4d55393a48e61",
+    "stage19-compressed_pin": "d8af34a2a53dd5796d21d9ab4dbed8a02d64ffc1969013946ab4d55393a48e61",
+    "stage20-fused_decode": "0d41a992a6348e6442e34a351a55c6c373fe0ce189e19e6177823af677820e0e"
+  },
+  "stage_exit_codes_zero": true,
+  "untimed_diagnostics": {
+    "build_probe_selections_q3": 2,
+    "dynamic_filter_publications_q3": 2,
+    "fused_filtered_decodes_q6": 32
+  },
+  "validation": "21 exact result text matches; Q11 has the same rows in a different tied-row order."
+}

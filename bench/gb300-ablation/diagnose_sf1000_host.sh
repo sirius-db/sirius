@@ -4,14 +4,18 @@ set -euo pipefail
 
 if (( $# == 1 )); then
   output_arg="$1"
-  join_first=false
+  uncompressed_join_stages=false
   specs=(fused_decode:3:6 build_probe:4:3 dynamic_filter:5:3)
 elif (( $# == 2 )) && [[ "$1" == --join-first-order ]]; then
   output_arg="$2"
-  join_first=true
+  uncompressed_join_stages=true
   specs=(build_probe:10:3 dynamic_filter:11:3 fused_decode:14:6)
+elif (( $# == 2 )) && [[ "$1" == --narrow-first-order ]]; then
+  output_arg="$2"
+  uncompressed_join_stages=true
+  specs=(build_probe:17:3 dynamic_filter:18:3 fused_decode:20:6)
 else
-  echo "usage: $0 [--join-first-order] ABLATION_OUTPUT" >&2
+  echo "usage: $0 [--join-first-order|--narrow-first-order] ABLATION_OUTPUT" >&2
   exit 2
 fi
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -27,7 +31,6 @@ else
   pixi=pixi
 fi
 mkdir -p "$output/diagnostics"
-export SIRIUS_PIN_COMPRESSION_TABLES=lineitem,orders
 export SIRIUS_PRE_SQL='SET enable_duckdb_fallback = false;'
 export SIRIUS_LOG_LEVEL=debug
 cd "$repo"
@@ -46,9 +49,12 @@ for spec in "${specs[@]}"; do
     printf '    fused_scan_diagnostics: true\n' >> "$case_dir/config.yaml"
   fi
   pin_option=--pin-compression
-  if [[ "$join_first" == true && "$stage" -lt 13 ]]; then
+  stage_compression_tables=lineitem,orders
+  if [[ "$uncompressed_join_stages" == true && "$label" != fused_decode ]]; then
     pin_option=--no-pin-compression
+    stage_compression_tables=""
   fi
+  export SIRIUS_PIN_COMPRESSION_TABLES="$stage_compression_tables"
   echo "Checking $label with Q$query"
   set +e
   timeout --signal=TERM --kill-after=30s 180s "$pixi" run --locked python \
