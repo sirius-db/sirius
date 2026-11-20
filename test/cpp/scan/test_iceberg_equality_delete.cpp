@@ -417,7 +417,7 @@ TEST_CASE("iceberg equality delete - each ceiling refuses the charge", "[iceberg
   auto plan_of = [](files const& entries) {
     iceberg_equality_plan plan;
     for (auto [rows, bytes] : entries)
-      plan.files.push_back({"delete.parquet", {1}, rows, bytes, 2});
+      plan.files.push_back({"delete.parquet", {1}, rows, bytes});
     return plan;
   };
   auto fits = [&](files const& entries, int64_t row_limit = kMaxEqualityDeleteRowsPerStatement) {
@@ -460,7 +460,7 @@ TEST_CASE("iceberg equality delete - a delete file that cannot supply its keys i
     iceberg_delete_discovery discovery;
     discovery.equality_delete_entries.emplace_back();
     auto& plan = discovery.equality_plan.emplace();
-    plan.files.push_back({directory.file("delete.parquet"), {field_id}, 1, 1, 2});
+    plan.files.push_back({directory.file("delete.parquet"), {field_id}, 1, 1});
     plan.by_data_file.emplace("data.parquet", std::vector<uint32_t>{0});
     plan.keys.emplace(field_id, iceberg_equality_plan::key{0, bound});
     return load_delete_payload(

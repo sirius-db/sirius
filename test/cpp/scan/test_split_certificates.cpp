@@ -1855,7 +1855,7 @@ TEST_CASE("Equality-delete keys are appended to the scan behind its output",
 {
   auto plan_with_key = [](std::size_t primary) {
     iceberg_equality_plan plan;
-    plan.files.push_back({"delete.parquet", {1}, 1, 1, 2});
+    plan.files.push_back({"delete.parquet", {1}, 1, 1});
     plan.keys.emplace(1, iceberg_equality_plan::key{primary, duckdb::LogicalType::VARCHAR});
     return plan;
   };

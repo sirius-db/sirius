@@ -1751,6 +1751,17 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          {{"1", "0"}, {"3", "2"}, {"5", "4"}});
   }
   {
+    INFO("a position delete and an equality delete on one data file");
+    // The position delete names row 3 (date); the equality delete removes banana, above it.
+    // Positions name rows by where they sit in the file, so they run first: the other order
+    // deletes elderberry instead of date.
+    auto path = table("iceberg_v2_eq_with_positional");
+    require_delete_files(path, 2);
+    expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                         {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}},
+                         2);
+  }
+  {
     INFO("equality deletes use the inherited sequence number");
     // After a manifest rewrite both data files sit in a manifest at sequence 3, above the delete
     // at 2. The older file keeps data sequence number 1 and must still lose banana/2; the newer
@@ -4132,7 +4143,6 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   auto plan = read_equality_plan(*con->context, *inventory.inventory, 64);
   REQUIRE(plan.files.size() == 1);
   CHECK(plan.files[0].equality_ids == std::vector<int32_t>{1});
-  CHECK(plan.files[0].data_sequence_number == 2);
   CHECK(plan.files[0].record_count == 1);
   REQUIRE(plan.by_data_file.size() == 2);
   for (auto const& [data_file, files] : plan.by_data_file) {
@@ -4157,6 +4167,12 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   CHECK(upsert.files.empty());
   for (auto const& [data_file, files] : upsert.by_data_file)
     CHECK(files.empty());
+  // Every data file removed while the delete is still live: nothing to plan, nothing to refuse.
+  auto no_data = *inventory.inventory;
+  std::erase_if(no_data.entries, [](auto const& entry) { return entry.content == "DATA"; });
+  auto const orphaned = read_equality_plan(*con->context, no_data, 64);
+  CHECK(orphaned.files.empty());
+  CHECK(orphaned.by_data_file.empty());
   // A file without an inherited sequence number cannot be ordered against the others.
   CHECK_THROWS_AS(read_equality_plan(*con->context,
                                      mutated([](auto& entry) {
@@ -4469,6 +4485,18 @@ std::string inventory_fixture(char const* name)
   return path.string();
 }
 }  // namespace
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Iceberg deletion vector and equality delete apply to one data file",
+                 "[integration][iceberg]")
+{
+  // The vector removes banana and date by position; a later equality delete removes cherry.
+  // A table with equality deletes loads its vectors eagerly, beside the delete tables.
+  auto path = inventory_fixture("equality_dv");
+  expect_equality_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                       {{"apple", "1"}, {"elderberry", "5"}},
+                       2);
+}
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "Iceberg equality rejection precedes a malformed live deletion vector",

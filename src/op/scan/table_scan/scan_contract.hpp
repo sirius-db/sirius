@@ -469,9 +469,8 @@ struct iceberg_equality_delete_file {
   // Field IDs that decide row equality, in manifest order. Never the delete file's column list:
   // a writer may store the whole deleted row.
   std::vector<int32_t> equality_ids;
-  int64_t record_count         = 0;
-  int64_t file_size_in_bytes   = 0;
-  int64_t data_sequence_number = 0;  // Inherited value, from the inventory.
+  int64_t record_count       = 0;
+  int64_t file_size_in_bytes = 0;
 };
 
 // Which equality-delete files apply to which data file, by data sequence number and partition.

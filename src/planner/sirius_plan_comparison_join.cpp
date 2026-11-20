@@ -198,6 +198,7 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
   auto const& column_ids  = get.GetColumnIds();
   auto const& proj_ids    = get.projection_ids;
   auto const output_count = proj_ids.empty() ? column_ids.size() : proj_ids.size();
+  auto const source_names = scan_source_names(get);
   unique_keys keys;
   for (duckdb::idx_t output_idx = 0; output_idx < output_count; ++output_idx) {
     auto const column_idx           = proj_ids.empty() ? output_idx : proj_ids[output_idx];
@@ -205,7 +206,7 @@ static unique_keys prove_unique_from_pin(duckdb::SiriusContext* sirius_context,
     // Virtual columns (row ids and the like) have no pinned counterpart.
     if (primary_column_index >= get.names.size()) { continue; }
     if (hive_partition_columns.contains(primary_column_index)) { continue; }
-    auto const column_name = scan_source_names(get)[primary_column_index];
+    auto const& column_name = source_names[primary_column_index];
     if (proven_unique(column_name)) {
       SIRIUS_LOG_DEBUG("[join] column '{}' proven distinct by the pinned table", column_name);
       keys.push_back({output_idx});

@@ -460,9 +460,8 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
         auto const [path, entry] = claim(deletes, chunk->GetValue(0, row).ToString(), manifest);
         iceberg_equality_delete_file file;
-        file.file_path            = std::string(path);
-        file.data_sequence_number = entry.sequence;
-        auto const ids            = chunk->GetValue(4, row);
+        file.file_path = std::string(path);
+        auto const ids = chunk->GetValue(4, row);
         if (!ids.IsNull())
           for (auto const& id : duckdb::ListValue::GetChildren(ids)) {
             if (id.IsNull())
@@ -1005,12 +1004,8 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
   data.equality_device = rmm::get_current_cuda_device();
   // One class per distinct applicability list.
   std::map<std::vector<uint32_t>, uint32_t> class_of_list;
-  std::vector<std::vector<uint32_t> const*> classes;
-  for (auto const& [data_file, files] : plan.by_data_file) {
-    auto const [slot, fresh] =
-      class_of_list.emplace(files, static_cast<uint32_t>(class_of_list.size()));
-    if (fresh) classes.push_back(&slot->first);
-  }
+  for (auto const& [data_file, files] : plan.by_data_file)
+    class_of_list.emplace(files, static_cast<uint32_t>(class_of_list.size()));
 
   // Each delete file's signature: the classes that use it. Unused files are never opened.
   std::vector<std::vector<uint32_t>> signature(plan.files.size());
@@ -1057,7 +1052,7 @@ void materialize_equality_deletes(duckdb::ClientContext& context,
       build_equality_group(ids, std::move(primary), views, resources.stream, resources.mr);
   }
 
-  std::vector<std::shared_ptr<equality_group_list const>> list_of_class(classes.size());
+  std::vector<std::shared_ptr<equality_group_list const>> list_of_class(class_of_list.size());
   for (auto const& [files, id] : class_of_list) {
     equality_group_list groups;
     for (auto file : files)
