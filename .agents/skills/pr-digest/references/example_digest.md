@@ -1,3 +1,6 @@
+> **Historical example:** Its relative source links and branch-based line-number caveat predate the
+> current pinned snapshot rules in `SKILL.md`; do not copy them for a new digest.
+
 # PR Digest — #1277: Dynamic filters: SIP (sideways information passing) across non-scan probes
 
 > **This digest explains what the PR does and where it lives — it is not a critique or an approval
