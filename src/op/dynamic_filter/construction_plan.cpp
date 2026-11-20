@@ -185,13 +185,16 @@ struct shadow_judgement {
  * @param at Where the key was judged: `begin` when Construction is planned, `finish` just before
  * it finishes
  * @param build_keys The valid build rows the candidate holds
+ * @param decision What happens next: at `begin` to the key's membership filter (`skip` or `build`),
+ * at `finish` to the whole plan (`abandon` or `finish`)
  */
 void log_shadow_judgement(std::string_view at,
                           std::size_t planner_condition_index,
                           static_filter_facts const& candidate,
                           std::size_t build_keys,
                           std::size_t bindings,
-                          shadow_judgement const& judgement) noexcept
+                          shadow_judgement const& judgement,
+                          std::string_view decision) noexcept
 {
   log::log_noexcept([&] {
     SIRIUS_LOG_DEBUG(
@@ -205,7 +208,7 @@ void log_shadow_judgement(std::string_view at,
       bindings,
       judgement.dead,
       judgement.max_removed_share,
-      judgement.shadowed ? "skip" : "build");
+      decision);
   });
 }
 
@@ -273,26 +276,32 @@ bool construction_shadowed(construction_plan const& planned,
                            std::span<std::vector<binding_facts> const> bindings,
                            std::size_t decode_membership_cap)
 {
+  std::vector<shadow_judgement> judgements;
+  judgements.reserve(planned.keys.size());
   bool shadowed = !planned.keys.empty();
   for (auto const& key : planned.keys) {
     if (key.admitted_key_index >= bindings.size()) {
       throw std::out_of_range("[construction_shadowed] a planned key has no binding list");
     }
-    auto const& key_bindings = bindings[key.admitted_key_index];
-    auto const judgement     = judge_shadow(key.candidate, key_bindings, decode_membership_cap);
-    if (judged(key.candidate)) {
-      auto const line = std::ranges::find(
-        planned.outcomes, key.admitted_key_index, &dynamic_filter_key_line::admitted_key_index);
-      if (line != planned.outcomes.end()) {
-        log_shadow_judgement("finish",
-                             line->planner_condition_index,
-                             key.candidate,
-                             line->outcome.valid_rows.value_or(line->outcome.rows),
-                             key_bindings.size(),
-                             judgement);
-      }
-    }
-    shadowed = shadowed && judgement.shadowed && !key.needs_bounds();
+    judgements.push_back(
+      judge_shadow(key.candidate, bindings[key.admitted_key_index], decode_membership_cap));
+    shadowed = shadowed && judgements.back().shadowed && !key.needs_bounds();
+  }
+  // A plan is finished or abandoned as a whole, so each key's line reports the plan's verdict next
+  // to the key's own counts.
+  for (std::size_t i = 0; i < planned.keys.size(); ++i) {
+    auto const& key = planned.keys[i];
+    if (!judged(key.candidate)) { continue; }
+    auto const line = std::ranges::find(
+      planned.outcomes, key.admitted_key_index, &dynamic_filter_key_line::admitted_key_index);
+    if (line == planned.outcomes.end()) { continue; }
+    log_shadow_judgement("finish",
+                         line->planner_condition_index,
+                         key.candidate,
+                         line->outcome.valid_rows.value_or(line->outcome.rows),
+                         bindings[key.admitted_key_index].size(),
+                         judgements[i],
+                         shadowed ? "abandon" : "finish");
   }
   return shadowed;
 }
@@ -397,7 +406,8 @@ construction_plan plan_construction(
                            planned.candidate,
                            outcome.valid_rows.value_or(facts.total_rows),
                            key_bindings.size(),
-                           judgement);
+                           judgement,
+                           judgement.shadowed ? "skip" : "build");
       shadowed = judgement.shadowed;
     }
     if (shadowed) {

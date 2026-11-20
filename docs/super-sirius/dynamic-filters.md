@@ -243,7 +243,7 @@ The judgement uses only what cannot change afterwards (`read_published_filters`)
 
 The key is judged twice with the same rule: when Construction is planned (`begin`), which saves all of it, and just before it finishes, which saves the merge and replication when the stronger filter was published while the build was being partitioned. A plan that still holds one selectable key at the second point finishes all of its keys. A stronger filter published after the weaker one is left to the Consumer, which skips the weaker filter per batch.
 
-At DEBUG level each judged key emits `[dynamic_filter_shadow] at=begin|finish condition=N kind=bloom|small_in_list|hash_in_list keys=N est=X bindings=N dead=N max_removed_share=X decision=skip|build`: `est` is the key's Proven Estimate, `dead` counts the bindings whose Consumer would not select the filter, and `max_removed_share` is the largest share of a batch the filter would remove on any binding.
+At DEBUG level each judged key emits `[dynamic_filter_shadow] at=begin|finish condition=N kind=bloom|small_in_list|hash_in_list keys=N est=X bindings=N dead=N max_removed_share=X decision=skip|build|abandon|finish`: `est` is the key's Proven Estimate, `dead` counts the bindings whose Consumer would not select the filter (the key is shadowed when `dead` equals `bindings`), and `max_removed_share` is the largest share of a batch the filter would remove on any binding. At `begin`, `decision` is the key's own: `skip` plans no Membership Filter for it, `build` plans one. At `finish` it is the whole plan's, repeated on each of its keys: `abandon` ends the Construction without publishing, `finish` publishes every planned key, the shadowed ones included.
 
 ### Key types
 
