@@ -6,15 +6,23 @@ selected C++ tests must implement the SQL, route and independent-result checks.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import select
 import signal
+import stat
+import struct
 import subprocess
+import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
+
+from process_anchor import LAUNCH_FAILED
 
 
 CASES = {
@@ -27,19 +35,41 @@ class TerminationRequested(BaseException):
     """Route SIGTERM through the owned-child cleanup and retained report."""
 
 
-def request_termination(signum, frame):
-    # A repeated cancellation must not interrupt cleanup of the first one.
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise TerminationRequested()
+class Interrupts:
+    """Handlers record requests; only explicit checkpoints unwind execution."""
+
+    def __init__(self):
+        self.signum = None
+
+    def request(self, signum, frame):
+        if self.signum is None:
+            self.signum = signum
+
+    def check(self):
+        if self.signum == signal.SIGTERM:
+            raise TerminationRequested()
+        if self.signum == signal.SIGINT:
+            raise KeyboardInterrupt()
+
+
+@contextmanager
+def regular_reader(path):
+    def opener(name, flags):
+        return os.open(name, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+
+    with open(path, "rb", opener=opener) as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError(f"Expected a regular file: {path}")
+        yield stream
 
 
 def digest(path):
-    with path.open("rb") as stream:
+    with regular_reader(path) as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def verify_xml(path):
-    root = ET.parse(path).getroot()
+def verify_xml(raw):
+    root = ET.fromstring(raw)
     if root.tag != "Catch2TestRun" or root.get("xml-format-version") != "3":
         raise ValueError("Expected Catch2 XML format 3")
     cases = root.findall("TestCase")
@@ -82,45 +112,163 @@ def verify_xml(path):
     return names
 
 
-def run_child(argv, directory, timeout, facts):
+def read_child_status(descriptor, data, deadline, interrupts=None):
+    """Read a closed launch-failure record or a signed C++ exit status."""
+    while time.monotonic() < deadline:
+        if interrupts is not None:
+            interrupts.check()
+        if len(data) > 4:
+            raise RuntimeError("Invalid C++ status length")
+        if select.select([descriptor], [], [], 0.02)[0]:
+            chunk = os.read(descriptor, 5 - len(data))
+            if not chunk:
+                if data == LAUNCH_FAILED:
+                    return LAUNCH_FAILED
+                if len(data) != 4:
+                    raise RuntimeError("Missing or truncated C++ status")
+                code = struct.unpack("!i", data)[0]
+                if not -signal.NSIG < code <= 255:
+                    raise RuntimeError("Invalid C++ status")
+                return code
+            data.extend(chunk)
+    return None
+
+
+def run_child(argv, directory, timeout, facts, interrupts):
     process = None
-    with (directory / "stdout.log").open("wb") as stdout, (
-        directory / "stderr.log"
-    ).open("wb") as stderr:
-        try:
-            process = subprocess.Popen(
-                argv,
-                cwd=directory,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-            )
-            facts["termination"] = "running"
-            try:
-                code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                facts["termination"] = "timeout"
-                raise RuntimeError(f"E2E process timed out after {timeout}s") from None
-            facts.update(
-                termination="signal" if code < 0 else "exited", exit_status=code
-            )
-            if code:
-                raise RuntimeError(f"E2E test binary exited with status {code}")
-        except OSError:
+    code = None
+    primary = None
+    channels = []
+    data = bytearray()
+    cleanup = facts["cleanup"] = {
+        "state": "NOT_STARTED",
+        "scope": "own_process_group",
+        "errors": [],
+    }
+    # This standalone CLI has one reaper. SIGCHLD must not auto-reap the anchor
+    # before the last group signal; no Popen.poll/wait precedes that signal.
+    previous_sigchld = None
+    logs = []
+    try:
+        stdout = (directory / "stdout.log").open("wb")
+        logs.append(stdout)
+        stderr = (directory / "stderr.log").open("wb")
+        logs.append(stderr)
+        previous_sigchld = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        control_read, control_write = os.pipe()
+        channels.extend([control_read, control_write])
+        status_read, status_write = os.pipe()
+        channels.extend([status_read, status_write])
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                str(Path(__file__).with_name("process_anchor.py")),
+                str(control_read),
+                str(status_write),
+                *argv,
+            ],
+            cwd=directory,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=(control_read, status_write),
+        )
+        facts["anchor_pid"] = process.pid
+        os.close(control_read)
+        channels.remove(control_read)
+        os.close(status_write)
+        channels.remove(status_write)
+        facts["termination"] = "running"
+        code = read_child_status(
+            status_read, data, time.monotonic() + timeout, interrupts
+        )
+        if code is None:
+            facts["termination"] = "timeout"
+            raise RuntimeError(f"E2E process timed out after {timeout}s")
+        if code == LAUNCH_FAILED:
             facts["termination"] = "launch_error"
-            raise
-        except KeyboardInterrupt:
+            raise RuntimeError("Could not launch the C++ test binary. See stderr.log")
+        facts["termination"] = "signal" if code < 0 else "exited"
+        if code:
+            raise RuntimeError(f"E2E test binary exited with status {code}")
+    except (Exception, KeyboardInterrupt, TerminationRequested) as error:
+        primary = error
+        if isinstance(error, OSError):
+            facts["termination"] = (
+                "launch_error" if process is None else "channel_error"
+            )
+        elif isinstance(error, KeyboardInterrupt):
             facts["termination"] = "interrupted"
-            raise
-        finally:
-            if process is not None:
-                # This process group belongs solely to this attempt, including
-                # any test children still alive after the parent exits.
+        elif isinstance(error, TerminationRequested):
+            facts["termination"] = "terminated"
+    finally:
+        if process is not None:
+            # Capture the active exception without replacing it with a later
+            # cleanup error. A cancellation asks the anchor to publish the
+            # actual C++ status before we stop the retained group.
+            if code is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                facts["exit_status"] = process.wait()
+                    os.write(control_write, b"x")
+                    code = read_child_status(
+                        status_read, data, time.monotonic() + 3
+                    )
+                    if code is None:
+                        cleanup["errors"].append("C++ status remains unknown")
+                except Exception as error:
+                    cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+            try:
+                # The anchor has not been reaped, even if it died early.
+                # Its reserved PID prevents group-number reassignment.
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as error:
+                cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+            try:
+                cleanup["anchor_exit_status"] = process.wait(timeout=2)
+                if cleanup["anchor_exit_status"] != -signal.SIGKILL:
+                    cleanup["errors"].append("Anchor ended before group cleanup")
+            except Exception as error:
+                cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+            if code is None:
+                # Closing the anchor can make a previously incomplete
+                # status channel terminal. Retain a newly observed C++ raw
+                # status even though the attempt already failed.
+                try:
+                    code = read_child_status(
+                        status_read, data, time.monotonic() + 0.02
+                    )
+                except Exception as error:
+                    cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+        for descriptor in channels:
+            try:
+                os.close(descriptor)
+            except Exception as error:
+                cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+        for stream in reversed(logs):
+            try:
+                stream.close()
+            except Exception as error:
+                cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+        if previous_sigchld is not None:
+            try:
+                signal.signal(signal.SIGCHLD, previous_sigchld)
+            except Exception as error:
+                cleanup["errors"].append(type(error).__name__ + ": " + str(error))
+        if process is not None:
+            cleanup["state"] = (
+                "UNKNOWN" if cleanup["errors"] else "GROUP_SIGNALLED_ANCHOR_REAPED"
+            )
+        if facts["termination"] == "running":
+            facts["termination"] = "unknown"
+        if code != LAUNCH_FAILED:
+            facts["exit_status"] = code
+    if primary is not None:
+        raise primary
+    if cleanup["errors"]:
+        raise RuntimeError("E2E group cleanup failed: " + "; ".join(cleanup["errors"]))
 
 
 def main(argv=None):
@@ -143,8 +291,13 @@ def main(argv=None):
         "process": {"termination": "not_started", "exit_status": None},
     }
     status = 1
-    previous_sigterm = signal.signal(signal.SIGTERM, request_termination)
+    interrupts = Interrupts()
+    previous = {
+        sig: signal.signal(sig, interrupts.request)
+        for sig in (signal.SIGINT, signal.SIGTERM)
+    }
     try:
+        interrupts.check()
         binary = args.binary.resolve(strict=True)
         observed = digest(binary)
         report.update(
@@ -161,18 +314,22 @@ def main(argv=None):
             str(directory / "tests.xml"),
         ]
         report["argv"] = command
-        run_child(command, directory, args.timeout, report["process"])
+        interrupts.check()
+        run_child(command, directory, args.timeout, report["process"], interrupts)
+        interrupts.check()
         if digest(binary) != observed:
             raise ValueError("Test binary changed during execution")
-        report["cases"] = verify_xml(directory / "tests.xml")
-        report["xml_sha256"] = digest(directory / "tests.xml")
+        with regular_reader(directory / "tests.xml") as stream:
+            raw_xml = stream.read()
+        report["cases"] = verify_xml(raw_xml)
+        report["xml_sha256"] = hashlib.sha256(raw_xml).hexdigest()
+        interrupts.check()
         report["state"] = "PASS"
         status = 0
     except KeyboardInterrupt:
         report.update(state="FAIL", error="Interrupted", error_type="KeyboardInterrupt")
         status = 130
     except TerminationRequested:
-        report["process"]["termination"] = "terminated"
         report.update(
             state="FAIL", error="SIGTERM received", error_type="TerminationRequested"
         )
@@ -180,9 +337,55 @@ def main(argv=None):
     except Exception as error:
         report.update(state="FAIL", error=str(error), error_type=type(error).__name__)
     finally:
-        (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(f"{report['state']}: {directory / 'report.json'}", flush=True)
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            if interrupts.signum is not None:
+                report["interrupt_signal"] = interrupts.signum
+                if report["state"] == "PASS":
+                    report.update(
+                        state="FAIL",
+                        error="Interrupted before publication",
+                        error_type="TerminationRequested",
+                    )
+                    status = 128 + interrupts.signum
+            temporary = directory / "report.json.tmp"
+            raw_report = (json.dumps(report, indent=2) + "\n").encode()
+            temporary.write_bytes(raw_report)
+            temporary.replace(directory / "report.json")
+            # The C++ command has redirected stdout/stderr and no inherited
+            # launcher stream FD. Outer retains this original single-writer
+            # publication record, not a hash reconstructed after drainage.
+            print(
+                json.dumps(
+                    {
+                        "event": "inner_report_persisted",
+                        "state": report["state"],
+                        "attempt": str(directory),
+                        "report_sha256": hashlib.sha256(raw_report).hexdigest(),
+                    }
+                ),
+                flush=True,
+            )
+        except OSError as error:
+            report.update(
+                state="FAIL", persistence_error=type(error).__name__ + ": " + str(error)
+            )
+            print(json.dumps(report), file=sys.stderr, flush=True)
+            status = status or 1
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+    # Requests recorded during publication cannot silently return launcher0.
+    # Later signals use the restored handler; outer records the real launcher
+    # status separately from the already-persisted scoped C++ pair result.
+    if interrupts.signum is not None and status == 0:
+        print(
+            json.dumps(
+                {"event": "interrupt_after_report", "signal": interrupts.signum}
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        status = 128 + interrupts.signum
     return status
 
 

@@ -35,10 +35,23 @@ cases exist, missing discovery must fail. Do not add passing placeholders.
 Each invocation creates a fresh `run-*` directory and keeps the exact argv,
 binary hash, terminal status, stdout/stderr and XML, including failure/timeout
 output. No retries overwrite a previous attempt. The launcher checks executable
-bytes before and after execution and terminates its own process group on timeout
-or interrupt. Exit zero plus successful-looking text is insufficient: require
-complete successful XML with both case identities, no skips or expected failures,
-and a positive assertion count.
+bytes before and after execution. It requires a zero C++ exit status and complete
+successful XML with both case identities, no skips or expected failures, and a
+positive assertion count. It reads the binary and XML as regular files. The XML
+hash covers the same bytes it verifies.
+
+On POSIX, a private session leader holds the process group identity until the
+launcher signals that group. This happens on both success and failure, including
+timeout and interrupt. The launcher records the C++ exit status separately from
+the session leader's cleanup status. A refused C++ launch retains the OS error
+in `stderr.log` and leaves the C++ exit status unset. Cleanup is scoped to the
+launched group. Qualification of the full owned process tree, including children that
+leave that group, requires the separately coordinated outer controller.
+
+After replacing `report.json` atomically, the launcher emits one JSON line with
+event `inner_report_persisted`, the attempt directory, the report state and the
+report's SHA-256. Use the launcher exit status together with this record and the
+report. An interrupt during publication can still make the launcher exit nonzero.
 
 A runner PASS means this particular binary passed the selected pair. A caller
 provided binary hash does not independently prove how the binary was built.

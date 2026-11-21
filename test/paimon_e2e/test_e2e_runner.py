@@ -1,5 +1,6 @@
 """Exercise the launcher's real CLI; child fixtures do not execute a GPU."""
 
+import errno
 import hashlib
 import json
 import os
@@ -28,7 +29,9 @@ class E2ERunnerTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.binary = self.root / "test-binary"
 
-    def invoke(self, xml=XML, ending="", *, expected=0, bad_hash=False, timeout=3):
+    def invoke(
+        self, xml=XML, ending="", *, expected=0, bad_hash=False, timeout=3, mode=0o755
+    ):
         self.binary.write_text(
             f"#!{sys.executable}\n"
             "import os, pathlib, signal, sys, time\n"
@@ -42,7 +45,7 @@ class E2ERunnerTests(unittest.TestCase):
             )
             + ending
         )
-        self.binary.chmod(0o755)
+        self.binary.chmod(mode)
         digest = (
             "0" * 64
             if bad_hash
@@ -70,7 +73,17 @@ class E2ERunnerTests(unittest.TestCase):
         reports = list(output.glob("run-*/report.json"))
         self.assertEqual(len(reports), 1, result.stdout + result.stderr)
         self.attempt = reports[0].parent
-        self.report = json.loads(reports[0].read_text())
+        report_bytes = reports[0].read_bytes()
+        self.report = json.loads(report_bytes)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "event": "inner_report_persisted",
+                "attempt": str(self.attempt.resolve()),
+                "state": self.report["state"],
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            },
+        )
         return self.report
 
     def test_complete_pair_passes_and_preserves_actual_argv_and_hash(self):
@@ -81,6 +94,10 @@ class E2ERunnerTests(unittest.TestCase):
             r["binary_sha256"], hashlib.sha256(self.binary.read_bytes()).hexdigest()
         )
         self.assertEqual((self.attempt / "tests.xml").read_text(), XML)
+        self.assertEqual(
+            r["xml_sha256"],
+            hashlib.sha256((self.attempt / "tests.xml").read_bytes()).hexdigest(),
+        )
 
     def test_missing_report_and_truncated_xml_fail(self):
         for xml in (None, "", XML[:-20]):
@@ -88,6 +105,15 @@ class E2ERunnerTests(unittest.TestCase):
                 self.root = Path(tmp)
                 self.binary = self.root / "child"
                 self.assertEqual(self.invoke(xml, expected=1)["state"], "FAIL")
+
+    def test_fifo_xml_fails_without_waiting_for_a_writer(self):
+        report = self.invoke(
+            xml=None,
+            ending="os.mkfifo(sys.argv[sys.argv.index('--out')+1])\n",
+            expected=1,
+        )
+        self.assertEqual(report["process"]["exit_status"], 0)
+        self.assertIn("Expected a regular file", report["error"])
 
     def test_wrong_duplicate_missing_or_skipped_case_cannot_pass(self):
         bad = [
@@ -143,12 +169,70 @@ class E2ERunnerTests(unittest.TestCase):
         self.assertEqual(r["process"]["termination"], "not_started")
         self.assertFalse((self.attempt / "launched").exists())
 
+    def test_exec_refusal_preserves_launch_error_without_child_exit_status(self):
+        report = self.invoke(expected=1, mode=0o644)
+        self.assertEqual(report["state"], "FAIL")
+        self.assertEqual(report["process"]["termination"], "launch_error")
+        self.assertIsNone(report["process"]["exit_status"])
+        self.assertEqual(
+            report["process"]["cleanup"]["state"], "GROUP_SIGNALLED_ANCHOR_REAPED"
+        )
+        self.assertIn(f"[Errno {errno.EACCES}]", (self.attempt / "stderr.log").read_text())
+        self.assertFalse((self.attempt / "launched").exists())
+
     def test_executable_mutation_during_run_fails(self):
         self.invoke(
             ending="with open(sys.argv[0], 'a') as out: out.write('# drift')\n",
             expected=1,
         )
         self.assertIn("changed", self.report["error"])
+
+    def test_executable_replaced_by_fifo_fails_without_blocking(self):
+        report = self.invoke(
+            ending="os.unlink(sys.argv[0])\nos.mkfifo(sys.argv[0])\n", expected=1
+        )
+        self.assertEqual(report["process"]["exit_status"], 0)
+        self.assertIn("Expected a regular file", report["error"])
+
+    def test_same_group_writer_is_stopped_after_cpp_exits(self):
+        fifo = self.root / "writer.fifo"
+        marker = self.root / "writer-ready"
+        os.mkfifo(fifo)
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            helper = (
+                "import pathlib,time\n"
+                f"with open({str(fifo)!r}, 'wb') as out:\n"
+                " out.write(b'ready'); out.flush()\n"
+                f" pathlib.Path({str(marker)!r}).write_text('ready')\n"
+                " time.sleep(30)\n"
+            )
+            self.invoke(
+                ending="import subprocess\n"
+                f"subprocess.Popen([sys.executable, '-c', {helper!r}])\n"
+                "deadline=time.monotonic()+2\n"
+                f"while not pathlib.Path({str(marker)!r}).exists():\n"
+                " if time.monotonic()>deadline: raise RuntimeError('writer not ready')\n"
+                " time.sleep(0.01)\n"
+            )
+            self.assertEqual(self.report["process"]["exit_status"], 0)
+            self.assertEqual(
+                self.report["process"]["cleanup"]["anchor_exit_status"], -signal.SIGKILL
+            )
+            # Source-owned writer keeps this descriptor open until exit. EOF
+            # proves this fixture's completion without signaling an old PID.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    if os.read(reader, 1024) == b"":
+                        break
+                except BlockingIOError:
+                    pass
+                time.sleep(0.01)
+            else:
+                self.fail("same-group writer did not close; outer cleanup required")
+        finally:
+            os.close(reader)
 
     def test_sigterm_cleans_child_and_records_terminal_report(self):
         self.binary.write_text(
@@ -202,11 +286,8 @@ class E2ERunnerTests(unittest.TestCase):
             if launcher.poll() is None:
                 launcher.kill()
             launcher.communicate()
-            if child_pid is not None:
-                try:
-                    os.kill(child_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            # Do not signal an observed grandchild's possibly recycled PID.
+            # Any failed/unknown fixture cleanup belongs to the owning outer job.
 
 
 if __name__ == "__main__":
