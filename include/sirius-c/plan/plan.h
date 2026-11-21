@@ -20,10 +20,10 @@ extern "C" {
  * Non-NULL pointers must refer to live handles or accessible storage of the stated size.
  * Optional diagnostics follow sirius_error's ownership contract. No exceptions cross the ABI.
  *
- * The initial subset supports one local Parquet scan followed by filters. Each node retains
- * its input. Nodes are never fused or reordered. Operator-specific properties and additional
- * operators can be introduced separately. Node chains and expression trees are limited to
- * 256 levels to bound traversal and destruction stack use.
+ * The initial subset supports one Parquet scan of a local file or an S3 object followed by
+ * filters. Each node retains its input. Nodes are never fused or reordered. Operator-specific
+ * properties and additional operators can be introduced separately. Node chains and expression
+ * trees are limited to 256 levels to bound traversal and destruction stack use.
  *
  * @par Thread safety
  * Handles may be transferred between threads. Concurrent reads and construction are safe.
@@ -53,12 +53,24 @@ enum {
   SIRIUS_COMPARISON_GREATER       = 4,
   SIRIUS_COMPARISON_GREATER_EQUAL = 5
 };
-/** Describe one local Parquet file with an explicit schema. path is a nonempty native-byte
- * path without NUL or a URI scheme. The path is literal: glob characters are never expanded.
- * A scheme-shaped prefix such as data:1.parquet is rejected; use ./data:1.parquet
- * to identify that literal POSIX filename.
- * Relative paths use the working directory at future preparation time.
- * No file is opened or schema inferred; preparation must bind the source
+/** Describe one Parquet source, a local file or an S3 object, with an explicit schema.
+ * path is a nonempty byte string without NUL. It is stored as given: never decoded, trimmed,
+ * case-folded or normalized, and glob characters are never expanded.
+ *
+ * A name without a URI scheme is a native-byte local path. A name with a scheme-shaped
+ * prefix, such as data:1.parquet, is not a local path; use ./data:1.parquet to identify that
+ * literal POSIX filename. Relative paths use the working directory at future preparation time.
+ *
+ * The only accepted URI form is `s3://bucket/key`, with the scheme in either ASCII case. The
+ * bucket is one or more ASCII letters, digits, `.`, `_` or `-`, other than `.` or `..`.
+ * User-info and a port cannot be written, and a host name there is a bucket name, not an
+ * endpoint. The key is nonempty and names one literal object: `@`, `:` and `%` are ordinary
+ * bytes and percent sequences are not decoded. `?` and `#` are rejected anywhere in the URI,
+ * so a key that contains one cannot be expressed. Any other scheme or malformed S3 URI
+ * returns SIRIUS_INVALID_ARGUMENT. A scan takes no credentials or configuration reference,
+ * and construction does not select a store.
+ *
+ * No source is opened or schema inferred; preparation must bind the source
  * and check its schema and engine support. schema and out_node must not be NULL.
  * @code{.c}
  * sirius_plan_node *scan = NULL;
@@ -181,8 +193,9 @@ SIRIUS_EXPORT sirius_status sirius_plan_from_root(const sirius_plan_node* root,
  */
 SIRIUS_EXPORT sirius_plan_node* sirius_plan_root(const sirius_plan* plan) SIRIUS_C_NOEXCEPT;
 /** Borrow a NUL-terminated, human-readable description until plan is released.
- * Returns an empty string for NULL. Names and paths are escaped. Formatting is diagnostic,
- * not a serialization format or stable machine-readable interface.
+ * Returns an empty string for NULL. Names and local paths are escaped. An S3 scan is shown
+ * as `s3://<redacted>`, without its bucket or key. Formatting is diagnostic, not a
+ * serialization format or stable machine-readable interface.
  * @code{.c}
  * const char *description = sirius_plan_describe(plan);
  * @endcode
