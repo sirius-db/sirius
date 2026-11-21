@@ -83,21 +83,42 @@ inline io_env& env()
   return e;
 }
 
-inline void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
+template <typename Pred>
+void null_rows(cudf::column& column,
+               Pred is_null,
+               ::cuda::stream_ref stream         = utils::default_stream(),
+               rmm::device_async_resource_ref mr = utils::get_resource_ref(*env().gpu))
 {
   auto const rows = column.size();
   std::vector<std::uint32_t> words(
     cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
   cudf::size_type nulls = 0;
   for (cudf::size_type i = 0; i < rows; ++i) {
-    if (i % 7 == 0) {
+    if (is_null(i)) {
       ++nulls;
     } else {
       words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
     }
   }
-  rmm::device_buffer mask(words.data(), words.size() * sizeof(std::uint32_t), stream);
+  auto mask = cudf::create_null_mask(rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+  if (!words.empty()) {
+    REQUIRE(cudaMemcpyAsync(mask.data(),
+                            words.data(),
+                            words.size() * sizeof(words[0]),
+                            cudaMemcpyHostToDevice,
+                            stream.get()) == cudaSuccess);
+    stream.sync();
+  }
   column.set_null_mask(std::move(mask), nulls);
+}
+
+inline void null_every_seventh(cudf::column& column, ::cuda::stream_ref stream)
+{
+  null_rows(
+    column,
+    [](cudf::size_type row) { return row % 7 == 0; },
+    stream,
+    rmm::mr::get_current_device_resource_ref());
 }
 
 template <typename T>
@@ -175,7 +196,7 @@ inline table_digest digest(std::shared_ptr<cucascade::data_batch> const& batch)
   if (batch->to_read_only().get_current_tier() != Tier::GPU) {
     rmm::cuda_stream stream;
     sirius::convertible_data_batch convertible(batch);
-    REQUIRE(convertible.convert({env().gpu}, stream.view(), *env().mgr, true).has_value());
+    REQUIRE(convertible.convert({env().gpu}, stream, *env().mgr, true).has_value());
     stream.synchronize();
   }
   auto ro = batch->to_read_only();

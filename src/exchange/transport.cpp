@@ -60,7 +60,7 @@ class event_pool {
       static_cast<void>(cudaEventDestroy(e));
     }
   }
-  cudaEvent_t record(rmm::cuda_stream_view stream)
+  cudaEvent_t record(::cuda::stream_ref stream)
   {
     cudaEvent_t e{};
     if (_free.empty()) {
@@ -71,7 +71,7 @@ class event_pool {
       e = _free.back();
       _free.pop_back();
     }
-    RMM_CUDA_TRY(cudaEventRecord(e, stream.value()));
+    RMM_CUDA_TRY(cudaEventRecord(e, stream.get()));
     return e;
   }
   /// Whether @p e has completed; a completed event goes back to the pool.
@@ -270,7 +270,7 @@ struct transport::engine {
   {
     if (!l.header || l.waiting.empty()) { return false; }
     if (!l.in) {
-      l.in = incoming_batch::land(*l.header, gpu, host, recv_stream.view());
+      l.in = incoming_batch::land(*l.header, gpu, host, recv_stream);
       if (!l.in) {
         if (!l.asked_for_room && opts.request_room) { opts.request_room(l.header->stream_bytes); }
         l.asked_for_room = true;
@@ -288,8 +288,8 @@ struct transport::engine {
           l.header->stream_bytes);
       }
       l.seen[m.k] = true;
-      l.in->copy_in(at, recv_ring.frame(m.recv_frame), m.bytes, recv_stream.view());
-      copies.push_back({events.record(recv_stream.view()), key, m.recv_frame});
+      l.in->copy_in(at, recv_ring.frame(m.recv_frame), m.bytes, recv_stream);
+      copies.push_back({events.record(recv_stream), key, m.recv_frame});
     }
     l.waiting.clear();
     return true;
@@ -352,7 +352,7 @@ struct transport::engine {
       auto it = landings.find(c.key);
       auto& l = it->second;
       if (++l.copied < l.seen.size()) { continue; }
-      auto received = l.in->seal(recv_stream.view());
+      auto received = l.in->seal(recv_stream);
       landings.erase(it);
       try {
         cb.on_batch(stream, from, batch, std::move(received));
@@ -405,11 +405,10 @@ struct transport::engine {
         auto const& batch = p.current->out;
         auto const at     = static_cast<std::size_t>(p.next_k) * frame_bytes();
         auto const bytes  = std::min<std::size_t>(frame_bytes(), batch->stream_bytes() - at);
-        batch->copy_range(at, at + bytes, send_ring.frame(send_frame), send_stream.view());
+        batch->copy_range(at, at + bytes, send_ring.frame(send_frame), send_stream);
         frame_message m{p.current->stream, p.current->batch, p.next_k, recv_frame, bytes, {}};
         if (p.next_k == 0) { m.header = encode_header(batch->header()); }
-        staged.push_back(
-          {events.record(send_stream.view()), peer, send_frame, std::move(m), batch});
+        staged.push_back({events.record(send_stream), peer, send_frame, std::move(m), batch});
         ++p.next_k;
         progress = true;
       }
@@ -541,12 +540,12 @@ void transport::send(stream_id stream, rank_t to, std::shared_ptr<cucascade::dat
   // Not on send_stream: planning reads string sizes back, which there would wait behind every
   // frame the engine has staged. send_stream waits for the planning instead (the producer's
   // writes and any unslice copy) before the engine stages from the batch.
-  rmm::cuda_stream_view const plan_stream{e.gpu.acquire_stream()};
+  ::cuda::stream_ref const plan_stream{e.gpu.acquire_stream()};
   auto out = outgoing_batch::make(std::move(batch), plan_stream);
   if (!out) { return; }
   cudaEvent_t planned{};
   RMM_CUDA_TRY(cudaEventCreateWithFlags(&planned, cudaEventDisableTiming));
-  RMM_CUDA_TRY(cudaEventRecord(planned, plan_stream.value()));
+  RMM_CUDA_TRY(cudaEventRecord(planned, plan_stream.get()));
   RMM_CUDA_TRY(cudaStreamWaitEvent(e.send_stream.value(), planned, 0));
   RMM_CUDA_TRY(cudaEventDestroy(planned));
   auto const bytes = out->stream_bytes();

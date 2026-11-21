@@ -31,6 +31,7 @@
 #include "utils/cuda_status_fault.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
@@ -119,7 +120,12 @@ owned_chunk make_compressed_chunk(cucascade::memory::memory_space& space, bool w
   rmm::device_buffer data(
     values.data(), values.size() * sizeof(std::int64_t), stream, space.get_default_allocator());
   cudf::column column(
-    cudf::data_type{cudf::type_id::INT64}, kNumRows, std::move(data), rmm::device_buffer{}, 0);
+    cudf::data_type{cudf::type_id::INT64},
+    kNumRows,
+    std::move(data),
+    cudf::create_null_mask(
+      0, cudf::mask_state::UNALLOCATED, stream_ref, space.get_default_allocator()),
+    0);
 
   auto blob   = std::make_shared<sirius::compressed_device_blob>();
   blob->table = simpatico::compress_with_plan(
