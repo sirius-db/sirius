@@ -1,0 +1,11 @@
+[workspace]
+name = "paimon-e2e-harness"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+requires-pixi = ">=0.78"
+
+[dependencies]
+python = "3.12.*"
+
+[tasks]
+test = "python -m unittest discover -s . -p 'test_*.py' -v"
