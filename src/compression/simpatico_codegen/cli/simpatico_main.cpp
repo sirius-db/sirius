@@ -4,6 +4,7 @@
 //
 // Modes:
 //   benchmark  Timed compress+decompress over a Parquet/binary/CSV input
+//   device-compare  Timed device-resident Parquet vs Simpatico decode
 //   explore    BFS cascade search for a single column
 //   compress   Compress input to a .hpln file (--verify round-trips it)
 //   decompress Decompress a .hpln file to Parquet (--verify checks vs source)
@@ -29,8 +30,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -681,6 +684,7 @@ void usage_top()
                "\n"
                "Modes:\n"
                "  benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)\n"
+               "  device-compare Timed device-resident Parquet vs Simpatico decode\n"
                "  explore     BFS cascade search for the best plan for a single column\n"
                "  compress    Compress input to a .hpln file (--verify round-trips it)\n"
                "  decompress  Decompress a .hpln file to Parquet (--verify checks vs source)\n"
@@ -827,6 +831,136 @@ int run_benchmark(int argc, char** argv)
   for (auto const& r : rows)
     if (!r.verify_ok) all_ok = false;
   return all_ok ? 0 : 5;
+}
+
+// ── DEVICE-COMPARE mode ───────────────────────────────────────────────────────
+// The Parquet file and the Simpatico representation are both on the GPU before
+// timing. Each timed call fully materializes exactly one GPU column.
+
+void usage_device_compare()
+{
+  std::fprintf(stderr,
+               "Usage: simpatico device-compare --input FILE.parquet --plan FILE.txt "
+               "[--column NAME] [--warmup N] [--iters N] [--csv-out FILE]\n");
+}
+
+int run_device_compare(int argc, char** argv)
+{
+  std::string input_path, plan_path, column_filter, csv_path;
+  int warmup = 3, iters = 10;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    auto need       = [&](char const* flag) -> std::string {
+      if (i + 1 >= argc) die(std::string(flag) + " requires a value");
+      return argv[++i];
+    };
+    if (arg == "--help" || arg == "-h") {
+      usage_device_compare();
+      return 0;
+    } else if (arg == "--input") {
+      input_path = need("--input");
+    } else if (arg == "--plan") {
+      plan_path = need("--plan");
+    } else if (arg == "--column") {
+      column_filter = need("--column");
+    } else if (arg == "--warmup") {
+      warmup = std::stoi(need("--warmup"));
+    } else if (arg == "--iters") {
+      iters = std::stoi(need("--iters"));
+    } else if (arg == "--csv-out") {
+      csv_path = need("--csv-out");
+    } else {
+      die("device-compare: unknown flag '" + arg + "'");
+    }
+  }
+  if (input_path.empty() || plan_path.empty() || warmup < 0 || iters < 1)
+    die("device-compare: --input and --plan are required; warmup >= 0 and iters >= 1");
+
+  init_gpu();
+  auto file_bytes = read_binary_file(input_path);
+  rmm::device_buffer parquet_device(file_bytes.size(), cudf::get_default_stream());
+  auto status =
+    cudaMemcpy(parquet_device.data(), file_bytes.data(), file_bytes.size(), cudaMemcpyHostToDevice);
+  if (status != cudaSuccess)
+    throw std::runtime_error(std::string("Parquet preload: ") + cudaGetErrorString(status));
+  auto const parquet_bytes = file_bytes.size();
+  file_bytes               = {};
+  auto source              = cudf::io::source_info{cudf::device_span<std::byte const>{
+    static_cast<std::byte const*>(parquet_device.data()), parquet_bytes}};
+
+  auto loaded = load_parquet(input_path);
+  auto blocks = simpatico::split_plan_dsl(read_file(plan_path));
+  if (blocks.size() != static_cast<std::size_t>(loaded.table->num_columns()))
+    die("device-compare: plan column count does not match Parquet input");
+
+  std::ofstream csv;
+  if (!csv_path.empty()) {
+    csv.open(csv_path);
+    if (!csv) die("device-compare: cannot write " + csv_path);
+    csv << "column,rows,decoded_bytes,parquet_file_bytes,simpatico_payload_bytes,"
+           "parquet_ms_median,parquet_gbps,simpatico_ms_median,simpatico_gbps,"
+           "simpatico_speedup,verify_ok\n";
+  }
+
+  bool matched = column_filter.empty();
+  for (int i = 0; i < loaded.table->num_columns(); ++i) {
+    auto const& name = loaded.column_names.at(static_cast<std::size_t>(i));
+    if (!column_filter.empty() && name != column_filter) continue;
+    matched                  = true;
+    auto const col           = loaded.table->view().column(i);
+    auto const decoded_bytes = column_input_bytes(col);
+    auto options             = cudf::io::parquet_reader_options::builder(source)
+                     .column_names(std::vector<std::string>{name})
+                     .build();
+
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::make_unique<cudf::column>(col));
+    cudf::table single(std::move(cols));
+    auto compressed = simpatico::compress_with_plan(single.view(),
+                                                    blocks.at(static_cast<std::size_t>(i)),
+                                                    cudf::get_default_stream(),
+                                                    rmm::mr::get_current_device_resource_ref());
+    cuda_sync();
+    auto const simpatico_bytes = compressed_table_bytes(compressed);
+
+    std::unique_ptr<cudf::table> parquet_out, simpatico_out;
+    auto parquet_ms = time_iters(
+      warmup,
+      iters,
+      [&] { parquet_out.reset(); },
+      [&] {
+        auto result = cudf::io::read_parquet(options);
+        parquet_out = std::move(result.tbl);
+        cuda_sync();
+      });
+    auto simpatico_ms = time_iters(
+      warmup,
+      iters,
+      [&] { simpatico_out.reset(); },
+      [&] {
+        simpatico_out = simpatico::decompress(
+          compressed, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+        cuda_sync();
+      });
+    bool const verify_ok = parquet_out && simpatico_out && parquet_out->num_columns() == 1 &&
+                           simpatico_out->num_columns() == 1 &&
+                           columns_equal(col, parquet_out->view().column(0)) &&
+                           columns_equal(col, simpatico_out->view().column(0));
+    auto const parquet_gbps   = gbps(decoded_bytes, parquet_ms.median);
+    auto const simpatico_gbps = gbps(decoded_bytes, simpatico_ms.median);
+    std::cout << name << ": Parquet " << parquet_gbps << " GB/s, Simpatico " << simpatico_gbps
+              << " GB/s, verified=" << verify_ok << std::endl;
+    if (csv) {
+      csv << name << ',' << col.size() << ',' << decoded_bytes << ',' << parquet_bytes << ','
+          << simpatico_bytes << ',' << parquet_ms.median << ',' << parquet_gbps << ','
+          << simpatico_ms.median << ',' << simpatico_gbps << ','
+          << parquet_ms.median / simpatico_ms.median << ',' << verify_ok << '\n';
+      csv.flush();
+    }
+    if (!verify_ok) return 5;
+  }
+  if (!matched) die("device-compare: requested column not found: " + column_filter);
+  return 0;
 }
 
 // ── EXPLORE mode ──────────────────────────────────────────────────────────────
@@ -1319,6 +1453,7 @@ int main(int argc, char** argv)
 
     // Pass (argc-1, argv+1): argv[0] stays "simpatico", mode word is gone.
     if (mode == "benchmark") return run_benchmark(argc - 1, argv + 1);
+    if (mode == "device-compare") return run_device_compare(argc - 1, argv + 1);
     if (mode == "explore") return run_explore(argc - 1, argv + 1);
     if (mode == "compress") return run_compress(argc - 1, argv + 1);
     if (mode == "decompress") return run_decompress(argc - 1, argv + 1);

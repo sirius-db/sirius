@@ -38,3 +38,36 @@ done
 python3 bench/gb300/simpatico-lineitem/summarize.py \
   test_datasets/simpatico-lineitem-sf1000 bench/gb300/simpatico-lineitem
 ```
+
+## Device-resident Parquet versus Simpatico
+
+The [device comparison](device-compare-summary.csv) measures single-column
+materialization from two GPU-resident compressed inputs. For each of the same
+60 SF1000 `lineitem` partitions, the standalone `simpatico device-compare` mode
+loads the complete Parquet file into a device buffer, and compresses each column
+with the plan above into a device-resident Simpatico representation. Both setup
+steps are outside the timer. Each timed path produces a fully decoded cuDF
+column on the GPU, synchronizes the device, and verifies the result against the
+source. There are three untimed warmups and ten timed iterations per column and
+partition; the summary divides decoded bytes by the sum of partition medians.
+The [per-partition results](device-compare-per-partition.csv) contain the raw
+timings and verification status. All 960 column/partition comparisons passed
+verification. Across the dataset, the decoded columns total 772.7 GB, the
+Parquet files total 177.2 GB, and Simpatico's compressed payloads total
+220.4 GB (decimal GB).
+
+The Parquet number measures the full `cudf::io::read_parquet` call using a device
+buffer source, including reader setup, metadata handling, and allocation. The
+Simpatico number measures its `decompress` call on an existing device-resident
+representation. Neither includes loading compressed data from storage or a
+host-to-device input transfer. This compares materialization from two formats;
+it is not an isolated codec-kernel comparison. Parquet file size is recorded per
+partition, not attributed to individual columns.
+
+To reproduce, build the CLI as above, then run:
+
+```bash
+bash bench/gb300/simpatico-lineitem/run_device_compare.sh 0 59
+python3 bench/gb300/simpatico-lineitem/summarize_device_compare.py \
+  test_datasets/simpatico-lineitem-device-compare bench/gb300/simpatico-lineitem
+```
