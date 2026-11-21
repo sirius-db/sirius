@@ -2464,6 +2464,26 @@ TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups", "[s3][inte
   compare_s3_gpu_to_local_cpu(fixture, aggregate_sql, local_sql);
 }
 
+TEST_CASE("gpu_execution S3 scan keeps column values under column aliases",
+          "[s3][integration][sql]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  // The aliases trade the names of nation's two key columns, which have one type. A scan that
+  // resolved its columns by alias would return each one's values under the other's name.
+  auto const query = [](std::string const& scan) {
+    return "SELECT n_nationkey, n_regionkey, n_name FROM " + scan +
+           " AS t(n_regionkey, n_name, n_nationkey, n_comment) ORDER BY 1, 2, 3";
+  };
+  compare_s3_gpu_to_local_cpu(
+    fixture, query(s3_parquet_scan(*env, "nation")), query(local_parquet_scan(*env, "nation")));
+  compare_s3_gpu_to_local_cpu(fixture,
+                              query(s3_sirius_parquet_scan(*env, "nation")),
+                              query(local_parquet_scan(*env, "nation")));
+}
+
 TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q1 shape", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();

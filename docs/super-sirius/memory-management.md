@@ -75,6 +75,8 @@ Index estimates use the input rows in selected row groups, before reader filteri
 
 Iceberg scans without virtual columns use interval deletion before query predicates when deletes are present. They add no internal row/source index workspace and have no alternative position peak selected at split emission.
 
+A data file with applicable Iceberg equality deletes adds the probe workspace to each selected row group: 9 B/row for the join indices, the compaction's gather map and the BOOL8 mask, plus one decoded copy for the compacted batch. Groups are probed one after another, so the allowance does not grow with their number; virtual scans add only the per-row part because they already budget a filter copy. The delete tables themselves are not part of this estimate (see [Equality deletes](scan.md#equality-deletes)).
+
 Virtual scans already budget their output columns, reader indices and selection/cast scratch; deletion adds only missing index allowances and delete storage. Source costs are conservative before coalescing, so virtual estimates may retain a source allowance for a single-file split. Filename estimates include characters, offsets and construction buffers. Arithmetic saturates on overflow. These are buffer estimates, not an exact bound on all cuDF decoder scratch.
 
 File/split preparation charges retain the same additive row-group estimate from registration through consumption. Batch fill and execution omit the deletion-position allowance when the split's selected row groups contain no deletes. If groups with and without deletes share a filtered split, its position allowance covers every input row. Plain Parquet and Iceberg reader-mode virtual scans reserve one combined reader result rather than per-row-group table concatenation.

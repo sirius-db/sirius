@@ -126,6 +126,9 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   std::size_t projected_output_count = 0;
+  /// Schema (P-space) indices of value-delete keys, already reachable through @ref column_ids
+  /// and @ref projection_ids. The plan gives those the query does not output the DELETE_KEY role.
+  std::vector<std::size_t> delete_key_primary_indices;
 
   parquet_ingestible_table_info() = default;
 
@@ -382,6 +385,9 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
+  /// Adapter-owned identity of a value-based visibility rule (for Iceberg: the equality-delete
+  /// groups that apply). The coalescer keeps files whose values differ out of one batch.
+  std::shared_ptr<void const> visibility_class;
   // Set by the core only for a qualified Iceberg virtual-column route/expression.
   bool position_filter_eligible   = false;
   bool requires_row_positions     = false;
