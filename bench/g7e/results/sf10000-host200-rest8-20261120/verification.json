@@ -1,0 +1,273 @@
+{
+  "profiles": {
+    "cold": [
+      {
+        "effective_config_sha256": "b3b60c965c16b32fabff5479f7fa445f23cf732ec9bcf1027b135666458e4906",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 1
+      },
+      {
+        "effective_config_sha256": "08fbf7c1382a233a2143c8042c584831799845444abd7ea346061731f9cd3cf7",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 2
+      },
+      {
+        "effective_config_sha256": "e3a06d55e6e0caae8c919402e34afbfec1b1a7c1a613af96d03f12da5ef7749a",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 3
+      },
+      {
+        "effective_config_sha256": "ea8c06feaf067518f8533607cbe20ed0d67ca287d391ca4244cc1fcb7dec8bd0",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 4
+      },
+      {
+        "effective_config_sha256": "245f4b3879af3d3bc1c7eac7bfb8fc43a97803018b1a8550df17fb3f3e89ac88",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 5
+      },
+      {
+        "effective_config_sha256": "655123ff520691b62b188ca2c141b4c8aa9327960006428ec14f9b55b10b2286",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 6
+      },
+      {
+        "effective_config_sha256": "7786ce79d6567224a9465cd309782378e2f4832b99f3f17a57af126fcf8bdfe4",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 7
+      },
+      {
+        "effective_config_sha256": "d13f999b18eccfca8572fe09f530dc01f9ba9186692c6de2d3d56936d7e9cd31",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 8
+      },
+      {
+        "effective_config_sha256": "91a5e14e2a2299c68fd7a647fc8ded4c28114bbe348a6d43f1c9fcc550e2439a",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 9
+      },
+      {
+        "effective_config_sha256": "38c0b23a1756d4ac5c3cc93d38327793d1e1c7fcbdc0ee2a6f59fd8a04f98f24",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 10
+      },
+      {
+        "effective_config_sha256": "e1cca2075abce99c6d248152429803bb324b2993a3f6c10ee232b4016abef60c",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 11
+      },
+      {
+        "effective_config_sha256": "753191350fae4ada45125c9209c18b63b9d8b3a4e286c36c70276744c792fe7e",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 12
+      },
+      {
+        "effective_config_sha256": "ab648c7451b3a6cf46c0d8a2b502696dd1128a71c1d397de284c1f1a28421d07",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 13
+      },
+      {
+        "effective_config_sha256": "c4885988b091868ef59d1eaf0f1a36fd6a2f5b43c5306e836eca1f68f2e6c306",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 14
+      },
+      {
+        "effective_config_sha256": "ad35fe972070f6ced8b42e724431638c264909188739d2d357915c1a4db5d719",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 15
+      },
+      {
+        "effective_config_sha256": "0d474ff7535de82f488d650b40398f50e9e357191af709c7c82da3df1801336f",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 16
+      },
+      {
+        "effective_config_sha256": "edcf9af72304cb623ecad1b3f2dbad45890d0e9ef8cec400928f91b2ade7cda9",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 17
+      },
+      {
+        "effective_config_sha256": "396374ffc72a617b3ce58344f744dcfef7acb48980d2a937d3113fe7a129de48",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 18
+      },
+      {
+        "effective_config_sha256": "7f26483ff6c9e0b79bb32082aeba32784ce3da76c5f7f48f0a6abc185014d95b",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 19
+      },
+      {
+        "effective_config_sha256": "d3b01c0352305f8e2830b6850323c98cb387db3a470454715aac67e8111bf47b",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 20
+      },
+      {
+        "effective_config_sha256": "ec98f73dd534f8e4b3260daab09b9a16a45078bd83594910d8bcceece6335850",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 21
+      },
+      {
+        "effective_config_sha256": "16c2cef306b2ce607d154b936bb92245ee440d45b5f11473c7f1066c888cd52c",
+        "gpu_plans": 1,
+        "quent_files": 17,
+        "query": 22
+      }
+    ],
+    "hot": [
+      {
+        "effective_config_sha256": "dd4795af6528c792597915b354fd7a07f49ba288d626bd6eb7c896bfd77644d8",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 1
+      },
+      {
+        "effective_config_sha256": "b69f805c7dbea7bdf022a951ea4b4fb7f2af97738edea9d523c6ade7b3f61798",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 2
+      },
+      {
+        "effective_config_sha256": "7d71c62b9402986db2d219f58cefc5b0ca9ff2ad228f3e6ca090ab4c68d34f19",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 3
+      },
+      {
+        "effective_config_sha256": "c63a9d1d8ab43d1d8a7b6d79e2ebf2d31bce59e0f888111b0e1c600872d4cb4e",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 4
+      },
+      {
+        "effective_config_sha256": "29303cf2561dcb420d50438e1fa884f7dae57a9ea3625202fa931c036b759178",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 5
+      },
+      {
+        "effective_config_sha256": "9c2b20b76d3740ef21a68aa59aa8d3740c1bb04d5367ad05bc064dadd56242c4",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 6
+      },
+      {
+        "effective_config_sha256": "573b22344a1e44d2ecf38862bfd5f4794f954e30f4fe5f29c0ea2ce3535a6821",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 7
+      },
+      {
+        "effective_config_sha256": "a44a9d9a24b2048de966f485397ae02af287da59adb9975c6263bf5f0c901d2b",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 8
+      },
+      {
+        "effective_config_sha256": "fdc043c561c7761565702ca57d45d107f38202a76901b83c7f4ca1b5fef135d1",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 9
+      },
+      {
+        "effective_config_sha256": "d1d547dca2c3b96205a1e95cb8124a2881dbb89e478740bf40d2f70dbe226986",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 10
+      },
+      {
+        "effective_config_sha256": "8cc3a26631653b1075c3a4959d851e9431e2b1d9fc496e3f4745c0ebd84a3744",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 11
+      },
+      {
+        "effective_config_sha256": "85962e3f61c89cb441da1a3984fd6dec7e2cd37d8c020fdbaebbb3f193bc32e7",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 12
+      },
+      {
+        "effective_config_sha256": "79ce8c6e254c34a48b509f9aa6ef4d6ef270b7b13b6d6fe602c916d4de753a35",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 13
+      },
+      {
+        "effective_config_sha256": "f7c10d3d64ad5d9d882ae3af1084d54dc66aa6a290279bb491777034af1b1bb7",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 14
+      },
+      {
+        "effective_config_sha256": "92c45764097386ae70177fea42840a092b38ef77308f8410de5936fc95a838ed",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 15
+      },
+      {
+        "effective_config_sha256": "1cc05bce7aaef950e46621e1e19ee36edd1e63cc4da04bba07a1553deadbf516",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 16
+      },
+      {
+        "effective_config_sha256": "39b9f04697ef6daa066795b9f252b21fc05da104ec0b6edb23b9c33306c1f696",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 17
+      },
+      {
+        "effective_config_sha256": "ad404fadd5afbe9d0745f8e11b8c2ba21b761870e4d872ce42f6bca8cdb1c718",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 18
+      },
+      {
+        "effective_config_sha256": "37c6baf98b44b9e18592aa75f80a6876a8882b7e4374a02198ebfc59e0968efd",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 19
+      },
+      {
+        "effective_config_sha256": "2a7b38641fec15e22e59a8cf9fb8cadfc0161ddae21562f7f100edfdd1ba6e5f",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 20
+      },
+      {
+        "effective_config_sha256": "4e8155eb797fbb9bfe1fb571543a5251d01f4383aa8a7e60e531b149b8e26d03",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 21
+      },
+      {
+        "effective_config_sha256": "35df8fe55ed3088a1e8a27b03f278075fa07534493856ad862d39bf17ff4c562",
+        "gpu_plans": 2,
+        "quent_files": 17,
+        "query": 22
+      }
+    ]
+  },
+  "verified_utc": "2026-11-21T02:17:32.331896+00:00"
+}

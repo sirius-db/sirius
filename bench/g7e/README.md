@@ -43,6 +43,18 @@ devices and rejects EBS by default, including EBS devices named `nvme*`.
 `--allow-ebs-spill` is an explicit opt-in exception. The runner never formats
 disks or silently changes spill paths. Recheck mounts after EC2 stop/start.
 
+## Results
+
+The [November 20 SF10000 custom run](results/sf10000-host200-rest8-20261120/README.md)
+uses engine `26b5caba`, the exact archived 200 GiB host / 8 REST reactor configs,
+and read-ahead 16. All 22 queries completed once cold and twice hot. Sums are
+2216.256305 s cold, 3715.063708 / 2434.062834 s hot, and 2258.198262 s for the
+best hot time per query. Hot Q21's first iteration spent 1466.775056 s in a run
+with prolonged memory retries, then its second iteration completed in 89.838282 s.
+Exact configs, both iterations, provenance, archive checksums and replay commands
+are saved beside the result. These timings do not use the 225 GiB / 4 REST
+reactor presets above.
+
 ## Historical results
 
 The [November 11 baseline](results/baseline-20261111/README.md) contains the

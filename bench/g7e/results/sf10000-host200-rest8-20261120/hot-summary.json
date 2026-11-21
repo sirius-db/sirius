@@ -1,0 +1,201 @@
+{
+  "complete": true,
+  "errors": [],
+  "expected_measurements": 44,
+  "expected_queries": 22,
+  "iteration_totals": [
+    {
+      "expected_queries": 22,
+      "iteration": 1,
+      "queries": 22,
+      "sum_s": 3715.063708
+    },
+    {
+      "expected_queries": 22,
+      "iteration": 2,
+      "queries": 22,
+      "sum_s": 2434.062834
+    }
+  ],
+  "per_query": [
+    {
+      "best_s": 55.13043,
+      "iterations_s": [
+        57.554687,
+        55.13043
+      ],
+      "query": 1
+    },
+    {
+      "best_s": 3.365915,
+      "iterations_s": [
+        10.716438,
+        3.365915
+      ],
+      "query": 2
+    },
+    {
+      "best_s": 46.938537,
+      "iterations_s": [
+        50.52593,
+        46.938537
+      ],
+      "query": 3
+    },
+    {
+      "best_s": 26.8948,
+      "iterations_s": [
+        31.175419,
+        26.8948
+      ],
+      "query": 4
+    },
+    {
+      "best_s": 59.110646,
+      "iterations_s": [
+        63.106186,
+        59.110646
+      ],
+      "query": 5
+    },
+    {
+      "best_s": 39.674351,
+      "iterations_s": [
+        41.591322,
+        39.674351
+      ],
+      "query": 6
+    },
+    {
+      "best_s": 65.080612,
+      "iterations_s": [
+        66.156,
+        65.080612
+      ],
+      "query": 7
+    },
+    {
+      "best_s": 77.753822,
+      "iterations_s": [
+        83.724128,
+        77.753822
+      ],
+      "query": 8
+    },
+    {
+      "best_s": 494.884738,
+      "iterations_s": [
+        494.884738,
+        581.308193
+      ],
+      "query": 9
+    },
+    {
+      "best_s": 55.862704,
+      "iterations_s": [
+        61.631895,
+        55.862704
+      ],
+      "query": 10
+    },
+    {
+      "best_s": 13.673813,
+      "iterations_s": [
+        14.50943,
+        13.673813
+      ],
+      "query": 11
+    },
+    {
+      "best_s": 44.06105,
+      "iterations_s": [
+        46.542118,
+        44.06105
+      ],
+      "query": 12
+    },
+    {
+      "best_s": 327.789658,
+      "iterations_s": [
+        350.104791,
+        327.789658
+      ],
+      "query": 13
+    },
+    {
+      "best_s": 53.378604,
+      "iterations_s": [
+        53.378604,
+        53.489225
+      ],
+      "query": 14
+    },
+    {
+      "best_s": 50.721384,
+      "iterations_s": [
+        50.721384,
+        50.783075
+      ],
+      "query": 15
+    },
+    {
+      "best_s": 4.643294,
+      "iterations_s": [
+        8.701206,
+        4.643294
+      ],
+      "query": 16
+    },
+    {
+      "best_s": 44.688253,
+      "iterations_s": [
+        48.043768,
+        44.688253
+      ],
+      "query": 17
+    },
+    {
+      "best_s": 568.415255,
+      "iterations_s": [
+        568.415255,
+        657.68406
+      ],
+      "query": 18
+    },
+    {
+      "best_s": 70.471488,
+      "iterations_s": [
+        70.736329,
+        70.471488
+      ],
+      "query": 19
+    },
+    {
+      "best_s": 60.199586,
+      "iterations_s": [
+        62.797862,
+        60.199586
+      ],
+      "query": 20
+    },
+    {
+      "best_s": 89.838282,
+      "iterations_s": [
+        1466.775056,
+        89.838282
+      ],
+      "query": 21
+    },
+    {
+      "best_s": 5.62104,
+      "iterations_s": [
+        13.271162,
+        5.62104
+      ],
+      "query": 22
+    }
+  ],
+  "queries_with_timings": 22,
+  "successful_measurements": 44,
+  "sum_best_s": 2258.198262
+}

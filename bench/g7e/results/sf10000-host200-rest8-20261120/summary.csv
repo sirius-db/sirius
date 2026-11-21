@@ -1,0 +1,5 @@
+profile,measurement,queries,sum_s
+cold,iteration1,22,2216.256305
+hot,iteration1,22,3715.063708
+hot,iteration2,22,2434.062834
+hot,best_per_query,22,2258.198262

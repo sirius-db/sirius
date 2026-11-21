@@ -1,0 +1,12 @@
+{
+  "benchmark_complete": true,
+  "bytes": 384061232,
+  "contains": "Full cold/hot logs, timings, exact source/effective configs, raw Quent, GPU smoke/build evidence and provenance",
+  "filename": "full-results.tar.gz",
+  "missing_hot_queries": [],
+  "payload_files": 1308,
+  "payload_inventory_sha256": "874f0d30831795983a2b764d126942db8a66f8b3dd2bc8af8235ed97ade20b09",
+  "sha256": "33b63f48a7682ef10837aeaac069d46249c9f2c4f1ff2778756060c61259b11f",
+  "storage": "Retained privately on EC2 EBS and locally; raw logs and Quent are not committed.",
+  "verified_locally": true
+}
