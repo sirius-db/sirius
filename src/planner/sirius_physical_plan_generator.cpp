@@ -16,7 +16,6 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
-#include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
@@ -32,7 +31,6 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
@@ -42,9 +40,8 @@
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
-#include "io/uri_parser.hpp"
 #include "log/logging.hpp"
-#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "op/partition/consumer_partition_policy.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -63,6 +60,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_limit.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -80,6 +78,8 @@
 #include "op/sirius_physical_union.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
+#include "planner/distributed_plan.hpp"
+#include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_window.hpp"
@@ -92,6 +92,8 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
 
@@ -340,7 +342,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    info->resolved_file_paths = std::move(resolved_file_paths);
+    assign_files_to_rank(*info, std::move(resolved_file_paths), op_params);
   }
 
   info->approximate_batch_size = op_params.scan_task_batch_size;
@@ -445,19 +447,6 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   info->table_path = scan_op.parameters.front().GetValue<std::string>();
 
-  // Second line of the gate in sirius_plan_get.cpp, which already declines an unpinned scan: a
-  // caller reaching here without an id must fail loudly rather than read "current" a third time.
-  // Deriving one here is not a fallback -- see that gate for why every derivation is unsound.
-  auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) {
-    throw duckdb::NotImplementedException(
-      "iceberg_scan reached GPU physical planning without 'snapshot_from_id': the snapshot its "
-      "delete files must be read from is unknown, and reading them from whatever is current now "
-      "risks pairing one snapshot's data files with another's deletes");
-  }
-  std::optional<uint64_t> const snapshot_id =
-    static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
-
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw duckdb::NotImplementedException(
@@ -484,7 +473,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
     *supplied_discovery = std::move(discovery);
   else
     info->delete_data = sirius::op::scan::load_delete_payload(
-      context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id, discovery);
+      context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -508,6 +497,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   };
   std::vector<candidate> scans;
   std::vector<preparation_request> requests;
+  // Connector requests are required: the statement cannot proceed without their admission.
+  std::vector<preparation_request> required_requests;
+  std::vector<std::pair<scan_contract_id, std::string>> required_origins;
   std::function<void(sirius::op::sirius_physical_operator&)> visit = [&](auto& node) {
     using type = sirius::op::SiriusPhysicalOperatorType;
     for (auto& child : node.children)
@@ -521,8 +513,12 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     auto& scan = node.template Cast<sirius::op::sirius_physical_table_scan>();
     if (auto const* connector = lookup_connector(scan.function, scan.bind_data.get(), context);
         connector && connector->prepare) {
-      if (auto request = connector->prepare(scan, params, context))
-        requests.push_back(std::move(*request));
+      if (auto request = connector->prepare(scan, params, context)) {
+        if (!request->prepare || !request->bind || !request->rollback)
+          throw std::invalid_argument("incomplete preparation resource request");
+        required_requests.push_back(std::move(*request));
+        required_origins.emplace_back(scan.contract_id, scan.function.GetName());
+      }
     }
     if (scan.function.GetName() != "iceberg_scan") return;
     candidate c{&scan, {}};
@@ -530,7 +526,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     scans.push_back(std::move(c));
   };
   visit(root);
-  if (scans.empty() && requests.empty()) return;
+  if (scans.empty() && required_requests.empty()) return;
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) throw duckdb::InternalException("scan preparation requires a SiriusContext");
   struct remote_puffin {
@@ -545,7 +541,7 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     bool remote = false;
     std::string scheme;
     try {
-      auto const parsed = sirius::io::parse(dv.file_path);
+      auto const parsed = cucascade::io::parse(dv.file_path);
       scheme            = parsed.scheme;
       remote            = parsed.scheme != "file";
     } catch (std::invalid_argument const&) {
@@ -554,10 +550,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
       remote = dv.file_path.find("://") != std::string::npos;
     }
     if (!remote) return;
-    auto const backend           = scan_manager.planning_io_backend(dv.file_path);
-    auto const backend_available = scheme == "s3" && backend.has_value() &&
-                                   (*backend == sirius::io::io_context_type::restful ||
-                                    *backend == sirius::io::io_context_type::kvikio);
+    auto const backend = scan_manager.planning_io_backend(dv.file_path);
+    auto const backend_available =
+      scheme == "s3" && backend.has_value() && *backend == cucascade::io::io_context_type::restful;
     remote_puffins.push_back({contract, dv.file_path, std::move(scheme), backend_available});
   };
   std::vector<scan_dv_count> counts;
@@ -623,34 +618,66 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   auto* selected = counters->track_units && counters->preparation_provider_for_testing
                      ? counters->preparation_provider_for_testing.get()
                      : &provider;
-  if (counters->track_units && counters->preparation_envelope_for_testing)
+  if (counters->track_units && counters->preparation_envelope_for_testing) {
+    for (auto& request : required_requests)
+      counters->preparation_envelope_for_testing(request.envelope);
     for (auto& request : requests)
       counters->preparation_envelope_for_testing(request.envelope);
+  }
   admission_decision decision;
   bool arena_failed = false;
   bool route_allowed =
     counters->track_units && counters->statement_dv_limit_for_testing
       ? statement_dv_route_allowed(counts, *counters->statement_dv_limit_for_testing)
       : statement_dv_route_allowed(counts);
-  if (qualified && route_allowed && !requests.empty()) {
+  // DV qualification only selects optional DV participation; required connector requests
+  // always take part in the single shared admission attempt.
+  bool const dv_eligible = qualified && route_allowed && !requests.empty();
+  bool const required    = !required_requests.empty();
+  std::vector<preparation_request> participants;
+  bool helper_rolled_back        = false;
+  std::string_view refusal_cause = {};
+  if (dv_eligible || required) {
     auto spaces =
       sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (!spaces.empty()) {
+    if (spaces.empty()) {
+      if (required) refusal_cause = "no HOST memory space";
+    } else {
       auto const& config = sirius_ctx->get_config().get_scan_manager_config();
       auto limits        = config.preparation.resolve(config.thread_pool.num_threads);
       auto permits       = static_cast<size_t>(config.thread_pool.num_threads);
       if (limits.max_inflight_dv_jobs) permits = std::min(permits, limits.max_inflight_dv_jobs);
+      participants.reserve(required_requests.size() + (dv_eligible ? requests.size() : 0));
+      for (auto& request : required_requests)
+        participants.push_back(std::move(request));
+      if (dv_eligible)
+        for (auto& request : requests)
+          participants.push_back(std::move(request));
       try {
-        decision = prepare_statement_resources(
-          *selected, requests, spaces.front()->get_id(), static_cast<uint32_t>(permits));
+        decision = prepare_statement_resources(*selected,
+                                               participants,
+                                               spaces.front()->get_id(),
+                                               static_cast<uint32_t>(permits),
+                                               &helper_rolled_back);
       } catch (preparation_resource_error const&) {
         arena_failed = true;
       } catch (std::bad_alloc const&) {
         arena_failed = true;
       }
+      if (required && !decision.deferred)
+        refusal_cause = arena_failed ? "arena allocation failed" : "HOST admission refused";
     }
   }
-  std::string_view route_reason = !qualified           ? "unqualified_envelope"
+  bool const refused = !refusal_cause.empty();
+  if (refused && !helper_rolled_back) {
+    // The helper reports whether it ran rollback; otherwise the unprepared requests
+    // still need their refusal cleanup.
+    auto& pending = participants.empty() ? required_requests : participants;
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it)
+      it->rollback();
+  }
+  std::string_view route_reason = refused              ? "provider_admission_refused"
+                                  : !qualified         ? "unqualified_envelope"
                                   : !route_allowed     ? "statement_dv_limit"
                                   : requests.empty()   ? "no_deferred_dv_work"
                                   : arena_failed       ? "arena_allocation"
@@ -667,10 +694,26 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
     });
     if (eager_remote != remote_puffins.end()) {
       sirius_ctx->record_semantic_decline(verdict_reason::iceberg_puffin_remote_eager);
+      if (refused && counters->track_units && counters->iceberg_statement_route_for_testing)
+        counters->iceberg_statement_route_for_testing(route_reason, decision);
       throw scan_verdict_declined(
         "iceberg_scan declines the GPU path: remote Puffin requires deferred preparation",
         {{eager_remote->contract, verdict_reason::iceberg_puffin_remote_eager}});
     }
+  }
+  if (refused) {
+    sirius_ctx->record_semantic_decline(verdict_reason::provider_admission_refused);
+    if (counters->track_units && counters->iceberg_statement_route_for_testing)
+      counters->iceberg_statement_route_for_testing(route_reason, decision);
+    std::vector<std::pair<scan_contract_id, verdict_reason>> declined;
+    std::string functions;
+    for (auto const& [contract, function] : required_origins) {
+      declined.emplace_back(contract, verdict_reason::provider_admission_refused);
+      functions += functions.empty() ? function : ", " + function;
+    }
+    throw scan_verdict_declined("connector preparation declines the GPU path: " +
+                                  std::string(refusal_cause) + " for " + functions,
+                                std::move(declined));
   }
   if (counters->track_units && counters->iceberg_statement_route_for_testing)
     counters->iceberg_statement_route_for_testing(route_reason, decision);
@@ -681,11 +724,9 @@ void prepare_scan_statement(sirius::op::sirius_physical_operator& root,
   for (auto& c : scans) {
     if (!c.info->deferred) {
       duckdb::SiriusContext::InternalQueryGuard guard(context);
-      auto started = std::chrono::steady_clock::now();
-      auto sid =
-        static_cast<uint64_t>(c.scan->named_parameters.at("snapshot_from_id").GetValue<int64_t>());
+      auto started        = std::chrono::steady_clock::now();
       c.info->delete_data = load_delete_payload(
-        context, c.info->table_path, sirius_ctx->get_scan_manager().io_ctx(), sid, *c.discovery);
+        context, c.info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), *c.discovery);
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - started)
                   .count();
@@ -1043,6 +1084,9 @@ plan_lineage collect_semantic_lineage(
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
     for (auto index : aggregate.cudf_aggregate_idx)
       if (index >= 0) mark_semantic(lineage_at(children[0], index));
+    // FIRST carries its input through cuDF gathers and concatenation before host export.
+    for (auto index : op::carried_inputs(aggregate.aggregate_slots))
+      mark_semantic(lineage_at(children[0], index));
     result.columns.resize(node.types.size());
   } else if (node.type == type::UNGROUPED_AGGREGATE && children.size() == 1) {
     for (auto const& expression : node.Cast<op::sirius_physical_ungrouped_aggregate>().aggregates)
@@ -1100,6 +1144,7 @@ plan_lineage collect_semantic_lineage(
     // Sort and TOP_N carry their payload through cuDF before host export.
     mark_semantic_columns(result.columns);
   } else if ((node.type == type::LIMIT || node.type == type::STREAMING_LIMIT ||
+              node.type == type::UNORDERED_STREAMING_LIMIT ||
               node.type == type::RESULT_COLLECTOR) &&
              children.size() == 1) {
     result.columns = children[0].columns;
@@ -1307,6 +1352,7 @@ void lower_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& 
                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                  : nullptr;
   if (state) state->record_scan_lowering(scan.contract_id);
+  if (params.distributed()) { check_distributed_scan(scan, *entry, context); }
   slot = entry->lower(scan, params, context, entry->filter_mode);
 }
 
@@ -1381,7 +1427,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
     // emits LIST sets locally and only becomes BIGINT after merge post-processing;
-    // STDDEV_SAMP emits count/mean/M2 STRUCT states and only becomes DOUBLE after merge.
+    // STDDEV_SAMP emits count/mean/M2 STRUCT states and only becomes DOUBLE after merge; the local
+    // schema puts FIRST columns after the partials.
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
       op_params.hash_partition_bytes);
@@ -1391,9 +1438,10 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
     bool const has_supported_count_distinct_layout =
-      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      grouped.has_count_distinct && !grouped.has_avg && !grouped.has_first() &&
+      !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.num_output_group_columns() + grouped.aggregate_slots.size();
-    if (grouped.has_stddev_samp()) {
+    if (grouped.has_stddev_samp() || grouped.has_first()) {
       hgb_ptr->types = grouped.local_types;
     } else if (has_supported_count_distinct_layout) {
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();
@@ -1549,9 +1597,12 @@ bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_b
     // Every probe row must see its partition's whole build to get one mark; MARK may run
     // hash-partitioned STANDARD, like SEMI.
     case duckdb::JoinType::MARK: return is_build;
-    case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::RIGHT_SEMI:
-    case duckdb::JoinType::RIGHT_ANTI: return !is_build;
+    case duckdb::JoinType::RIGHT_ANTI:
+      // A kept-build join folds its build into one hash table per partition and streams the probe.
+      if (hash_join.kept_build_streaming()) { return is_build; }
+      return !is_build;
+    case duckdb::JoinType::RIGHT: return !is_build;
     case duckdb::JoinType::OUTER: return true;
     case duckdb::JoinType::INNER: return false;
     default:
@@ -1689,7 +1740,8 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
 //! chain (probe = children[0], build = children[1]) and bind the two inputs. The inner join of a
-//! RIGHT_DELIM_JOIN is sized from its build side even when it is right-family.
+//! RIGHT_DELIM_JOIN, and a kept-build RIGHT_SEMI/RIGHT_ANTI, are sized from their build side even
+//! though they are right-family.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
                const sirius::operator_params& op_params,
                duckdb::SiriusContext* compressed_materialization_observer)
@@ -1702,7 +1754,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
   bool probe_drives = false;
   if (join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
     auto const& hash_join = join_op.Cast<sirius::op::sirius_physical_hash_join>();
-    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner();
+    probe_drives          = hash_join.is_right_family() && !hash_join.is_delim_join_inner() &&
+                   !hash_join.kept_build_streaming();
   }
   bind_wrapped_join(join_op, probe_drives);
 }
@@ -1883,10 +1936,10 @@ void insert_gpu_pipeline_operators_recursive(
       auto const& window = slot->Cast<sirius::op::sirius_physical_window>();
       std::vector<duckdb::idx_t> keys(window.partition_columns().begin(),
                                       window.partition_columns().end());
-      slot->children[0] = build_whole_partition_window_exchange(std::move(slot->children[0]),
-                                                                keys,
-                                                                slot->estimated_cardinality,
-                                                                op_params.hash_partition_bytes);
+      slot->children[0] = build_window_exchange(std::move(slot->children[0]),
+                                                keys,
+                                                slot->estimated_cardinality,
+                                                op_params.hash_partition_bytes);
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
@@ -1904,6 +1957,48 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
+    case sirius::op::SiriusPhysicalOperatorType::STREAMING_LIMIT: {
+      // Children are fully expanded: global ORDER BY/TOP N now end in their merge operators.
+      // An unresolved INSERTION_ORDER leaf is not proof of unordered input.
+      auto const has_inline_replicate = [](sirius::op::sirius_physical_operator const& input) {
+        auto const* current = &input;
+        while (!current->is_source()) {
+          if (current->type == sirius::op::SiriusPhysicalOperatorType::REPLICATE) { return true; }
+          if (current->children.size() != 1) { break; }
+          current = current->children.front().get();
+        }
+        return false;
+      };
+      // REPLICATE can return several batches in one task, including through projection/filter.
+      // The barrier publishes them separately so LIMIT's one-batch claims remain valid.
+      if (slot->children.at(0)->output_order() == sirius::OrderPreservationType::NO_ORDER &&
+          !has_inline_replicate(*slot->children.at(0))) {
+        auto& limit      = slot->Cast<sirius::op::sirius_physical_streaming_limit>();
+        auto replacement = duckdb::make_uniq<sirius::op::sirius_physical_unordered_streaming_limit>(
+          limit.types,
+          std::move(limit.limit_val),
+          std::move(limit.offset_val),
+          limit.estimated_cardinality,
+          limit.parallel);
+        if (limit.has_physical_overrides()) {
+          replacement->set_physical_types(limit.get_physical_types());
+        }
+        replacement->children = std::move(limit.children);
+        slot                  = std::move(replacement);
+        break;
+      }
+      // Claims require complete, position-addressable input before any limit task executes.
+      wrap_child(*slot, 0, [](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child) {
+        auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+          child->types, child->estimated_cardinality, "default");
+        if (child->has_physical_overrides()) {
+          sink->set_physical_types(child->get_physical_types());
+        }
+        sink->children.push_back(std::move(child));
+        return sink;
+      });
+      break;
+    }
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
@@ -2278,59 +2373,32 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   prepare_scan_statement(*plan, op_params, context);
   insert_gpu_pipeline_operators_recursive(
     plan, op_params, context, sirius_ctx.get(), contract_provenance);
-}
-
-sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
-  sirius::op::sirius_physical_operator& op)
-{
-  if (op.is_source()) { return op.source_order(); }
-
-  std::size_t child_idx = 0;
-  for (auto& child : op.children) {
-    // Do not take the materialization phase of physical CTEs into account
-    if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {
-      child_idx++;
-      continue;
+  if (op_params.distributed()) {
+    // The scans above took this rank's share; without the exchanges each rank's answer is partial.
+    if (!sirius_ctx) {
+      throw sirius::internal_exception(
+        "distributed execution: sirius_exchange_peers set on a connection without Sirius state");
     }
-    auto child_preservation = order_preservation_recursive(*child);
-    if (child_preservation != sirius::OrderPreservationType::INSERTION_ORDER) {
-      return child_preservation;
-    }
-    child_idx++;
+    auto* gpu = sirius_ctx->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    sirius::planner::distribute_plan(plan,
+                                     sirius_ctx->get_exchange_service(op_params),
+                                     *gpu,
+                                     sirius_ctx->next_distributed_query(context),
+                                     sirius_ctx->get_query_lifecycle_registry());
   }
-  return sirius::OrderPreservationType::INSERTION_ORDER;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& plan)
-{
-  auto preservation_type = order_preservation_recursive(plan);
-  if (preservation_type == sirius::OrderPreservationType::FIXED_ORDER) {
-    // always need to maintain preservation order
-    return true;
-  }
-  if (preservation_type == sirius::OrderPreservationType::NO_ORDER) {
-    // never need to preserve order
-    return false;
-  }
-  // preserve insertion order - check flags
-  if (!duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context)) {
-    // preserving insertion order is disabled by config
-    return false;
-  }
-  return true;
-}
-
-bool sirius_physical_plan_generator::preserve_insertion_order(
-  sirius::op::sirius_physical_operator& plan)
-{
-  return preserve_insertion_order(context, plan);
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
+
+  // Before binding resolution (DuckDB's own conversion is off in delim CTE plans): a MARK join
+  // under FILTER(mark) becomes SEMI, which can publish dynamic filters; one under FILTER(NOT mark)
+  // becomes ANTI, which cannot publish but no longer builds a mark. Either one is then built on
+  // its outer side (RIGHT_SEMI, RIGHT_ANTI) when that side is the small, filtered one, so that its
+  // keys are published into the subquery.
+  sirius::planner::convert_mark_joins(context, op);
 
   {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
@@ -2356,8 +2424,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   };
   try {
     auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
-    validate_whole_partition_window_stages(*op);
-    plan = create_plan(*op);
+    plan       = create_plan(*op);
   } catch (duckdb::NotImplementedException const&) {
     // A pre-capture refusal used to throw before parent planning. Preserve
     // that first error if a later ordinary planner decline aborts tree build.
@@ -2368,6 +2435,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2408,6 +2478,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     throw;
   } catch (duckdb::Exception const&) {
     // Interrupt, source-policy and other classified engine errors keep priority.
+    throw;
+  } catch (sirius::not_implemented_exception const&) {
+    preserve_first_pre_decline();
     throw;
   } catch (std::runtime_error const& error) {
     // Existing nested-column planner declines and read-view capture failures use
@@ -2485,8 +2558,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalTopN>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE:
-      throw duckdb::NotImplementedException("Copy to file not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
+      plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
       plan = create_plan(op.Cast<duckdb::LogicalDummyScan>());
@@ -2640,10 +2712,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   if (!plan) { throw duckdb::InternalException("Physical plan generator - no plan generated"); }
 
   plan->estimated_cardinality = op.estimated_cardinality;
-#ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
-  auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
-  plan        = std::move(verify);
-#endif
 
   return plan;
 }

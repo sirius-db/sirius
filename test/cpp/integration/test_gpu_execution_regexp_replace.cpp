@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>

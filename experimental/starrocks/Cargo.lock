@@ -1869,6 +1869,7 @@ dependencies = [
  "arrow-schema",
  "cxx",
  "cxx-build",
+ "sirius-sys",
 ]
 
 [[package]]
@@ -1904,6 +1905,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "sirius-sys"
+version = "0.1.0"
 
 [[package]]
 name = "slab"

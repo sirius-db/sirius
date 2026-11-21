@@ -6,24 +6,21 @@
  */
 
 #include "catch.hpp"
-#include "io/io_errors.hpp"
-#include "io/kvikio/kvikio_context.hpp"
-#include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/scan/parquet_delete_reader.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "utils/local_ioctx.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
-#include <arpa/inet.h>
-#include <duckdb.hpp>
+#include <arpa/inet.h>  // IWYU pragma: keep
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
 #include <duckdb/common/virtual_file_system.hpp>
-#include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/external_file_cache/caching_file_system.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -303,7 +300,7 @@ class sirius_httpfs_fixture {
     load_sirius_extension(db);
     auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(context);
-    sirius::io::object_store_config object_store;
+    cucascade::io::object_store_config object_store;
     object_store.endpoint   = env.endpoint;
     object_store.region     = env.region;
     object_store.access_key = env.access_key;
@@ -337,8 +334,8 @@ void set_gpu_execution(duckdb::Connection& con, bool enabled)
   REQUIRE_FALSE(result->HasError());
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
-  sirius_httpfs_fixture& fixture, std::string const& uri)
+std::shared_ptr<cucascade::io::datasource> require_rest_datasource(sirius_httpfs_fixture& fixture,
+                                                                   std::string const& uri)
 {
   auto sirius_ctx =
     fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -653,10 +650,10 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
 
   sirius::op::scan::iceberg_delete_discovery discovery;
   discovery.positional_delete_files.push_back(uri);
-  sirius::io::kvikio_context unused_equality_io;
-  auto read = [&] {
+  auto unused_equality_io = sirius::test::make_test_local_ioctx();
+  auto read               = [&] {
     return sirius::op::scan::load_delete_payload(
-      *fixture.con.context, "s3-table", &unused_equality_io, {}, discovery);
+      *fixture.con.context, "s3-table", unused_equality_io, discovery);
   };
   fixture.con.BeginTransaction();
   auto result           = read();
@@ -725,7 +722,7 @@ TEST_CASE("Sirius S3 Parquet position delete reader preserves results and admiss
   fixture.con.BeginTransaction();
   std::vector<int64_t> published;
   if (replace_during_batches) {
-    REQUIRE_THROWS_AS(published = read_complete(), sirius::io::object_changed_error);
+    REQUIRE_THROWS_AS(published = read_complete(), cucascade::io::object_changed_error);
     REQUIRE(consumed > 0);
   } else {
     REQUIRE_THROWS_WITH(published = read_complete(),

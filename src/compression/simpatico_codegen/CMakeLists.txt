@@ -99,7 +99,6 @@ add_library(
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
-  src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
@@ -128,6 +127,11 @@ set_target_properties(
              CUDA_STANDARD_REQUIRED ON)
 if(VCPKG_BUILD)
   set_target_properties(simpatico PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  target_compile_options(
+    simpatico
+    PRIVATE
+      "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+  )
 endif()
 target_compile_options(
   simpatico
@@ -155,7 +159,7 @@ target_include_directories(
                     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
-# Standalone / pixi builds use the toolkit's shared NVRTC target.
+# Other builds use the toolkit's shared NVRTC target.
 if(VCPKG_BUILD AND NOT TARGET nvrtc::nvrtc_static)
   # A standalone vcpkg configure has no parent to discover this target.
   find_package(nvrtc REQUIRED CONFIG)

@@ -20,7 +20,6 @@
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
-#include <duckdb/common/types/decimal.hpp>
 
 namespace sirius {
 

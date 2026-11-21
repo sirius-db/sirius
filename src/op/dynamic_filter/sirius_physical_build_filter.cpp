@@ -117,7 +117,8 @@ std::unique_ptr<operator_data> sirius_physical_build_filter::execute(
 {
   nvtx_scoped_range range{"sirius_physical_build_filter::execute"};
   auto const& input = dynamic_cast<pipelineable_operator_data const&>(input_data);
-  auto output       = std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  auto output =
+    std::make_unique<pipelineable_operator_data>(input.get_data_batches(), input.get_position());
   if (!_accumulating.load(std::memory_order_acquire)) { return output; }
 
   auto const ids = input.original_batch_ids();

@@ -15,13 +15,12 @@
  */
 
 // sirius
-#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/substring_slice.hpp>
-#include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
+#include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/cudf_regex_pattern.hpp>
@@ -71,7 +70,6 @@
 #include <regex>
 #include <string>
 #include <tuple>
-#include <variant>
 #include <vector>
 
 namespace sirius {
@@ -86,7 +84,8 @@ namespace {
  * signed-minimum/-1 pair throws not_implemented_exception before cuDF arithmetic,
  * requesting runtime CPU replay when enabled or safe query failure otherwise.
  * This guard neither mutates operands nor produces an arithmetic result. Replay
- * supplies DuckDB's errors/settings and guarded CASE semantics; the guard does not.
+ * supplies DuckDB's errors and settings. Inside CASE or COALESCE, the exception first
+ * makes the evaluator retry the division on only the rows its branch selects.
  */
 void require_safe_division(evaluate_result const& left_result,
                            evaluate_result const& right_result,
@@ -671,6 +670,12 @@ evaluate_result expression_evaluator::evaluate_function_kernel(
         freq_str);
     }
     auto input = evaluate_as_column(*args[1]);
+    // DATE has no sub-day component; return DuckDB's declared TIMESTAMP type so parent
+    // expressions can combine it with timestamp branches.
+    if (input.get_column_view().type().id() == cudf::type_id::TIMESTAMP_DAYS) {
+      return evaluate_result(cast_date_to_timestamp(
+        input.get_column_view(), output_type, /*try_cast=*/false, _stream, _mr));
+    }
 
     auto frequency = [](date_trunc_unit unit) -> cudf::datetime::rounding_frequency {
       switch (unit) {

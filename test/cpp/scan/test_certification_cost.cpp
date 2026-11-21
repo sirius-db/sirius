@@ -15,7 +15,7 @@
  */
 
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "transparent/read_view_registry.hpp"
+#include "transparent/read_view_registry.hpp"  // IWYU pragma: keep
 #include "util/env_guard.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 

@@ -15,15 +15,10 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <limits>
-#include <sstream>
 #include <string>
 
 namespace {

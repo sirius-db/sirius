@@ -2,6 +2,10 @@
 //!
 //! This API remains supported while the public C API gains execution support.
 //! It requires a C++20 compiler and a matching Sirius C++ toolchain.
+//! Use `sirius` for the public C ABI configuration API.
+
+// Retain this dependency so its native library link directives reach consumers.
+use sirius_sys as _;
 
 /// Low-level C++ bridge, including object-store configuration.
 pub mod bridge;

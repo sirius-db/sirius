@@ -23,14 +23,22 @@ The script runs three steps:
 |---|---|
 | `shards` | Two Catch2 shards per visible GPU in parallel. Each shard sees one GPU, sets `SIRIUS_TEST_SINGLE_GPU=1` and uses `cpp/integration/integration-shard.yaml`. `[multi_gpu]` and hidden tests are excluded. |
 | `multi_gpu` | The `[multi_gpu]` tests with all GPUs visible. Skipped with fewer than two GPUs. |
-| `late_mat` | The `[late_mat]`, `[deferred_query]` and `[native_filter]` tests with `SIRIUS_EXP_LATE_MAT=1`. |
+| `late_mat` | The `[late_mat]`, `[deferred_query]` and `[native_filter]` tests; late materialization is enabled by default. |
 
 It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each process writes `unittest.log` and `sirius.log` to its own subdirectory of `build/release/test/cpp/log/`, for example `shard-0/` or `late_mat/`.
 
+Multi-GPU tests of direct peer copies skip when a GPU's memory pool does not grant the other GPUs access, as on some PCIe topologies. On a machine whose GPUs must support those copies, set `SIRIUS_TEST_REQUIRE_POOL_PEER_ACCESS=1` so these tests fail instead of skipping.
+
+Iceberg tests load the installed `iceberg` extension. Set `SIRIUS_TEST_ICEBERG_EXTENSION` to the path of another build to load that one instead. With it set, `iceberg table replacement at the same location` fails unless that build's `iceberg_metadata()` accepts `expected_table_uuid` ([duckdb/duckdb-iceberg#1729](https://github.com/duckdb/duckdb-iceberg/pull/1729)), so the run covers the verified delete lookup and not the known limitation:
+```bash
+SIRIUS_TEST_ICEBERG_EXTENSION=/path/to/iceberg.duckdb_extension \
+  pixi run build/release/test/cpp/sirius_unittest "[iceberg_table_replacement]"
+```
+
 To run specific tests, call the test binary directly with a Catch2 tag or test name:
 ```bash
-pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
+pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```
 
 ## TPC-Havoc queries

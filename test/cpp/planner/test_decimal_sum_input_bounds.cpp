@@ -22,7 +22,7 @@
 #include "utils/pipeline_conversion_test_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 
 #include <cstdint>

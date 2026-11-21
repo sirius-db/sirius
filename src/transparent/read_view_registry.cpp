@@ -20,8 +20,8 @@
 #include "op/scan/table_scan/split_validation.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
-#include "transparent/replay_admission.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 
 #include <algorithm>
@@ -129,8 +129,16 @@ bool compare_multiset(std::span<op::scan::read_view_fingerprint const* const> or
     count_fingerprint(counts, buckets, binding.view->identity->fingerprint, false);
   }
 
+  // The candidate may read an identical view fewer times than the original plan did, when a
+  // planner pass merged scans of one view into a single scan. It may not read a view more often,
+  // and a view the original read must still be read at least once.
+  bool merged_identical_scans = false;
   for (auto const& count : counts) {
     if (count.original > count.candidate) {
+      if (count.candidate > 0) {
+        merged_identical_scans = true;
+        continue;
+      }
       auto const difference = count.original - count.candidate;
       result.different_original_count += difference;
       append_difference(result.only_original, *count.value, difference);
@@ -144,7 +152,7 @@ bool compare_multiset(std::span<op::scan::read_view_fingerprint const* const> or
     }
   }
   if (!result.only_original.empty() || !result.only_candidate.empty() ||
-      original.size() != candidate.size()) {
+      (original.size() != candidate.size() && !merged_identical_scans)) {
     result.reason = "fingerprint_mismatch";
     return false;
   }
@@ -176,8 +184,20 @@ read_view_comparison compare_read_views_impl(
   candidate_origin origin,
   std::span<original_binding_ref const> logical_original,
   std::span<op::scan::read_view_fingerprint const* const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> planned,
+  std::span<candidate_binding const> skipped)
 {
+  // Skipped definitions get the same identity checks; only replan's single correspondence,
+  // which names the scan the GPU reads, considers planned scans alone.
+  std::vector<candidate_binding> all;
+  auto candidate = planned;
+  if (!skipped.empty()) {
+    all.reserve(planned.size() + skipped.size());
+    all.assign(planned.begin(), planned.end());
+    all.insert(all.end(), skipped.begin(), skipped.end());
+    candidate = all;
+  }
+
   read_view_comparison result;
   result.original_count  = physical_original.size();
   result.candidate_count = candidate.size();
@@ -187,29 +207,29 @@ read_view_comparison compare_read_views_impl(
   if (!candidate.empty() && candidate.front().view && candidate.front().view->identity) {
     result.candidate_hash = candidate.front().view->identity->fingerprint.hash;
   }
+  bool const multi_replan = origin == candidate_origin::replan && planned.size() > 1;
   if (origin == candidate_origin::replan) {
-    result.correspondence = candidate.empty() ? "none" : "single";
-    if (candidate.size() > 1) {
-      result.correspondence = "none";
-      result.reason         = "no_correspondence";
-      return result;
-    }
+    // For multi-scan replans, table indexes propose pairs; the checks below
+    // must still prove identity and required selector equality.
+    result.correspondence = planned.empty() ? "none"
+                            : multi_replan  ? "table_index_replan"
+                                            : "single";
   } else {
     result.correspondence = "table_index";
   }
   if (!compare_multiset(physical_original, candidate, result)) return result;
 
-  if (origin == candidate_origin::replan) {
-    if (candidate.empty()) {
+  if (origin == candidate_origin::replan && !multi_replan) {
+    if (planned.empty()) {
       result.equal = true;
       return result;
     }
     op::scan::bound_read_view const* selector_original = nullptr;
     if (logical_original.size() == 1 &&
-        same_identity(logical_original.front().view, candidate.front().view)) {
+        same_identity(logical_original.front().view, planned.front().view)) {
       selector_original = logical_original.front().view;
     }
-    if (!selector_proven(*candidate.front().view, selector_original)) {
+    if (!selector_proven(*planned.front().view, selector_original)) {
       result.reason = "selector_unproven";
       return result;
     }
@@ -217,29 +237,46 @@ read_view_comparison compare_read_views_impl(
     return result;
   }
 
-  if (logical_original.size() != candidate.size()) {
-    result.reason = "binding_mismatch";
+  auto pairing_failed = [&] {
+    if (multi_replan) result.correspondence = "none";
+    result.reason = multi_replan ? "no_correspondence" : "binding_mismatch";
     return result;
+  };
+  // A candidate never reads more scans than the logical plan had. It may read fewer when a planner
+  // pass merged scans of one identical view into a single scan, which is checked below, but only
+  // when the original physical plan read every logical scan.
+  if (candidate.size() > logical_original.size() ||
+      (candidate.size() < logical_original.size() &&
+       physical_original.size() != logical_original.size())) {
+    return pairing_failed();
   }
   std::unordered_set<duckdb::idx_t> matched_table_indexes;
   matched_table_indexes.reserve(candidate.size());
   for (auto const& candidate_binding : candidate) {
-    if (!matched_table_indexes.insert(candidate_binding.table_index).second) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (!matched_table_indexes.insert(candidate_binding.table_index).second)
+      return pairing_failed();
     auto const found =
       std::find_if(logical_original.begin(), logical_original.end(), [&](auto const& original) {
         return original.table_index == candidate_binding.table_index;
       });
-    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view)) {
-      result.reason = "binding_mismatch";
-      return result;
-    }
+    if (found == logical_original.end() || !same_identity(found->view, candidate_binding.view))
+      return pairing_failed();
     if (!selector_proven(*candidate_binding.view, found->view)) {
       result.reason = "selector_unproven";
       return result;
     }
+  }
+  // Every logical scan the candidate does not read must be a duplicate of one it does: the same
+  // view, selecting the same rows, read once instead of twice. A scan of any other view going
+  // missing is a mismatch.
+  for (auto const& original : logical_original) {
+    if (matched_table_indexes.contains(original.table_index)) { continue; }
+    bool const duplicates_a_read_view =
+      std::any_of(candidate.begin(), candidate.end(), [&](auto const& candidate_binding) {
+        return same_identity(original.view, candidate_binding.view) &&
+               op::scan::same_selector(*original.view, *candidate_binding.view);
+      });
+    if (!duplicates_a_read_view) return pairing_failed();
   }
   result.equal = true;
   return result;
@@ -250,7 +287,8 @@ read_view_comparison compare_read_views(
   candidate_origin origin,
   std::span<original_binding const> logical_original,
   std::span<op::scan::read_view_fingerprint const> physical_original,
-  std::span<candidate_binding const> candidate)
+  std::span<candidate_binding const> candidate,
+  std::span<candidate_binding const> skipped)
 {
   std::vector<original_binding_ref> logical;
   logical.reserve(logical_original.size());
@@ -260,7 +298,7 @@ read_view_comparison compare_read_views(
   physical.reserve(physical_original.size());
   for (auto const& fingerprint : physical_original)
     physical.push_back(&fingerprint);
-  return compare_read_views_impl(origin, logical, physical, candidate);
+  return compare_read_views_impl(origin, logical, physical, candidate, skipped);
 }
 
 read_view_comparison compare_read_views(
@@ -287,7 +325,8 @@ read_view_comparison compare_read_views(
     physical.push_back(&view.identity->fingerprint);
   }
   auto bindings = candidate.candidate_bindings();
-  auto result   = compare_read_views_impl(origin, logical, physical, bindings);
+  auto result =
+    compare_read_views_impl(origin, logical, physical, bindings, candidate.skipped_bindings());
   if (!physical_original.empty()) result.original_depth = physical_original.front().depth;
   if (!bindings.empty() && bindings.front().view) {
     result.candidate_depth = bindings.front().view->depth;
@@ -299,8 +338,10 @@ void share_equal_read_view_identities(op::scan::logical_bound_read_view_capture*
                                       std::span<op::scan::bound_read_view> physical_original,
                                       read_view_registry const& candidate)
 {
-  auto const bindings = candidate.candidate_bindings();
-  auto share          = [&](op::scan::bound_read_view& original, bool required) {
+  auto bindings       = candidate.candidate_bindings();
+  auto const& skipped = candidate.skipped_bindings();
+  bindings.insert(bindings.end(), skipped.begin(), skipped.end());
+  auto share = [&](op::scan::bound_read_view& original, bool required) {
     if (!original.identity) {
       throw std::logic_error("cannot share a missing original read-view identity");
     }
@@ -408,6 +449,15 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
     result.push_back({entry.contract.table_index, entry.contract.view});
   }
   return result;
+}
+
+void read_view_registry::record_skipped_scans(std::vector<op::scan::logical_bound_read_view> views)
+{
+  skipped_.reserve(skipped_.size() + views.size());
+  for (auto& view : views) {
+    skipped_.push_back(
+      {view.table_index, std::make_shared<op::scan::bound_read_view const>(std::move(view.view))});
+  }
 }
 
 void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,

@@ -21,11 +21,12 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, spill borrows and retirement barriers |
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
+| [Parquet Output](parquet-output.md) | COPY directory export, parallel writing, ordering, and failure cleanup |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
-| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
+| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, and how Sirius uses cuCascade's IO layer (local io_uring, native HTTP/1.1 REST reactors with kTLS or user-space TLS, `fs_cache`) |
 | [Scan Contracts](scan-contracts-design.md) | How scans verify their inputs, protect native reads during checkpoints, and decide whether CPU fallback is allowed |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
@@ -36,8 +37,9 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
+| [Distributed Execution](distributed-sirius.md) | One query across processes and GPUs: `EXCHANGE_SINK`/`EXCHANGE_SOURCE`, the NIXL transport with per-peer credits, the plan rewrite, Bloom filters merged across ranks, and running TPC-H Q12 on 4 GPUs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
-| [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
+| [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, the `enable_late_materialization` setting, and deferral thresholds |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 

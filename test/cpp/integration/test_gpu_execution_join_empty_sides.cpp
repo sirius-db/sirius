@@ -19,7 +19,6 @@
 // zero-row-group Parquet currently fails upstream column discovery before reaching the join.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>

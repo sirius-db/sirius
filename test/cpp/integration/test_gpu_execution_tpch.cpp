@@ -14,15 +14,11 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_partition.hpp"
 #include "util/env_guard.hpp"
-
-#include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>

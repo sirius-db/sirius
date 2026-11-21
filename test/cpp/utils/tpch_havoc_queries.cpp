@@ -6,7 +6,7 @@
  */
 
 #include <utils/tpch_havoc_queries.hpp>
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
 #include <cstdio>
 #include <cstdlib>

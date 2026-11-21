@@ -14,7 +14,6 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
@@ -105,7 +104,8 @@ std::string codegen_kind_for_compressor(std::string const& c)
 // list → unknown kind.
 std::vector<std::string> consumed_slots(std::string const& kind)
 {
-  if (kind == "bitpack") return {"chunk_min", "chunk_count", "chunk_bits", "packed"};
+  if (kind == "bitpack")
+    return {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"};
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};
@@ -381,6 +381,15 @@ void bind_real_node_buffers(std::int32_t node_id,
     labeled[codegen::jit::buffer_key(node_id, slot)] = {
       ptr, len, elem_size_for_slot(slot, element_size)};
   }
+
+  auto const* fused = dynamic_cast<codegen_fused_representation const*>(repr);
+  if (fused != nullptr && kind == "bitpack") {
+    auto const entries = labeled.at(codegen::jit::buffer_key(node_id, "chunk_count")).length + 1;
+    if (fused->word_offsets.size() == entries * sizeof(std::int32_t)) {
+      labeled[codegen::jit::buffer_key(node_id, "kept_bp_offsets")] = {
+        fused->word_offsets.data(), entries, sizeof(std::int32_t)};
+    }
+  }
 }
 
 // Each fused node's lane width, as both renderers type it: Rle's `runs` are int32 run
@@ -587,7 +596,7 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                        dtype,
                                        num_rows,
                                        hollow,
-                                       row_enumeration{nullptr, sel->rows},
+                                       row_enumeration{nullptr, sel->rows, sel->diagnostics},
                                        out,
                                        frame,
                                        out_dtype);
@@ -600,7 +609,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     dtype,
     num_rows,
     *sel->mask,
-    row_enumeration{by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr},
+    row_enumeration{
+      by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr, sel->diagnostics},
     out,
     frame,
     out_dtype);
@@ -972,10 +982,11 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree);
 // width implies. An unknown or variable width, compressed key channels, and a width that
 // contradicts the extent take the general route, which measures or rejects. The caller owns the
 // analytic offsets (j * width) and the strings assembly; the kernel itself emits only the compacted
-// chars. Returns nullptr only when this shape is unsupported. Execution failures throw; nothing
-// shared is mutated before a semantic decline.
+// chars. Without a selection every row is gathered, which needs a bare bitpack code leaf. Returns
+// nullptr only when this shape is unsupported. Execution failures throw; nothing shared is mutated
+// before a semantic decline.
 std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
-                                                        decode_selection const& sel,
+                                                        decode_selection const* sel,
                                                         DecodeWalk& walk,
                                                         decode_frame& frame)
 {
@@ -993,14 +1004,23 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   // metadata first, the property reconstruct_decode_representation enforces on the general route.
   auto const keys = static_cast<std::int64_t>(offsets_column->size()) - 1;
   if (keys < 0 || static_cast<std::int64_t>(chars.size()) != keys * width) return nullptr;
-  // The analytic offsets are INT32; a larger output takes the general route.
-  if (sel.survivor_count * width > std::numeric_limits<cudf::size_type>::max()) return nullptr;
   auto codes_nid = static_cast<NodeId>(tree.nodes.size());
   for (auto const& edge : node.children)
     if (edge.channel == "indices") codes_nid = edge.child;
   if (codes_nid >= tree.nodes.size()) return nullptr;
+  std::int64_t rows = 0;
+  if (sel) {
+    rows = sel->survivor_count;
+  } else {
+    auto const* const codes = node_rep(codes_nid, tree);
+    if (!codes || tree.nodes[codes_nid].op != "bitpack" || !tree.nodes[codes_nid].children.empty())
+      return nullptr;
+    rows = codes->num_rows;
+  }
+  // The analytic offsets are INT32; a larger output takes the general route.
+  if (rows * width > std::numeric_limits<cudf::size_type>::max()) return nullptr;
   auto const region    = bind_fused_region(tree, codes_nid, walk, frame.stream());
-  auto const survivors = static_cast<cudf::size_type>(sel.survivor_count);
+  auto const survivors = static_cast<cudf::size_type>(rows);
   std::vector<std::unique_ptr<cudf::column>> children;
   auto const key_width = static_cast<std::int32_t>(width);
   // Built on the device: each cuDF scalar would wait for the stream and upload from the host.
@@ -1017,13 +1037,22 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()),
     0,
     std::move(children));
-  if (survivors != 0) {
+  if (survivors != 0 && !sel) {
+    launch_decode_fused_tree_dict_gather_all(*region.built.tree,
+                                             region.labeled,
+                                             region.dtype,
+                                             region.num_rows,
+                                             chars.data<std::uint8_t>(),
+                                             key_width,
+                                             char_data,
+                                             frame);
+  } else if (survivors != 0) {
     launch_decode_fused_tree_dict_gather(*region.built.tree,
                                          region.labeled,
                                          region.dtype,
                                          region.num_rows,
-                                         *sel.mask,
-                                         row_enumeration{},
+                                         *sel->mask,
+                                         row_enumeration{nullptr, nullptr, sel->diagnostics},
                                          chars.data<std::uint8_t>(),
                                          key_width,
                                          char_data,
@@ -1081,7 +1110,7 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
                                             region.dtype,
                                             sel.mask->num_rows,
                                             *sel.mask,
-                                            row_enumeration{},
+                                            row_enumeration{nullptr, nullptr, sel.diagnostics},
                                             static_cast<std::int64_t*>(source_offsets.data()),
                                             lengths->mutable_view().data<std::int32_t>(),
                                             frame);
@@ -1170,8 +1199,10 @@ void validate_request(column_decode_request const& request)
   }
   validate_plan(tree->get());
   // A selection compacts the value rows, while the stored bitmask describes every row of the
-  // chunk, so the decode cannot reattach it; a caller that wants both declines the selection.
-  if (request.selection && !tree->get().validity.empty())
+  // chunk, so the decode cannot reattach it; a caller that wants both either declines the
+  // selection or opts in to compacting the stripped sidecar itself.
+  if (request.selection && !tree->get().validity.empty() &&
+      !request.selection->get().caller_reattaches_validity)
     throw unsupported_nullable_selection("decode: selection on a null-masked column unsupported");
   if (predicate && !predicate->predicate.active())
     throw std::invalid_argument("decode: empty predicate request");
@@ -1221,7 +1252,9 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
     output = decode_str_split_selected(tree, *selection, walk, frame);
   } else {
     if (selection && selection->route == sc::decode_route::dict_codes && !predicate) {
-      output = try_dict_gather_fast_path(tree, *selection, walk, frame);
+      output = try_dict_gather_fast_path(tree, selection, walk, frame);
+    } else if (!selection && !predicate) {
+      output = try_dict_gather_fast_path(tree, nullptr, walk, frame);
     }
     if (!output && selection && !selection->compacted()) {
       auto const full = walk.run();
@@ -1238,8 +1271,10 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
     }
   }
   // Reattach the validity the compress side detached. The walk decodes a null-free column, so this
-  // is the only place the mask re-enters; a selecting request was refused above unless all-valid.
-  attach_validity(*output, tree.validity, frame.stream(), frame.mr());
+  // is the only place the mask re-enters; a selecting request was refused above unless all-valid
+  // or the caller compacts the sidecar itself against the selection it supplied.
+  if (!selection || !selection->caller_reattaches_validity)
+    attach_validity(*output, tree.validity, frame.stream(), frame.mr());
   if (selection && (output->size() != selection->survivor_count || output->null_count() != 0)) {
     throw std::runtime_error("decode: selected output has wrong size or unsupported nulls");
   }

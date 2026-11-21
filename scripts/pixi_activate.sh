@@ -12,8 +12,10 @@ fi
 clang_cpp="$CONDA_PREFIX/bin/clang-cpp"
 clang_pp="$CONDA_PREFIX/bin/clang++"
 
-if [[ -x "$clang_cpp" ]]; then
+if [[ -x "$clang_cpp" && ( ! -L "$clang_pp" || ! "$clang_pp" -ef "$clang_cpp" ) ]]; then
   ln -sf "$clang_cpp" "$clang_pp"
 fi
 
-mkdir -p build
+if [[ ! -d build ]]; then
+  mkdir -p build
+fi

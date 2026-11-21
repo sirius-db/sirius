@@ -24,36 +24,25 @@
  * decision.
  */
 
-#include "expression/join_condition.hpp"
-#include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "operator_test_utils.hpp"
 #include "utils/dynamic_filter_publication_fixture.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
-#include <cudf/utilities/error.hpp>
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <data/sirius_converter_registry.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/operator/logical_comparison_join.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>
@@ -421,16 +410,16 @@ TEST_CASE("deposit observes a pinned unpublished owner that survives synthetic f
     {
     }
 
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
+    void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
+                                 std::size_t partition = 0) override
     {
       ++deposits;
       auto const snapshot = channel.snapshot();
       observed_pending_owner =
         stats.publication_attempts.load() == 1 && !snapshot.terminal() && snapshot.empty();
       observed_source_pin = batch->get_read_only_count() != 0;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
-      stored_before_finalization = size(partition) == 1;
+      cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
+      stored_before_finalization = partition_size_unlocked(partition) == 1;
       // Only this test repository finalizes on deposit; production repositories just store.
       join.finalize_operator();
     }
@@ -490,11 +479,11 @@ TEST_CASE("deposit exceptions resolve the claim and propagate without retry",
     bool throw_oom       = false;
     std::size_t deposits = 0;
 
-    void add_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                        std::size_t partition = 0) override
+    void add_data_batch_unlocked(const std::shared_ptr<cucascade::data_batch>& batch,
+                                 std::size_t partition = 0) override
     {
       ++deposits;
-      cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
+      cucascade::shared_data_repository::add_data_batch_unlocked(batch, partition);
       if (throw_oom) { throw rmm::out_of_memory{"synthetic repository allocation failure"}; }
       throw std::runtime_error{"synthetic repository delivery failure"};
     }

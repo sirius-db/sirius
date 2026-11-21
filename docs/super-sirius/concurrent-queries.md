@@ -18,9 +18,8 @@ The default is **1**. A permit covers query initialization, execution and resour
 Additional queries wait in a cancellable FIFO queue. A materialized result owns its returned
 buffers and does not keep the permit after execution finishes.
 
-The old `sirius.executor.scan_manager.max_concurrent_queries` key remains a deprecated alias.
-Conflicting values are rejected. This is a per-runtime limit, not a process-wide limit shared
-between independent DatabaseInstances.
+This is a per-runtime limit, not a process-wide limit shared between independent
+DatabaseInstances.
 
 Keep the default per-thread reservation tracking mode. `per_stream_reservation: true` is rejected
 when the limit exceeds one: conversions may change streams, and the underlying per-stream tracker
@@ -41,9 +40,12 @@ waits retain reserved worker capacity in this baseline. The later memory-progres
 introduces worker release during reservation retries. Equal GPU shares are not promised.
 IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 
-The shared scan metadata pool also uses strict query-age priority: older queries' queued tasks
-run before newer queries' tasks, with FIFO ordering within a query. Workers return to the shared
-queue after each task; running tasks are not preempted. Consequently, a newly admitted query's
+The shared scan metadata/coalescing pool uses strict query-age priority among queued tasks
+eligible for a worker's domain: older queries' tasks run before newer queries' tasks. Within
+each query, the dispatcher preserves FIFO order within each pending work class (metadata or
+coalescing) and alternates classes when both have work. Overall enqueue order across classes
+is not preserved. Workers return to the shared queue after each task; running tasks are not
+preempted. Consequently, a newly admitted query's
 metadata work can wait while older queries continue supplying work to that pool. Admission permits
 concurrent execution but does not guarantee an equal share of metadata workers or bounded metadata
 startup latency for each query.
@@ -102,13 +104,13 @@ facts, uniqueness proofs and late-materialization handle. Re-pin builds privatel
 the previous entry usable. Readers hold entry snapshots and query-local visibility masks. SQL pin
 replacement and cache reset remain exclusive maintenance operations.
 
-Metadata producers use the shared metadata worker pool. Coordination and preparation retirement depend on the attempt's sources and [preparation configuration](configuration.md#siriusexecutorscan_managerpreparation):
+Metadata production and asynchronous Parquet/Iceberg coalescing share the metadata worker pool. Coordination and preparation retirement depend on the attempt's sources and [preparation configuration](configuration.md#siriusexecutorscan_managerpreparation):
 
 | Attempt | Coordination | Preparation retirement |
 |---|---|---|
-| Metadata-only | Query owner; no additional coordinator thread. | The owner drains preparation. |
-| Provider or native-reader sources, `coordinator_workers > 0` (default `1`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
-| Provider or native-reader sources, `coordinator_workers: 0` | One dedicated coordinator thread per attempt. | Join that attempt's coordinator thread. |
+| Synchronous-only metadata sources | Query owner; no additional coordinator thread. | The owner drains preparation. |
+| Asynchronous Parquet/Iceberg, provider or native-reader sources, `coordinator_workers > 0` (default `1`) | Workers shared by the scan manager, started lazily. | Wait for the registration's final step and any in-flight stop notification to return. |
+| Asynchronous Parquet/Iceberg, provider or native-reader sources, `coordinator_workers: 0` | One dedicated coordinator thread per attempt. | Join that attempt's coordinator thread. |
 
 The default of one coordinator worker limits thread overhead and matches the default admission limit of one concurrent query. It is a starting configuration, not a measured throughput optimum; more workers can be configured, and dedicated mode remains available for comparison.
 
@@ -119,9 +121,9 @@ The additional preparation-thread budget per scan manager accounts for lazy star
 | Shared coordinator pool | `W_started + N_started` |
 | Dedicated coordinators | `R + N_started` |
 
-`W_started` is zero before the coordinator pool starts, then `coordinator_workers` (default 1). `N_started` is zero before the first native reservation starts its pool, then `native_reader_workers` (default 2). Both pools retain their workers until manager shutdown. `R` counts reader attempts whose dedicated coordinator threads have started but not exited. Metadata-only attempts add no coordinator threads. There are no separate timer or retirement threads; query-owner, metadata and I/O threads are outside this additional budget. `max_native_readers` limits reader slots, not threads.
+`W_started` is zero before the coordinator pool starts, then `coordinator_workers` (default 1). `N_started` is zero before the first native reservation starts its pool, then `native_reader_workers` (default 2). Both pools retain their workers until manager shutdown. `R` counts attempts with asynchronous coalescing or reader sources whose dedicated coordinator threads have started but not exited. Only synchronous-only metadata attempts add no coordinator threads. There are no separate timer or retirement threads; query-owner, metadata and I/O threads are outside this additional budget. `max_native_readers` limits reader slots, not threads.
 
-Preparation retirement completes before the query slot is released. Shared coordinator workers are joined when the scan manager stops. The query owner remains available for statement-bound provider work through drain; native readers use a separate shared executor. Coalescing does not occupy metadata workers or wait for a blocked provider call.
+Preparation retirement completes before the query slot is released. Shared coordinator workers are joined when the scan manager stops. The query owner remains available for statement-bound provider work through drain; native readers use a separate shared executor. Asynchronous coalescing occupies metadata workers and shares admission with metadata reads; blocked reads can delay coalescing. Provider calls run in their declared reader domain. See the [thread budgets and scheduling limits](configuration.md#metadata-worker-numa-placement-and-asynchronous-parquet-preparation).
 
 I/O readahead shares runtime backend budgets across queries. Demand reads borrow immediately and block further speculation until their debt is repaid. Canceling one subscriber releases its interest without invalidating another subscriber's bytes. Cache pressure permits a bounded eviction attempt before abandoning speculative work.
 

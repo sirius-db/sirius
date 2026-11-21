@@ -16,6 +16,7 @@
 // share the bitjoin/column-copy helpers and reconstruct_representation.
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
+#include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
@@ -23,8 +24,6 @@
 #include "codegen/util/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
-
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
@@ -767,10 +766,11 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
   if (!plan_tree) return nullptr;
 
   // Locate the op node (index 1 for a single-step plan).
-  PlanNode* op_node  = nullptr;
-  NodeId op_node_idx = 0;
+  PlanNode* op_node         = nullptr;
+  NodeId op_node_idx        = 0;
+  std::string const node_op = op_name == kBitpackGcdName ? std::string("bitpack") : op_name;
   for (std::size_t i = 1; i < plan_tree->nodes.size(); ++i) {
-    if (plan_tree->nodes[i].op == op_name) {
+    if (plan_tree->nodes[i].op == node_op) {
       op_node     = &plan_tree->nodes[i];
       op_node_idx = static_cast<NodeId>(i);
       break;

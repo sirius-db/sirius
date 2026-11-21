@@ -143,6 +143,7 @@ for variant, names in (
     ("dv_corrupt_crc", ("a",)),
     ("dv_missing_payload", ("a",)),
     ("dv_unsupported_uri", ("a",)),
+    ("dv_supported_s3_uri", ("a",)),
     ("dv_unused_unsupported_uri", ("a",)),
 ):
     dest = out / variant
@@ -219,6 +220,10 @@ for variant, names in (
                             # The planner must refuse before opening this object.
                             df["file_path"] = (
                                 "http://unsupported-puffin.invalid/sidecar.puffin"
+                            )
+                        elif variant == "dv_supported_s3_uri":
+                            df["file_path"] = (
+                                "s3://connector-admission.invalid/sidecar.puffin"
                             )
                     expanded.append(row)
             rows = expanded

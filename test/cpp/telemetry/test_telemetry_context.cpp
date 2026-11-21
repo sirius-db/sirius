@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "duckdb.hpp"
 #include "scan/test_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_extension.hpp"
@@ -30,12 +29,10 @@
 
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -137,9 +134,7 @@ TEST_CASE("fresh runtime startup captures the libcucascade domain only when opte
               "    enable_quent: "
            << (enable_quent ? "true" : "false") << '\n';
     if (nvtx_setting != "default") { config << "    enable_nvtx: " << nvtx_setting << '\n'; }
-    config << "    exporter: ndjson\n"
-              "    output_directory: "
-           << output.string() << '\n';
+    config << "    output_directory: " << output.string() << '\n';
     REQUIRE(config.good());
   }
 

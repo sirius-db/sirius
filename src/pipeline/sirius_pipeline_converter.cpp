@@ -19,18 +19,15 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
-#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"  // IWYU pragma: keep
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"  // IWYU pragma: keep
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "sirius/exception.hpp"
@@ -39,12 +36,30 @@
 #include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace {
+// Diagnostic label for the static filter bytes: zero-padded 64-bit FNV-1a, first eight hex digits;
+// "-" when the contract carries no static filter. Never a cache, equality or enforcement input.
+std::string static_filter_label(std::string const& bytes)
+{
+  if (bytes.empty()) return "-";
+  uint64_t hash = 14695981039346656037ull;
+  for (unsigned char c : bytes) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  char text[17];
+  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+  return std::string(text, 8);
+}
+}  // namespace
 
 namespace sirius::pipeline {
 
@@ -526,6 +541,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
           << (contract.predicates.pushdown_mode.empty() ? "none"
                                                         : contract.predicates.pushdown_mode)
+
+          << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
           << " scan_cpu_replay="
           << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                                : "forbidden")
@@ -592,6 +609,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " depth=" << dump_evidence_depth(entry.eligibility.depth)
         << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
         << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+
+        << " fingerprint=" << static_filter_label(contract.predicates.static_filter_fingerprint)
         << " scan_cpu_replay="
         << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
                                                                              : "forbidden")

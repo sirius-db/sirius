@@ -8,7 +8,7 @@
 // ==================================================
 //
 //   * Bitpack  — LEAF value reader.  Exposes a closed-form C++
-//     expression `simpatico_bp_at(packed + base, bits, min, __POS__)` that
+//     expression `simpatico_bp_at(packed + base, bits, min, div, __POS__)` that
 //     yields the decoded value at any per-chunk position.  No shared
 //     memory, no sync — the parent splices the expression inline.
 //
@@ -40,7 +40,6 @@
 #include "codegen/jit/render_util.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -207,6 +206,7 @@ std::string shape_symbol_suffix(DecodeShape shape)
   if (shape == kShapeMaskOut) return "_mask_out";
   if (shape == kShapeMaskConsume) return "_mask_consume";
   if (shape == kShapeDictGather) return "_mask_dict";
+  if (shape == kShapePlainDictGather) return "_dict";
   if (shape == kShapeIndexConsume) return "_index_consume";
   if (shape == kShapeStrSplitMeta) return "_str_meta";
   if (shape == kShapeSparseConsume) return "_sparse_consume";
@@ -244,8 +244,14 @@ std::string out_param_decl(Consumer c, const std::string& dtype)
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  Walker(std::string root_dtype, DecodeShape shape, std::string out_dtype = {})
-    : dtype_(std::move(root_dtype)), out_dtype_(std::move(out_dtype)), shape_(shape)
+  Walker(std::string root_dtype,
+         DecodeShape shape,
+         std::string out_dtype               = {},
+         std::vector<std::int32_t> undivided = {})
+    : dtype_(std::move(root_dtype)),
+      out_dtype_(std::move(out_dtype)),
+      shape_(shape),
+      undivided_(std::move(undivided))
   {
   }
 
@@ -256,6 +262,10 @@ class Walker {
       case Consumer::write_column:
         switch (shape_.enumerator) {
           case Enumerator::all_rows:
+            if (dtype_elem_size(dtype_) <= 8 && warp_supported(tree)) {
+              emit_warp_plain(tree);
+              break;
+            }
             // Root producer writes the reconstructed chunk straight to out.
             emit_producer(tree, "(out + chunk_start)", "len", dtype_);
             break;
@@ -282,7 +292,18 @@ class Walker {
           emit_generic_mask_out(tree);
         }
         break;
-      case Consumer::dict_gather: emit_bitpack_mask_dict_gather(tree); break;
+      case Consumer::dict_gather:
+        if (shape_.enumerator == Enumerator::all_rows) {
+          if (dtype_elem_size(dtype_) > 8 || !warp_supported(tree)) {
+            throw RenderError(
+              "decode render: a full dictionary gather needs a bitpack, FOR, zigzag or delta code "
+              "chain");
+          }
+          emit_warp_plain(tree);
+        } else {
+          emit_bitpack_mask_dict_gather(tree);
+        }
+        break;
       case Consumer::offsets_meta: emit_str_split_meta(tree); break;
     }
     return finalize(tree);
@@ -291,7 +312,12 @@ class Walker {
  private:
   std::string dtype_;
   std::string out_dtype_;  // empty: `out` holds dtype_ (see render)
-  DecodeShape shape_        = kShapePlain;
+  DecodeShape shape_ = kShapePlain;
+  std::vector<std::int32_t> undivided_;  // Bitpack nodes without a chunk_divisors channel
+  bool divided(std::int32_t id) const
+  {
+    return std::find(undivided_.begin(), undivided_.end(), id) == undivided_.end();
+  }
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
   std::ostringstream body_;
@@ -300,6 +326,10 @@ class Walker {
   std::unordered_map<const ::codegen::jit::FusedTree*, std::int32_t> ids_;
   bool narrow_unpack_ =
     false;  ///< Whether to include the narrow unpack prelude in the source string
+  bool warp_per_chunk_ = false;  ///< all_rows kernel maps one chunk per warp (see finalize)
+  /// Passes over a chunk below a Delta: fewer bound fewer registers and less shared transpose.
+  static constexpr int kWarpParts = 8;
+  std::ostringstream warp_loop_;  ///< per-part body below a Delta (emit_warp_plain)
 
   // DFS-preorder, lex-sorted children (std::map iteration) — must match
   // jit::assign_ids and the decode binder (bind_fused_subtree) so
@@ -342,6 +372,18 @@ class Walker {
                              const std::string& dst,
                              const std::string& len,
                              const std::string& elem_type);
+
+  // ---- Warp-per-chunk full decode (see emit_warp_plain). ----
+  // A node's decoded chunk: either a closed-form `read_expr` in __POS__, or, from a Delta up, the
+  // name of a per-lane register array holding one part's positions h * PART + lane * PER_PART + k.
+  struct WarpValue {
+    std::string read_expr;
+    std::string regs;
+  };
+  static bool warp_supported(const ::codegen::jit::FusedTree& node);
+  static bool warp_has_delta(const ::codegen::jit::FusedTree& node);
+  void emit_warp_plain(const ::codegen::jit::FusedTree& tree);
+  WarpValue warp_value(const ::codegen::jit::FusedTree& node, const std::string& count);
 
   // ---- Row-selecting variants. ----
   // The ballot emits one __ballot_sync word per 32 consecutive rows; the consuming
@@ -431,11 +473,14 @@ class Walker {
       decls.emplace_back(tp.decl);
     }
 
-    // Block prologue: the chunk this thread serves. The index walk maps one warp per chunk, so its
+    // Block prologue: the chunk this thread serves. The index walk and the warp decode
+    // (emit_warp_plain) map one warp per chunk, so its
     // chunk follows from the warp index and the `len` guard below returns a warp rather than a
     // block (nothing after it synchronizes).
     std::string chunk_binding;
-    switch (shape_.enumerator) {
+    const bool warp_mapped   = shape_.enumerator == Enumerator::index_list || warp_per_chunk_;
+    const int chunks_per_blk = warp_mapped ? tbs_ / 32 : chunks_per_block(shape_);
+    switch (warp_per_chunk_ ? Enumerator::index_list : shape_.enumerator) {
       case Enumerator::chunk_csr:
         chunk_binding =
           "    const int32_t chunk_id = static_cast<int32_t>(chunk_ids[blockIdx.x]);\n"
@@ -443,7 +488,7 @@ class Walker {
         break;
       case Enumerator::index_list:
         chunk_binding =
-          "    constexpr int32_t CHUNKS_PER_BLOCK = " + std::to_string(chunks_per_block(shape_)) +
+          "    constexpr int32_t CHUNKS_PER_BLOCK = " + std::to_string(chunks_per_blk) +
           ";  // one chunk per warp\n"
           "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
           "    const int32_t lane     = tid & 31;\n"
@@ -474,7 +519,7 @@ class Walker {
         << "    const int32_t len = static_cast<int32_t>(\n"
         << "        (n - chunk_start) < static_cast<int64_t>(CHUNK)\n"
         << "            ? (n - chunk_start) : static_cast<int64_t>(CHUNK));\n"
-        << (shape_.enumerator == Enumerator::index_list
+        << (warp_mapped
               ? "    if (len <= 0) return;  // the last block's trailing warps pass the batch\n"
               : "    if (len <= 0) return;\n")
         << "    extern __shared__ __align__(16) unsigned char workspace[];\n"
@@ -482,10 +527,11 @@ class Walker {
         << "\n"
         << body_.str() << "}\n";
 
-    spec.source       = src.str();
-    spec.buffers      = std::move(buffers_);
-    spec.block_x      = tbs_;
-    spec.shared_bytes = static_cast<int>(sm_.peak_bytes());
+    spec.source           = src.str();
+    spec.buffers          = std::move(buffers_);
+    spec.block_x          = tbs_;
+    spec.shared_bytes     = static_cast<int>(sm_.peak_bytes());
+    spec.chunks_per_block = chunks_per_blk;
     spec.note =
       "decode-walker-rendered; dynamic-shared workspace = " + std::to_string(sm_.peak_bytes()) +
       " bytes";
@@ -557,15 +603,17 @@ template <> struct simpatico_unsigned<__int128> { using type = unsigned __int128
 // constant-chunk (bits==0) short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
-                                          int32_t bits, T minv, int32_t idx) {
+                                          int32_t bits, T minv, T divv, int32_t idx) {
     using U = typename simpatico_unsigned<T>::type;
     if (bits == 0) return minv;
     if constexpr (sizeof(T) == 16) {
         const unsigned __int128 v = simpatico_bitunpack_one_128(packed_base, bits, idx);
-        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+        const U q = divv == T{1} ? static_cast<U>(v) : static_cast<U>(divv) * static_cast<U>(v);
+        return static_cast<T>(static_cast<U>(minv) + q);
     } else {
         const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
-        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+        const U q = divv == T{1} ? static_cast<U>(v) : static_cast<U>(divv) * static_cast<U>(v);
+        return static_cast<T>(static_cast<U>(minv) + q);
     }
 }
 
@@ -598,11 +646,12 @@ __device__ __forceinline__ T simpatico_bp_at32(const uint32_t* __restrict__ pack
                                                int32_t bits,
                                                uint32_t vmask,
                                                T minv,
+                                               T divv,
                                                int32_t idx) {
     using U = typename ::cuda::std::make_unsigned<T>::type;
     if (bits == 0) return minv;
-    return static_cast<T>(static_cast<U>(minv) +
-                          static_cast<U>(simpatico_bp_field32(packed_base, bits, vmask, idx)));
+    const U v = static_cast<U>(simpatico_bp_field32(packed_base, bits, vmask, idx));
+    return static_cast<T>(static_cast<U>(minv) + (divv == T{1} ? v : static_cast<U>(divv) * v));
 }
 
 }  // namespace
@@ -644,9 +693,11 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   const std::string idstr = std::to_string(id);
 
   const std::string p_min  = "chunk_min_" + idstr;
+  const std::string p_divs = "chunk_divisors_" + idstr;
   const std::string p_bits = "chunk_bits_" + idstr;
   const std::string p_pkd  = "packed_" + idstr;
   const std::string v_min  = "bpmin_" + idstr;
+  const std::string v_div  = "bpdiv_" + idstr;
   const std::string v_bits = "bpbits_" + idstr;
   const std::string v_base = "bpbase_" + idstr;
 
@@ -654,15 +705,19 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   add_param("const " + elem_type + "* __restrict__", p_min);
   add_param("const uint8_t* __restrict__", p_bits);
   add_param("const uint32_t* __restrict__", p_pkd);
+  if (divided(id)) { add_param("const " + elem_type + "* __restrict__", p_divs); }
   add_buffer(id, "chunk_min", esize);
   add_buffer(id, "chunk_bits", sizeof(std::uint8_t));
   add_buffer(id, "packed", sizeof(std::uint32_t));
+  if (divided(id)) { add_buffer(id, "chunk_divisors", esize); }
 
   // Per-chunk scalar prelude (loaded once per block).
   body_ << "    // --- node " << id << ": Bitpack (" << elem_type << ") value source ---\n"
         << "    const int32_t " << v_bits << " = static_cast<int32_t>(" << p_bits
         << "[chunk_id]);\n"
-        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n";
+        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n"
+        << "    const " << elem_type << " " << v_div << " = "
+        << (divided(id) ? p_divs + "[chunk_id]" : elem_type + "{1}") << ";\n";
 
   // Decode reads the Compact per-chunk ``bp_offsets`` layout; every stored
   // bitpack rep is dense (the fused encode path compacts in place).
@@ -675,8 +730,8 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
 
   ValueSource vs;
   vs.elem_type = elem_type;
-  vs.read_expr =
-    "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", (__POS__))";
+  vs.read_expr = "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", " +
+                 v_div + ", (__POS__))";
   return vs;
 }
 
@@ -693,6 +748,257 @@ void Walker::emit_bitpack_producer(const ::codegen::jit::FusedTree& node,
         << "    for (int32_t i = tid; i < (" << len << "); i += " << tbs_ << ") {\n"
         << "        (" << dst << ")[i] = " << at_pos(vs.read_expr, "i") << ";\n"
         << "    }\n";
+}
+
+// =====================================================================
+// Warp-per-chunk full decode of a Bitpack / FOR / Zigzag / Delta chain.
+//
+// The block-per-chunk producers read a Bitpack value with two or three overlapping global loads,
+// and with one chunk per block too few chunks are in flight per SM to cover DRAM latency. Here
+// finalize maps one chunk per warp (kTBSize / 32 per block) and the warp:
+//   * reads each Bitpack value straight from global memory: a funnel shift of two words in an
+//     int32 lane, the three-word gather in an int64 lane. Staging the packed words in
+//     shared memory is a little faster alone, but its 16 KB per block costs more than it saves
+//     beside the kernels of concurrent scan tasks (TPC-H SF1000 q17: 0.25 s staged, 0.17 s not);
+//   * applies FOR / Zigzag per position, closed-form, as the block producers do;
+//   * reconstructs a Delta in registers, one part of the chunk at a time (PARTS passes) to bound
+//     register use: each lane owns PER_PART consecutive positions, scans them serially, and adds
+//     the warp's exclusive prefix of lane totals plus the earlier parts' total. Nodes above it (FOR
+//     / Zigzag / an outer Delta) then work on those registers, and the root transposes them back
+//     through a small shared slice per warp so stores stay coalesced.
+// Only __syncwarp is needed, so a warp past the batch may return early.
+// =====================================================================
+bool Walker::warp_supported(const ::codegen::jit::FusedTree& node)
+{
+  auto only_child = [&](const char* name) {
+    return node.children.size() == 1 && node.children.count(name) == 1 &&
+           warp_supported(*node.children.begin()->second);
+  };
+  switch (node.op) {
+    case ::codegen::OpKind::Bitpack: return node.children.empty();
+    case ::codegen::OpKind::For: return only_child("deltas");
+    case ::codegen::OpKind::Zigzag: return only_child("zigzag");
+    case ::codegen::OpKind::Delta: return only_child("differences");
+    default: return false;
+  }
+}
+
+bool Walker::warp_has_delta(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op == ::codegen::OpKind::Delta) return true;
+  return !node.children.empty() && warp_has_delta(*node.children.begin()->second);
+}
+
+void Walker::emit_warp_plain(const ::codegen::jit::FusedTree& tree)
+{
+  warp_per_chunk_         = true;
+  narrow_unpack_          = true;
+  const std::size_t esize = dtype_elem_size(dtype_);
+  const std::size_t chunk = ::codegen::kChunkSize;
+  body_ << "    // --- Warp-per-chunk decode ---\n"
+        << "    constexpr int32_t PER_LANE = CHUNK / 32;\n"
+        << "    constexpr int32_t PARTS    = " << kWarpParts << ";\n"
+        << "    constexpr int32_t PART     = CHUNK / PARTS;\n"
+        << "    constexpr int32_t PER_PART = PART / 32;\n";
+  if (warp_has_delta(tree)) {
+    // One part of results per warp, padded by one element per 32 so the lane-major writes do not
+    // conflict on a bank.
+    const std::size_t slice = chunk / kWarpParts + chunk / kWarpParts / 32;
+    const std::size_t bytes = (tbs_ / 32) * slice * esize;
+    const std::size_t off   = sm_.alloc(sizeof(std::uint64_t), (bytes + 7) / 8);
+    body_ << "    " << dtype_ << "* const tr = reinterpret_cast<" << dtype_ << "*>(workspace + "
+          << off << ") + (tid >> 5) * " << slice << ";\n";
+  }
+
+  warp_loop_.str({});
+  const WarpValue v = warp_value(tree, "len");
+  // A dictionary gather stores each row's key bytes rather than its code.
+  const bool dict = shape_.consumer == Consumer::dict_gather;
+  auto store      = [&](const std::string& i, const std::string& value) -> std::string {
+    if (!dict) return "dst[" + i + "] = " + value + ";";
+    return "{ const char* _k = keys_chars + static_cast<int64_t>(" + value +
+           ") * key_width; char* _o = dst + static_cast<int64_t>(" + i +
+           ") * key_width; for (int32_t _b = 0; _b < key_width; ++_b) _o[_b] = _k[_b]; }";
+  };
+  body_ << (dict ? "    char* const dst = out + chunk_start * key_width;\n"
+                 : "    auto* const dst = out + chunk_start;\n");
+  if (!v.regs.empty()) {
+    // Below a Delta the chain runs once per part; in part h, lane l's registers hold rows
+    // h * PART + l * PER_PART + [0, PER_PART). The part's rows are transposed through the slice
+    // and stored striped.
+    body_ << "#pragma unroll 1\n"
+          << "    for (int32_t h = 0; h < PARTS; ++h) {\n"
+          << warp_loop_.str() << "        __syncwarp();\n"
+          << "#pragma unroll\n"
+          << "        for (int32_t k = 0; k < PER_PART; ++k) {\n"
+          << "            const int32_t r = lane * PER_PART + k;\n"
+          << "            tr[r + (r >> 5)] = " << v.regs << "[k];\n"
+          << "        }\n"
+          << "        __syncwarp();\n"
+          << "#pragma unroll\n"
+          << "        for (int32_t k = 0; k < PER_PART; ++k) {\n"
+          << "            const int32_t r = lane + 32 * k;\n"
+          << "            const int32_t i = h * PART + r;\n"
+          << "            if (i < len) " << store("i", "tr[r + (r >> 5)]") << "\n"
+          << "        }\n"
+          << "    }\n";
+    return;
+  }
+  const std::string value = at_pos(v.read_expr, "i");
+  body_ << "    if (len == CHUNK) {\n"
+        << "#pragma unroll\n"
+        << "        for (int32_t k = 0; k < PER_LANE; ++k) {\n"
+        << "            const int32_t i = lane + 32 * k;\n"
+        << "            " << store("i", value) << "\n"
+        << "        }\n"
+        << "    } else {\n"
+        << "        for (int32_t i = lane; i < len; i += 32) " << store("i", value) << "\n"
+        << "    }\n";
+}
+
+Walker::WarpValue Walker::warp_value(const ::codegen::jit::FusedTree& node,
+                                     const std::string& count)
+{
+  const std::size_t esize = dtype_elem_size(dtype_);
+  const std::string& T    = dtype_;
+  const std::string U     = unsigned_counterpart(esize);
+  const std::string idstr = std::to_string(id_of(node));
+
+  // Apply `op` (a statement on `_v`, of type T) at every position: wrapped around the child's
+  // expression, or in place on its registers.
+  auto elementwise = [&](WarpValue child, const std::string& name, const std::string& op) {
+    if (!child.regs.empty()) {
+      warp_loop_ << "#pragma unroll\n"
+                 << "        for (int32_t k = 0; k < PER_PART; ++k) {\n"
+                 << "            " << T << " _v = " << child.regs << "[k];\n"
+                 << "            " << op << "\n"
+                 << "            " << child.regs << "[k] = _v;\n"
+                 << "        }\n";
+      return child;
+    }
+    body_ << "    auto " << name << " = [&](int32_t _p) -> " << T << " {\n"
+          << "        " << T << " _v = " << at_pos(child.read_expr, "_p") << ";\n"
+          << "        " << op << "\n"
+          << "        return _v;\n"
+          << "    };\n";
+    return WarpValue{name + "((__POS__))", {}};
+  };
+
+  switch (node.op) {
+    case ::codegen::OpKind::Bitpack: {
+      (void)bitpack_value_source(node, T);
+      const std::string bits  = "bpbits_" + idstr;
+      const std::string vmask = "bpvmask_" + idstr;
+      body_ << "    // --- node " << idstr << ": Bitpack ---\n"
+            << "    const uint32_t " << vmask << " = (" << bits
+            << " >= 32) ? 0xFFFFFFFFu : ((1u << " << bits << ") - 1u);\n";
+      const std::string narrow = "simpatico_bp_at32(packed_" + idstr + " + bpbase_" + idstr + ", " +
+                                 bits + ", " + vmask + ", bpmin_" + idstr + ", bpdiv_" + idstr +
+                                 ", (__POS__))";
+      if (esize <= 4) return WarpValue{narrow, {}};
+      // An int64 lane may hold a chunk wider than 32 bits; one unpack serves every width.
+      return WarpValue{"simpatico_bp_at(packed_" + idstr + " + bpbase_" + idstr + ", " + bits +
+                         ", bpmin_" + idstr + ", bpdiv_" + idstr + ", (__POS__))",
+                       {}};
+    }
+    case ::codegen::OpKind::For: {
+      WarpValue child = warp_value(*node.children.begin()->second, count);
+      add_param("const " + T + "* __restrict__", "references_" + idstr);
+      add_buffer(id_of(node), "references", esize);
+      // residual + reference may leave the signed range: add in the unsigned counterpart.
+      body_ << "    // --- node " << idstr << ": FOR ---\n"
+            << "    const " << T << " for_ref_" << idstr << " = references_" << idstr
+            << "[chunk_id];\n";
+      return elementwise(child,
+                         "for_at_" + idstr,
+                         "_v = static_cast<" + T + ">(static_cast<" + U + ">(_v) + static_cast<" +
+                           U + ">(for_ref_" + idstr + "));");
+    }
+    case ::codegen::OpKind::Zigzag: {
+      WarpValue child = warp_value(*node.children.begin()->second, count);
+      body_ << "    // --- node " << idstr << ": Zigzag ---\n";
+      // The exact-width inner cast keeps a negative narrow code from sign-extending into the shift.
+      return elementwise(child,
+                         "zz_at_" + idstr,
+                         "{ const " + U + " _z = static_cast<" + U + ">(static_cast<" +
+                           exact_unsigned(esize) + ">(_v)); _v = static_cast<" + T +
+                           ">((_z >> 1) ^ (static_cast<" + U + ">(0) - (_z & static_cast<" + U +
+                           ">(1)))); }");
+    }
+    case ::codegen::OpKind::Delta: {
+      add_param("const " + T + "* __restrict__", "delta_first_" + idstr);
+      add_buffer(id_of(node), "delta_first", esize);
+      const std::string n_rows = "dn_" + idstr;
+      body_ << "    const int32_t " << n_rows << " = static_cast<int32_t>(" << count << ");\n";
+      WarpValue child =
+        warp_value(*node.children.begin()->second, "(" + n_rows + " > 0 ? " + n_rows + " - 1 : 0)");
+      // Shuffles take a 32- or 64-bit integer, not every exact-width type.
+      const std::string S     = esize == 8 ? "unsigned long long" : "unsigned int";
+      const std::string dv    = "dv_" + idstr;
+      const std::string carry = "dcarry_" + idstr;  // first + every difference of earlier parts
+      const std::string last  = "dlast_" + idstr;   // the child's last row of the earlier part
+      body_ << "    // --- node " << idstr << ": Delta, scanned in registers per part ---\n"
+            << "    " << U << " " << carry << " = static_cast<" << U << ">(delta_first_" << idstr
+            << "[chunk_id]);\n";
+      // Row r reconstructs to first + sum of differences [0, r), so row r's scan input is
+      // difference r - 1 and row 0's is zero.
+      warp_loop_ << "        " << T << " " << dv << "[PER_PART];\n";
+      if (child.regs.empty()) {
+        warp_loop_ << "#pragma unroll\n"
+                   << "        for (int32_t k = 0; k < PER_PART; ++k) {\n"
+                   << "            const int32_t r = h * PART + lane * PER_PART + k;\n"
+                   << "            " << dv << "[k] = (r >= 1 && r < " << n_rows
+                   << ") ? static_cast<" << T << ">(" << at_pos(child.read_expr, "r - 1")
+                   << ") : " << T << "{0};\n"
+                   << "        }\n";
+      } else {
+        // Row r's input is the child's row r - 1: the previous register, the previous lane's
+        // last, or for lane 0 the earlier part's last.
+        body_ << "    " << T << " " << last << " = " << T << "{0};\n";
+        warp_loop_ << "        {\n"
+                   << "            const " << U << " _tail = static_cast<" << U << ">("
+                   << child.regs << "[PER_PART - 1]);\n"
+                   << "            const " << T << " _up = static_cast<" << T
+                   << ">(__shfl_up_sync(0xFFFFFFFFu, static_cast<" << S << ">(_tail), 1));\n"
+                   << "            const " << T << " _prev = lane == 0 ? " << last << " : _up;\n"
+                   << "            " << last << " = static_cast<" << T
+                   << ">(__shfl_sync(0xFFFFFFFFu, static_cast<" << S << ">(_tail), 31));\n"
+                   << "#pragma unroll\n"
+                   << "            for (int32_t k = 0; k < PER_PART; ++k) {\n"
+                   << "                const int32_t r = h * PART + lane * PER_PART + k;\n"
+                   << "                const " << T << " _d = k > 0 ? " << child.regs
+                   << "[k - 1] : _prev;\n"
+                   << "                " << dv << "[k] = (r >= 1 && r < " << n_rows
+                   << ") ? _d : " << T << "{0};\n"
+                   << "            }\n"
+                   << "        }\n";
+      }
+      warp_loop_ << "        {\n"
+                 << "            " << U << " _acc = 0;\n"
+                 << "#pragma unroll\n"
+                 << "            for (int32_t k = 0; k < PER_PART; ++k) {\n"
+                 << "                _acc += static_cast<" << U << ">(" << dv << "[k]);\n"
+                 << "                " << dv << "[k] = static_cast<" << T << ">(_acc);\n"
+                 << "            }\n"
+                 << "            " << U << " _incl = _acc;\n"
+                 << "#pragma unroll\n"
+                 << "            for (int32_t s = 1; s < 32; s <<= 1) {\n"
+                 << "                const " << U << " _t = static_cast<" << U
+                 << ">(__shfl_up_sync(0xFFFFFFFFu, static_cast<" << S << ">(_incl), s));\n"
+                 << "                if (lane >= s) _incl += _t;\n"
+                 << "            }\n"
+                 << "            const " << U << " _base = " << carry << " + (_incl - _acc);\n"
+                 << "#pragma unroll\n"
+                 << "            for (int32_t k = 0; k < PER_PART; ++k)\n"
+                 << "                " << dv << "[k] = static_cast<" << T
+                 << ">(_base + static_cast<" << U << ">(" << dv << "[k]));\n"
+                 << "            " << carry << " += static_cast<" << U
+                 << ">(__shfl_sync(0xFFFFFFFFu, static_cast<" << S << ">(_incl), 31));\n"
+                 << "        }\n";
+      return WarpValue{{}, dv};
+    }
+    default: throw RenderError("decode render: warp decode reached an unsupported op");
+  }
 }
 
 // =====================================================================
@@ -919,7 +1225,7 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 
   narrow_unpack_           = true;
   const std::string narrow = "simpatico_bp_at32(packed_" + idstr + " + bpbase_" + idstr + ", " +
-                             bits + ", " + vmask + ", bpmin_" + idstr + ", i)";
+                             bits + ", " + vmask + ", bpmin_" + idstr + ", bpdiv_" + idstr + ", i)";
   const std::string value =
     dtype_elem_size(dtype_) > 4
       ? "(" + bits + " > 32) ? " + at_pos(vs.read_expr, "i") + " : " + narrow
@@ -993,7 +1299,10 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
           << "[chunk_id + 1],\n"
           << "                                static_cast<int32_t>(chunk_bits_" << idstr
           << "[chunk_id + 1]),\n"
-          << "                                chunk_min_" << idstr << "[chunk_id + 1], 0);\n";
+          << "                                chunk_min_" << idstr << "[chunk_id + 1],\n"
+          << "                                "
+          << (divided(id_of(node)) ? "chunk_divisors_" + idstr + "[chunk_id + 1]" : dtype_ + "{1}")
+          << ", 0);\n";
   } else {
     body_ << "        next0 = delta_first_" << idstr << "[chunk_id + 1];\n";
   }
@@ -1051,9 +1360,9 @@ std::string decoded_range_pass(const std::string& value_expr)
 // words of the chunk are written; bits for rows >= n are zero (the CNT and combine waves rely on
 // that). Grid = C blocks x 128 threads, no dynamic shared memory, no barriers.
 //
-// The predicate is translated once per chunk into bounds [lo_u, hi_u] on the stored residual u, so
-// a row costs one two-word funnel-shift extraction and one unsigned compare: pass = (u - lo_u) <=
-// hi_u - lo_u.
+// The predicate is translated once per chunk into bounds [lo_u, hi_u] on the stored residual u
+// (x = min + div * u), so a row costs one two-word funnel-shift extraction and one unsigned
+// compare: pass = (u - lo_u) <= hi_u - lo_u.
 // =====================================================================
 void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
 {
@@ -1073,31 +1382,44 @@ void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
     body_ << "        return;\n"
           << "    }\n";
   }
-  body_ << "    constexpr int64_t kInt64Max = 0x7FFFFFFFFFFFFFFFll;\n"
-        << "    const int64_t minv   = static_cast<int64_t>(bpmin_" << idstr << ");\n"
-        << "    const int64_t maxu   = (" << bits << " >= 32) ? 0xFFFFFFFFll : ((1ll << " << bits
-        << ") - 1);\n"
-        << "    const int64_t dom_hi = (minv > kInt64Max - maxu) ? kInt64Max : minv + maxu;\n"
-        << "    const int64_t lo_eff = pred_lo > minv ? pred_lo : minv;\n"
-        << "    const int64_t hi_eff = pred_hi < dom_hi ? pred_hi : dom_hi;\n"
-        << "    if (lo_eff > hi_eff) {  // predicate misses the chunk's domain\n"
-        << "        if (tid < CHUNK / 32) mask_words[tid] = 0u;\n"
-        << "        return;\n"
-        << "    }\n"
-        << "    const uint32_t lo_u = static_cast<uint32_t>(lo_eff - minv);\n"
-        << "    const uint32_t hi_u = static_cast<uint32_t>(hi_eff - minv);\n"
-        << "    if (lo_u == 0u && hi_u == static_cast<uint32_t>(maxu)) {  // covers the domain\n"
-        << "        if (tid < CHUNK / 32) {\n"
-        << "            const int32_t rows_in_word = len - tid * 32;\n"
-        << "            mask_words[tid] = rows_in_word >= 32   ? 0xFFFFFFFFu\n"
-        << "                              : rows_in_word <= 0 ? 0u\n"
-        << "                                                  : ((1u << rows_in_word) - 1u);\n"
-        << "        }\n"
-        << "        return;\n"
-        << "    }\n"
-        << "    const uint32_t span  = hi_u - lo_u;\n"
-        << "    const uint32_t vmask = (" << bits << " >= 32) ? 0xFFFFFFFFu : ((1u << " << bits
-        << ") - 1u);\n";
+  body_
+    << "    constexpr int64_t kInt64Max = 0x7FFFFFFFFFFFFFFFll;\n"
+    << "    const int64_t minv   = static_cast<int64_t>(bpmin_" << idstr << ");\n"
+    << "    const uint64_t divu   = static_cast<uint64_t>(bpdiv_" << idstr << ");\n"
+    << "    const int64_t maxu   = (" << bits << " >= 32) ? 0xFFFFFFFFll : ((1ll << " << bits
+    << ") - 1);\n"
+    // Unsigned differences are exact here: every one is a non-negative value below 2^64.
+    << "    const uint64_t span_max = (static_cast<uint64_t>(maxu) > ~0ull / divu)\n"
+    << "                                ? ~0ull : static_cast<uint64_t>(maxu) * divu;\n"
+    << "    const int64_t dom_hi =\n"
+    << "        (span_max > static_cast<uint64_t>(kInt64Max) - static_cast<uint64_t>(minv))\n"
+    << "            ? kInt64Max : static_cast<int64_t>(static_cast<uint64_t>(minv) + span_max);\n"
+    << "    const int64_t lo_eff = pred_lo > minv ? pred_lo : minv;\n"
+    << "    const int64_t hi_eff = pred_hi < dom_hi ? pred_hi : dom_hi;\n"
+    // A ceiling without adding divu - 1, which wraps for a distance near 2^64.
+    << "    const uint64_t lo_d  = static_cast<uint64_t>(lo_eff) - static_cast<uint64_t>(minv);\n"
+    << "    const uint64_t lo_q  = lo_d / divu + (lo_d % divu != 0 ? 1ull : 0ull);\n"
+    << "    const uint64_t hi_q  =\n"
+    << "        (static_cast<uint64_t>(hi_eff) - static_cast<uint64_t>(minv)) / divu;\n"
+    // A predicate can also fall strictly between two multiples of the divisor.
+    << "    if (lo_eff > hi_eff || lo_q > hi_q) {  // predicate misses the chunk's domain\n"
+    << "        if (tid < CHUNK / 32) mask_words[tid] = 0u;\n"
+    << "        return;\n"
+    << "    }\n"
+    << "    const uint32_t lo_u = static_cast<uint32_t>(lo_q);\n"
+    << "    const uint32_t hi_u = static_cast<uint32_t>(hi_q);\n"
+    << "    if (lo_u == 0u && hi_u == static_cast<uint32_t>(maxu)) {  // covers the domain\n"
+    << "        if (tid < CHUNK / 32) {\n"
+    << "            const int32_t rows_in_word = len - tid * 32;\n"
+    << "            mask_words[tid] = rows_in_word >= 32   ? 0xFFFFFFFFu\n"
+    << "                              : rows_in_word <= 0 ? 0u\n"
+    << "                                                  : ((1u << rows_in_word) - 1u);\n"
+    << "        }\n"
+    << "        return;\n"
+    << "    }\n"
+    << "    const uint32_t span  = hi_u - lo_u;\n"
+    << "    const uint32_t vmask = (" << bits << " >= 32) ? 0xFFFFFFFFu : ((1u << " << bits
+    << ") - 1u);\n";
   emit_range_ballot_loop(
     "pass = (simpatico_bp_field32(" + base + ", " + bits + ", vmask, i) - lo_u) <= span;\n",
     "    ");
@@ -1383,13 +1705,14 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
     if (vit->second->op == ::codegen::OpKind::Bitpack) {
       body_ << "        struct " << vstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            " << elem_type << " min; int32_t base;\n"
+            << "            " << elem_type << " min; " << elem_type << " div; int32_t base;\n"
             << "            __device__ __forceinline__ " << elem_type
             << " operator()(int32_t idx) const noexcept {\n"
-            << "                return simpatico_bp_at(packed + base, bits, min, idx);\n"
+            << "                return simpatico_bp_at(packed + base, bits, min, div, idx);\n"
             << "            }\n"
             << "        } " << vread << " { packed_" << v_child_id << ", bpbits_" << v_child_id
-            << ", bpmin_" << v_child_id << ", bpbase_" << v_child_id << " };\n";
+            << ", bpmin_" << v_child_id << ", bpdiv_" << v_child_id << ", bpbase_" << v_child_id
+            << " };\n";
     } else {
       // Raw leaf
       body_ << "        struct " << vstruct << " {\n"
@@ -1410,14 +1733,15 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
       bitpack_value_source(*rit->second, "int32_t");  // emits kernel params
       body_ << "        struct " << cstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            int32_t min; int32_t base;\n"
+            << "            int32_t min; int32_t div; int32_t base;\n"
             << "            __device__ __forceinline__ int32_t operator()(int32_t idx) const "
                "noexcept {\n"
             << "                return static_cast<int32_t>(simpatico_bp_at(packed + base, bits, "
-               "min, idx));\n"
+               "min, div, idx));\n"
             << "            }\n"
             << "        } " << cread << " { packed_" << c_child_id << ", bpbits_" << c_child_id
-            << ", bpmin_" << c_child_id << ", bpbase_" << c_child_id << " };\n"
+            << ", bpmin_" << c_child_id << ", bpdiv_" << c_child_id << ", bpbase_" << c_child_id
+            << " };\n"
             << "        ::codegen::block_rle_decompress_fv<" << elem_type << ", "
             << ::codegen::kChunkSize << ", " << tbs_ << ">(\n"
             << "            " << vread << ", " << cread << ",\n"
@@ -1804,7 +2128,8 @@ bool shape_is_supported(DecodeShape shape)
   // remain unbuilt: chunk_csr covers the same two consumers for the selection
   // shape that needed them, so building them would add a second way to say it.
   return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapeMaskConsume ||
-         shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta ||
+         shape == kShapeIndexConsume || shape == kShapeDictGather ||
+         shape == kShapePlainDictGather || shape == kShapeStrSplitMeta ||
          shape == kShapeSparseConsume || shape == kShapeSparseDictGather ||
          shape == kShapeSparseStrSplitMeta;
 }
@@ -1843,7 +2168,8 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
                         DecodeShape shape,
-                        const std::string& out_dtype)
+                        const std::string& out_dtype,
+                        const std::vector<std::int32_t>& undivided)
 {
   if (!out_dtype.empty() && (shape.consumer != Consumer::write_column ||
                              dtype_elem_size(out_dtype) <= dtype_elem_size(element_dtype))) {
@@ -1861,7 +2187,7 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
     throw RenderError("decode render: unsupported element_dtype '" + element_dtype +
                       "'. Supported: int32_t, int64_t");
   }
-  Walker w(element_dtype, shape, out_dtype);
+  Walker w(element_dtype, shape, out_dtype, undivided);
   return w.build(tree);
 }
 

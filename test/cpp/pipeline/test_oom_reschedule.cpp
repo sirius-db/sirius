@@ -16,7 +16,6 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
-#include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -25,7 +24,7 @@
 #include "pipeline/query_retirement_test_utils.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_scheduler.hpp"
-#include "scan/test_utils.hpp"
+#include "scan/test_utils.hpp"  // IWYU pragma: keep
 #include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>

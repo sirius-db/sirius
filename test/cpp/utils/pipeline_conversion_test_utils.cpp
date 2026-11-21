@@ -27,11 +27,9 @@
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
-#include <duckdb/main/database.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
@@ -210,10 +208,7 @@ void with_conversion_result(
       std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
     query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
     pipeline::pipeline_build_context build_ctx(
-      /*telemetry_context=*/nullptr,
-      duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-      std::move(active_gpu_ids),
-      std::move(query_operator_params));
+      /*telemetry_context=*/nullptr, std::move(active_gpu_ids), std::move(query_operator_params));
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =

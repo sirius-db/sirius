@@ -103,6 +103,11 @@ class dense_count_join_input : public partitioned_operator_data {
  */
 class sirius_physical_dense_count_join : public sirius_physical_partition_consumer_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DENSE_COUNT_JOIN;
 
   static constexpr std::string_view PRESERVED_PORT = "preserved";

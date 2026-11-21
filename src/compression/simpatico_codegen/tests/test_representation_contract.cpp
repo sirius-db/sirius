@@ -12,10 +12,7 @@
 
 #include "codegen/plan/representation.hpp"
 
-#include <cudf/column/column.hpp>
-
 #include <rmm/mr/per_device_resource.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 

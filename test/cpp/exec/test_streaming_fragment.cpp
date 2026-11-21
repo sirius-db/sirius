@@ -26,18 +26,25 @@
 #include <cudf/unary.hpp>
 
 #include <catch.hpp>
-#include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
-#include <duckdb.hpp>
+#include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/query_result.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
+#include <duckdb/planner/planner.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -574,6 +581,192 @@ TEST_CASE_METHOD(fragment_fixture,
     std::sort(values.begin(), values.end());
     REQUIRE(values == std::vector<std::int32_t>{1, 2, 3, 4, 5});
 
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "a bare distinct set-operation fragment owns its multiplicity",
+                 "[integration][streaming_fragment][set_operation][setop_distinct_fragment]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  std::string const left =
+    "SELECT k FROM (VALUES (1), (1), (2), (2), (NULL::INTEGER), (NULL::INTEGER)) l(k)";
+  std::string const right = "SELECT k FROM (VALUES (1), (NULL::INTEGER)) r(k)";
+  auto sorted_rows        = [](duckdb::QueryResult& result) {
+    REQUIRE(result.ColumnCount() == 1);
+    std::vector<std::string> rows;
+    for (duckdb::idx_t row = 0; row < result.RowCount(); ++row) {
+      rows.push_back(result.Collection().GetValue(0, row).ToString());
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  };
+  std::vector<std::string> expected;
+  duckdb::vector<duckdb::LogicalType> expected_types;
+  {
+    sirius::test::scoped_sirius_setting cpu_execution{*con, "gpu_execution", false};
+    auto cpu = con->Query(left + " " + keyword + " " + right);
+    REQUIRE(cpu != nullptr);
+    REQUIRE_FALSE(cpu->HasError());
+    expected       = sorted_rows(*cpu);
+    expected_types = cpu->GetTypes();
+    REQUIRE(expected.size() == (keyword == "EXCEPT" ? 1 : 2));
+    REQUIRE(expected_types == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  }
+
+  fragment_spec spec;
+  spec.plan_source = [all_sql = left + " " + keyword + " ALL " + right](auto& context) {
+    duckdb::Parser parser(context);
+    parser.ParseQuery(all_sql);
+    duckdb::Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    std::size_t set_operations                                  = 0;
+    std::function<void(duckdb::LogicalOperator&)> make_distinct = [&](auto& node) {
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        node.template Cast<duckdb::LogicalSetOperation>().setop_all = false;
+        ++set_operations;
+      }
+      for (auto& child : node.children) {
+        make_distinct(*child);
+      }
+    };
+    make_distinct(*planner.plan);
+    REQUIRE(set_operations == 1);
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names = planner.names;
+    prepared->types = planner.types;
+    duckdb::Optimizer optimizer(*planner.binder, context);
+    auto plan = optimizer.Optimize(std::move(planner.plan));
+    plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*plan);
+    std::function<void(duckdb::LogicalOperator&)> require_no_wrapper = [&](auto& node) {
+      REQUIRE(node.type != duckdb::LogicalOperatorType::LOGICAL_DISTINCT);
+      for (auto& child : node.children) {
+        require_no_wrapper(*child);
+      }
+    };
+    require_no_wrapper(*plan);
+    return bound_plan{std::move(plan), std::move(prepared)};
+  };
+
+  con->BeginTransaction();
+  try {
+    {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      fragment.build();
+      fragment.run();
+      auto result = fragment.take_result();
+      REQUIRE(result != nullptr);
+      REQUIRE_FALSE(result->HasError());
+      CHECK(result->GetTypes() == expected_types);
+      CHECK(result->RowCount() == expected.size());
+      CHECK(sorted_rows(*result) == expected);
+    }
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "a bare set-operation fragment refuses right-only native collation",
+                 "[integration][streaming_fragment][set_operation][setop_child_collation]")
+{
+  std::string keyword;
+  SECTION("EXCEPT") { keyword = "EXCEPT"; }
+  SECTION("INTERSECT") { keyword = "INTERSECT"; }
+
+  run_ok("CREATE TABLE coll_l (s VARCHAR);");
+  run_ok("CREATE TABLE coll_r (s VARCHAR COLLATE nocase);");
+  run_ok("INSERT INTO coll_l VALUES ('A'), ('B');");
+  run_ok("INSERT INTO coll_r VALUES ('a');");
+  run_ok("CHECKPOINT;");
+  std::string const left  = "SELECT s FROM coll_l";
+  std::string const right = "SELECT s FROM coll_r";
+  {
+    sirius::test::scoped_sirius_setting cpu_execution{*con, "gpu_execution", false};
+    auto cpu = con->Query(left + " " + keyword + " " + right);
+    REQUIRE(cpu != nullptr);
+    REQUIRE_FALSE(cpu->HasError());
+    REQUIRE(cpu->GetTypes() == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::VARCHAR});
+    REQUIRE(sirius::test::collect_rows(*cpu) ==
+            std::vector<std::vector<std::string>>{{keyword == "EXCEPT" ? "B" : "A"}});
+  }
+
+  fragment_spec spec;
+  spec.plan_source = [all_sql = left + " " + keyword + " ALL " + right](auto& context) {
+    duckdb::Parser parser(context);
+    parser.ParseQuery(all_sql);
+    duckdb::Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    std::function<void(duckdb::LogicalOperator&)> make_distinct = [&](auto& node) {
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        node.template Cast<duckdb::LogicalSetOperation>().setop_all = false;
+      }
+      for (auto& child : node.children) {
+        make_distinct(*child);
+      }
+    };
+    make_distinct(*planner.plan);
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names = planner.names;
+    prepared->types = planner.types;
+    duckdb::Optimizer optimizer(*planner.binder, context);
+    auto plan = optimizer.Optimize(std::move(planner.plan));
+    plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver verifier(true);
+    verifier.VisitOperator(*plan);
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*plan);
+    std::size_t set_operations                                            = 0;
+    std::function<void(duckdb::LogicalOperator&)> require_right_collation = [&](auto& node) {
+      REQUIRE(node.type != duckdb::LogicalOperatorType::LOGICAL_DISTINCT);
+      if (node.type == duckdb::LogicalOperatorType::LOGICAL_EXCEPT ||
+          node.type == duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        ++set_operations;
+        REQUIRE_FALSE(node.template Cast<duckdb::LogicalSetOperation>().setop_all);
+        REQUIRE(node.types.size() == 1);
+        REQUIRE(node.children.size() == 2);
+        REQUIRE(node.children[0]->types.size() == 1);
+        REQUIRE(node.children[1]->types.size() == 1);
+        REQUIRE(duckdb::StringType::GetCollation(node.types[0]).empty());
+        REQUIRE(duckdb::StringType::GetCollation(node.children[0]->types[0]).empty());
+        REQUIRE(duckdb::StringType::GetCollation(node.children[1]->types[0]) == "nocase");
+      }
+      for (auto& child : node.children) {
+        require_right_collation(*child);
+      }
+    };
+    require_right_collation(*plan);
+    REQUIRE(set_operations == 1);
+    return bound_plan{std::move(plan), std::move(prepared)};
+  };
+
+  con->BeginTransaction();
+  try {
+    {
+      streaming_fragment fragment(*con->context, std::move(spec));
+      REQUIRE_THROWS_WITH(
+        fragment.build(),
+        ContainsSubstring("keys DuckDB compares through a collation or normalization"));
+    }
     con->Rollback();
   } catch (...) {
     con->Rollback();

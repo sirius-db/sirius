@@ -15,7 +15,6 @@
  */
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>

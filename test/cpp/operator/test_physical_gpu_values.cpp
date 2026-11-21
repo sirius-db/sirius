@@ -24,8 +24,6 @@
 
 #include <rmm/cuda_stream.hpp>
 
-#include <duckdb.hpp>
-
 namespace {
 
 void require_empty_string(cudf::column_view column, ::cuda::stream_ref stream)

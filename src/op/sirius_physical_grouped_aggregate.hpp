@@ -42,6 +42,11 @@ namespace op {
 
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::HASH_GROUP_BY;
 
@@ -78,7 +83,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   /// integer SUM input (planner::resolve_sum_input_bounds); nullopt when unproven.
   std::vector<std::optional<std::uint64_t>> cudf_aggregate_input_max_abs;
   /// Parallel to cudf_aggregates: true for the SUM of a wide integer SUM or AVG
-  /// (AggregateSlot::is_wide_integer_sum), whose partial result may be DECIMAL128.
+  /// (see wide_integer_sum_mask), whose partial result may be DECIMAL128.
   std::vector<bool> cudf_aggregate_is_wide_integer_sum;
 
   /// Max groups in the previous batch for a widened BIGINT SUM to be summed as two INT64 halves
@@ -93,12 +98,19 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::atomic<std::int64_t> _last_batch_groups{-1};
 
   // Partial aggregate layout and finalization metadata
-  std::vector<AggregateSlot> aggregate_slots;
+  std::vector<aggregate_slot> aggregate_slots;
   duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
  public:
+  [[nodiscard]] bool has_first() const { return has_slot<first_slot>(aggregate_slots); }
+
+  [[nodiscard]] grouped_aggregate_layout partial_layout() const
+  {
+    return {num_output_group_columns(), cudf_aggregates.size(), aggregate_slots};
+  }
+
   /// Whether the aggregate computes several grouping sets or GROUPING() functions. The local
   /// output then has a set id column and one column per GROUPING() function after the keys.
   [[nodiscard]] bool has_grouping_sets() const noexcept
@@ -129,21 +141,14 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! wide integer SUM, or of an aggregate whose result is HUGEINT, is INT64 or DECIMAL128 with
   //! scale 0; its column's alternate is whichever of the two is not its native carrier. Empty when
   //! no slot has two carriers or `types` is not one column per cuDF aggregate after the group
-  //! columns.
+  //! columns, followed by the FIRST carried columns.
   [[nodiscard]] std::vector<std::optional<cudf::data_type>> wide_integer_sum_partial_types() const;
 
   // Source interface
   bool is_source() const override { return true; }
 
-  sirius::OrderPreservationType source_order() const override
-  {
-    return sirius::OrderPreservationType::NO_ORDER;
-  }
-
   // Sink interface
   bool is_sink() const override { return true; }
-
-  bool sink_order_dependent() const override { return false; }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

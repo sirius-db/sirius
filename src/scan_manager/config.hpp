@@ -19,35 +19,60 @@
 
 #include "creator/config.hpp"
 #include "exec/config.hpp"
-#include "io/cache/config.hpp"
-#include "io/kvikio/config.hpp"
-#include "io/object_store_config.hpp"
-#include "io/rest/config.hpp"
-#include "io/uring/config.hpp"
+#include "exec/thread_defaults.hpp"
 #include "scan_manager/preparation_options.hpp"
+
+#include <cucascade/io/config.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count; counted in the scan-manager sizing budget below.
+/// Unresolved uring fallback; hardware resolution uses 2 reactors below 32 CPU
+/// hardware threads and 4 otherwise, unless YAML explicitly sets the count.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
-/// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
-[[nodiscard]] inline int default_scan_manager_num_threads()
+/// Sirius keeps read-path chunks in cuCascade's pinned host cache for reuse,
+/// with LRU eviction under memory pressure. Keep this default independent of
+/// cuCascade's library defaults; YAML can still select none, os, or idle eviction.
+[[nodiscard]] inline cucascade::io::cache::config default_cache_config() noexcept
 {
-  constexpr int reserved =
-    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
-  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+  auto c     = cucascade::io::cache::config{};
+  c.mode     = cucascade::io::cache::cache_mode::cucs;
+  c.eviction = cucascade::io::cache::eviction_policy::lru;
+  c.apply_mode();
+  return c;
+}
+
+/// Sirius's unresolved uring backend config: cuCascade's struct defaults with
+/// @c n_max_concurrent_scans = 0.  cuCascade's own default is 0 as well; the
+/// explicit assignment keeps Sirius's choice independent of it.
+///
+/// @c sirius_config re-defaults the budget to the pipeline pool size when it
+/// resolves a configuration (@c sirius_config::derive_uring_scan_budget), so this
+/// zero is what a @c scan_manager_config built directly carries.
+/// @c n_max_concurrent_scans_explicit stays false: this is a default, not a
+/// value the config named.
+[[nodiscard]] inline cucascade::io::uring::config default_uring_config() noexcept
+{
+  auto c                   = cucascade::io::uring::config{};
+  c.n_max_concurrent_scans = 0;
+  return c;
+}
+
+/// Initial scan-worker default; runtime resolution also covers every eligible
+/// NUMA domain. Explicit counts retain their domain-coverage validation.
+[[nodiscard]] inline constexpr int default_scan_manager_num_threads()
+{
+  return exec::derive_thread_defaults(0, 0).scan_manager;
 }
 
 /// How the readahead decides *when* to issue the next prefetch.
@@ -94,18 +119,16 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 
 /// IO backend that serves managed reads.
 enum class io_backend {
-  /// Sirius's own IO stack: uring for local paths, REST for @c s3:// URLs.
-  sirius,
-  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
-  kvikio,
+  /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
+  native,
 };
 
-/// Parse a @ref io_backend from its lowercase YAML spelling.
+/// Parse a @ref io_backend from its lowercase YAML spelling.  @c "sirius" is the
+/// deprecated spelling of @c "native" and is still accepted.
 inline bool string_to_enum(std::string_view sv, io_backend& out)
 {
   static const std::unordered_map<std::string_view, io_backend> map = {
-    {"sirius", io_backend::sirius},
-    {"kvikio", io_backend::kvikio},
+    {"native", io_backend::native}, {"sirius", io_backend::native},  // deprecated alias
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -119,8 +142,7 @@ inline bool string_to_enum(std::string_view sv, io_backend& out)
 inline bool enum_to_string(io_backend b, std::string& s)
 {
   switch (b) {
-    case io_backend::sirius: s = "sirius"; return true;
-    case io_backend::kvikio: s = "kvikio"; return true;
+    case io_backend::native: s = "native"; return true;
   }
   return false;
 }
@@ -188,11 +210,15 @@ struct memory_prefetcher_config {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c backend selects the IO stack: @ref io_backend::sirius routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes local paths to @c kvikio_context. Reads go through
- * @c sirius_datasource either way; the kvikio backend drives
- * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::sirius.
+ * @c backend selects the IO stack: @ref io_backend::native routes local paths
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend (cuCascade's native
+ * io_uring HTTP/1.1 transport with kTLS or user-space TLS). Object-store LIST
+ * and glob use the same REST backend. Reads go through
+ * @c cucascade::io::datasource. Raw HTTP(S) URLs are unsupported; use @c s3://
+ * paths with an object-store endpoint instead.
+ *
+ * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
+ * them to the @c cucascade::io::io_context_registry.
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and
@@ -201,7 +227,6 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO backend tunables (local-file fallback path).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -209,17 +234,40 @@ struct scan_manager_config {
   preparation_config preparation;
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
-  /// Admission limit, also accepted through the legacy scan-manager configuration path.
-  int max_concurrent_queries{1};
+  /// YAML preserves explicit values even when numerically equal to the default.
+  /// C++ callers assigning that same value should also set this flag to request a hard limit.
+  bool num_threads_explicit{false};
   /// IO backend that serves managed reads.
-  io_backend backend{io_backend::sirius};
+  io_backend backend{io_backend::native};
 
-  /// Number of uring reactor worker threads for the local-disk IO path.
+  /// Number of uring reactors for the local-disk IO path (each one worker thread
+  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
-  /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own libcurl event loop + connection pool).
+  /// Number of REST reactors for the S3/object-store IO path (each one worker
+  /// thread with its own io_uring ring and HTTP/1.1 connection pool), per routed
+  /// REST context and shared by all GPUs.  Each distinct resolved object-store
+  /// configuration (endpoint or credentials) builds its own context, so N
+  /// resident configurations hold N pools of this size, each with up to
+  /// @c rest.max_connections slots per reactor.  0 sizes each pool from the
+  /// egress NIC: one reactor per NIC queue IRQ CPU, pinned to it
+  /// (@c rest.pin_to_irq_cpus), when the IRQs are steered to a strict subset of
+  /// the NIC's NUMA-node cores; 2 unpinned reactors otherwise.
   std::size_t rest_n_reactors{2};
+
+  /// Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator,
+  /// downgrade) off the CPUs the REST reactors pin to (cuCascade's
+  /// @c planned_reactor_cpus: the NIC's steered IRQ CPUs when
+  /// @c rest.pin_to_irq_cpus is on), so those CPUs carry only the NIC's
+  /// interrupts and the reactors.  No effect when the reactors run unpinned.
+  bool reserve_rest_reactor_cpus{true};
+
+  /// Engine-owned rank CPU boundary, sampled from the main-thread affinity and cgroup
+  /// allowance at configuration resolution. Used by metadata and lazy I/O/control startup.
+  std::vector<int> startup_cpus;
+  /// Default CPU mask for lazy control/native workers, excluding reserved reactor CPUs.
+  /// Independent of the metadata pool's explicit cpu_affinity override.
+  std::vector<int> worker_startup_cpus;
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -245,26 +293,24 @@ struct scan_manager_config {
   std::size_t pipeline_width{0};
 
   /// Local (uring) reactor configuration. @c use_odirect is derived from
-  /// @ref cache; physical operation size is selected by the worker.
-  io::uring::config uring{};
+  /// @ref cache; physical operation size is selected by the worker.  Defaults
+  /// to @ref default_uring_config (budget 0 until @c sirius_config derives it).
+  cucascade::io::uring::config uring{default_uring_config()};
 
-  /// REST (S3/object-store) reactor configuration — timeouts, TLS, logical
-  /// merge hints, retry policy, and connection limits. Physical GET sizing is
-  /// worker-owned.
-  io::rest::config rest{};
-
-  /// kvikIO backend tunables for the local-file fallback path.  Every field is
-  /// optional; unset leaves kvikIO's own env-seeded default in place.
-  io::kvikio_config kvikio{};
+  /// REST (S3/object-store) reactor configuration — timeouts, TLS policy,
+  /// logical merge hints, retry policy, connection pool, transport and reactor
+  /// placement. Physical GET sizing is worker-owned, bounded by
+  /// @c min_segment_bytes / @c max_segment_bytes.
+  cucascade::io::rest::config rest{};
 
   /// The read path's caching configuration: mode, eviction policy and the
   /// prefetching cache's tunables.  One block, rather than a mode here and the
   /// tunables in a sibling one.
-  io::cache::config cache{};
+  cucascade::io::cache::config cache{default_cache_config()};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
-  io::object_store_config object_store{};
+  cucascade::io::object_store_config object_store{};
 
   /// Background host->GPU memory prefetcher for queued pinned-cache scan
   /// splits. Disabled by default.
@@ -275,6 +321,25 @@ struct scan_manager_config {
   {
     cache.apply_mode();
     uring.use_odirect = cache.use_odirect();
+  }
+
+  /// The cuCascade io configuration for the @c io_context_registry: the backend
+  /// sub-configs and reactor counts copied verbatim, @ref backend mapped onto
+  /// cuCascade's enum, and the cache-derived knobs refreshed.
+  [[nodiscard]] cucascade::io::io_config to_io_config() const
+  {
+    cucascade::io::io_config out{};
+    switch (backend) {
+      case io_backend::native: out.backend = cucascade::io::io_backend::native; break;
+    }
+    out.uring_n_reactors = uring_n_reactors;
+    out.rest_n_reactors  = rest_n_reactors;
+    out.uring            = uring;
+    out.rest             = rest;
+    out.cache            = cache;
+    out.object_store     = object_store;
+    out.apply_cache_mode();
+    return out;
   }
 
   /// Resolve what the readahead should run with, or a budget of 0 to not run
@@ -295,9 +360,10 @@ struct scan_manager_config {
     // chunk would be dropped before its scan ever asked for it.
     if (!cache.enabled()) { return plan; }
     // A backend budget of zero is the backend opting out of readahead entirely
-    // (see io::uring::config::n_max_concurrent_scans).  Honor it even under the
-    // opportunistic strategy, which would otherwise substitute the pipeline
-    // width and run a readahead the backend asked not to have.
+    // (an explicit `n_max_concurrent_scans: 0`, or the unresolved default of
+    // default_uring_config).  Honor it even under the opportunistic strategy,
+    // which would otherwise substitute the pipeline width and run a readahead
+    // the backend asked not to have.
     if (backend_budget == 0) { return plan; }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful
@@ -308,6 +374,23 @@ struct scan_manager_config {
     return plan;
   }
 };
+
+// Resolve only after GPU topology and CPU restrictions determine eligible domains.
+// Preserve direct C++ overrides as well as explicitly supplied YAML values.
+inline int resolve_scan_manager_num_threads(scan_manager_config const& config, size_t domains)
+{
+  auto workers   = config.thread_pool.num_threads;
+  auto automatic = default_scan_manager_num_threads();
+  if (workers <= 0) throw std::invalid_argument("scan_manager.num_threads must be positive");
+  if (config.num_threads_explicit || workers != automatic) {
+    if (static_cast<size_t>(workers) < domains)
+      throw std::invalid_argument("scan_manager.num_threads must cover each eligible NUMA domain");
+    return workers;
+  }
+  if (domains > static_cast<size_t>(std::numeric_limits<int>::max()))
+    throw std::invalid_argument("too many scan metadata NUMA domains");
+  return std::max(workers, static_cast<int>(domains));
+}
 
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)

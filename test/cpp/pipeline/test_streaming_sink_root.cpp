@@ -21,7 +21,6 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <duckdb.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 

@@ -28,7 +28,6 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>

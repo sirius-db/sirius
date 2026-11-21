@@ -15,7 +15,6 @@
  */
 
 // sirius
-#include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/date_cast.hpp>
 #include <expression_evaluator/decimal_integer_cast.hpp>
@@ -34,7 +33,6 @@
 #include <cudf/utilities/traits.hpp>
 
 // standard library
-#include <algorithm>
 #include <limits>
 
 namespace sirius {

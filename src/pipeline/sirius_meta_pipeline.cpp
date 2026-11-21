@@ -16,8 +16,6 @@
 
 #include "pipeline/sirius_meta_pipeline.hpp"
 
-#include "config.hpp"
-
 #include <algorithm>
 
 namespace sirius {

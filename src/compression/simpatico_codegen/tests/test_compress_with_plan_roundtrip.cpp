@@ -1,6 +1,4 @@
 #include "api/simpatico_codegen.hpp"
-#include "codegen/jit/nvrtc_compiler.hpp"
-#include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/util/stream_pool.hpp"
 #include "test_utils.hpp"
@@ -10,7 +8,6 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -19,10 +16,8 @@
 #include <nvcomp/version.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -971,6 +966,27 @@ int main()
 
         auto t_empty = make_strings_table({"", "", ""}, {}, stream);
         roundtrip_once(t_empty->view(), plan, 1, "string_all_empty");
+      }
+
+      // Constant-width keys over bare bitpacked indices gather every row's key bytes straight
+      // from the packed codes; a FOR over the codes takes the general route.
+      std::vector<std::vector<std::string>> const constant_key_sets = {
+        {"A", "N", "R"}, {"FIFTEEN-BYTES-A", "FIFTEEN-BYTES-B"}};
+      for (auto const& keys : constant_key_sets) {
+        for (int rows : {1, 31, 32, 33, 1025, 300001}) {
+          std::vector<std::string> values(static_cast<std::size_t>(rows));
+          for (int r = 0; r < rows; ++r)
+            values[static_cast<std::size_t>(r)] = keys[(r * 7 + r / 3) % keys.size()];
+          auto t = make_strings_table(values, {}, stream);
+          for (char const* plan :
+               {"input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+                "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                "dictionary.indices -> for -> deltas, references\n"
+                "dictionary.indices.deltas -> bitpack\n"}) {
+            roundtrip_once(t->view(), plan, 1, "constant_width_dictionary");
+          }
+        }
       }
 
       // The canonical childless empty column (cudf::make_empty_column).

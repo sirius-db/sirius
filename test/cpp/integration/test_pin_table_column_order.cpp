@@ -36,7 +36,6 @@
 // superset), so the query exercises the cached-scan path on both pin tiers.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 

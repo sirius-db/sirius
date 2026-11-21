@@ -1,7 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #include "config_loading.hpp"
 
-#include <yaml-cpp/yaml.h>
+#include <yaml-cpp/yaml.h>  // IWYU pragma: keep
 
 #include <fstream>
 

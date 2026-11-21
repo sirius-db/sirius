@@ -16,6 +16,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <rmm/cuda_stream.hpp>
 
@@ -722,11 +723,11 @@ TEST_CASE("dense_count_join owns direct child port and barrier wiring",
 
   duckdb::vector<sirius::logical_type> child_types;
   child_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
-  auto preserved =
-    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::CONCAT, child_types, 1);
+  auto preserved = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::CONCAT, child_types, 1);
   auto* preserved_ptr = preserved.get();
-  auto counted =
-    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::FILTER, child_types, 1);
+  auto counted        = duckdb::make_uniq<sirius::op::test_physical_operator>(
+    SiriusPhysicalOperatorType::FILTER, child_types, 1);
   auto* counted_ptr = counted.get();
   op.children.push_back(std::move(preserved));
   op.children.push_back(std::move(counted));

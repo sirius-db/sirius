@@ -23,7 +23,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <set>
@@ -295,6 +294,19 @@ TEST_CASE_METHOD(DecimalSumFixture,
   compare_gpu_vs_cpu_approx(
     "SELECT g, sum(q) s, avg(q) a, sum(p) t, count(*) c FROM small GROUP BY g;",
     std::set<size_t>{1, 2, 3},
+    1e-12);
+}
+
+TEST_CASE_METHOD(DecimalSumFixture,
+                 "decimal sum overflow - statistics-bounded grouped SUM and AVG beside a FIRST",
+                 "[integration][gpu_execution][aggregate][decimal_sum_overflow]")
+{
+  create_small_decimal_tables(*this);
+  // The FIRST shifts every bound's expression index but owns no cuDF request. It carries a copy of
+  // the key, so both engines return the same row.
+  compare_gpu_vs_cpu_approx(
+    "SELECT g, first(g) fg, sum(q) s, avg(q) a, sum(p) t FROM small GROUP BY g;",
+    std::set<size_t>{2, 3, 4},
     1e-12);
 }
 

@@ -26,7 +26,6 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/settings.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <vector>
 

@@ -34,6 +34,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
 #include "sirius/exception.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <memory>
 
@@ -52,7 +53,7 @@ struct schedule_fixture {
   //! An operator that no pipeline ever claimed, as an unplaced plan node would be.
   std::unique_ptr<sirius::op::sirius_physical_operator> make_operator()
   {
-    auto op = std::make_unique<sirius::op::sirius_physical_operator>(
+    auto op = std::make_unique<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::FILTER,
       duckdb::vector<sirius::logical_type>{},
       /*estimated_cardinality=*/0);
@@ -74,7 +75,7 @@ struct schedule_fixture {
     return pipeline;
   }
 
-  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr};
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   sirius::exec::query_lifecycle_registry lifecycle;
   task_creator creator;

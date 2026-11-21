@@ -16,9 +16,7 @@
 
 #include "op/sirius_physical_column_data_scan.hpp"
 
-#include "config.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -119,7 +117,8 @@ std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches(),
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_position());
 }
 
 }  // namespace op

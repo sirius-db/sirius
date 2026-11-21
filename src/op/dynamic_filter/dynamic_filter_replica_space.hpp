@@ -17,9 +17,6 @@
 #pragma once
 
 #include <functional>
-#include <optional>
-#include <span>
-#include <utility>
 
 namespace cucascade::memory {
 class memory_space;
@@ -54,17 +51,5 @@ class dynamic_filter_replica_space final {
   std::reference_wrapper<cucascade::memory::memory_space> _gpu_space;
   std::reference_wrapper<cucascade::memory::memory_space const> _host_staging_space;
 };
-
-/**
- * @brief Grants all ordered replica-pool accesses needed by accumulated Bloom publication
- *
- * Applies `sirius::memory::find_pair_without_pool_access` to the replicas' GPU spaces; CUDA errors
- * propagate. The replicas are borrowed only for this call.
- *
- * @return First unavailable (allocation owner, accessor) pair, or no value when every required
- * grant succeeds
- */
-[[nodiscard]] std::optional<std::pair<int, int>> find_pair_without_pool_access(
-  std::span<dynamic_filter_replica_space const> replicas);
 
 }  // namespace sirius::op

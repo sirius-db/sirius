@@ -44,13 +44,11 @@
 //   3. Repeated back-to-back invocations of BUILD_PROBE don't wedge on the
 //      leftover hash table state from the prior query (DESTROYED → NOT_BUILT).
 
-#include "log/logging.hpp"
 #include "mgpu_test_utils.hpp"
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <unistd.h>
 
 #include <cstdlib>

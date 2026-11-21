@@ -13,8 +13,6 @@
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
-#include <duckdb.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -24,7 +22,6 @@
 #include <fstream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -283,7 +280,7 @@ class s3_tpch_suite {
     auto context =
       gpu_connection_->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(context);
-    sirius::io::object_store_config object_store;
+    cucascade::io::object_store_config object_store;
     object_store.endpoint      = env_.endpoint;
     object_store.region        = env_.region;
     object_store.access_key    = env_.access_key;

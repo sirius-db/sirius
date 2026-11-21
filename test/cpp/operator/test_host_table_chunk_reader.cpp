@@ -32,9 +32,6 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-// duckdb
-#include <duckdb/common/types/timestamp.hpp>
-
 // rmm
 #include <rmm/cuda_stream.hpp>
 

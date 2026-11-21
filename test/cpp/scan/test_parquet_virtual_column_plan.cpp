@@ -5,14 +5,9 @@
  * you may not use this file except in compliance with the License.
  */
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
-
 #include <catch.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <sirius/exception.hpp>
 
 namespace {
 

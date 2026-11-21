@@ -30,6 +30,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 #include "utils/telemetry_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/lists/lists_column_view.hpp>
 
@@ -88,6 +89,11 @@ class hint_walker final : public sirius::creator::task_creator {
 
 class capture_result final : public sirius_physical_operator {
  public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   explicit capture_result(schema types)
     : sirius_physical_operator(SiriusPhysicalOperatorType::RESULT_COLLECTOR, std::move(types), 1)
   {
@@ -117,7 +123,7 @@ class capture_result final : public sirius_physical_operator {
 struct merge_fixture {
   sirius::pipeline::pipeline_build_context context{nullptr};
   cucascade::shared_data_repository_manager repositories;
-  sirius_physical_operator producer;
+  test_physical_operator producer;
   sirius_physical_ungrouped_aggregate_merge merge;
   capture_result collector;
   std::shared_ptr<sirius_pipeline> upstream;

@@ -56,13 +56,23 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
           pixi-version: v0.81.0
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
+
+      - name: Test concurrent benchmark harness without a GPU
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
+            -s test/tpch_performance -p 'test_concurrent_benchmark.py'
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python -m unittest discover \
+            -s test/tpch_performance -p 'test_throughput_validation.py'
+
+      - name: Test Pixi activation invariants without a GPU
+        run: pixi run -e ${{ matrix.cuda.pixi-environment }} python -B test/scripts/test_pixi_activate.py -v
 
       - name: Test Simpatico cache identity without a GPU
         run: |
@@ -121,6 +131,12 @@ jobs:
           LD_PRELOAD="$PWD/build/loader/extension/sirius/test/libsirius_test_hide_driver.so" \
             build/loader/test/unittest --autoloading available --require sirius \
             "$PWD/sirius-duckdb/loader/test/sql/*"
+
+      - name: Build no-export DuckDB hosts
+        # The official DuckDB CLI exports no DuckDB symbols (#2174); the wrapper CLI exports
+        # them all. Relink the wrapper CLI without -rdynamic to get a host of the official
+        # shape, plus a variant with the reference symbols demoted to LOCAL binding.
+        run: test/scripts/build_noexport_host.sh sirius-duckdb/build/release
 
       - name: Build shared DuckDB scan host tests
         run: |
@@ -196,7 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true
@@ -258,6 +274,7 @@ jobs:
       - name: Run C++ unit tests
         env:
           SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_GPU: "1"
           SIRIUS_TEST_REQUIRE_DUCKLAKE: "1"
         run: |
           nvidia-smi
@@ -278,7 +295,29 @@ jobs:
         run: |
           export LD_LIBRARY_PATH="$PWD/build/release:$CONDA_PREFIX/lib:$CONDA_PREFIX/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           pixi run --locked -e ${{ matrix.cuda.pixi-environment }} cargo test --locked \
-            --manifest-path rust/Cargo.toml --package sirius-ffi
+            --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --package sirius-ffi
+
+      - name: Scan smoke in no-export hosts (as linked)
+        id: smoke
+        # Loads the extension into the no-export CLI and runs a filtered Parquet scan and a
+        # filtered native-table scan with CPU fallback disabled, asserting a logged GPU
+        # execution for each: the scan verification must find the host's trusted reference
+        # definitions without dynamic exports (#2174).
+        timeout-minutes: 15
+        run: |
+          SMOKE_OUT_DIR=build/release/test/cpp/log/host_smoke test/scripts/host_cli_scan_smoke.sh \
+            ./sirius-duckdb/build/release/duckdb-noexport \
+            ./sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+
+      - name: Scan smoke in no-export hosts (LOCAL symbols)
+        # Same check against a host whose reference symbols have LOCAL binding, the shape of
+        # the official DuckDB v2.0 preview CLI (#2174).
+        if: ${{ !cancelled() && steps.smoke.conclusion != 'skipped' }}
+        timeout-minutes: 15
+        run: |
+          SMOKE_OUT_DIR=build/release/test/cpp/log/host_smoke_local test/scripts/host_cli_scan_smoke.sh \
+            ./sirius-duckdb/build/release/duckdb-noexport-local \
+            ./sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
@@ -350,7 +389,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
         with:
           cache: false
           locked: true

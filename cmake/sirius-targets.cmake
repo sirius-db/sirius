@@ -1,5 +1,9 @@
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
+if(SIRIUS_DISTRIBUTION_DEFAULTS)
+  target_compile_definitions(sirius_objects
+                             PRIVATE SIRIUS_DISTRIBUTION_DEFAULTS)
+endif()
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
 set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -45,20 +49,20 @@ set(SIRIUS_LINK_LIBRARIES
     spdlog::spdlog
     cuCascade::cucascade
     cuCascade::cucascade_cudf
+    cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     roaring::roaring
+    nixl::nixl
     telemetry_bridge
     $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico
-    PkgConfig::NUMA
     PkgConfig::LIBURING
-    ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
-    kvikio::kvikio)
-if(BUILD_WITH_CTRACK)
-  list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
-endif()
+    absl::strings
+    utf8proc::utf8proc
+    # NVML: the NIXL fabric checks peer access between GPUs other processes own.
+    CUDA::nvml)
 
 foreach(_target sirius_objects sirius_core sirius_shared)
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
@@ -87,6 +91,17 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    # zstd device code; needs a CUDA 12.4+ driver, below the 12.8 floor.
+    target_compile_options(
+      ${_target}
+      PRIVATE
+        "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xfatbin=-compress-all;--compress-mode=size>"
+    )
+    if(NOT _target STREQUAL "sirius_objects")
+      target_link_options(
+        ${_target} PRIVATE
+        "$<DEVICE_LINK:-Xfatbin=-compress-all;--compress-mode=size>")
+    endif()
   endif()
 
   # In the vcpkg build, vcpkg include dir must be searched before DuckDB's
@@ -117,7 +132,8 @@ foreach(_target sirius_objects sirius_core sirius_shared)
 
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
-  # (cuCascade::cucascade) and cudf::cudf.
+  # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io is the io
+  # library (uring/REST reactors, fs_cache) Sirius consumes directly.
 
   target_link_libraries(${_target} PRIVATE ${SIRIUS_LINK_LIBRARIES})
 
@@ -160,7 +176,10 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+# mold localizes GNU_UNIQUE symbols under --exclude-libs (rmm#826).
+if(CMAKE_LINKER_TYPE STREQUAL "MOLD")
+  set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+endif()
 
 # Keep the embedded DuckDB private when the host exposes another DuckDB
 # globally.
@@ -173,9 +192,9 @@ endforeach()
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
                     "LINKER:--allow-multiple-definition")
 
-# sirius-ffi is built by Cargo, independently of the telemetry bridge above. Its
-# build.rs compiles against include/ and links the library in build/<preset>.
-# See rust/crates/sirius-ffi.
+# Cargo builds the Rust API crates separately from the telemetry bridge above.
+# sirius-sys links libsirius from build/<preset>; sirius-ffi additionally
+# compiles its C++ bridge against include/. See rust/README.md.
 
 # NVML's static stub cannot be embedded safely; the real library is supplied by
 # the NVIDIA driver. Keep this requirement in the exported support target.

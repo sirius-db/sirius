@@ -14,12 +14,7 @@
  * limitations under the License.
  */
 
-// clang-format off
-#include <variant>
 #include "expression_evaluator/regex/regex_playground.hpp"
-// clang-format on
-
-#include <cudf/cudf_utils.hpp>
 
 namespace sirius {
 namespace regex {

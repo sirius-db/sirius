@@ -10,20 +10,22 @@ if(NOT EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
       "Initialize the DuckDB submodule or set SIRIUS_DUCKDB_SOURCE_DIR")
 endif()
 
+# Installed with the package: the DuckDB extension refuses a library built from
+# another revision.
+include("${CMAKE_CURRENT_LIST_DIR}/sirius-duckdb-revision.cmake")
+sirius_duckdb_revision("${SIRIUS_DUCKDB_SOURCE_DIR}"
+                       SIRIUS_DUCKDB_SOURCE_REVISION)
+
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
   set(DUCKDB_EXTENSION_CONFIGS "")
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)
-  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION)
-    execute_process(
-      COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
-      OUTPUT_VARIABLE sirius_duckdb_commit
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(sirius_duckdb_commit STREQUAL "d54cbbe3df17e8e5ce68312f483b4155836112aa")
-      set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
-    endif()
+  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION
+     AND SIRIUS_DUCKDB_SOURCE_REVISION STREQUAL
+         "d54cbbe3df17e8e5ce68312f483b4155836112aa")
+    set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
   endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)
@@ -66,6 +68,17 @@ endif()
 target_link_libraries(
   sirius_duckdb_dependency INTERFACE duckdb_static core_functions_extension
                                      parquet_extension)
+
+# duckdb's vendored moodycamel (namespace duckdb_moodycamel). cuCascade io links
+# this so both sides of the boundary use one moodycamel ABI. IMPORTED (like
+# sirius_duckdb_dependency) because DuckDB's build-tree export() keeps
+# cucascade_io_thirdparty's $<BUILD_INTERFACE:> link to it, and a non-imported
+# target would have to join an export set.
+add_library(sirius_duckdb_moodycamel INTERFACE IMPORTED GLOBAL)
+add_library(duckdb::moodycamel ALIAS sirius_duckdb_moodycamel)
+target_include_directories(
+  sirius_duckdb_moodycamel
+  INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue")
 
 function(sirius_link_duckdb_extensions target)
   set(DUCKDB_MODULE_BASE_DIR "${SIRIUS_DUCKDB_SOURCE_DIR}")

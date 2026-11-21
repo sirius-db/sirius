@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/mapping_rules.hpp"
 #include "op/scan/table_scan/materializer_capabilities.hpp"
 
 #include <duckdb/common/column_index.hpp>
@@ -53,10 +54,10 @@ struct scan_envelope;
 class reservation_provider;
 struct admission_decision;
 }  // namespace sirius::scan_manager
-namespace sirius::io {
-class sirius_datasource;
+namespace cucascade::io {
+class datasource;
 class io_object_metadata;
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 class scan_info;
@@ -204,7 +205,8 @@ enum class verdict_reason : uint16_t {
   callback_mismatch,
   iceberg_puffin_uri_unsupported,
   iceberg_puffin_remote_eager,
-  iceberg_delete_corrupt
+  iceberg_delete_corrupt,
+  provider_admission_refused
 };
 
 struct scan_publication_observation {
@@ -217,8 +219,23 @@ struct scan_publication_observation {
 };
 
 struct physical_check_counters {
+  std::array<std::array<std::atomic<uint64_t>, 11>, 3> mapper_refusals{};
+  void record_mapper_refusal(rule_set_id rules, refusal_rule rule) noexcept
+  {
+    mapper_refusals[static_cast<std::size_t>(rules)][static_cast<std::size_t>(rule)].fetch_add(
+      1, std::memory_order_relaxed);
+  }
+  [[nodiscard]] std::array<std::array<uint64_t, 11>, 3> mapper_refusal_snapshot() const noexcept
+  {
+    std::array<std::array<uint64_t, 11>, 3> result{};
+    for (std::size_t i = 0; i < result.size(); ++i)
+      for (std::size_t j = 0; j < result[i].size(); ++j)
+        result[i][j] = mapper_refusals[i][j].load(std::memory_order_relaxed);
+    return result;
+  }
   std::atomic<uint64_t> split_flushed_for_schema{0};
   std::atomic<uint64_t> arrow_batches_imported{0}, arrow_rows_imported{0};
+  std::atomic<uint64_t> arrow_schema_drift_refusals{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
@@ -305,7 +322,7 @@ struct physical_check_counters {
   }
   std::atomic<uint64_t> checks{0};
   std::array<std::atomic<uint64_t>,
-             static_cast<std::size_t>(verdict_reason::iceberg_delete_corrupt) + 1>
+             static_cast<std::size_t>(verdict_reason::provider_admission_refused) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
@@ -516,12 +533,12 @@ struct split_materializer_certificate {
 struct parquet_input_approval {
   std::size_t footer_bytes = 0;
   std::vector<std::size_t> row_groups;
-  std::shared_ptr<io::io_object_metadata const> metadata_owner;
+  std::shared_ptr<cucascade::io::io_object_metadata const> metadata_owner;
   std::string object_identity;
 };
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;

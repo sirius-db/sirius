@@ -19,7 +19,6 @@
 // pinned table and checkpoint replacement cannot race a pinned scan.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <sirius_context.hpp>

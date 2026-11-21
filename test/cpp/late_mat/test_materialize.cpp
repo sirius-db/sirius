@@ -54,7 +54,6 @@
 #include <cstdint>
 #include <memory>
 #include <numeric>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>

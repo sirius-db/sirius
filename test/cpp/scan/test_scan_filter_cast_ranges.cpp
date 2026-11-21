@@ -23,7 +23,6 @@
 // from midnight(d) = d * ticks_per_day being strictly monotonic in d.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/interval.hpp>
 #include <duckdb/common/types/timestamp.hpp>
@@ -33,8 +32,6 @@
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
 #include <utils/table_filter_test_utils.hpp>

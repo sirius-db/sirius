@@ -5,9 +5,8 @@
 
 #include <catch.hpp>
 #include <core_functions_extension.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
-#include <duckdb/common/multi_file/multi_file_function.hpp>
+#include <duckdb/common/multi_file/multi_file_function.hpp>  // IWYU pragma: keep
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension_helper.hpp>

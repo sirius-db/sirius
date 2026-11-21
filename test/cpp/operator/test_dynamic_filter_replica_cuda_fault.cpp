@@ -19,6 +19,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
 #include "utils/cuda_status_fault.hpp"
+#include "utils/pool_peer_access_requirement.hpp"
 
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
@@ -36,7 +37,6 @@
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
-#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <memory/pool_peer_access.hpp>
 #include <memory/pool_peer_access_detail.hpp>
 
@@ -185,6 +185,8 @@ TEMPLATE_TEST_CASE("ordinary replica CUDA failures propagate after pending copie
   auto spaces  = get_replica_spaces(*manager);
   auto& source = spaces.front().get_gpu_space();
   if (have_pending_copy && !sirius::memory::try_grant_pool_access(source, 1)) {
+    sirius::test::fail_if_pool_peer_access_required(
+      "pending asynchronous replica case requires source-pool access");
     WARN(
       "pending asynchronous replica case requires source-pool access; first-copy errors remain "
       "covered");
@@ -291,6 +293,8 @@ TEMPLATE_TEST_CASE("replica completion errors drain every pending copy before pr
   auto spaces  = get_replica_spaces(*manager);
   auto& source = spaces.front().get_gpu_space();
   if (!sirius::memory::try_grant_pool_access(source, 1)) {
+    sirius::test::fail_if_pool_peer_access_required(
+      "completion fault requires a direct copy so staging cannot consume it");
     SKIP("completion fault requires a direct copy so staging cannot consume it");
   }
   spaces.push_back(spaces.back());

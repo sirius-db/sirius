@@ -9,7 +9,6 @@
 #include "log/logging.hpp"
 
 #include <cudf/copying.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>

@@ -15,7 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "scan_manager/preparation.hpp"
@@ -23,6 +22,8 @@
 #include "utils/host_allocation_fault.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
+
+#include <cucascade/cudf/datasource.hpp>
 
 #include <array>
 #include <barrier>
@@ -188,14 +189,14 @@ TEST_CASE("Failed ready snapshot retries release replaced dependency owners outs
         delete value;
       });
     // Real datasource shell, with no I/O context/object: only ownership is exercised.
-    old.datasource = std::shared_ptr<sirius::io::sirius_datasource>(
-      new sirius::io::sirius_datasource(nullptr, nullptr), [observer = seen[2]](auto* value) {
+    old.datasource = std::shared_ptr<cucascade::io::datasource>(
+      new cucascade::io::datasource(nullptr, nullptr), [observer = seen[2]](auto* value) {
         observer->release();
         delete value;
       });
     replacement.footer           = std::make_shared<cudf::io::parquet::FileMetaData>();
     replacement.parquet_approval = std::make_shared<sirius::op::scan::parquet_input_approval>();
-    replacement.datasource = std::make_shared<sirius::io::sirius_datasource>(nullptr, nullptr);
+    replacement.datasource       = std::make_shared<cucascade::io::datasource>(nullptr, nullptr);
   } else if (family == required_input::segments) {
     old.profiles = std::shared_ptr<sirius::op::scan::physical_profile_table>(
       new sirius::op::scan::physical_profile_table, [observer = seen[0]](auto* value) {

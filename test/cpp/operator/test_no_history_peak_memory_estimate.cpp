@@ -22,6 +22,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "operator/partition_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 
@@ -37,6 +38,11 @@ namespace {
 // Minimal concrete subclass for testing the base-class default.
 class stub_operator : public sirius_physical_operator {
  public:
+ public:
+  sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
   stub_operator() : sirius_physical_operator(SiriusPhysicalOperatorType::FILTER, {}, 0) {}
   std::string get_name() const override { return "stub"; }
 };
@@ -53,11 +59,11 @@ hash_join_fixture make_hash_join()
   f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
   f.logical_join->types = {duckdb::LogicalType::INTEGER};
 
-  auto left = duckdb::make_uniq<sirius_physical_operator>(
+  auto left = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);
-  auto right = duckdb::make_uniq<sirius_physical_operator>(
+  auto right = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0);

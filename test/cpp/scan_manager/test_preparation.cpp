@@ -20,7 +20,6 @@
 #include <duckdb/common/exception.hpp>
 
 #include <barrier>
-#include <chrono>
 #include <thread>
 
 using sirius::pipeline::completion_handler;

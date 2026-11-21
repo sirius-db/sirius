@@ -2,6 +2,8 @@
 #include "c_api/error_internal.hpp"
 #include "catch.hpp"
 
+#include <rmm/error.hpp>
+
 #include <sirius-c/context/config_builder.h>
 #include <sirius-c/version.h>
 #include <unistd.h>
@@ -187,17 +189,15 @@ TEST_CASE("C configuration supports concurrent builds from immutable settings",
     CHECK(worker.get());
 }
 
-TEST_CASE("C exception boundary preserves statuses without allocating diagnostics",
+TEST_CASE("C exception boundary preserves statuses when diagnostics are unavailable",
           "[c_api_config][config]")
 {
   auto* error = reinterpret_cast<sirius_error*>(std::uintptr_t{1});
-  CHECK(sirius::c_api::invoke(&error, []() -> sirius_status { throw std::bad_alloc{}; }) ==
+  CHECK(sirius::c_api::invoke(nullptr, []() -> sirius_status { throw std::bad_alloc{}; }) ==
         SIRIUS_ALLOCATION_FAILURE);
-  CHECK(error == nullptr);
-  error = reinterpret_cast<sirius_error*>(std::uintptr_t{1});
-  CHECK(sirius::c_api::with_diagnostic(SIRIUS_CONFIGURATION_IO, &error, []() -> sirius_error* {
+  CHECK(sirius::c_api::with_diagnostic(SIRIUS_ALLOCATION_FAILURE, &error, []() -> sirius_error* {
           throw std::bad_alloc{};
-        }) == SIRIUS_CONFIGURATION_IO);
+        }) == SIRIUS_ALLOCATION_FAILURE);
   CHECK(error == nullptr);
   CHECK(sirius::c_api::invoke(nullptr, []() -> sirius_status {
           throw std::runtime_error("failure");
@@ -210,4 +210,21 @@ TEST_CASE("C exception boundary preserves statuses without allocating diagnostic
   CHECK(std::string(sirius_error_message(diagnostic.get())) == "failure");
   CHECK(sirius::c_api::invoke(nullptr, []() -> sirius_status { throw 1; }) ==
         SIRIUS_INTERNAL_ERROR);
+}
+
+TEST_CASE("C exception boundary preserves allocation diagnostics", "[c_api_config][config]")
+{
+  auto check = [](const auto& failure) {
+    sirius_error* raw = nullptr;
+    auto status       = sirius::c_api::invoke(
+      &raw, [&]() -> sirius_status { throw failure; }, SIRIUS_CONTEXT_INITIALIZATION);
+    error_owner diagnostic(raw, sirius_error_destroy);
+    CHECK(status == SIRIUS_ALLOCATION_FAILURE);
+    REQUIRE(diagnostic);
+    CHECK(std::string(sirius_error_message(diagnostic.get()),
+                      sirius_error_message_size(diagnostic.get())) == failure.what());
+  };
+  SECTION("host allocation") { check(std::bad_alloc{}); }
+  SECTION("RMM allocation") { check(rmm::bad_alloc{"pinned allocation failed"}); }
+  SECTION("RMM pool exhaustion") { check(rmm::out_of_memory{"device pool exhausted"}); }
 }

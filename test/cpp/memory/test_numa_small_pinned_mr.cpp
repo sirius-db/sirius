@@ -16,18 +16,20 @@
  */
 
 #include "memory/numa_small_pinned_mr.hpp"
+#include "utils/host_allocation_fault.hpp"
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
-#include <catch2/catch_all.hpp>
+#include <catch.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 using namespace cucascade::memory;
@@ -91,17 +93,42 @@ class pending_stream_work {
   std::atomic<bool> released_{false};
 };
 
+[[nodiscard]] std::vector<void*> allocate_slabs(sirius::memory::numa_small_pinned_mr& mr,
+                                                std::size_t bytes,
+                                                std::size_t count)
+{
+  std::vector<void*> slabs;
+  for (std::size_t i = 0; i < count; ++i) {
+    slabs.push_back(mr.allocate_sync(bytes));
+  }
+  return slabs;
+}
+
+void deallocate_slabs(sirius::memory::numa_small_pinned_mr& mr,
+                      std::vector<void*> const& slabs,
+                      std::size_t bytes)
+{
+  for (auto* slab : slabs) {
+    mr.deallocate_sync(slab, bytes);
+  }
+}
+
 }  // namespace
 
 TEST_CASE("NUMA facade synchronous allocation waits for pending DMA before host reuse",
           "[numa_small_pinned][stream_ordering]")
 {
   // Slab reuse already existed before the large-cache change; keep this regression independent.
-  constexpr std::size_t bytes = 2048;
+  constexpr std::size_t bytes           = 2048;
+  constexpr std::size_t slabs_per_block = test_fixture::block_size / bytes;
   test_fixture f;
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
   rmm::device_buffer device{bytes, ::cuda::stream_ref{producer.value()}};
   auto* original = f.slab_mr.allocate_sync(bytes);
+  // Hold the rest of the block's slabs, so the slab freed below is the only free one. A pool
+  // that prefers slabs with no pending work would otherwise hand out an unused slab and never
+  // wait for the copy.
+  auto const held = allocate_slabs(f.slab_mr, bytes, slabs_per_block - 1);
   std::memset(original, 0x43, bytes);
   pending_stream_work gate{producer};
   CUCASCADE_CUDA_TRY(
@@ -123,4 +150,49 @@ TEST_CASE("NUMA facade synchronous allocation waits for pending DMA before host 
   REQUIRE(std::all_of(
     copied.begin(), copied.end(), [](std::byte value) { return value == std::byte{0x43}; }));
   f.slab_mr.deallocate_sync(reused, bytes);
+  deallocate_slabs(f.slab_mr, held, bytes);
+}
+
+TEST_CASE("NUMA facade gives a slab back to its pool when recording the slab fails",
+          "[.][numa_small_pinned][host_allocation_fault]")
+{
+  using fault = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault::available());
+  constexpr std::size_t bytes           = 2048;
+  constexpr std::size_t slabs_per_block = test_fixture::block_size / bytes;
+  ::cuda::stream_ref const stream{cudaStreamPerThread};
+
+  // Fail each allocation a fresh facade's first request makes in turn: the pool carving a block
+  // into slabs, then the facade recording which pool the slab came from. Whichever one failed,
+  // the request must lose no slab, so a block's worth of slabs still fits in one upstream block.
+  std::size_t failures = 0;
+  for (std::size_t ordinal = 1;; ++ordinal) {
+    test_fixture f;
+    auto const free_before = f.upstream.get_free_blocks();
+    void* ptr              = nullptr;
+    bool failed            = false;
+    bool fired             = false;
+    {
+      fault injection(fault::every_allocation_scope, ordinal);
+      try {
+        ptr = f.slab_mr.allocate(stream, bytes);
+      } catch (std::bad_alloc const&) {
+        failed = true;
+      }
+      (void)injection.stop();
+      fired = injection.fired();
+    }
+    INFO("allocation " << ordinal << " of the first request failed");
+    if (!fired) {  // the request made fewer allocations than `ordinal`
+      REQUIRE_FALSE(failed);
+      f.slab_mr.deallocate_sync(ptr, bytes);
+      break;
+    }
+    ++failures;
+    REQUIRE(failed);
+    auto const slabs = allocate_slabs(f.slab_mr, bytes, slabs_per_block);
+    CHECK(f.upstream.get_free_blocks() == free_before - 1);
+    deallocate_slabs(f.slab_mr, slabs, bytes);
+  }
+  CHECK(failures >= 2);  // at least one in the pool and one recording the slab
 }

@@ -17,7 +17,7 @@
 #include "helper/transaction_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>

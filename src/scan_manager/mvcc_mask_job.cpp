@@ -27,6 +27,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/error_data.hpp>
 #include <duckdb/transaction/transaction_data.hpp>
 
 #include <algorithm>
@@ -87,6 +88,10 @@ void fan_out_and_join(exec::scoped_dispatcher& dispatcher,
   }
   controller.close();
   done_future.wait();
+  // Completion slots retire inside callback destruction, before the enclosing
+  // dispatcher reservation. Join that reservation too before the prepare owner
+  // reuses this dispatcher and binds coordinator callbacks.
+  dispatcher.wait_for_all();
 
   if (submission_error) { std::rethrow_exception(submission_error); }
   if (state->first_error) { std::rethrow_exception(state->first_error); }
@@ -155,9 +160,11 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
       try {
         return op::scan::capture_mvcc_visibility_plan(
           *request.storage, *request.context, request.metadata);
+      } catch (duckdb::InterruptException const&) {
+        throw;
       } catch (std::exception const& e) {
-        throw std::runtime_error("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
-                                 "': " + e.what());
+        duckdb::ErrorData(e).Throw("[prepare_mvcc_mask_tasks] pinned entry '" + request.entry_name +
+                                   "': ");
       }
     }();
     if (plan.mvcc_row_groups.size() != request.masks.size() ||

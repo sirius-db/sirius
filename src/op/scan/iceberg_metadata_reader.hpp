@@ -16,13 +16,13 @@
 
 #pragma once
 
-#include "io/types.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/io/types.hpp>
 #include <duckdb/main/client_context.hpp>
 
 #include <cstdint>
@@ -35,9 +35,9 @@
 #include <unordered_set>
 #include <vector>
 
-namespace sirius::io {
+namespace cucascade::io {
 class ioctx;
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 
@@ -102,10 +102,12 @@ struct inventory_query_error : std::runtime_error {
 std::unordered_set<std::string> iceberg_files_without_partition_values(
   duckdb::ClientContext&, iceberg_delete_inventory const&);
 
+/// @p expected_table_uuid is checked by iceberg_metadata() when the loaded extension accepts it.
 inventory_result read_delete_inventory(duckdb::ClientContext&,
                                        std::string const&,
                                        std::optional<int64_t>,
-                                       std::string_view injection = {});
+                                       std::string_view injection           = {},
+                                       std::string_view expected_table_uuid = {});
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);
@@ -173,18 +175,14 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  * first drops deletes silently and returns rows the table removed.
  *
  * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
- *                       sufficient (planning-time reads). Must outlive the call; nullptr throws.
- * @param snapshot_id    The snapshot the SCAN was bound to. Callers on the GPU path always pass
- *                       one: an unpinned iceberg_scan is declined at plan time precisely so that
- *                       this pass cannot resolve "current" independently and pair one snapshot's
- *                       data files with another's deletes. This function never queries the
- * inventory.
+ *                       sufficient (planning-time reads). Shared because every datasource
+ *                       opened on it co-owns it; nullptr throws.
+ * The caller supplies discovery from the scan's snapshot-scoped inventory.
  */
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  sirius::io::ioctx* metadata_ioctx,
-  std::optional<uint64_t> snapshot_id,
+  std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery);
 
 /// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.

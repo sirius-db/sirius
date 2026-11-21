@@ -17,7 +17,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/execution/expression_executor.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/parquet_fixture_utils.hpp>

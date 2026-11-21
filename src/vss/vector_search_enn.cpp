@@ -26,7 +26,6 @@
 #include <raft/core/device_resources.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <cstddef>
 #include <memory>

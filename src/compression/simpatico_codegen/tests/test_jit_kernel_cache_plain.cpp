@@ -22,7 +22,7 @@
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
-#include "test_utils.hpp"
+#include "test_utils.hpp"  // IWYU pragma: keep
 
 #include <chrono>
 #include <cstdio>

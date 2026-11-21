@@ -57,7 +57,6 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/types.hpp"
 #include "s3_autotune.hpp"
 #include "s3_bench_common.hpp"
 
@@ -398,8 +397,8 @@ struct file_plan {
   /// One allocation per file, carved into a slice per request.  Value-init
   /// touches every page, so the timed loop never takes a first-touch fault.
   std::vector<std::uint8_t> buffer;
-  std::vector<sirius::io::slice> slices;
-  std::unique_ptr<sirius::io::sirius_datasource> ds;
+  std::vector<cucascade::io::slice> slices;
+  std::unique_ptr<cucascade::io::datasource> ds;
 };
 
 /// Per-table rollup for the end-of-run report: how much of the workload each
@@ -507,7 +506,8 @@ discovery discover_query(engine& eng,
       disp.enqueue([&, i] {
         auto const& task    = tasks[i];
         auto const& table_e = table_entries[task.table_idx];
-        auto ds             = eng.io_ctx().open_datasource(task.file.path, task.file.size_bytes);
+        auto ds =
+          cucascade::io::open_datasource(eng.io_ctx_ptr(), task.file.path, task.file.size_bytes);
 
         auto footer = cudf::io::parquet::fetch_footer_to_host(*ds);
         hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
@@ -595,7 +595,7 @@ discovery discover_query(engine& eng,
 /// completed.  The submission loop blocks on acquire() once `npread` files are
 /// outstanding, so a file with hundreds of ranges is one unit of concurrency,
 /// not hundreds -- the next file only starts once an entire file finishes.
-iteration_result run_once(sirius::io::ioctx& io_ctx,
+iteration_result run_once(cucascade::io::ioctx& io_ctx,
                           std::vector<file_plan>& files,
                           std::size_t npread)
 {

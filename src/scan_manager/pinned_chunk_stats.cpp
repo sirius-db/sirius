@@ -34,7 +34,6 @@
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 
 #include <algorithm>
-#include <cstdint>
 #include <optional>
 #include <utility>
 

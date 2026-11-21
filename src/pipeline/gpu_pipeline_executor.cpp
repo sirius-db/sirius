@@ -23,9 +23,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
-#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
@@ -36,13 +34,13 @@
 
 #include <util/stream_check_wrapper.hpp>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
 #include <format>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 namespace sirius {
@@ -66,7 +64,7 @@ gpu_pipeline_executor::gpu_pipeline_executor(
 
 gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
-sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
+sirius::exec::invocable<void()> gpu_pipeline_executor::get_per_thread_init()
 {
   int device_id          = _memory_space->get_device_id();
   auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
@@ -74,7 +72,7 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
   return [device_id,
           telemetry_context = _telemetry_context,
           thread_prefix     = _config.thread_name_prefix,
-          thread_id_counter]() mutable noexcept {
+          thread_id_counter]() mutable {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
 
     try {
@@ -93,14 +91,13 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
     // context; silent failure would cause every downstream CUDA call on this
-    // thread to land on GPU 0 regardless of device_id. We cannot use
-    // CUCASCADE_CUDA_TRY here because the lambda is noexcept — inline the
-    // check instead.
+    // thread to land on GPU 0 regardless of device_id.
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) {
-      SIRIUS_LOG_ERROR("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
-                       device_id,
-                       cudaGetErrorString(err));
+      throw std::runtime_error(
+        std::format("gpu_pipeline_executor per-thread init: cudaSetDevice({}) failed: {}",
+                    device_id,
+                    cudaGetErrorString(err)));
     }
     sirius::util::enable_log_on_default_stream();
   };

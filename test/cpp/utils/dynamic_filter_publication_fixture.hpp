@@ -23,6 +23,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
@@ -107,12 +108,12 @@ struct claim_fixture {
                        .key_bindings             = {{.admitted_key_index   = 0,
                                                      .channel_push_ordinal = kProbeColumnIndex,
                                                      .probe_storage_type   = probe_type}}});
-    dynamic_filter_publish_plan::admitted_key key{.planner_condition_index      = 0,
-                                                  .build_key_ordinal            = build_key_ordinal,
-                                                  .storage_type                 = kInt64,
-                                                  .key_shape                    = {},
-                                                  .build_key_domain_cardinality = 0,
-                                                  .build_key_proven_unique      = false};
+    dynamic_filter_publish_plan::admitted_key key{.planner_condition_index = 0,
+                                                  .build_key_ordinal       = build_key_ordinal,
+                                                  .storage_type            = kInt64,
+                                                  .key_shape               = {},
+                                                  .build_key_domain        = {.cardinality = 0},
+                                                  .build_key_proven_unique = false};
     std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces{{*gpu_space, *host_space}};
     dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(replica_spaces)};
 
@@ -120,9 +121,9 @@ struct claim_fixture {
     logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
     logical_join->types = output_types;
 
-    auto left_child = duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    auto left_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(output_types), 0);
-    auto right_child = duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+    auto right_child = duckdb::make_uniq<sirius::op::test_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::PROJECTION, sirius::from_duckdb_vec(output_types), 0);
 
     duckdb::vector<duckdb::JoinCondition> conditions;

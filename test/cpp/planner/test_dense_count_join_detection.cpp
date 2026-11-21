@@ -28,7 +28,6 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/function/aggregate/distributive_functions.hpp>
 #include <duckdb/function/aggregate_function.hpp>

@@ -27,6 +27,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
@@ -97,7 +98,7 @@ struct partitioned_join_options {
     tree.logical_join->types.end(), options.side_types.begin(), options.side_types.end());
   auto const types = sirius::from_duckdb_vec(options.side_types);
   auto const child = [&] {
-    return duckdb::make_uniq<op::sirius_physical_operator>(
+    return duckdb::make_uniq<op::test_physical_operator>(
       op::SiriusPhysicalOperatorType::PROJECTION, types, 1);
   };
 

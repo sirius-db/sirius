@@ -310,6 +310,7 @@ class current_resource_guard {
 TEST_CASE("Arrow migration normalizes combined Boolean and UTF8 windows on the selected stream",
           "[materialization][scan][arrow_migration]")
 {
+  auto large = GENERATE(false, true);
   release_counts released;
   bounded_host_resource host;
   rmm::cuda_stream stream;
@@ -317,8 +318,14 @@ TEST_CASE("Arrow migration normalizes combined Boolean and UTF8 windows on the s
   observed_device_resource device(cudf::get_current_device_resource_ref());
   device.state->expected_stream = stream.value();
   auto producer                 = std::make_shared<producer_batch>(released);
-  producer->array.offset        = 2;
-  producer->array.length        = 7;
+  std::array<int64_t, 13> large_offsets{};
+  if (large) {
+    std::copy(std::begin(producer->offsets), std::end(producer->offsets), large_offsets.begin());
+    producer->fields[2].format = "U";
+    producer->buffers[2][1]    = large_offsets.data();
+  }
+  producer->array.offset = 2;
+  producer->array.length = 7;
   for (auto& child : producer->columns) {
     child.offset = 1;
     child.length = 11;
@@ -801,7 +808,7 @@ TEST_CASE("Arrow migration failed completion retains roots and staging until ver
   completion_fault fault;
   observed_device_resource device(cudf::get_current_device_resource_ref());
   device.state->expected_stream = stream.value();
-  sirius::exec::detail::completion_cuda_api api;
+  cucascade::exec::detail::completion_cuda_api api;
   api.add_callback = completion_fault::add;
   api.synchronize  = completion_fault::synchronize;
   sirius::exec::retire_lane lane(stream.value(), api);
@@ -855,7 +862,7 @@ TEST_CASE("Arrow migration final quiesce covers frees queued after failed commit
   device.state->delay_deallocation = true;
   completion_fault fault;
   fault.refuse_sync = false;
-  sirius::exec::detail::completion_cuda_api api;
+  cucascade::exec::detail::completion_cuda_api api;
   api.add_callback = completion_fault::add;
   api.synchronize  = completion_fault::synchronize;
   sirius::exec::retire_lane lane(stream.value(), api);

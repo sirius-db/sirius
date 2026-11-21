@@ -27,15 +27,12 @@
 #include <expression/ast/coalesce.hpp>
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/conjunction.hpp>
-#include <expression/ast/constant.hpp>
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
-#include <expression/ast/reference.hpp>
 #include <expression/ast/unary_op.hpp>
 #include <expression/function_id.hpp>
 #include <expression/join_condition.hpp>  // sirius::comparison_type, sirius::from_duckdb (enum mapper)
-#include <expression/value.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 

@@ -41,8 +41,6 @@
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
-#include <cucascade/memory/memory_space.hpp>
-#include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>

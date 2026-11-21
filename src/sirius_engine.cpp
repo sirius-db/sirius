@@ -16,16 +16,13 @@
 
 #include "sirius_engine.hpp"
 
-#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
-#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -41,11 +38,9 @@
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
-#include "sirius_interface.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
@@ -162,7 +157,7 @@ sirius_engine::~sirius_engine()
   try {
     query_handle_.finished();
   } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what()); });
   }
 }
 
@@ -273,17 +268,19 @@ void sirius_engine::execute()
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
-    query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                      query_id_,
-                                      completion_handler_,
-                                      telemetry::query_telemetry_info{
-                                        .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
-                                      },
-                                      [&client = context] { return client.IsInterrupted(); });
-    sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    completion_handler_->run_startup([&] {
+      query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                        query_id_,
+                                        completion_handler_,
+                                        telemetry::query_telemetry_info{
+                                          .telemetry_query_id = telemetry_uuid,
+                                          .worker_id = telemetry_context_->worker_id().raw(),
+                                          .query_id  = query_id_,
+                                        },
+                                        [&client = context] { return client.IsInterrupted(); });
+      sirius_ctx->get_task_scheduler().start_query(*query_);
+      sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    });
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
@@ -304,14 +301,14 @@ void sirius_engine::execute()
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Error executing query: {}", e.what()); });
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Unknown error executing query");
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Unknown error executing query"); });
     cancel_dynamic_filter_publications();
     quiesce_plan_users();
     throw;
@@ -373,11 +370,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 
   // Create the plan-time context with one immutable snapshot of query policy.
-  const pipeline::pipeline_build_context build_ctx{
-    sirius_ctx_ptr->get_telemetry_context(),
-    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids),
-    std::move(query_operator_params)};
+  const pipeline::pipeline_build_context build_ctx{sirius_ctx_ptr->get_telemetry_context(),
+                                                   std::move(active_gpu_ids),
+                                                   std::move(query_operator_params)};
 
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);

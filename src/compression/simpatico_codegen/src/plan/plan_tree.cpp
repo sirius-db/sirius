@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/plan/plan_tree.hpp"
 
+#include "codegen/plan/operator_registry.hpp"
+
 #include <algorithm>
 #include <deque>
 #include <iterator>
@@ -55,6 +57,10 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
     NodeId const nid = static_cast<NodeId>(tree.nodes.size());
     PlanNode node;
     node.op = step.compressor;
+    if (step.compressor == kBitpackGcdName) {
+      node.op                = "bitpack";
+      node.attrs.bitpack_gcd = true;
+    }
 
     if (is_bitextract_compressor(step.compressor)) {
       if (auto suffix = strip_bitextract_prefix(step.compressor)) {
@@ -219,7 +225,7 @@ std::string render_plan_tree(PlanTree const& tree)
   for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
     PlanNode const& node = tree.nodes[nid];
     plan_step s;
-    s.compressor = node.op;
+    s.compressor = node.attrs.bitpack_gcd ? std::string(kBitpackGcdName) : node.op;
     if (node.attrs.bitjoin.has_value()) {
       auto const& bj = *node.attrs.bitjoin;
       for (std::size_t j = 0; j < node.input_sources.size(); ++j) {

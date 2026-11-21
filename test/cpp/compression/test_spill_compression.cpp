@@ -269,9 +269,10 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
   std::mt19937_64 rng{7};
   std::vector<std::int64_t> random(100'000), sorted(100'000), repeated_keys(100'000);
   for (std::size_t i = 0; i < random.size(); ++i) {
-    random[i]        = static_cast<std::int64_t>(rng() % 1'000'000'000);
-    sorted[i]        = static_cast<std::int64_t>(i * 1000 + rng() % 7);
-    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+    random[i] = static_cast<std::int64_t>(rng() % 1'000'000'000);
+    sorted[i] = static_cast<std::int64_t>(i * 1000 + rng() % 7);
+    // The offset keeps the key gaps (994 or 1001) free of a common 2^a * 5^b divisor.
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
   }
   auto const int64       = cudf::data_type{cudf::type_id::INT64};
   auto const random_plan = plan(numeric_column(int64, random, stream)->view());
@@ -293,6 +294,31 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
                                 stream)
                       .front();
   CHECK(contains(plan(tail), "rle"));
+
+  // A bitpack detects its divisor only where the sample has one: random values have
+  // none, while prices in whole units are multiples of 100 and keys
+  // spaced exactly 1000 apart differ by multiples of 1000.
+  CHECK_FALSE(contains(random_plan, "bitpack_gcd"));
+  CHECK_FALSE(contains(sorted_plan, "bitpack_gcd"));
+  std::vector<std::int64_t> whole_units(100'000);
+  for (auto& v : whole_units) {
+    v = static_cast<std::int64_t>(rng() % 1'000'000) * 100;
+  }
+  auto const units_plan = plan(numeric_column(int64, whole_units, stream)->view());
+  CHECK(contains(units_plan, "input -> bitpack_gcd"));
+  // Per leaf: after the first group the run lengths alternate 3 and 1, so they differ by 2,
+  // while the run values (0 and the key gaps) share nothing.
+  auto const repeated_plan = plan(repeated_column->view());
+  INFO(repeated_plan);
+  CHECK(contains(repeated_plan, "delta.differences.runs -> bitpack_gcd"));
+  CHECK(contains(repeated_plan, "delta.differences.values -> bitpack ->"));
+  std::vector<std::int64_t> spaced_keys(100'000);
+  for (std::size_t i = 0; i < spaced_keys.size(); ++i) {
+    spaced_keys[i] = static_cast<std::int64_t>(i / 4 * 1000);
+  }
+  auto const spaced_plan = plan(numeric_column(int64, spaced_keys, stream)->view());
+  INFO(spaced_plan);
+  CHECK(contains(spaced_plan, "-> bitpack_gcd"));
 
   // Other fixed-width types are bitpacked as they are.
   auto const doubles = numeric_column(
@@ -318,6 +344,56 @@ TEST_CASE("spill compression: default plans follow the column type and a sample"
         std::string::npos);
 }
 
+TEST_CASE("pin compression: default plans favor what a filtered scan can decode in place",
+          "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  auto stream   = utils::default_stream();
+  auto mr       = utils::get_resource_ref(*env().gpu);
+  auto pin_plan = [&](cudf::column_view const& c) {
+    return sirius::compression::default_pin_plan(c, stream);
+  };
+  auto spill_plan = [&](cudf::column_view const& c) {
+    return sirius::compression::default_spill_plan(c, stream);
+  };
+  auto const contains = [](std::string const& plan, char const* op) {
+    return plan.find(op) != std::string::npos;
+  };
+
+  std::mt19937_64 rng{11};
+  std::vector<std::int64_t> repeated_keys(100'000), long_runs(100'000);
+  for (std::size_t i = 0; i < repeated_keys.size(); ++i) {
+    // The offset keeps the key gaps (994 or 1001) free of a common 2^a * 5^b divisor.
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
+  }
+  std::int64_t run_value = 0;
+  for (std::size_t i = 0; i < long_runs.size(); ++i) {
+    if (i % 1000 == 0) { run_value = static_cast<std::int64_t>(rng() % 1'000'000'000); }
+    long_runs[i] = run_value;
+  }
+  auto const int64 = cudf::data_type{cudf::type_id::INT64};
+
+  // Short runs of sorted keys: rle is smaller than delta -> bitpack, but by little of the column.
+  auto const repeated = numeric_column(int64, repeated_keys, stream);
+  CHECK(contains(spill_plan(repeated->view()), "rle"));
+  auto const repeated_pin = pin_plan(repeated->view());
+  CHECK(contains(repeated_pin, "delta"));
+  CHECK_FALSE(contains(repeated_pin, "rle"));
+
+  // Long runs of unrelated values: only rle packs them, saving most of the column.
+  CHECK(contains(pin_plan(numeric_column(int64, long_runs, stream)->view()), "rle"));
+
+  std::vector<std::string> unique(10'000);
+  for (std::size_t i = 0; i < unique.size(); ++i) {
+    unique[i] = "value_" + std::to_string(i);
+  }
+  auto const strings   = utils::make_string_column(unique, stream, mr);
+  auto const pin_split = pin_plan(strings->view());
+  CHECK(contains(pin_split, "str_split"));
+  CHECK_FALSE(contains(pin_split, "ans"));
+  CHECK(contains(spill_plan(strings->view()), "ans"));
+}
+
 TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spill]")
 {
   if (!has_gpu()) { return; }
@@ -339,6 +415,44 @@ TEST_CASE("spill compression: GPU -> compressed host -> GPU", "[compression][spi
   CHECK_FALSE(gpu_mr->is_stream_tracked(env().stream));
   CHECK(gpu_mr->get_total_reserved_bytes() == reserved_before);
 
+  move_to(batch, env().gpu);
+  REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
+  CHECK(digest(*batch) == expected);
+}
+
+TEST_CASE("spill compression: bitpack_gcd leaves round-trip", "[compression][spill]")
+{
+  if (!has_gpu()) { return; }
+  scoped_settings settings(enabled_settings());
+  auto stream = utils::default_stream();
+
+  // 2500 runs: two full bitpack chunks of run lengths alternating 3 and 1, and a partial one.
+  std::vector<std::int64_t> repeated_keys(10'000);
+  for (std::size_t i = 0; i < repeated_keys.size(); ++i) {
+    repeated_keys[i] = static_cast<std::int64_t>(i / 4 * 1000 + i / 4 % 7);
+  }
+  // Values 128 apart, a power of 2 an int8 divisor cannot hold, so it is capped to 64.
+  std::vector<std::int8_t> alternating(10'000);
+  for (std::size_t i = 0; i < alternating.size(); ++i) {
+    alternating[i] = static_cast<std::int8_t>(i % 2 == 0 ? -128 : 0);
+  }
+  auto keys  = numeric_column(cudf::data_type{cudf::type_id::INT64}, repeated_keys, stream);
+  auto bytes = numeric_column(cudf::data_type{cudf::type_id::INT8}, alternating, stream);
+  auto const keys_plan = sirius::compression::default_spill_plan(keys->view(), stream);
+  INFO(keys_plan);
+  REQUIRE(keys_plan.find("delta.differences.runs -> bitpack_gcd") != std::string::npos);
+  auto const bytes_plan = sirius::compression::default_spill_plan(bytes->view(), stream);
+  INFO(bytes_plan);
+  REQUIRE(bytes_plan.find("bitpack_gcd") != std::string::npos);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(keys));
+  columns.push_back(std::move(bytes));
+  auto batch          = gpu_batch(std::make_unique<cudf::table>(std::move(columns)));
+  auto const expected = digest(*batch);
+
+  move_to(batch, env().host);
+  REQUIRE(holds<sirius::compressed_host_representation>(*batch));
   move_to(batch, env().gpu);
   REQUIRE(holds<cucascade::gpu_table_representation>(*batch));
   CHECK(digest(*batch) == expected);

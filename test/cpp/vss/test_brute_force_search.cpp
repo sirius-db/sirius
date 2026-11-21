@@ -32,7 +32,6 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/stream>

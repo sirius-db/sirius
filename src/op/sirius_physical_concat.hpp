@@ -33,6 +33,11 @@ namespace op {
  */
 class sirius_physical_concat : public sirius_physical_partition_consumer_operator {
  public:
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
   explicit sirius_physical_concat(

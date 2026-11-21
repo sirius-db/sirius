@@ -25,7 +25,6 @@
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <map>

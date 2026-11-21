@@ -19,7 +19,6 @@
 // operands are all constants. These tests check that such calls run on the GPU and match the CPU.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <algorithm>

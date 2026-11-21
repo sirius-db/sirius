@@ -5,7 +5,9 @@ here until it can move to `sirius-db/sirius-duckdb`. Its Makefile uses DuckDB's
 normal extension build infrastructure.
 
 Use matching DuckDB revisions and compatible C++ toolchains for Sirius and the
-wrapper. The engine and wrapper gitlinks record the supported revision.
+wrapper. The engine and wrapper gitlinks record the supported revision. The
+wrapper refuses a Sirius package built from another DuckDB commit; static builds
+compile Sirius against the wrapper's checkout, `sirius-duckdb/duckdb`.
 
 ## Shared development build
 
@@ -52,7 +54,7 @@ Hosts that statically link their C++ runtime must export its exception-handling
 symbols. The supplied DuckDB build enables this with `EXPORT_DYNAMIC_SYMBOLS=ON`.
 
 ```sh
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+git submodule update --init substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
   SIRIUS_DUCKDB_LINKAGE=static \
   VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -70,7 +72,7 @@ The static port hashes source contents and filenames, including the engine's
 submodules and untracked, nonignored source files, so source edits invalidate
 Sirius's package without invalidating third-party dependency caches.
 Distribution CI uses the same port, with
-`configure_ci` initializing the engine's submodules.
+`configure_ci` initializing the engine's other submodules.
 
 For shared builds, first build/install Sirius with the root Makefile or CMake,
 then pass its prefix as `SIRIUS_INSTALL_DIR` (or use CMake's normal package search
@@ -94,22 +96,28 @@ The core-extension layout has three artifacts:
 - `sirius_cuda13`: the backend built with CUDA 13.
 
 `INSTALL sirius; LOAD sirius;` opens `libcuda.so.1` and queries `cuDriverGetVersion`.
-Versions 12000–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cuda13`.
+Versions 12080–12999 select `sirius_cuda12`; 13000 and newer select `sirius_cuda13`.
 When `autoinstall_known_extensions` is enabled and the selected backend is not
 installed yet, `LOAD sirius` downloads it from DuckDB's community repository (or
 the configured auto-install repository); without a usable driver it does no
-network I/O. The loader does not retry with the other CUDA version.
+network I/O. Because the backend is large, the loader prints a status line to
+stderr when this one-time install starts and another when it finishes or fails, and
+logs both at `INFO` level. The loader does not retry with the other CUDA version.
 
-If the driver is missing, supports a CUDA version below 12, or cannot report its
+If the driver is missing, supports a CUDA version below 12.8, or cannot report its
 version, or the selected backend is not installed, cannot be installed, or its
 file cannot be loaded, `LOAD sirius` still succeeds and the loader leaves
 DuckDB's CPU execution untouched: it registers no optimizer hook and
 `gpu_execution` defaults to `false`. Explicit requests for the GPU, `SET gpu_execution = true` or the
 `gpu_execution(...)` table function, then fail with the recorded reason, such as
-`Sirius requires an NVIDIA driver supporting CUDA 12 or newer: cannot open
+`Sirius requires an NVIDIA driver supporting CUDA 12.8 or newer: cannot open
 libcuda.so.1 (...)`. The fallback is logged once at `INFO` level to
-`duckdb_logs`, and the loader prints nothing. The result is cached per database:
-loading the backend after a fallback needs a new database instance.
+`duckdb_logs`. When the fallback follows a failed one-time install, the loader
+adds a status line to stderr saying that queries run on DuckDB's CPU engine and
+that `sirius_status()` shows why. Every other fallback, such as no usable driver or
+a backend that is not installed or cannot be loaded without an install attempt,
+prints nothing. The result is cached per database: loading the backend after a
+fallback needs a new database instance.
 
 `LOAD sirius` still fails if the database already has the other backend loaded,
 if the loader is loaded under a backend name, or if the backend fails once its
@@ -146,7 +154,13 @@ Use separate extension directories when testing both layouts.
 
 `LOAD sirius` reuses an installed backend; it does not update it or require its
 Sirius version to match the loader. Updating only the loader can therefore leave
-an older backend installed. The loader only selects and loads the backend; it
+an older backend installed. When `autoinstall_known_extensions` is enabled and the
+backend came from an HTTP repository, the first `LOAD sirius` in a database asks that
+repository whether it publishes a different build, using the ETag recorded at install
+time and without downloading it. If so, it prints a notice to stderr suggesting
+`UPDATE EXTENSIONS`. The check never fails `LOAD`. It uses two-second network
+timeouts, but a stalled DNS lookup or a server that answers very slowly can delay
+`LOAD` further. The loader only selects and loads the backend; it
 does not link against the engine API.
 
 Run `UPDATE EXTENSIONS;` to update the installed loader and backend(s) from their
@@ -184,11 +198,13 @@ is prepared separately on
 The build job supplies GPU architectures. CUDA 12 builds include Blackwell's
 `100-real` and `120-real` targets and require a toolkit of at least 12.8.
 Core CI must supply those targets too; selecting a backend by driver version
-does not check GPU architecture. The 12000/13000 thresholds select a CUDA major
-version, not a tested minimum driver for every backend feature. Before core
-publication, test the CUDA 12.9 backend on the oldest supported CUDA 12 driver,
-including cuDF NVRTC/nvJitLink paths, then record the tested minimum or raise the
-loader threshold. Simpatico compiles cubins rather than relying on
+does not check GPU architecture. The 12080 threshold is the first driver with
+`cuMemcpyBatchAsync`, which the CUDA 12 backend calls unconditionally on its scan,
+spill, and transfer paths; 13000 selects a CUDA major version. Neither is a tested
+minimum driver for every backend feature. Before core publication, test the CUDA
+12.9 backend on the oldest supported CUDA 12 driver, including cuDF
+NVRTC/nvJitLink paths, then record the tested minimum or raise the loader
+threshold. Simpatico compiles cubins rather than relying on
 the driver's PTX compiler; other dependency paths need separate qualification.
 
 The conflict checks reject sequential loads of different backends in one

@@ -28,7 +28,6 @@
 // would land in a single row group and barely exercise the stats path.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 

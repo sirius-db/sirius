@@ -289,9 +289,6 @@ __global__ void extract_kernel(__int128_t const* slot_totals,
     output[group] = static_cast<Output>(total);
   }
 }
-
-void check_cuda(cudaError_t status) { CUDF_CUDA_TRY(status); }
-
 }  // namespace
 
 std::unique_ptr<cudf::table> try_low_cardinality_groupby(
@@ -358,37 +355,37 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   rmm::device_uvector<uint32_t> present_codes(bitmap_words, stream, mr);
   rmm::device_uvector<int32_t> representative_rows(code_space, stream, mr);
   rmm::device_uvector<int> flags(2, stream, mr);
-  check_cuda(cudaMemsetAsync(
+  CUDF_CUDA_TRY(cudaMemsetAsync(
     present_codes.data(), 0, present_codes.size() * sizeof(uint32_t), stream.get()));
-  check_cuda(cudaMemsetAsync(
+  CUDF_CUDA_TRY(cudaMemsetAsync(
     representative_rows.data(), 0xFF, representative_rows.size() * sizeof(int32_t), stream.get()));
-  check_cuda(cudaMemsetAsync(flags.data(), 0, flags.size() * sizeof(int), stream.get()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(flags.data(), 0, flags.size() * sizeof(int), stream.get()));
 
   int device_id = 0;
-  check_cuda(cudaGetDevice(&device_id));
+  CUDF_CUDA_TRY(cudaGetDevice(&device_id));
   int num_sms = 0;
-  check_cuda(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
   int64_t const max_blocks = (num_rows + block_size - 1) / block_size;
   int const num_blocks     = static_cast<int>(std::min<int64_t>(8L * num_sms, max_blocks));
 
   find_groups_kernel<<<num_blocks, block_size, 0, stream.get()>>>(
     keys, num_rows, present_codes.data(), representative_rows.data(), flags.data());
-  check_cuda(cudaGetLastError());
+  CUDF_CUDA_TRY(cudaGetLastError());
 
   std::vector<uint32_t> host_codes(bitmap_words);
   std::vector<int32_t> host_representatives(code_space);
   std::array<int, 2> host_flags{};
-  check_cuda(cudaMemcpyAsync(host_codes.data(),
-                             present_codes.data(),
-                             bitmap_words * sizeof(uint32_t),
-                             cudaMemcpyDeviceToHost,
-                             stream.get()));
-  check_cuda(cudaMemcpyAsync(host_representatives.data(),
-                             representative_rows.data(),
-                             code_space * sizeof(int32_t),
-                             cudaMemcpyDeviceToHost,
-                             stream.get()));
-  check_cuda(cudaMemcpyAsync(
+  CUDF_CUDA_TRY(cudaMemcpyAsync(host_codes.data(),
+                                present_codes.data(),
+                                bitmap_words * sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(host_representatives.data(),
+                                representative_rows.data(),
+                                code_space * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
     host_flags.data(), flags.data(), sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
   stream.sync();
   if (host_flags[0] != 0) { return nullptr; }
@@ -415,11 +412,11 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   int64_t const max_abs_value = (int64_t{1} << 62) / rows_per_warp;
 
   rmm::device_uvector<uint8_t> group_of_code(code_space, stream, mr);
-  check_cuda(cudaMemcpyAsync(group_of_code.data(),
-                             host_group_of_code.data(),
-                             code_space,
-                             cudaMemcpyHostToDevice,
-                             stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(group_of_code.data(),
+                                host_group_of_code.data(),
+                                code_space,
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
   std::vector<int64_t const*> host_sum_columns;
   for (int column_id : sum_column_ids) {
     auto const& column = input.column(column_id);
@@ -427,11 +424,11 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
   }
   rmm::device_uvector<int64_t const*> sum_columns(num_sum_columns, stream, mr);
   if (num_sum_columns > 0) {
-    check_cuda(cudaMemcpyAsync(sum_columns.data(),
-                               host_sum_columns.data(),
-                               num_sum_columns * sizeof(int64_t const*),
-                               cudaMemcpyHostToDevice,
-                               stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(sum_columns.data(),
+                                  host_sum_columns.data(),
+                                  num_sum_columns * sizeof(int64_t const*),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
   }
   rmm::device_uvector<__int128_t> block_totals(
     static_cast<std::size_t>(num_blocks) * slots_per_copy, stream, mr);
@@ -441,7 +438,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
     rmm::device_uvector<uint8_t> group_ids(num_rows, stream, mr);
     group_ids_kernel<<<num_blocks, block_size, 0, stream.get()>>>(
       keys, num_rows, group_of_code.data(), group_ids.data());
-    check_cuda(cudaGetLastError());
+    CUDF_CUDA_TRY(cudaGetLastError());
     if (num_groups <= 4) {
       aggregate_columns_kernel<4><<<num_blocks, block_size, 0, stream.get()>>>(group_ids.data(),
                                                                                num_rows,
@@ -461,7 +458,7 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
                                                                                block_totals.data(),
                                                                                flags.data() + 1);
     }
-    check_cuda(cudaGetLastError());
+    CUDF_CUDA_TRY(cudaGetLastError());
     // group_ids is freed at the end of this scope; the stream orders the free after its readers.
   } else {
     aggregate_kernel<<<num_blocks, block_size, shared_size, stream.get()>>>(keys,
@@ -474,12 +471,12 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
                                                                             block_totals.data(),
                                                                             flags.data() + 1);
   }
-  check_cuda(cudaGetLastError());
+  CUDF_CUDA_TRY(cudaGetLastError());
   rmm::device_uvector<__int128_t> slot_totals(slots_per_copy, stream, mr);
   combine_kernel<<<slots_per_copy, block_size, 0, stream.get()>>>(
     block_totals.data(), num_blocks, slots_per_copy, slot_totals.data());
-  check_cuda(cudaGetLastError());
-  check_cuda(cudaMemcpyAsync(
+  CUDF_CUDA_TRY(cudaGetLastError());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
     host_flags.data() + 1, flags.data() + 1, sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
   stream.sync();
   if (host_flags[1] != 0) { return nullptr; }
@@ -490,11 +487,11 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
     key_views.push_back(input.column(column_id));
   }
   rmm::device_uvector<int32_t> gather_map(num_groups, stream, mr);
-  check_cuda(cudaMemcpyAsync(gather_map.data(),
-                             group_rows.data(),
-                             num_groups * sizeof(int32_t),
-                             cudaMemcpyHostToDevice,
-                             stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(gather_map.data(),
+                                group_rows.data(),
+                                num_groups * sizeof(int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
   cudf::column_view const gather_view(
     cudf::data_type{cudf::type_id::INT32}, num_groups, gather_map.data(), nullptr, 0);
   auto output_columns =
@@ -533,13 +530,13 @@ std::unique_ptr<cudf::table> try_low_cardinality_groupby(
                                                           output->mutable_view().data<int64_t>(),
                                                           flags.data() + 1);
     }
-    check_cuda(cudaGetLastError());
+    CUDF_CUDA_TRY(cudaGetLastError());
     output_columns.push_back(std::move(output));
   }
   // An INT64 SUM whose total does not fit in INT64 falls back to the general path, which widens
   // it or matches cuDF's semantics. The synchronize also keeps the device buffers above alive
   // until their last readers have finished.
-  check_cuda(cudaMemcpyAsync(
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
     host_flags.data() + 1, flags.data() + 1, sizeof(int), cudaMemcpyDeviceToHost, stream.get()));
   stream.sync();
   if (host_flags[1] != 0) { return nullptr; }

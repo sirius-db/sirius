@@ -27,7 +27,6 @@
 
 #include <catch.hpp>
 #include <cuvs/distance/distance.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -35,7 +34,6 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <vss/cuvs_index_cache.hpp>
 
-#include <cstdlib>
 #include <numbers>
 #include <set>
 #include <string>

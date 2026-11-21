@@ -37,6 +37,7 @@ class DataTable;
 namespace cucascade::memory {
 class memory_reservation_manager;
 class memory_space;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::exec {
@@ -44,7 +45,7 @@ class scoped_dispatcher;
 }  // namespace sirius::exec
 
 namespace sirius::memory {
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::scan_manager {
@@ -52,6 +53,8 @@ namespace sirius::scan_manager {
 /**
  * @brief Run @p tasks on @p dispatcher and block until every one has run.
  *        Generic drop-safe fan-out/join for prepare-time work units.
+ *        The query dispatcher must be exclusive to this prepare phase; return
+ *        also waits for its reservations to drain. Do not call from its workers.
  *
  * Each task's completion_controller slot is acquired BEFORE its enqueue and
  * moved into the task lambda: a stopping dispatcher silently drops enqueues

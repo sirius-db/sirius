@@ -15,7 +15,6 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -125,8 +124,9 @@ TEST_CASE_METHOD(DivisionFixture,
     run_ok("SET error_on_division_by_zero = false;");
     expect_runtime_fallback_matches_cpu("SELECT id, a " + std::string(op) + " b FROM div_zero");
     run_ok("SET error_on_division_by_zero = true;");
-    expect_runtime_fallback_matches_cpu("SELECT id, CASE WHEN b = 0 THEN NULL ELSE a " +
-                                        std::string(op) + " b END FROM div_zero");
+    // The zero divisors select THEN, so the GPU evaluates the division only on other rows.
+    compare_gpu_vs_cpu("SELECT id, CASE WHEN b = 0 THEN NULL ELSE a " + std::string(op) +
+                       " b END FROM div_zero");
     expect_plan_fallback_matches_cpu("SELECT id, TRY(a " + std::string(op) + " b) FROM div_zero");
   }
 }

@@ -16,7 +16,6 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius::scan_manager {
 inline constexpr std::chrono::milliseconds k_interrupt_check_interval{10};
@@ -38,6 +39,8 @@ struct preparation_options {
   std::chrono::milliseconds interrupt_check_interval = k_interrupt_check_interval;
   size_t max_inflight_dv_jobs                        = 0;
   std::optional<partial_batch_options> partial_batch;
+  // Engine-owned affinity for the per-attempt control-runner fallback.
+  std::vector<int> control_cpu_affinity{};
 };
 // YAML and C++ overrides; zero job limits are unlimited.
 struct preparation_config {

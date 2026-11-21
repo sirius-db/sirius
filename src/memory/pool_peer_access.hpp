@@ -16,7 +16,9 @@
 
 #pragma once
 
-#include <absl/functional/function_ref.h>
+// CUDA translation units include this header, and nvcc rejects Abseil headers under a clang host
+// compiler, so keep Abseil out; declarations that take Abseil types belong in
+// `memory/pool_peer_access_scan.hpp`.
 
 #include <optional>
 #include <span>
@@ -33,8 +35,8 @@ namespace sirius::memory {
  *
  * Only the ordinary RMM async allocation domain qualifies. The borrowed space must outlive
  * transfers using its allocations. No handle or capability is cached; callers must coordinate later
- * permission changes. Manager initialization, replica transfer, and accumulated-filter admission
- * share this policy.
+ * permission changes. Manager initialization, replica transfer, and the choice of
+ * accumulated-filter publication transport (peer copy or HOST staging) share this policy.
  *
  * @throw std::invalid_argument if the space is not GPU-tier, lacks its adaptor, or a device ID is
  * invalid
@@ -46,18 +48,6 @@ namespace sirius::memory {
  */
 [[nodiscard]] bool try_grant_pool_access(cucascade::memory::memory_space const& owner_space,
                                          int accessor_device);
-
-/**
- * @brief Calls `try_grant_pool_access` for each ordered pair of @p spaces on distinct devices, in
- * order, and reports each unavailable pair
- *
- * @param spaces GPU spaces whose pools each other space's device must access
- * @param on_unavailable Receives the allocation owner's and the accessor's device IDs; returning
- * false stops the scan
- */
-void for_each_pair_without_pool_access(
-  std::span<cucascade::memory::memory_space const* const> spaces,
-  absl::FunctionRef<bool(int owner_device, int accessor_device)> on_unavailable);
 
 /**
  * @brief Stops `for_each_pair_without_pool_access` at the first unavailable pair

@@ -27,8 +27,6 @@
 #include <duckdb/common/optional_idx.hpp>
 #include <duckdb/common/types.hpp>
 
-#include <stdexcept>
-
 using sirius::logical_type;
 using sirius::type_id;
 

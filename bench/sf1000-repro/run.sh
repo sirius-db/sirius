@@ -8,19 +8,13 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 DATA="${DATA:-$HOME/tpch_parquet_sf1000}"          # SF1000 parquet, one dir per table
 CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-provided libcudf
-PLANS="${PLANS:-$HERE/plans}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 NAME="${NAME:-sf1000_repro}"
 
-# Late materialization (group-by-rowid ride) and fused decode-time filtering. Both off by
-# default; both are worth real suite time here and are safe to leave on for a repro run.
-# PIN_UNIQUE_COLS must cover every rider's key, not just the ride's own — dropping n_name/
-# n_nationkey still gets a correct answer (nation just stops riding) but costs real time.
+# Late materialization, fused decode-time filtering and low-cardinality group-by default on.
+# Override them in CFG under sirius.operator_params when comparing policies.
+# The ride's uniqueness proof comes from the pin itself (pin_table_prove_unique_keys, on by default).
 # See docs/super-sirius/late-materialization.md.
-export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
-export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
-export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 [ -d "$DATA" ] || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
 
@@ -32,14 +26,17 @@ if [ -n "$CUDF_SO" ]; then
   export LD_PRELOAD="$CUDF_SO"
 fi
 
-# Two settings do the work here:
-#   pin_table_input_compression_plan_dir -> simpatico plans; l_shipinstruct MUST stay `dictionary`
-#     or the decode-time predicate pushdown has no dictionary to answer from and silently no-ops.
+# Settings that do the work here:
+#   pin_table_compression=true -> Simpatico plans selected automatically per pinned table; GPU pins
+#     small next to GPU memory stay uncompressed (pin_table_compression_min_table_device_fraction).
 #   expression_evaluator_strategy=ast_jit -> cuDF's JIT expression evaluator instead of the
 #     interpreted AST walker. Worth -4.17% suite on its own. Default is ast_interpret.
+#   parquet_metadata_cache=true -> DuckDB keeps the parsed Parquet footers instead of re-parsing
+#     them at every bind (2-4 ms per query on the short queries). Inputs that are not Parquet
+#     ignore it.
 export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
-SET pin_table_input_compression_plan_dir = '$PLANS'; \
-SET expression_evaluator_strategy = 'ast_jit'"
+SET expression_evaluator_strategy = 'ast_jit'; \
+SET parquet_metadata_cache = true"
 
 # All eight tables pinned GPU-tier compressed. partsupp included: no TPC-H query ever
 # materialises ps_comment, so the union across q2/q9/q11/q16/q20 is 4 narrow columns (~20-25 GB).
@@ -52,11 +49,7 @@ done
 # per-iteration timings are unaffected either way because we report best-of-3.
 echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
-echo "plans     : $PLANS"
 echo "config    : $CFG"
-echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=$SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS"
-echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
-echo "lowcard gb: SIRIUS_EXP_LOWCARD_GROUPBY=$SIRIUS_EXP_LOWCARD_GROUPBY"
 echo
 
 cd "$REPO"

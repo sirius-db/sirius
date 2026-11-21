@@ -16,6 +16,8 @@
 
 #include "op/scan/table_scan/owned_arrow_scan.hpp"
 
+#include "transparent/replay_admission.hpp"
+
 namespace sirius::op::scan {
 namespace {
 std::string identity(uint64_t sequence)
@@ -56,6 +58,10 @@ class arrow_validator final : public split_validator {
         arrow->batch()->validate_for(program);
       else if (arrow->input_types() != *program.input_types)
         fail("Arrow empty source schema mismatch");
+    } catch (transparent::arrow_schema_drift_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
+                                                    error.what(),
+                                                    transparent::kArrowSchemaDrift);
     } catch (std::invalid_argument const& error) {
       throw certificate_incomplete(context.contract, {}, error.what());
     }
@@ -91,7 +97,8 @@ owned_arrow_scan_info::owned_arrow_scan_info(std::shared_ptr<owned_arrow_batch> 
                                              std::shared_ptr<physical_profile_table> profiles,
                                              std::size_t admitted_host_bytes,
                                              std::shared_ptr<void const> read_identity,
-                                             std::shared_ptr<void> input_lifetime)
+                                             std::shared_ptr<void> input_lifetime,
+                                             std::size_t admitted_batch_bytes)
   : read_identity_(std::move(read_identity)),
     input_lifetime_(std::move(input_lifetime)),
     batch_(std::move(batch)),
@@ -103,7 +110,7 @@ owned_arrow_scan_info::owned_arrow_scan_info(std::shared_ptr<owned_arrow_batch> 
   if (!batch_ || !batch_->has_capacity() || !contract || !generation || !profiles ||
       (batch_->row_count() && !host_bytes_))
     throw std::invalid_argument("Arrow scan requires owned input and a bound contract");
-  bytes_ = batch_->estimated_device_bytes();
+  bytes_ = admitted_batch_bytes ? admitted_batch_bytes : batch_->estimated_device_bytes();
   set_profile(contract, std::move(profiles));
 }
 owned_arrow_scan_info::owned_arrow_scan_info(materialization_program const& program,

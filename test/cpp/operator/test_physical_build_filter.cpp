@@ -18,6 +18,7 @@
 #include "op/dynamic_filter/sirius_physical_build_filter.hpp"
 #include "partitioned_join_test_utils.hpp"
 #include "planner/late_mat_plan_pass.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 
@@ -39,7 +40,7 @@ duckdb::vector<sirius::logical_type> build_types()
 
 struct build_filter_fixture {
   acc::fixture gpu;
-  op::sirius_physical_operator upstream{
+  op::test_physical_operator upstream{
     op::SiriusPhysicalOperatorType::PROJECTION, build_types(), 100};
   std::shared_ptr<util::controllable_pipeline> source =
     std::make_shared<util::controllable_pipeline>(false);

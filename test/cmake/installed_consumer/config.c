@@ -1,6 +1,7 @@
 // Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0
 #define _POSIX_C_SOURCE 200809L
 #include <sirius-c/context/config_builder.h>
+#include <sirius-c/context/context.h>
 #include <sirius-c/version.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,11 @@ int main(void)
   sirius_context_config_builder* builder = NULL;
   sirius_context_config* config          = NULL;
   sirius_error* error                    = NULL;
+  sirius_context* context                = NULL;
+  CHECK(sirius_context_create(NULL, &context, &error) == SIRIUS_INVALID_ARGUMENT);
+  CHECK(context == NULL);
+  sirius_error_destroy(error);
+  sirius_context_destroy(NULL);
   CHECK(sirius_abi_version() == SIRIUS_ABI_VERSION);
   CHECK(sirius_context_config_builder_create(&builder, &error) == SIRIUS_SUCCESS);
   CHECK(builder != NULL && error == NULL);

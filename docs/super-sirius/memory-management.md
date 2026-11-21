@@ -58,7 +58,8 @@ downgrade_trigger_fraction = 0.9;
 downgrade_stop_fraction = 0.8;
 block_size = 1MiB;              // cuCascade block size
 pool_size = 128;                // blocks per pool
-initial_number_pools = 4;       // pools allocated at startup
+initial_number_pools;           // auto: 10% of NUMA RAM, capped by host capacity,
+                              // rounded down to whole pools; explicit count overrides
 ```
 
 **Disk Memory Space:**
@@ -84,6 +85,14 @@ usable reader predicate, the execution estimate excludes the internal position w
 decode retains interval deletion; filters published later cannot enable positions for that split.
 User-requested virtual columns retain their own workspace. Pipeline memory history and retry
 floors still apply independently; this removes the position estimate, not other measured peaks.
+
+Canonical lineage is opt-in: identity and interval selections use host metadata;
+a device selection retains an INT64 ordinal column (8 B/row), with additional
+copy/sort scratch during validation. `lineage_conversion_workspace_bytes()` and
+`shared_materialization_workspace_bytes()` estimate extra working space; they do
+not reserve memory and currently have no production callers. An adapter using them
+must account for its complete working set according to the API contract. Default
+Parquet/Iceberg scans do not reserve canonical-lineage scratch.
 
 Metadata-only scans reserve synthesized columns and temporary buffers, but no compressed data or data prefetch. Typed empty virtual columns allocate no scalar buffers. The coalescer and execution task use the same read mode for their estimates.
 
@@ -135,8 +144,8 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
-   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
-   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle batches resident in the executor's source space one at a time
+   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue. Only the task's batches in the executor's source space are moved; inputs it holds in other spaces are left to that space's executor
 4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated both **before dispatching each candidate** (a request that is already satisfied — e.g. the caller's reservation landed, or the running query freed memory — spills nothing) and after each conversion. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
 **Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
@@ -171,9 +180,9 @@ The compressed host representation decodes with the converter `pin_table` alread
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. A queued task can hold inputs in several spaces (inputs that were only partly spilled, a build batch shared from another GPU); only the batches still in the source space are converted, and the request is credited with the bytes that actually moved. Tasks are returned to the queue via RAII on all code paths.
 
-Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
+Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically per batch. A task is not a unit of rollback: its batches convert one at a time, and if a later batch throws, the ones already moved stay at the target but the request is credited nothing for the task, since the exception discards the running totals. Credited bytes are the batches' sizes in the source space, not what they occupy at the target (a batch spilled compressed is credited at its uncompressed GPU size).
 
 ## Memory Consumption History
 
@@ -201,7 +210,7 @@ Materialization allocations are charged to the task's reservation through the de
 
 A cached scan input (a resident `scan_operator_input`) is sized by a dedicated branch before the pipelineable-input walk: it contributes its uncompressed GPU footprint when the cached batch is not already GPU-resident (since `prepare_for_processing()` uploads HOST-cached batches before execution), and zero when it is. Resident classification is deliberately unchanged by this sizing — a HOST cache hit must not be treated as a fresh read, which would apply the fresh-read decode heuristic instead.
 
-Without history, a resident scan split is sized by `sirius_gpu_scan_operator::no_history_peak_memory_estimate` from its working set (`scan_operator_input::get_estimated_working_set_size_in_bytes`). A resident split that can reach the scan's dynamic-filter checkpoint reserves twice its batch bytes, covering the membership masks and one gather of the survivors, whether or not decompression pushdown is enabled. `scan_operator_input::cached_checkpoint_possible` decides this for both the estimate and execution: the scan has a consumer with `consumer_config::cached_placement` enabled, its ingestible can describe a cached view (only resident Parquet can), and the split has neither a visibility mask nor a stolen table. Execution tries the transfer first: `prepare_for_processing` steals a transferable table it converts (a compressed or HOST-tier chunk with no mask and no pending static filter), and execute transfers a carrier-converting one unless its transfer refuses it (for example, the scan defers columns to late materialization or its output repeats a column). The estimate runs before `prepare_for_processing` and cannot tell whether a transfer will take the table, so a resident split that will transfer may also get twice its batch bytes until the pipeline has history. A split whose decode is forecast to compact keeps the forecast envelope, because the checkpoint can then see only the compacted table, after a refused carrier-converting transfer. Decode bindings play no part: a deferring scan, whose decode consumer is null, and a permuted or duplicate output layout still reach the checkpoint. Normalizing the selected rows to the planned carriers stays covered by the resident conversion estimate. The checkpoint adds no separate floor: once the pipeline has history, the learned peak replaces this estimate, and an underestimate is retried under the raised OOM retry floor. Checked retirement of the checkpoint's GPU work makes that retry safe, although capacity limits or retry exhaustion can still fail the query.
+Without history, a resident scan split is sized by `sirius_gpu_scan_operator::no_history_peak_memory_estimate` from its working set (`scan_operator_input::get_estimated_working_set_size_in_bytes`). A resident split that can reach the scan's dynamic-filter checkpoint reserves twice its batch bytes, covering the membership masks and one gather of the survivors, whether or not decompression pushdown is enabled. `scan_operator_input::cached_checkpoint_possible` decides this for both the estimate and execution: the scan has a consumer with `consumer_config::cached_placement` enabled, its ingestible can describe a cached view (only resident Parquet can), and the split has neither a visibility mask nor a stolen table. Execution tries the transfer first: `prepare_for_processing` steals a transferable table it converts (a compressed or HOST-tier chunk with no mask and no pending static filter), and execute transfers a carrier-converting one unless its transfer refuses it (for example, the scan defers columns to late materialization or its output repeats a column). A split that defers columns is never stolen, because rowid substitution allocates after the take. It keeps its decoded table in the cached batch while the output copies the columns it keeps, so wherever the estimate would assume a steal, it adds that copy back: up to the forecast compacted bytes when the decode is forecast to compact, otherwise the full batch. Any split carrying a deferral also reserves its 8-byte rowid column, one per reported survivor or per row of its origin. The estimate runs before `prepare_for_processing` and cannot tell whether a transfer will take the table, so a resident split that will transfer may also get twice its batch bytes until the pipeline has history. A split whose decode is forecast to compact keeps the forecast envelope, because the checkpoint can then see only the compacted table, after a refused carrier-converting transfer. Decode bindings play no part: a deferring scan, whose decode consumer is null, and a permuted or duplicate output layout still reach the checkpoint. Normalizing the selected rows to the planned carriers stays covered by the resident conversion estimate. The checkpoint adds no separate floor: once the pipeline has history, the learned peak replaces this estimate, and an underestimate is retried under the raised OOM retry floor. Checked retirement of the checkpoint's GPU work makes that retry safe, although capacity limits or retry exhaustion can still fail the query.
 
 ## Memory Pool Defragmentation
 
@@ -222,7 +231,8 @@ On allocation failure:
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
-- Fixed-size block pools: 1 MiB blocks, 128 blocks per pool, with four pools initially
+- Obtains blocks on demand from shared fixed-size HOST pools (default: 1 MiB blocks, 128 blocks per pool).
+- With high-level configuration and an omitted `initial_number_pools`, initial HOST pools target 10% of each backing NUMA node's RAM, capped by host capacity and rounded down to whole pools. Set `initial_number_pools: 4` to retain four initial pools explicitly.
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))

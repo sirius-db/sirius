@@ -28,7 +28,6 @@
 // (partial #1160).
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>

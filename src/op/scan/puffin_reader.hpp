@@ -27,8 +27,8 @@
 namespace sirius::scan_manager {
 class charging_allocator;
 }
-namespace sirius::io {
-class sirius_datasource;
+namespace cucascade::io {
+class datasource;
 }
 #include <string>
 #include <string_view>
@@ -49,7 +49,7 @@ class puffin_byte_source {
 };
 
 std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
-  std::unique_ptr<sirius::io::sirius_datasource> source);
+  std::unique_ptr<cucascade::io::datasource> source);
 
 // Structural metadata only; adapters interpret blob type, properties and
 // snapshot applicability before decoding. Strings borrow the metadata owner.

@@ -16,10 +16,8 @@
 
 #include "op/sirius_physical_delim_join.hpp"
 
-#include "config.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"

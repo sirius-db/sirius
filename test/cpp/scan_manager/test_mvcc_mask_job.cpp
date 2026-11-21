@@ -29,7 +29,6 @@
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/main/attached_database.hpp>
@@ -42,6 +41,7 @@
 #include <op/scan/duckdb_mvcc_visibility.hpp>
 #include <scan_manager/mvcc_mask_cache.hpp>
 #include <scan_manager/mvcc_mask_job.hpp>
+#include <scan_manager/preparation_coordinator.hpp>
 #include <unistd.h>
 
 #include <atomic>
@@ -292,6 +292,50 @@ TEST_CASE("fan_out_and_join with zero tasks returns immediately", "[mvcc_mask_jo
   sirius::exec::static_thread_pool pool(1);
   sirius::exec::scoped_dispatcher dispatcher(pool, 1);
   REQUIRE_NOTHROW(fan_out_and_join(dispatcher, {}, "empty test"));
+}
+
+TEST_CASE("prepare fanout drains dispatcher reservations before coordinator registration",
+          "[fanout_retirement][review_regression]")
+{
+  bool routed  = GENERATE(false, true);
+  auto allowed = sirius::exec::thread_util::get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  sirius::exec::static_thread_pool pool(
+    1,
+    "fanout_retirement",
+    {},
+    nullptr,
+    routed ? std::vector<std::vector<int>>{{allowed.front()}} : std::vector<std::vector<int>>{});
+  sirius::exec::scoped_dispatcher dispatcher(pool);
+  std::promise<void> disposing, release;
+  auto disposing_now = disposing.get_future();
+  auto released      = release.get_future();
+  auto capture       = std::shared_ptr<int>(new int{}, [&](int* value) {
+    delete value;
+    // fan_out_and_join's completion slot is destroyed first. Keep the
+    // enclosing callback alive after that logical-completion notification.
+    disposing.set_value();
+    released.wait();
+  });
+  std::vector<sirius::exec::invocable<void()>> tasks;
+  tasks.emplace_back([capture = std::move(capture)] {});
+  auto result           = std::async(std::launch::async, [&] {
+    fan_out_and_join(dispatcher, std::move(tasks), "coordinator handoff");
+    sirius::pipeline::completion_handler completion;
+    sirius::scan_manager::preparation_coordinator coordinator(
+      completion, dispatcher, sirius::scan_manager::preparation_config{}.resolve(1));
+  });
+  bool worker_released  = false;
+  absl::Cleanup cleanup = [&] {
+    if (!worker_released) release.set_value();
+  };
+  REQUIRE(disposing_now.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  CHECK(result.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+  release.set_value();
+  worker_released = true;
+  REQUIRE(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  CHECK_NOTHROW(result.get());
+  dispatcher.wait_for_all();
 }
 
 TEST_CASE("run_mvcc_mask_jobs keeps pinned masks for dirty chunks only",

@@ -18,7 +18,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -33,14 +32,12 @@
 #include <cuda_runtime_api.h>
 
 #include <data/data_batch_utils.hpp>
-#include <expression/ast/utils.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <sirius/exception.hpp>
 #include <telemetry/nvtx.hpp>
 
 #include <algorithm>
@@ -48,15 +45,12 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <concepts>
 #include <cstddef>
-#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -94,6 +88,9 @@ constexpr std::size_t k_deferred_minimum_row_width       = 64;
 constexpr double k_deferred_selective_keep_ratio         = 0.35;
 constexpr double k_gather_once_minimum_narrow_keep_ratio = 0.40;
 constexpr double k_wide_row_skip_keep_ratio              = 0.60;
+/// A later filter that removes less than this share of the batch is skipped at any row width: its
+/// probe covers every row, and no per-removed-row cost makes up for so few removed rows.
+constexpr double k_negligible_removed_share = 0.10;
 
 }  // namespace
 
@@ -109,6 +106,8 @@ struct selected_step {
   std::optional<double> expected_keep;
   bool sample                = false;
   std::size_t snapshot_index = 0;
+  std::optional<double>
+    estimated_selectivity;  ///< The publisher's static estimate of the keep ratio
 
   [[nodiscard]] bool operator==(selected_step const&) const = default;
 };
@@ -579,16 +578,17 @@ std::unique_ptr<application_program_state> prepare_state(
       represented.push_back(alias->identity);
     }
     if (!representative) { continue; }
-    selected_step step{.identity      = representative->identity,
-                       .column_index  = current.column_index,
-                       .represented   = std::move(represented),
-                       .mask_source   = mask,
-                       .ast_source    = ast,
-                       .expected_keep = representative->expected_keep,
-                       .sample        = history_known && mask &&
-                                 !covered_by(program->receipt.decode_attached) &&
-                                 !representative->expected_keep,
-                       .snapshot_index = representative->snapshot_index};
+    selected_step step{
+      .identity      = representative->identity,
+      .column_index  = current.column_index,
+      .represented   = std::move(represented),
+      .mask_source   = mask,
+      .ast_source    = ast,
+      .expected_keep = representative->expected_keep,
+      .sample        = history_known && mask && !covered_by(program->receipt.decode_attached) &&
+                !representative->expected_keep,
+      .snapshot_index        = representative->snapshot_index,
+      .estimated_selectivity = representative->identity.filter->estimated_selectivity()};
     if (mask) {
       program->membership.push_back(std::move(step));
     } else {
@@ -597,6 +597,30 @@ std::unique_ptr<application_program_state> prepare_state(
   }
   std::stable_sort(
     program->membership.begin(), program->membership.end(), in_normal_order<selected_step>);
+  // A fused or gathered-once probe runs on every row, so a filter that removes a negligible share
+  // of the batch does not repay it, however selective it is on the rows earlier filters kept. Judge
+  // each filter by the publisher's estimate, after the stronger ones, so the first batch need not
+  // learn it. The combined sample then covers only the filters that stay, which could read as a
+  // channel that removes nothing, so a batch that skips one records no combined sample.
+  {
+    std::vector<selected_step> kept;
+    for (auto const& step : program->membership) {
+      double survival = 1.0;
+      for (auto const& other : program->membership) {
+        if (other.estimated_selectivity && step.estimated_selectivity &&
+            *other.estimated_selectivity < *step.estimated_selectivity) {
+          survival *= *other.estimated_selectivity;
+        }
+      }
+      if (step.estimated_selectivity && survival < 1.0 &&
+          survival * (1.0 - *step.estimated_selectivity) < k_negligible_removed_share) {
+        program->sample_combined = false;
+        continue;
+      }
+      kept.push_back(step);
+    }
+    program->membership = std::move(kept);
+  }
   if (program->membership.empty() && program->ast.empty()) { return nullptr; }
   if (input.cached_layout) {
     program->cached             = true;

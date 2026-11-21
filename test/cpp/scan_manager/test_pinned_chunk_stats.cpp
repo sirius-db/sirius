@@ -50,14 +50,8 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
-#include <duckdb/planner/filter/conjunction_filter.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/dynamic_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
-#include <duckdb/planner/filter/in_filter.hpp>
-#include <duckdb/planner/filter/null_filter.hpp>
-#include <duckdb/planner/filter/optional_filter.hpp>
-#include <duckdb/planner/filter/struct_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>

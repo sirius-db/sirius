@@ -15,26 +15,17 @@
  */
 
 #include <catch.hpp>
-#include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/common/column_index.hpp>
-#include <duckdb/common/constants.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/main/client_context.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/filter/optional_filter.hpp>
-#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
-#include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
-#include <unistd.h>
-#include <utils/table_filter_test_utils.hpp>
+#include <unistd.h>  // IWYU pragma: keep
 #include <utils/utils.hpp>
 
-#include <algorithm>
-#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>

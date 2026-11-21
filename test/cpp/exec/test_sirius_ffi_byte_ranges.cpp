@@ -24,7 +24,7 @@
 #include "utils/parquet_fixture_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb.hpp>
+#include <duckdb.hpp>  // IWYU pragma: keep
 #include <duckdb/common/arrow/arrow.hpp>
 #include <substrait/plan.pb.h>
 

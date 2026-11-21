@@ -129,7 +129,7 @@ build_duckdb_dataset() {
 
     rm -f "$out" "$out".wal
     # Loading needs no GPU, and a stale Sirius config would otherwise block it.
-    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$(cat "$SCRIPT_DIR/tpch_schema.sql")"
+    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$DUCKDB_SCHEMA"
 
     local spec table flag
     for spec in $TPCH_TABLE_FLAGS; do
@@ -197,6 +197,11 @@ if [ "$CLUSTER" = "true" ] && [ "$FORMAT" != "duckdb" ]; then
     echo "       Decimal128 as FIXED_LEN_BYTE_ARRAY, which disables Sirius row-group pruning for"
     echo "       the whole file (skip_pushdown_due_to_flba). Use --format duckdb."
     exit 1
+fi
+
+# Resolve widths before either DuckDB path deletes an existing database.
+if [ "$FORMAT" = "duckdb" ]; then
+    DUCKDB_SCHEMA=$(python "$SCRIPT_DIR/tpch_schema.py" "$SF")
 fi
 
 # --- Set default output path ---

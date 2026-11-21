@@ -35,7 +35,7 @@ A source rejected before its scan node exists still gets a classified lookup ver
 
 Sirius verifies supported scan functions against trusted definitions and the current catalog. A matching function name is insufficient.
 
-Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module. Sirius checks that each resolved entry point belongs to that module. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
+Loadable builds obtain ABI-compatible `duckdb::TableScanFunction::GetFunction()` and `duckdb_extension_parquet_describe` from the host DuckDB module, first from its dynamic exports (`dlsym`). The official DuckDB CLI exports nothing, so there is a second path that reads the static symbol table (`.symtab`) of the mapped image. It opens the mapped file itself through `/proc/self/map_files` (or the path, accepted only if device and inode match the mapping), requires the file's program header table to equal the one the loader reports for the module, takes the one definition with that name (GLOBAL or WEAK, otherwise a single LOCAL), requires the address to lie in the module (`dladdr1`), and compares the function's first bytes in memory with the file. Each check failing yields no reference. A host stripped of `.symtab` has no trusted reference. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
 
 If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet descriptor.
 
@@ -55,7 +55,7 @@ Projection and predicates are outside read identity. Iceberg also requires match
 |---|---|
 | Logical plan copy | Each scan matches its logical original; physical input sets also agree. |
 | Single-scan SQL replan | Physical inputs match; Iceberg additionally needs original logical selector evidence. |
-| Multi-scan SQL replan | Declined because scan order cannot prove correspondence. |
+| Multi-scan SQL replan | Physical inputs match, including duplicates. Each scan pairs one-to-one with its logical original by `table_index` and must match its read identity and any required snapshot selector evidence. |
 
 Missing correspondence or changed inputs prevent GPU admission. Rebuilds and repeated prepared executions validate again. File metadata is observational, not part of identity equality; overwrites at the same path may go undetected.
 
@@ -85,31 +85,22 @@ Unbounded inputs, the statement deletion-vector limit, or insufficient host capa
 
 Cancellation closes admission and publication and wakes blocked work. Completion waits for workers, queued results, query-owned callbacks, and published consumers to drain. GPU completion alone cannot report success while preparation is still open.
 
-### Host Arrow batch source contract
+### Arrow scan integration
 
-The shared host Arrow path has two explicit boundaries. `import_arrow_host()` consumes one owned `ArrowSchema` plus `ArrowArray` record batch and retains its input capacity through the retirement lane. `materialize_arrow_stream()` consumes a sequential internal `arrow_batch_source`: each item carries an independently owned batch, a contiguous sequence number, and declared row and byte bounds; `nullopt` is the only EOS marker. The verifier compares the declared row count with the imported batch, sends results directly to a bounded sink, and calls `cancel()` on source, validation, import, or sink failure. Producers acquire preparation/output capacity and split oversized input before returning an item. An adapter may bridge an `ArrowArrayStream` one batch at a time, but this interface does not add a public Fragment Arrow-input API or a native Paimon/DuckLake adapter.
+The [Arrow input contract](scan.md#arrow-input-contract) defines supported types,
+placement, admission, errors and lifetime rules for the shared importer and queue.
+`arrow_import_ingestible` binds the planning-owned program, original read identity
+and optional provider validator. Claims acquire preparation capacity before reader
+entry; acceptance follows schema, extent and envelope validation. Qualified queues
+release the reader gate after each read; legacy affine producers keep it until
+final input release. Admission reserves two permits per qualified queue, one per
+legacy output-holding scan, and a circulating permit for non-holding jobs.
 
-### Shared Arrow scan driver
-
-`arrow_import_ingestible` drives one `arrow_batch_producer` on its declared execution domain, with one active input per shared gate. Trusted planning binds the schema, materialization program, original read identity and optional provider validator. Claims inspect readiness and acquire preparation capacity before entering the producer; this is not root acceptance. An available root must pass layout, schema and row/byte bounds before acceptance or capacity deferral. Invalid input fails rather than waiting for capacity.
-
-Import completes on the caller's task stream before returning independently owned GPU columns. The input gate and permit return only when the last input owner releases them; another descriptor can retain them after import. The caller's output allocator, backing and stream must survive output destruction and required completion. Unconfirmed completion retains import state under the existing unsafe-completion policy; it does not transfer ownership of caller resources. The driver creates no stream and adds no device-wide synchronization.
-
-| Input or lifecycle event | Behavior |
-|---|---|
-| Occupied input gate or open push queue without input | Pending; release, input arrival or a terminal transition wakes the coordinator. |
-| Non-null zero-row input | A real batch; validated and imported normally. |
-| Normal EOS without any accepted input | One rootless empty descriptor; no Arrow import or input credit. A composite scan can disable child empty carriers and supply its own. |
-| Failure or cancellation | Propagates through the attempt; never treated as EOS. Stop prevents new admission and publication. Source close wakes blocked offers. |
-| Synchronous pin or cached rows | Pin throws a named refusal; metadata-complete and cached-view checks remain false, including after EOS, close, failure and cancellation. |
-
-The push adapter retains at most one offered root. Concurrent offers return false without retaining another root. The submitting thread must hold no engine resource needed for progress. Foreign owners and returned Arrow release callbacks must be thread-neutral; there is no submitting-thread release guarantee or affine reclamation handshake. A false `offer()` return does not join an in-progress copy: retained source views and backing must remain readable and immutable until their final use ends.
-
-Retained budgets become available for subsequent inputs only after the unit is retired and its final allocation and permit have been released. A coordinator request for normal end of stream discards in-flight results without turning successful completion into a query error; user cancellation and read failures retain their error semantics.
-
-Each Arrow input permit enforces its producer's temporary envelope at allocation time, with each declared block rounded independently to the admission allocation granularity. Admission reserves one permit per output-holding scan plus one circulating permit whenever a scan with units declares no holding minimum, so preparation that releases its permit (for example deletion-vector jobs) can progress while Arrow outputs are held. A producer that observes the stop token inside `next()` and reports it as an interrupt is classified by the driver as the cancellation status; interrupts without a token stop propagate unchanged. Another scan's larger query-wide W cannot increase that local allowance.
-
-The admitted job copies the selected window into charged storage. Preparation covers detached Arrow storage and bounded staging; the queue separately bounds foreign-input/copy overlap without adopting foreign backing into its allocator. GPU outputs use task reservations. Neither the input gate nor this ledger bounds all output retention or total host/device memory. `finish()` drains queued input before EOS.
+An open queue without input is pending. Normal empty-source EOS emits one rootless
+descriptor; composites may supply their own. Failure and cancellation never mean
+EOS. Synchronous pinning is refused, and cached-view/metadata-complete checks stay
+false. A token-driven `operation_canceled` follows the coordinator's stop intent;
+normal completion may discard in-flight results without reporting a query error.
 
 Adapters using this driver must also handle the following integration responsibilities:
 
@@ -132,7 +123,7 @@ Adapters using this driver must also handle the following integration responsibi
 
 ### Execution and ownership
 
-The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Metadata-only attempts advance on the query owner without another thread. An attempt with query-owner or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
+The coordinator claims work, coalesces results and publishes batches after GPU consumers are ready. Parquet/Iceberg attempts advance coordination independently and dispatch coalescing to the existing metadata worker pool. Other metadata-only attempts advance on the query owner without another thread. An attempt with asynchronous coalescing, query-owner sources or native-reader sources runs coordination independently of reader calls: on the manager's shared pool by default, or on a dedicated thread when `coordinator_workers` is `0`. All drivers use the same bounded control steps, publication gate and retirement path. Sources choose where their jobs run:
 
 | Execution domain | Work and cleanup | Use |
 |---|---|---|
@@ -195,7 +186,7 @@ The action limit bounds work count, not hook duration. Adapters used with the sh
 |---|---|
 | `try_claim` | Returns work, pending or exhausted without entering a reader. Parquet/Iceberg resolve and read inside the job. DuckDB-native storage walks must finish during manager setup; its legacy claim fallback can still perform the walk if setup is bypassed. |
 | Job submission | Metadata enqueue does not wait for a worker slot; query-owner/native handoff uses the admitted mailbox or lease. Submission may allocate and take locks. |
-| Coalescer `advance`, `partial_emit`, `flush`; input construction | Manipulate prepared metadata and allocate descriptors. Datasource duplication shares existing handles. Allocation, locks and capture destruction still run inline. |
+| Coalescer `advance`, `partial_emit`, `flush`; input construction | Parquet coalescer operations run asynchronously on metadata workers; other coalescers and input construction remain inline. Datasource duplication shares existing handles. |
 | `prepare_prefetch` | Does not wait for eviction or device progress. It takes cache locks, allocates buffers and invokes ready completion callbacks inline. |
 | Final publication | Readahead registration and connector insertion run under the gate; no arbitrary adapter hooks are allowed there. Their locks and allocations remain part of the step. |
 | Source/output close and released captures | Metadata close and output notifications can run inline. Query-owner/native reader close and accepted-job disposal stay in their assigned execution domain. |
@@ -241,7 +232,7 @@ Published batches must own their storage independently of the reader and transac
 | Preparation jobs and results | Bounded slots limit outstanding work, not total memory. |
 | Output lookahead | Counts results, coalescer input and queued batches. Taking a batch returns lookahead capacity, not storage; submitted work may overshoot the target. |
 | Reserved backing | The last physical owner releases the allocation and its reservation. Provider SQL, SDK allocations and decoder working memory are not automatically covered. |
-| Arrow input | Use the shared importer with an explicit staging PMR kept alive by the capacity owner. Retain host backing, staging and capacity through the last asynchronous read, including cancellation and failure. Release callbacks and staging deallocation must be safe outside the statement thread. |
+| Arrow input | Follow the [Arrow input contract](scan.md#arrow-input-contract); retain source, staging and credits through readiness and the final asynchronous read. |
 | GPU output | May outlive the source and imported host batch. After destroying imported outputs, call `lane.quiesce()` even if the lane is idle; retain the stream, device allocator and backing through that barrier. |
 
 Partial publication follows the configured fill and residence limits. Residence starts at the first retained input; later arrivals do not reset it. Backpressure may delay publication. See [preparation settings](configuration.md#siriusexecutorscan_managerpreparation) for defaults.
@@ -282,8 +273,49 @@ A late GPU, physical-input, certificate, or exhausted-retry failure stops and dr
 
 The policy checks bound sources, including those hidden behind views. Transparent execution retains the original CPU plan. Explicit `gpu_execution()` checks its bind-time policy and validates the newly bound CPU plan before replay, so a replaced view cannot inherit stale permission. SQL-text and filesystem checks also block S3 replay.
 
+Source discovery retains its first failure while continuing to check siblings. Known S3 and stream restrictions take precedence. If discovery failure prevents replay, the query error includes both the discovery failure and the underlying GPU error. Discovery errors of type `INTERNAL` or `FATAL` become `EXECUTOR` errors so a failed replay check cannot invalidate the database instance. Other DuckDB error types and metadata are preserved when adding GPU context, so transaction invalidation follows the configured DuckDB policy. Non-standard C++ exceptions are converted to ordinary query errors; cancellation still propagates immediately.
+
 On the explicit path, the rebound validator returns a policy refusal separately from the CPU result. Such a refusal counts as no replay; an admitted CPU execution counts as replay even if it returns an ordinary error or no rows.
 
 Iceberg manifest queries use a separate read-only connection with recursive GPU execution disabled and finish before native leases are acquired. Parquet position-delete files use the shared reader in the caller's active transaction, with its filesystem and credentials. Callers must discard partial results if reading fails.
 
 Related documentation: [Scan](scan.md), [Physical Plan Generation](physical-plan-generation.md), and [Streaming Fragments](streaming-fragments.md).
+
+### Asynchronous Parquet coalescing
+
+Parquet coalescers opt into worker execution via `asynchronous_preparation()`. The coordinator
+submits `advance`, partial emission and final flush through the existing query-scoped metadata
+dispatcher. Each source has at most one pending operation, with an owning input and completion;
+no references into recyclable result slots cross the worker boundary. Completion snapshots
+carry the cursor, retained byte count and first-retained timestamp. The coordinator reads those
+snapshots rather than concurrently inspecting the mutable coalescer, then publishes through
+the existing admission gate. A pending operation reserves that source's next emission opportunity.
+
+Partial-batch deadlines schedule work rather than directly invoking the coalescer. Cancellation
+closes publication immediately; running operations finish before the dispatcher reports drain.
+Queued operations may be discarded. Source close and cleanup occur only after dispatcher drain,
+so input metadata and coalescer dependencies outlive all accepted work. Workers report coalescer
+exceptions outside the publication gate before completing their dispatcher work, including when
+normal EOS has closed the gate and no controller will consume the result. Routed pool-submission
+failures likewise reach query completion before pending work is discarded or final dispatcher
+drain is observable. The first query error wins. Cancellation does not preempt an in-progress
+library call.
+
+Workers have permanent NUMA-domain assignments. Independent metadata jobs rotate across the
+query's eligible domains; a whole job runs in its assigned domain, while each source's coalescer
+retains its selected domain. There is no persistent per-file routing state or cross-domain stealing.
+The dispatcher fairly selects the two work classes without executing callbacks on the submitting
+coordinator. Completed operations are consumed in rotating source
+order, at most one per control turn; a repeatedly ready source cannot continually bypass another
+ready completion. These policies do not preempt running reads or bound shared admission delay.
+See configuration for CPU allowance, fallback rules and separate worker-thread budgets.
+
+### Shared startup CPU boundary
+
+CPU-allowance discovery belongs to cuCascade, separately from hardware topology. Sirius saves
+the intersection of the main-thread mask and deployment allowance when configuration resolves.
+Metadata domains, pool affinity and lazy I/O/control/exchange startup use that snapshot rather
+than rediscovering a boundary from whichever DuckDB worker makes the call. Explicit pool masks
+can narrow the snapshot, and REST-reactor reservations further restrict worker CPUs. Temporary
+startup scopes preserve the caller's CUDA/thread-local context and restore CPU affinity; they
+do not move coalescing back to the query owner or change memory policy.

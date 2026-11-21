@@ -16,11 +16,9 @@
 
 #include "op/sirius_physical_projection.hpp"
 
-#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
-#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -28,9 +26,7 @@
 
 #include <cuda_runtime.h>
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <duckdb/common/exception.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -184,7 +180,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     output_batches.push_back(sirius::make_data_batch_from_view(
       out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
-  return std::make_unique<pipelineable_operator_data>(output_batches);
+  return std::make_unique<pipelineable_operator_data>(output_batches, input.get_position());
 }
 
 }  // namespace op

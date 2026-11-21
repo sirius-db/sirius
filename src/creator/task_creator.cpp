@@ -29,7 +29,6 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
-#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/execution/execution_context.hpp>
@@ -37,7 +36,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -164,7 +162,6 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   // lock, holding only their shared_ptr to this state. Note the map is NOT cleared — other
   // queries own their own entries, and this one is brand new.
   for (const auto& pipeline : pipelines) {
-    pipeline->set_task_creator(this);
     if (pipeline->is_query_terminal()) { pipeline->set_completion_handler(handler); }
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) {
@@ -183,15 +180,25 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
     state->global_states.emplace(operator_id, std::move(gs));
   }
 
-  std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
-  state->lookahead_queue.clear();
-  auto scan_operators            = query.get_scan_operators();
-  state->index_of_next_lookahead = 0;
-  if (!scan_operators.empty()) {
-    auto begin = scan_operators.begin() + 1;
-    for (auto it = begin; it != scan_operators.end(); ++it) {
-      state->lookahead_queue.push_back(*it);
+  {
+    std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
+    state->lookahead_queue.clear();
+    auto scan_operators            = query.get_scan_operators();
+    state->index_of_next_lookahead = 0;
+    if (!scan_operators.empty()) {
+      auto begin = scan_operators.begin() + 1;
+      for (auto it = begin; it != scan_operators.end(); ++it) {
+        state->lookahead_queue.push_back(*it);
+      }
     }
+  }
+
+  // Last: an exchange or streaming source schedules from another thread once its pipeline has a
+  // creator, and a worker that finds no global state for the source drops the batch it took. An
+  // exchange source notified earlier schedules nothing; it is scheduled again when its stream
+  // ends, which waits on this rank's own producer and so comes after the query starts.
+  for (const auto& pipeline : pipelines) {
+    pipeline->set_task_creator(this);
   }
 }
 
@@ -387,11 +394,13 @@ void task_creator::do_stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _bounded_pool->interrupt();
+  if (_bounded_pool) { _bounded_pool->interrupt(); }
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
-  _bounded_pool->stop();
+  if (_bounded_pool) {
+    _bounded_pool->wait_all();
+    _bounded_pool->stop();
+  }
   _bounded_pool.reset();
 }
 
@@ -698,12 +707,16 @@ void task_creator::manager_loop()
             }
 
             while (!node->all_ports_empty()) {
-              auto task_lock  = pipeline->get_task_creation_lock();
+              auto task_lock = pipeline->get_task_creation_lock();
+              // Serialize this check with task registration and pipeline completion. A claim
+              // may race this check, but any extra task is counted and safely claims zero rows.
+              if (pipeline->is_pipeline_finished() || pipeline->is_limit_exhausted()) { break; }
               auto input_data = node->get_next_task_input_data();
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
               if (!input_data ||
-                  (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+                  (pipelineable_input && pipelineable_input->get_data_batches().empty() &&
+                   !node->runs_without_input())) {
                 // no data to create task for
                 break;
               }

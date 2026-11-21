@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 description = "Existing Sirius C++ FFI bindings for execution and object stores."
 license = "Apache-2.0"
-links = "sirius"
 publish = false
 
 [features]
-static = []
+static = ["sirius-sys/static"]
 
 [dependencies]
+sirius-sys.workspace = true
 cxx.workspace = true
 arrow-array = { version = "60.1", features = ["ffi"] }
 arrow-schema = "60"

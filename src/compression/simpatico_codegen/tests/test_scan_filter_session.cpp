@@ -11,7 +11,6 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <algorithm>
 #include <array>
@@ -92,6 +91,7 @@ void numeric_sources(simpatico::stream_pool& pool,
   std::vector<std::int32_t> first_twenty(20);
   std::iota(first_twenty.begin(), first_twenty.end(), 0);
   sc::scan_filter_request request;
+  request.fused_scan.max_membership_sources = 4;
   request.routes            = {sc::decode_route::bitpack_mask, sc::decode_route::full};
   request.source_generation = 42;
   request.filters.push_back({0, {0, 19}});
@@ -116,6 +116,24 @@ void numeric_sources(simpatico::stream_pool& pool,
            "direct FULL remains legal on a compact-capable bitpack plan");
   }
   output.reset();
+
+  // A full-width output uses this request's own threshold on every decode.
+  for (bool const accept : {false, true, false}) {
+    request.fused_scan.full_route_max_selectivity =
+      (20.0 / static_cast<double>(row_count)) * (accept ? 2.0 : 0.5);
+    output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied == accept, "full-route selectivity threshold is per request");
+    if (accept) {
+      verify_values(output->view(), first_twenty, stream);
+    } else {
+      expect(result.status == sc::scan_filter_status::declined_unselective &&
+               output->num_rows() == row_count,
+             "full-route threshold decline returns every row");
+    }
+    output.reset();
+  }
+  request.fused_scan.full_route_max_selectivity = 0.10;
 
   request.filters.front().pred = {0, row_count - 1};
   output =
@@ -296,6 +314,7 @@ void membership_cascade(simpatico::stream_pool& pool,
 
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 199}});
     probe_trace trace;
@@ -320,7 +339,8 @@ void membership_cascade(simpatico::stream_pool& pool,
   // A keep mask alone primes the cascade.
   {
     sc::scan_filter_request request;
-    request.routes = {sc::decode_route::full, sc::decode_route::full};
+    request.fused_scan.max_membership_sources = 4;
+    request.routes                            = {sc::decode_route::full, sc::decode_route::full};
     std::vector<std::uint32_t> keep((row_count + 31) / 32, 0);
     for (int i = 0; i < row_count; i += 2)
       keep[i / 32] |= std::uint32_t{1} << (i % 32);
@@ -343,6 +363,7 @@ void membership_cascade(simpatico::stream_pool& pool,
   // A probe that throws after an earlier probe queued work and declined.
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 19}});
     auto const limit =
@@ -384,6 +405,7 @@ void membership_cascade(simpatico::stream_pool& pool,
     request.routes = {sc::decode_route::full, sc::decode_route::full};
     probe_trace trace;
     request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
+    request.fused_scan.max_membership_sources = 4;
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     sc::scan_filter_result result;
     auto output =
@@ -403,6 +425,7 @@ void membership_cascade(simpatico::stream_pool& pool,
     probe_trace trace;
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.fused_scan.max_membership_sources = 4;
     sc::scan_filter_result result;
     auto output =
       simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
@@ -440,6 +463,7 @@ void membership_measurement(simpatico::stream_pool& pool,
   // The cascade after a range: each probe sees the rows the range and the earlier probes kept.
   {
     sc::scan_filter_request request;
+    request.fused_scan.max_membership_sources = 4;
     request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
     request.filters.push_back({0, {0, 199}});
     request.measure_membership = true;
@@ -468,6 +492,7 @@ void membership_measurement(simpatico::stream_pool& pool,
     request.routes             = {sc::decode_route::full, sc::decode_route::full};
     request.measure_membership = true;
     probe_trace trace;
+    request.fused_scan.max_membership_sources = 4;
     request.membership_filters.push_back({1, traced_probe(trace, 10100, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
     request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
@@ -885,18 +910,82 @@ void dict_codes_gather(simpatico::stream_pool& pool,
   expect(rejected, "dict_codes gather accepted a key width hint that contradicts the key chars");
 }
 
+// A full-width output caps compaction at full_route_max_selectivity, unless a dict_codes output
+// shares the batch: then the ordinary max_selectivity ceiling applies.
+void dict_codes_lifts_full_route_ceiling(simpatico::stream_pool& pool,
+                                         ::cuda::stream_ref stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  std::vector<std::string> const keys{"MAIL", "SHIP", "AIR"};
+  std::vector<std::string> strings(row_count);
+  for (int i = 0; i < row_count; ++i)
+    strings[i] = keys[(i * 5 + i / 7) % keys.size()];
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_strings_column(strings, {}, stream));
+  columns.push_back(sequence(0, stream, mr));
+  columns.push_back(sequence(10000, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed =
+    simpatico::compress_with_plan(input.view(),
+                                  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                                  "dictionary.indices -> bitpack\n---\ninput -> bitpack\n---\n"
+                                  "input -> identity\n",
+                                  stream,
+                                  mr);
+
+  auto filtered = [&](std::vector<std::size_t> const& selected,
+                      std::vector<sc::decode_route> routes,
+                      std::int64_t keep,
+                      sc::scan_filter_result& result) {
+    sc::scan_filter_request request;
+    request.routes = std::move(routes);
+    request.filters.push_back({selected.size() - 2, {0, keep - 1}});
+    expect(request.fused_scan.full_route_max_selectivity == 0.10 &&
+             request.fused_scan.max_selectivity == 0.35,
+           "default selectivity ceilings");
+    return simpatico::decompress_scan_filter(
+      compressed, selected, request, result, pool, stream, mr);
+  };
+  std::int64_t const fifth = row_count / 5;
+
+  sc::scan_filter_result result;
+  auto output =
+    filtered({0, 1, 2},
+             {sc::decode_route::dict_codes, sc::decode_route::bitpack_mask, sc::decode_route::full},
+             fifth,
+             result);
+  expect(result.applied && result.survivor_count == fifth,
+         "a dict_codes output keeps compaction above the full-route ceiling");
+  std::vector<std::string> const expected_strings(strings.begin(), strings.begin() + fifth);
+  auto expected = make_strings_column(expected_strings, {}, stream);
+  expect(strings_equal(expected->view(), output->view().column(0), stream),
+         "dict_codes strings beside a full output");
+  auto const full = read<std::int32_t>(output->view().column(2), stream);
+  for (std::int64_t i = 0; i < fifth; ++i)
+    expect(full[i] == 10000 + i, "full output gathered beside a dict_codes output");
+  output.reset();
+
+  output =
+    filtered({1, 2}, {sc::decode_route::bitpack_mask, sc::decode_route::full}, fifth, result);
+  expect(!result.applied && result.status == sc::scan_filter_status::declined_unselective,
+         "without a dict_codes output the full-route ceiling applies");
+  output.reset();
+
+  output =
+    filtered({0, 1, 2},
+             {sc::decode_route::dict_codes, sc::decode_route::bitpack_mask, sc::decode_route::full},
+             row_count / 2,
+             result);
+  expect(!result.applied && result.status == sc::scan_filter_status::declined_unselective &&
+           output->num_rows() == row_count,
+         "a dict_codes output still declines above max_selectivity beside a full output");
+}
+
 }  // namespace
 
 int main()
 {
   try {
-    // Policy values cache on first read; use a dedicated process, not mutations
-    // of environment knobs between cases in a shared engine test binary.
-    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER", "4", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", "0.35", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", "0.10", 1);
-    setenv("SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL", "0.15", 1);
     // cuDF intentionally retains its default pinned pool until process exit.
     // Use individually freed pinned allocations so this standalone fixture can
     // check complete teardown without suppressing process-global pool leaks.
@@ -915,6 +1004,7 @@ int main()
     bool8_delivery(pool, stream, resource);
     nullable_bool8_declines(pool, stream, resource);
     dict_codes_gather(pool, stream, resource);
+    dict_codes_lifts_full_route_ceiling(pool, stream, resource);
     nullable_full_route_declines(pool, stream, resource);
     aliased_borrowed_lanes(pool, stream, resource);
     cuda_check(pool.sync_all());

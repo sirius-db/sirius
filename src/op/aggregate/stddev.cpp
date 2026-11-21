@@ -16,13 +16,12 @@
 
 #include "op/aggregate/stddev.hpp"
 
-#include "cudf/ast_compat.hpp"
+#include "cudf/compute_column_compat.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
@@ -124,7 +123,8 @@ std::unique_ptr<cudf::column> finalize_stddev(cudf::column_view states,
   auto const& deviation       = cudf::ast::jit::operation(tree, op::SQRT, {variance});
   auto const& result =
     cudf::ast::jit::operation(tree, op::IF_ELSE, {deviation, null_ref, enough_values});
-  auto output = cudf::compute_column_jit(cudf::table_view{{count, m2}}, result, stream, mr);
+  auto output =
+    sirius::cudf_compat::compute_column_jit(cudf::table_view{{count, m2}}, result, stream, mr);
 
   // DuckDB rejects non-finite finalized results (but returns NULL for singleton NaN/Inf).
   auto nan = cudf::is_nan(output->view(), stream, mr);

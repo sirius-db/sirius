@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <catch.hpp>
 
@@ -56,7 +57,8 @@ TEST_CASE("concurrent partition requests share one layout decision", "[partition
 {
   sirius_physical_partition left(one_column(), 0, partition_spec{{0}});
   sirius_physical_partition right(one_column(), 0, partition_spec{{0}});
-  sirius_physical_operator target(SiriusPhysicalOperatorType::PROJECTION, one_column(), 0);
+  sirius::op::test_physical_operator target(
+    SiriusPhysicalOperatorType::PROJECTION, one_column(), 0);
   cucascade::shared_data_repository left_repo, right_repo, output_repo;
   attach(left, left_repo);
   attach(right, right_repo);

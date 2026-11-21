@@ -31,8 +31,6 @@
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/filter/constant_filter.hpp>
-#include <duckdb/planner/filter/null_filter.hpp>
 #include <helper/type_conversions.hpp>
 #include <utils/table_filter_test_utils.hpp>
 

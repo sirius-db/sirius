@@ -52,16 +52,17 @@ namespace sirius::op {
  * arrays. `accumulations_skipped_inventory` counts builds whose input could not be certified and
  * attempts ended because a task input could not be matched to exactly one certified batch.
  * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
- * published, including initialization leases, publication scratch, missing peer DMA, and a
+ * published, including initialization leases, publication workspace, and a
  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
  * unexpected or fatal failures before they propagate, and `accumulations_skipped_transient` counts
  * retryable kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every
  * batch contributed, `accumulations_abandoned` publications owed by a task that never ran them
  * before input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs
- * that pushed at least one filter. `accumulation_storage_leaks` counts partial storage deliberately
- * leaked because GPU work might still use it after a failed host join.
- * `accumulation_publication_latency_ns` sums the time from final contribution to first push for
- * every attempt that published a filter.
+ * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose
+ * replicas were staged through HOST memory instead of copied between GPU pools.
+ * `accumulation_storage_leaks` counts partial storage deliberately leaked because GPU work might
+ * still use it after a failed host join. `accumulation_publication_latency_ns` sums the time from
+ * final contribution to first push for every attempt that published a filter.
  */
 template <typename Counter>
 struct dynamic_filter_counters {
@@ -77,6 +78,7 @@ struct dynamic_filter_counters {
   Counter accumulations_abandoned{};
   Counter accumulation_storage_leaks{};
   Counter accumulation_publications_finished{};
+  Counter accumulation_publications_host_staged{};
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_bloom_unsupported{};
@@ -126,6 +128,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulations_abandoned,
   &dynamic_filter_counters<Counter>::accumulation_storage_leaks,
   &dynamic_filter_counters<Counter>::accumulation_publications_finished,
+  &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_unsupported,

@@ -5,24 +5,21 @@
 # See the LICENSE file at the repo root for the full text.
 """Run the Sirius C++ unit tests.
 
-The run has four steps:
+The run has five steps:
 
   shards     Two Catch2 shards per visible GPU, run in parallel. Each shard sees
-             one GPU and uses integration-shard.yaml. [multi_gpu] and hidden
-             tests are excluded.
+             one GPU and uses integration-shard.yaml. [multi_gpu],
+             [public_context], and hidden tests are excluded.
+  context    The [public_context] lifecycle tests run alone because default
+             contexts reserve most of each GPU's memory.
   cuda_fault Isolated CUDA status-injection tests (Linux only). One GPU is
              visible; the [multi_gpu] ones run in a second process with all
              GPUs visible, skipped when fewer than two are.
   multi_gpu  The [multi_gpu] tests with all GPUs visible. Skipped when fewer
              than two GPUs are visible.
-  late_mat   The late-materialization tests with SIRIUS_EXP_LATE_MAT=1. The
-             gate is read once per process, so these tests need a process of
-             their own. The hidden [.late_mat_fused] tests run alone in a
-             second process: they skip when either gate is off, and Catch2
-             fails a run in which every test skipped, so a misconfigured gate
-             fails the step instead of passing unnoticed. That process sets
-             SIRIUS_EXP_FUSED_SCAN_FILTER=1 to override an inherited value; the
-             test binary arms that gate itself only when it is unset.
+  late_mat   The late-materialization tests, followed by the hidden
+             [.late_mat_fused] tests in a separate process. Both optimizations
+             are enabled by default; their master controls are SQL settings.
 
 The run stops after a step that fails. Arguments after -- are Catch2 options
 passed to every process. Every process writes its console output (unittest.log)
@@ -47,9 +44,10 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNITTEST_DIR = Path("test/cpp")
 SHARD_CONFIG = REPO_ROOT / "test/cpp/integration/integration-shard.yaml"
-STEPS = ("shards", "cuda_fault", "multi_gpu", "late_mat")
+STEPS = ("shards", "context", "cuda_fault", "multi_gpu", "late_mat")
 STEP_SPECS = {
-    "shards": "~[.]~[multi_gpu]",
+    "shards": "~[.]~[multi_gpu]~[public_context]",
+    "context": "[public_context]~[.]",
     "cuda_fault": "[cuda_status_fault]~[multi_gpu]",
     "multi_gpu": "[multi_gpu]~[.]",
     "late_mat": "[late_mat]~[late_mat_fused],[deferred_query]~[late_mat_fused],"
@@ -57,7 +55,13 @@ STEP_SPECS = {
 }
 LATE_MAT_FUSED_SPEC = "[late_mat_fused]"
 CUDA_FAULT_MULTI_GPU_SPEC = "[cuda_status_fault][multi_gpu]~[.]"
-TIMEOUT_MIN = {"shards": 45, "cuda_fault": 10, "multi_gpu": 20, "late_mat": 20}
+TIMEOUT_MIN = {
+    "shards": 45,
+    "context": 20,
+    "cuda_fault": 10,
+    "multi_gpu": 20,
+    "late_mat": 20,
+}
 SUMMARY_PREFIXES = ("All tests passed", "test cases:", "No tests ran")
 
 _print_lock = threading.Lock()
@@ -116,11 +120,16 @@ def visible_gpus() -> list[str]:
         ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     else:
         try:
-            ids = subprocess.run(
+            result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
                 capture_output=True,
                 text=True,
-            ).stdout.split()
+            )
+            # Driver failures can write diagnostics to stdout. Never interpret those
+            # words as device IDs and launch a pair of shards for each one.
+            if result.returncode != 0:
+                return []
+            ids = result.stdout.split()
         except OSError:
             ids = []
     return [i.strip() for i in ids if i.strip()]
@@ -264,7 +273,7 @@ def main() -> int:
                             prefix="[fault_mgpu] ",
                         )
                     )
-            case "multi_gpu":
+            case "context" | "multi_gpu":
                 jobs = [Job(label=step, cmd=cmd, env={}, log_dir=log_root / step)]
             case "late_mat":
                 fused_cmd = cmd[:-1] + [LATE_MAT_FUSED_SPEC]
@@ -272,17 +281,14 @@ def main() -> int:
                     Job(
                         label=step,
                         cmd=cmd,
-                        env={"SIRIUS_EXP_LATE_MAT": "1"},
+                        env={},
                         log_dir=log_root / step,
                         prefix="[late_mat] ",
                     ),
                     Job(
                         label="late_mat_fused",
                         cmd=fused_cmd,
-                        env={
-                            "SIRIUS_EXP_LATE_MAT": "1",
-                            "SIRIUS_EXP_FUSED_SCAN_FILTER": "1",
-                        },
+                        env={},
                         log_dir=log_root / "late_mat_fused",
                         prefix="[late_mat_fused] ",
                     ),
