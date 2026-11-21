@@ -20,8 +20,7 @@
 
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/device_buffer.hpp>
+#include <cuda/stream_ref>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -53,17 +52,14 @@ class outgoing_batch {
   /// @throws sirius::invalid_input_exception when the batch is not on the GPU, or has a column
   ///         neither fixed-width nor STRING.
   [[nodiscard]] static std::optional<outgoing_batch> make(
-    std::shared_ptr<cucascade::data_batch> batch, rmm::cuda_stream_view stream);
+    std::shared_ptr<cucascade::data_batch> batch, ::cuda::stream_ref stream);
 
   [[nodiscard]] batch_header const& header() const noexcept { return _header; }
   [[nodiscard]] std::uint64_t stream_bytes() const noexcept { return _header.stream_bytes; }
 
   /// Enqueues on @p stream the copies of stream range [@p begin, @p end) into device memory
   /// @p dst; padding between buffers is left as is.
-  void copy_range(std::size_t begin,
-                  std::size_t end,
-                  void* dst,
-                  rmm::cuda_stream_view stream) const;
+  void copy_range(std::size_t begin, std::size_t end, void* dst, ::cuda::stream_ref stream) const;
 
  private:
   outgoing_batch(std::shared_ptr<cucascade::data_batch> batch,
@@ -92,7 +88,7 @@ class incoming_batch {
   [[nodiscard]] static std::unique_ptr<incoming_batch> land(batch_header header,
                                                             cucascade::memory::memory_space& gpu,
                                                             cucascade::memory::memory_space* host,
-                                                            rmm::cuda_stream_view stream);
+                                                            ::cuda::stream_ref stream);
 
   [[nodiscard]] cucascade::memory::Tier tier() const noexcept { return _tier; }
   [[nodiscard]] batch_header const& header() const noexcept { return _header; }
@@ -100,11 +96,11 @@ class incoming_batch {
   /// Enqueues on @p stream the copies of stream range [@p begin, @p begin + @p size) from device
   /// memory @p src into the landing.
   /// @throws sirius::invalid_input_exception when the range is outside the stream.
-  void copy_in(std::size_t begin, void const* src, std::size_t size, rmm::cuda_stream_view stream);
+  void copy_in(std::size_t begin, void const* src, std::size_t size, ::cuda::stream_ref stream);
 
   /// The landed batch. Every copy_in() must have completed: a host batch is read by the CPU.
   /// The landing is empty afterwards.
-  [[nodiscard]] std::shared_ptr<cucascade::data_batch> seal(rmm::cuda_stream_view stream);
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> seal(::cuda::stream_ref stream);
 
  private:
   incoming_batch(batch_header header, cucascade::memory::memory_space& space);
@@ -113,7 +109,8 @@ class incoming_batch {
   std::vector<stream_buffer> _buffers;
   cucascade::memory::memory_space* _space;
   cucascade::memory::Tier _tier{cucascade::memory::Tier::GPU};
-  std::vector<rmm::device_buffer> _gpu_buffers;
+  std::vector<std::unique_ptr<cudf::column>> _columns;
+  std::vector<void*> _destinations;
   cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation _host_blocks;
 };
 

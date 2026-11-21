@@ -506,7 +506,7 @@ struct fake_compressed_entry {
   fake_compressed_entry(std::vector<std::int64_t> const& batch_rows,
                         std::vector<std::int64_t> const& null_rows,
                         std::string const& name,
-                        rmm::cuda_stream_view stream)
+                        ::cuda::stream_ref stream)
   {
     auto const mr   = rmm::mr::get_current_device_resource_ref();
     manager         = sirius::test::operator_utils::initialize_memory_manager();
@@ -528,7 +528,7 @@ struct fake_compressed_entry {
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
       cudf::size_type null_count = 0;
       for (auto const global_row : null_rows) {
         if (global_row < next || global_row >= next + rows) { continue; }
@@ -537,13 +537,13 @@ struct fake_compressed_entry {
         ++null_count;
       }
       col->set_null_count(null_count);
-      cudaStreamSynchronize(stream.value());
+      cudaStreamSynchronize(stream.get());
       next += rows;
 
       auto blob   = std::make_shared<sirius::compressed_device_blob>();
       blob->table = simpatico::compress_with_plan(
         cudf::table_view{{col->view()}}, "input -> bitpack -> packed\n", stream, mr);
-      cudaStreamSynchronize(stream.value());
+      cudaStreamSynchronize(stream.get());
 
       sirius::device_pin_chunk chunk;
       chunk.memory_space = gpu_space;
@@ -578,7 +578,7 @@ struct fake_compressed_entry {
 TEST_CASE("a nullable compressed pin resolves and materializes with its nulls",
           "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   // Rows 5 and 60 are null, and 60 falls in the third chunk, so the selection
   // below crosses chunk boundaries with nulls on either side of one.
@@ -600,7 +600,7 @@ TEST_CASE("a nullable compressed pin resolves and materializes with its nulls",
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const out = materialize(*column, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(out->view().nullable());
   auto const host_mask = read_back_mask(out->view());

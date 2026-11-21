@@ -134,28 +134,6 @@ std::shared_ptr<cucascade::data_batch> keys_batch(std::int64_t first, std::int64
   return gpu_batch(keys_table(first, step, rows));
 }
 
-/// Sets @p column's rows NULL where @p is_null(row) holds.
-template <typename Pred>
-void null_rows(cudf::column& column, Pred is_null)
-{
-  auto const rows = column.size();
-  std::vector<std::uint32_t> words(
-    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
-  cudf::size_type nulls = 0;
-  for (cudf::size_type i = 0; i < rows; ++i) {
-    if (is_null(i)) {
-      ++nulls;
-    } else {
-      words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
-    }
-  }
-  rmm::device_buffer mask(words.data(),
-                          words.size() * sizeof(std::uint32_t),
-                          utils::default_stream(),
-                          utils::get_resource_ref(*env().gpu));
-  column.set_null_mask(std::move(mask), nulls);
-}
-
 std::vector<std::int64_t> keys_of(cucascade::data_batch& batch)
 {
   auto ro = batch.to_read_only();

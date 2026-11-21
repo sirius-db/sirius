@@ -905,32 +905,6 @@ TEST_CASE("a VALUES source keeps its rows on rank 0 alone", "[exchange][operator
   CHECK(rows[1] == 0);
 }
 
-namespace {
-
-/// Sets @p column's rows NULL where @p is_null(row) holds.
-template <typename Pred>
-void null_rows(cudf::column& column, Pred is_null)
-{
-  auto const rows = column.size();
-  std::vector<std::uint32_t> words(
-    cudf::bitmask_allocation_size_bytes(rows) / sizeof(std::uint32_t), 0);
-  cudf::size_type nulls = 0;
-  for (cudf::size_type i = 0; i < rows; ++i) {
-    if (is_null(i)) {
-      ++nulls;
-    } else {
-      words[static_cast<std::size_t>(i) / 32] |= 1u << (i % 32);
-    }
-  }
-  rmm::device_buffer mask(words.data(),
-                          words.size() * sizeof(std::uint32_t),
-                          utils::default_stream(),
-                          utils::get_resource_ref(*env().gpu));
-  column.set_null_mask(std::move(mask), nulls);
-}
-
-}  // namespace
-
 TEST_CASE("a NULL in any of several keys sends the row to every rank", "[exchange][operators]")
 {
   ranks c(3);

@@ -5,6 +5,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
@@ -153,7 +154,8 @@ std::unique_ptr<cudf::column> empty_column(parquet_field const& field)
     std::vector<std::unique_ptr<cudf::column>> children;
     for (auto const& child : field.children)
       children.push_back(empty_column(child));
-    return cudf::make_structs_column(0, std::move(children), 0, {});
+    return cudf::make_structs_column(
+      0, std::move(children), 0, cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   }
   if (field.type.id() == type_id::LIST || field.type.id() == type_id::ARRAY) {
     auto offsets = cudf::make_numeric_column(
@@ -161,8 +163,11 @@ std::unique_ptr<cudf::column> empty_column(parquet_field const& field)
     auto status = cudaMemset(offsets->mutable_view().data<int32_t>(), 0, sizeof(int32_t));
     if (status != cudaSuccess)
       throw cudf::cuda_error("Initializing empty Parquet list offsets failed", status);
-    return cudf::make_lists_column(
-      0, std::move(offsets), empty_column(field.children.at(0)), 0, {});
+    return cudf::make_lists_column(0,
+                                   std::move(offsets),
+                                   empty_column(field.children.at(0)),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   }
   return cudf::make_empty_column(physical_type(field.type));
 }

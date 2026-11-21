@@ -120,8 +120,7 @@ struct forged_peer {
 std::vector<std::uint8_t> many_frame_header()
 {
   rmm::cuda_stream stream;
-  auto const out =
-    sirius::exchange::outgoing_batch::make(gpu_batch(sample_table(30'000)), stream.view());
+  auto const out = sirius::exchange::outgoing_batch::make(gpu_batch(sample_table(30'000)), stream);
   REQUIRE(out.has_value());
   REQUIRE(out->stream_bytes() > 64 * KiB);
   return sirius::exchange::encode_header(out->header());
