@@ -4,6 +4,7 @@
 #include <sirius-c/plan/plan.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <variant>
@@ -44,8 +45,10 @@ struct comparison {
   owner<sirius_expression> right;
   sirius_comparison operation;
 };
+enum class scan_source : std::uint8_t { local_path, s3_object };
 struct parquet_scan {
   std::string path;
+  scan_source source = scan_source::local_path;
 };
 struct filter {
   owner<sirius_plan_node> input;

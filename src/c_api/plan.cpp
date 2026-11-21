@@ -4,6 +4,7 @@
 
 #include <absl/strings/ascii.h>
 #include <absl/strings/escaping.h>
+#include <absl/strings/match.h>
 #include <utf8proc.h>
 
 #include <algorithm>
@@ -61,6 +62,26 @@ bool has_uri_scheme(std::string_view path)
            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-") ==
          std::string_view::npos;
 }
+scan_source classify_scan_source(std::string_view source)
+{
+  if (!has_uri_scheme(source)) { return scan_source::local_path; }
+  constexpr std::string_view prefix = "s3://";
+  constexpr std::string_view bucket_bytes =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+  require(absl::StartsWithIgnoreCase(source, prefix),
+          "Expected a local file path or an s3://bucket/key URI");
+  source.remove_prefix(prefix.size());
+  require(source.find_first_of("?#") == std::string_view::npos,
+          "S3 URI must not contain '?' or '#'");
+  auto slash  = source.find('/');
+  auto bucket = source.substr(0, slash);
+  require(!bucket.empty() && bucket != "." && bucket != "..",
+          "S3 bucket must not be empty, '.' or '..'");
+  require(bucket.find_first_not_of(bucket_bytes) == std::string_view::npos,
+          "S3 bucket must use only ASCII letters, digits, '.', '_' or '-'");
+  require(slash != std::string_view::npos && slash + 1 < source.size(), "S3 URI has no object key");
+  return scan_source::s3_object;
+}
 bool is_valid_utf8(std::string_view text)
 {
   while (!text.empty()) {
@@ -109,7 +130,11 @@ std::string describe(const sirius_plan_node& root)
   while (node) {
     result.append(indentation, ' ');
     if (auto scan = std::get_if<parquet_scan>(&node->value)) {
-      result += "ParquetScan(path=" + quoted(scan->path) + ")\n";
+      if (scan->source == scan_source::s3_object) {
+        result += "ParquetScan(uri=\"s3://<redacted>\")\n";
+      } else {
+        result += "ParquetScan(path=" + quoted(scan->path) + ")\n";
+      }
       node = nullptr;
     } else {
       const auto& value = std::get<filter>(node->value);
@@ -175,9 +200,9 @@ sirius_status sirius_plan_scan_parquet(const char* path,
 {
   return create(out_node, out_error, [&] {
     require(schema != nullptr, "Schema is NULL");
-    auto name = bytes(path, path_size);
-    require(!has_uri_scheme(name), "Expected a local file path without a URI scheme");
-    return new sirius_plan_node(acquire(schema), parquet_scan{std::move(name)}, 1);
+    auto name   = bytes(path, path_size);
+    auto source = classify_scan_source(name);
+    return new sirius_plan_node(acquire(schema), parquet_scan{std::move(name), source}, 1);
   });
 }
 sirius_status sirius_expression_column(const sirius_plan_node* input,

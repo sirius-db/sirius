@@ -108,11 +108,11 @@ lifetime constraints.
 
 ## Physical plan construction
 
-Construct plans without a context, GPU, or file access. The initial subset supports
-Boolean and Int64 fields, a local Parquet scan with an explicit schema, typed column
-references and literals, comparisons, and filters. Each factory returns a complete
-immutable object or an error. Schema names and column types are checked during
-construction. Field names are case-sensitive; file schemas and engine support
+Construct plans without a context, a GPU, or any file or network access. The initial subset
+supports Boolean and Int64 fields, a Parquet scan of a local file or an S3 object with an
+explicit schema, typed column references and literals, comparisons, and filters. Each factory
+returns a complete immutable object or an error. Schema names and column types are checked
+during construction. Field names are case-sensitive; file schemas and engine support
 belong to future preparation.
 
 ```text
@@ -137,10 +137,27 @@ These functions expose node kinds, input links, and schemas; construction neithe
 filters nor changes the chosen operators. sirius_plan_describe() provides a readable
 explanation with shared expression definitions. Its text is diagnostic, not a
 serialization format. Full expression-tree accessors are a separate addition.
-Borrowed inspection handles may be retained independently. Relative source paths
-are resolved using the working directory at future preparation time; the same
-relative description can therefore refer to different files in different directories.
-Paths identify a single literal filename; glob characters are never expanded.
+Borrowed inspection handles may be retained independently.
+
+A scan source is a nonempty byte string without NUL, denoting a local path or an S3
+location. Its bytes are stored as given and identify a single literal file or object; glob
+characters are never expanded. Relative local paths are resolved using the working
+directory at future preparation time; the same relative description can therefore refer to
+different files in different directories.
+
+An S3 location is `s3://bucket/key`, with the scheme in either ASCII case. The bucket is one
+or more ASCII letters, digits, `.`, `_` or `-`, other than `.` or `..`. User-info and a port
+cannot be written, and a host name there is a bucket name, not an endpoint. The key is not
+empty: `@`, `:` and `%` are ordinary bytes in it and percent sequences are not decoded. `?`
+and `#` are rejected anywhere in the location, so a key that contains one cannot be
+expressed. Any other URI scheme or malformed S3 location returns SIRIUS_INVALID_ARGUMENT; its
+diagnostic does not repeat the input.
+
+A scan takes no credentials or object-store configuration, and construction does not select
+a store. Store selection belongs to future preparation and can refuse a location that
+construction accepts: object-store prefix matching currently cannot serve a key that contains
+`%`, an empty, `.` or `..` segment, or a trailing slash. sirius_plan_describe() shows every
+S3 scan as `s3://<redacted>` instead of printing its bucket or key.
 
 Plan nodes and expression trees currently support up to 256 levels. Unknown type
 and comparison identifiers, mismatched scopes, invalid schemas, and unsupported
