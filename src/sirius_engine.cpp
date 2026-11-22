@@ -297,6 +297,9 @@ void sirius_engine::execute()
       sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
+    // No finish transition is running past the work barrier. One that failed after success was
+    // signalled had its report dropped, so it fails the query here.
+    if (query_) { pipeline::rethrow_finalize_failure(query_->get_pipelines()); }
     finish_scan_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {

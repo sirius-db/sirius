@@ -385,6 +385,16 @@ class failing_finalize_operator final : public sirius::op::test_physical_operato
   std::future<void> release_;
 };
 
+/// An inline LIMIT that has already claimed its quota.
+class exhausted_limit_operator final : public sirius::op::test_physical_operator {
+ public:
+  exhausted_limit_operator()
+    : test_physical_operator(SiriusPhysicalOperatorType::UNORDERED_STREAMING_LIMIT, {}, 1)
+  {
+  }
+  bool is_limit_exhausted() const override { return true; }
+};
+
 std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_task(
   std::shared_ptr<sirius_pipeline> pipeline, std::shared_ptr<completion_handler> handler)
 {
@@ -486,8 +496,9 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
           "[pipeline][completion][issue-1625]")
 {
   // upstream -> terminal. The upstream pipeline's last task is being destroyed and its finalize
-  // is held; the terminal pipeline has no work left and waits only on the upstream pipeline.
+  // is held; the terminal pipeline has no work left of its own.
   failing_finalize_operator op(/*hold=*/true);
+  exhausted_limit_operator limit;
   auto upstream_sink = make_sink(SiriusPhysicalOperatorType::PROJECTION);
   auto upstream      = make_finishable_pipeline(upstream_sink);
   sirius_pipeline_build_state{}.add_pipeline_operator(*upstream, op);
@@ -501,6 +512,10 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
   input->src_pipeline = upstream;
   terminal_sink.add_port("default", std::move(input));
 
+  // An exhausted LIMIT lets the terminal pipeline finish without waiting for the upstream one.
+  const bool limit_exhausted = GENERATE(false, true);
+  if (limit_exhausted) { sirius_pipeline_build_state{}.add_pipeline_operator(*terminal, limit); }
+
   auto handler = std::make_shared<completion_handler>();
   terminal->set_completion_handler(handler);
   auto awaitable = handler->get_awaitable();
@@ -512,15 +527,33 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
 
   // Another thread now tries to finish the terminal pipeline.
   REQUIRE_NOTHROW(terminal->update_pipeline_status(false));
-  CHECK_FALSE(terminal->is_pipeline_finished());
-  CHECK(awaitable.wait_for(0s) == std::future_status::timeout);
+  const std::vector<std::shared_ptr<sirius_pipeline>> pipelines{upstream, terminal};
 
-  op.release.set_value();
-  destroyer.get();
+  if (!limit_exhausted) {
+    CHECK_FALSE(terminal->is_pipeline_finished());
+    CHECK(awaitable.wait_for(0s) == std::future_status::timeout);
 
-  REQUIRE(awaitable.wait_for(5s) == std::future_status::ready);
-  CHECK_THROWS_WITH(awaitable.get(), "finalize failed");
-  REQUIRE_NOTHROW(terminal->update_pipeline_status(false));
+    op.release.set_value();
+    destroyer.get();
+
+    REQUIRE(awaitable.wait_for(5s) == std::future_status::ready);
+    CHECK_THROWS_WITH(awaitable.get(), "finalize failed");
+    REQUIRE_NOTHROW(terminal->update_pipeline_status(false));
+    CHECK_FALSE(terminal->is_pipeline_finished());
+  } else {
+    // Success is delivered while the upstream finalize is still running.
+    CHECK(terminal->is_pipeline_finished());
+    REQUIRE(awaitable.wait_for(0s) == std::future_status::ready);
+
+    op.release.set_value();
+    destroyer.get();
+
+    // The task's error report lost to the success; the future cannot carry it.
+    CHECK_NOTHROW(awaitable.get());
+    CHECK_FALSE(handler->has_error());
+  }
+
+  // What the query thread checks after retiring the query's work, before returning success.
   CHECK_FALSE(upstream->is_pipeline_finished());
-  CHECK_FALSE(terminal->is_pipeline_finished());
+  CHECK_THROWS_WITH(sirius::pipeline::rethrow_finalize_failure(pipelines), "finalize failed");
 }

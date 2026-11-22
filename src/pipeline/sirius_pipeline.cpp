@@ -358,6 +358,19 @@ sirius_pipeline::task_creation_guard sirius_pipeline::get_task_creation_lock()
   return task_creation_guard(*this);
 }
 
+std::exception_ptr sirius_pipeline::finalize_error() const
+{
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  return _finalize_error;
+}
+
+void rethrow_finalize_failure(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
+{
+  for (const auto& pipeline : pipelines) {
+    if (auto error = pipeline->finalize_error()) { std::rethrow_exception(error); }
+  }
+}
+
 bool sirius_pipeline::is_limit_exhausted() const
 {
   return std::any_of(operators.begin(), operators.end(), [](auto const& op) {
@@ -377,7 +390,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
     std::lock_guard<std::mutex> lock(_status_mutex);
     if (_task_creation_active) return;
     // A failed finalize is final: the pipeline stays unfinished and is not finalized again.
-    if (_finalize_failed) return;
+    if (_finalize_error) return;
 
     auto end_nvtx_range_if_finished = [this]() {
       if (pipeline_finished.load() && _nvtx_range_started.load()) {
@@ -415,7 +428,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
           } catch (...) {
             // The pipeline stays unfinished, so no downstream pipeline treats its input as
             // complete and the query cannot be reported successful. The caller reports the error.
-            _finalize_failed = true;
+            _finalize_error = std::current_exception();
             if (_nvtx_range_started.load()) {
               nvtxDomainRangeEnd(nvtx3::domain::get<sirius::nvtx_domain>(),
                                  _nvtx_pipeline_range_id);

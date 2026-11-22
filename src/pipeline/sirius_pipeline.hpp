@@ -30,6 +30,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <atomic>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -212,6 +213,12 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! finalizing them threw.
   virtual bool is_pipeline_finished() const;
 
+  //! The exception finalize_operator() threw during the finish transition, or null. The caller
+  //! of the transition reports it, but a query that has already succeeded drops that report (an
+  //! exhausted LIMIT finishes the query without waiting for upstream pipelines), so the query
+  //! thread reads it here after retiring the query's work.
+  [[nodiscard]] std::exception_ptr finalize_error() const;
+
   //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
   [[nodiscard]] bool is_limit_exhausted() const;
 
@@ -341,9 +348,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   mutable std::mutex _status_mutex;
   std::mutex _task_creation_mutex;
   bool _task_creation_active = false;
-  //! Set when finalize_operator() threw during the finish transition; the pipeline then never
+  //! What finalize_operator() threw during the finish transition; the pipeline then never
   //! finishes. Guarded by _status_mutex.
-  bool _finalize_failed = false;
+  std::exception_ptr _finalize_error;
 
   //! Whether the pipeline has been finished. Set after its operators are finalized.
   std::atomic<bool> pipeline_finished = false;
@@ -360,6 +367,10 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
 
   quent::Uuid _pipeline_uuid{quent::now_v7()};
 };
+
+//! Rethrows the first finalize failure recorded by @p pipelines, if any. Call once no finish
+//! transition can still be running.
+void rethrow_finalize_failure(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines);
 
 }  // namespace pipeline
 }  // namespace sirius

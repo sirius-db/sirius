@@ -410,6 +410,13 @@ rethrows to its caller, which reports the error. The pipeline then stays unfinis
 finalized again, it never signals completion, and no downstream pipeline can treat its input as
 complete and finish the query in its place.
 
+An exhausted LIMIT is the one case where a terminal pipeline finishes without waiting for its
+upstream pipelines, so success can be signalled while an upstream finalize is still running. The
+handler accepts only the first signal and drops the later error. The pipeline keeps the
+exception (`finalize_error()`), and `sirius_engine::execute()` calls
+`rethrow_finalize_failure()` on the query's pipelines after `retire_query_work()` has waited for
+all work, so the query fails instead of returning its result.
+
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
 `SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,
