@@ -158,7 +158,7 @@ class translation_context {
 
   /**
    * @brief Emits the code for a node that DuckDB evaluates as a condition (a filter predicate or a
-   * CASE WHEN condition) and returns its @c register_value.
+   *        CASE WHEN condition) and returns its @c register_value.
    *
    * Only its value's truth is meaningful: an AND that a later operand did not run for may be NULL
    * where its Kleene value is FALSE.
@@ -187,8 +187,8 @@ class translation_context {
   [[nodiscard]] bool has_subquery_error() const noexcept { return _subquery_error_checks > 0; }
   /**
    * @brief Returns the overflow sites of the produced expressions in the order their statements
-   * appear in @c body_code(), leaving out those under a TRY and the conversion of a TRY_CAST, which
-   * turn their overflow into NULL before it can reach an NVRTC Sink.
+   *        appear in @c body_code(), leaving out those under a TRY and the conversion of a
+   *        TRY_CAST, which turn their overflow into NULL before it can reach an NVRTC Sink.
    */
   [[nodiscard]] std::span<overflow_site const> overflow_sites() const noexcept
   {
@@ -251,7 +251,7 @@ class translation_context {
 
   /**
    * @brief Records the current end of the body and the numbers of subquery-error checks and of
-   * computed values produced so far.
+   *        computed values produced so far.
    */
   [[nodiscard]] operand_mark mark_operand() const noexcept
   {
@@ -260,7 +260,8 @@ class translation_context {
 
   /**
    * @brief Returns whether the operand produced since @p mark, whose result is @p operand, can
-   * raise a SQL error: Overflow Poison, or a scalar subquery that returned more than one row.
+   *        raise a SQL error: Overflow Poison, or a scalar subquery that returned more than one
+   * row.
    */
   [[nodiscard]] bool can_raise_since(operand_mark mark,
                                      register_value const& operand) const noexcept
@@ -270,7 +271,8 @@ class translation_context {
 
   /**
    * @brief Returns whether the later AND or OR operand or IN list value produced since @p mark,
-   * whose result is @p operand, runs only for the rows that the earlier operands leave undecided.
+   *        whose result is @p operand, runs only for the rows that the earlier operands leave
+   *        undecided.
    *
    * In @p position `condition` an operand that can raise must be skipped for the other rows, and
    * as a value it must run on every row. An operand that cannot raise is skipped for them when it
@@ -290,8 +292,8 @@ class translation_context {
 
   /**
    * @brief Records @p site when its own operation can raise Overflow Poison, and returns whether
-   * the operation's result can carry Overflow Poison, raised by the operation or passed on from its
-   * inputs.
+   *        the operation's result can carry Overflow Poison, raised by the operation or passed on
+   *        from its inputs.
    */
   [[nodiscard]] bool record_overflow_site(overflow_site site,
                                           bool raises_overflow,
@@ -302,7 +304,7 @@ class translation_context {
 
   /**
    * @brief Forgets the overflow sites recorded after @p mark, under a TRY, which turns their
-   * Overflow Poison into NULL before it can reach an NVRTC Sink.
+   *        Overflow Poison into NULL before it can reach an NVRTC Sink.
    */
   void drop_overflow_sites_since(std::size_t mark) noexcept;
 

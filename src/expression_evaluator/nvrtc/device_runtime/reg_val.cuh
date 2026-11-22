@@ -306,26 +306,15 @@ __device__ __forceinline__ ovf_result<T> checked_mul(T a, T b)
 
 //===----------REGISTER CARRIER----------===//
 /**
- * @brief One Register Value of a generated kernel's row: the payload, its SQL validity, and its
- *        Overflow Poison.
+ * @brief Holds a row's payload, SQL validity, and overflow flag.
  *
- * ==========OVERFLOW POISON==========
- * Every function of this runtime and every statement that `translation_context` emits keeps one
- * invariant: an operation sets @c overflow only by propagating an operand's Overflow Poison, or
- * from its own computation over operands that are all valid and carry no Overflow Poison, and it
- * never clears the Overflow Poison of an operand it evaluated: only TRY turns that into NULL.
- * Overflow Poison therefore always comes from an Evaluated Operation, and the NVRTC Sinks of the
- * `ProjectSink` and `FilterSink` kernels report every Overflow Poison that reaches them, whatever
- * the value's final validity: e.g., `n + abs(x)` with `n` NULL and `x` the lowest INTEGER is a NULL
- * that still carries the Overflow Poison of `abs(x)`.
+ * Propagate overflow from every operand evaluated, even if the result is NULL. An operation can set
+ * a new overflow flag only when all its operands are valid and carry no overflow. TRY can catch
+ * overflow and return NULL.
  *
- * The payload of a value that is invalid or carries Overflow Poison is unspecified: it is whatever
- * the operation computes from its operands' bits, and it never decides validity or overflow. The
- * arithmetic and the numeric casts do not return early for such an operand, because a branch per
- * operation costs a chain of operations more than computing every row does; `operation_result`
- * applies the invariant to the flags instead. Whatever reads a payload must therefore be defined
- * for every bit pattern (i.e., the following must be avoided): no signed overflow, no division by
- * zero or of the lowest value by -1, no float-to-integer conversion out of range.
+ * The payload is unspecified when the value is NULL or carries overflow. Device operations must
+ * handle every payload bit pattern without undefined behavior. For example, guard division by zero
+ * and out-of-range float-to-integer casts even when the operand is invalid.
  */
 template <typename T>
 struct reg_val {

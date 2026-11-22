@@ -4138,11 +4138,6 @@ TEST_CASE("nvrtc_jit - changing scalar constant values reuses cached compiled ke
   CHECK(out3->view().column(2).null_count() == in.view.num_rows());
 }
 
-// ============================================================================
-// Ticket #6: Checked integer/float arithmetic, comparisons, BETWEEN, and
-// unary_op (NOT, IS [NOT] NULL, TRY)
-// ============================================================================
-
 TEST_CASE("nvrtc_jit - binary arithmetic, abs, round, and constant_or_null match MATERIALIZE",
           "[expression_evaluator][nvrtc_jit][ticket6]")
 {
@@ -5077,11 +5072,6 @@ TEST_CASE("nvrtc_jit - comparisons, IS [NOT] DISTINCT FROM, BETWEEN, NOT, and IS
   }
 }
 
-// ============================================================================
-// Ticket #7: Lazy branching & poison-safe control flow: CASE WHEN, COALESCE,
-// Kleene AND/OR, and IN lists
-// ============================================================================
-
 TEST_CASE("nvrtc_jit - conjunction, case_expr, coalesce, and in_list match MATERIALIZE",
           "[expression_evaluator][nvrtc_jit][ticket7]")
 {
@@ -5846,11 +5836,6 @@ TEST_CASE("nvrtc_jit - lazy branching and poison-safe control flow for CASE, COA
   }
 }
 
-// ============================================================================
-// Ticket #8: DECIMAL(32/64/128) arithmetic, comparisons, and checked
-// CAST / TRY_CAST (numeric, decimal, and temporal)
-// ============================================================================
-
 TEST_CASE("nvrtc_jit - DECIMAL(32/64/128) arithmetic, scale alignment, and comparisons",
           "[expression_evaluator][nvrtc_jit][ticket8][decimal]")
 {
@@ -6501,10 +6486,6 @@ TEST_CASE(
   }
 }
 
-// ============================================================================
-// Ticket #9: In-kernel temporal extraction (year..microsecond) and date_trunc
-// ============================================================================
-
 TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and fuse in one kernel",
           "[expression_evaluator][nvrtc_jit][ticket9]")
 {
@@ -6890,12 +6871,6 @@ TEST_CASE("nvrtc_jit - temporal extraction and date_trunc match MATERIALIZE and 
     check_tables_match(jit_out->view(), mat_out->view());
   }
 }
-
-// ============================================================================
-// Ticket #10: String operations
-// (LIKE, NOT LIKE, CONTAINS, PREFIX, SUFFIX, strlen, length, substring,
-// comparisons, BETWEEN, IN, CASE/COALESCE over strings)
-// ============================================================================
 
 TEST_CASE(
   "nvrtc_jit - string comparisons, functions, substring, and mixed-length strings match "
@@ -7461,11 +7436,6 @@ TEST_CASE(
   }
 }
 
-// ============================================================================
-// Ticket #11: Materialization Boundaries for allocating string and struct
-// sub-trees
-// ============================================================================
-
 TEST_CASE(
   "nvrtc_jit - Materialization Boundaries for string and struct sub-trees match MATERIALIZE",
   "[expression_evaluator][nvrtc_jit][ticket11]")
@@ -7979,11 +7949,6 @@ TEST_CASE(
   }
 }
 
-// ============================================================================
-// Ticket #12: FilterSink with TQP++ 3-tier Sparse-to-Dense Compaction
-// (select and select_with_survivors)
-// ============================================================================
-
 TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across selectivities and blocks",
           "[expression_evaluator][nvrtc_jit][ticket12]")
 {
@@ -8379,8 +8344,7 @@ TEST_CASE("nvrtc_jit - FilterSink select and select_with_survivors across select
 
 namespace {
 
-// Bulk column builders: one host-to-device copy per buffer, so a 100k-row table costs
-// milliseconds rather than one cuDF call per row.
+// Build the column buffers on the host and copy each buffer to the device once.
 rmm::device_buffer make_mask_from_valids(std::vector<bool> const& valids,
                                          cudf::size_type& null_count,
                                          rmm::cuda_stream_view stream,

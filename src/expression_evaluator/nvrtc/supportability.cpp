@@ -43,8 +43,10 @@ namespace {
   return off_id == cudf::type_id::INT32 || off_id == cudf::type_id::INT64;
 }
 
-/// @brief STRING only mixes with STRING and fixed-point only with fixed-point; everything else
-/// mixes.
+/**
+ * @brief STRING only mixes with STRING and fixed-point only with fixed-point; everything else
+ *        mixes.
+ */
 [[nodiscard]] bool types_compatible(cudf::data_type a, cudf::data_type b) noexcept
 {
   bool const a_str = a.id() == cudf::type_id::STRING;
@@ -84,7 +86,7 @@ namespace {
   return true;
 }
 
-/// @brief The Materialization Boundaries a planning walk has met, in the order it met them.
+/** @brief The Materialization Boundaries a planning walk has met, in the order it met them. */
 using boundary_list = std::vector<sirius::ast::node const*>;
 
 /**
@@ -464,7 +466,7 @@ bool is_node_supported(sirius::ast::node const& expr,
 
 /**
  * @brief Plans one kernel whose outputs are the entries of @p roots it can compute; @p
- * is_output_type tells which root types the kernel can write.
+ *        is_output_type tells which root types the kernel can write.
  */
 template <typename OutputTypePredicate>
 [[nodiscard]] std::optional<compile_plan> plan_sink(std::span<sirius::ast::node const* const> roots,

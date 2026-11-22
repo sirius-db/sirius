@@ -72,12 +72,10 @@ void maybe_dump_kernel_source(std::string_view entry, std::string const& source)
 }
 
 /**
- * @brief Kernels already resolved by this process, keyed by (entry, kernel body, compile options)
- *        so the evaluation-time cost is proportional to the generated body rather than to the
- *        ~50 KB preamble.
+ * @brief Caches compiled sink kernels by entry name, kernel body, and compile options.
  *
- * @note The table is subordinate to @c KernelCache: it is dropped whenever @c KernelCache::clear()
- *       advances the generation, so a cleared cache compiles again exactly as before.
+ * The first lookup or insertion that sees a newer KernelCache generation clears the table. Requests
+ * from older generations cannot read or insert entries.
  */
 class compiled_sink_table {
  public:
@@ -105,8 +103,6 @@ class compiled_sink_table {
   }
 
  private:
-  // Generations only move forward: a caller that observed an older generation than the table
-  // raced with a clear() and must neither read nor publish through the table.
   bool adopt_generation(std::uint64_t generation)
   {
     if (generation < _generation) { return false; }
@@ -117,9 +113,13 @@ class compiled_sink_table {
     return true;
   }
 
-  // Every compile option takes part, as it does in the request identity of @c KernelCache, so the
-  // table never answers with a kernel built another way. The binding names every member of
-  // @c CompileOptions, so an option added there does not compile here until it joins the key.
+  /**
+   * @brief Creates a key for the compiled sink table based on the entry, body, and compile options.
+   *
+   * Every compile option takes part, as it does in the request identity of @c KernelCache, so the
+   * table never answers with a kernel built another way. The binding names every member of
+   * @c CompileOptions, so an option added there does not compile here until it joins the key.
+   */
   static std::string key(std::string_view entry,
                          std::string const& body,
                          codegen::jit::CompileOptions const& options)
@@ -144,12 +144,10 @@ compiled_sink_table& sink_table()
 }
 
 /**
- * @brief Kernel handles whose launches may still be in flight, each paired with an event recorded
- *        after the launch.
+ * @brief Keeps kernel handles alive while their launches are in flight.
  *
- * Completed entries are released on the next retain, so the list stays as short as the number of
- * concurrently executing sink kernels. Events are pooled; process-exit destruction may run after
- * the CUDA context is gone, so it ignores the CUDA results.
+ * `retain` releases handles whose completion events have fired, then records a new event on the
+ * supplied stream. Events are reused only on the device where they were created.
  */
 class kernel_retire_list {
  public:
@@ -168,7 +166,7 @@ class kernel_retire_list {
   void retain(std::shared_ptr<codegen::jit::CompiledKernel const> kernel, ::cuda::stream_ref stream)
   {
     // An event may only be recorded on streams of the device it was created on, so the free
-    // lists are per device; the calling thread's device is the stream's device.
+    // lists of events are per device; the calling thread's device is the stream's device.
     int device = 0;
     simpatico::throw_if_cuda_error(cudaGetDevice(&device), "cudaGetDevice(kernel retire)");
     std::lock_guard<std::mutex> const lock(_mutex);

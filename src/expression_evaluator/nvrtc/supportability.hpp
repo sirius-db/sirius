@@ -31,7 +31,7 @@
 /**
  * @file
  * @brief The `NVRTC_JIT` compile planner, which decides before any GPU work which expressions one
- * fused kernel computes, and the type helpers it shares with @c translation_context.
+ *        fused kernel computes, and the type helpers it shares with @c translation_context.
  *
  * `expression_evaluator` plans each kernel with `plan_project_sink` or `plan_filter_sink`. A
  * `compile_plan` names the roots the kernel computes and either runs directly over the input table,

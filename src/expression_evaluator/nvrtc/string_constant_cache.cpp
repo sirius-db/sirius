@@ -64,7 +64,7 @@ using unique_event = std::unique_ptr<std::remove_pointer_t<cudaEvent_t>, event_d
 
 /**
  * @brief Queues a copy of the host bytes @p source to @p destination on @p stream, reading
- * @p source before returning, so the host never waits for work already queued on @p stream.
+ *        @p source before returning, so the host never waits for work already queued on @p stream.
  */
 void copy_to_device(void* destination, std::string_view source, cudaStream_t stream)
 {
@@ -113,7 +113,7 @@ void copy_to_device(void* destination, std::string_view source, cudaStream_t str
 
 /**
  * @brief The copies on one device, the stream that uploads and frees them, and the last work that
- * may read them.
+ *        may read them.
  *
  * `stream` is declared first so that it outlives the copies, which free their memory on it.
  */
@@ -146,7 +146,7 @@ struct string_constant_cache::device_copies {
 
   /**
    * @brief Makes the stream wait for every recorded use, after which the copies free their memory
-   * on it; call on this device.
+   *        on it; call on this device.
    *
    * When a use could not be recorded, nothing orders the free after it, so the copies, and their
    * charges, are leaked instead.
@@ -172,7 +172,7 @@ struct string_constant_cache::device_copies {
 
   /**
    * @brief Returns the copy of @p pool and the last-use event of @p stream, uploading the copy if
-   * this is its first acquisition.
+   *        this is its first acquisition.
    */
   [[nodiscard]] std::pair<pool_copy const*, cudaEvent_t> acquire(std::string_view pool,
                                                                  ::cuda::stream_ref stream)

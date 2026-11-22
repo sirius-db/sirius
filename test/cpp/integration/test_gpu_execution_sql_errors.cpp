@@ -15,21 +15,10 @@
  */
 
 /**
- * @file test_gpu_execution_sql_errors.cpp
- * @brief SQL errors that the GPU detects are decided by CPU Replay, so every query returns DuckDB's
- * rows or DuckDB's error.
+ * @file
+ * @brief Checks that GPU queries return the same rows or SQL error as DuckDB.
  *
- * The error contract in `docs/super-sirius/expression-executor.md` states what this guarantees. An
- * overflow in a branch that a Row-exact Guard (CASE, COALESCE) excludes returns DuckDB's value,
- * even where an evaluator computes that branch over every row; an evaluated overflow returns
- * DuckDB's error even where the row's value is NULL or another AND, OR or IN operand decides it,
- * unless a filter predicate or CASE WHEN condition skips that operand for the row as DuckDB does;
- * an unguarded conversion overflow returns DuckDB's error, as does an overflow in a TRY_CAST's
- * input; a check that DuckDB does not share (a non-finite STDDEV_SAMP) returns DuckDB's value; and
- * a zero divisor returns DuckDB's error, or DuckDB's NULL under `error_on_division_by_zero =
- * false`. Each case asserts whether the query completed on the GPU or through CPU Replay, so a
- * replay cannot hide a broken GPU path. Overflow of abs and negation is covered beside their other
- * cases in `test_gpu_execution_abs.cpp` and `test_gpu_execution_negate.cpp`.
+ * Each case also checks whether the query completed on the GPU or used CPU Replay.
  */
 
 #include <catch.hpp>

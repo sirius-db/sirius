@@ -46,20 +46,23 @@ constexpr char const* filter_entry  = "sirius_nvrtc_filter_kernel";
 constexpr char const* scatter_entry = "sirius_nvrtc_filter_scatter_kernel";
 constexpr std::size_t status_words  = 2;  // [0] = status bits, [1] = total survivors
 
-// A warp of the predicate kernel and of the scatter kernel owns `words_per_warp` consecutive ballot
-// words, each covering 32 consecutive rows: lane `i` holds word `i` of its warp in a register.
+// A warp of the predicate kernel and of the scatter kernel owns `words_per_warp` consecutive
+// *ballot words*  (32-bit masks), each covering 32 consecutive rows: lane `i` holds word `i` of its
+// warp in a register (thus, `words_per_warp <= 32`).
 constexpr int words_per_warp = filter_tile.items_per_thread;
 constexpr int rows_per_warp  = words_per_warp * 32;
 constexpr int words_per_tile = words_per_warp * filter_tile.num_warps();
 static_assert(words_per_warp <= 32, "a lane holds at most one ballot word of its warp");
 static_assert(filter_tile.block_threads % 32 == 0, "a tile is made of whole warps");
 
-// The predicate kernel adds every tile's survivor count to the total of the tile's group. A group
-// holds as many tiles as a scatter block has threads, so that each thread reads the count of at
+// The predicate kernel adds every tile's survivor count to the total of the tile's group: a group
+// owns as many tiles as a scatter block has threads, so that each thread reads the count of at
 // most one tile of the block's group.
 constexpr int tiles_per_group = filter_tile.block_threads;
 
-/** @brief Appends the statements that replace @p var in every lane by its sum over the warp. */
+/**
+ * @brief Appends the statements that replace @p var in every lane by its sum over the warp.
+ */
 void emit_warp_sum(std::string& out, std::string_view var)
 {
   out += std::format(

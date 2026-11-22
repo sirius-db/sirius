@@ -33,35 +33,22 @@ class memory_space;
 namespace sirius::nvrtc {
 
 /**
- * @brief Device copies of the string-constant bytes that `NVRTC_JIT` kernels read through their
- * `c_N_ptr` and `c_N_len` parameters, each uploaded once per device for the lifetime of the cache.
+ * @brief Caches string constant pools by their bytes and CUDA device.
  *
- * Before each launch, `kernel_arguments` concatenates one kernel's string constants into a pool and
- * acquires the pool's device copy here. Copies are keyed by the pool's bytes and the device, so a
- * query that evaluates the same expression over many batches, in many task-local
- * `expression_evaluator` instances, uploads it once per device. Each query's
- * `pipeline::pipeline_build_context` owns one cache, inside the `expression_query_caches` it shares
- * with every evaluator of the query, so the copies live exactly as long as the query.
+ * The cache uploads each pool on its own stream for that device. `acquire` makes the caller's
+ * stream wait for the upload. The caller's current device must match the stream's device.
  *
- * Member functions are thread-safe and never wait on the host for GPU work. Each works on the
- * calling thread's current device, which must be the device of the stream it is given. Every device
- * has its own copies, its own lock, and its own stream, which the cache creates at the device's
- * first acquisition. The first acquisition of a pool on a device uploads it on that stream, so the
- * upload never waits for work queued on the caller's stream. Concurrent acquisitions of the same
- * pool wait only until that upload is queued, acquisitions of other pools do not wait for it, and
- * every acquisition makes the caller's stream wait for the upload on the device.
- *
- * Destruction is stream-ordered too: each device's stream, which already orders the uploads, waits
- * for the work queued before every `lease` was released, and the copies are freed on it. Every
- * lease must be released before the cache is destroyed.
+ * Release each lease on the device where it was acquired, while its stream still exists and before
+ * destroying the cache. The cache frees the pool only after the work queued on the lease's stream
+ * at release has completed.
  */
 class string_constant_cache {
  public:
   class lease;
 
   /**
-   * @brief A cache that allocates the copies of each device from the device's current memory
-   * resource, for code that runs without Sirius memory spaces, such as unit tests.
+   * @brief A cache that allocates the copies for each device from the device's current memory
+   *        resource, for code that runs without Sirius memory spaces, such as unit tests.
    *
    * Destruction waits on the host only when that resource frees synchronously, as
    * `rmm::mr::cuda_memory_resource` does.
@@ -70,7 +57,7 @@ class string_constant_cache {
 
   /**
    * @brief A cache that charges its copies on the device of each of @p gpu_spaces to that GPU
-   * memory space, for exactly as long as the cache holds them.
+   *        memory space, for exactly as long as the cache holds them.
    *
    * Each copy is allocated from the upstream resource of the space's reservation-aware allocator
    * under a reservation of the copy's aligned size that the copy holds. The charge therefore never
@@ -88,7 +75,7 @@ class string_constant_cache {
 
   /**
    * @brief Returns a lease on the current device's copy of @p pool, ordered before any work queued
-   * on @p stream after this call.
+   *        on @p stream after this call.
    *
    * @p pool is read before the call returns.
    *
@@ -115,7 +102,7 @@ class string_constant_cache {
 
 /**
  * @brief Read access to one device copy for the work its holder queues on the stream it was
- * acquired with.
+ *        acquired with.
  *
  * Releasing the lease, by destroying it or assigning over it, records that the work queued on that
  * stream so far may read the copy, so the cache frees the copy only after that work completes. A

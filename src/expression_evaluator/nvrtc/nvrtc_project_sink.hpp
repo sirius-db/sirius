@@ -39,7 +39,7 @@
  * @file
  * @brief The `NVRTC_JIT` entry points of @c expression_evaluator that run one fused kernel:
  *        `evaluate_project_sink` for a projection list and `evaluate_filter_sink` for a filter
- * predicate.
+ *        predicate.
  *
  * `expression_evaluator` first plans each kernel with `plan_project_sink` or `plan_filter_sink`
  * (`supportability.hpp`), evaluates the plan's Materialization Boundaries, and passes their columns
