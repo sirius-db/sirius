@@ -23,11 +23,9 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/column/column_stream.hpp>
 #include <cudf/version_config.hpp>
 
 #include <rmm/aligned.hpp>
-#include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 
 #include <cuda/cmath>
@@ -82,20 +80,49 @@ auto allocate_mask(std::size_t bytes, ::cuda::stream_ref stream, rmm::device_asy
 #endif
 }
 
-/// Allocate the final column buffers and collect their writable addresses in wire order.
-std::unique_ptr<cudf::column> allocate_column(column_metadata const& c,
-                                              ::cuda::stream_ref stream,
-                                              rmm::device_async_resource_ref mr,
-                                              std::vector<void*>& destinations)
+/// Allocates the non-empty buffers of @p c in walk order and collects their addresses.
+void allocate_buffers(column_metadata const& c,
+                      ::cuda::stream_ref stream,
+                      rmm::device_async_resource_ref mr,
+                      std::vector<mask_buffer>& masks,
+                      std::vector<rmm::device_buffer>& data,
+                      std::vector<void*>& destinations)
 {
-  auto const id   = static_cast<cudf::type_id>(c.type_id);
-  auto const rows = static_cast<cudf::size_type>(c.num_rows);
-  auto mask       = allocate_mask(c.has_null_mask ? c.null_mask_size : 0, stream, mr);
-  if (c.has_null_mask && c.null_mask_size > 0) { destinations.push_back(mask.data()); }
-  rmm::device_buffer data(c.has_data ? c.data_size : 0, stream, mr);
-  if (c.has_data && c.data_size > 0) { destinations.push_back(data.data()); }
+  if (c.has_null_mask && c.null_mask_size > 0) {
+    destinations.push_back(masks.emplace_back(allocate_mask(c.null_mask_size, stream, mr)).data());
+  }
+  if (c.has_data && c.data_size > 0) {
+    destinations.push_back(data.emplace_back(c.data_size, stream, mr).data());
+  }
+  for (auto const& child : c.children) {
+    allocate_buffers(child, stream, mr, masks, data, destinations);
+  }
+}
+
+/// Rebuilds one column from its buffers, consumed in walk order from @p next_mask and
+/// @p next_data. A missing mask is an empty buffer on @p stream.
+std::unique_ptr<cudf::column> rebuild(column_metadata const& c,
+                                      std::vector<mask_buffer>::iterator& next_mask,
+                                      std::vector<rmm::device_buffer>::iterator& next_data,
+                                      ::cuda::stream_ref stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto const id    = static_cast<cudf::type_id>(c.type_id);
+  auto const rows  = static_cast<cudf::size_type>(c.num_rows);
+  mask_buffer mask = c.has_null_mask && c.null_mask_size > 0 ? std::move(*next_mask++)
+                                                             : allocate_mask(0, stream, mr);
+  rmm::device_buffer data =
+    c.has_data && c.data_size > 0 ? std::move(*next_data++) : rmm::device_buffer{};
   if (id == cudf::type_id::STRING) {
-    auto offsets = allocate_column(c.children.front(), stream, mr, destinations);
+    auto const& o = c.children.front();
+    rmm::device_buffer offsets_data =
+      o.has_data && o.data_size > 0 ? std::move(*next_data++) : rmm::device_buffer{};
+    auto offsets =
+      std::make_unique<cudf::column>(cudf::data_type{static_cast<cudf::type_id>(o.type_id)},
+                                     rows + 1,
+                                     std::move(offsets_data),
+                                     allocate_mask(0, stream, mr),
+                                     0);
     return cudf::make_strings_column(
       rows, std::move(offsets), std::move(data), c.null_count, std::move(mask));
   }
@@ -209,15 +236,21 @@ std::unique_ptr<incoming_batch> incoming_batch::land(batch_header header,
           std::make_unique<cucascade::memory::fail_reservation_limit_policy>())) {
       absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
       try {
-        out->_columns.reserve(out->_header.columns.size());
+        out->_gpu_masks.reserve(out->_buffers.size());
+        out->_gpu_data.reserve(out->_buffers.size());
         out->_destinations.reserve(out->_buffers.size());
-        for (auto const& column : out->_header.columns) {
-          out->_columns.push_back(
-            allocate_column(column, stream, gpu.get_default_allocator(), out->_destinations));
+        for (auto const& c : out->_header.columns) {
+          allocate_buffers(c,
+                           stream,
+                           gpu.get_default_allocator(),
+                           out->_gpu_masks,
+                           out->_gpu_data,
+                           out->_destinations);
         }
         return out;
       } catch (rmm::out_of_memory const&) {
-        out->_columns.clear();
+        out->_gpu_masks.clear();
+        out->_gpu_data.clear();
         out->_destinations.clear();
       }
     }
@@ -276,12 +309,25 @@ std::shared_ptr<cucascade::data_batch> incoming_batch::seal(::cuda::stream_ref s
   }
   // Freed later on one of the space's streams; the copies are ordered before the batch's writer
   // event, recorded on @p stream.
-  for (auto& column : _columns) {
-    column = cudf::rebind_stream(std::move(*column), _space->acquire_stream());
+  for (auto& buffer : _gpu_masks) {
+    buffer.set_stream(_space->acquire_stream());
   }
+  for (auto& buffer : _gpu_data) {
+    buffer.set_stream(_space->acquire_stream());
+  }
+  auto next_mask = _gpu_masks.begin();
+  auto next_data = _gpu_data.begin();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(_header.columns.size());
+  for (auto const& c : _header.columns) {
+    columns.push_back(
+      rebuild(c, next_mask, next_data, _space->acquire_stream(), _space->get_default_allocator()));
+  }
+  _gpu_masks.clear();
+  _gpu_data.clear();
   _destinations.clear();
   return sirius::make_data_batch(
-    std::make_unique<cudf::table>(std::move(_columns)), *_space, stream, {});
+    std::make_unique<cudf::table>(std::move(columns)), *_space, stream, {});
 }
 
 }  // namespace sirius::exchange

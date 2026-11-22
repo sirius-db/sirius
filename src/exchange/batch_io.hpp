@@ -18,7 +18,10 @@
 
 #include "exchange/wire.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <cuda/stream_ref>
 
@@ -37,6 +40,9 @@ class memory_space;
 }
 
 namespace sirius::exchange {
+
+/// The buffer type a cudf::column holds its null mask in; it differs between cuDF versions.
+using mask_buffer = decltype(cudf::column::contents::null_mask)::element_type;
 
 /**
  * @brief A GPU batch being sent: its header and where each stream buffer lives.
@@ -109,7 +115,8 @@ class incoming_batch {
   std::vector<stream_buffer> _buffers;
   cucascade::memory::memory_space* _space;
   cucascade::memory::Tier _tier{cucascade::memory::Tier::GPU};
-  std::vector<std::unique_ptr<cudf::column>> _columns;
+  std::vector<mask_buffer> _gpu_masks;
+  std::vector<rmm::device_buffer> _gpu_data;
   std::vector<void*> _destinations;
   cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation _host_blocks;
 };
