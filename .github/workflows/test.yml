@@ -280,6 +280,24 @@ jobs:
           nvidia-smi
           python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
 
+      - name: Test cancelled waiter watchdog
+        if: matrix.cuda.version == '13'
+        timeout-minutes: 5
+        env:
+          SIRIUS_EXTENSION_PATH: ${{ github.workspace }}/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+          SIRIUS_TEST_GPU: "1"
+          SIRIUS_TEST_SINGLE_GPU: "1"
+          SIRIUS_TEST_INTEGRATION_CONFIG: ${{ github.workspace }}/test/cpp/integration/integration-shard.yaml
+          SIRIUS_TEST_LOG_DIR: ${{ github.workspace }}/build/release/test/cpp/log/ac9-watchdog
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          CUDA_VISIBLE_DEVICES="$(python3 -B -c 'from scripts.run_unit_tests import visible_gpus; print(visible_gpus()[0])')"
+          export CUDA_VISIBLE_DEVICES
+          mkdir -p "$SIRIUS_TEST_LOG_DIR"
+          exec build/release/test/cpp/sirius_unittest \
+            'a cancelled waiter cannot enter a later execution window' \
+            --success --reporter xml --out "$SIRIUS_TEST_LOG_DIR/results.xml"
+
       - name: Test preparation allocation failures
         timeout-minutes: 5
         env:
