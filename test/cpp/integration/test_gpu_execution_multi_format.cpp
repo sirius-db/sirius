@@ -1845,6 +1845,28 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          5);
   }
   {
+    INFO("a data manifest written by format version 1");
+    // The table of "respect partitions" as an upgraded table carries it: the data manifest has
+    // no `content` field and no sequence numbers. A reader that needs `content` cannot plan the
+    // partition-scoped delete and declines.
+    auto path = table("iceberg_v2_eq_v1_data_manifest");
+    require_delete_files(path, 2);
+    expect_equality_rows("SELECT id, region, v FROM " + pinned_scan(path) + " ORDER BY v;",
+                         {{"1", "B", "30"}, {"3", "A", "50"}, {"3", "B", "60"}},
+                         2);
+  }
+  {
+    INFO("partition tuples compare as DuckDB values");
+    // Three data files hold ids 1..3 with v = 10 * file + id, in partitions f=-0.0, f=+0.0 and
+    // f=1.5; id=1 is deleted in f=+0.0. DuckDB takes the two zeros for one partition, so the row
+    // goes from both files. Comparing bit patterns, as the spec does, keeps v=11.
+    auto path = table("iceberg_v2_eq_signed_zero");
+    require_delete_files(path, 1);
+    expect_equality_rows(
+      "SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
+      {{"2", "12"}, {"3", "13"}, {"2", "22"}, {"3", "23"}, {"1", "31"}, {"2", "32"}, {"3", "33"}});
+  }
+  {
     INFO("upsert within one commit");
     // The second commit writes key 2 twice. Its equality delete removes the first commit's (2, b)
     // and must NOT touch its own commit's rows; its position delete removes the superseded (2, x).

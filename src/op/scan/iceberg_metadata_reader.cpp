@@ -393,8 +393,10 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
   }
 
   iceberg_metadata_connection metadata_conn(context);
-  // One manifest's live entries of one content kind, with the spec its header names. The
-  // inventory supplies the manifest paths, so the table path is not resolved again.
+  // One manifest's live entries of one content kind, with the spec its header names. Kind 0 is
+  // not tested: a data manifest holds data files only, and has no `content` field when format
+  // version 1 wrote it. The inventory supplies the manifest paths, so the table path is not
+  // resolved again.
   auto const read_manifest = [&](std::string_view manifest, std::string const& columns, int kind) {
     auto const path = "'" + escape_sql_string(std::string(manifest)) + "'";
     auto result     = metadata_conn.Query(
@@ -403,8 +405,9 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
       path +
       ") WHERE key = 'partition-spec-id'), "
           "(SELECT value FROM avro_metadata(" +
-      path + ") WHERE key = 'partition-spec')" + columns + " FROM read_avro(" + path +
-      ") WHERE data_file.\"content\" = " + std::to_string(kind) + " AND status <> 2");
+      path + ") WHERE key = 'partition-spec')" + columns + " FROM read_avro(" + path + ") WHERE " +
+      (kind == 0 ? "" : "data_file.\"content\" = " + std::to_string(kind) + " AND ") +
+      "status <> 2");
     if (!result || result->HasError())
       throw fail("manifest '" + std::string(manifest) +
                  "' could not be read: " + (result ? result->GetError() : "null result"));

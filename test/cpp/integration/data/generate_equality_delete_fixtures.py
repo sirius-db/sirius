@@ -28,6 +28,15 @@ are listed beside the right ones, so a failure says which rule broke:
                                     int and a NULL partition value, a spec whose only field is
                                     void, and an unpartitioned spec. The first two stay inside
                                     their spec and partition; the last two reach every file.
+  iceberg_v2_eq_v1_data_manifest    The partitioned table as an upgraded table carries it: format
+                                    version 1 wrote the data manifest, which has no `content`
+                                    field and no sequence numbers. A reader that needs `content`
+                                    cannot plan the partition-scoped delete.
+  iceberg_v2_eq_signed_zero         Data files in partitions -0.0, +0.0 and 1.5 of a float field;
+                                    the delete is stored in +0.0. DuckDB takes the two zeros for
+                                    one partition and deletes from both files, and the GPU path
+                                    returns DuckDB's rows. The spec compares bit patterns, which
+                                    keeps the row in -0.0.
   iceberg_v2_eq_upsert_same_commit  One commit rewrites key 2 twice: the equality delete removes
                                     the OLDER commit's row, a position delete removes this
                                     commit's first version. Applying the equality delete to its
@@ -56,7 +65,8 @@ are listed beside the right ones, so a failure says which rule broke:
 
 Hand-forged, like the other delete fixtures: pyiceberg does not write delete files, and the only
 independent writer of equality deletes is Flink. Avro schemas are copied from an existing
-fixture so they stay byte-compatible with what the Iceberg extension already reads.
+fixture so they stay byte-compatible with what the Iceberg extension already reads. The format
+version 1 manifest has the fields of one written by pyiceberg.
 """
 
 import argparse
@@ -64,6 +74,7 @@ import copy
 import json
 import pathlib
 import shutil
+import struct
 import sys
 
 DATA = pathlib.Path(__file__).resolve().parent
@@ -78,6 +89,32 @@ def _avro(path):
     with open(path, "rb") as fh:
         reader = fastavro.reader(fh)
         return dict(reader.metadata), reader.writer_schema, list(reader)
+
+
+def _as_v1_manifest(schema, meta, rows):
+    """Removes what format version 2 added to a data manifest; v1 requires block_size_in_bytes."""
+    schema["fields"] = [
+        f for f in schema["fields"] if not f["name"].endswith("sequence_number")
+    ]
+    for field in schema["fields"]:
+        if field["name"] != "data_file":
+            continue
+        fields = [
+            f
+            for f in field["type"]["fields"]
+            if f["name"] not in ("content", "equality_ids")
+        ]
+        size = [f["name"] for f in fields].index("file_size_in_bytes")
+        fields.insert(
+            size + 1, {"name": "block_size_in_bytes", "type": "long", "field-id": 105}
+        )
+        field["type"]["fields"] = fields
+    del meta["content"]
+    meta["format-version"] = "1"
+    for row in rows:
+        del row["sequence_number"], row["file_sequence_number"]
+        del row["data_file"]["content"], row["data_file"]["equality_ids"]
+        row["data_file"]["block_size_in_bytes"] = 64 * 1024 * 1024
 
 
 class Table:
@@ -100,6 +137,7 @@ class Table:
         self.schemas = schemas  # list of [(field_id, name, iceberg_type)]
         self.specs = partition_specs or [[]]
         self.snapshots, self.manifests, self.seq = [], [], 0
+        self.v1_manifests = set()  # data manifests to write as format version 1 did
         if self.root.exists():
             shutil.rmtree(self.root)
         (self.root / "data").mkdir(parents=True)
@@ -183,6 +221,9 @@ class Table:
                     },
                 }
             )
+        v1 = name in self.v1_manifests
+        if v1:
+            _as_v1_manifest(schema, meta, rows)
         out = self.root / "metadata" / name
         with open(out, "wb") as fh:
             fastavro.writer(fh, schema, rows, codec="null", metadata=meta)
@@ -194,6 +235,8 @@ class Table:
             present = sorted(v for v in values if v is not None)
 
             def bound(v):
+                if isinstance(v, float):
+                    return struct.pack("<f", v)
                 return v.encode() if isinstance(v, str) else v.to_bytes(4, "little")
 
             return {
@@ -209,9 +252,11 @@ class Table:
             manifest_length=out.stat().st_size,
             partition_spec_id=spec_id,
             content=content,
-            sequence_number=self.seq,
-            min_sequence_number=min(
-                [self.seq] + [s for _, s, *_ in entries if s is not None]
+            sequence_number=0 if v1 else self.seq,
+            min_sequence_number=(
+                0
+                if v1
+                else min([self.seq] + [s for _, s, *_ in entries if s is not None])
             ),
             added_snapshot_id=self.snapshot_id(self.seq),
             added_files_count=added,
@@ -470,17 +515,19 @@ def build_null_key():
     t.finish()
 
 
-def build_partitioned():
+def build_partitioned(name="iceberg_v2_eq_partitioned", v1_data_manifest=False):
     import pyarrow as pa
 
     spec = [
         {"name": "region", "transform": "identity", "source-id": 2, "field-id": 1000}
     ]
     t = Table(
-        "iceberg_v2_eq_partitioned",
+        name,
         [[(1, "id", "long"), (2, "region", "string"), (3, "v", "long")]],
         [spec, []],
     )
+    if v1_data_manifest:
+        t.v1_manifests.add("m-data-1.avro")
 
     def data(region, values):
         return t.parquet(
@@ -627,6 +674,39 @@ def build_partition_shapes():
             # An unpartitioned spec: every file.
             ("m-delete-3e.avro", 1, 3, [added(delete("3e", 5), 2, None, [1])]),
         ],
+    )
+    t.finish()
+
+
+def build_signed_zero():
+    import pyarrow as pa
+
+    spec = [{"name": "f", "transform": "identity", "source-id": 2, "field-id": 1000}]
+    t = Table(
+        "iceberg_v2_eq_signed_zero",
+        [[(1, "id", "long"), (2, "f", "float"), (3, "v", "long")]],
+        [spec],
+        partition_types={"f": "float"},
+    )
+
+    def data(n, f):
+        file = t.parquet(
+            f"data-{n}.parquet",
+            [
+                (1, "id", pa.int64(), [1, 2, 3]),
+                (2, "f", pa.float32(), [f] * 3),
+                (3, "v", pa.int64(), [10 * n + i for i in (1, 2, 3)]),
+            ],
+        )
+        return (1, None, file, 0, {"f": f}, None)
+
+    t.commit(
+        "append",
+        [("m-data-1.avro", 0, 0, [data(1, -0.0), data(2, 0.0), data(3, 1.5)])],
+    )
+    delete = t.parquet("delete-eq-2.parquet", [(1, "id", pa.int64(), [1])])
+    t.commit(
+        "delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, {"f": 0.0}, [1])])]
     )
     t.finish()
 
@@ -964,6 +1044,15 @@ FIXTURES = {
             for i in (1, 2, 3)
             if i != gone
         ],
+    ),
+    "iceberg_v2_eq_v1_data_manifest": (
+        lambda: build_partitioned("iceberg_v2_eq_v1_data_manifest", True),
+        [(1, "B", 30), (3, "A", 50), (3, "B", 60)],
+    ),
+    "iceberg_v2_eq_signed_zero": (
+        build_signed_zero,
+        [(2, -0.0, 12), (3, -0.0, 13), (2, 0.0, 22), (3, 0.0, 23)]
+        + [(i, 1.5, 30 + i) for i in (1, 2, 3)],
     ),
     "iceberg_v2_eq_upsert_same_commit": (
         build_upsert_same_commit,
