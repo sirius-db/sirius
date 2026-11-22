@@ -48,6 +48,7 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_returned_types.hpp"
+#include "planner/scan_source_names.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -934,6 +935,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
   op.ResolveOperatorTypes();
+  auto source_names = scan_source_names(op);
   // create the table scan node
   if (!op.function.projection_pushdown) {
     // function does not support projection pushdown
@@ -944,7 +946,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       column_ids,
       duckdb::vector<duckdb::column_t>(),
-      duckdb::IdentifiersToStrings(op.names),
+      std::move(source_names),
       std::move(table_filters),
       op.estimated_cardinality,
       std::move(op.extra_info),
@@ -1020,7 +1022,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     scan_returned_types(op.returned_types, column_ids),
     column_ids,
     duckdb::vector<std::size_t>(op.projection_ids.begin(), op.projection_ids.end()),
-    duckdb::IdentifiersToStrings(op.names),
+    std::move(source_names),
     std::move(table_filters),
     op.estimated_cardinality,
     std::move(op.extra_info),

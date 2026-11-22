@@ -477,6 +477,15 @@ TEST_CASE_METHOD(ParquetCountCarrierFixture,
 }
 
 TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet columns keep their values under column aliases",
+                 "[integration][scan][parquet][gpu]")
+{
+  // The aliases trade the names of two same-typed columns. A scan that reads its columns by the
+  // aliased names returns each one's values under the other's name.
+  compare_gpu_vs_cpu("SELECT * FROM " + scan("strings.parquet") + " AS t(b, a)");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
                  "parquet empty-file count star matches the CPU oracle",
                  "[integration][scan][parquet][gpu][carrier]")
 {

@@ -986,6 +986,10 @@ results preserve physical-check evidence and diagnostics, and distinguish field
 correspondence from the reader projection, including cardinality carriers and
 natural-read fallback. Preparation still reads and certifies each footer once.
 
+Scans and the join-key checks resolve source columns by the names the table function
+bound (`scan_source_names`, `src/planner/scan_source_names.hpp`), not by
+`LogicalGet::names`, which holds column aliases such as `AS t(b, a)`.
+
 ## Key Files
 
 | File | Purpose |
