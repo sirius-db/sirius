@@ -542,8 +542,7 @@ TEST_CASE("A finalize failure after a successful task fails the query, not the p
   auto* mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(mem_space);
 
-  // A terminal pipeline whose sole task succeeds; destroying that task finishes the pipeline
-  // and finalizes `failing`.
+  // A terminal pipeline whose sole task succeeds; destroying that task finalizes `failing`.
   sirius::op::test_physical_operator terminal(
     sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR, {}, 0);
   sirius::op::test_physical_operator failing(
@@ -578,8 +577,7 @@ TEST_CASE("A finalize failure after a successful task fails the query, not the p
   executor.stop();
   CHECK(global->executed_count.load() == 1);
   CHECK(global->error_count.load() == 0);
-  CHECK(pipe->is_pipeline_finished());
-  CHECK_FALSE(pipe->finished_successfully());
+  CHECK_FALSE(pipe->is_pipeline_finished());
   lifecycle.close(query);
 }
 

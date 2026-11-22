@@ -367,10 +367,12 @@ class failing_finalize_operator final : public sirius::op::test_physical_operato
 
   std::promise<void> entered;
   std::promise<void> release;
+  int calls = 0;
 
  protected:
   void on_finalize_operator() override
   {
+    ++calls;
     if (hold_) {
       entered.set_value();
       release_.wait();
@@ -416,8 +418,7 @@ TEST_CASE("A finalize failure while completing a task fails the query",
 
   REQUIRE(awaitable.wait_for(0s) == std::future_status::ready);
   CHECK_THROWS_WITH(awaitable.get(), "finalize failed");
-  CHECK(pipeline->is_pipeline_finished());
-  CHECK_FALSE(pipeline->finished_successfully());
+  CHECK_FALSE(pipeline->is_pipeline_finished());
 }
 
 TEST_CASE("A task completing on a pipeline that cannot be evaluated fails the query",
@@ -437,7 +438,7 @@ TEST_CASE("A task completing on a pipeline that cannot be evaluated fails the qu
   CHECK_FALSE(pipeline->is_pipeline_finished());
 }
 
-TEST_CASE("A pipeline whose finalize failed never signals completion",
+TEST_CASE("A pipeline whose finalize failed never finishes or signals completion",
           "[pipeline][completion][issue-1625]")
 {
   failing_finalize_operator op;
@@ -449,15 +450,16 @@ TEST_CASE("A pipeline whose finalize failed never signals completion",
   pipeline->set_completion_handler(handler);
 
   REQUIRE_THROWS_WITH(pipeline->update_pipeline_status(false), "finalize failed");
-  CHECK(pipeline->is_pipeline_finished());
-  CHECK_FALSE(pipeline->finished_successfully());
+  CHECK_FALSE(pipeline->is_pipeline_finished());
 
-  // Later callers find the pipeline already finished; that must not complete the query.
+  // Later callers must neither finalize again nor complete the query.
   REQUIRE_NOTHROW(pipeline->update_pipeline_status(false));
+  CHECK(op.calls == 1);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
   CHECK_FALSE(handler->is_completed());
 }
 
-TEST_CASE("A finish in progress is not reported successful before finalize ends",
+TEST_CASE("A pipeline is not finished while its operators are being finalized",
           "[pipeline][completion][issue-1625]")
 {
   failing_finalize_operator op(/*hold=*/true);
@@ -473,13 +475,52 @@ TEST_CASE("A finish in progress is not reported successful before finalize ends"
     }
   });
   REQUIRE(entered.wait_for(5s) == std::future_status::ready);
-
-  // The flag is set before finalize runs, so a lock-free reader already sees "finished".
-  CHECK(pipeline->is_pipeline_finished());
-  auto observer = std::async(std::launch::async, [&] { return pipeline->finished_successfully(); });
-  CHECK(observer.wait_for(100ms) == std::future_status::timeout);
+  CHECK_FALSE(pipeline->is_pipeline_finished());
 
   op.release.set_value();
   finisher.get();
-  CHECK_FALSE(observer.get());
+  CHECK_FALSE(pipeline->is_pipeline_finished());
+}
+
+TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream finalize",
+          "[pipeline][completion][issue-1625]")
+{
+  // upstream -> terminal. The upstream pipeline's last task is being destroyed and its finalize
+  // is held; the terminal pipeline has no work left and waits only on the upstream pipeline.
+  failing_finalize_operator op(/*hold=*/true);
+  auto upstream_sink = make_sink(SiriusPhysicalOperatorType::PROJECTION);
+  auto upstream      = make_finishable_pipeline(upstream_sink);
+  sirius_pipeline_build_state{}.add_pipeline_operator(*upstream, op);
+  REQUIRE_FALSE(upstream->is_query_terminal());
+
+  auto terminal_sink  = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto terminal       = make_finishable_pipeline(terminal_sink);
+  auto input          = std::make_unique<sirius_physical_operator::port>();
+  input->type         = sirius::op::MemoryBarrierType::FULL;
+  input->repo         = nullptr;
+  input->src_pipeline = upstream;
+  terminal_sink.add_port("default", std::move(input));
+
+  auto handler = std::make_shared<completion_handler>();
+  terminal->set_completion_handler(handler);
+  auto awaitable = handler->get_awaitable();
+
+  auto entered   = op.entered.get_future();
+  auto destroyer = std::async(std::launch::async,
+                              [task = make_task(upstream, handler)]() mutable { task.reset(); });
+  REQUIRE(entered.wait_for(5s) == std::future_status::ready);
+
+  // Another thread now tries to finish the terminal pipeline.
+  REQUIRE_NOTHROW(terminal->update_pipeline_status(false));
+  CHECK_FALSE(terminal->is_pipeline_finished());
+  CHECK(awaitable.wait_for(0s) == std::future_status::timeout);
+
+  op.release.set_value();
+  destroyer.get();
+
+  REQUIRE(awaitable.wait_for(5s) == std::future_status::ready);
+  CHECK_THROWS_WITH(awaitable.get(), "finalize failed");
+  REQUIRE_NOTHROW(terminal->update_pipeline_status(false));
+  CHECK_FALSE(upstream->is_pipeline_finished());
+  CHECK_FALSE(terminal->is_pipeline_finished());
 }

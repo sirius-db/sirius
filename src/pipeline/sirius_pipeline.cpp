@@ -286,12 +286,6 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
-bool sirius_pipeline::finished_successfully() const
-{
-  std::lock_guard<std::mutex> lock(_status_mutex);
-  return !_finalize_failed && is_pipeline_finished();
-}
-
 bool sirius_pipeline::is_query_terminal() const
 {
   auto s = get_sink();
@@ -382,6 +376,8 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
     if (_task_creation_active) return;
+    // A failed finalize is final: the pipeline stays unfinished and is not finalized again.
+    if (_finalize_failed) return;
 
     auto end_nvtx_range_if_finished = [this]() {
       if (pipeline_finished.load() && _nvtx_range_started.load()) {
@@ -412,20 +408,24 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
                               first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
-          pipeline_finished.store(true);
-          just_closed = true;
           try {
             for (auto& op : get_operators()) {
               op.get().finalize_operator();
             }
           } catch (...) {
-            // pipeline_finished is already visible. Record the failure before the lock is
-            // released, so nobody who then finds the pipeline finished reports the query
-            // complete. The caller reports the error.
+            // The pipeline stays unfinished, so no downstream pipeline treats its input as
+            // complete and the query cannot be reported successful. The caller reports the error.
             _finalize_failed = true;
-            end_nvtx_range_if_finished();
+            if (_nvtx_range_started.load()) {
+              nvtxDomainRangeEnd(nvtx3::domain::get<sirius::nvtx_domain>(),
+                                 _nvtx_pipeline_range_id);
+            }
             throw;
           }
+          // Published only after the operators are finalized: readers take this flag without the
+          // lock, and a downstream pipeline may finish the query as soon as it is set.
+          pipeline_finished.store(true);
+          just_closed = true;
           end_nvtx_range_if_finished();
           should_notify = true;
         }
@@ -435,9 +435,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 
     // Signal from the transition so non-epilogue finish paths cannot strand execute() (#1486).
     // Sampling under the lock pairs with set_completion_handler().
-    if (should_notify && !_finalize_failed && is_query_terminal()) {
-      completion = _completion_handler.lock();
-    }
+    if (should_notify && is_query_terminal()) { completion = _completion_handler.lock(); }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 

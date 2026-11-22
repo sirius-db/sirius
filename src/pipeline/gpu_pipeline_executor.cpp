@@ -568,10 +568,8 @@ void gpu_pipeline_executor::process_task(
           // which may destroy the engine and its operators. We must not schedule
           // tasks that reference those operators after signaling completion.
           bool query_complete = false;
-          // Not the lock-free is_pipeline_finished(): that flag is set before the operators are
-          // finalized, and a finalize failure on another thread must not be reported as success.
           if (completion && pipeline && pipeline->is_query_terminal()) {
-            query_complete = pipeline->finished_successfully();
+            query_complete = pipeline->is_pipeline_finished();
           }
 
           if (!query_complete && _task_creator) {

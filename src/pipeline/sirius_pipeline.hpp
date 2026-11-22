@@ -208,11 +208,9 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! update_pipeline_status. If it is, we dont want to schedule tasks for its consumers, that will
   //! be done later.
   void update_pipeline_status(bool original_pipeline = true);
-  //! Checks if the pipeline has been finished
+  //! True once the pipeline's work is done and its operators have been finalized. Stays false if
+  //! finalizing them threw.
   virtual bool is_pipeline_finished() const;
-  //! True when the pipeline finished and every operator finalized without throwing. Takes the
-  //! status lock, so a finish in progress on another thread is waited for and its outcome seen.
-  [[nodiscard]] bool finished_successfully() const;
 
   //! True once any inline LIMIT has claimed its quota; in-flight tasks must still finish.
   [[nodiscard]] bool is_limit_exhausted() const;
@@ -343,10 +341,11 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   mutable std::mutex _status_mutex;
   std::mutex _task_creation_mutex;
   bool _task_creation_active = false;
-  //! Set when finalize_operator() threw during the finish transition. Guarded by _status_mutex.
+  //! Set when finalize_operator() threw during the finish transition; the pipeline then never
+  //! finishes. Guarded by _status_mutex.
   bool _finalize_failed = false;
 
-  //! Whether the pipeline has been finished
+  //! Whether the pipeline has been finished. Set after its operators are finalized.
   std::atomic<bool> pipeline_finished = false;
 
   std::atomic<std::size_t> tasks_created   = 0;

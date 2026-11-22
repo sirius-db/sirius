@@ -403,11 +403,12 @@ as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
-`pipeline_finished` is set before the operators are finalized. If `finalize_operator()` throws, the
-pipeline records the failure under `_status_mutex` and rethrows to its caller, which reports the
-error. From then on the pipeline never signals completion. The GPU epilogue therefore reads
-`finished_successfully()`, which takes the lock, instead of the lock-free `is_pipeline_finished()`,
-so a finalize failure on another thread is not reported as success.
+`pipeline_finished` is set only after the operators are finalized, so the lock-free
+`is_pipeline_finished()` never reports a pipeline whose finalize is still running or has failed.
+If `finalize_operator()` throws, the pipeline records the failure under `_status_mutex` and
+rethrows to its caller, which reports the error. The pipeline then stays unfinished: it is not
+finalized again, it never signals completion, and no downstream pipeline can treat its input as
+complete and finish the query in its place.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
