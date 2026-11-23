@@ -99,19 +99,19 @@ struct carried_row_selector {
 /**
  * @brief Appends the request that picks each group's carried row to @p requests
  *
- * The request is a MIN. Without an order its values are the row positions `0 .. num_rows - 1`, so
- * its result is the lowest input row of each group. With @p order its values are each row's rank
- * in `cudf::sorted_order` of the order's keys, so its result is the sorted position of each
- * group's first row in that order. Either result survives the caller sorting every request's
- * values together with the keys before the groupby. Subsequent requests do not change its
- * identity.
+ * The request is a MIN. Without an order its values are the row positions of @p carried, so its
+ * result is the lowest input row of each group. With @p order its values are each row's rank in
+ * `cudf::sorted_order` of the order's keys, so its result is the sorted position of each group's
+ * first row in that order. Either result survives the caller sorting every request's values
+ * together with the keys before the groupby. Subsequent requests do not change its identity.
  *
  * @param requests The groupby's requests
  * @param carried The carried columns, in the row order of the groupby input
  * @param order The row order; its positions index @p carried
  * @param stream CUDA stream used for device operations
  * @param mr Device memory resource used for the returned columns
- * @return The owned request values and the appended request index
+ * @return The owned request values, the sort permutation under @p order, and the appended request
+ * index
  */
 [[nodiscard]] carried_row_selector append_carried_row_selector(
   std::vector<cudf::groupby::aggregation_request>& requests,
