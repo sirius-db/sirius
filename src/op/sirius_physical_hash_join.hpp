@@ -49,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -312,6 +313,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
                                        duckdb::JoinType join_type,
                                        std::size_t delim_key_count = 0);
+
+  /**
+   * @brief Whether a MARK join's conditions form a correlated IN / ANY / ALL (see
+   * mark_is_correlated): @p delim_key_count null-safe correlation keys, then the IN key under a
+   * null-propagating comparison, in DuckDB's positions.
+   *
+   * @param comparisons The comparison of each join condition, in condition order.
+   * @param delim_key_count Number of correlated columns (DuckDB's `mark_types`).
+   */
+  [[nodiscard]] static bool is_correlated_mark(std::span<sirius::comparison_type const> comparisons,
+                                               std::size_t delim_key_count);
 
   [[nodiscard]] bool is_right_family() const
   {

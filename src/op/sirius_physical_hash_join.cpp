@@ -140,25 +140,19 @@ static bool mark_join_mixes_null_safe_keys(duckdb::vector<sirius::join_condition
   return has_null_safe && !all_keys_null_safe(conditions);
 }
 
-// A correlated IN / ANY / ALL (see sirius_physical_hash_join::mark_is_correlated):
-// @p delim_key_count null-safe correlation keys, then the IN key under a null-propagating
-// comparison, in DuckDB's positions.
-static bool is_correlated_mark(duckdb::vector<sirius::join_condition> const& conditions,
-                               duckdb::JoinType join_type,
-                               std::size_t delim_key_count)
+// Whether a join's conditions form a correlated quantified comparison (see
+// sirius_physical_hash_join::is_correlated_mark).
+static bool conditions_are_correlated_mark(duckdb::vector<sirius::join_condition> const& conditions,
+                                           duckdb::JoinType join_type,
+                                           std::size_t delim_key_count)
 {
-  if (join_type != duckdb::JoinType::MARK || delim_key_count == 0 ||
-      conditions.size() != delim_key_count + 1) {
-    return false;
+  if (join_type != duckdb::JoinType::MARK) { return false; }
+  std::vector<sirius::comparison_type> comparisons;
+  comparisons.reserve(conditions.size());
+  for (auto const& condition : conditions) {
+    comparisons.push_back(condition.comparison);
   }
-  auto const in_comparison = conditions.back().comparison;
-  return std::all_of(conditions.begin(),
-                     conditions.end() - 1,
-                     [](auto const& c) {
-                       return c.comparison == sirius::comparison_type::not_distinct_from;
-                     }) &&
-         in_comparison != sirius::comparison_type::not_distinct_from &&
-         in_comparison != sirius::comparison_type::distinct_from;
+  return sirius_physical_hash_join::is_correlated_mark(comparisons, delim_key_count);
 }
 
 // Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
@@ -303,6 +297,19 @@ bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_typ
   }
 }
 
+bool sirius_physical_hash_join::is_correlated_mark(
+  std::span<sirius::comparison_type const> comparisons, std::size_t delim_key_count)
+{
+  if (delim_key_count == 0 || comparisons.size() != delim_key_count + 1) { return false; }
+  auto const in_comparison = comparisons.back();
+  return std::all_of(
+           comparisons.begin(),
+           comparisons.end() - 1,
+           [](auto const c) { return c == sirius::comparison_type::not_distinct_from; }) &&
+         in_comparison != sirius::comparison_type::not_distinct_from &&
+         in_comparison != sirius::comparison_type::distinct_from;
+}
+
 bool sirius_physical_hash_join::are_conditions_supported(
   duckdb::vector<sirius::join_condition>& conditions,
   duckdb::JoinType join_type,
@@ -313,7 +320,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // All-null-safe MARK is fine (EQUAL keys, definite marks); a mixture only as a correlated
   // quantified comparison.
   if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions) &&
-      !is_correlated_mark(conditions, join_type, delim_key_count)) {
+      !conditions_are_correlated_mark(conditions, join_type, delim_key_count)) {
     return false;
   }
 
@@ -462,7 +469,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   reorder_join_conditions(conditions, route_null_safe);
 
   // `this->`: the parameter of the same name is moved-from.
-  mark_is_correlated_ = is_correlated_mark(conditions, join_type, this->delim_types.size());
+  mark_is_correlated_ =
+    conditions_are_correlated_mark(conditions, join_type, this->delim_types.size());
 
   // Backstop for the planner's screen; reaching here would silently give the null-safe key
   // NULL != NULL semantics.

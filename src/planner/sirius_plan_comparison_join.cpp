@@ -439,27 +439,17 @@ std::vector<duckdb::idx_t> proven_unique_scan_outputs(duckdb::ClientContext& con
   return outputs;
 }
 
-// A correlated IN / ANY / ALL: one null-safe key per correlated column (`mark_types`), then the
-// quantified comparison. Mirrors sirius_physical_hash_join::mark_is_correlated. DuckDB sends `=`
-// or `<>` here; it plans an ordered comparison as a min/max aggregate under a SINGLE join.
+// A correlated IN / ANY / ALL (see sirius_physical_hash_join::is_correlated_mark). DuckDB sends
+// `=` or `<>` here; it plans an ordered comparison as a min/max aggregate under a SINGLE join.
 static bool is_correlated_any_mark(duckdb::LogicalComparisonJoin const& op)
 {
-  auto const correlated = op.mark_types.size();
-  if (correlated == 0 || op.conditions.size() != correlated + 1) { return false; }
-  for (std::size_t i = 0; i < correlated; ++i) {
-    if (op.conditions[i].GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      return false;
-    }
+  std::vector<sirius::comparison_type> comparisons;
+  comparisons.reserve(op.conditions.size());
+  for (auto const& condition : op.conditions) {
+    comparisons.push_back(sirius::from_duckdb(condition.GetComparisonType()));
   }
-  switch (op.conditions.back().GetComparisonType()) {
-    case duckdb::ExpressionType::COMPARE_EQUAL:
-    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
-    case duckdb::ExpressionType::COMPARE_LESSTHAN:
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: return true;
-    default: return false;
-  }
+  return sirius::op::sirius_physical_hash_join::is_correlated_mark(comparisons,
+                                                                   op.mark_types.size());
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
