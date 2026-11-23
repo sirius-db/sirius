@@ -1148,7 +1148,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     if (auto const& order = aggregate.GetOrderBys()) {
       if (op.groups.empty()) {
         throw duckdb::NotImplementedException(
-          "first() with an ORDER BY clause is not supported on the GPU (falling back to CPU): " +
+          "first() with an ORDER BY clause and no GROUP BY is not supported on the GPU (falling "
+          "back to CPU): " +
           aggregate.ToString());
       }
       if (first_order && !duckdb::BoundOrderModifier::Equals(*first_order, *order)) {

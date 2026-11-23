@@ -79,6 +79,15 @@ bool targets_every_column(duckdb::LogicalDistinct const& op)
   return std::ranges::all_of(targeted, std::identity{});
 }
 
+//! The child column @p expression reads, or nothing unless it is a bare reference below @p width.
+std::optional<duckdb::idx_t> child_column(duckdb::Expression const& expression, duckdb::idx_t width)
+{
+  if (expression.GetExpressionType() != duckdb::ExpressionType::BOUND_REF) { return std::nullopt; }
+  auto const index = expression.Cast<duckdb::BoundReferenceExpression>().Index();
+  if (index >= width) { return std::nullopt; }
+  return index;
+}
+
 }  // namespace
 
 bool sirius_physical_plan_generator::input_rows_are_distinct(duckdb::LogicalOperator const& op)
@@ -186,24 +195,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   }
 
   // The operator requires every group to be a bare reference to a column the child has. Checked
-  // here because the loop below casts each group unchecked and the kernels read the index
-  // unguarded at execution time.
+  // here because the kernels read the index unguarded at execution time.
   auto const child_column_count = planned_types.size();
+  duckdb::vector<duckdb::idx_t> key_columns;
+  key_columns.reserve(groups.size());
   for (duckdb::idx_t i = 0; i < groups.size(); i++) {
-    auto const& group = *groups[i];
-    if (group.GetExpressionType() != duckdb::ExpressionType::BOUND_REF) {
+    auto const column = child_column(*groups[i], child_column_count);
+    if (!column) {
       throw duckdb::NotImplementedException(
-        "DISTINCT: group key " + std::to_string(i) +
-        " is not a plain column reference (falling back to CPU): '" + group.ToString() + "'");
+        "DISTINCT: group key " + std::to_string(i) + " '" + groups[i]->ToString() +
+        "' is not a plain reference to a child column (falling back to CPU)");
     }
-    auto const& bound_ref = group.Cast<duckdb::BoundReferenceExpression>();
-    if (bound_ref.Index() >= child_column_count) {
-      throw duckdb::NotImplementedException(
-        "DISTINCT: group key " + std::to_string(i) + " reads column " +
-        std::to_string(bound_ref.Index()) + " of a child that has " +
-        std::to_string(child_column_count) + (child_column_count == 1 ? " column" : " columns") +
-        " (falling back to CPU)");
-    }
+    key_columns.push_back(*column);
   }
 
   // The kernels sort on child columns, so every surviving ORDER BY key must be one.
@@ -211,23 +214,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   if (order) {
     for (auto const& key : order->orders) {
       reject_nested_column_operation(*key.expression, "a DISTINCT ON ORDER BY");
-      auto const modifier    = sirius::ast::order_modifier_from_duckdb(key);
-      auto const& expression = *key.expression;
-      if (expression.GetExpressionType() != duckdb::ExpressionType::BOUND_REF || !modifier ||
-          expression.Cast<duckdb::BoundReferenceExpression>().Index() >= child_column_count) {
+      auto const column = child_column(*key.expression, child_column_count);
+      if (!column) {
         throw duckdb::NotImplementedException(
-          "DISTINCT ON: ORDER BY key '" + expression.ToString() +
+          "DISTINCT ON: ORDER BY key '" + key.expression->ToString() +
           "' is not a plain reference to a child column (falling back to CPU)");
       }
-      order_keys.push_back({.column   = expression.Cast<duckdb::BoundReferenceExpression>().Index(),
-                            .modifier = *modifier});
+      auto const modifier = sirius::ast::order_modifier_from_duckdb(key);
+      if (!modifier) {
+        throw duckdb::NotImplementedException("DISTINCT ON: ORDER BY key '" +
+                                              key.expression->ToString() +
+                                              "' has no resolved direction or NULL placement "
+                                              "(falling back to CPU)");
+      }
+      order_keys.push_back({.column = *column, .modifier = *modifier});
     }
-  }
-
-  duckdb::vector<duckdb::idx_t> key_columns;
-  key_columns.reserve(groups.size());
-  for (auto const& group : groups) {
-    key_columns.push_back(group->Cast<duckdb::BoundReferenceExpression>().Index());
   }
   auto group_by =
     plan_dedup(std::move(plan), key_columns, carried_columns, order_keys, op.estimated_cardinality);
