@@ -2793,7 +2793,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - unsupported DISTINCT shapes are rejected at plan time",
-                 "[plan_tree_shape][isolated_context]")
+                 "[plan_tree_shape][isolated_context][distinct]")
 {
   // The builder's own guards throw duckdb::NotImplementedException specifically: SiriusContext
   // reports that type as an unsupported shape and logs the message, where a plain std::exception

@@ -1011,6 +1011,9 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT k, first(DISTINCT u ORDER BY u DESC) FROM dist_ord GROUP BY k");
   compare_gpu_vs_cpu("SELECT k, last(DISTINCT u ORDER BY u) FROM dist_ord GROUP BY k");
   compare_gpu_vs_cpu("SELECT k, first(DISTINCT v ORDER BY v DESC) FROM dist_ord GROUP BY k");
+  // Groups 1 and 2 keep their NULL `t`, which MIN and MAX would skip.
+  compare_gpu_vs_cpu("SELECT k, last(DISTINCT t ORDER BY t) FROM dist_ord GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first(DISTINCT t ORDER BY t NULLS FIRST) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -1034,9 +1037,10 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution ordered FIRST over a filter that keeps no row",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // A live filter, unlike `WHERE false`, is not folded away, so the ranked selector sees 0 rows.
-  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY t) FROM dist_ord WHERE v > 100 GROUP BY k");
-  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord WHERE v > 100 ORDER BY t");
+  // 26 lies inside t's min/max, so statistics keep the scan and its filter and the ranked selector
+  // sees 0 rows.
+  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY t) FROM dist_ord WHERE t = 26 GROUP BY k");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord WHERE t = 26 ORDER BY t");
 }
 
 // Known issue #2598, not fixed here: the GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps
@@ -1096,8 +1100,9 @@ TEST_CASE_METHOD(DistinctBulkFixture,
                  "gpu_execution ordered carried rows rank NULL keys across batches",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // Rows from 500000 on have a NULL key, so the later batches send NULL-keyed partials to the
-  // merge; the winner, 499990 + k, needs NULLs placed per key at the merge as well.
+  // The first and third queries null the key from 500000 on and the second below it, so NULL-keyed
+  // partials reach the merge from both ends; the winner, 499990 + k, needs NULLs placed per key at
+  // the merge as well.
   sirius::test::scoped_sirius_setting batch_size{
     *con, "scan_task_batch_size", std::uint64_t{1048576}};
   compare_gpu_vs_cpu(
@@ -1127,6 +1132,27 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k, last(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL "
     "ELSE payload END NULLS FIRST) AS w FROM dist_dup GROUP BY k) WHERE w <> 499990 + k");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered carried rows over several merge partitions",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // A tiny partition size splits the ten groups' partials over several merge tasks.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  sirius::test::scoped_sirius_setting partitions{*con, "hash_partition_bytes", std::uint64_t{1000}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY payload) AS a, "
+    "last(payload + 1 ORDER BY payload) AS b FROM dist_dup GROUP BY k) "
+    "WHERE a <> 999990 + k OR b <> a + 1");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL "
+    "ELSE payload END NULLS FIRST, payload DESC) AS w FROM dist_dup GROUP BY k) "
+    "WHERE w <> 499990 + k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY CASE WHEN "
+    "payload >= 500000 THEN NULL ELSE payload END DESC) WHERE payload <> 499990 + k");
 }
 
 //===----------------------------------------------------------------------===//
