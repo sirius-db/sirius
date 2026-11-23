@@ -32,6 +32,7 @@
 #include <exception>
 #include <format>
 #include <limits>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -86,7 +87,7 @@ void downgrade_executor::start()
       std::lock_guard monitor_lock(_monitor_cv_mutex);
       _running.store(false);
     }
-    _request_queue.interrupt();
+    set_request_queue_open(false);
     _monitor_cv.notify_all();
     if (_pool) { _pool->interrupt(); }
     if (_monitor_thread.joinable()) { _monitor_thread.join(); }
@@ -114,7 +115,7 @@ void downgrade_executor::start()
       rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
   }
 
-  _request_queue.reactivate();
+  set_request_queue_open(true);
 
   sirius::exec::invocable<void()> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
@@ -154,7 +155,7 @@ void downgrade_executor::stop()
   }
 
   if (_pool) { _pool->interrupt(); }
-  _request_queue.interrupt();
+  set_request_queue_open(false);
   _monitor_cv.notify_one();
 
   if (_monitor_thread.joinable()) { _monitor_thread.join(); }
@@ -179,7 +180,7 @@ void downgrade_executor::pause()
   }
 
   _pool->interrupt();
-  _request_queue.interrupt();
+  set_request_queue_open(false);
   _monitor_cv.notify_all();
 
   // The monitor also borrows the cache for its viability check. Join it as well as the
@@ -198,7 +199,7 @@ void downgrade_executor::resume()
   if (_resume_fault) { std::rethrow_exception(std::exchange(_resume_fault, nullptr)); }
 
   _pool->resume();
-  _request_queue.reactivate();
+  set_request_queue_open(true);
   _paused.store(false);
   try {
     _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
@@ -213,7 +214,7 @@ void downgrade_executor::resume()
       _paused.store(true);
     }
     _pool->interrupt();
-    _request_queue.interrupt();
+    set_request_queue_open(false);
     _monitor_cv.notify_all();
     if (_monitor_thread.joinable()) { _monitor_thread.join(); }
     if (_processing_thread.joinable()) { _processing_thread.join(); }
@@ -247,7 +248,7 @@ void downgrade_executor::set_fs_cache(cucascade::io::cache::fs_cache* cache)
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
-    auto request = _request_queue.pop();
+    auto request = take_ready_request();
     if (!request) break;  // interrupted
 
     auto& req = request;
@@ -711,8 +712,9 @@ void downgrade_executor::processing_loop()
       });
     }
 
-    // Fulfill the promise
-    if (dispatch_error) {
+    if (req->on_complete) {
+      req->on_complete(req->bytes_freed.load(std::memory_order_relaxed), dispatch_error);
+    } else if (dispatch_error) {
       req->result.set_exception(dispatch_error);
     } else {
       req->result.set_value(req->bytes_freed.load(std::memory_order_relaxed));
@@ -872,8 +874,14 @@ void downgrade_executor::monitor_loop()
             _source_label,
             amount,
             issued);
-          // Fire-and-forget: monitor does not wait for the result
-          _request_queue.push(std::move(req));
+          // The monitor must retry if a request could not be queued.
+          try {
+            if (!enqueue_request(req)) {
+              _monitor_request_enqueued.store(false, std::memory_order_release);
+            }
+          } catch (const std::bad_alloc&) {
+            _monitor_request_enqueued.store(false, std::memory_order_release);
+          }
         }
       } else {
         // The viability gate now holds the monitor off; a later stall starts from monitor_period.
@@ -902,14 +910,74 @@ void downgrade_executor::monitor_loop()
   }
 }
 
+void downgrade_executor::set_request_queue_open(bool open)
+{
+  {
+    std::lock_guard lock(_request_mutex);
+    _request_queue_open = open;
+  }
+  _request_ready.notify_one();
+}
+
+bool downgrade_executor::enqueue_request(std::unique_ptr<downgrade_request>& request,
+                                         std::chrono::milliseconds delay)
+{
+  {
+    std::lock_guard lock(_request_mutex);
+    if (!_request_queue_open) { return false; }
+    // Allocate the queue entry before taking ownership. A failed insertion leaves
+    // the request and its callback with the submitting call.
+    auto entry    = _requests.emplace(std::chrono::steady_clock::now() + delay, nullptr);
+    entry->second = std::move(request);
+  }
+  _request_ready.notify_one();
+  return true;
+}
+
+std::unique_ptr<downgrade_request> downgrade_executor::take_ready_request()
+{
+  std::unique_lock lock(_request_mutex);
+  while (_request_queue_open) {
+    if (_requests.empty()) {
+      _request_ready.wait(lock);
+      continue;
+    }
+    const auto ready_at = _requests.begin()->first;
+    if (ready_at > std::chrono::steady_clock::now()) {
+      _request_ready.wait_until(lock, ready_at);
+      continue;
+    }
+    return std::move(_requests.extract(_requests.begin()).mapped());
+  }
+  return nullptr;
+}
+
 void downgrade_executor::cancel_pending_requests()
 {
-  while (auto req = _request_queue.try_pop()) {
+  decltype(_requests) pending;
+  {
+    std::lock_guard lock(_request_mutex);
+    pending.swap(_requests);
+  }
+  std::exception_ptr cancellation;
+  if (!pending.empty()) {
     try {
-      req->result.set_exception(
-        std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
+      throw std::runtime_error("downgrade executor shutting down");
     } catch (...) {
-      // Promise may already be fulfilled — safe to ignore
+      // Keep the allocation exception if constructing the diagnostic failed. Each callback
+      // still needs to settle its query before the canceled request releases its task.
+      cancellation = std::current_exception();
+    }
+  }
+  for (auto& [ready_at, req] : pending) {
+    if (req->on_complete) {
+      req->on_complete(0, cancellation);
+    } else {
+      try {
+        req->result.set_exception(cancellation);
+      } catch (const std::future_error&) {
+        // The promise may already be settled.
+      }
     }
   }
   // All producers/consumers are joined by callers. A cancelled queued monitor request must not
@@ -933,11 +1001,25 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
     return freed.load(std::memory_order_relaxed) >= bytes;
   };
   auto future = req->result.get_future();
-  if (!_request_queue.push(std::move(req))) {
+  if (!enqueue_request(req)) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
   }
   return future;
+}
+
+void downgrade_executor::request_free_memory(size_t bytes,
+                                             std::function<bool()> stop,
+                                             downgrade_completion on_complete,
+                                             std::chrono::milliseconds delay)
+{
+  auto req          = std::make_unique<downgrade_request>();
+  req->target_bytes = bytes;
+  req->predicate    = std::move(stop);
+  req->on_complete  = std::move(on_complete);
+  if (!enqueue_request(req, delay)) {
+    throw std::runtime_error("downgrade executor stopped accepting memory requests");
+  }
 }
 
 size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
@@ -950,7 +1032,7 @@ std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> 
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = std::move(predicate);
   auto future    = req->result.get_future();
-  if (!_request_queue.push(std::move(req))) {
+  if (!enqueue_request(req)) {
     SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
     return future;
   }

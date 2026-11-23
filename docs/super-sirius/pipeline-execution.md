@@ -190,7 +190,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result collection also attempts a HOST reservation, but this baseline falls back to conversion without one if the reservation is unavailable; that conversion may OOM. Mandatory reservation-backed collection is introduced by the later memory-progress PR (#2001).
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md).
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 
@@ -417,27 +417,32 @@ Thread-safe signaling for query completion using promise/future:
 All methods are idempotent: the GPU epilogue and terminal pipeline may signal the same completion,
 and only the first call takes effect.
 
-## Reschedule Handling (OOM and CUDA launch failures)
+## Reschedule Handling
 
-**File:** `src/pipeline/oom_reschedule_exception.hpp`
+**File** `src/pipeline/oom_reschedule_exception.hpp`
 
-Retryable execution failures are modeled as a small exception hierarchy: `task_reschedule_exception` is the base, with two subclasses —
+A `task_reschedule_exception` carries the input to retry and the operator index to resume from.
+The subclasses identify which resource or execution stage to retry.
 
-- `oom_reschedule_exception` — a GPU operator ran out of memory. Carries `intermediate_data` (partial results computed so far) and `_resume_operator_index` (which operator to resume from).
-- `cuda_launch_reschedule_exception` — a transient CUDA kernel-launch failure. `gpu_pipeline_task` translates retryable `thrust::system_error` codes (`cudaErrorLaunchOutOfResources` / `cudaErrorInvalidValue`, seen from concurrent PDL launches in `cudf::hash_partition`) into this exception rather than failing the query.
+- `oom_reschedule_exception` resumes GPU work after the executor adjusts GPU admission.
+- `cuda_launch_reschedule_exception` retries a transient CUDA launch failure. The task translates
+  retryable `thrust::system_error` codes such as `cudaErrorLaunchOutOfResources` into this exception.
+- `host_reschedule_exception` resumes materialized result collection after HOST admission. It carries
+  the staging size and the computed output, including any logical position.
 
-The GPU executor catches the **base** `task_reschedule_exception` and:
+The executor creates a replacement task through `create_rescheduled_task()` and submits it through
+the scheduler. GPU execution retries use a bounded retry count (100 by default) and a worker
+backoff (50 ms by default). For a HOST retry, admission probes compatible HOST pools before
+dispatch. If they cannot grant a reservation, the executor releases the GPU reservation and worker
+slot and submits a byte-targeted HOST reclamation request. The downgrade queue handles backoff
+between sweeps of eligible pools.
+The completion callback requeues the replacement through normal query admission. The replacement
+resumes at collection with the computed batches on their original device. The collector publishes
+the task's rows and position together after staging succeeds.
 
-1. Checks if the completion handler already has an error (skip if so)
-2. Increments `retry_count` (max 100 retries, `MAX_RETRIES`)
-3. Logs the retry attempt
-4. Marks the original task as rescheduled (skips pipeline completion tracking)
-5. Transitions intermediate data from idle to `task_created` state
-6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 50ms for backoff
-8. Reschedules the new task back through the manager loop
-
-If max retries are exceeded, the error propagates and terminates the query.
+Queue rejection or retry exhaustion fails the affected query. Cancellation closes the query's
+submission gate, and the pending task's work lease keeps its resources alive until the callback
+retires it. See [HOST staging for materialized results](memory-management.md#host-staging-for-materialized-results).
 
 ## Error Handling and Draining
 

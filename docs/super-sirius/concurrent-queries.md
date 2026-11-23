@@ -35,9 +35,8 @@ contract. Multiple connections to one DatabaseInstance use the shared runtime de
 
 Queries receive scheduling IDs from their arrival tickets. Within each device-preference bucket,
 tasks favor older queries. A ready GPU takes an exact-device task before considering unbound
-tasks. Running kernels are not preempted. Blocking GPU reservation and synchronous downgrade
-waits retain reserved worker capacity in this baseline. The later memory-progress PR (#2001)
-introduces worker release during reservation retries. Equal GPU shares are not promised.
+tasks. Running kernels are not preempted. Blocking GPU reservation and synchronous GPU downgrade
+waits retain reserved worker capacity. Equal GPU shares are not promised.
 IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 
 The shared scan metadata pool also uses strict query-age priority: older queries' queued tasks
@@ -76,16 +75,17 @@ retries retire only the affected query. Queued requests poll interruption every 
 queries poll completion/interruption/health every 25 ms. Already-submitted kernels must finish
 before their buffers can be released; cancellation does not preempt them.
 
-GPU reservations retain the existing blocking wait and synchronous downgrade path at this
-point in the stack. Memory pressure can delay dispatch and query retirement; prompt cancellation
-or a timeout while blocked on a reservation is not guaranteed. Operator OOM/batch-contention
-retries remain separately bounded. HOST result collection retains its existing unreserved
-fallback when a reservation is unavailable.
+GPU reservations can block on capacity and request synchronous downgrade. This can delay dispatch
+and query retirement, including cancellation. Operator OOM and batch-contention retries have a
+separate bound.
 
-The final memory-progress PR (#2001) adds nonblocking GPU reservation retries, a configurable
-retry budget and reservation-backed HOST result collection. Compare the benchmark-runner PR
-(#2015) with that final PR to measure these changes, using an external process timeout for the
-baseline and recording failures/timeouts as well as throughput.
+Materialized GPU results require a HOST staging reservation before collection. A task waiting for
+HOST capacity retains its computed output and its query work lease while reclamation runs on the
+HOST downgrade executor. GPU workers remain available, and the admission thread can dispatch
+other tasks during the wait. Admission tries compatible HOST pools again when reclamation
+completes. Cancellation prevents the task from reentering the scheduler, and exhausted retries
+fail the affected query.
+See [HOST staging for materialized results](memory-management.md#host-staging-for-materialized-results).
 
 Illegal device access, device assertion, launch failure/timeout, uncorrectable ECC and destroyed
 CUDA contexts latch shared GPU-runtime unavailability. Existing owners stop/retire and later GPU

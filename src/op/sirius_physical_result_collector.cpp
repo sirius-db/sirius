@@ -16,7 +16,6 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
-#include <data/sirius_converter_registry.hpp>
 #include <data/spill_chunked_converters.hpp>
 #include <helper/type_conversions.hpp>
 #include <memory/host_reservation.hpp>
@@ -167,8 +166,7 @@ void sirius_physical_materialized_collector::sink_with_reservation(
     }
   }
 
-  const cucascade::memory::memory_space* unreserved_host_space = nullptr;
-  std::size_t copy_chunk_bytes                                 = 0;
+  std::size_t copy_chunk_bytes = 0;
   if (staging_bytes) {
     const auto ctx   = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     copy_chunk_bytes = ctx->get_config().get_downgrade_executor_config().copy_chunk_bytes;
@@ -178,24 +176,9 @@ void sirius_physical_materialized_collector::sink_with_reservation(
       if (!required || reservation->size() < *required) { reservation.reset(); }
     }
     if (!reservation) {
-      auto host_spaces = ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
-      if (host_spaces.empty()) {
-        throw internal_exception(
-          "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
-          "collection");
-      }
-      reservation = memory::try_reserve_host(host_spaces, *staging_bytes);
-      if (!reservation) {
-        // Prefer the pool with the most available memory for the unreserved copy.
-        unreserved_host_space =
-          *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto* a, auto* b) {
-            return a->get_available_memory() < b->get_available_memory();
-          });
-        SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: HOST reservation failed for {} staging bytes. "
-          "Proceeding without a reservation.",
-          *staging_bytes);
-      }
+      reservation = memory::try_reserve_host(
+        ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST), *staging_bytes);
+      if (!reservation) { throw memory::host_reservation_required(*staging_bytes); }
     }
   }
 
@@ -212,20 +195,10 @@ void sirius_physical_materialized_collector::sink_with_reservation(
     if (data->get_current_tier() == Tier::GPU) {
       auto next_batch_id = sirius::get_next_batch_id();
       auto probe = telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id);
+      auto host  = spill::copy_gpu_to_host(
+        data->cast<cucascade::gpu_table_representation>(), *reservation, stream, copy_chunk_bytes);
       auto result_batch =
-        reservation
-          ? cucascade::data_batch::make(
-              next_batch_id,
-              spill::copy_gpu_to_host(data->cast<cucascade::gpu_table_representation>(),
-                                      *reservation,
-                                      stream,
-                                      copy_chunk_bytes),
-              std::move(probe))
-          : ro.clone_to<cucascade::host_data_representation>(sirius::converter_registry::get(),
-                                                             next_batch_id,
-                                                             unreserved_host_space,
-                                                             stream,
-                                                             std::move(probe));
+        cucascade::data_batch::make(next_batch_id, std::move(host), std::move(probe));
       result_ro = result_batch->to_read_only();
       data      = result_ro->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {

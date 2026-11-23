@@ -750,7 +750,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
            .data   = {.bytes = _reservation_bytes},
      }});
   try {
-    local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    if (!local_state.collection_retry) {
+      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    }
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();
@@ -814,12 +816,13 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // operators.size() means "the loop already ran; only the sink is left" (compute_task's loop is
     // a no-op for that index, see the guard on first_op above).
     if (output_data) {
-      // ONLY the restoration is retryable. A sink publishes incrementally — a partition writes
-      // batches to its repositories as it goes — so an OOM inside sink() has already committed
-      // some of them, and replaying the whole sink input would emit those rows twice. The
-      // reschedule window therefore closes before sink() is entered; an OOM there propagates.
+      // GPU OOM retry ends before sink execution. Sinks such as partition publish incrementally,
+      // so replaying a sink after an OOM could emit rows twice. The materialized collector has a
+      // separate HOST admission signal that can only be raised before publication.
       try {
-        materialized = materialize_sink_input(*output_data, stream);
+        if (!local_state.collection_retry) {
+          materialized = materialize_sink_input(*output_data, stream);
+        }
       } catch (const rmm::out_of_memory& oom) {
         auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
         auto const bytes_to_materialize_input =
@@ -850,14 +853,27 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         throw oom_reschedule_exception(
           std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
       }
-      publish_output(*output_data, materialized.get(), stream);
+      if (dynamic_cast<op::sirius_physical_materialized_collector*>(sink_op.get()) &&
+          !local_state.collection_retry) {
+        // Hold the computed representations through admission. A collection-only retry needs
+        // neither readback nor the GPU scratch reservation used to compute these batches.
+        auto& input  = dynamic_cast<op::pipelineable_operator_data&>(materialized ? *materialized
+                                                                                 : *output_data);
+        materialized = input.forward_with_read_only_locks(input.get_position());
+      }
+      try {
+        publish_output(*output_data, materialized.get(), stream);
+      } catch (const memory::host_reservation_required& miss) {
+        throw host_reschedule_exception(
+          materialized ? std::move(materialized) : std::move(output_data), operators.size(), miss);
+      }
     }
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not
     // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
     // here also captures whatever the sink's own deferral restoration allocated -- otherwise a
     // reservation sized from this history would systematically undercount a sink port's true peak.
-    if (output_data) {
+    if (output_data && !local_state.collection_retry) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
       // operators. Clamp at zero to avoid size_t underflow when estimates exceed the observed peak.
@@ -924,7 +940,8 @@ std::size_t gpu_pipeline_task::get_input_size() const
 pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_size_info(
   const cucascade::memory::memory_space* target_space) const
 {
-  auto& ls                         = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto& ls = _local_state->cast<gpu_pipeline_task_local_state>();
+  if (ls.collection_retry) { return {}; }  // The result is already computed and resident.
   auto& gs                         = _global_state->cast<gpu_pipeline_task_global_state>();
   std::size_t input_basis          = ls.get_task_consumption_basis();
   std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input(target_space);

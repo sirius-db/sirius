@@ -19,7 +19,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
+#include "exec/invocable.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -32,11 +32,13 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +52,8 @@ enum class reclaim_mode : std::uint8_t;
 
 namespace sirius {
 namespace parallel {
+
+using downgrade_completion = exec::invocable<void(std::size_t, std::exception_ptr) noexcept>;
 
 /**
  * @brief A request to free GPU memory by downgrading data batches.
@@ -68,6 +72,7 @@ struct downgrade_request {
   /// which keep the dispatch-until-satisfied behavior.
   std::optional<std::size_t> target_bytes;
   std::promise<size_t> result;
+  downgrade_completion on_complete;
   std::atomic<size_t> bytes_freed{0};
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
@@ -150,6 +155,24 @@ class downgrade_executor {
   std::future<size_t> request_free_memory(size_t bytes);
 
   /**
+   * @brief Asynchronously request memory reclamation with a completion callback.
+   *
+   * @param bytes Target bytes to free from this executor's memory space
+   * @param stop Optional predicate that stops further reclamation when it returns true. It must
+   * be safe to call concurrently.
+   * @param on_complete Callback invoked after workers finish or a queued request is canceled.
+   * It receives the actual bytes freed and an exception pointer, which is null on success.
+   * @param delay Time before the queued request becomes eligible for processing
+   * @throws std::runtime_error if the executor is no longer accepting requests
+   * @todo Consider a single byte-targeted API returning an `exec::semi_future<size_t>` so callers
+   * can wait for completion or install a callback.
+   */
+  void request_free_memory(size_t bytes,
+                           std::function<bool()> stop,
+                           downgrade_completion on_complete,
+                           std::chrono::milliseconds delay = {});
+
+  /**
    * @brief Synchronously request GPU memory reclamation.
    *
    * Blocks until the request completes and returns the actual bytes freed.
@@ -226,6 +249,10 @@ class downgrade_executor {
 
   void processing_loop();
   void monitor_loop();
+  void set_request_queue_open(bool open);
+  bool enqueue_request(std::unique_ptr<downgrade_request>& request,
+                       std::chrono::milliseconds delay = {});
+  std::unique_ptr<downgrade_request> take_ready_request();
   void cancel_pending_requests();
 
   // Processing thread only: reclaim and credit only bytes that relieve this HOST space. The
@@ -245,7 +272,11 @@ class downgrade_executor {
  private:
   exec::downgrade_executor_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _pool;
-  exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
+  std::mutex _request_mutex;
+  std::condition_variable _request_ready;
+  bool _request_queue_open{false};  // guarded by _request_mutex
+  std::multimap<std::chrono::steady_clock::time_point, std::unique_ptr<downgrade_request>>
+    _requests;  // guarded by _request_mutex
   std::thread _processing_thread;
   std::thread _monitor_thread;
   std::atomic<bool> _monitor_request_enqueued{false};

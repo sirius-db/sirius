@@ -84,7 +84,7 @@ struct downgrade_executor_test_access {
     request->is_monitor_request = true;
     auto result                 = request->result.get_future();
     executor._monitor_request_enqueued.store(true, std::memory_order_relaxed);
-    if (!executor._request_queue.push(std::move(request))) {
+    if (!executor.enqueue_request(request)) {
       throw std::runtime_error("test monitor request queue is inactive");
     }
     return result;

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "memory/host_reservation.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
@@ -64,6 +65,29 @@ class task_reschedule_exception : public std::exception {
 class oom_reschedule_exception : public task_reschedule_exception {
  public:
   using task_reschedule_exception::task_reschedule_exception;
+};
+
+/**
+ * @brief Reschedule request for a computed result waiting for HOST admission before publication.
+ */
+class host_reschedule_exception : public task_reschedule_exception {
+ public:
+  /**
+   * @brief Capture the output needed to retry result collection.
+   *
+   * @param output Computed batches to preserve for the collection retry
+   * @param resume_operator_index Operator index at which to resume execution
+   * @param miss Reservation miss carrying the required HOST staging size
+   */
+  host_reschedule_exception(std::unique_ptr<op::operator_data> output,
+                            size_t resume_operator_index,
+                            const memory::host_reservation_required& miss)
+    : task_reschedule_exception(std::move(output), resume_operator_index, miss.what()),
+      staging_bytes(miss.bytes)
+  {
+  }
+
+  const std::size_t staging_bytes;
 };
 
 /** @brief Reschedule request from a transient CUDA kernel-launch failure. */

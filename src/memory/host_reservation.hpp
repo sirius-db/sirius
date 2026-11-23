@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 
 namespace sirius::memory {
 
@@ -42,6 +43,21 @@ namespace sirius::memory {
   const auto blocks = bytes / block + static_cast<std::size_t>(bytes % block != 0);
   if (blocks > space.get_max_memory() / block) { return std::nullopt; }
   return blocks * block;
+}
+
+/**
+ * @brief Estimate how much capacity is available below the HOST reservation limit.
+ *
+ * @param space HOST memory space backed by a fixed-size HOST resource
+ * @return The reservation limit minus currently allocated bytes, clamped to zero
+ */
+[[nodiscard]] inline std::size_t host_reservation_headroom(
+  const cucascade::memory::memory_space& space)
+{
+  const auto* resource = space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  const auto used      = resource->get_total_allocated_bytes();
+  const auto limit     = space.get_max_memory();
+  return used < limit ? limit - used : 0;
 }
 
 /**
@@ -76,5 +92,24 @@ namespace sirius::memory {
   }
   return nullptr;
 }
+
+/**
+ * @brief A pre-publication miss carrying the copy size needed to resume.
+ */
+class host_reservation_required : public std::runtime_error {
+ public:
+  /**
+   * @brief Construct a HOST reservation miss.
+   *
+   * @param bytes Copy size needed to resume, before rounding for a candidate HOST pool
+   */
+  explicit host_reservation_required(std::size_t bytes)
+    : std::runtime_error("Insufficient HOST memory to stage materialized query results"),
+      bytes(bytes)
+  {
+  }
+
+  const std::size_t bytes;
+};
 
 }  // namespace sirius::memory

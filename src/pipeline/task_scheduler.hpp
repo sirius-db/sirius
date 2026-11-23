@@ -227,6 +227,8 @@ class task_scheduler {
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
   std::vector<int> _ready_devices;
 
+  /// Built before the GPU executors borrow it and kept for their lifetime.
+  std::vector<host_pool_binding> _host_pools;
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   sirius::creator::task_creator* _task_creator{nullptr};

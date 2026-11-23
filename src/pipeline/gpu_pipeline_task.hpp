@@ -97,6 +97,13 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Secondary task reservation, independently owned from the GPU reservation.
   std::unique_ptr<cucascade::memory::reservation> host_reservation;
 
+  /// Fully computed, pinned output waiting to resume at the materialized collector.
+  struct result_collection_retry {
+    std::size_t staging_bytes;
+    std::size_t reclaim_attempts = 0;
+  };
+  std::optional<result_collection_retry> collection_retry;
+
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
 
@@ -255,18 +262,29 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * Pushes the output batches to the configured data repositories.
    *
    * @param output_batches The data batches to publish
+   * @param stream CUDA stream used to restore and publish sink input
    */
   void publish_output(op::operator_data& output_batches, ::cuda::stream_ref stream) override;
 
-  /// Restore the sink's deferred input, if it carries a port directive.
-  ///
-  /// Split out from @ref publish_output so the caller can bound the OOM-reschedule window to the
-  /// restoration alone: a sink publishes incrementally, so an OOM inside sink() has already
-  /// committed batches and replaying its input would duplicate them.
+  /**
+   * @brief Restore deferred sink input before publication.
+   *
+   * GPU OOM recovery can retry this step without replaying any sink publication.
+   *
+   * @param output_data Computed output that may carry a port directive
+   * @param stream CUDA stream used for restoration
+   * @return Restored sink input, or nullptr if no restoration was needed
+   */
   std::unique_ptr<op::operator_data> materialize_sink_input(op::operator_data& output_data,
                                                             ::cuda::stream_ref stream);
 
-  /// Publish @p materialized (or @p output_batches when there was nothing to restore) to the sink.
+  /**
+   * @brief Publish a task's output to its sink.
+   *
+   * @param output_batches The original output batches
+   * @param materialized Restored sink input, or nullptr to publish @p output_batches directly
+   * @param stream CUDA stream used by the sink
+   */
   void publish_output(op::operator_data& output_batches,
                       op::operator_data* materialized,
                       ::cuda::stream_ref stream);
