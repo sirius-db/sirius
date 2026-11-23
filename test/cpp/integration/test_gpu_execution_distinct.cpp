@@ -945,6 +945,64 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution grouped last(v ORDER BY ...) runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Groups 1 and 2 hold a NULL `t` in a middle row. Each query's winners differ from both the
+  // un-reversed order's and the order with only the direction reversed.
+  SECTION("both directions and NULL placements")
+  {
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t DESC) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t NULLS FIRST) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t DESC NULLS FIRST) FROM dist_ord GROUP BY k");
+  }
+
+  // Group 4's winner has a NULL `v`; group 1's NULL `v` sits in a row that does not win.
+  SECTION("a NULL value at the winner")
+  {
+    run_ok("CREATE TABLE dist_last (k INTEGER, v VARCHAR, t INTEGER);");
+    run_ok(
+      "INSERT INTO dist_last VALUES (1, 'a', 30), (1, 'b', 10), (1, NULL, 20), (2, 'c', 5), "
+      "(2, 'd', NULL), (3, 'e', 7), (4, 'f', 8), (4, NULL, 9);");
+    run_ok("CHECKPOINT;");
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t) FROM dist_last GROUP BY k");
+  }
+
+  SECTION("beside a SUM and a COUNT(DISTINCT)")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, last(v ORDER BY t), sum(v), count(DISTINCT u) FROM dist_ord GROUP BY k");
+  }
+
+  // The rewrites share one create_sort_key, which DuckDB projects below the aggregate.
+  SECTION("two LASTs sharing an ORDER BY")
+  {
+    compare_gpu_vs_cpu("SELECT k, last(v ORDER BY t), last(s ORDER BY t) FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, last(v ORDER BY u DESC, t), last(d ORDER BY u DESC, t) FROM dist_ord GROUP BY k");
+  }
+
+  // `t DESC NULLS FIRST` is the reverse of `t`, so both read the same row.
+  SECTION("beside a FIRST under the reversed order")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, last(v ORDER BY t), first(s ORDER BY t DESC NULLS FIRST) FROM dist_ord GROUP BY "
+      "k");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ordered FIRST and LAST with DISTINCT run on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // `u` repeats within groups 1 to 3 and rises, so the winners are later rows than the first.
+  compare_gpu_vs_cpu("SELECT k, first(DISTINCT u ORDER BY u DESC) FROM dist_ord GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, last(DISTINCT u ORDER BY u) FROM dist_ord GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first(DISTINCT v ORDER BY v DESC) FROM dist_ord GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution ordered FIRST breaks signed-zero and NaN ties by its next key",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
@@ -1043,6 +1101,23 @@ TEST_CASE_METHOD(DistinctBulkFixture,
     "payload >= 500000 THEN NULL ELSE payload END DESC) WHERE payload <> 499990 + k");
 }
 
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered LAST over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Each key's largest payload sits in the last scan batch, so the merge must rank the partials
+  // again under the reversed order. The second query's key is NULL from 500000 on.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY payload) AS a, "
+    "last(payload + 1 ORDER BY payload) AS b FROM dist_dup GROUP BY k) "
+    "WHERE a <> 999990 + k OR b <> a + 1");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, last(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL "
+    "ELSE payload END NULLS FIRST) AS w FROM dist_dup GROUP BY k) WHERE w <> 499990 + k");
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
@@ -1057,13 +1132,22 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution ungrouped ordered FIRST and ordered LAST fall back at plan time",
+                 "gpu_execution ungrouped ordered FIRST and LAST fall back at plan time",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The smallest `t` is unique, and every group's last row under `t` is its NULL `t` row or a
-  // unique largest one, so both CPU runs agree.
+  // The smallest and the largest `t` are unique, so both CPU runs agree.
   expect_plan_fallback_matches_cpu("SELECT first(v ORDER BY t) FROM dist_ord");
-  expect_plan_fallback_matches_cpu("SELECT k, last(v ORDER BY t) FROM dist_ord GROUP BY k");
+  expect_plan_fallback_matches_cpu("SELECT last(v ORDER BY t NULLS FIRST) FROM dist_ord");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST and LAST over one ORDER BY fall back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // LAST decodes to a FIRST under the reversed order, and one carried row cannot answer two orders.
+  // Every group's smallest `t` is unique, and its last row is a NULL `t` row or a unique largest.
+  expect_plan_fallback_matches_cpu(
+    "SELECT k, first(v ORDER BY t), last(v ORDER BY t) FROM dist_ord GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,

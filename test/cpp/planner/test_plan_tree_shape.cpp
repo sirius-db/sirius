@@ -2970,11 +2970,31 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "create_sort_key");
   }
 
-  SECTION("an ordered LAST still falls back")
+  SECTION("an arg_max_null with its own ORDER BY is not decoded")
   {
-    // Only FIRST's rewrite is decoded; LAST's arg_max_null leaves create_sort_key untranslatable.
-    require_rejected("SELECT id, last(val ORDER BY val) FROM big_left GROUP BY id",
-                     "Unsupported expression in aggregate");
+    require_rejected(
+      "SELECT id % 2 AS g, arg_max_null(val, create_sort_key(val, 'ASC NULLS LAST') ORDER BY id) "
+      "FROM big_left GROUP BY id % 2",
+      "create_sort_key");
+  }
+
+  SECTION("a FIRST and a LAST over one ORDER BY are two orders")
+  {
+    // Both rewrites read one shared sort key; once inlined and decoded, LAST's order is reversed.
+    require_rejected(
+      "SELECT id, first(val ORDER BY val), last(val ORDER BY val) FROM big_left GROUP BY id",
+      "first() with different ORDER BYs");
+  }
+
+  SECTION("an ungrouped ordered LAST is refused")
+  {
+    require_rejected("SELECT last(val ORDER BY val) FROM big_left",
+                     "first() with an ORDER BY clause");
+  }
+
+  SECTION("an unordered LAST still falls back")
+  {
+    require_rejected("SELECT id, last(val) FROM big_left GROUP BY id", "last");
   }
 }
 
@@ -3096,6 +3116,104 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       chain.firsts[0].order ==
       std::vector<order_key>{
         {.input_idx = 2, .column_order = descending, .null_precedence = cudf::null_order::AFTER}});
+  }
+
+  SECTION("an ordered LAST is a FIRST under the reversed direction and NULL placement")
+  {
+    auto const require_last = [&](std::string const& modifiers,
+                                  cudf::order column_order,
+                                  cudf::null_order null_precedence) {
+      auto const query =
+        "SELECT id, last(val ORDER BY val " + modifiers + ") FROM big_left GROUP BY id";
+      INFO(query);
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(tree_to_string(plan.get()));
+      auto const chain = require_ordered_chain(plan.get());
+      REQUIRE(chain.firsts.size() == 1);
+      CHECK(chain.firsts[0].order ==
+            std::vector<order_key>{
+              {.input_idx = 2, .column_order = column_order, .null_precedence = null_precedence}});
+    };
+    // ASC NULLS LAST -> DESC NULLS FIRST, and so on; cuDF's AFTER is DuckDB's NULLS FIRST under
+    // DESC.
+    require_last("", descending, cudf::null_order::AFTER);
+    require_last("DESC", ascending, cudf::null_order::BEFORE);
+    require_last("NULLS FIRST", descending, nulls_last_descending);
+    require_last("DESC NULLS FIRST", ascending, nulls_last_ascending);
+  }
+
+  SECTION("LASTs sharing an ORDER BY get the key DuckDB moved below the aggregate")
+  {
+    bool key_below_aggregate = false;
+    auto const inspect       = [&](LogicalOperator const& root) {
+      auto const* node = &root;
+      while (node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+             !node->children.empty()) {
+        node = node->children[0].get();
+      }
+      REQUIRE(node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY);
+      REQUIRE(node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION);
+      for (auto const& expression : node->children[0]->expressions) {
+        if (expression->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+            expression->Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName() ==
+              "create_sort_key") {
+          key_below_aggregate = true;
+        }
+      }
+      for (auto const& expression : node->expressions) {
+        auto const& aggregate = expression->Cast<BoundAggregateExpression>();
+        CHECK(aggregate.Function().GetName().GetIdentifierName() == "arg_max_null");
+        CHECK(aggregate.GetChildren()[1]->GetExpressionClass() == ExpressionClass::BOUND_REF);
+      }
+    };
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT id, last(val ORDER BY val), last(id ORDER BY val) FROM big_left GROUP BY id",
+      {},
+      true,
+      nullptr,
+      true,
+      inspect);
+    CHECK(key_below_aggregate);
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    CHECK(chain.firsts[0].order == chain.firsts[1].order);
+    CHECK(
+      chain.firsts[0].order ==
+      std::vector<order_key>{
+        {.input_idx = 2, .column_order = descending, .null_precedence = cudf::null_order::AFTER}});
+  }
+
+  SECTION("a LAST and a FIRST under the reversed order share one row")
+  {
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT id, last(val ORDER BY val), first(id ORDER BY val DESC "
+                           "NULLS FIRST) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+    auto const chain = require_ordered_chain(plan.get());
+    REQUIRE(chain.firsts.size() == 2);
+    CHECK(chain.firsts[0].order == chain.firsts[1].order);
+  }
+
+  SECTION("an ordered FIRST or LAST with DISTINCT is decoded without it")
+  {
+    // DuckDB passes DISTINCT through its rewrite, which the GPU refuses on anything but COUNT.
+    auto const require_decoded = [&](std::string const& query, cudf::null_order null_precedence) {
+      INFO(query);
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(tree_to_string(plan.get()));
+      auto const chain = require_ordered_chain(plan.get());
+      REQUIRE(chain.firsts.size() == 1);
+      CHECK(chain.firsts[0].order ==
+            std::vector<order_key>{
+              {.input_idx = 2, .column_order = descending, .null_precedence = null_precedence}});
+    };
+    require_decoded("SELECT id, first(DISTINCT val ORDER BY val DESC) FROM big_left GROUP BY id",
+                    nulls_last_descending);
+    require_decoded("SELECT id, last(DISTINCT val ORDER BY val) FROM big_left GROUP BY id",
+                    cudf::null_order::AFTER);
   }
 
   SECTION("an ordered FIRST beside a SUM carries its key after the FIRST")
