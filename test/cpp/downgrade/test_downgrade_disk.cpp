@@ -689,3 +689,52 @@ TEST_CASE("task-queue downgrade credits only the bytes it moved", "[downgrade_di
   REQUIRE(first_moved != second_moved);  // exactly one fit
   REQUIRE(freed == batch_bytes);
 }
+
+// HOST pressure that the executor cannot relieve (a reservation, IO staging: nothing in a
+// repository, the task queue or the cache) passes the viability gate whenever a disk is
+// configured, yet every request frees nothing. The monitor must back off instead of re-firing
+// every monitor_period.
+TEST_CASE("HOST-source monitor backs off when a disk is configured but nothing can be released",
+          "[downgrade_disk]")
+{
+  sirius::converter_registry::reset_for_testing();
+  auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk";
+  std::filesystem::create_directories(tmp_dir);
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(256ull << 20)
+    .set_per_numa_region_capacity(64ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .set_downgrade_fractions_per_numa_region(0.1, 0.05)  // a reservation reaches HOST pressure
+    .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(host_space != nullptr);
+  auto pressure = host_space->make_reservation_upto(host_space->get_max_memory());
+  REQUIRE(host_space->should_downgrade_memory());
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
+    .monitor_period = std::chrono::milliseconds{1}};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  repo_registry.create_for_query(kTestQueryId);
+  downgrade_executor executor(
+    lifecycle, config, repo_registry, host_space->get_id(), host_space, *mem_mgr);
+  executor.start();
+
+  // Without back-off the 1 ms monitor re-fires about 200 times in this window. With it, the
+  // intervals double from 1 ms, so about 8 requests fit.
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  auto const requests = executor.monitor_requests_issued_for_testing();
+  executor.stop();
+
+  CHECK(requests >= 1);
+  CHECK(requests <= 20);
+}

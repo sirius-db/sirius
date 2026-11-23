@@ -804,12 +804,13 @@ void downgrade_executor::monitor_loop()
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;
 
-  // A HOST source without DISK can only reclaim cache chunks. When every chunk above the
-  // reservation is pinned by a reader or still loading, its viability check still passes, yet
-  // each request frees nothing. Back off exponentially after such a request, from
-  // monitor_period up to a cap. This is a timer rather than a latch: a reader unpinning a chunk
-  // makes it reclaimable without changing anything the monitor can observe.
-  bool const cache_only  = _space_id.tier == cucascade::memory::Tier::HOST && !has_disk_tier();
+  // A HOST source can pass its viability check while a request frees nothing: without DISK it
+  // can only reclaim cache chunks, and every chunk above the reservation may be pinned by a
+  // reader or still loading; with DISK the pressure may be memory no request can move (a
+  // reservation, IO staging). Back off exponentially after such a request, from monitor_period
+  // up to a cap. This is a timer rather than a latch: a reader unpinning a chunk makes it
+  // reclaimable without changing anything the monitor can observe.
+  bool const host_source = _space_id.tier == cucascade::memory::Tier::HOST;
   auto const backoff_cap = std::max(_config.monitor_period, std::chrono::milliseconds{1000});
   auto backoff           = std::chrono::milliseconds::zero();
   auto next_request      = std::chrono::steady_clock::time_point{};
@@ -820,17 +821,18 @@ void downgrade_executor::monitor_loop()
     auto const enqueued = _monitor_request_enqueued.load(std::memory_order_acquire);
     if (awaiting_outcome && !enqueued) {
       awaiting_outcome = false;
-      if (cache_only && _monitor_request_stalled.load(std::memory_order_relaxed)) {
+      if (host_source && _monitor_request_stalled.load(std::memory_order_relaxed)) {
         backoff      = backoff == std::chrono::milliseconds::zero() ? _config.monitor_period
                                                                     : std::min(backoff * 2, backoff_cap);
         next_request = std::chrono::steady_clock::now() + backoff;
         if (!stalled) {
           SIRIUS_LOG_WARN(
-            "[downgrade] [{}] memory pressure but the cache could not release anything (chunks "
-            "pinned by readers or loading) and no disk is configured; retrying with back-off up to "
-            "{} ms. Consider configuring a disk memory space to enable spilling.",
+            "[downgrade] [{}] memory pressure but nothing could be released (cache chunks pinned "
+            "by readers or loading, or memory held outside the repositories); retrying with "
+            "back-off up to {} ms.{}",
             _source_label,
-            backoff_cap.count());
+            backoff_cap.count(),
+            has_disk_tier() ? "" : " Consider configuring a disk memory space to enable spilling.");
           stalled = true;
         }
       } else {
