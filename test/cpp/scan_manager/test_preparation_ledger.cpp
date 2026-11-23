@@ -30,6 +30,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <array>
 #include <future>
 #include <limits>
@@ -545,8 +546,8 @@ TEST_CASE("Results keep backing after plan and attempt owners finish", "[scan_pr
   CHECK_THROWS_AS(owner.consume(), std::logic_error);
   attempt->register_unit({1, 1}, 20);
   auto permit = attempt->acquire_permit({1, 1});
-  auto block  = attempt->allocator(permit).allocate_retained(16);
-  auto* p     = reinterpret_cast<int64_t*>(block.data());
+  auto block  = attempt->allocator(permit).allocate_retained_blocks(16);
+  auto* p     = reinterpret_cast<int64_t*>(block.blocks().front());
   p[0]        = 2;
   p[1]        = 9;
   auto result =
@@ -665,6 +666,58 @@ TEST_CASE("HOST adapter allocates real reserved blocks and returns them after th
   CHECK(manager.get_active_reservation_count() == 1);
   retained.release();
   CHECK(manager.get_active_reservation_count() == 0);
+  CHECK(resource->get_free_blocks() == initial_free);
+}
+
+TEST_CASE("HOST adapter serves a multi-block request from blocks that are not adjacent",
+          "[scan_preparation][ledger][host]")
+{
+  cucascade::memory::host_memory_space_config config;
+  config.numa_id              = 0;
+  config.memory_capacity      = 16 * 1024;
+  config.block_size           = 1024;
+  config.pool_size            = 16;
+  config.initial_number_pools = 1;
+  cucascade::memory::memory_reservation_manager manager({config});
+  auto* resource = manager.get_memory_space(cucascade::memory::Tier::HOST, 0)
+                     ->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  auto initial_free = resource->get_free_blocks();
+  {
+    // A pool that has been in use: six blocks come back out of address order, so the next
+    // ones it hands out are not neighbours.
+    std::vector<decltype(resource->allocate_multiple_blocks(1024))> held;
+    for (int i = 0; i < 6; ++i)
+      held.push_back(resource->allocate_multiple_blocks(1024));
+    std::sort(held.begin(), held.end(), [](auto const& a, auto const& b) {
+      return a->get_blocks().front() < b->get_blocks().front();
+    });
+    for (auto index : {1, 3, 5, 0, 2, 4})
+      held[static_cast<size_t>(index)].reset();
+  }
+  host_reservation_provider provider(manager);
+  std::array<scan_envelope, 1> envelope{scan_envelope{{{{2048}, 2048}}, {}, true}};
+  preparation_ledger ledger(provider);
+  REQUIRE(ledger.admit(envelope, host).deferred);
+  ledger.register_unit({1, 1}, 2048);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  // The contiguous form needs neighbours; it finds none and returns its charge.
+  CHECK_THROWS_AS(allocator.allocate_retained(2048), preparation_resource_error);
+  CHECK(ledger.allocation_failures() == 1);
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  auto retained = allocator.allocate_retained_blocks(2048);
+  REQUIRE(retained.blocks().size() == 2);
+  CHECK(retained.block_size() == 1024);
+  CHECK(retained.blocks()[0] + 1024 != retained.blocks()[1]);
+  CHECK(retained.blocks()[1] + 1024 != retained.blocks()[0]);
+  CHECK(ledger.charged_bytes({1, 1}) == 2048);
+  auto temporary = allocator.allocate_blocks(2048);
+  CHECK(temporary.blocks().size() == 2);
+  CHECK(ledger.allocation_failures() == 1);
+  CHECK(resource->get_free_blocks() == initial_free - 4);
+  temporary.release();
+  retained.release();
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
   CHECK(resource->get_free_blocks() == initial_free);
 }
 
@@ -1015,8 +1068,8 @@ TEST_CASE("Charged DV descriptor names outlive the plan through the last publish
   auto claim   = attempt->try_claim();
   auto job     = std::get<std::shared_ptr<iceberg_dv_attempt::file_job>>(std::move(claim));
   job->commit();
-  auto allocation = job->allocator().allocate_retained(16);
-  auto* values    = reinterpret_cast<int64_t*>(allocation.data());
+  auto allocation = job->allocator().allocate_retained_blocks(16);
+  auto* values    = reinterpret_cast<int64_t*>(allocation.blocks().front());
   values[0]       = 1;
   values[1]       = 3;
   auto result     = std::make_shared<iceberg_delete_set const>(

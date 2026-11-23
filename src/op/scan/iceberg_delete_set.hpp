@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "op/scan/block_span.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
@@ -45,7 +46,7 @@ struct iceberg_delete_set : prepared_visibility {
     positions = *legacy_positions_;
   }
   iceberg_delete_set(std::string file,
-                     scan_manager::charged_block backing,
+                     scan_manager::charged_blocks backing,
                      uint64_t count,
                      uint64_t sources)
     : source_dv_count(sources), file_owner_(std::move(file)), backing_(std::move(backing))
@@ -54,7 +55,7 @@ struct iceberg_delete_set : prepared_visibility {
     validate(count);
   }
   iceberg_delete_set(std::string_view file,
-                     scan_manager::charged_block backing,
+                     scan_manager::charged_blocks backing,
                      uint64_t count,
                      uint64_t sources,
                      std::shared_ptr<void const> owner)
@@ -67,7 +68,7 @@ struct iceberg_delete_set : prepared_visibility {
     validate(count);
   }
   std::string_view data_file;
-  std::span<int64_t const> positions;
+  block_span<int64_t const> positions;
   uint64_t source_dv_count = 0;
   /// Equality-delete groups that apply to this data file, or null when none do. Files with the
   /// same applicability share one list, so the pointer is also the batch-compatibility class.
@@ -92,9 +93,12 @@ struct iceberg_delete_set : prepared_visibility {
       throw std::invalid_argument("delete positions require retained backing");
     if (count > backing_.size() / sizeof(int64_t))
       throw std::invalid_argument("delete positions exceed charged backing");
-    if (count && reinterpret_cast<uintptr_t>(backing_.data()) % alignof(int64_t))
+    auto const blocks = backing_.blocks();
+    if (count && std::any_of(blocks.begin(), blocks.end(), [](auto* block) {
+          return reinterpret_cast<uintptr_t>(block) % alignof(int64_t) != 0;
+        }))
       throw std::invalid_argument("delete positions backing is misaligned");
-    positions = {reinterpret_cast<int64_t const*>(backing_.data()), static_cast<size_t>(count)};
+    positions = {blocks, backing_.block_size(), static_cast<size_t>(count)};
     if (!std::is_sorted(positions.begin(), positions.end()) ||
         std::adjacent_find(positions.begin(), positions.end()) != positions.end() ||
         (!positions.empty() && positions.front() < 0))
@@ -102,7 +106,7 @@ struct iceberg_delete_set : prepared_visibility {
   }
   std::string file_owner_;
   std::shared_ptr<void const> path_owner_;
-  scan_manager::charged_block backing_;
+  scan_manager::charged_blocks backing_;
   std::shared_ptr<std::vector<int64_t> const> legacy_positions_;
 };
 using iceberg_delete_sets =

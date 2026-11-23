@@ -235,8 +235,8 @@ TEST_CASE("Delete result validation rejects invalid positions and releases its r
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
   ledger.register_unit({1, 1}, 20);
   auto permit    = ledger.acquire_permit({1, 1});
-  auto block     = ledger.allocator(permit).allocate_retained(16);
-  auto positions = reinterpret_cast<int64_t*>(block.data());
+  auto block     = ledger.allocator(permit).allocate_retained_blocks(16);
+  auto positions = reinterpret_cast<int64_t*>(block.blocks().front());
   SECTION("unsorted")
   {
     positions[0] = 2;

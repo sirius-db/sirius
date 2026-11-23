@@ -1,6 +1,7 @@
 /* Copyright 2026, Sirius Contributors. SPDX-License-Identifier: Apache-2.0 */
 #pragma once
 
+#include "op/scan/block_span.hpp"
 #include "op/scan/gpu_row_positions.hpp"
 #include "op/scan/owning_table_view.hpp"
 #include "op/scan/scan_execution_record.hpp"
@@ -134,7 +135,7 @@ class row_lineage {
   friend void apply_lineage_visibility(
     owning_table_view&,
     row_lineage&,
-    std::function<std::span<int64_t const>(std::string const&)> const&,
+    std::function<block_span<int64_t const>(std::string const&)> const&,
     ::cuda::stream_ref,
     rmm::device_async_resource_ref);
 };
@@ -154,7 +155,7 @@ void append_lineage_virtual_columns(owning_table_view&,
                                     rmm::device_async_resource_ref);
 void apply_lineage_visibility(owning_table_view&,
                               row_lineage&,
-                              std::function<std::span<int64_t const>(std::string const&)> const&,
+                              std::function<block_span<int64_t const>(std::string const&)> const&,
                               ::cuda::stream_ref,
                               rmm::device_async_resource_ref);
 }  // namespace sirius::op::scan

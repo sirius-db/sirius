@@ -208,15 +208,22 @@ DeletionVectorRef fixture_ref()
           .record_count          = kCardinality};
 }
 
+/// A nonzero @p block_size hands the charged reader its blob and positions as non-adjacent
+/// blocks of that size, as a fragmented host pool does.
 std::vector<int64_t> read_for_test(DeletionVectorRef ref,
                                    bool charged,
-                                   puffin_byte_source* supplied_source = nullptr)
+                                   puffin_byte_source* supplied_source = nullptr,
+                                   uint64_t block_size                 = 0)
 {
   if (!charged)
     return supplied_source ? read_deletion_vector(ref, *supplied_source)
                            : read_deletion_vector(ref);
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
+  if (block_size) {
+    provider.quantum              = block_size;
+    provider.seen->scatter_blocks = true;
+  }
   auto path = ref.puffin_path;
   if (path.starts_with("file://")) path.erase(0, 7);
   std::error_code error;
@@ -227,7 +234,7 @@ std::vector<int64_t> read_for_test(DeletionVectorRef ref,
     8;
   auto blob            = static_cast<uint64_t>(std::max<int64_t>(ref.content_size_in_bytes, 0));
   auto parser          = static_cast<uint64_t>(ref.file_size_in_bytes) * 14 + 512;
-  provider.grant_bytes = positions + blob + parser;
+  provider.grant_bytes = positions + blob + parser + 3 * provider.quantum;
   preparation_ledger ledger(provider);
   std::array scans{scan_envelope{{{{blob, parser, 0}, positions}}, {}, true}};
   REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
@@ -673,6 +680,8 @@ TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets an
           "[scan_preparation][iceberg][charged_reader]")
 {
   auto shape = GENERATE(0, 1, 2, 3);
+  // 8 puts every position in its own block and splits every header field and container body.
+  auto block = GENERATE(uint64_t{0}, uint64_t{8}, uint64_t{4096});
   roaring::Roaring bitmap;
   if (shape == 0)
     for (uint32_t i : {1u, 5u, 65537u, 0xfffffffeu})
@@ -700,7 +709,35 @@ TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets an
   push_u32_be(blob, crc32_of(checksummed));
   auto path = write_puffin(blob, "charged_roaring_" + std::to_string(shape), bitmap.cardinality());
   auto ref  = synthetic_ref(path, blob, bitmap.cardinality());
-  CHECK(read_for_test(ref, true) == read_deletion_vector(ref));
+  CHECK(read_for_test(ref, true, nullptr, block) == read_deletion_vector(ref));
+}
+
+TEST_CASE("Charged Puffin sorts and deduplicates positions held in non-adjacent blocks",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  // High keys 1, 0, 1 over the same three values: nine encoded positions, out of order and
+  // repeated, one per 8-byte block. A reader that orders or deduplicates only within a block
+  // returns all nine.
+  roaring::Roaring bitmap;
+  for (uint32_t value : {1u, 5u, 65537u})
+    bitmap.add(value);
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64};
+  for (int i = 0; i < 8; ++i)
+    checksummed.push_back(i == 0 ? 3 : 0);
+  for (uint32_t key : {1u, 0u, 1u}) {
+    push_u32_le(checksummed, key);
+    checksummed.insert(checksummed.end(), serial.begin(), serial.end());
+  }
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, checksummed.size());
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  auto path = write_puffin(blob, "charged_blocks_order", 9);
+  auto high = int64_t{1} << 32;
+  CHECK(read_for_test(synthetic_ref(path, blob, 9), true, nullptr, 8) ==
+        std::vector<int64_t>{1, 5, 65537, high | 1, high | 5, high | 65537});
 }
 
 TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files",
@@ -829,7 +866,8 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
                            std::string("bitmap_budget"),
                            std::string("late_corruption"),
                            std::string("run_header"));
-  CAPTURE(scenario);
+  auto block    = GENERATE(uint64_t{0}, uint64_t{8});
+  CAPTURE(scenario, block);
   int64_t declared = 1;
   std::vector<uint8_t> blob;
   if (scenario.starts_with("bitset")) {
@@ -881,7 +919,7 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
   auto ref   = synthetic_ref(path, blob, declared);
   auto error = [&](bool charged) {
     try {
-      (void)read_for_test(ref, charged);
+      (void)read_for_test(ref, charged, nullptr, block);
     } catch (std::runtime_error const& e) {
       return std::string(e.what());
     }
@@ -889,7 +927,7 @@ TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
   };
   if (scenario == "run_header") {
     CHECK(read_for_test(ref, false) == std::vector<int64_t>{1, 2});
-    CHECK(read_for_test(ref, true) == read_for_test(ref, false));
+    CHECK(read_for_test(ref, true, nullptr, block) == read_for_test(ref, false));
   } else {
     auto legacy = error(false);
     REQUIRE_FALSE(legacy.empty());
@@ -1032,6 +1070,75 @@ TEST_CASE("Neutral DV payload obeys independent limits and retained grant",
   provider.seen->fail_allocation = true;
   CHECK_THROWS_AS(decode_deletion_vector_payload(blob, allocator), preparation_resource_error);
   CHECK(ledger.charged_bytes({1, 1}) == 0);
+}
+
+TEST_CASE("Deletion vector bitmaps are sized as CRoaring sizes them",
+          "[scan_preparation][dv_payload]")
+{
+  using namespace sirius::scan_manager;
+  // The reader sizes a serialized bitmap itself, so that it can do so over blocks. Candidates:
+  // array, bitset and run containers (five, so the offset header is present) cut short at
+  // each length, cookies that are neither format, and a container count above 65,536.
+  roaring::Roaring bitmap;
+  for (uint32_t value : {1u, 5u, 3u * 65536 + 7, 4u * 65536 + 9})
+    bitmap.add(value);
+  for (uint32_t value = 65536; value < 2 * 65536; value += 2)
+    bitmap.add(value);
+  bitmap.addRange(2 * 65536, 3 * 65536);
+  REQUIRE(bitmap.runOptimize());
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<std::vector<uint8_t>> candidates;
+  for (size_t length = 0; length <= serial.size(); ++length)
+    if (length < 80 || length + 80 > serial.size() || length % 251 == 0)
+      candidates.emplace_back(serial.begin(), serial.begin() + length);
+  candidates.push_back(serial);
+  candidates.back()[0] ^= 1;
+  // The format without run containers, with a bit set above the cookie's low half.
+  roaring::Roaring arrays;
+  arrays.add(1);
+  candidates.emplace_back(arrays.getSizeInBytes());
+  REQUIRE(arrays.write(reinterpret_cast<char*>(candidates.back().data())) ==
+          candidates.back().size());
+  candidates.back()[2] = 1;
+  candidates.emplace_back();
+  push_u32_le(candidates.back(), 12346);
+  push_u32_le(candidates.back(), 65537);
+  for (uint32_t i = 0; i < 65537; ++i)
+    push_u32_le(candidates.back(), i & 0xffff);
+  candidates.back().resize(candidates.back().size() + 65537 * 6);
+
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  auto const retained = bitmap.cardinality() * sizeof(int64_t);
+  std::array scans{scan_envelope{{{{0, 0, 0}, retained}}, {}, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, retained);
+  auto permit    = ledger.acquire_permit({1, 1});
+  auto allocator = ledger.allocator(permit);
+  size_t valid   = 0;
+  for (auto const& bytes : candidates) {
+    CAPTURE(bytes.size());
+    auto const size = roaring::api::roaring_bitmap_portable_deserialize_size(
+      reinterpret_cast<char const*>(bytes.data()), bytes.size());
+    std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    checksummed.insert(checksummed.end(), bytes.begin(), bytes.end());
+    std::vector<uint8_t> blob;
+    push_u32_be(blob, checksummed.size());
+    blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+    push_u32_be(blob, crc32_of(checksummed));
+    if (size) {
+      REQUIRE(size == bytes.size());
+      CHECK(decode_deletion_vector_payload(blob, allocator)->positions().size() ==
+            bitmap.cardinality());
+      ++valid;
+    } else {
+      CHECK_THROWS_WITH(decode_deletion_vector_payload(blob, allocator),
+                        Catch::Matchers::ContainsSubstring("no valid portable-Roaring bitmap"));
+    }
+  }
+  CHECK(valid == 1);
 }
 
 namespace {

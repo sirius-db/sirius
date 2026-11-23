@@ -73,7 +73,7 @@ class positional_delete_filter : public iceberg_delete_filter {
   [[nodiscard]] bool affects(batch_layout layout) const;
 
  private:
-  [[nodiscard]] std::span<int64_t const> positions_for(std::string const& path) const;
+  [[nodiscard]] block_span<int64_t const> positions_for(std::string const& path) const;
   iceberg_delete_sets _delete_sets;
 };
 

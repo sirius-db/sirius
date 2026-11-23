@@ -928,7 +928,7 @@ void append_lineage_virtual_columns(owning_table_view& table,
 void apply_lineage_visibility(
   owning_table_view& table,
   row_lineage& lineage,
-  std::function<std::span<int64_t const>(std::string const&)> const& lookup,
+  std::function<block_span<int64_t const>(std::string const&)> const& lookup,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {

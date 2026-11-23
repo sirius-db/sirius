@@ -1129,9 +1129,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
       apply_lineage_visibility(
         decoded.batch.table,
         decoded.lineage,
-        [&](auto const& file) -> std::span<int64_t const> {
+        [&](auto const& file) -> block_span<int64_t const> {
           return file == "A" ? test.inputs.visibility[0].owner->positions
-                             : std::span<int64_t const>{};
+                             : block_span<int64_t const>{};
         },
         s,
         resource);

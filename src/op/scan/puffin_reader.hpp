@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "op/scan/block_span.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 
@@ -46,6 +47,13 @@ class puffin_byte_source {
   virtual bool seek(std::streamoff offset)            = 0;
   virtual bool read(std::span<std::byte> destination) = 0;
   [[nodiscard]] virtual std::streamoff size() const   = 0;
+  /// Fills the destinations in order from the current offset, as one read() of their total.
+  virtual bool readv(std::span<std::span<std::byte> const> destinations)
+  {
+    for (auto destination : destinations)
+      if (!read(destination)) return false;
+    return true;
+  }
 };
 
 std::unique_ptr<puffin_byte_source> make_puffin_byte_source(
@@ -117,16 +125,16 @@ struct deletion_vector_decode_limits {
 // or manifest. Only the decoder constructs it; consumers get immutable positions.
 class decoded_delete_positions {
  public:
-  std::span<int64_t const> positions() const noexcept { return positions_; }
+  block_span<int64_t const> positions() const noexcept { return positions_; }
   decoded_delete_positions(decoded_delete_positions const&)            = delete;
   decoded_delete_positions& operator=(decoded_delete_positions const&) = delete;
 
  private:
   friend std::shared_ptr<decoded_delete_positions const> decode_deletion_vector_payload(
     std::span<uint8_t const>, scan_manager::charging_allocator&, deletion_vector_decode_limits);
-  decoded_delete_positions(scan_manager::charged_block backing, size_t count);
-  scan_manager::charged_block backing_;
-  std::span<int64_t const> positions_;
+  decoded_delete_positions(scan_manager::charged_blocks backing, size_t count);
+  scan_manager::charged_blocks backing_;
+  block_span<int64_t const> positions_;
 };
 
 // Decode one already acquired, bounded deletion-vector-v1 payload (bare or a

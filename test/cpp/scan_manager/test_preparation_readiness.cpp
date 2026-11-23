@@ -1027,8 +1027,8 @@ TEST_CASE(
     return preparation_coordinator::job{
       [&, id, permit] {
         auto allocator = ledger.allocator(*permit);
-        auto positions = allocator.allocate_retained(16);
-        auto* data     = reinterpret_cast<int64_t*>(positions.data());
+        auto positions = allocator.allocate_retained_blocks(16);
+        auto* data     = reinterpret_cast<int64_t*>(positions.blocks().front());
         data[0]        = 1;
         data[1]        = 3;
         auto set       = std::make_shared<sirius::op::scan::iceberg_delete_set const>(

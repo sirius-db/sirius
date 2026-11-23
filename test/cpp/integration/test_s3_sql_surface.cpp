@@ -4631,6 +4631,7 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   require_query_ok(con, "LOAD avro");
   require_query_ok(con, "LOAD iceberg");
   require_query_ok(con, "SET unsafe_enable_version_guessing=true");
+  auto const table = std::string(GENERATE("dv_bounded", "dv_two_blocks"));
 
   sirius::test::scratch_dir local_directory("s3_dv_cpu_reference");
   sirius::test::scratch_dir remote_directory("s3_dv_remote_reference");
@@ -4660,8 +4661,8 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   generate(local_directory.path(), "");
   generate(remote_directory.path(), remote);
 
-  auto const local        = local_directory.path() / "dv_bounded";
-  auto const remote_local = remote_directory.path() / "dv_bounded";
+  auto const local        = local_directory.path() / table;
+  auto const remote_local = remote_directory.path() / table;
   for (auto const& entry : fs::recursive_directory_iterator(remote_local)) {
     if (!entry.is_regular_file()) continue;
     auto relative = fs::relative(entry.path(), remote_directory.path());
@@ -4690,13 +4691,21 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   auto counters         = context.physical_counters();
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
   provider->grant_bytes = 1024 * 1024;
-  bool deferred_route   = false;
+  if (table == "dv_two_blocks") {
+    // 140,000 deleted positions and a 21 KB blob, in 4 KiB blocks with gaps between them: the
+    // blob arrives through one vectored remote read into several blocks.
+    provider->grant_bytes          = 8 * 1024 * 1024;
+    provider->quantum              = 4096;
+    provider->seen->scatter_blocks = true;
+  }
+  bool deferred_route = false;
   std::string opened_path;
   struct reset_hooks {
     std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
     ~reset_hooks()
     {
       counters->preparation_provider_for_testing.reset();
+      counters->statement_dv_limit_for_testing.reset();
       counters->iceberg_preparation_route_for_testing = {};
       counters->iceberg_dv_phase_for_testing          = {};
     }
@@ -4712,14 +4721,29 @@ TEST_CASE("S3 remote Puffin deferred route matches an independent local CPU refe
   set_gpu_execution(con, true);
   require_query_ok(con, "SET enable_duckdb_fallback=false");
   auto remote_sql = "SELECT fruit, count FROM iceberg_scan(" +
-                    sql_quote(remote + "/dv_bounded/metadata/v1.metadata.json") +
+                    sql_quote(remote + "/" + table + "/metadata/v1.metadata.json") +
                     ", snapshot_from_id=" + std::to_string(snapshot) + ")";
   auto remote_result = con.Query(remote_sql);
   REQUIRE(remote_result);
   REQUIRE_FALSE(remote_result->HasError());
   CHECK(collect_rows(*remote_result) == expected);
   CHECK(deferred_route);
-  CHECK(opened_path == remote + "/dv_bounded/data/a.puffin");
+  CHECK(opened_path == remote + "/" + table + "/data/a.puffin");
+  if (table != "dv_two_blocks") return;
+
+  // The statement ceiling counts the manifest's 140,000 positions. One below it, the remote
+  // scan is refused at planning, before its Puffin object is opened.
+  counters->statement_dv_limit_for_testing = 139'999;
+  opened_path.clear();
+  auto const reason =
+    static_cast<size_t>(sirius::op::scan::verdict_reason::iceberg_puffin_remote_eager);
+  auto const before = context.get_transparent_execution_stats();
+  auto refused      = con.Query(remote_sql);
+  REQUIRE(refused);
+  CHECK(refused->HasError());
+  CHECK(context.get_transparent_execution_stats().semantic_declines[reason] ==
+        before.semantic_declines[reason] + 1);
+  CHECK(opened_path.empty());
 }
 
 TEST_CASE("S3 mapped Parquet normalizes IDs on the bulk reader",

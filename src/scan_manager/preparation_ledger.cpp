@@ -69,6 +69,16 @@ class host_backing final : public reservation_backing {
               cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>(
               std::move(blocks))};
   }
+  backing_blocks allocate_blocks(uint64_t bytes) override
+  {
+    auto blocks   = resource_->allocate_multiple_blocks(bytes, reservation_.get());
+    auto pointers = blocks->get_blocks();
+    return {{pointers.begin(), pointers.end()},
+            resource_->get_block_size(),
+            std::shared_ptr<
+              cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>(
+              std::move(blocks))};
+  }
 
  private:
   std::shared_ptr<void> lifetime_;
@@ -174,10 +184,10 @@ struct allocation_owner {
   unit_key key;
   uint64_t charge;
   bool retained;
-  backing_allocation allocation;
+  std::shared_ptr<void> backing;
   ~allocation_owner()
   {
-    allocation.owner.reset();  // Free physical backing before returning credit.
+    backing.reset();  // Free physical backing before returning credit.
     std::lock_guard lock(ledger->mutex);
     if (retained) {
       ledger->retained -= charge;
@@ -374,12 +384,47 @@ charging_allocator preparation_ledger::allocator(w_permit const& permit)
     throw std::invalid_argument("foreign or empty temporary-memory permit");
   return charging_allocator(permit.state_);
 }
-charged_block charging_allocator::allocate(uint64_t bytes) { return allocate_impl(bytes, false); }
+charged_block charging_allocator::allocate(uint64_t bytes)
+{
+  return allocate_impl<charged_block>(bytes, false);
+}
 charged_block charging_allocator::allocate_retained(uint64_t bytes)
 {
-  return allocate_impl(bytes, true);
+  return allocate_impl<charged_block>(bytes, true);
 }
-charged_block charging_allocator::allocate_impl(uint64_t bytes, bool retained)
+charged_blocks charging_allocator::allocate_blocks(uint64_t bytes)
+{
+  return allocate_impl<charged_blocks>(bytes, false);
+}
+charged_blocks charging_allocator::allocate_retained_blocks(uint64_t bytes)
+{
+  return allocate_impl<charged_blocks>(bytes, true);
+}
+std::shared_ptr<void> charging_allocator::acquire(reservation_backing& backing,
+                                                  uint64_t bytes,
+                                                  charged_block& block)
+{
+  auto allocation = backing.allocate(bytes);
+  if (!allocation.owner || !allocation.data) throw std::bad_alloc();
+  block.data_ = allocation.data;
+  return std::move(allocation.owner);
+}
+std::shared_ptr<void> charging_allocator::acquire(reservation_backing& backing,
+                                                  uint64_t bytes,
+                                                  charged_blocks& block)
+{
+  auto allocation = backing.allocate_blocks(bytes);
+  auto const size = allocation.block_size;
+  if (!allocation.owner || !size || allocation.blocks.size() < bytes / size + (bytes % size != 0) ||
+      std::find(allocation.blocks.begin(), allocation.blocks.end(), nullptr) !=
+        allocation.blocks.end())
+    throw std::bad_alloc();
+  block.blocks_     = std::move(allocation.blocks);
+  block.block_size_ = size;
+  return std::move(allocation.owner);
+}
+template <typename Block>
+Block charging_allocator::allocate_impl(uint64_t bytes, bool retained)
 {
   auto permit = state_.lock();
   if (!permit) throw std::logic_error("released temporary-memory permit");
@@ -411,17 +456,15 @@ charged_block charging_allocator::allocate_impl(uint64_t bytes, bool retained)
       permit->temporary += charge;
   }
   try {
-    auto allocation = ledger->grant->handle->allocate(bytes);
-    if (!allocation.owner || !allocation.data) throw std::bad_alloc();
-    auto owner        = std::make_shared<allocation_owner>();
-    owner->ledger     = ledger;
-    owner->permit     = retained ? nullptr : permit;
-    owner->key        = permit->key;
-    owner->charge     = charge;
-    owner->retained   = retained;
-    owner->allocation = std::move(allocation);
-    charged_block block;
-    block.data_     = owner->allocation.data;
+    Block block;
+    auto backing    = acquire(*ledger->grant->handle, bytes, block);
+    auto owner      = std::make_shared<allocation_owner>();
+    owner->ledger   = ledger;
+    owner->permit   = retained ? nullptr : permit;
+    owner->key      = permit->key;
+    owner->charge   = charge;
+    owner->retained = retained;
+    owner->backing  = std::move(backing);
     block.size_     = bytes;
     block.retained_ = retained;
     block.owner_    = std::move(owner);
