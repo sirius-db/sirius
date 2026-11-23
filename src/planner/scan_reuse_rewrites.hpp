@@ -27,8 +27,9 @@ class LogicalOperator;
 
 namespace sirius::planner {
 
-/// @brief Rewrites Sirius's copy of DuckDB's optimized plan to reuse a grouped SUM from an IN subquery.
-/// 
+/// @brief Rewrites Sirius's copy of DuckDB's optimized plan to reuse a grouped SUM from an IN
+/// subquery.
+///
 /// The SQL below illustrates the equivalent plan shapes:
 /// @code{.sql}
 /// -- BEFORE: scan lineitem in both the outer query and the IN subquery.

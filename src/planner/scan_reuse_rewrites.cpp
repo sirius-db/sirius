@@ -58,7 +58,9 @@ using duckdb::unique_ptr;
 
 template <std::ranges::input_range Range, class Value>
 bool contains(Range const& range, Value const& value)
-{ return std::ranges::find(range, value) != std::ranges::end(range); }
+{
+  return std::ranges::find(range, value) != std::ranges::end(range);
+}
 
 /// A plain column reference of this query level (depth 0), else nullopt.
 std::optional<ColumnBinding> column_ref(Expression const& expression)
