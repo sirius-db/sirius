@@ -67,8 +67,8 @@ namespace {
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved. If
-// from_duckdb declines an unsupported shape (e.g. an ORDER BY aggregate rewritten
-// to arg_max_null / create_sort_key), it returns null — which the downstream
+// from_duckdb declines an unsupported shape (e.g. a create_sort_key the ordered-first
+// decode left in an aggregate's input), it returns null — which the downstream
 // aggregate/projection operators cannot represent. Rather than build a GPU plan
 // containing null nodes (which crashes at execution time), throw here so the
 // query falls back to DuckDB's CPU execution.
@@ -209,11 +209,18 @@ bool is_first(duckdb::BoundAggregateExpression const& aggregate)
          sirius::aggregate_id::first;
 }
 
-// Matched by name only: create_sort_key returns BIGINT or BLOB. An arg_min_null with its own ORDER
-// BY, which breaks ties on the sort key, is not a decodable FIRST.
-bool is_unordered_arg_min_null(duckdb::BoundAggregateExpression const& aggregate)
+bool is_arg_max_null(duckdb::BoundAggregateExpression const& aggregate)
 {
-  return aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" &&
+  return aggregate.Function().GetName().GetIdentifierName() == "arg_max_null";
+}
+
+// DuckDB rewrites first(v ORDER BY ...) to arg_min_null(v, sort_key) and last(v ORDER BY ...) to
+// arg_max_null(v, sort_key). Matched by name only: create_sort_key returns BIGINT or BLOB. One with
+// its own ORDER BY, which breaks ties on the sort key, is not a decodable FIRST.
+bool is_unordered_arg_min_or_max_null(duckdb::BoundAggregateExpression const& aggregate)
+{
+  return (aggregate.Function().GetName().GetIdentifierName() == "arg_min_null" ||
+          is_arg_max_null(aggregate)) &&
          aggregate.GetChildren().size() == 2 && !aggregate.GetOrderBys();
 }
 
@@ -249,9 +256,10 @@ std::size_t count_references(duckdb::Expression const& expression, duckdb::idx_t
   return count;
 }
 
-// DuckDB's common-subexpression pass moves a create_sort_key that several ordered FIRSTs share
-// into the projection below, leaving arg_min_null(v, #i). When only such aggregates read #i, puts
-// the sort key back inline over key columns: #i becomes the first key, the others are appended.
+// DuckDB's common-subexpression pass moves a create_sort_key that several ordered FIRSTs or LASTs
+// share into the projection below, leaving arg_min_null(v, #i) or arg_max_null(v, #i). When only
+// such aggregates read #i, puts the sort key back inline over key columns: #i becomes the first
+// key, the others are appended.
 void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
 {
   if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) { return; }
@@ -260,7 +268,7 @@ void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
   std::map<duckdb::idx_t, std::vector<duckdb::BoundAggregateExpression*>> readers;
   for (auto& expression : op.expressions) {
     auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (!is_unordered_arg_min_null(aggregate)) { continue; }
+    if (!is_unordered_arg_min_or_max_null(aggregate)) { continue; }
     auto const& key = *aggregate.GetChildren()[1];
     if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const index = key.Cast<duckdb::BoundReferenceExpression>().Index();
@@ -303,19 +311,31 @@ void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
 
 // Rebuilds DuckDB's rewrite of first(v ORDER BY k1 m1, ...), arg_min_null(v, create_sort_key(k1,
 // 'm1', ...)), as that first. The sort key is never NULL and orders rows as the ORDER BY does.
-// Other expressions are left alone.
+// arg_max_null becomes a first under the reverse of every direction and NULL placement. Other
+// expressions are left alone.
 void decode_ordered_first(duckdb::ClientContext& context,
                           duckdb::unique_ptr<duckdb::Expression>& expression)
 {
   auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
   auto& children  = aggregate.GetChildrenMutable();
-  if (!is_unordered_arg_min_null(aggregate) || !is_decodable_sort_key(*children[1])) { return; }
-  auto& terms = children[1]->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+  if (!is_unordered_arg_min_or_max_null(aggregate) || !is_decodable_sort_key(*children[1])) {
+    return;
+  }
+  auto& terms        = children[1]->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+  bool const reverse = is_arg_max_null(aggregate);
 
   auto order_bys = duckdb::make_uniq<duckdb::BoundOrderModifier>();
   for (std::size_t i = 0; i < terms.size(); i += 2) {
-    auto const modifiers = duckdb::OrderModifiers::Parse(
+    auto modifiers = duckdb::OrderModifiers::Parse(
       terms[i + 1]->Cast<duckdb::BoundConstantExpression>().GetValue().ToString());
+    if (reverse) {
+      modifiers.order_type = modifiers.order_type == duckdb::OrderType::ASCENDING
+                               ? duckdb::OrderType::DESCENDING
+                               : duckdb::OrderType::ASCENDING;
+      modifiers.null_type  = modifiers.null_type == duckdb::OrderByNullType::NULLS_FIRST
+                               ? duckdb::OrderByNullType::NULLS_LAST
+                               : duckdb::OrderByNullType::NULLS_FIRST;
+    }
     order_bys->orders.emplace_back(modifiers.order_type, modifiers.null_type, std::move(terms[i]));
   }
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> value;
