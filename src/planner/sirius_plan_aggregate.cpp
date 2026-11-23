@@ -342,10 +342,11 @@ void decode_ordered_first(duckdb::ClientContext& context,
   value.push_back(std::move(children[0]));
   auto const value_type = value[0]->GetReturnType();
   duckdb::FunctionBinder binder(context);
+  // DISTINCT never changes the row first picks, so the first is bound without it.
   auto first = binder.BindAggregateFunction(duckdb::FirstFunctionGetter::GetFunction(value_type),
                                             std::move(value),
                                             std::move(aggregate.GetFilterMutable()),
-                                            aggregate.GetAggregateType());
+                                            duckdb::AggregateType::NON_DISTINCT);
   first->GetOrderBysMutable() = std::move(order_bys);
   first->SetAlias(aggregate.GetAlias());
   first->SetQueryLocation(aggregate.GetQueryLocation());
