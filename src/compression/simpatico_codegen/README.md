@@ -281,7 +281,8 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 
 `SIMPATICO_CODEGEN_BACKEND=meld` compiles plain decoders of bitpack, FOR, zigzag and raw
 trees with Meld instead of NVRTC; everything else stays with NVRTC. `shadow` runs both and
-throws where they differ, synchronizing on each decode. Build with Meld beside Sirius:
+compares them on the decode's stream without waiting; the session's `finish()` throws where they
+differ. Build with Meld beside Sirius:
 
 ```bash
 pixi run make release-meld

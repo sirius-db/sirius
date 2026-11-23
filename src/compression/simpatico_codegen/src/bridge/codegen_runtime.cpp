@@ -815,7 +815,43 @@ void launch_meld_decode(simpatico::meld::DecodeKernel const& decoder,
                                "simpatico decode: cuLaunchKernel (meld)");
 }
 
-// Synchronizes the stream; throws at the first row that differs from `out`.
+// The record simpatico_first_mismatch writes.
+struct mismatch_record {
+  std::uint64_t first;
+  std::array<std::uint64_t, 2> nvrtc;
+  std::array<std::uint64_t, 2> meld;
+};
+static_assert(sizeof(mismatch_record) == 5 * sizeof(std::uint64_t));
+
+// Pinned, so the copy into a record stays asynchronous. Never released, since releasing pinned
+// memory waits for the device; a record returns to the pool once its frame no longer holds it.
+std::shared_ptr<mismatch_record> pinned_mismatch_record()
+{
+  struct pool {
+    std::mutex mu;
+    std::vector<mismatch_record*> free;
+  };
+  static auto* const records = new pool;
+  std::lock_guard lock(records->mu);
+  if (records->free.empty()) {
+    constexpr std::size_t kSlabRecords = 256;
+    void* slab                         = nullptr;
+    simpatico::throw_if_cuda_error(
+      cudaHostAlloc(&slab, kSlabRecords * sizeof(mismatch_record), cudaHostAllocPortable),
+      "simpatico decode: shadow record allocation");
+    for (std::size_t i = 0; i < kSlabRecords; ++i)
+      records->free.push_back(static_cast<mismatch_record*>(slab) + i);
+  }
+  auto* const record = records->free.back();
+  records->free.pop_back();
+  return {record, [](mismatch_record* released) {
+            std::lock_guard lock(records->mu);
+            records->free.push_back(released);
+          }};
+}
+
+// Queues Meld's decode beside `out` and their comparison without waiting; the session's finish()
+// throws at the first row that differs.
 void shadow_meld_decode(simpatico::meld::DecodeKernel const& decoder,
                         std::size_t element_size,
                         jit::LabeledBuffers const& persisted,
@@ -831,38 +867,32 @@ void shadow_meld_decode(simpatico::meld::DecodeKernel const& decoder,
   launch_meld_decode(decoder, persisted, transients, num_chunks, num_rows, shadow.data(), frame);
 
   auto const stream = frame.stream().get();
-  rmm::device_buffer first(sizeof(std::uint64_t), frame.stream(), frame.mr());
+  rmm::device_buffer device_record(sizeof(mismatch_record), frame.stream(), frame.mr());
   simpatico::throw_if_cuda_error(
-    static_cast<cudaError_t>(simpatico_first_mismatch(
-      out, shadow.data(), static_cast<std::size_t>(num_rows), element_size, first.data(), stream)),
+    static_cast<cudaError_t>(simpatico_first_mismatch(out,
+                                                      shadow.data(),
+                                                      static_cast<std::size_t>(num_rows),
+                                                      element_size,
+                                                      device_record.data(),
+                                                      stream)),
     "simpatico decode: shadow compare");
-  std::uint64_t mismatch_index = 0;
+  // The frame holds the record before the copy into it is queued, until the stream has drained.
+  auto record = pinned_mismatch_record();
+  frame.check_on_completion([record, element_size, num_rows, kernel = decoder.kernel] {
+    if (record->first == static_cast<std::uint64_t>(num_rows)) return;
+    auto const hex = [&](std::array<std::uint64_t, 2> const& words) {
+      return element_size == 16 ? std::format("{:#018x}{:016x}", words[1], words[0])
+                                : std::format("{:#0{}x}", words[0], 2 + 2 * element_size);
+    };
+    throw std::runtime_error("simpatico decode: shadow mismatch at row " +
+                             std::to_string(record->first) + " of " + std::to_string(num_rows) +
+                             ": nvrtc " + hex(record->nvrtc) + ", meld " + hex(record->meld) +
+                             "; scheme:\n" + kernel->rendered_source);
+  });
   simpatico::throw_if_cuda_error(
     cudaMemcpyAsync(
-      &mismatch_index, first.data(), sizeof(mismatch_index), cudaMemcpyDeviceToHost, stream),
+      record.get(), device_record.data(), sizeof(mismatch_record), cudaMemcpyDeviceToHost, stream),
     "simpatico decode: shadow compare copy");
-  simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream),
-                                 "simpatico decode: shadow synchronize");
-  if (mismatch_index == static_cast<std::uint64_t>(num_rows)) return;
-
-  auto mismatch_value = [&](void const* column) {
-    std::array<std::uint64_t, 2> words{};
-    simpatico::throw_if_cuda_error(
-      cudaMemcpyAsync(words.data(),
-                      static_cast<unsigned char const*>(column) + mismatch_index * element_size,
-                      element_size,
-                      cudaMemcpyDeviceToHost,
-                      stream),
-      "simpatico decode: shadow mismatch copy");
-    simpatico::throw_if_cuda_error(cudaStreamSynchronize(stream),
-                                   "simpatico decode: shadow synchronize");
-    return element_size == 16 ? std::format("{:#018x}{:016x}", words[1], words[0])
-                              : std::format("{:#0{}x}", words[0], 2 + 2 * element_size);
-  };
-  throw std::runtime_error(
-    "simpatico decode: shadow mismatch at row " + std::to_string(mismatch_index) + " of " +
-    std::to_string(num_rows) + ": nvrtc " + mismatch_value(out) + ", meld " +
-    mismatch_value(shadow.data()) + "; scheme:\n" + decoder.kernel->rendered_source);
 }
 
 // Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`

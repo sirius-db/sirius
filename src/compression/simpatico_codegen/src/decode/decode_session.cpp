@@ -51,6 +51,11 @@ void decode_frame::keep_kernel(std::shared_ptr<codegen::jit::CompiledKernel cons
   }
 }
 
+void decode_frame::check_on_completion(std::function<void()> check)
+{
+  checks_.push_back(std::move(check));
+}
+
 std::span<std::byte> decode_frame::host_bytes(std::size_t bytes)
 {
   // Byte-array allocation supplies fundamental alignment and implicit-lifetime storage for T.
@@ -210,6 +215,9 @@ std::vector<std::unique_ptr<cudf::column>> decode_session::finish()
   state_->check_open();
   state_->open = false;
   throw_if_cuda_error(state_->drain(), "simpatico decode completion");
+  for (auto const& item : state_->requests)
+    for (auto const& check : item.frame.checks_)
+      check();
   state_->requests.clear();
   return std::move(state_->results);
 }

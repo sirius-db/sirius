@@ -10,6 +10,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -259,35 +260,43 @@ void test_first_mismatch()
   constexpr std::size_t kRows = 3'000'000;
   for (std::size_t const width : {1, 2, 4, 8, 16}) {
     auto const bytes = kRows * width;
-    void *a = nullptr, *b = nullptr, *first = nullptr;
+    void *a = nullptr, *b = nullptr, *record = nullptr;
     codegen_test::rt_check(cudaMalloc(&a, bytes), "cudaMalloc(a)");
     codegen_test::rt_check(cudaMalloc(&b, bytes), "cudaMalloc(b)");
-    codegen_test::rt_check(cudaMalloc(&first, sizeof(std::uint64_t)), "cudaMalloc(first)");
+    codegen_test::rt_check(cudaMalloc(&record, 5 * sizeof(std::uint64_t)), "cudaMalloc(record)");
     codegen_test::rt_check(cudaMemset(a, 0, bytes), "cudaMemset(a)");
     codegen_test::rt_check(cudaMemset(b, 0, bytes), "cudaMemset(b)");
-    auto first_of = [&] {
+    // The first differing row, then that row of a and of b.
+    auto record_of = [&](std::size_t rows) {
       codegen_test::rt_check(
-        static_cast<cudaError_t>(simpatico_first_mismatch(a, b, kRows, width, first, nullptr)),
+        static_cast<cudaError_t>(simpatico_first_mismatch(a, b, rows, width, record, nullptr)),
         "simpatico_first_mismatch");
-      std::uint64_t row = 0;
-      codegen_test::rt_check(cudaMemcpy(&row, first, sizeof(row), cudaMemcpyDeviceToHost),
-                             "cudaMemcpy(first)");
-      return row;
+      std::array<std::uint64_t, 5> words{};
+      codegen_test::rt_check(
+        cudaMemcpy(words.data(), record, sizeof(words), cudaMemcpyDeviceToHost),
+        "cudaMemcpy(record)");
+      return words;
     };
     auto const label = std::to_string(width) + "-byte rows: ";
-    expect(first_of() == kRows, label + "equal columns differ");
+    expect(record_of(kRows)[0] == kRows, label + "equal columns differ");
     // In each row's last byte, the high word of a 16-byte row.
     for (std::size_t const row : {kRows - 1, std::size_t{1'700'000}}) {
       codegen_test::rt_check(
         cudaMemset(static_cast<unsigned char*>(b) + row * width + width - 1, 1, 1),
         "cudaMemset(b row)");
     }
-    expect(first_of() == 1'700'000, label + "wrong first differing row");
+    auto const last_byte = std::uint64_t{1} << (8 * ((width - 1) % 8));
+    auto const found     = record_of(kRows);
+    expect(found[0] == 1'700'000, label + "wrong first differing row");
+    expect(found[1] == 0 && found[2] == 0, label + "wrong value of a at the differing row");
+    expect(found[width == 16 ? 4 : 3] == last_byte && found[width == 16 ? 3 : 4] == 0,
+           label + "wrong value of b at the differing row");
     codegen_test::rt_check(cudaMemset(b, 1, 1), "cudaMemset(b row 0)");
-    expect(first_of() == 0, label + "row 0 not found first");
+    expect(record_of(kRows)[0] == 0, label + "row 0 not found first");
+    expect(record_of(0)[0] == 0, label + "empty columns differ");
     cudaFree(a);
     cudaFree(b);
-    cudaFree(first);
+    cudaFree(record);
   }
 }
 
