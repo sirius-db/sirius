@@ -1973,6 +1973,43 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
   REQUIRE(out2->num_rows() == 2);
 }
 
+TEST_CASE("a filter's static keep estimate lets a later filter that removes little be skipped",
+          "[dynamic_filter][scan_merge]")
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+
+  // The first filter keeps rows 0..9. The second keeps rows 9..99 (the second column is reversed).
+  // The estimates are the share of each key domain the build covers.
+  auto first  = make_in_list_prefix(10, stream);
+  auto second = make_in_list_prefix(91, stream);
+  first->set_estimated_selectivity(0.10);
+  second->set_estimated_selectivity(0.91);
+  auto filters = std::make_shared<sirius_dynamic_filter_set>();
+  dynamic_filter_consumer consumer(
+    filters, {.mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS}, {});
+  auto& gate    = consumer_test_access::gate(consumer);
+  auto producer = filters->register_producer({0, 1});
+  REQUIRE(producer.push_filter(0, first));
+  REQUIRE(producer.push_filter(1, second));
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_sequence_column<int64_t>(100, stream));
+  columns.push_back(make_sequence_column<int64_t>(100, stream, 99, -1));
+  auto table = std::make_shared<cudf::table>(std::move(columns));
+
+  // After the first filter the second would remove at most 9% of the batch, which a probe over
+  // every row does not repay, so it is skipped before anything is measured.
+  auto out = apply_consumer(consumer, table, stream);
+  stream.sync();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 10);
+
+  // The batch applied only the first filter, so it must not stand as the channel's combined sample:
+  // a partial sample that keeps every row could disable a channel whose skipped filter was never
+  // tested.
+  CHECK(gate_test_access::needs_combined_sample(gate, filters->snapshot()));
+}
+
 TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
           "[dynamic_filter][scan_merge]")
 {

@@ -31,6 +31,7 @@
 #include "planner/query.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -45,6 +46,19 @@
 
 namespace sirius {
 namespace pipeline {
+
+std::vector<int> gpu_executor_cpu_affinity(std::vector<int> const& local_cores,
+                                           std::vector<int> const& pool_affinity)
+{
+  if (pool_affinity.empty()) { return local_cores; }
+  std::vector<int> cores;
+  for (int const cpu : local_cores) {
+    if (std::find(pool_affinity.begin(), pool_affinity.end(), cpu) != pool_affinity.end()) {
+      cores.push_back(cpu);
+    }
+  }
+  return cores.empty() ? pool_affinity : cores;
+}
 
 task_scheduler::task_scheduler(
   sirius::exec::query_lifecycle_registry& lifecycle,
@@ -83,7 +97,12 @@ task_scheduler::task_scheduler(
                                return std::cmp_equal(dev.id, device_id);
                              });
 
-      if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
+      if (it != sys_topology->gpus.end()) {
+        // The pool's own affinity is a configured list, or the CPUs left after sirius_config
+        // reserved the REST reactors' CPUs.
+        config.cpu_affinity_list =
+          gpu_executor_cpu_affinity(it->cpu_cores, config.cpu_affinity_list);
+      }
     }
     // Find matching downgrade executor for this GPU space
     sirius::parallel::downgrade_executor* dg_exec = nullptr;
@@ -123,6 +142,13 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
       submission = begin_submission(
         _query_lifecycle, *task, "task_scheduler: query lifecycle registration is missing");
       if (!submission) { return; }
+    }
+    if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+      auto device = gpu_task->get_preferred_device_id();
+      if (device && *device != exec::no_preferred_device && !_gpu_executors.contains(*device))
+        throw transparent::classified_execution_error(
+          transparent::late_failure_cause::physical_input,
+          "GPU task requires a device without a configured executor");
     }
     if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_fsm().queued(

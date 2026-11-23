@@ -22,7 +22,8 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
+If no config file is found, Sirius uses built-in capacity budgets of 95% of GPU memory and 90% of each backing NUMA node's RAM for pinned host memory.
+Initial host pools target 10% of that node's RAM, capped by the host budget and rounded down to whole pools.
 
 ### Concurrent query admission
 
@@ -102,7 +103,7 @@ sirius:
       num_threads: 4
       backend: native
       uring_n_reactors: 4
-      cache: { mode: none, eviction: lru }
+      cache: { mode: cucs, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -114,7 +115,6 @@ sirius:
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
     enable_dynamic_filter_multi_partition: true   # Bloom accumulation for multi-partition builds
-    max_dynamic_filter_bloom_bytes_per_gpu: 256Mi  # accumulated Bloom arrays across keys, per GPU
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip all filters for keys meeting known-domain coverage
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
@@ -167,11 +167,11 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Must be greater than `downgrade_stop_fraction`. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start HOST memory reclamation above this fraction. Must be greater than `downgrade_stop_fraction`. File-cache reclaim needs no DISK tier and only frees cache memory above the prefetch reservation; spilling HOST repository data requires configured `downgrade_root_dirs`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
-| `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+| `initial_number_pools` | int | auto | When omitted, pre-allocate 10% of each backing NUMA node's total RAM, capped by host capacity and rounded down to whole pools (possibly zero). Requires discovered host RAM capacity. An explicit count overrides automatic sizing. Additional pools are created on demand. Initial host footprint = aligned `block_size × pool_size × initial_number_pools`. |
 
 ### Disk Memory (`sirius.memory.disk`)
 
@@ -185,19 +185,21 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 
 ### Input-table compression (`sirius.compression`)
 
-These settings control optional Simpatico compression when
-`pin_table` caches input tables. Prefer the per-call
-`CALL pin_table(..., compression => true)` argument to request compression for a specific pin.
-The settings below supply the default for calls that omit the argument and configure plan lookup
-and retention gates. Compression also requires a matching plan in `input_plan_dir`; otherwise the
-table is pinned uncompressed.
+Simpatico compression is enabled by default when `pin_table` caches input tables on
+the host or GPU. Use `CALL pin_table(..., compression => false)` to opt out for a specific
+pin, or `SET pin_table_compression = false` for the session default. Matching table plans
+in `input_plan_dir` override automatic selection; without one, a large enough table has each
+chunk's plans chosen from type and sample after carrier narrowing, favoring plans a filtered
+scan can decode in place (see [Compressed Pinning](compressed-pinning.md)). The size and actual
+compressed-footprint gates below still apply.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
-| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Default for `pin_table` calls that omit the `compression` argument. |
+| `enable_pin_table_compression` | `pin_table_compression` | bool | true | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
-| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
+| `min_table_device_fraction` | `pin_table_compression_min_table_device_fraction` | finite double >= 0 | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size (first chunk's bytes per row times the table's rows) is at least this fraction of the memory of the GPUs it pins to; store a smaller one uncompressed. Host pins and explicit table plans are not gated. `0` disables the gate. |
+| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Optional directory of per-table Simpatico plan overrides. An empty path or no readable, nonempty matching file selects plans automatically. A selected plan that does not cover the pinned columns leaves the pin raw. |
 
 The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
@@ -312,14 +314,17 @@ per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`
 The thread-pool sub-blocks use these common keys; pipeline affinity is the
 hardware-derived exception described below:
 
+In the default formulas, T counts logical CPU hardware threads and G counts configured GPUs.
+See [Thread Pool Configuration](#thread-pool-configuration) for rounding, limits, and examples.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is the selected GPU's local cores, within the pipeline pool's `cpu_affinity` when one is set. With `scan_manager.reserve_rest_reactor_cpus` (default), the pinned REST reactors' CPUs are removed from every pool. |
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`). Task creation
+Thread pool (fixed default `num_threads: 4`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
 on demand and prioritizes source-side pipelines first. The former
 `sirius.executor.task_creator.strategy` and
@@ -328,29 +333,51 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`). No extra keys.
+Thread pool only (default `num_threads: clamp(floor(3T/(8G)), 4, 8)` per GPU). No extra keys.
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 1`) plus:
+Thread pool (default `num_threads: clamp(floor(T/(8G)), 1, 4)`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
 
+HOST downgrade executors synchronously reclaim idle staging chunks from the default local
+ioctx's `fs_cache` before spilling repository batches or queued tasks. If a byte-target request
+is still short after those workers finish, a forced pass reclaims additional unpinned,
+non-loading chunks up to the remaining deficit, even if a future scan subscribes to them. That
+includes the chunks of a `pin_table(..., tier => 'parquet')` pin, whatever the eviction settings:
+the pin stays registered and later scans re-read those ranges from storage.
+Only bytes above the cache's prefetch reservation (`scan_manager.cache.min_prefetching_budget_fraction`
+of each HOST space) relieve HOST pressure: the executor reclaims and credits only those bytes,
+from its own NUMA space, so the cache keeps at least its reservation. The credit is a
+best-effort estimate: a concurrent cache evictor can return the overflow first, and the pass is
+then still credited up to its snapshot (see [Scan](scan.md#host-downgrade-reclaim)). Reclaim
+performs no disk writes
+and needs no DISK tier. Without DISK, a HOST executor has nothing to convert repository batches
+or queued tasks into, so it runs only the two cache passes. If its cache holds nothing above the
+reservation, it backs off like any other non-viable executor. If the cache holds overflow but a
+monitor request frees nothing (every chunk above the reservation is pinned by a reader or still
+loading), the monitor waits before its next request: the wait starts at `monitor_period` and
+doubles up to `max(monitor_period, 1 s)`. It resets as soon as a request frees memory or the
+pressure clears. GPU executors and routed remote ioctx caches do not participate. This adds no
+configuration keys.
+
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `tls/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer worker threads. |
+| `num_threads` | int (**> 0**) | max(18, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
+| `backend` | enum: `native` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`, including S3 listing and globs. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
+| `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
+| `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -383,7 +410,7 @@ A runtime budget additionally accounts for every backend touched by each split a
 queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
 routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
-Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
+Five optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
 ### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
@@ -401,84 +428,187 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
+| `n_max_concurrent_scans` | int (**>= 0**) | `pipeline.num_threads` | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it as the pipeline pool size (one scan per pipeline thread); under `opportunistic`, the default for local reads, the pipeline width is the budget the readahead schedules against. An explicit value wins, and an explicit `0` keeps the readahead off for local reads. An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 4 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `4` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 4 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
 | `range_batch_slices` | int (**>= 0**) | 8 | Most slices one queue entry holds when a host-only multi-range read (a whole-split prefetch, the DuckDB-native decoder's column-chunk set) is dispatched to the uring reactors: a local read does not prefer bulk I/O, so the read is queued as several entries of at most this many slices instead of one per reactor. Reads with a device destination are never split. `0` = no split. |
 
 Sirius rejects a negative `range_batch_slices` and a `slices_per_pass` outside 0..64 when it loads the config, naming the
 key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
 
-`uring.prefetch_reactors` is deprecated: the reactor priority tiers replaced prefetch-reactor partitioning, so the key is
-accepted and ignored with a warning, and will be removed.
-
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
-TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST backend consumes those values so signing
-and transport use one trust policy; there are no separate REST YAML controls.
+The native REST backend speaks HTTP/1.1 over io_uring; it does not use libcurl.
+HTTPS endpoints use kernel TLS (kTLS) when the kernel accepts the session keys
+and cuCascade's user-space TLS record layer otherwise. It requires Linux 6.1+ with
+usable io_uring, for plain HTTP endpoints too: a container seccomp policy or
+`kernel.io_uring_disabled` makes S3 unavailable, and there is no alternate
+transport. kTLS additionally needs the `tls` kernel module; without it,
+`tls.ktls: prefer` (the default) falls back to user space.
+
+TLS trust is supplied by the resolved `object_store_config`: its
+`ca_bundle_path` and `tls_verify` are applied to transport as well as signing.
+Set a private CA with `ca_bundle_path` through `sirius_config::set_object_store_config()`.
+A selected SQL secret keeps that path, but a secret cannot carry a CA itself.
+Alternatively, set `NIX_SSL_CERT_FILE` / `SSL_CERT_FILE` / `SSL_CERT_DIR` in the process
+environment; these apply when `ca_bundle_path` is empty. A usable `NIX_SSL_CERT_FILE`
+takes precedence over `SSL_CERT_FILE`. With neither an explicit CA nor usable
+process trust settings, trust falls back to the OpenSSL default store and system bundles.
+Certificate verification is controlled by `tls_verify`, or by `VERIFY_SSL` on a selected
+`SIRIUS_S3` secret. `scan_manager.object_store` and
+`rest.ca_bundle_path` / `rest.tls_verify` are not YAML-loadable and are rejected.
+The `rest.tls` block below controls protocol/offload policy only, not trust.
+
+Sirius sets no transport defaults of its own: every default below is cuCascade's
+`rest::config` default (the exceptions are `n_max_concurrent_scans`, `min_mtu` and
+`max_connections`, which Sirius derives). Each key is range-checked when the config loads, and the loaded block is then checked with
+cuCascade's own `rest::config::validate()`, so cross-field rules (`queue_depth`
+against `max_connections`, `max_segment_bytes` against `min_segment_bytes`, the TLS
+session-cache rule) fail at load time, naming the YAML key. Sirius hands the loaded
+`rest::config` to cuCascade inside a `rest_reactor::reactor_context`, which is
+non-copyable and shared by the pool's reactors through a `shared_ptr`.
+
+**Requests and retries**
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
-| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
-| `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
-| `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
-| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
-| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
-| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
-| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
-| `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
-| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
-| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
-| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `n_max_concurrent_scans` | int (**>= 0**) | max(8, 2 × `pipeline.num_threads`) | Readahead budget the REST backend publishes, which an unset `max_readahead_scans` defers to. Unset derives it from the pipeline pool, since several splits per pipeline thread give an object-store prefetch time to land; an explicit value wins. |
+| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-exchange timeout of one control-plane request (HEAD / LIST / footer probe / warm-up); retries can extend a call's total time. Also the base of the presigned-URL TTL (this value plus 60 s). `0` = no limit on control requests, and presigned URLs then live 300 s. Data GETs use the stall detector instead. |
+| `stall_speed_limit_bytes` | int (bytes/s, **>= 0**) | 65536 | Stall detector for data GETs: a transfer that received fewer than `stall_speed_limit_bytes` × `stall_time_s` bytes during the last `stall_time_s` seconds fails and is retried. `0` disables the detector. |
+| `stall_time_s` | int (seconds, **>= 0**) | 30 | Window of the stall detector; `0` disables it. |
+| `retry_backoff_base_ms` | int (ms, **>= 0**) | 50 | Base of the exponential backoff between retries. |
+| `retry_jitter_ms` | int (ms, **>= 0**) | 50 | Random jitter added to each retry backoff. |
+| `max_retry_attempts` | int (**>= 1**) | 10 | Attempt budget (the first attempt included) for transient transport failures and HTTP 408/429/500/502/503/504; `1` = no retry. |
+| `max_auth_retry_attempts` | int (**>= 1**) | 3 | Async data attempt budget for HTTP 403 (an expired presigned URL); each attempt re-authorizes. Kept low so a genuine AccessDenied fails fast. Control requests treat 403 as terminal. |
+| `honor_retry_after` | bool | true | Wait a numeric `Retry-After` instead of the backoff. |
+| `footer_probe_bytes` | bytes (**<= 1Gi**) | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
+| `list_max_matches` | int (**> 0**) | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
+| `list_max_scanned` | int (**> 0**) | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
-Two REST values are deliberately not YAML keys. **Connections per reactor** are
-fixed at 64 — the useful number is a property of one reactor thread, not of a
-deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread and connection pool. **Physical GET size** is reactor-owned:
-each reactor derives a target between 4 MiB and 16 MiB from the queued logical
-bytes and its currently free connections. Large contiguous requests are balanced
-under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
-cache-chunk boundaries so a chunk is never published before all of its bytes
-arrive.
+**Physical GET sizing**
 
-`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
-as prepared slices without forcing a static physical layout. Device operations
-allocate as many pinned CuCascade blocks as their selected physical range needs;
-those blocks stay owned through curl retries, the asynchronous H2D copy, and its
-CUDA completion event. Staging is therefore proportional to active device work
-instead of being reserved as one fixed bounce slot per connection.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `min_segment_bytes` | bytes (**> 0**) | 4Mi | Lower bound of the adaptive physical GET size. |
+| `max_segment_bytes` | bytes (**>= `min_segment_bytes`**) | 16Mi | Upper bound of the adaptive physical GET size. |
+| `merge_max_gap` | bytes | 512Ki | Logical cache/read-planner coalescing hint: the largest gap between two ranges still planned as one. `0` merges only adjacent ranges. It does not set physical GET segments. |
 
-### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
+Each reactor sizes a physical GET as its queued backlog divided by its free
+connections, clamped to [`min_segment_bytes`, `max_segment_bytes`]. Fragmented cache
+fills are grouped only at whole cache-chunk boundaries so a chunk is never published
+before all of its bytes arrive. Device reads stage through pinned CuCascade blocks that
+stay owned through retries, the asynchronous H2D copy and its CUDA completion event,
+so staging is proportional to the device work in flight.
 
-Used when `backend: kvikio` routes reads (local files and `s3://` objects)
-to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
-alone"** — kvikIO seeds each setting from an environment variable at first use, so
-omitting a key preserves that value and setting one overrides it.
+**Connection pool** (libcurl parity)
 
-**These are process-global.** Every key except `compat_mode` maps to a setter on
-kvikIO's `defaults` singleton, so the last context constructed wins and the
-setting is shared with every other kvikIO user in the process. Treat it as
-startup configuration. `compat_mode` is the exception: it rides the file-handle
-constructor, so it scopes to files this backend opens.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_connections` | int (**1..4096**) | 128 with kTLS loaded, 64 without | Keep-alive connections per reactor (one in-flight request each), not a process-wide cap. Unnamed, Sirius derives it from cuCascade's topology (`kernel_tls.loaded`), capped at half of `queue_depth` so a smaller named `queue_depth` stays valid; a named value wins. Past the point where the link is full, more connections only split the bandwidth into thinner streams; add reactors (`rest_n_reactors`) instead. |
+| `conn_max_age_s` | int (seconds, **>= 0**) | 20 | Idle cutoff of a pooled connection (curl's `CURLOPT_MAXAGE_CONN`): a connection idle for longer is closed and replaced when a request needs its slot, never in a sweep. Also the window in which the query-start warm-up skips a repeat of the bucket it warmed last (60 s when `0`). `0` = no idle cutoff. |
+| `upkeep_http1` | bool | false | Send idle upkeep: while a reactor is idle, one zero-key `ListObjectsV2` per established connection every `upkeep_interval_ms`, staggered across the interval, so the endpoint does not idle-close the pool. Off by default, as libcurl's upkeep is a no-op on HTTP/1.1. |
+| `upkeep_interval_ms` | int (ms, **>= 0**) | 15000 | Upkeep period; only acts with `upkeep_http1`. `0` disables upkeep. |
+| `connect_timeout_ms` | int (ms, **> 0**) | 3000 | Bound of one connection's TCP connect plus TLS handshake (curl's `CONNECTTIMEOUT`). |
+| `dns_ttl_s` | int (seconds, **> 0**) | 60 | DNS answer lifetime. Answers are refreshed ahead of expiry on a resolver thread shared by the pool, so a reactor never blocks on a lookup. IP literals bypass the resolver. |
+| `dns_accumulate` | bool | false | Union fresh answers with the previous ones (aged out after 5 minutes) instead of replacing them, so connections spread over more front-end addresses over time. |
+| `dns_max_addresses` | int (**1..4096**) | 64 | Addresses kept per host. |
+| `keepalive_idle_s` | int (seconds, **> 0**) | 60 | TCP keepalive (always on): idle time before the first probe. |
+| `keepalive_interval_s` | int (seconds, **> 0**) | 60 | TCP keepalive: time between probes. |
+| `keepalive_count` | int (**>= 0**) | 0 | TCP keepalive: probes before the connection is dropped; `0` = kernel default. |
+| `min_mtu` | bytes (**0..65607**) | the egress NIC's MTU when above 1500 (jumbo frames), else 0 | Reject connections whose effective MTU is below this many bytes. `0` = off. Unnamed, Sirius derives it from cuCascade's topology: the MTU of the egress NIC (`rest.interface`, else the default route's interface) when that is a jumbo-frame MTU, otherwise `0`; a named value, `0` included, wins. See below. |
+| `mtu_reject_max_attempts` | int (**>= 1**) | 8 | Consecutive `min_mtu` rejections of one request after which the connection is accepted anyway. |
+| `close_with_rst` | bool | true | Close every socket with an RST (`SO_LINGER {on, 0}`), so none lingers in `TIME_WAIT` / `FIN_WAIT`. |
 
-This backend runs without the prefetching cache and therefore without the
-readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
-`readahead_strategy` have no effect on it.
+At query start Sirius warms the REST pool of each bucket the query reads: every reactor
+sends one zero-key `ListObjectsV2` (`list-type=2&max-keys=0`) per idle connection slot,
+each on a fresh connection, so TCP, TLS and HTTP are validated and the pool is hot before
+the reads arrive. The suppression remembers only the last bucket warmed per REST context
+(one per resolved object-store configuration, so buckets that share credentials and endpoint
+share it): a repeat of that bucket within `conn_max_age_s` is skipped, but alternating buckets
+A, B, A warms A again. Warm-up failures are logged at debug level and never fail a read.
+Nothing else is sent while idle unless `upkeep_http1` is on, and nothing reconnects en masse
+(not after warm-up, not at a query's end, not on a DNS refresh).
 
-| Key | Type | Env default | Description |
-|-----|------|-------------|-------------|
-| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
-| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
-| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
-| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
-| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
-| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
-| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
-| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+`min_mtu` exists for jumbo-frame networks, where some connections of a pool may
+negotiate small TCP segments, which costs per-byte decryption time. Right after the TCP
+connect, the effective MTU is `TCP_MAXSEG` + 40 (IPv4) or 60 (IPv6) header bytes, + 12
+with TCP timestamps; a connection below `min_mtu` is reset and the next DNS address is
+tried, up to `mtu_reject_max_attempts` times per request, after which the connection is
+accepted. Unnamed, the check is on only for a jumbo-frame NIC, at that NIC's own MTU (for
+example 9000), and off for a standard-MTU NIC or without NIC information. The REST counters
+(`rest_ioctx::stats()`) report `mtu_rejects`, `mtu_fallbacks` and the smallest and largest MSS
+observed.
+
+**Transport and placement**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `receive_buffer_bytes` | bytes (**16Ki..4Mi**) | 256Ki | Per-connection header / scratch buffer and the cap of one direct body receive. |
+| `queue_depth` | int (**>= 2 × `max_connections`, <= 32768**) | 1024 | Submission-queue entries of each reactor's io_uring ring (one primary and one cancel entry per connection). Raise it with `max_connections` above 512. |
+| `wait_mode` | enum: `epoll`, `uring` | `epoll` | How an idle reactor blocks: `epoll_pwait2` over its wake-up eventfd, retry timer and ring fd, or one `io_uring_submit_and_wait_timeout` per pass. |
+| `iowq_max_unbound` | int (**>= 0**) | 0 | io-wq unbound-worker cap of each reactor's ring (used by kTLS receives placed on io-wq); `0` = kernel default. |
+| `fan_out` | int (**>= 1**) | 2 | Number of least-backlogged reactors one read is split across. With a positive `rest_n_reactors`, a value above it is rejected unless it is the default 2, which is clamped to a one-reactor pool; with `rest_n_reactors: 0` it is clamped to the NIC-sized pool. |
+| `interface` | string | "" | Egress interface whose queue IRQs size the pool when `rest_n_reactors: 0` and place (pin) its reactors; empty = the default route's interface. |
+| `pin_to_irq_cpus` | bool | true | Pin reactors to the NIC's IRQ CPUs when the IRQs are steered to a strict subset of the NIC node's cores. With a positive `rest_n_reactors` the configured count is pinned round-robin over those CPUs. Pinning leaves the reactors' scheduling class and nice value as inherited. |
+| `raise_reactor_priority` | bool | false | Opt-in: raise each pinned reactor to the highest priority the process may set (`SCHED_FIFO` where `CAP_SYS_NICE` or `RLIMIT_RTPRIO` permits, else the lowest permitted nice value). Unpinned reactors are never raised. Off by default because a `SCHED_FIFO` reactor can starve other work pinned to the same IRQ CPU, and the measured throughput gain is within noise. |
+
+The remaining `rest::config` fields — `max_recv_iovecs`, `recv_waitall`, `sqpoll`,
+`single_issuer`, `defer_taskrun`, `register_ring_fd`, `iowq_max_bound`,
+`copy_poll_interval`, `hold_slot_during_copy`, `so_rcvbuf`, `so_sndbuf`, `busy_poll_us`,
+`tcp_user_timeout_ms`, `footer_resolve_max_inflight` and `footer_resolve_stash_budget` —
+are not YAML-loadable and keep their cuCascade struct defaults.
+
+#### `scan_manager.rest.tls` — TLS protocol and offload policy (`io/tls/config.hpp`)
+
+All enum values are lowercase. Certificate/hostname verification stays enabled by
+default; configure trust through `object_store_config`, not this block.
+`verify`, `ca_file`, `ca_dir`, and `ca_blob` under `rest.tls` are rejected.
+The error for `verify` points to `VERIFY_SSL` / `tls_verify`. The errors for `ca_*`
+point to `ca_bundle_path` or the process trust environment.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ktls` | enum: `prefer`, `require`, `disable` | `prefer` | Try kernel TLS then fall back to user space (counted as a kTLS fallback); `require` fails the connection if kTLS cannot be installed; `disable` never requests it. |
+| `user_space_rx` | enum: `record_layer`, `library` | `record_layer` | Built-in AES-GCM receive record layer or the TLS library's receive path. Unsupported suites use the library path. |
+| `min_version` | enum: `tls1.2`, `tls1.3` | `tls1.2` | Minimum TLS version. |
+| `max_version` | enum: `tls1.2`, `tls1.3`, `auto` | `auto` | Automatic maximum considers kTLS and kernel re-key support, plus `allow_tls13_without_rekey`; with kTLS disabled, automatic permits TLS 1.3. Must not be below the minimum. |
+| `recv_placement` | enum: `automatic`, `inline`, `iowq` | `automatic` | Where kTLS body decryption runs: io-wq on EC2 (by DMI vendor) and inline elsewhere by default. `iowq` is bounded by `rest.iowq_max_unbound`. |
+| `expect_no_pad` | bool | true | Request the TLS 1.3 kTLS no-padding receive optimization. |
+| `session_cache` | bool | false | Enable the client TLS session cache, shared by the reactors of a pool; useful for stores that resume sessions. It is effective for TLS 1.2 sessions and for TLS 1.3 sessions of `user_space_rx: library` connections only: kTLS and the built-in record layer consume TLS 1.3 session tickets without handing them to the TLS library. |
+| `session_cache_per_endpoint` | int (**>= 0**; **> 0** with `session_cache: true`) | 256 | Maximum cached TLS sessions per endpoint when the cache is enabled. |
+| `max_connection_bytes` | bytes | 64Gi | Retire a connection at check-in after this many bytes, limiting KeyUpdate exposure. `0` disables the bound. |
+| `ciphersuites` | string | TLS 1.3 AES-128/256-GCM | TLS 1.3 suites in OpenSSL syntax (`TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384` by default). |
+| `cipher_list` | string | TLS 1.2 ECDHE + AES-128/256-GCM | TLS 1.2 ciphers in OpenSSL syntax; the default includes ECDSA and RSA authentication. |
+| `groups` | string | "" | Key-exchange groups in library syntax; empty keeps the library default. |
+| `sni_override` | string | "" | Send this SNI name and verify the certificate against it instead of the endpoint host. Does not disable verification. |
+| `allow_tls13_without_rekey` | bool | true | Permit TLS 1.3 on kernels without kTLS TLS 1.3 re-key support; a KeyUpdate then requires reconnection. |
+
+The YAML loader intentionally leaves the TLS fields `alpn_http11`, `client_cert_file`,
+`client_key_file` and `keylog_env` at their cuCascade struct defaults; they are not
+YAML-loadable.
+
+For example, tune transport independently of the credentials supplied by a secret
+or the programmatic object-store config — here a NIC-sized, IRQ-pinned pool on a
+jumbo-frame network:
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      backend: native
+      rest_n_reactors: 0        # one pinned reactor per NIC IRQ CPU when IRQs are steered
+      rest:
+        interface: eth0
+        max_connections: 64
+        fan_out: 2
+        min_segment_bytes: 4Mi
+        max_segment_bytes: 16Mi
+        min_mtu: 8000
+        connect_timeout_ms: 3000
+        tls:
+          ktls: prefer
+          user_space_rx: record_layer
+          recv_placement: automatic
+```
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
@@ -496,7 +626,7 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
+| `mode` | enum: `none`, `os`, `cucs` | `cucs` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
@@ -504,6 +634,12 @@ sirius:
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
 through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
 pinned prefetching cache (`fs_cache`).
+
+Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
+file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
+existing pinned host-memory pool. With `max_readahead_scans` unset, read-ahead uses the
+serving backend's budget: max(8, 2 × `pipeline.num_threads`) for REST and `pipeline.num_threads`
+for local uring (an explicit `uring.n_max_concurrent_scans: 0` keeps it off).
 
 `eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
 pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
@@ -519,18 +655,26 @@ Those two knobs derive the settings below, which are therefore **not** individua
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
-### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+### `scan_manager.object_store` — programmatic S3 config (`io/object_store_config.hpp`)
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `endpoint` | string | "" | S3 endpoint URL. |
-| `region` | string | "" | AWS region. |
+This is a C++ configuration reference, **not a YAML block**.
+`scan_manager.object_store` in YAML is rejected: supply
+`cucascade::io::object_store_config` through
+`sirius_config::set_object_store_config()`, or use
+`CREATE SECRET (TYPE SIRIUS_S3, ...)`. A matching SQL secret takes precedence
+over this fallback; an invalid matching secret is an error, not a reason to fall
+back. See [S3 authorization](scan.md#s3--object-store-backend).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL, including `http://` or `https://`. Input paths remain `s3://bucket/key`; raw HTTP(S) input URLs are unsupported. |
+| `region` | string | "" | AWS signing region. |
 | `access_key` / `secret_key` | string | "" | Static credentials. |
 | `session_token` | string | "" | STS session token for temporary credentials. |
-| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
-| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
-| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
+| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: auth in the URL query or in signed headers. |
+| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection; `https` aliases `http`. HTTP versus HTTPS comes from the endpoint scheme. |
+| `ca_bundle_path` | string | "" | PEM CA bundle for the REST endpoint; empty uses the process trust environment, then the TLS provider's default trust. |
+| `tls_verify` | bool | true | Certificate and hostname verification. Disable only for development endpoints. Applied with the CA bundle on top of the REST TLS policy. |
 
 ### `sirius.executor.scan_manager.preparation`
 
@@ -543,7 +687,7 @@ These settings are loaded at initialization. Metadata jobs default to a limit of
 | `lookahead_batches` | 2 | Per-scan preparation target in multiples of `scan_task_batch_size`, using decoded read-column bytes, including predicate-only columns. Results, retained coalescer input, and published batches stay charged until downstream takes the batch. Already submitted jobs may overshoot the target. |
 | `native_reader_workers` | 2 | Native-reader worker threads per scan manager, started lazily at the first native reservation. Positive and independent of metadata workers and GPU count. |
 | `max_native_readers` | 64 | Reader slots shared by all attempts within that manager. Must be at least `native_reader_workers`; an attempt reserves its full group before any reader starts. |
-| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per reader attempt. Metadata-only attempts still run coordination on the query owner. |
+| `coordinator_workers` | 1 | Shared coordinator workers per scan manager, started lazily. `0` uses one dedicated coordinator per asynchronous-coalescing or reader attempt. Parquet/Iceberg attempts also use independent coordination; synchronous-only metadata attempts retain query-owner coordination. |
 | `max_control_work` | N | Maximum coordinator actions per iteration. |
 | `drain_quantum` | N | Maximum coalescing work per result advancement. |
 | `partial_batch` | enabled | Partial-publication policy. An omitted or empty block uses the defaults below. |
@@ -616,6 +760,13 @@ default is narrowed to
 An explicit value for either budget overrides its default. `SET hash_partition_bytes`
 does not re-derive either budget; `RESET` restores each registered startup default.
 
+The per-GPU dynamic-filter Bloom budget is always **4× the query's
+`scan_task_batch_size`**, including YAML scan-size overrides and internal test
+settings. Multiplication saturates at the maximum unsigned 64-bit byte count.
+The budget is engine-owned: `max_dynamic_filter_bloom_bytes_per_gpu` is no longer
+accepted in YAML or registered as a SQL setting. Remove the old key from existing
+configs. Use `enable_dynamic_filter_multi_partition: false` to disable accumulation.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
@@ -632,12 +783,15 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `use_hw_decompression` | false | Startup-only opt-in to cuDF hardware (on-GPU) decompression for compressed Parquet scans. When set and every GPU reports support, Sirius exports `LIBCUDF_HW_DECOMPRESSION=ON` for the lifetime of the context. Enable only on GPUs known to support it: the support probe is also true on some GPUs (e.g. T4) where the runtime path fails. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
+| `enable_delim_aggregate_reuse` | true | Compute a decorrelated subquery's MIN/MAX/AVG from the delim join's outer rows instead of rescanning the subquery's tables, when the outer rows provably hold every subquery row for their key (TPC-H q2 and q17 shapes). See [Subquery Aggregates from the Delim Join's Rows](optimizations.md#subquery-aggregates-from-the-delim-joins-rows). |
+| `enable_partial_aggregate_below_join` | true | Compute `SUM`/`MIN`/`MAX` per join key below an inner join whose other side only adds variable-width columns the aggregate groups by, and combine the partial results above it (TPC-H q10 shape). See [Partial Aggregate Below a Payload Join](optimizations.md#partial-aggregate-below-a-payload-join). |
 | `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
-| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization (experimental) also gets no group-by-rowid ride or rider. |
+| `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time (every integer column is observed) and let a join whose build key was proven distinct take the single-pass distinct hash join, as for a PRIMARY KEY. `false` makes the planner ignore pin-time facts and disables the probe, so late materialization also gets no group-by-rowid ride or rider. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values a pin retains, across all columns together, for the pin-time exact uniqueness check, which sorts a whole column when its chunks overlap in range. Each retained chunk holds a GPU reservation, and integer columns, then earlier columns, take priority when the cap, free GPU memory or a reservation is short; the check's peak GPU use is about three times the cap. A column that no longer fits stays unproven. `0` uses 10% of the capacity of the GPU memory space the pin runs on. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
@@ -675,9 +829,8 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_quent` | bool | true; false in released extensions | Emit Quent telemetry as NDJSON files. When false, nothing is written. |
 | `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
-| `exporter` | string | `ndjson` | Quent filesystem exporter; only `ndjson` is supported. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 | `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
@@ -759,28 +912,41 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
-| `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
-| `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
+| `task_creator` | `executor.task_creator` | 4 (fixed) | `task_creator` | Task creation from scheduling requests |
+| `gpu_pipeline_executor` | `executor.pipeline` | clamp(floor(3T/(8G)), 4, 8) per GPU | `gpu_pipeline` | GPU pipeline task execution |
+| `downgrade_executor` | `executor.downgrade` | clamp(floor(T/(8G)), 1, 4) per executor | `downgrade` | Data tier migration (GPU→Host) |
+| `scan_manager` | `executor.scan_manager` | 18 (fixed) | `scan_manager` | Scan metadata production (IO reactors are separate) |
+
+Here T is the logical CPU hardware-thread count and G is the number of configured GPU memory
+spaces, before any per-query GPU limit. Unknown CPU counts and zero configured GPUs use one.
+Each expression is rounded down once and clamped independently. Pipeline and downgrade split
+T/(2G) as 75% and 25% before applying their limits. HOST downgrade executors inherit the same
+downgrade setting. These independently capped pools do not form a total CPU-thread budget.
+Task creator and scan manager stay fixed at 4 and 18 threads, independent of T and G.
+
+uring reactors default to 2 below 32 CPU hardware threads and 4 otherwise. REST reactors default
+to clamp(floor(T/6), 8, 16) without kernel TLS (kTLS) and clamp(floor(T/6), 4, 16) with it. When
+cuCascade's topology discovery reports kTLS loaded and the egress NIC's queue IRQs are steered to a
+strict subset of its NUMA node's cores on fewer than 16 CPUs, the default is instead one reactor per
+IRQ CPU (at least 4). Omitted or null YAML counts use these defaults; explicit counts take
+precedence, including `rest_n_reactors: 0` for cuCascade's NIC-based automatic sizing. Resolution happens before deriving the pipeline-dependent REST and uring
+readahead budgets and reserving reactor CPUs.
+
+| CPU threads | GPUs | Pipeline / GPU | Task creator | Downgrade / executor | Scan manager | REST | uring |
+|---|---|---|---|---|---|---|---|
+| 20 | 1 | 7 | 4 | 2 | 18 | 8 | 2 |
+| 32 | 1 | 8 | 4 | 4 | 18 | 8 | 4 |
+| 96 | 4 | 8 | 4 | 3 | 18 | 16 | 4 |
+| 192 | 8 | 8 | 4 | 3 | 18 | 16 | 4 |
+
+The REST column is without kTLS. With kTLS loaded it is 4, 5, 16 and 16, unless the NIC's steered
+IRQ CPUs (fewer than 16) set it to one reactor per IRQ CPU, at least 4.
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
-GPU's CPU topology. `num_threads` must be `> 0` for every pool.
-
-## DuckDB Settings Changed by Sirius
-
-Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
-
-| Setting | DuckDB default | Default with Sirius | Description |
-|---------|----------------|---------------------|-------------|
-| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
-
-DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
-
-```sql
-SET delim_join_as_cte = true;
-```
+GPU's CPU topology, within the pipeline pool's `cpu_affinity` when one is set. When the REST
+reactors pin to the NIC's IRQ CPUs, `scan_manager.reserve_rest_reactor_cpus` (on by default) takes
+those CPUs out of all four pools. `num_threads` must be `> 0` for every pool.
 
 ## DuckDB SET Variables
 
@@ -794,14 +960,15 @@ requires startup configuration.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
+| `sirius_log_backend` | `spdlog`; `duckdb` in released extensions | Log sink: `spdlog`, `duckdb`, or `noop` |
 | `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
 | `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
-- **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
-  `sirius_log_level` and `sirius_log_flush_seconds`.
-- **`duckdb`**: routes logs into DuckDB's own logging under the `Sirius` log type; enable and
+- **`spdlog`** (default in source builds): writes the daily-rotated
+  `<sirius_log_dir>/sirius_<date>.log`, honouring `sirius_log_level` and `sirius_log_flush_seconds`.
+- **`duckdb`** (default in the released `sirius_cuda12`/`sirius_cuda13` extensions, which are
+  built with `-DSIRIUS_DISTRIBUTION_DEFAULTS=ON`): routes logs into DuckDB's own logging under the `Sirius` log type; enable and
   read them with `CALL enable_logging(); SELECT * FROM duckdb_logs WHERE type = 'Sirius';`.
   Level and enable are governed by DuckDB, not `sirius_log_level`.
 - **`noop`**: discards all logs.
@@ -816,9 +983,11 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 `SIRIUS_LOG_LEVEL` environment variables.
 
 The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
-If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
-the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
-the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+If none is set, it leaves the current log sink unchanged. In source builds, if only
+`SIRIUS_LOG_LEVEL` is set, the default `spdlog` backend writes to `./log/sirius_<date>.log`; if
+only `SIRIUS_LOG_DIR` is set, the default `spdlog` backend writes there. Libraries built with
+`SIRIUS_DISTRIBUTION_DEFAULTS` default to `duckdb`, so they need `SIRIUS_LOG_BACKEND=spdlog` for
+file logs. An unknown backend leaves the current sink in
 place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
 backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
 does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
@@ -909,7 +1078,11 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_delim_aggregate_reuse` | true | Compute decorrelated subquery aggregates from the delim join's outer rows |
 | `enable_exists_minmax_rewrite` | true | Rewrite sibling correlated `[NOT] EXISTS` with one `=` and one `<>` correlation over the same table into one scan and a per-key `MIN`/`MAX` aggregate; see [Optimizations](optimizations.md#correlated-exists-minmax-rewrite). |
+| `enable_partial_aggregate_below_join` | true | Aggregate below an inner join that only adds group-by payload; see [Optimizations](optimizations.md#partial-aggregate-below-a-payload-join). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_partial_aggregate_below_join` in YAML. |
+| `enable_subquery_key_carry` | false | Under `delim_join_as_cte`, restrict every table a subquery ties to its correlation column by an equality to the outer rows' keys, before DuckDB orders the joins; see [Optimizations](optimizations.md#subquery-keys-carried-across-an-equality). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_subquery_key_carry` in YAML. |
+| `enable_exists_from_aggregate` | false | Drop a correlated `EXISTS` whose rows a scalar aggregate subquery of the same query also reads, and keep the outer rows that have a group; see [Optimizations](optimizations.md#exists-answered-from-an-aggregate-subquery). Test-only as a `SET` variable: it exists only when the process starts with `SIRIUS_ENABLE_TEST_OPTIONS=1`. Otherwise set `sirius.operator_params.enable_exists_from_aggregate` in YAML. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -956,8 +1129,7 @@ rejected as unknown, and the old `SET` variables no longer exist.
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `enable_dynamic_filter_multi_partition` | true | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition. Requires `enable_dynamic_filter`, a build fed through a FULL barrier (an `ORDER BY`-fed build never accumulates), and working peer DMA between every pair of replica GPUs. |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Cap on the accumulated Bloom arrays of one join on each GPU: the active keys times the array size rounded up to 256 bytes. Must be greater than zero: YAML loading and `SET` reject zero, and `enable_dynamic_filter_multi_partition` is the only switch that disables accumulation. A cap smaller than the required arrays records a size refusal. Whole-build publication is unaffected. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing filters or accumulated partials, skip an eligible key when the complete build covers at least this fraction of its unfiltered row domain. Native scans use catalog bounds and genuine uniqueness proofs; matching materialized Parquet pins may supply exact row counts and per-column `unique_cols` usefulness hints. Unknown/zero domains and builds exceeding the domain disable the gate. Values above 1.0 disable it; exactly 1.0 fires only at full coverage. `0.45` is an explicit measurement profile, not the production default. |
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
@@ -966,6 +1138,21 @@ Accumulation holds each GPU's arrays, at most the cap, until safe release after 
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
+
+### Distributed Execution
+
+Distributed execution is experimental: these settings can change or go away between releases.
+
+See [Distributed Execution](distributed-sirius.md). The exchange belongs to the process, not the
+connection: with `sirius_exchange_peers` already set, `SET sirius_exchange_rank` connects it and
+waits for every peer; set the other way round, the first distributed query connects it. Once it is
+connected, none of these settings can change, on any connection.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `sirius_exchange_peers` | `''` | `host:port` of every rank's exchange listener, comma-separated in rank order. Empty, or one entry, runs in one process. |
+| `sirius_exchange_rank` | 0 | This process's position in `sirius_exchange_peers`. |
+| `sirius_exchange_host_staging` | `auto` | `auto`, `always` or `never` send exchange writes to a peer through its pinned host mirror instead of NIXL; `auto` does so where the GPUs lack peer access. Set it before `sirius_exchange_rank`, which connects. |
 
 ### Pinned Tables
 
@@ -992,10 +1179,11 @@ retention gates.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
-| `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
+| `pin_table_compression` | true | Default for `pin_table` calls that omit the `compression` argument. |
+| `pin_table_input_compression_plan_dir` | (empty) | Optional directory of per-table Simpatico plan overrides (`<table_name>.<ext>`, multi-column plan DSL). If no readable, nonempty matching file is found, plans are selected automatically; a selected plan that does not cover the pinned columns leaves the pin raw. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). Spill compression uses `spill_max_compressed_fraction` instead. |
+| `pin_table_compression_min_table_device_fraction` | 0.05 | Select plans automatically for a GPU-tier pin only when its uncompressed size is at least this fraction of its GPUs' memory; store a smaller one uncompressed; host pins are not gated; `0` disables. |
 | `pin_table_prove_unique_keys` | true | Prove pinned parquet columns distinct at pin time and use those facts as join-key proofs (single-pass distinct hash join) and as late materialization's proof for a group-by-rowid ride. Affects pins and plans made after it is set. |
 | `pin_table_unique_exact_max_bytes` | 0 (auto) | Cap on the values retained across all columns for the pin-time exact uniqueness check; `0` uses 10% of the GPU memory space capacity. |
 
@@ -1008,28 +1196,66 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 |----------|---------|-------------|
 | `spill_compression` | false | Store batches the downgrade executor spills to the host or disk tier Simpatico-compressed. Applies to the whole process, not just the session. See [Spill compression](#spill-compression-siriuscompression) for the YAML-only gates. |
 
-### Late Materialization (experimental)
-
-Off by default, and gated by environment variables rather than `sirius_config`/`SET` — this is
-still an experimental optimization, not a normal session choice.
+### Late Materialization
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
+| `enable_late_materialization` | true | Carries a pin-order rowid instead of scanned values for an eligible GPU-tier pinned table, restoring them at the far end. |
+| `late_materialization_min_boundaries` | 4 | Minimum port crossings a ride must save; nonnegative integer. |
+| `late_materialization_min_value_x_boundaries` | 128 | Minimum net bytes per row times crossings saved; nonnegative integer. |
+| `late_materialization_count_defer` | false | Allow null-free columns read only by COUNT to remain deferred. |
+| `late_materialization_min_value_compressed` | 1 | Minimum deferred bytes per row for compressed origins; nonnegative integer. Matches the ordinary value floor by default. |
 
-Four further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
-path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
-gate table, the mechanism, and results.
+See [Late Materialization](late-materialization.md#configuration) for the mechanism
+and results.
 
-### Grouped Aggregation (experimental)
+### Grouped Aggregation
 
-Off by default, and gated by an environment variable rather than `sirius_config`/`SET`, like late materialization. The path applies only to batches it can handle and falls back to cuDF's group-by for anything else, so the variable never changes query results.
+The specialized path applies only to eligible batches and otherwise uses cuDF's group-by.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIRIUS_EXP_LOWCARD_GROUPBY` | off | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. Set to `1` to enable; any other value leaves it off. |
+| `enable_low_cardinality_groupby` | true | Grouped aggregation with at most 64 groups over one or two one-character string keys uses a dedicated kernel instead of cuDF's hash group-by. |
 
-See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation-experimental) for the mechanism and its measured effect.
+### Fused Scan Filtering
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_fused_scan_filter` | true | Fuse eligible row filters into compressed scan decoding; retain the ordinary decode and residual filter when ineligible. |
+| `fused_scan_diagnostics` | false | Promote fused-scan decision traces to INFO and enable decoder diagnostics on stderr. |
+| `fused_scan_max_selectivity` | 0.35 | Maximum surviving-row fraction for ordinary compaction. |
+| `fused_scan_full_route_max_selectivity` | 0.10 | Maximum surviving-row fraction when decoding full-width outputs. A batch that also has a dictionary output uses `fused_scan_max_selectivity` instead, if larger. |
+| `fused_scan_index_walk_max_selectivity` | 0.15 | Maximum surviving-row fraction for the survivor-index walk. |
+| `fused_scan_max_membership_sources` | 1 | Maximum join-filter probes carried by one decode; nonnegative integer. Zero disables these probes. |
+
+Selectivity thresholds must be finite and greater than zero; values above one are accepted,
+and a small positive index-walk threshold effectively disables that route.
+
+The former master environment variables `SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`,
+and `SIRIUS_EXP_LOWCARD_GROUPBY` are no longer read. Migrate overrides to these settings:
+
+```sql
+SET enable_late_materialization = false;
+SET enable_fused_scan_filter = false;
+SET enable_low_cardinality_groupby = false;
+```
+
+The former experimental threshold and diagnostic variables are also no longer read. Defaults
+are unchanged; migrate overrides using this mapping:
+
+| Retired environment variable | SQL / YAML setting |
+|---|---|
+| `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | `late_materialization_min_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | `late_materialization_min_value_x_boundaries` |
+| `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | `late_materialization_count_defer` |
+| `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | `late_materialization_min_value_compressed` |
+| `SIRIUS_EXP_FUSED_SCAN_DIAG` | `fused_scan_diagnostics` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` | `fused_scan_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL` | `fused_scan_full_route_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` | `fused_scan_index_walk_max_selectivity` |
+| `SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER` | `fused_scan_max_membership_sources` |
+
+See [Low-Cardinality Grouped Aggregation](optimizations.md#low-cardinality-grouped-aggregation) for the mechanism and its measured effect.
 
 ### Runtime Data Size Estimation
 
@@ -1054,7 +1280,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates plan-time fallback (unsupported operator/type) and runtime fallback for transparent SELECT, plus explicit `CALL gpu_execution(...)`. Unsupported COPY options can fall back during planning; transparent [Parquet COPY](parquet-output.md#failure-and-cleanup) never replays runtime failures because files may already be visible. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
@@ -1068,7 +1294,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `cucascade/include/cucascade/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
-| `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs (cuCascade) |
+| `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/tls/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / TLS / object-store sub-configs (cuCascade) |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 
@@ -1088,7 +1314,7 @@ sirius:
         enable: true
         num_threads: 3       # 2 is the swept default; 3 buys q21 ~3% under 8 pipeline threads
     pipeline:
-      num_threads: 8         # default 4; cliff at 12 (q1/q6 regress)
+      num_threads: 8         # default was 4 when measured; cliff at 12 (q1/q6 regress)
 ```
 
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
@@ -1097,10 +1323,11 @@ conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
 concern.  Each uring reactor stages through whole host blocks under a fixed
 64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
 and even a small device miss occupies that whole block for the duration of
-its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
-so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /
-`stall_time_s`) rather than by a whole-transfer deadline: a large block does
-not time out on a slow link as long as bytes keep arriving.
+its I/O. On the REST backend physical GET sizing is adaptive within
+`rest.min_segment_bytes` / `rest.max_segment_bytes`, and fragmented cache fills
+respect whole-chunk boundaries. Data GETs are bounded by a stall detector
+(`stall_speed_limit_bytes` / `stall_time_s`) rather than by a whole-transfer
+deadline, so a large transfer does not time out merely because a link is slow.
 `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
@@ -1112,3 +1339,76 @@ prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
 pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
 regardless of stream count; past these settings the link, not scheduling,
 is the bound.
+
+### Metadata worker NUMA placement and asynchronous Parquet preparation
+
+The existing `scan_manager.num_threads` budget is divided across eligible NUMA domains
+associated with configured GPUs. When `num_threads` is omitted or null, its initial default
+is 18; after discovering eligible domains, initialization
+raises that default if necessary to provide at least one worker per domain. An explicitly
+supplied value is never raised: initialization rejects it when it cannot cover all eligible
+domains. Each worker binds once, before accepting work; there is no per-operation affinity
+guard or extra coalescing pool. cuCascade discovers the rank's main-thread CPU affinity
+and its effective cgroup v2 CPU allowance. Configuration resolution saves their intersection
+as the startup CPU boundary shared by metadata placement, worker startup and lazy REST and
+exchange construction. GPU-local CPU sets and explicit pool affinity may narrow this boundary;
+they cannot expand it. Reserved REST-reactor CPUs remain excluded from worker pools, subject
+to the documented explicit-affinity fallback.
+
+A `taskset` or `numactl --cpunodebind` launch is honored through the main thread's mask, even
+when several ranks share a broader cgroup. A later single-CPU DuckDB worker mask does not
+replace that boundary. Capture occurs at engine configuration resolution: the embedder must
+preserve the launch mask on the main thread until then. Changing the main thread's affinity
+before capture changes the boundary; this mechanism cannot reconstruct historical launch
+settings. Native/coordinator workers start lazily from the saved mask, and each startup scope
+restores its caller's previous affinity on success and failure without changing CUDA/TLS state.
+If the deployment cpuset shrinks before lazy startup, coordinator/native workers, the
+dedicated coordinator runner, and lazy REST/exchange construction use the nonempty subset
+the kernel grants from the saved boundary and log the narrowed mask. They never substitute
+the creating thread's narrower mask or expand beyond the saved boundary. An empty subset
+still rejects startup; dormant worker pools may retry after the allowance is restored.
+
+cuCascade resolves cgroup2 mount roots and inherited effective cpusets. If cgroup discovery is
+unavailable, it retains the main-thread affinity with a diagnostic. If the main thread's mask
+cannot be read, it falls back to caller affinity with a diagnostic. A known empty intersection
+fails initialization; no broader mask is substituted. Missing GPU-local topology uses the
+permitted CPU boundary and reports the locality fallback. CPU restrictions do not select GPUs
+or change memory-binding policy, and ranks sharing a socket are not automatically assigned
+exclusive CPU or memory shares.
+
+Each preparation source selects a stable coalescing domain from the query's eligible GPU
+domains. A manager-wide cursor rotates the starting domain across queries, including
+independent single-source scans; each query rotates within its own eligible GPU-domain set.
+If CPU restrictions leave none of the query's GPU-local domains available, the query uses
+the first permitted manager domain instead. That domain may be remote from all of the
+query's GPUs; CPU restrictions still apply. This exception also applies when a per-query
+GPU limit selects only GPUs whose local domains were excluded.
+Independent metadata jobs rotate across the query's eligible domains, so a single source
+can use metadata workers in multiple domains. Each whole job executes in its assigned domain;
+plain Parquet creates one metadata job per file. There is no persistent file-to-domain mapping,
+so separate jobs referencing the same file may use different domains. A source's Parquet
+coalescer operations retain their stable domain. Workers do not steal domain-routed jobs from
+other domains. Metadata may therefore be produced in a different domain from its coalescer.
+This routing does not select I/O reactor or driver queues. Final GPU batch placement is unchanged;
+CPU placement does not imply page migration or pin all batches to one GPU.
+
+The query dispatcher alternates pending metadata and coalescing work when both are ready.
+Running metadata I/O is not preempted: a domain whose workers are all blocked on reads can
+still delay coalescing. No worker waits for another job in the pool. Trace logs report
+coalescing queue and execution duration; storage/concurrency qualification must check both.
+
+Thread counts are separate budgets. `scan_manager.num_threads` counts only the shared
+metadata/coalescing workers. Asynchronous Parquet/Iceberg attempts additionally use the
+manager's `preparation.coordinator_workers` control pool (one worker by default, started
+lazily). Setting that value to zero instead starts one coordinator thread per asynchronous
+or reader attempt. Native reads use their own `preparation.native_reader_workers` pool
+(two workers by default, started lazily). Each uring or REST reactor is another worker;
+reactor counts are per IO context. These workers are additional to pipeline, task-creator
+and downgrade threads. Pool defaults are independently sized and capped; the scan-manager
+default of 18 is not a total process thread cap and does not subtract coordinator, native-reader
+or additional IO-context workers.
+
+Completed coalescing operations are consumed in rotating source order, with at most one
+completion per control turn. This prevents a repeatedly ready first source from bypassing
+later ready sources. Shared admission can still delay work before an idle domain worker
+receives it; class alternation and rotating consumption provide no wall-clock latency bound.

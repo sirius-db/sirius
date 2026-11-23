@@ -123,6 +123,9 @@ struct exists_rewrite_fixture {
     db  = sirius::test::open_sirius_db(db_dir.file("exists_rewrite.db").c_str(), cfg);
     con = std::make_unique<Connection>(*db);
     set_flag(true);
+    // The delim-join shapes are the baseline here; the tests of the plain-join shapes turn
+    // `delim_join_as_cte` on themselves.
+    REQUIRE_FALSE(con->Query("SET delim_join_as_cte = false")->HasError());
 
     con->Query("CREATE TABLE dim (id BIGINT, tag INTEGER)");
     con->Query("INSERT INTO dim SELECT range, range % 5 FROM range(1, 30)");
@@ -202,8 +205,10 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   CHECK(rewrites(q21_shape_query) == 2);
 
   auto merged = physical_plan(q21_shape_query);
-  // One LEFT delim join and one aggregate answer both subqueries.
-  CHECK(delim_join_types(merged.get()) == std::vector{duckdb::JoinType::LEFT});
+  // One aggregate answers both subqueries, joined to the outer rows read twice from one CTE.
+  CHECK(delim_join_types(merged.get()).empty());
+  CHECK(collect(merged.get(), T::CTE).size() == 1);
+  CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
 
   set_flag(false);
   auto unrewritten = physical_plan(q21_shape_query);
@@ -276,7 +281,9 @@ TEST_CASE_METHOD(exists_rewrite_fixture,
   sirius::test::scoped_sirius_setting as_cte{*con, "delim_join_as_cte", true};
   CHECK(rewrites(q21_shape_query) == 2);
   auto merged = physical_plan(q21_shape_query);
-  CHECK(delim_join_types(merged.get()) == std::vector{duckdb::JoinType::LEFT});
+  CHECK(delim_join_types(merged.get()).empty());
+  CHECK(collect(merged.get(), T::CTE).size() == 1);
+  CHECK(collect(merged.get(), T::CTE_SCAN).size() == 2);
   CHECK(collect(merged.get(), T::GPU_SCAN).size() == 2);
 }
 

@@ -27,7 +27,8 @@ std::unordered_map<int32_t, std::size_t> index_parquet_field_ids(
     auto const& element = metadata.schema[i];
     if (!element.field_id) continue;
     if (*element.field_id <= 0 || !result.emplace(*element.field_id, i).second)
-      throw std::invalid_argument("Parquet has an invalid or duplicate field ID");
+      throw mapping_error(refusal_rule::invalid_or_duplicate_id,
+                          "Parquet has an invalid or duplicate field ID");
   }
   return result;
 }
@@ -52,7 +53,9 @@ cudf::data_type flat_type(duckdb::LogicalType const& type)
     case D::VARCHAR: return cudf::data_type{C::STRING};
     case D::DATE: return cudf::data_type{C::TIMESTAMP_DAYS};
     case D::TIMESTAMP: return cudf::data_type{C::TIMESTAMP_MICROSECONDS};
-    default: throw std::invalid_argument("field_id_core_v1: unsupported logical type");
+    default:
+      throw mapping_error(refusal_rule::unqualified_conversion,
+                          "field_id_core_v1: unsupported logical type");
   }
 }
 
@@ -173,10 +176,11 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
     throw std::invalid_argument("unknown row-count carrier policy");
   if (!metadata || opened_identity.empty() || metadata->built_for_identity != opened_identity ||
       !program.contract || !program.generation)
-    throw std::invalid_argument("field mapping has no matching source or program identity");
+    throw mapping_error(refusal_rule::unbound_generation,
+                        "field mapping has no matching source or program identity");
   auto footer = metadata->file_metadata();
   if (!footer || footer->schema.empty())
-    throw std::invalid_argument("missing field mapping footer");
+    throw mapping_error(refusal_rule::unbound_generation, "missing field mapping footer");
   auto index = index_parquet_field_ids(*footer);
   auto schema =
     scope == field_mapping_scope::top_level_scalars
@@ -187,7 +191,7 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
     throw std::invalid_argument("unknown field mapping scope");
   // Preserve the original flat-only default for existing adapters.
   if (scope == field_mapping_scope::flat_file && footer->schema.size() != schema.names.size() + 1)
-    throw std::invalid_argument("field_id_core_v1 requires a flat schema");
+    throw mapping_error(refusal_rule::not_flat, "field_id_core_v1 requires a flat schema");
   auto roots = io::parquet_helpers::top_level_schema_indices(*footer);
   std::unordered_map<std::size_t, std::size_t> root_ordinals;
   for (std::size_t i = 0; i < roots.size(); ++i)
@@ -195,19 +199,25 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
   std::unordered_set<std::string> physical_names;
   for (auto const& name : schema.names)
     if (!physical_names.insert(name).second)
-      throw std::invalid_argument("field ID has an ambiguous physical reader address");
+      throw mapping_error(refusal_rule::ambiguous_physical_name,
+                          "field ID has an ambiguous physical reader address");
   field_id_mapping result;
   result.metadata_ = std::move(metadata);
   result.program_  = std::move(program);
   std::unordered_map<std::size_t, std::size_t> read_slots;
   for (auto& field : fields) {
-    if (field.id <= 0) throw std::invalid_argument("invalid bound field ID");
+    if (field.id <= 0)
+      throw mapping_error(refusal_rule::invalid_or_duplicate_id, "invalid bound field ID");
     auto target = flat_type(field.type);
     operation op{std::move(field), {}, target, target};
     auto found = index.find(op.field.id);
     if (found == index.end()) {
-      if (!op.field.missing_value || op.field.missing_value->type() != op.field.type)
-        throw std::invalid_argument("missing field requires an explicitly typed default");
+      if (!op.field.missing_value)
+        throw mapping_error(refusal_rule::missing_typed_default,
+                            "missing field requires an explicitly typed default");
+      if (op.field.missing_value->type() != op.field.type)
+        throw mapping_error(refusal_rule::wrong_default_type,
+                            "missing field requires an explicitly typed default");
     } else {
       auto root = root_ordinals.find(found->second);
       if (root == root_ordinals.end())
@@ -219,7 +229,7 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
             target.id() == cudf::type_id::INT64) &&
           !(op.field.allow_float_to_double && op.physical_type.id() == cudf::type_id::FLOAT32 &&
             target.id() == cudf::type_id::FLOAT64))
-        throw std::invalid_argument("unqualified field conversion");
+        throw mapping_error(refusal_rule::unqualified_conversion, "unqualified field conversion");
       auto [it, inserted] = read_slots.emplace(ordinal, result.read_names_.size());
       if (inserted) {
         result.read_names_.push_back(schema.names.at(ordinal));
@@ -241,13 +251,15 @@ field_id_mapping field_id_mapping::compile(std::shared_ptr<parquet_metadata cons
       break;
     }
     if (result.read_names_.empty())
-      throw std::invalid_argument("field mapping has no qualified row-count carrier");
+      throw mapping_error(refusal_rule::no_qualified_carrier,
+                          "field mapping has no qualified row-count carrier");
   }
   std::vector<cudf::data_type> targets;
   for (auto const& op : result.operations_)
     targets.push_back(op.target_type);
   if (!result.program_.input_types || *result.program_.input_types != targets)
-    throw std::invalid_argument("mapped schema does not match its bound program");
+    throw mapping_error(refusal_rule::program_target_mismatch,
+                        "mapped schema does not match its bound program");
   return result;
 }
 

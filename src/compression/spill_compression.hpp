@@ -72,7 +72,7 @@ void apply_spill_compression_config(compression_config const& config);
 [[nodiscard]] bool spill_compression_applies(std::size_t bytes);
 
 /**
- * @brief The plan a spilled column is compressed with, chosen from its type and a sample.
+ * @brief Automatic per-column plan for spilling, chosen from type and sample.
  *
  * Fixed-width columns (including decimals and chrono types) up to 8 GiB are bitpacked;
  * larger ones exceed bitpack's encode scratch and are stored as is. Integer-valued
@@ -85,6 +85,18 @@ void apply_spill_compression_config(compression_config const& config);
  */
 [[nodiscard]] std::string default_spill_plan(cudf::column_view const& column,
                                              ::cuda::stream_ref stream);
+
+/**
+ * @brief Automatic per-column plan for pinning, which favors plans a filtered scan can decode
+ * in place.
+ *
+ * Like default_spill_plan, except that an integer-valued column takes delta -> rle -> bitpack
+ * only when rle saves at least a quarter of the column's uncompressed size beyond bitpack or
+ * delta -> bitpack, and a string column that is not dictionary-encoded keeps its chars as is
+ * beside delta-bitpacked offsets.
+ */
+[[nodiscard]] std::string default_pin_plan(cudf::column_view const& column,
+                                           ::cuda::stream_ref stream);
 
 /// Thrown by a spill converter that chose not to compress (too small a saving, no
 /// encode headroom). The caller spills the batch uncompressed instead.

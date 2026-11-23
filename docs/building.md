@@ -36,10 +36,11 @@ Tools:
   set `LIBCLANG_PATH` if libclang is not on CMake's or the system's search path
 - `xxhsum` (xxHash 0.8) to fingerprint embedded JIT headers
 
-CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `kvikio`, `nvcomp`, `spdlog`,
+CMake packages: `cudf`, `rmm`, `raft`, `cuvs`, `nvcomp`, `spdlog`,
 `yaml-cpp`, `roaring`, and `absl`, plus `OpenSSL`, `ZLIB`, and `CUDAToolkit`.
-`pkg-config` modules: `numa`, `liburing`, and `libcurl`. Use the RAPIDS versions
-pinned in `pixi.toml`.
+`pkg-config` modules: `liburing`, plus `libcurl` when
+`SIRIUS_BUILD_TESTS` is on (the S3 test fixture uploads with it). Use the RAPIDS
+versions pinned in `pixi.toml`.
 
 The `duckdb`, `substrait`, and `cucascade` submodules are built from source.
 `cuco` and Corrosion are used from installed CMake packages when found and are
@@ -131,7 +132,7 @@ The wrapper owns the vcpkg dependency setup. Build and install the local static
 library without building the extension:
 
 ```bash
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg
+git submodule update --init sirius-duckdb/duckdb substrait cucascade sirius-duckdb/vcpkg
 VCPKG_CUDA_ARCHITECTURES=100 pixi run -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
   --x-manifest-root=sirius-duckdb \
   --x-install-root=build/static-install

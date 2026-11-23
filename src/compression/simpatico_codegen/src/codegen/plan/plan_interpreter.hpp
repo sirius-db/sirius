@@ -84,7 +84,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               std::string* error_out);
 
 /// Per-column decode-time row selection
-/// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
+/// (`enable_fused_scan_filter`). Built by the wave-2 orchestrator in
 /// table decode orchestration AFTER the combine + CNT wave fixed the
 /// survivor count; never active on the default path (gate off ⇒ callers pass
 /// nullptr and behavior is byte-identical).
@@ -116,6 +116,8 @@ struct decode_selection {
   /// orchestrator supplies @c survivor_indices; absent/size-mismatched maps use
   /// the mask walk. An index map that is used must be nonnullable INT32 data.
   bool enumerate_by_index = false;
+  /// Query-local decision tracing, passed through the decode session to launchers.
+  bool diagnostics = false;
   /// A selection that arrived AFTER the scan — post-join survivor rows, bucketed
   /// per chunk (codegen/selection/chunk_row_set.hpp). Mutually exclusive with
   /// @c mask in practice: a late selection has no mask to have been balloted
@@ -132,6 +134,12 @@ struct decode_selection {
   /// stored type, saving the caller's separate widening cast. Ignored unless it is a same-family,
   /// same-scale widening of the decoded type.
   std::optional<cudf::data_type> output_type;
+  /// The caller compacts the column's stripped validity itself, against this
+  /// same selection. Off by default, which refuses a nullable column outright:
+  /// the stored bitmask spans the whole chunk and a compacted output does not,
+  /// so anything that returns one against the other silently misaligns validity
+  /// with values.
+  bool caller_reattaches_validity = false;
 
   [[nodiscard]] bool active() const noexcept
   {

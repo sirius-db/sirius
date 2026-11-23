@@ -18,10 +18,12 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace codegen_test {
@@ -59,9 +61,19 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
 {
   const std::int32_t num_chunks = codegen::num_chunks_for(n);
 
+  // A plain bitpack's chunk_divisors is empty and must render undivided, as the runtime does.
+  std::vector<std::int32_t> undivided;
+  for (const auto& [key, buffer] : labeled) {
+    constexpr std::string_view kDivisors = ".chunk_divisors";
+    if (buffer.length == 0 && key.ends_with(kDivisors)) {
+      undivided.push_back(std::stoi(key.substr(0, key.size() - kDivisors.size())));
+    }
+  }
+  std::sort(undivided.begin(), undivided.end());
+
   cdj::DecodeKernelSpec spec;
   try {
-    spec = cdj::render(tree, element_dtype, num_chunks);
+    spec = cdj::render(tree, element_dtype, num_chunks, cdj::kShapePlain, {}, undivided);
   } catch (const cdj::RenderError& e) {
     throw std::runtime_error(std::string("decode render: ") + e.what());
   }
@@ -114,7 +126,8 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   }
 
   cu_check(cuLaunchKernel(fn_dec,
-                          static_cast<unsigned>(num_chunks),
+                          static_cast<unsigned>((num_chunks + spec.chunks_per_block - 1) /
+                                                spec.chunks_per_block),
                           1,
                           1,
                           static_cast<unsigned>(spec.block_x),

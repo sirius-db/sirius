@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -47,6 +48,7 @@
 namespace sirius {
 
 class like_multiliteral_cache;
+struct operator_params;
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -115,11 +117,19 @@ enum class operator_data_type : uint8_t {
   INPUT_FREE,
 };
 
+// Describes the task delivering this input, independently of physical batch IDs.
+// The executor stamps the actual input before each execute() call. A writer's
+// accounting is query-local, so the original task ID needs no query ID here.
+struct delivery_metadata {
+  std::uint64_t original_task_id = 0;
+  std::uint32_t retry_count      = 0;
+};
+
 /**
  * @brief Generic base class for operator input/output data.
  *
- * This is an intentionally minimal base class with no opinion on what the
- * data should be. Derived classes define the concrete data representation.
+ * Derived classes define the concrete data representation. Optional delivery
+ * metadata describes the task invocation independently of that representation.
  */
 class operator_data {
  public:
@@ -130,6 +140,12 @@ class operator_data {
   operator_data& operator=(const operator_data&) = default;
   operator_data(operator_data&&)                 = default;
   operator_data& operator=(operator_data&&)      = default;
+
+  [[nodiscard]] delivery_metadata const* delivery() const noexcept
+  {
+    return _delivery ? &*_delivery : nullptr;
+  }
+  void set_delivery(delivery_metadata metadata) noexcept { _delivery = metadata; }
 
   /**
    * @brief Identify the concrete subclass at runtime.
@@ -233,6 +249,9 @@ class operator_data {
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
  private:
+  // Optional while constructing an input; overwritten for each task invocation,
+  // including after row-preserving materialization or a downstream task boundary.
+  std::optional<delivery_metadata> _delivery;
   /// Producer-assigned device preference; nullopt until set_preferred_device_id.
   std::optional<int> _preferred_device_id;
 };
@@ -587,6 +606,7 @@ class sirius_physical_operator {
 
   /// The owning pipeline supplies query policy; standalone operators use fixed defaults.
   [[nodiscard]] expression_query_policy expression_policy() const noexcept;
+  [[nodiscard]] const sirius::operator_params& operator_options() const noexcept;
 
   [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
 
@@ -655,8 +675,8 @@ class sirius_physical_operator {
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
   //! The late-materialization half this operator carries, if any. Both are empty on every
-  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
-  //! at query prepare, before any task runs, and only read from then on.
+  //! operator unless `enable_late_materialization` is on AND the pair installed; they are written
+  //! once, at query prepare, before any task runs, and only read from then on.
   //!
   //! A scan carries the producing half (stop emitting these positions' values) and its port
   //! carries the consuming half (put them back). Stamped only by
@@ -795,11 +815,22 @@ class sirius_physical_operator {
                                pipeline::sirius_meta_pipeline& meta_pipeline);
 
   //! Called when the pipeline this operator belongs to finishes. Sets finalized=true, then
-  //! dispatches to on_finalize_operator(). Do not override this; override on_finalize_operator().
+  //! dispatches to on_finalize_operator(), then to each finalize listener. Do not override this;
+  //! override on_finalize_operator().
   void finalize_operator()
   {
     finalized.store(true);
     on_finalize_operator();
+    for (auto const& listener : _finalize_listeners) {
+      listener();
+    }
+  }
+
+  //! Adds @p listener, which finalize_operator() calls after on_finalize_operator(). Register it
+  //! while planning; it runs under the pipeline's status lock, so it must not block or throw.
+  void add_finalize_listener(std::function<void()> listener)
+  {
+    _finalize_listeners.push_back(std::move(listener));
   }
 
   //! True after finalize_operator() has been called on this operator.
@@ -924,6 +955,10 @@ class sirius_physical_operator {
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
+
+  //! Whether the task creator may hand this operator a task with no input batches. A distributed
+  //! collective needs one on a rank whose input is empty, since the other ranks wait for it.
+  [[nodiscard]] virtual bool runs_without_input() const { return false; }
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
 
@@ -973,6 +1008,9 @@ class sirius_physical_operator {
   //! the two halves cannot be installed apart.
   late_mat::deferred_scan_output _deferred_output;
   late_mat::port_materialize_directive _port_directive;
+
+  //! See add_finalize_listener().
+  std::vector<std::function<void()>> _finalize_listeners;
 
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }

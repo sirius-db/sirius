@@ -157,7 +157,7 @@ sirius_engine::~sirius_engine()
   try {
     query_handle_.finished();
   } catch (std::exception const& e) {
-    SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("query telemetry finish failed: {}", e.what()); });
   }
 }
 
@@ -268,17 +268,19 @@ void sirius_engine::execute()
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
-    query_ = sirius_ctx->create_query(std::move(new_scheduled),
-                                      query_id_,
-                                      completion_handler_,
-                                      telemetry::query_telemetry_info{
-                                        .telemetry_query_id = telemetry_uuid,
-                                        .worker_id          = telemetry_context_->worker_id().raw(),
-                                        .query_id           = query_id_,
-                                      },
-                                      [&client = context] { return client.IsInterrupted(); });
-    sirius_ctx->get_task_scheduler().start_query(*query_);
-    sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    completion_handler_->run_startup([&] {
+      query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                        query_id_,
+                                        completion_handler_,
+                                        telemetry::query_telemetry_info{
+                                          .telemetry_query_id = telemetry_uuid,
+                                          .worker_id = telemetry_context_->worker_id().raw(),
+                                          .query_id  = query_id_,
+                                        },
+                                        [&client = context] { return client.IsInterrupted(); });
+      sirius_ctx->get_task_scheduler().start_query(*query_);
+      sirius_ctx->get_scan_manager().start_preparation(query_id_);
+    });
   } catch (...) {
     // Prepare/start failures and asynchronous failures compete for the same terminal winner.
     completion_handler_->report_error(std::current_exception());
@@ -299,14 +301,14 @@ void sirius_engine::execute()
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Error executing query: {}", e.what()); });
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
     registry->report_failure(std::current_exception(), query_id_);
-    SIRIUS_LOG_ERROR("Unknown error executing query");
+    log::log_noexcept([&] { SIRIUS_LOG_ERROR("Unknown error executing query"); });
     cancel_dynamic_filter_publications();
     quiesce_plan_users();
     throw;

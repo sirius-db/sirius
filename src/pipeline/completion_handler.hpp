@@ -28,9 +28,11 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 namespace sirius::pipeline {
 
@@ -158,6 +160,32 @@ class completion_handler {
     inputs_closed_         = false;
     preparation_quiescent_ = false;
   }
+  // Establish before GPU submission. Startup can allocate while wrapping cached
+  // workers, after an independent coordinator has already observed normal EOS.
+  // Keep success pending until any such exception has been recorded.
+  template <typename F>
+  void run_startup(F&& start)
+  {
+    {
+      std::lock_guard lock(terminal_mutex_);
+      if (startup_active_ || gpu_done_ || _completed.load())
+        throw std::logic_error("startup must register before query work starts");
+      startup_active_ = true;
+    }
+    auto release = [&] {
+      std::lock_guard lock(terminal_mutex_);
+      startup_active_ = false;
+      maybe_complete();
+    };
+    try {
+      std::forward<F>(start)();
+    } catch (...) {
+      report_error(std::current_exception());
+      release();
+      throw;
+    }
+    release();
+  }
   void close_preparation_inputs() noexcept
   {
     std::lock_guard lock(terminal_mutex_);
@@ -207,6 +235,10 @@ class completion_handler {
    * @return True if completion has been signaled, false otherwise.
    */
   [[nodiscard]] bool is_completed() const noexcept { return _completed.load(); }
+  [[nodiscard]] std::stop_token execution_stop_token() const noexcept
+  {
+    return execution_stop_.get_token();
+  }
 
   /**
    * @brief Check if the handler has already been completed with an error.
@@ -294,6 +326,7 @@ class completion_handler {
     published_changed_.notify_all();
     auto stop = preparation_stop_;
     terminal_lock.unlock();
+    execution_stop_.request_stop();
     if (on_error_) {
       try {
         on_error_(error);
@@ -314,7 +347,7 @@ class completion_handler {
   // Called with terminal_mutex_. Errors and cancellation do not wait for preparation closure.
   void maybe_complete() noexcept
   {
-    if (_completed.load() || !gpu_done_ ||
+    if (_completed.load() || !gpu_done_ || startup_active_ ||
         (preparation_active_ && (!inputs_closed_ || !preparation_quiescent_)))
       return;
     _completed.store(true);
@@ -324,9 +357,11 @@ class completion_handler {
     }
   }
   std::shared_ptr<std::function<void(bool)> const> preparation_stop_;
+  std::stop_source execution_stop_;
   mutable std::mutex terminal_mutex_;
   std::exception_ptr terminal_error_, preparation_cleanup_error_;
   bool gpu_done_              = false;
+  bool startup_active_        = false;
   bool preparation_active_    = false;
   bool inputs_closed_         = false;
   bool preparation_quiescent_ = false;

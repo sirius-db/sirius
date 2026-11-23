@@ -23,6 +23,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/delim_cte_proof.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -53,6 +54,7 @@ class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalCrossProduct;
+class LogicalCopyToFile;
 class LogicalDelimGet;
 class LogicalDistinct;
 class LogicalDummyScan;
@@ -75,9 +77,10 @@ class Binder;
 namespace sirius::planner {
 
 /// Rewrite nested decorrelated `[NOT] EXISTS (... WHERE t.k = outer.k AND t.x <> outer.x)`
-/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: a LEFT
-/// DELIM_JOIN against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery plus a filter. The replacement
-/// emits the same column bindings as the nodes it replaces. Subqueries DuckDB left as plain SEMI
+/// subqueries over the same table in the optimized, unresolved plan into one scan of `t`: the outer
+/// rows become a CTE, LEFT JOINed against `MIN(t.x), MAX(t.x) GROUP BY k` per subquery over `t`
+/// restricted to the CTE's distinct keys, plus a filter. Operators above that read the outer rows'
+/// columns are repointed to the CTE's scan. Subqueries DuckDB left as plain SEMI
 /// or ANTI joins (`delim_join_as_cte`) over a table pinned in GPU memory are merged only when those
 /// joins are estimated to exceed @p gpu_memory_budget bytes; 0 merges them regardless. Returns the
 /// number of subqueries rewritten.
@@ -127,6 +130,9 @@ class sirius_physical_plan_generator {
                                  scan_contract_provenance provenance);
   ~sirius_physical_plan_generator();
 
+  // Original frontend SQL for validating COPY options consumed by DuckDB binding.
+  std::string copy_statement_sql;
+
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
@@ -170,6 +176,8 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalComparisonJoin& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCopyToFile& op);
   // create_plan(duckdb::LogicalCopyDatabase &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreate
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -307,6 +315,10 @@ class sirius_physical_plan_generator {
   // private:
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
+  //! Delim CTE reads whose rows may be restricted (see planner/delim_cte_proof.hpp). Null when the
+  //! plan was not captured with proofs; then no read is treated as restrictable.
+  std::shared_ptr<delim_cte_proofs const> cte_reader_proofs;
+
   std::size_t delim_index = 0;
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t next_scan_node_id = 0;

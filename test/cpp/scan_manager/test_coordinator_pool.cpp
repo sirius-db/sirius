@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "exec/thread_util.hpp"
 #include "scan_manager/coordinator_pool.hpp"
 
 #include <atomic>
@@ -228,4 +229,75 @@ TEST_CASE("Coordinator drain includes an in-flight pool stop notification", "[co
   drained.get();
   stopping.get();
   CHECK(status == std::future_status::timeout);
+}
+
+TEST_CASE("lazy coordinator workers use the saved startup mask",
+          "[coordinator_pool][startup_affinity]")
+{
+  using namespace sirius::exec::thread_util;
+  auto cpus = get_current_thread_affinity();
+  REQUIRE_FALSE(cpus.empty());
+  coordinator_pool pool(1, cpus);
+  std::shared_ptr<coordinator_pool::registration> handle;
+  std::promise<std::vector<int>> observed;
+  auto ready = observed.get_future();
+  std::vector<int> caller_after;
+  std::exception_ptr error;
+  std::thread caller([&] {
+    try {
+      scoped_thread_affinity narrow(std::vector<int>{cpus.front()});
+      handle = pool.add(
+        [&] {
+          observed.set_value(get_current_thread_affinity());
+          return result{progress::finished, {}};
+        },
+        [] {},
+        [&](auto e) { observed.set_exception(e); });
+      caller_after = get_current_thread_affinity();
+      handle->wake();
+    } catch (...) {
+      error = std::current_exception();
+    }
+  });
+  caller.join();
+  if (error) std::rethrow_exception(error);
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == cpus);
+  CHECK(caller_after == std::vector<int>{cpus.front()});
+  handle->wait();
+  pool.stop();
+}
+
+TEST_CASE("coordinator startup accepts a narrowed saved mask and rejects an empty grant",
+          "[coordinator_pool][startup_affinity]")
+{
+  using namespace sirius::exec::thread_util;
+  auto cpus = get_current_thread_affinity();
+  REQUIRE_FALSE(cpus.empty());
+  scoped_thread_affinity restore(cpus);
+  int const denied = CPU_SETSIZE - 1;
+  if (set_current_thread_affinity(std::vector<int>{denied}))
+    SKIP("requires a CPU the kernel will not grant");
+  coordinator_pool refused(1, {denied});
+  CHECK_THROWS_AS(refused.add([] { return result{progress::finished}; }, [] {}, [](auto) {}),
+                  std::runtime_error);
+  CHECK(refused.started_workers() == 0);
+
+  coordinator_pool pool(1, {cpus.front(), denied});
+  scoped_thread_affinity caller(std::vector<int>{cpus.back()});
+  std::promise<std::vector<int>> observed;
+  auto ready  = observed.get_future();
+  auto handle = pool.add(
+    [&] {
+      observed.set_value(get_current_thread_affinity());
+      return result{progress::finished};
+    },
+    [] {},
+    [&](auto error) { observed.set_exception(error); });
+  CHECK(get_current_thread_affinity() == std::vector<int>{cpus.back()});
+  handle->wake();
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == std::vector<int>{cpus.front()});
+  handle->wait();
+  pool.stop();
 }

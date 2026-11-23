@@ -16,6 +16,7 @@ find_package(yaml-cpp REQUIRED CONFIG)
 # readers agree by construction.
 find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
+find_package(utf8proc REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -88,15 +89,19 @@ if(VCPKG_BUILD)
       "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig:${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/pkgconfig:$ENV{PKG_CONFIG_PATH}"
   )
 endif()
-pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-if(VCPKG_BUILD)
-  # The CMake target includes curl's private static dependencies.
-  find_package(CURL CONFIG REQUIRED)
-  set(SIRIUS_CURL_TARGET CURL::libcurl)
-else()
-  pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
-  set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+# The engine no longer calls libcurl (cuCascade's REST transport is io_uring
+# based); only the S3 test fixture uploader (test/cpp/utils/s3_backend.cpp)
+# does.
+if(SIRIUS_BUILD_TESTS)
+  if(VCPKG_BUILD)
+    # The CMake target includes curl's private static dependencies.
+    find_package(CURL CONFIG REQUIRED)
+    set(SIRIUS_CURL_TARGET CURL::libcurl)
+  else()
+    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+  endif()
 endif()
 
 if(VCPKG_BUILD)
@@ -172,5 +177,3 @@ endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
-
-find_package(kvikio REQUIRED CONFIG)

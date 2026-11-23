@@ -105,7 +105,7 @@ void io_roundtrip(char const* label,
     file.seekg(4);
     char version = 0;
     file.read(&version, 1);
-    expect(version == 15, "file version is independent of codec and nvCOMP build");
+    expect(version == 16, "file version is independent of codec and nvCOMP build");
   }
 
   // Metadata survives.
@@ -279,6 +279,55 @@ void test_nested_metadata_rle_scale()
                "bitpack.chunk_count -> rle -> runs, values\n"
                "bitpack.chunk_count.runs -> rle -> runs, values\n"
                "bitpack.chunk_count.values -> rle -> runs, values\n");
+}
+
+// 1c. A re-read table has no Bitpack word offsets; keep_bitpack_word_offsets recomputes the
+//     encoder's for a rep owning its metadata, skips one whose chunk_count is tail-routed, and
+//     the decode reads them correctly.
+void test_keep_bitpack_word_offsets()
+{
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                   = rmm::mr::get_current_device_resource_ref();
+  auto offsets_of           = [](simpatico::compressed_table const& ct) {
+    auto const& nodes = ct.columns.at(0).plan_tree->nodes;
+    auto const node =
+      std::find_if(nodes.begin(), nodes.end(), [](auto const& n) { return n.op == "bitpack"; });
+    expect(node != nodes.end(), "keep offsets: plan has no bitpack node");
+    auto const* rep = dynamic_cast<simpatico::codegen_fused_representation const*>(node->rep.get());
+    expect(rep != nullptr, "keep offsets: root is not a fused rep");
+    return &rep->word_offsets;
+  };
+  auto t = make_int32_table(1, 300000, 5);
+  for (bool routed : {false, true}) {
+    std::string const dsl = routed
+                              ? "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                                "bitpack.chunk_count -> rle -> runs, values\n"
+                              : "input -> bitpack\n";
+    auto const ct         = simpatico::compress_with_plan(t->view(), dsl, stream, mr);
+    std::string rerr;
+    auto ct2 = memory_reread("keep offsets", ct, rerr);
+    expect(rerr.empty(), ("keep offsets: read error: " + rerr).c_str());
+    expect(offsets_of(ct2)->size() == 0, "keep offsets: a re-read rep has offsets");
+    auto const kept_bytes = simpatico::keep_bitpack_word_offsets(ct2, stream, mr);
+    auto const* kept      = offsets_of(ct2);
+    expect(kept_bytes.size() == 1 && kept_bytes[0] == kept->size(),
+           "keep offsets: reported bytes differ from the kept buffer");
+    if (routed) {
+      expect(kept->size() == 0, "keep offsets: tail-routed metadata got offsets");
+    } else {
+      auto const* encoded = offsets_of(ct);
+      expect(kept->size() > 0 && kept->size() == encoded->size(), "keep offsets: size");
+      std::vector<std::uint8_t> a(kept->size()), b(encoded->size());
+      expect(
+        cudaMemcpy(a.data(), kept->data(), a.size(), cudaMemcpyDeviceToHost) == cudaSuccess &&
+          cudaMemcpy(b.data(), encoded->data(), b.size(), cudaMemcpyDeviceToHost) == cudaSuccess,
+        "keep offsets: copy");
+      expect(a == b, "keep offsets: differ from the encoder's");
+    }
+    auto out = simpatico::decompress(ct2, stream, mr);
+    expect(columns_equal_any(t->view().column(0), out->view().column(0), stream),
+           "keep offsets: data mismatch");
+  }
 }
 
 // 2. FOR + fused bitpack on deltas: JIT fused region covers both ops.
@@ -727,7 +776,7 @@ void test_nvcomp_payload_compatibility()
       bool const matches     = format == (NVCOMP_VER_MAJOR >= 6 ? 6 : 5);
       bool const unavailable = cascaded && NVCOMP_VER_MAJOR >= 6;
       if (matches && !unavailable) continue;
-      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 15};
+      std::vector<std::uint8_t> header{'H', 'P', 'L', 'N', 16};
       auto append = [&](std::uint64_t value, int bytes) {
         for (int i = 0; i < bytes; ++i)
           header.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
@@ -1055,10 +1104,10 @@ void test_validity_header_integrity()
 void test_decimal128_bitpack_roundtrip()
 {
   auto t = make_decimal128_table(1, 4096, 17);
-  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack_gcd\n");
   // The spill path stages through build_compressed_table_header, not the file
   // writer, so cover that seam too.
-  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack_gcd\n");
 }
 
 // An identity leaf keeps its column's type, so a decimal read back must be rebuilt
@@ -1079,10 +1128,10 @@ void test_decimal128_bitpack_named_channels()
   auto t = make_decimal128_table(1, 4096, 19);
   io_roundtrip("decimal128_bitpack_named",
                t->view(),
-               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+               "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n");
   memory_roundtrip("decimal128_bitpack_named_memory",
                    t->view(),
-                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+                   "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n");
 }
 
 // Trees with a Bitpack or an Rle are measured and then packed straight into place, Raw
@@ -1097,6 +1146,7 @@ void test_measured_encode_roundtrip()
   tables.push_back(make_decimal128_table(1, rows, 7));
   std::string const plans[] = {
     "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+    "input -> bitpack_gcd -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> delta -> differences\n"
     "delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
     "input -> delta -> differences\n"
@@ -1150,6 +1200,7 @@ int main()
   Case cases[] = {
     {"fused_delta_rle_bitpack", test_fused_delta_rle_bitpack},
     {"nested_metadata_rle_scale", test_nested_metadata_rle_scale},
+    {"keep_bitpack_word_offsets", test_keep_bitpack_word_offsets},
     {"for_bitpack", test_for_bitpack},
     {"for_only", test_for_only},
     {"zigzag", test_zigzag},

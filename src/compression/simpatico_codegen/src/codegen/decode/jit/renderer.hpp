@@ -57,7 +57,7 @@
 namespace codegen::decode::jit {
 
 // Kernels that evaluate a scan's filter while decoding (experimental; the
-// engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator, not
+// query policy enable_fused_scan_filter lives in the wave orchestrator, not
 // here).
 //
 // A decode kernel is a point in a two-axis product, not a flat variant list.
@@ -120,6 +120,7 @@ inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballo
 inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::write_column};
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
+inline constexpr DecodeShape kShapePlainDictGather{Enumerator::all_rows, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
 inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer::write_column};
 inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};
@@ -195,6 +196,9 @@ struct DecodeKernelSpec {
   // Launch geometry.  The launcher computes grid_x = ceil(num_chunks_for(n) / chunks_per_block).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
   int shared_bytes = 0;    // dynamic shared workspace peak (RLE boundaries)
+  // chunks_per_block(shape), or kTBSize / 32 where the renderer maps one chunk per warp for a
+  // shape that otherwise maps one per block (the full decode of a Bitpack/FOR/Zigzag/Delta chain).
+  int chunks_per_block = 1;
 
   std::string note;  // human-readable diagnostic
 };
@@ -229,10 +233,14 @@ DecodeKernelSpec render_masked_char_copy();
 // `element_dtype` (e.g. "int64_t" for a DECIMAL32 column restored to DECIMAL64). Decoded values are
 // computed in `element_dtype` and widened by the store's implicit conversion. Only bitpack-rooted
 // mask/index walks request it (see decode_fused_subtree_impl in plan/decompress.cpp).
+//
+// `undivided` lists the Bitpack node ids whose `chunk_divisors` channel is empty (every
+// chunk's divisor is 1). They render without that channel, as the plain affine decode.
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeShape shape            = kShapePlain,
-                        const std::string& out_dtype = {});
+                        DecodeShape shape                          = kShapePlain,
+                        const std::string& out_dtype               = {},
+                        const std::vector<std::int32_t>& undivided = {});
 
 }  // namespace codegen::decode::jit

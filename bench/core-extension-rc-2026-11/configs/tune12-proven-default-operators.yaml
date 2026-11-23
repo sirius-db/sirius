@@ -1,0 +1,48 @@
+sirius:
+  topology:
+    num_gpus: 2
+    gpus_per_query: 0
+  memory:
+    gpu:
+      usage_limit_fraction: 0.95
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.8
+      block_size: 1Mi
+      pool_size: 512
+      initial_number_pools: 800
+      capacity_bytes: 400Gi
+    disk:
+      disk_id: 0
+      capacity_bytes: 2Ti
+      downgrade_root_dirs: /opt/dlami/nvme/spill
+  executor:
+    task_creator:
+      num_threads: 4
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 8
+    scan_manager:
+      num_threads: 24
+      backend: native
+      rest_n_reactors: 8
+      rest:
+        pin_to_irq_cpus: false
+        max_connections: 128
+        min_mtu: 8000
+        conn_max_age_s: 300
+      max_readahead_scans: 16
+      cache:
+        mode: cucs
+        eviction: idle
+        min_prefetching_budget_fraction: 0.05
+        eviction_threshold_fraction: 0.8
+      memory_prefetcher:
+        enable: false
+  compression:
+    enable_spill_compression: true

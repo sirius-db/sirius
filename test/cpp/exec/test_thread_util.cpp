@@ -28,6 +28,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -157,4 +159,97 @@ TEST_CASE("current_thread_id names a live kernel TID", "[exec][thread_util]")
   t.join();
   CHECK(other_tid != 0);
   CHECK(other_tid != self_tid);
+}
+
+TEST_CASE("run_with_affinity runs work under the given mask and rethrows", "[exec][thread_util]")
+{
+  auto const allowed = get_current_thread_affinity();
+  REQUIRE_FALSE(allowed.empty());
+  if (allowed.size() < 2) { SKIP("needs two allowed CPUs"); }
+
+  // A thread restricted to one CPU builds from the wider mask, as a lazy REST build must.
+  std::vector<int> seen_inside;
+  std::vector<int> seen_child;
+  std::vector<int> caller_after;
+  std::thread restricted([&] {
+    REQUIRE(set_current_thread_affinity(std::span{allowed}.first(1)));
+    sirius::exec::run_with_affinity(allowed, [&] {
+      seen_inside = get_current_thread_affinity();
+      std::thread child([&] { seen_child = get_current_thread_affinity(); });
+      child.join();
+    });
+    caller_after = get_current_thread_affinity();
+  });
+  restricted.join();
+  CHECK(seen_inside == allowed);
+  CHECK(seen_child == allowed);
+  CHECK(caller_after == std::vector<int>{allowed.front()});
+
+  CHECK_THROWS_WITH(
+    sirius::exec::run_with_affinity(allowed, [] { throw std::runtime_error("build failed"); }),
+    "build failed");
+}
+
+TEST_CASE("startup affinity scopes restore the caller after success and failure",
+          "[exec][thread_util][startup_affinity]")
+{
+  auto before = get_current_thread_affinity();
+  REQUIRE_FALSE(before.empty());
+  auto narrow = std::vector<int>{before.front()};
+  {
+    scoped_thread_affinity outer(narrow);
+    CHECK(get_current_thread_affinity() == narrow);
+    CHECK_THROWS_WITH(
+      [&] {
+        scoped_thread_affinity inner(before);
+        CHECK(get_current_thread_affinity() == before);
+        throw std::runtime_error("startup failed");
+      }(),
+      "startup failed");
+    CHECK(get_current_thread_affinity() == narrow);
+  }
+  CHECK(get_current_thread_affinity() == before);
+  CHECK_THROWS_AS(scoped_thread_affinity(std::vector<int>{CPU_SETSIZE}), std::invalid_argument);
+  bool ran = false;
+  CHECK_THROWS_AS(
+    sirius::exec::run_with_affinity(std::vector<int>{CPU_SETSIZE}, [&] { ran = true; }),
+    std::invalid_argument);
+  CHECK_FALSE(ran);
+  CHECK(get_current_thread_affinity() == before);
+}
+
+TEST_CASE("startup affinity accepts only the kernel-granted saved subset",
+          "[exec][thread_util][startup_affinity]")
+{
+  auto before = get_current_thread_affinity();
+  REQUIRE_FALSE(before.empty());
+  scoped_thread_affinity restore(before);
+  int const denied = CPU_SETSIZE - 1;
+  if (set_current_thread_affinity(std::vector<int>{denied}))
+    SKIP("requires a CPU the kernel will not grant");
+  // The caller's mask is deliberately different from the requested startup CPU.
+  auto caller = std::vector<int>{before.back()};
+  scoped_thread_affinity pinned(caller);
+  std::vector<int> saved{before.front(), denied};
+  {
+    sirius::exec::scoped_startup_affinity startup(saved);
+    CHECK(startup.effective_cpus() == std::vector<int>{before.front()});
+    CHECK(get_current_thread_affinity() == startup.effective_cpus());
+  }
+  CHECK(get_current_thread_affinity() == caller);
+  bool ran = false;
+  sirius::exec::run_with_affinity(saved, [&] {
+    ran = true;
+    CHECK(get_current_thread_affinity() == std::vector<int>{before.front()});
+  });
+  CHECK(ran);
+  CHECK_THROWS_AS(sirius::exec::scoped_startup_affinity(std::vector<int>{denied}),
+                  std::runtime_error);
+  CHECK_THROWS_WITH(
+    [&] {
+      sirius::exec::scoped_startup_affinity startup(saved);
+      throw std::runtime_error("startup failed");
+    }(),
+    "startup failed");
+  CHECK(get_current_thread_affinity() == caller);
 }

@@ -135,7 +135,10 @@ std::uint64_t splitmix64(std::uint64_t& s)
 //   chunk 4 = confined to the top quarter of the domain (zero survivors
 //             under the mid-selectivity predicate -> mask-walk early return).
 template <typename Element>
-std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t range)
+std::vector<Element> gen_data(std::int64_t n,
+                              std::int64_t base,
+                              std::int64_t range,
+                              std::int64_t step = 1)
 {
   std::vector<Element> v(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
@@ -151,7 +154,7 @@ std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t ra
     } else {
       val = base + r;
     }
-    v[static_cast<std::size_t>(i)] = static_cast<Element>(val);
+    v[static_cast<std::size_t>(i)] = static_cast<Element>(base + (val - base) * step);
   }
   return v;
 }
@@ -276,18 +279,31 @@ std::int64_t host_cnt(const std::vector<std::uint32_t>& mask,
 }
 
 template <typename Element>
-bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t range, int arch)
+bool run_roundtrip(
+  const std::string& dtype, std::int64_t base, std::int64_t range, int arch, std::int64_t step = 1)
 {
   const std::int64_t n  = 5 * kChunk + 700;  // partial tail chunk
   const std::int64_t nc = codegen::num_chunks_for(n);
   const ::cuda::stream_ref stream{cudaStream_t{}};
 
-  const std::vector<Element> data = gen_data<Element>(n, base, range);
+  const std::vector<Element> data = gen_data<Element>(n, base, range, step);
 
-  auto tree = jit::FusedTree::make(OpKind::Bitpack);
+  auto tree         = jit::FusedTree::make(OpKind::Bitpack);
+  tree->bitpack_gcd = true;
 
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
   if (!compact_packed_on_host(enc, nc)) return false;
+  if (step > 1) {
+    Element chunk0_divisor{};
+    cudaMemcpy(&chunk0_divisor,
+               device_ptr<Element>(enc, 0, "chunk_divisors"),
+               sizeof(Element),
+               cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(static_cast<std::int64_t>(chunk0_divisor) % step == 0,
+                "[%s] bitpack did not fold the common divisor %lld",
+                dtype.c_str(),
+                static_cast<long long>(step));
+  }
 
   // --- Plain reference through the production launcher. -------------------
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
@@ -303,10 +319,11 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
   REQUIRE_MSG(plain == data, "[%s] plain decode != original input", dtype.c_str());
 
   // --- Range ballot -> host CNT-equivalent -> mask walk, for three selectivities. ---
+  const std::int64_t span       = range * step;
   const range_predicate preds[] = {
-    {base + range / 4, base + range / 2},  // mid (chunk 4 has zero survivors)
-    {base, base + range},                  // all pass
-    {base + 2 * range, base + 3 * range},  // none pass
+    {base + span / 4, base + span / 2},  // mid (chunk 4 has zero survivors)
+    {base, base + span},                 // all pass
+    {base + 2 * span, base + 3 * span},  // none pass
   };
   const char* pred_names[] = {"mid", "all", "none"};
 
@@ -670,6 +687,76 @@ bool run_ballot_edges(
               label,
               static_cast<long long>(n),
               survivors_report.c_str());
+  return true;
+}
+
+// The divisor-aware ballot where the chunk's domain spans almost all of int64. The values
+// INT64_MIN + k * 5 * 2^60 fold the divisor 5 * 2^60 into two-bit residuals, so a lower
+// bound's distance from the chunk minimum is close to 2^64 and rounding it up to a whole
+// number of divisors must not wrap.
+bool run_ballot_divisor_edges(int arch)
+{
+  const std::int64_t n = kChunk;
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+  constexpr std::int64_t kMin64 = std::numeric_limits<std::int64_t>::min();
+  constexpr std::int64_t kMax64 = std::numeric_limits<std::int64_t>::max();
+  constexpr std::int64_t kStep  = std::int64_t{5} << 60;
+  const auto value              = [&](std::int64_t k) {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(kMin64) +
+                                     static_cast<std::uint64_t>(k) *
+                                       static_cast<std::uint64_t>(kStep));
+  };
+
+  std::vector<std::int64_t> data(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    data[static_cast<std::size_t>(i)] = value(i % 4);
+  }
+  auto tree         = jit::FusedTree::make(OpKind::Bitpack);
+  tree->bitpack_gcd = true;
+  GpuEncoded enc =
+    codegen_test::gpu_encode_tree<std::int64_t>(*tree, "int64_t", data.data(), n, arch);
+  if (!compact_packed_on_host(enc, 1)) return false;
+  std::int64_t divisor = 0;
+  cudaMemcpy(&divisor,
+             device_ptr<std::int64_t>(enc, 0, "chunk_divisors"),
+             sizeof(divisor),
+             cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(divisor == kStep, "[ballot-divisor] divisor %lld", static_cast<long long>(divisor));
+
+  struct Case {
+    const char* name;
+    range_predicate pred;
+  };
+  const Case cases[] = {
+    {"at_top_value", {value(3), kMax64}},
+    {"just_above_top", {value(3) + 1, kMax64}},
+    {"just_above_second", {value(2) + 1, kMax64}},
+    {"just_above_minimum", {kMin64 + 1, kMax64}},
+    {"below_top", {kMin64, value(3) - 1}},
+    {"all_INT64", {kMin64, kMax64}},
+    {"between_values", {value(1) + 1, value(2) - 1}},
+  };
+  const std::size_t nwords = kWordsPerChunk;
+  for (const Case& c : cases) {
+    CUdeviceptr d_mask = enc.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                  stream, *tree, enc.buffers, "int64_t", n, c.pred, sm),
+                "[ballot-divisor/%s] mask_out launch failed",
+                c.name);
+    std::vector<std::uint32_t> got(nwords);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got == host_mask(data, 1, c.pred),
+                "[ballot-divisor/%s] ballot mask != host reference for [%lld, %lld]",
+                c.name,
+                static_cast<long long>(c.pred.lo),
+                static_cast<long long>(c.pred.hi));
+  }
+  std::printf("PASS: ballot-divisor/int64 near-full-range divisor\n");
   return true;
 }
 
@@ -1260,9 +1347,12 @@ bool render_checks()
               "FOR-rooted mask_consume must render via the generic seam");
 
   // 8. Launch geometry the launcher follows: the index walk serves one chunk
-  //    per warp, every other shape one chunk per block; the walk is
-  //    lane-strided over the two-word unpack and never synchronizes the
-  //    block, which its per-warp early returns rely on.
+  //    per warp, every other shape one chunk per block unless its spec says
+  //    otherwise (the plain Bitpack decode); the warp-mapped kernels never
+  //    synchronize the block, which their per-warp early returns rely on.
+  REQUIRE_MSG(s3.chunks_per_block == codegen::kTBSize / 32 &&
+                s3.source.find("__syncthreads") == std::string::npos,
+              "the plain bitpack decode must map one chunk per warp without block barriers");
   REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapeIndexConsume) == codegen::kTBSize / 32,
               "index walk must pack one chunk per warp");
   REQUIRE_MSG(cdj::chunks_per_block(cdj::kShapePlain) == 1 &&
@@ -1279,8 +1369,8 @@ bool render_checks()
 
   // 9. The Bitpack ballot compares in the packed domain; only the int64 lane
   //    can pack more than 32 bits and so only it carries the decoded-domain
-  //    path. The Delta ballot stays on the generic seam, and no other render
-  //    carries the two-word helpers (their JIT keys must not move).
+  //    path. The Delta ballot stays on the generic seam, and no other masked
+  //    render carries the two-word helpers (their JIT keys must not move).
   const cdj::DecodeKernelSpec k1_32 = cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskOut);
   REQUIRE_MSG(k1.source.find("(packed domain)") != std::string::npos &&
                 k1.source.find("simpatico_bp_field32") != std::string::npos &&
@@ -1297,9 +1387,8 @@ bool render_checks()
   REQUIRE_MSG(dk1.source.find("selection mask (generic)") != std::string::npos &&
                 !carries_narrow_prelude(dk1),
               "the delta ballot must stay on the generic seam without the two-word helpers");
-  REQUIRE_MSG(!carries_narrow_prelude(s3) && !carries_narrow_prelude(k3) &&
-                !carries_narrow_prelude(k5) && !carries_narrow_prelude(k6) &&
-                !carries_narrow_prelude(kfor) &&
+  REQUIRE_MSG(!carries_narrow_prelude(k3) && !carries_narrow_prelude(k5) &&
+                !carries_narrow_prelude(k6) && !carries_narrow_prelude(kfor) &&
                 !carries_narrow_prelude(cdj::render(*bp, "int64_t", 8, cdj::kShapeSparseConsume)),
               "the two-word prelude must join only the kernels that use it");
 
@@ -1644,6 +1733,14 @@ int main()
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
+    // Every value a multiple of `step`, so bitpack folds a per-chunk divisor and each
+    // variant must apply it; the mid bounds are not multiples, so rounding is exercised.
+    run_roundtrip<std::int32_t>("int32_t", 803'500, 2526, arch, 100);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 1000);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'000LL, 5052, arch, 100'000);
+    // Offset bases: no value is a multiple of the step, only every difference is.
+    run_roundtrip<std::int32_t>("int32_t", 803'507, 2526, arch, 100);
+    run_roundtrip<std::int64_t>("int64_t", -3'000'000'007LL, 5052, arch, 1000);
     // The ballot at open-ended / lane-typed bounds: engine lanes (int16 dates,
     // int32 decimals), negative minima, the full 32-bit int32 width, a 40-bit
     // int64 chunk and an int64 minimum next to INT64_MIN.
@@ -1660,6 +1757,7 @@ int main()
                                    std::numeric_limits<std::int64_t>::min() + 5,
                                    1LL << 13,
                                    arch);
+    run_ballot_divisor_edges(arch);
     // The index walk from 0.1% to 50% selectivity on 38 chunks (not a multiple of the chunks a
     // block serves), then the full-width int32 unpack and the int64 wide select at one selectivity.
     const auto index_walk_selectivities = {10u, 180u, 1400u, 5000u};
