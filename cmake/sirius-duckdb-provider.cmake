@@ -10,20 +10,22 @@ if(NOT EXISTS "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
       "Initialize the DuckDB submodule or set SIRIUS_DUCKDB_SOURCE_DIR")
 endif()
 
+# Installed with the package: the DuckDB extension refuses a library built from
+# another revision.
+include("${CMAKE_CURRENT_LIST_DIR}/sirius-duckdb-revision.cmake")
+sirius_duckdb_revision("${SIRIUS_DUCKDB_SOURCE_DIR}"
+                       SIRIUS_DUCKDB_SOURCE_REVISION)
+
 function(sirius_add_duckdb_source)
   # Keep DuckDB options scoped to its dependency build.
   set(DUCKDB_EXTENSION_CONFIGS "")
   set(BUILD_EXTENSIONS "core_functions;parquet")
   set(BUILD_SHELL OFF)
   set(BUILD_UNITTESTS OFF)
-  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION)
-    execute_process(
-      COMMAND git -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
-      OUTPUT_VARIABLE sirius_duckdb_commit
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(sirius_duckdb_commit STREQUAL "d54cbbe3df17e8e5ce68312f483b4155836112aa")
-      set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
-    endif()
+  if(NOT DEFINED DUCKDB_EXPLICIT_VERSION
+     AND SIRIUS_DUCKDB_SOURCE_REVISION STREQUAL
+         "d54cbbe3df17e8e5ce68312f483b4155836112aa")
+    set(DUCKDB_EXPLICIT_VERSION "v2.0.0")
   endif()
   # Root sanitizer presets supply flags to both the library and its dependency.
   set(ENABLE_SANITIZER OFF)

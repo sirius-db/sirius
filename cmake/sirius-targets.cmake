@@ -59,6 +59,8 @@ set(SIRIUS_LINK_LIBRARIES
     PkgConfig::LIBURING
     OpenSSL::Crypto
     absl::any_invocable
+    absl::strings
+    utf8proc::utf8proc
     # NVML: the NIXL fabric checks peer access between GPUs other processes own.
     CUDA::nvml)
 

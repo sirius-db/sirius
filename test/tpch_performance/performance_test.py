@@ -291,7 +291,6 @@ def setup_benchmark_dir(
         "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
-        "pin_compression": PIN_COMPRESSION_PLAN_DIR is not None,
         "compression_plan_dir": PIN_COMPRESSION_PLAN_DIR,
         "precmd": precmd,
         # Keep this field while downstream report scripts migrate to `precmd`.
@@ -518,8 +517,9 @@ class S3Input:
 
 DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
-# Set from --pin-compression/--compression-plan-dir in main(); when set, every
-# Sirius connection enables Simpatico compression for its pin_table calls.
+# Set from --compression-plan-dir in main(); when set, every Sirius connection
+# points pin_table at those plan files. Whether pins are compressed at all is the
+# engine's setting (pin_table_compression, on by default).
 PIN_COMPRESSION_PLAN_DIR = None
 
 
@@ -809,13 +809,8 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
             con.execute(stmt)
         log("All TPC-H views registered")
     if gpu_execution:
-        con.execute(
-            f"SET pin_table_compression = {'true' if PIN_COMPRESSION_PLAN_DIR else 'false'};"
-        )
         if PIN_COMPRESSION_PLAN_DIR:
-            log(
-                f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
-            )
+            log(f"Simpatico pin compression plans: {PIN_COMPRESSION_PLAN_DIR}")
             con.execute(
                 "SET pin_table_input_compression_plan_dir = "
                 f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
@@ -1219,15 +1214,11 @@ def _build_precmd_temp_sql(
         parts.append(_build_views_sql(source).rstrip("\n"))
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
-    if pin != "none":
+    if pin != "none" and PIN_COMPRESSION_PLAN_DIR:
         parts.append(
-            f"SET pin_table_compression = {'true' if PIN_COMPRESSION_PLAN_DIR else 'false'};"
+            "SET pin_table_input_compression_plan_dir = "
+            f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
         )
-        if PIN_COMPRESSION_PLAN_DIR:
-            parts.append(
-                "SET pin_table_input_compression_plan_dir = "
-                f"{_sql_literal(PIN_COMPRESSION_PLAN_DIR)};"
-            )
 
     pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
     if pre_sql:
@@ -2086,22 +2077,14 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--pin-compression",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Compress the pinned tables with Simpatico; needs --pin gpu|host "
-            "and per-table plan files (--compression-plan-dir)"
-        ),
-    )
-    p.add_argument(
         "--compression-plan-dir",
         type=str,
         default=None,
         help=(
             "Directory of per-table Simpatico plan files (<table>.<ext>) for "
-            "--pin-compression (default: the SF1000 plans under "
-            "src/compression/simpatico_codegen/plans)"
+            "compressed pins; needs --pin gpu|host. Without it, pins compressed "
+            "under the engine's pin_table_compression setting (on by default) "
+            "select plans automatically"
         ),
     )
     p.add_argument(
@@ -2250,15 +2233,14 @@ def main():
             )
         duckdb_results_dir = _resolve_duckdb_results_dir(args.duckdb_results)
 
-    # Simpatico compression happens at pin time, so it only applies to pinned
-    # input, and it is a no-op without a plan file naming a TPC-H table.
-    if args.pin_compression:
+    # Plan files apply at pin time, so they need pinned input, and a directory
+    # naming no TPC-H table would change nothing.
+    if args.compression_plan_dir:
         if args.pin == "none":
-            raise SystemExit("--pin-compression needs a pinned tier (--pin gpu|host)")
-        plan_dir = args.compression_plan_dir or os.path.join(
-            REPO_ROOT, "src/compression/simpatico_codegen/plans/tpch_sf1000"
-        )
-        plan_dir = os.path.abspath(plan_dir)
+            raise SystemExit(
+                "--compression-plan-dir needs a pinned tier (--pin gpu|host)"
+            )
+        plan_dir = os.path.abspath(args.compression_plan_dir)
         if not os.path.isdir(plan_dir):
             raise SystemExit(f"--compression-plan-dir not found: {plan_dir}")
         plan_stems = {os.path.splitext(f)[0] for f in os.listdir(plan_dir)}
@@ -2429,7 +2411,7 @@ def main():
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
     if PIN_COMPRESSION_PLAN_DIR:
-        log(f"Compression:   simpatico ({PIN_COMPRESSION_PLAN_DIR})")
+        log(f"Compression plans: {PIN_COMPRESSION_PLAN_DIR}")
     log(f"DuckDB profiling: {args.duckdb_profiling}")
     log(f"Pre-command:   {precmd}")
     log(f"Benchmark dir: {benchmark_dir}")

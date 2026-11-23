@@ -102,10 +102,12 @@ struct inventory_query_error : std::runtime_error {
 std::unordered_set<std::string> iceberg_files_without_partition_values(
   duckdb::ClientContext&, iceberg_delete_inventory const&);
 
+/// @p expected_table_uuid is checked by iceberg_metadata() when the loaded extension accepts it.
 inventory_result read_delete_inventory(duckdb::ClientContext&,
                                        std::string const&,
                                        std::optional<int64_t>,
-                                       std::string_view injection = {});
+                                       std::string_view injection           = {},
+                                       std::string_view expected_table_uuid = {});
 iceberg_delete_discovery discover_from_manifests(duckdb::ClientContext&,
                                                  std::string const&,
                                                  iceberg_delete_inventory&&);

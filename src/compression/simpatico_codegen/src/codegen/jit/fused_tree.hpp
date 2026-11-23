@@ -41,6 +41,11 @@ inline constexpr std::size_t kBitpackLiveWordShards      = 16;
 inline constexpr std::size_t kBitpackLiveWordShardStride = 32;
 static_assert((kBitpackLiveWordShards & (kBitpackLiveWordShards - 1)) == 0,
               "the kernel picks a shard with a mask");
+// Word 1 of the slab is not a counter: a chunk whose folded-in divisor is not 1 sets it,
+// and the host drops the `chunk_divisors` channel of a Bitpack that never set it.
+inline constexpr std::size_t kBitpackDivisorFlagWord = 1;
+static_assert(kBitpackDivisorFlagWord % kBitpackLiveWordShardStride != 0,
+              "the divisor flag must not alias a shard counter");
 
 inline constexpr int32_t num_chunks_for(int64_t n) noexcept
 {
@@ -60,6 +65,10 @@ struct FusedTree {
   // FusedTrees without copying (the same subtree can appear in more
   // than one place).
   std::map<std::string, std::shared_ptr<FusedTree>> children;
+
+  // Bitpack only: the encoder detects a per-chunk divisor of the residuals. Without it
+  // every chunk's divisor is 1 and the detection code is not emitted.
+  bool bitpack_gcd = false;
 
   bool is_leaf() const noexcept { return children.empty(); }
 

@@ -154,7 +154,7 @@ class _RecordingConnection:
 
 
 class TestOpenConnection(unittest.TestCase):
-    def test_gpu_connection_applies_pin_compression_and_pre_sql_after_load(self):
+    def test_gpu_connection_applies_compression_plans_and_pre_sql_after_load(self):
         con = _RecordingConnection()
         pre_sql = "SET expression_evaluator_strategy = 'ast_jit'; SET threads = 4"
         with (
@@ -170,7 +170,6 @@ class TestOpenConnection(unittest.TestCase):
         self.assertEqual(
             con.statements[load + 1 :],
             [
-                "SET pin_table_compression = true;",
                 "SET pin_table_input_compression_plan_dir = '/plans';",
                 "SET expression_evaluator_strategy = 'ast_jit'",
                 "SET threads = 4",
