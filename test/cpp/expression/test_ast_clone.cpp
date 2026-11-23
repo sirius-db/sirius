@@ -96,7 +96,7 @@ TEST_CASE("ast_clone - cloning an aggregate deep-clones its reference child", "[
   REQUIRE(agg.arguments()[0]->get<reference>().column_index == 3);
 }
 
-TEST_CASE("ast_clone - cloning an aggregate keeps its ORDER BY", "[ast_clone]")
+TEST_CASE("ast_clone - cloning an aggregate keeps its ORDER BY", "[ast_clone][distinct]")
 {
   auto const type = sirius::logical_type::make(sirius::type_id::INTEGER);
   std::vector<std::unique_ptr<node>> args;

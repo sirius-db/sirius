@@ -167,7 +167,7 @@ TEST_CASE("ast_aggregate - direct node construction reads back fields", "[ast_ag
   REQUIRE(agg.order().empty());
 }
 
-TEST_CASE("ast_aggregate - ORDER BY keys are trailing arguments", "[ast_aggregate]")
+TEST_CASE("ast_aggregate - ORDER BY keys are trailing arguments", "[ast_aggregate][distinct]")
 {
   auto const integer  = sirius::logical_type::make(sirius::type_id::INTEGER);
   auto make_arguments = [&](std::size_t count) {
@@ -340,7 +340,7 @@ TEST_CASE("ast_aggregate - unsupported aggregate name yields nullptr fallback (n
 }
 
 TEST_CASE("ast_aggregate - an aggregate ORDER BY translates to trailing key arguments",
-          "[ast_aggregate]")
+          "[ast_aggregate][distinct]")
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
   children.push_back(duckdb::make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
@@ -374,7 +374,8 @@ TEST_CASE("ast_aggregate - an aggregate ORDER BY translates to trailing key argu
                                     {sort_direction::ascending, null_placement::last}});
 }
 
-TEST_CASE("ast_aggregate - an unresolved ORDER BY modifier yields nullptr", "[ast_aggregate]")
+TEST_CASE("ast_aggregate - an unresolved ORDER BY modifier yields nullptr",
+          "[ast_aggregate][distinct]")
 {
   bool const default_direction = GENERATE(false, true);
   CAPTURE(default_direction);

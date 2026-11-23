@@ -921,10 +921,10 @@ TEST_CASE_METHOD(DistinctFixture,
   {
     compare_gpu_vs_cpu(
       "SELECT k, first(v ORDER BY s COLLATE NOCASE DESC, t) FROM dist_ord GROUP BY k");
-    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s COLLATE NOCASE, t) FROM dist_ord GROUP BY k");
   }
 
-  // `t` as DECIMAL and as DATE, so the sort runs on fixed-point and timestamp-days storage.
+  // `t` as DECIMAL and as DATE, so the sort runs on fixed-point and timestamp-days storage. Under
+  // `DESC NULLS FIRST` groups 1 and 2 keep their middle NULL row, which no unordered route keeps.
   SECTION("DECIMAL and DATE keys")
   {
     run_ok(
@@ -932,22 +932,74 @@ TEST_CASE_METHOD(DistinctFixture,
       "DATE '2024-01-01' + t AS dt FROM dist_ord ORDER BY v;");
     run_ok("CHECKPOINT;");
     compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dec) FROM dist_ord_types GROUP BY k");
-    compare_gpu_vs_cpu("SELECT k, first(v ORDER BY dt DESC) FROM dist_ord_types GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY dt DESC NULLS FIRST) FROM dist_ord_types GROUP BY k");
+  }
+
+  // stddev_samp is an M2 request, so the groupby sorts every request's values, the rank included.
+  SECTION("beside an M2 aggregate")
+  {
+    compare_gpu_vs_cpu_on_columns(
+      "SELECT k, first(v ORDER BY t), stddev_samp(t) FROM dist_ord GROUP BY k", {0, 1});
   }
 }
 
-// Known issue #2598, not fixed here: the GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps
-// it to "i", so a NOCASE key that differs there keeps another row. [!shouldfail] keeps CI green
-// and flags the day it passes.
 TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution first(v ORDER BY ...) under NOCASE ranks by DuckDB's lower()",
-                 "[integration][gpu_execution][distinct][aggregate][!shouldfail]")
+                 "gpu_execution ordered FIRST breaks signed-zero and NaN ties by its next key",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Each group's first key ties (-0.0 = 0.0, -NaN = NaN), so `t` alone picks the row: a
+  // sign-aware float order keeps v 1 (ASC) and v 5 or v 3 (DESC) instead.
+  run_ok("CREATE TABLE dist_zero (k INTEGER, v INTEGER, d DOUBLE, t INTEGER);");
+  run_ok(
+    "INSERT INTO dist_zero VALUES (1, 1, '-0.0'::DOUBLE, 20), (1, 2, 0.0, 10), "
+    "(2, 3, 'nan'::DOUBLE, 20), (2, 4, -('nan'::DOUBLE), 10), "
+    "(3, 5, 0.0, 20), (3, 6, '-0.0'::DOUBLE, 10);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d, t) FROM dist_zero GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY d DESC, t) FROM dist_zero GROUP BY k");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_zero ORDER BY d DESC, t");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ordered FIRST over a filter that keeps no row",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // A live filter, unlike `WHERE false`, is not folded away, so the ranked selector sees 0 rows.
+  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY t) FROM dist_ord WHERE v > 100 GROUP BY k");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, v FROM dist_ord WHERE v > 100 ORDER BY t");
+}
+
+// Known issue #2598, not fixed here: the GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps
+// it to "i", so a NOCASE key that differs there keeps another row. Pins the GPU route and its wrong
+// value; when either changes, replace the checks with compare_gpu_vs_cpu.
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution first(v ORDER BY ...) under NOCASE diverges from DuckDB (#2598)",
+                 "[integration][gpu_execution][distinct][aggregate]")
 {
   // DuckDB orders 'ia' (from 'İa') before 'ib' and keeps v 1; the GPU's 'i̇a' sorts after 'ib'.
   run_ok("CREATE TABLE dist_nocase (k INTEGER, s VARCHAR, v INTEGER);");
   run_ok("INSERT INTO dist_nocase VALUES (1, 'İa', 1), (1, 'ib', 2);");
   run_ok("CHECKPOINT;");
-  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s COLLATE NOCASE) FROM dist_nocase GROUP BY k");
+  auto const* query = "SELECT first(v ORDER BY s COLLATE NOCASE) FROM dist_nocase GROUP BY k";
+
+  run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto gpu          = con->Query(query);
+  REQUIRE(gpu);
+  REQUIRE_FALSE(gpu->HasError());
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
+  REQUIRE(gpu->RowCount() == 1);
+  CHECK(gpu->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(2));
+
+  run_ok("SET gpu_execution = false;");
+  auto cpu = con->Query(query);
+  run_ok("SET gpu_execution = true;");
+  REQUIRE(cpu);
+  REQUIRE_FALSE(cpu->HasError());
+  REQUIRE(cpu->RowCount() == 1);
+  CHECK(cpu->Collection().GetValue(0, 0) == duckdb::Value::INTEGER(1));
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
@@ -969,6 +1021,26 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   compare_gpu_vs_cpu(
     "SELECT k, first(payload ORDER BY payload DESC), count(*), count(DISTINCT payload % 7) "
     "FROM dist_dup GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution ordered carried rows rank NULL keys across batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Rows from 500000 on have a NULL key, so the later batches send NULL-keyed partials to the
+  // merge; the winner, 499990 + k, needs NULLs placed per key at the merge as well.
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload >= 500000 THEN NULL "
+    "ELSE payload END DESC) AS w FROM dist_dup GROUP BY k) WHERE w <> 499990 + k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT k, first(payload ORDER BY CASE WHEN payload < 500000 THEN NULL "
+    "ELSE payload END NULLS FIRST, payload DESC) AS w FROM dist_dup GROUP BY k) "
+    "WHERE w <> 499990 + k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM (SELECT DISTINCT ON (k) k, payload FROM dist_dup ORDER BY CASE WHEN "
+    "payload >= 500000 THEN NULL ELSE payload END DESC) WHERE payload <> 499990 + k");
 }
 
 //===----------------------------------------------------------------------===//
