@@ -23,6 +23,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
+#include "operator/operator_test_utils.hpp"
 #include "operator/operator_type_traits.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/data_utils.hpp"
@@ -31,8 +32,6 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/bit.hpp>
-
-#include <rmm/device_buffer.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -1248,25 +1247,6 @@ std::map<int64_t, int64_t> carried_value_by_key(data_batch& output)
   return by_key;
 }
 
-/// Sets the rows of @p column whose entry in @p valid is false to NULL.
-void set_nulls(cudf::column& column, std::vector<bool> const& valid)
-{
-  std::vector<std::uint32_t> words(
-    cudf::bitmask_allocation_size_bytes(column.size()) / sizeof(std::uint32_t), 0);
-  cudf::size_type nulls = 0;
-  for (cudf::size_type i = 0; i < column.size(); ++i) {
-    if (valid[static_cast<std::size_t>(i)]) {
-      words[static_cast<std::size_t>(i) / 32] |= 1U << (i % 32);
-    } else {
-      ++nulls;
-    }
-  }
-  column.set_null_mask(
-    rmm::device_buffer(
-      words.data(), words.size() * sizeof(std::uint32_t), cudf::get_default_stream()),
-    nulls);
-}
-
 }  // namespace
 
 TEST_CASE("Ordered selector maps each group's minimum rank back to its row",
@@ -1394,7 +1374,8 @@ TEST_CASE("Ordered grouped aggregate honors NULL placement, direction and every 
         sirius::test::vector_to_cudf_column<sirius::test::operator_utils::gpu_type_traits<int64_t>>(
           values, stream, mr));
     }
-    set_nulls(*columns[2], {true, false, false, true, true, true, true});
+    columns[2] = sirius::test::operator_utils::with_nulls(
+      std::move(columns[2]), {true, false, false, true, true, true, true}, stream, mr);
     auto input = sirius::make_data_batch(std::make_unique<cudf::table>(std::move(columns)),
                                          *mem_space,
                                          stream,
