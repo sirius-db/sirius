@@ -990,6 +990,17 @@ TEST_CASE_METHOD(DistinctFixture,
       "SELECT k, last(v ORDER BY t), first(s ORDER BY t DESC NULLS FIRST) FROM dist_ord GROUP BY "
       "k");
   }
+
+  // The shared key's `t` and the lone aggregate's `t` read one column, so one order remains.
+  SECTION("two LASTs sharing an ORDER BY beside a FIRST under the reversed order")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT k, last(v ORDER BY t), last(s ORDER BY t), first(u ORDER BY t DESC NULLS FIRST) "
+      "FROM dist_ord GROUP BY k");
+    compare_gpu_vs_cpu(
+      "SELECT k, first(v ORDER BY t), first(s ORDER BY t), last(u ORDER BY t DESC NULLS FIRST) "
+      "FROM dist_ord GROUP BY k");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFixture,

@@ -3197,6 +3197,26 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(chain.firsts[0].order == chain.firsts[1].order);
   }
 
+  // The LASTs' shared sort key is inlined over `val`, which the FIRST's own key already projects.
+  SECTION("LASTs sharing an ORDER BY and a FIRST under the reversed order share one row")
+  {
+    auto const require_one_order = [&](std::string const& query) {
+      INFO(query);
+      auto plan = generate_sirius_plan(*con, query);
+      INFO(tree_to_string(plan.get()));
+      auto const chain = require_ordered_chain(plan.get());
+      REQUIRE(chain.firsts.size() == 3);
+      CHECK(chain.firsts[0].order == chain.firsts[1].order);
+      CHECK(chain.firsts[0].order == chain.firsts[2].order);
+    };
+    require_one_order(
+      "SELECT id, last(val ORDER BY val), last(id ORDER BY val), first(id ORDER BY val DESC NULLS "
+      "FIRST) FROM big_left GROUP BY id");
+    require_one_order(
+      "SELECT id, first(val ORDER BY val), first(id ORDER BY val), last(id ORDER BY val DESC NULLS "
+      "FIRST) FROM big_left GROUP BY id");
+  }
+
   SECTION("an ordered FIRST or LAST with DISTINCT is decoded without it")
   {
     // DuckDB passes DISTINCT through its rewrite, which the GPU refuses on anything but COUNT.

@@ -259,7 +259,7 @@ std::size_t count_references(duckdb::Expression const& expression, duckdb::idx_t
 // DuckDB's common-subexpression pass moves a create_sort_key that several ordered FIRSTs or LASTs
 // share into the projection below, leaving arg_min_null(v, #i) or arg_max_null(v, #i). When only
 // such aggregates read #i, puts the sort key back inline over key columns: #i becomes the first
-// key, the others are appended.
+// key, the others are appended, and a key already projected elsewhere reads that column.
 void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
 {
   if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) { return; }
@@ -292,17 +292,25 @@ void inline_shared_sort_keys(duckdb::LogicalAggregate& op)
     auto& terms         = sort_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
     auto inline_key     = sort_key->Copy();
     auto& inline_terms  = inline_key->Cast<duckdb::BoundFunctionExpression>().GetChildrenMutable();
+    projection.types[index]       = terms[0]->GetReturnType();
+    projection.expressions[index] = terms[0]->Copy();
     for (std::size_t term = 0; term < terms.size(); term += 2) {
-      auto const column = term == 0 ? index : projection.expressions.size();
+      // An equal column already projected is reused, so equal orders decode to equal references.
+      auto const& expressions = projection.expressions;
+      auto const reused       = std::ranges::find_if(expressions, [&](auto const& projected) {
+        return &projected != &expressions[index] && projected->Equals(*terms[term]);
+      });
+      auto column             = static_cast<duckdb::idx_t>(reused - expressions.begin());
+      if (reused == expressions.end()) {
+        column = term == 0 ? index : expressions.size();
+        if (term != 0) {
+          projection.types.push_back(terms[term]->GetReturnType());
+          projection.expressions.push_back(terms[term]->Copy());
+        }
+      }
       inline_terms[term] =
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(terms[term]->GetReturnType(), column);
-      if (term != 0) {
-        projection.types.push_back(terms[term]->GetReturnType());
-        projection.expressions.push_back(std::move(terms[term]));
-      }
     }
-    projection.types[index]       = terms[0]->GetReturnType();
-    projection.expressions[index] = std::move(terms[0]);
     for (auto* aggregate : aggregates) {
       aggregate->GetChildrenMutable()[1] = inline_key->Copy();
     }
