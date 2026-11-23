@@ -1170,7 +1170,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   // A FIRST's ORDER BY runs only grouped, one ORDER BY per aggregate list. A FILTER on FIRST is
   // refused above because FIRST does not skip NULLs.
-  duckdb::BoundOrderModifier const* first_order = nullptr;
+  duckdb::BoundAggregateExpression const* first_ordered = nullptr;
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
     if (!is_first(aggregate)) { continue; }
@@ -1181,12 +1181,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
           "back to CPU): " +
           aggregate.ToString());
       }
-      if (first_order && !duckdb::BoundOrderModifier::Equals(*first_order, *order)) {
+      if (first_ordered &&
+          !duckdb::BoundOrderModifier::Equals(*first_ordered->GetOrderBys(), *order)) {
         throw duckdb::NotImplementedException(
           "first() with different ORDER BYs in one GROUP BY is not supported on the GPU (falling "
-          "back to CPU)");
+          "back to CPU); an ordered last() counts as first() under the reversed order: " +
+          first_ordered->ToString() + " vs " + aggregate.ToString());
       }
-      first_order = order.get();
+      first_ordered = &aggregate;
       for (auto const& key : order->orders) {
         reject_nested_column_operation(*key.expression, "an aggregate ORDER BY");
       }
@@ -1196,7 +1198,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     if (has_grouping_sets) {
       throw duckdb::NotImplementedException(
         "grouped FIRST is not supported over several grouping sets or beside a grouping function "
-        "(falling back to CPU)");
+        "(falling back to CPU); an ordered last() counts as first(): " +
+        aggregate.ToString());
     }
   }
 
