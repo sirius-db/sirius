@@ -47,6 +47,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "planner/aggregate_binding.hpp"
 #include "planner/decimal_sum_input_bounds.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -597,9 +598,7 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   }
   auto const& aggr        = op.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
   auto const aggregate_id = builtin_count_candidate_id(aggr);
-  if (!aggregate_id || aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys()) {
-    return std::nullopt;
-  }
+  if (!aggregate_id || !is_plain_aggregate(aggr)) { return std::nullopt; }
   bool const is_count = *aggregate_id == sirius::aggregate_id::count;
   if (is_count &&
       aggr.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {

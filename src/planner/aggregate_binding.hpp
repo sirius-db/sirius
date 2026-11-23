@@ -37,4 +37,8 @@ duckdb::unique_ptr<duckdb::BoundAggregateExpression> bind_builtin_aggregate(
   duckdb::unique_ptr<duckdb::Expression> argument,
   duckdb::unique_ptr<duckdb::Expression> filter = nullptr);
 
+/// Whether @p aggregate has no DISTINCT, FILTER, ORDER BY or exported state: the parts a rewrite
+/// loses when it rebinds the aggregate with `bind_builtin_aggregate` and no FILTER.
+bool is_plain_aggregate(duckdb::BoundAggregateExpression const& aggregate);
+
 }  // namespace sirius::planner
