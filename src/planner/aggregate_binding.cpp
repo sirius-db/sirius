@@ -42,4 +42,15 @@ duckdb::unique_ptr<duckdb::BoundAggregateExpression> bind_builtin_aggregate(
   return binder.BindAggregateFunction(std::move(function), std::move(children), std::move(filter));
 }
 
+bool sum_combines_exactly(duckdb::LogicalType const& argument)
+{
+  if (argument.id() != duckdb::LogicalTypeId::DECIMAL) { return false; }
+  switch (argument.InternalType()) {
+    case duckdb::PhysicalType::INT16:
+    case duckdb::PhysicalType::INT32:
+    case duckdb::PhysicalType::INT64: return true;
+    default: return false;
+  }
+}
+
 }  // namespace sirius::planner

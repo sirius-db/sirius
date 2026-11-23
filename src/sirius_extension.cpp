@@ -3105,6 +3105,14 @@ static void SetEnableDelimAggregateReuse(ClientContext& context, SetScope scope,
                    params->enable_delim_aggregate_reuse);
 }
 
+static void SetEnableScanReuseRewrites(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                       = get_operator_params(context, scope);
+  params->enable_scan_reuse_rewrites = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SCAN_REUSE_REWRITES to {}",
+                   params->enable_scan_reuse_rewrites);
+}
+
 static void SetEnableExistsMinmaxRewrite(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                         = get_operator_params(context, scope);
@@ -3741,6 +3749,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_delim_aggregate_reuse),
                     SetEnableDelimAggregateReuse);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_scan_reuse_rewrites",
+                    "reuse an IN-subquery's grouped SUM instead of scanning its table again",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_scan_reuse_rewrites),
+                    SetEnableScanReuseRewrites);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_exists_minmax_rewrite",

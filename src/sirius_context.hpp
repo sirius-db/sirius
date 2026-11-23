@@ -422,6 +422,8 @@ class SiriusContext : public ClientContextState {
     uint64_t exists_minmax_rewrites = 0;
     // Aggregates pushed below a join that only adds group-by payload, in captured plans.
     uint64_t partial_aggregate_pushdowns = 0;
+    // Scans removed by the scan-reuse rewrite, per planning of a captured plan.
+    uint64_t scan_reuse_rewrites = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
     uint64_t provider_internal_skips          = 0;
     uint64_t hidden_catalog_skips             = 0;
@@ -927,6 +929,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Record @p count aggregates pushed below a join that only adds group-by payload.
   void record_partial_aggregate_pushdowns(uint64_t count) noexcept;
 
+  /// \brief Record @p count scans removed by the scan-reuse rewrite.
+  void record_scan_reuse_rewrites(uint64_t count) noexcept;
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -1078,6 +1083,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
   std::atomic<uint64_t> exists_minmax_rewrite_count_{0};
   std::atomic<uint64_t> partial_aggregate_pushdown_count_{0};
+  std::atomic<uint64_t> scan_reuse_rewrite_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
