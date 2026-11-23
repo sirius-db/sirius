@@ -45,7 +45,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <deque>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
@@ -363,6 +366,29 @@ bool spec_partitions(std::string const& spec_json)
   return false;
 }
 
+/// The value a partition tuple is matched by. Floating-point fields are matched by bit pattern
+/// with NaNs normalized, as the spec compares them, except that -0.0 is matched as +0.0: DuckDB's
+/// Iceberg reader takes the two zeros for one partition, and this path returns its rows.
+duckdb::Value partition_key(duckdb::Value const& tuple)
+{
+  if (tuple.IsNull()) return tuple;
+  auto const& fields = duckdb::StructType::GetChildTypes(tuple.type());
+  duckdb::child_list_t<duckdb::Value> key;
+  for (auto const& value : duckdb::StructValue::GetChildren(tuple)) {
+    auto const& [name, type] = fields[key.size()];
+    if (value.IsNull() || !type.IsFloating()) {
+      key.emplace_back(name, value);
+      continue;
+    }
+    // FLOAT widens to DOUBLE exactly, so one bit pattern serves both.
+    auto number = value.GetValue<double>();
+    if (number == 0) number = 0;  // the exception: -0.0 becomes +0.0
+    if (std::isnan(number)) number = std::numeric_limits<double>::quiet_NaN();
+    key.emplace_back(name, duckdb::Value::UBIGINT(std::bit_cast<uint64_t>(number)));
+  }
+  return duckdb::Value::STRUCT(std::move(key));
+}
+
 }  // namespace
 
 iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
@@ -505,7 +531,7 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
           if (auto const [type, fresh] = tuple_type.emplace(spec_id, tuple.type());
               !fresh && type->second != tuple.type())
             throw fail("partition tuples of spec " + std::to_string(spec_id) + " differ in type");
-          by_partition[spec_id][std::move(tuple)].push_back(scoped);
+          by_partition[spec_id][partition_key(tuple)].push_back(scoped);
         }
         files.push_back(std::move(file));
       }
@@ -565,7 +591,8 @@ iceberg_equality_plan read_equality_plan(duckdb::ClientContext& context,
       if (auto const spec = by_partition.find(place->second.spec_id); spec != by_partition.end()) {
         if (place->second.tuple.type() != tuple_type.at(spec->first))
           throw fail("partition tuples of spec " + std::to_string(spec->first) + " differ in type");
-        if (auto const scope = spec->second.find(place->second.tuple); scope != spec->second.end())
+        if (auto const scope = spec->second.find(partition_key(place->second.tuple));
+            scope != spec->second.end())
           add(scope->second);
       }
     }

@@ -1856,15 +1856,24 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqRulesFixture,
                          2);
   }
   {
-    INFO("partition tuples compare as DuckDB values");
-    // Three data files hold ids 1..3 with v = 10 * file + id, in partitions f=-0.0, f=+0.0 and
-    // f=1.5; id=1 is deleted in f=+0.0. DuckDB takes the two zeros for one partition, so the row
-    // goes from both files. Comparing bit patterns, as the spec does, keeps v=11.
-    auto path = table("iceberg_v2_eq_signed_zero");
-    require_delete_files(path, 1);
-    expect_equality_rows(
-      "SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
-      {{"2", "12"}, {"3", "13"}, {"2", "22"}, {"3", "23"}, {"1", "31"}, {"2", "32"}, {"3", "33"}});
+    INFO("floating-point partition values");
+    // Four data files hold ids 1..3 with v = 10 * file + id, in partitions f=-0.0, f=+0.0, f=1.5
+    // and f=NaN. id=1 is deleted in f=+0.0: DuckDB takes the two zeros for one partition, so the
+    // row goes from both files, where the spec's bit patterns keep v=11. id=2 is deleted in a NaN
+    // partition whose sign bit is set: every NaN is one partition, so v=42 goes.
+    auto path = table("iceberg_v2_eq_float_partition");
+    require_delete_files(path, 2);
+    expect_equality_rows("SELECT id, v FROM " + pinned_scan(path) + " ORDER BY v;",
+                         {{"2", "12"},
+                          {"3", "13"},
+                          {"2", "22"},
+                          {"3", "23"},
+                          {"1", "31"},
+                          {"2", "32"},
+                          {"3", "33"},
+                          {"1", "41"},
+                          {"3", "43"}},
+                         2);
   }
   {
     INFO("upsert within one commit");

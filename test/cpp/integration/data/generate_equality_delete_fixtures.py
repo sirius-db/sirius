@@ -32,11 +32,12 @@ are listed beside the right ones, so a failure says which rule broke:
                                     version 1 wrote the data manifest, which has no `content`
                                     field and no sequence numbers. A reader that needs `content`
                                     cannot plan the partition-scoped delete.
-  iceberg_v2_eq_signed_zero         Data files in partitions -0.0, +0.0 and 1.5 of a float field;
-                                    the delete is stored in +0.0. DuckDB takes the two zeros for
-                                    one partition and deletes from both files, and the GPU path
-                                    returns DuckDB's rows. The spec compares bit patterns, which
-                                    keeps the row in -0.0.
+  iceberg_v2_eq_float_partition     Data files in partitions -0.0, +0.0, 1.5 and NaN of a float
+                                    field. A delete stored in +0.0 also reaches -0.0: DuckDB takes
+                                    the two zeros for one partition and the GPU path returns its
+                                    rows, where the spec's bit patterns keep them apart. A delete
+                                    stored in a NaN with its sign bit set reaches the NaN file:
+                                    every NaN is one partition.
   iceberg_v2_eq_upsert_same_commit  One commit rewrites key 2 twice: the equality delete removes
                                     the OLDER commit's row, a position delete removes this
                                     commit's first version. Applying the equality delete to its
@@ -232,7 +233,7 @@ class Table:
 
         def summary(field):
             values = [p[field["name"]] for *_, p, _ in entries if p]
-            present = sorted(v for v in values if v is not None)
+            present = sorted(v for v in values if v is not None and v == v)
 
             def bound(v):
                 if isinstance(v, float):
@@ -240,8 +241,8 @@ class Table:
                 return v.encode() if isinstance(v, str) else v.to_bytes(4, "little")
 
             return {
-                "contains_null": len(present) != len(values),
-                "contains_nan": False,
+                "contains_null": any(v is None for v in values),
+                "contains_nan": any(v != v for v in values),
                 "lower_bound": bound(present[0]) if present else None,
                 "upper_bound": bound(present[-1]) if present else None,
             }
@@ -678,12 +679,12 @@ def build_partition_shapes():
     t.finish()
 
 
-def build_signed_zero():
+def build_float_partition():
     import pyarrow as pa
 
     spec = [{"name": "f", "transform": "identity", "source-id": 2, "field-id": 1000}]
     t = Table(
-        "iceberg_v2_eq_signed_zero",
+        "iceberg_v2_eq_float_partition",
         [[(1, "id", "long"), (2, "f", "float"), (3, "v", "long")]],
         [spec],
         partition_types={"f": "float"},
@@ -700,13 +701,21 @@ def build_signed_zero():
         )
         return (1, None, file, 0, {"f": f}, None)
 
+    def delete(key, f):
+        file = t.parquet(f"delete-eq-{key}.parquet", [(1, "id", pa.int64(), [key])])
+        return (1, None, file, 2, {"f": f}, [1])
+
+    nan = float("nan")
+    files = [data(1, -0.0), data(2, 0.0), data(3, 1.5), data(4, nan)]
+    t.commit("append", [("m-data-1.avro", 0, 0, files)])
+    # -nan sets the sign bit, which a conforming Avro writer does not. It has its own manifest:
+    # DuckDB skips a NaN delete when its manifest's partition summary has bounds.
     t.commit(
-        "append",
-        [("m-data-1.avro", 0, 0, [data(1, -0.0), data(2, 0.0), data(3, 1.5)])],
-    )
-    delete = t.parquet("delete-eq-2.parquet", [(1, "id", pa.int64(), [1])])
-    t.commit(
-        "delete", [("m-delete-2.avro", 1, 0, [(1, None, delete, 2, {"f": 0.0}, [1])])]
+        "delete",
+        [
+            ("m-delete-2a.avro", 1, 0, [delete(1, 0.0)]),
+            ("m-delete-2b.avro", 1, 0, [delete(2, -nan)]),
+        ],
     )
     t.finish()
 
@@ -1049,10 +1058,10 @@ FIXTURES = {
         lambda: build_partitioned("iceberg_v2_eq_v1_data_manifest", True),
         [(1, "B", 30), (3, "A", 50), (3, "B", 60)],
     ),
-    "iceberg_v2_eq_signed_zero": (
-        build_signed_zero,
-        [(2, -0.0, 12), (3, -0.0, 13), (2, 0.0, 22), (3, 0.0, 23)]
-        + [(i, 1.5, 30 + i) for i in (1, 2, 3)],
+    # Ids only: a NaN in an expected row never compares equal.
+    "iceberg_v2_eq_float_partition": (
+        build_float_partition,
+        {2: [(2,), (3,), (2,), (3,), (1,), (2,), (3,), (1,), (3,)]},
     ),
     "iceberg_v2_eq_upsert_same_commit": (
         build_upsert_same_commit,
