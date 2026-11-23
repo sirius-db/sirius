@@ -414,6 +414,12 @@ class expression_evaluator {
     return _ast_jit_evaluation_count;
   }
 
+  /// Number of interpreted AST evaluations over the evaluator lifetime.
+  [[nodiscard]] std::size_t ast_interpret_evaluation_count_for_testing() const noexcept
+  {
+    return _ast_interpret_evaluation_count;
+  }
+
   /// Number of shared LIKE-cache lookups over the evaluator lifetime.
   [[nodiscard]] std::size_t like_shared_cache_lookup_count_for_testing() const noexcept
   {
@@ -443,6 +449,7 @@ class expression_evaluator {
   like_classification_memo _like_classifications;
   std::size_t _like_shared_cache_lookup_count{0};
   std::size_t _ast_jit_evaluation_count{0};
+  std::size_t _ast_interpret_evaluation_count{0};
   std::size_t _selective_evaluation_count{0};
   bool _in_eager_conditional{false};  ///< An enclosing conditional's eager pass, which retries
   bool _in_selective_pass{false};     ///< This evaluator runs part of a selective pass
