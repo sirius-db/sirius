@@ -233,12 +233,13 @@ op::dynamic_filter_domain_evidence evidence_for_column(
 
     auto const files = resolve_parquet_scan_file_paths(
       function_name.GetIdentifierName(), get.bind_data.get(), get.parameters);
+    auto const scan_name = scan_source_names(get)[primary];
     // Every pin of one file set describes the same rows, so a declaration on any pin that holds
     // the column applies; pins that disagree on the row count supply no evidence.
     std::optional<op::dynamic_filter_domain_evidence> chosen;
     for (auto const& entry : registry.find_pinned_entries_for_parquet_files(files)) {
-      auto const evidence = pinned_column_evidence(
-        *entry, column, scan_source_names(get)[primary], get.returned_types[primary]);
+      auto const evidence =
+        pinned_column_evidence(*entry, column, scan_name, get.returned_types[primary]);
       if (!evidence) { continue; }
       if (chosen && chosen->cardinality != evidence->cardinality) { return {}; }
       if (!chosen || evidence->declared_unique) { chosen = evidence; }

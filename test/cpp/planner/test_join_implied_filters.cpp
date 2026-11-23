@@ -107,18 +107,51 @@ TEST_CASE("join implied filters - the join's own range filter on the other side 
   }
 }
 
-TEST_CASE("join implied filters - a column alias does not hide the footer statistics",
+TEST_CASE("join implied filters - footer statistics are read under the bound column name",
           "[planner][join_implied_filters]")
 {
-  // `AS t(renamed)` changes LogicalGet::names only; the statistics stay under the bound name.
-  auto customer = make_scan(1, 1, k_customers, k_customers - 1);
-  customer->bind_data->Cast<duckdb::MultiFileBindData>().names = {duckdb::Identifier("k")};
-  customer->names                                              = {duckdb::Identifier("renamed")};
-  auto const* raw                                              = customer.get();
-  auto join =
-    make_join(duckdb::JoinType::INNER, make_scan(0, 1, k_customers - 1), std::move(customer));
-  drop_join_implied_filters(*join);
-  CHECK_FALSE(has_filter(*raw));
+  // Column aliases change LogicalGet::names only; the statistics stay under the bound names.
+  SECTION("an alias that names no column")
+  {
+    // `AS t(renamed)`: read under the alias, the key would have no statistics and keep its filter.
+    auto customer = make_scan(1, 1, k_customers, k_customers - 1);
+    customer->bind_data->Cast<duckdb::MultiFileBindData>().names = {duckdb::Identifier("k")};
+    customer->names                                              = {duckdb::Identifier("renamed")};
+    auto const* raw                                              = customer.get();
+    auto join =
+      make_join(duckdb::JoinType::INNER, make_scan(0, 1, k_customers - 1), std::move(customer));
+    drop_join_implied_filters(*join);
+    CHECK_FALSE(has_filter(*raw));
+  }
+  SECTION("an alias that names another column")
+  {
+    // The other scan's file holds `k` in [1, 2000] and `narrow` in [1, 1000], and
+    // `AS t(narrow, k)` trades their names. Its keys reach 2000, so `k <= 1000` removes rows the
+    // join matches and stays. Read under the alias, the key would take `narrow`'s range, which
+    // the filter passes whole.
+    auto const text  = duckdb::LogicalType::VARCHAR;
+    auto const range = [&](std::int64_t max) {
+      return duckdb::Value::MAP(text,
+                                text,
+                                {duckdb::Value("min"), duckdb::Value("max")},
+                                {duckdb::Value("1"), duckdb::Value(std::to_string(max))});
+    };
+    auto other = make_scan(0, 1, 2000);
+    auto& bind = other->bind_data->Cast<duckdb::MultiFileBindData>();
+    bind.names = {duckdb::Identifier("k"), duckdb::Identifier("narrow")};
+    bind.file_options.column_statistics =
+      duckdb::Value::MAP(text,
+                         duckdb::LogicalType::MAP(text, text),
+                         {duckdb::Value("k"), duckdb::Value("narrow")},
+                         {range(2000), range(1000)});
+    other->returned_types.push_back(duckdb::LogicalType::BIGINT);
+    other->names    = {duckdb::Identifier("narrow"), duckdb::Identifier("k")};
+    auto filtered   = make_scan(1, 1, 1005, 1000);
+    auto const* raw = filtered.get();
+    auto join       = make_join(duckdb::JoinType::INNER, std::move(other), std::move(filtered));
+    drop_join_implied_filters(*join);
+    CHECK(has_filter(*raw));
+  }
 }
 
 TEST_CASE("join implied filters - filters that can remove matching rows stay",

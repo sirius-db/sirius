@@ -26,7 +26,9 @@
 namespace sirius::planner {
 
 /// The column names the table function bound, in LogicalGet order. LogicalGet::names carries the
-/// query's column aliases (`AS t(b, a)`), which name no column of the source.
+/// query's column aliases (`AS t(b, a)`), which name no column of the source. Falls back to
+/// LogicalGet::names, aliases included, when the bind data is neither of the two kinds below or
+/// holds a different number of columns.
 inline duckdb::vector<std::string> scan_source_names(duckdb::LogicalGet const& op)
 {
   if (auto const* multi_file = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());

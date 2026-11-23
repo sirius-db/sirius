@@ -988,7 +988,10 @@ natural-read fallback. Preparation still reads and certifies each footer once.
 
 Scans and the join-key checks resolve source columns by the names the table function
 bound (`scan_source_names`, `src/planner/scan_source_names.hpp`), not by
-`LogicalGet::names`, which holds column aliases such as `AS t(b, a)`.
+`LogicalGet::names`, which holds column aliases such as `AS t(b, a)`. Multi-file binds
+(`read_parquet`, `iceberg_scan`) and `sirius_read_parquet` supply the bound names; any other
+bind, or one whose column count differs from the `LogicalGet`'s, falls back to
+`LogicalGet::names`.
 
 ## Key Files
 
