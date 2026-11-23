@@ -936,6 +936,20 @@ TEST_CASE_METHOD(DistinctFixture,
   }
 }
 
+// Known issue #2598, not fixed here: the GPU lower() maps U+0130 to "i" + U+0307 where DuckDB maps
+// it to "i", so a NOCASE key that differs there keeps another row. [!shouldfail] keeps CI green
+// and flags the day it passes.
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution first(v ORDER BY ...) under NOCASE ranks by DuckDB's lower()",
+                 "[integration][gpu_execution][distinct][aggregate][!shouldfail]")
+{
+  // DuckDB orders 'ia' (from 'İa') before 'ib' and keeps v 1; the GPU's 'i̇a' sorts after 'ib'.
+  run_ok("CREATE TABLE dist_nocase (k INTEGER, s VARCHAR, v INTEGER);");
+  run_ok("INSERT INTO dist_nocase VALUES (1, 'İa', 1), (1, 'ib', 2);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT k, first(v ORDER BY s COLLATE NOCASE) FROM dist_nocase GROUP BY k");
+}
+
 TEST_CASE_METHOD(DistinctBulkFixture,
                  "gpu_execution ordered carried rows over many batches",
                  "[integration][gpu_execution][distinct][aggregate]")
