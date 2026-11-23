@@ -17,7 +17,6 @@
 #pragma once
 
 #include <map>
-#include <set>
 
 // sirius
 #include <op/sirius_physical_operator.hpp>
@@ -93,11 +92,10 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
   /**
    * @brief Sink a data batch into the result collection
    *
-   * @param[in] input_batch The input data batch
-   * @throws InvalidInputException if input_batches is empty, if any data_batch has no data, or if
-   * any data_batch currently resides in the DISK tier
-   * @throws InternalException if the memory manager is not initialized, if the reservation fails,
-   * or if the memory space for the reservation is invalid
+   * @param[in] input_data The input batches
+   * @param stream CUDA stream used to stage GPU batches
+   * @throws invalid_input_exception if a batch has no readable GPU or HOST data
+   * @throws internal_exception if no HOST memory space is available for GPU input
    * @note For now, we assume that the input batch, if in the HOST tier, is always in the
    * host_data_representation. If it is in the GPU tier, we convert it to the
    * host_data_representation. In the future, we should register converters for other
@@ -105,10 +103,23 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    */
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
+  /**
+   * @brief Stage and publish one task's result batches, reserving HOST capacity when available.
+   *
+   * @param[in] input_data The input batches
+   * @param stream CUDA stream used to stage GPU batches
+   * @param[in,out] reservation Optional existing HOST reservation. The collector can acquire or
+   * replace it as needed and releases it after staging.
+   * @throws invalid_input_exception if a batch has no readable GPU or HOST data
+   * @throws internal_exception if no HOST memory space is available for GPU input
+   */
+  void sink_with_reservation(const operator_data& input_data,
+                             ::cuda::stream_ref stream,
+                             std::unique_ptr<cucascade::memory::reservation>& reservation);
+
  private:
   duckdb::ClientContext& _client_ctx;
   std::optional<bool> _positioned;
-  std::set<std::size_t> _seen_positions;
   std::map<std::size_t, duckdb::unique_ptr<duckdb::ColumnDataCollection>> _positioned_collections;
 };
 

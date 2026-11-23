@@ -493,7 +493,7 @@ void enqueue_column_overwrite(cudf::column_view original,
 
 }  // namespace
 
-TEST_CASE("direct chunked spill waits before reading string geometry and null masks",
+TEST_CASE("GPU-to-HOST copies wait before planning string geometry and null masks",
           "[spill_converter_ordering][cucascade_api_migration]")
 {
   auto& setup = env();
@@ -502,7 +502,9 @@ TEST_CASE("direct chunked spill waits before reading string geometry and null ma
   rmm::cuda_stream reader{rmm::cuda_stream::flags::non_blocking};
   cucascade::representation_converter_registry registry;
   cucascade::register_builtin_converters(registry);
-  sirius::spill::register_chunked_spill_converters(registry, 7);
+  bool const chunked = GENERATE(false, true);
+  CAPTURE(chunked);
+  if (chunked) { sirius::spill::register_chunked_spill_converters(registry, 7); }
 
   std::vector<std::unique_ptr<cudf::column>> children;
   children.push_back(make_ordering_strings(producer));
@@ -563,6 +565,8 @@ TEST_CASE("direct chunked spill waits before reading string geometry and null ma
   if (failure) { std::rethrow_exception(failure); }
   REQUIRE(host != nullptr);
   REQUIRE(host->get_host_table()->data_size > 0);
+  CHECK(host->get_host_table()->data_size ==
+        sirius::spill::gpu_to_host_staging_bytes(*source, reader));
   auto restored =
     registry.convert<cucascade::gpu_table_representation>(*host, setup.gpu_space, reader);
   for (cudf::size_type i = 0; i < expected.num_columns(); ++i) {

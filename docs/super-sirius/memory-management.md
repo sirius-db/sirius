@@ -97,7 +97,7 @@ Metadata-only scans reserve synthesized columns and temporary buffers, but no co
 
 ## Memory Reservations
 
-Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
+Pipeline tasks acquire GPU memory reservations before execution.
 
 1. GPU executor's `manager_loop()` calls `memory_space.make_reservation(estimated_size)`
 2. The reservation is attached to the task's local state via `set_reservation()`
@@ -115,7 +115,21 @@ Wraps RMM device memory resource. On each allocation:
 
 ### Caller reservations for HOST conversions
 
-Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+The reservation-taking `convert_to` and `clone_to` overloads charge allocations against capacity
+the caller already holds. `lock_or_prepare_batch` attempts `make_reservation_or_null(size)` for
+HOST-targeted conversions and uses the `memory_space*` overload if admission fails. That overload
+allocates from the shared pool and can run out of memory.
+
+### HOST staging for materialized results
+
+A GPU pipeline task can also own a HOST reservation for result staging. The collector uses the
+Sirius GPU-to-HOST converter for sizing and reserved copies. Its layout planner accounts for
+variable-width data, child columns, null masks, and alignment. The collector stages one batch at
+a time and sizes the reservation for the largest copy, rounded to the chosen HOST pool's block
+size. Batches already in the readable HOST representation need no copy. The collector builds a
+task-local DuckDB collection and publishes it with its logical position after staging succeeds.
+
+If a HOST reservation cannot be obtained, the collector attempts staging from the shared pool.
 
 ## Downgrade Executor
 
@@ -158,6 +172,10 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 **Files:** `src/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/data/chunked_spill_copy.hpp`
 
 The builtin cucascade fast converter submits an entire batch's GPU→HOST copies as one monolithic batched call followed by one blocking synchronize (18–28 GB single submissions observed on q9-class partition spills). At context initialization Sirius replaces it with a chunked converter (`executor.downgrade.copy_chunk_bytes`, default 1 GiB; 0 keeps the builtin) that produces a byte-identical `host_data_representation` but flushes copies every ~chunk while the column tree is still being walked — overlapping each chunk's DMA with the next chunk's prep — and wraps each conversion in an NVTX range. The HOST→GPU restore direction deliberately stays on the builtin converter (it runs on instrumented pipeline threads and reconstructs from the self-describing `column_metadata`).
+
+The result collector uses the Sirius converter for reserved copies. With
+`copy_chunk_bytes: 0`, it submits all copies for each batch together, and spill conversions
+through the registry use the builtin.
 
 ### Spill Compression
 

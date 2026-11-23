@@ -21,6 +21,8 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
+#include <data/spill_chunked_converters.hpp>
+#include <memory/host_reservation.hpp>
 #include <op/sirius_physical_dummy_scan.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <sirius_interface.hpp>
@@ -274,10 +276,11 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
           "[operator][physical_result_collector][shared_context]")
 {
-  constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
-  auto [db_owner, con]      = sirius::make_test_db_and_connection();
-  auto sirius_ctx           = sirius::get_sirius_context(con, get_test_config_path());
-  auto* gpu_space           = get_default_gpu_space(sirius_ctx);
+  const bool use_caller_reservation = GENERATE(false, true);
+  constexpr size_t num_rows         = STANDARD_VECTOR_SIZE * 2 + 3;
+  auto [db_owner, con]              = sirius::make_test_db_and_connection();
+  auto sirius_ctx                   = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space                   = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
   rmm::cuda_stream stream;  // Must outlive data_batch for cudaMemcpyBatchAsync
 
@@ -292,9 +295,15 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
   expected_table_data expected;
+  std::size_t staging_bytes = 0;
   {
-    auto const gpu_view = sirius::get_cudf_table_view(*batch);
+    auto ro             = batch->to_read_only();
+    auto const gpu_view = sirius::get_cudf_table_view(ro);
     expected            = extract_expected_data(gpu_view);
+    if (use_caller_reservation) {
+      staging_bytes = sirius::spill::gpu_to_host_staging_bytes(
+        ro.get_data()->cast<cucascade::gpu_table_representation>(), stream);
+    }
   }
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
@@ -309,7 +318,16 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
-  collector.sink(pipelineable_operator_data({batch}), stream);
+  auto input = pipelineable_operator_data({batch});
+  if (use_caller_reservation) {
+    const auto hosts = sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST);
+    auto reservation = sirius::memory::try_reserve_host(hosts, staging_bytes);
+    REQUIRE(reservation != nullptr);
+    collector.sink_with_reservation(input, stream, reservation);
+    CHECK(reservation == nullptr);
+  } else {
+    collector.sink(input, stream);
+  }
   auto result = collector.get_result();
   REQUIRE(result != nullptr);
 

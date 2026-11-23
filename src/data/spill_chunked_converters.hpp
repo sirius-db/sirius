@@ -16,12 +16,44 @@
 
 #pragma once
 
+#include <cucascade/cuda/stream.hpp>
 #include <cucascade/data/representation_converter.hpp>
 
 #include <cstddef>
+#include <memory>
+
+namespace cucascade {
+class gpu_table_representation;
+class host_data_representation;
+}  // namespace cucascade
 
 namespace sirius {
 namespace spill {
+
+/**
+ * @brief Size a GPU table's payload for the Sirius GPU-to-HOST converter.
+ *
+ * @param source GPU table representation held against mutation by the caller
+ * @param stream CUDA stream used to read metadata after the source's writer
+ * @return Payload bytes before rounding to HOST blocks
+ */
+[[nodiscard]] std::size_t gpu_to_host_staging_bytes(
+  const cucascade::gpu_table_representation& source, ::cuda::stream_ref stream);
+
+/**
+ * @brief Copy a GPU table into pinned HOST blocks from an existing reservation.
+ *
+ * @param source GPU table representation held against mutation by the caller
+ * @param reservation Caller-owned reservation in the destination HOST space
+ * @param stream CUDA stream used for the copy
+ * @param chunk_bytes Bytes per copy submission. Zero submits all copies together.
+ * @return The copied HOST table, ready to read
+ */
+[[nodiscard]] std::unique_ptr<cucascade::host_data_representation> copy_gpu_to_host(
+  const cucascade::gpu_table_representation& source,
+  cucascade::memory::reservation& reservation,
+  ::cuda::stream_ref stream,
+  std::size_t chunk_bytes);
 
 /**
  * @brief Replace the builtin monolithic GPU->HOST spill converter with a chunked one.

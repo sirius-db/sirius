@@ -25,6 +25,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
@@ -660,7 +661,14 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
     const bool observe_publication =
       completion && completion->injections && completion->injections->hold_footer_index &&
       (materialized ? *materialized : output_data).get_estimated_size_in_bytes() > 0;
-    sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
+    auto& input = materialized ? *materialized : output_data;
+    if (auto* collector =
+          dynamic_cast<op::sirius_physical_materialized_collector*>(sink_operators.get())) {
+      auto& state = _local_state->cast<gpu_pipeline_task_local_state>();
+      collector->sink_with_reservation(input, stream, state.host_reservation);
+    } else {
+      sink_operators.get()->sink(input, stream);
+    }
     if (observe_publication) completion->record_publication_for_testing();
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =

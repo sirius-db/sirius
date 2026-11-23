@@ -148,6 +148,19 @@ cucascade::memory::column_metadata plan_column_copy(const cudf::column_view& col
   return meta;
 }
 
+std::size_t plan_host_copy(const cudf::table_view& view,
+                           ::cuda::stream_ref stream,
+                           std::vector<cucascade::memory::column_metadata>* columns)
+{
+  if (columns) { columns->reserve(static_cast<std::size_t>(view.num_columns())); }
+  std::size_t bytes = 0;
+  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+    auto meta = plan_column_copy(view.column(i), bytes, stream);
+    if (columns) { columns->push_back(std::move(meta)); }
+  }
+  return bytes;
+}
+
 /**
  * @brief Queue copy ops for @p size device bytes into the host allocation.
  *
@@ -253,8 +266,8 @@ void submit_chunk(std::span<const copy_op> ops,
  * call, so the DMA engine drains chunk k while the column-tree walk collects chunk k+1. The
  * final synchronize preserves the converter contract: source buffers are dead after return.
  */
-std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
-  const cucascade::idata_representation& source,
+std::unique_ptr<cucascade::host_data_representation> convert_gpu_to_host_chunked(
+  const cucascade::gpu_table_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   ::cuda::stream_ref stream,
   cucascade::memory::reservation* reservation,
@@ -262,18 +275,12 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 {
   nvtx3::scoped_range nvtx_range{"sirius::spill::gpu_to_host_chunked"};
 
-  auto const& gpu_source = source.cast<cucascade::gpu_table_representation>();
-  gpu_source.wait_for_writer(stream);
-  const cudf::table_view view = gpu_source.get_table_view();
+  source.wait_for_writer(stream);
+  const cudf::table_view view = source.get_table_view();
 
   // Pass 1: plan the allocation layout.
-  std::size_t current_offset = 0;
   std::vector<cucascade::memory::column_metadata> columns;
-  columns.reserve(static_cast<std::size_t>(view.num_columns()));
-  for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-    columns.push_back(plan_column_copy(view.column(i), current_offset, stream));
-  }
-  const std::size_t total_size = current_offset;
+  const std::size_t total_size = plan_host_copy(view, stream, &columns);
 
   // Pass 2: allocate pinned host blocks (draws down the caller's reservation).
   auto mr = target_memory_space
@@ -309,6 +316,23 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 
 }  // namespace
 
+std::size_t gpu_to_host_staging_bytes(const cucascade::gpu_table_representation& source,
+                                      ::cuda::stream_ref stream)
+{
+  source.wait_for_writer(stream);
+  return plan_host_copy(source.get_table_view(), stream, nullptr);
+}
+
+std::unique_ptr<cucascade::host_data_representation> copy_gpu_to_host(
+  const cucascade::gpu_table_representation& source,
+  cucascade::memory::reservation& reservation,
+  ::cuda::stream_ref stream,
+  std::size_t chunk_bytes)
+{
+  return convert_gpu_to_host_chunked(
+    source, &reservation.get_memory_space(), stream, &reservation, chunk_bytes);
+}
+
 void register_chunked_spill_converters(cucascade::representation_converter_registry& registry,
                                        std::size_t chunk_bytes)
 {
@@ -327,8 +351,11 @@ void register_chunked_spill_converters(cucascade::representation_converter_regis
                     const cucascade::memory::memory_space* target_memory_space,
                     ::cuda::stream_ref stream,
                     cucascade::memory::reservation* reservation) {
-        return convert_gpu_to_host_chunked(
-          source, target_memory_space, stream, reservation, chunk_bytes);
+        return convert_gpu_to_host_chunked(source.cast<cucascade::gpu_table_representation>(),
+                                           target_memory_space,
+                                           stream,
+                                           reservation,
+                                           chunk_bytes);
       });
   SIRIUS_LOG_INFO("[spill] registered chunked GPU->HOST spill converter (copy_chunk_bytes = {})",
                   chunk_bytes);
