@@ -2,7 +2,7 @@
 
 ## Getting started
 
-**Prerequisites:** [Pixi](https://prefix.dev/) 0.84.1 or newer for environment management.
+**Prerequisites:** [Pixi](https://prefix.dev/) 0.84.2 or newer for environment management.
 
 Keep the workspace `requires-pixi` minimums, the nightly launcher's Pixi dependency,
 and CI's `pixi-version` pins in sync when upgrading Pixi. Older Pixi versions can

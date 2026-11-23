@@ -8,7 +8,7 @@ platforms = [
   { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
   { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
 ]
-requires-pixi = ">=0.84.1"
+requires-pixi = ">=0.84.2"
 
 [environments]
 default = ["fe","cn","client","engine"]
