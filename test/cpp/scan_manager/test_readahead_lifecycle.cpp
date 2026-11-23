@@ -675,10 +675,8 @@ TEST_CASE("cuFile ignores an explicit readahead budget without an eligible backe
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index();
   empty_query query;
-  auto config               = config_with_readahead_budget(4);
-  config.backend            = sirius::scan_manager::io_backend::cufile;
-  config.cufile.compat_mode = cucascade::io::cufile::compat::on;
-  config.cufile.use_odirect = false;
+  auto config    = config_with_readahead_budget(4);
+  config.backend = sirius::scan_manager::io_backend::cufile;
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{lifecycle, config, *memory, topology};
   CHECK_FALSE(manager.io_ctx()->can_use_fs_cache());
@@ -828,13 +826,11 @@ TEST_CASE("an empty query does not subscribe readahead even with an explicit bud
 TEST_CASE("cuFile does not subscribe readahead or charge reading transitions",
           "[scan_manager][readahead][cufile][scan]")
 {
-  auto memory               = initialize_memory_manager(1);
-  auto config               = config_with_readahead_budget(4);
-  config.backend            = sirius::scan_manager::io_backend::cufile;
-  config.cufile.compat_mode = cucascade::io::cufile::compat::on;
-  config.cufile.use_odirect = false;
-  auto counters             = std::make_shared<sirius::op::scan::physical_check_counters>();
-  counters->track_units     = true;
+  auto memory           = initialize_memory_manager(1);
+  auto config           = config_with_readahead_budget(4);
+  config.backend        = sirius::scan_manager::io_backend::cufile;
+  auto counters         = std::make_shared<sirius::op::scan::physical_check_counters>();
+  counters->track_units = true;
   sirius::test::scoped_recording_log_sink logs{"info"};
   sirius::exec::query_lifecycle_registry lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{

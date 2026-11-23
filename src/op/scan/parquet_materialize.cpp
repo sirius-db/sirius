@@ -82,7 +82,7 @@ bool prefers_bulk_materialize(std::span<parquet_source const> sources,
   // span covering all of them, so a single file that cannot be read this way
   // takes the whole split to the general route.
   // The backend's own preference (REST), or Sirius's request for it on the context (a cuFile
-  // context with cufile_bulk_read on, so its fused lanes see the whole split at once).
+  // context with cufile_bulk_read on, so its lanes see the whole split at once).
   return std::all_of(sources.begin(), sources.end(), [](parquet_source const& src) {
     return src.datasource && src.metadata && !src.row_group_indices.empty() &&
            sirius::io::prefers_bulk_read(*src.datasource);
@@ -173,6 +173,8 @@ pending_fetch begin_fetch(parquet_source const& src,
                            static_cast<std::size_t>(ranges[i].size()),
                            static_cast<std::uint8_t*>(out.chunks.buffers[i].data()));
   }
+
+  stream.sync();
 
   out.read = src.datasource->device_read_ranges_async(out.reads, stream);
   return out;

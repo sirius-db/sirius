@@ -1413,27 +1413,19 @@ class sirius_scan_manager {
 };
 
 /**
- * @brief Reserve the registered cuFile staging the default cufile pool will use,
- *        before the GPU memory pools claim the devices.
+ * @brief Reserve the registered cuFile arena of each GPU the default cufile context
+ *        will serve, before the GPU memory pools claim the devices.
  *
- * cuFile staging slots are allocated with @c cudaMalloc outside RMM and kept for the
- * life of the process.  The pool reserves them when it starts, which is after the
+ * A cuFile reactor's arena is allocated with @c cudaMalloc outside RMM
+ * (@c cufile.lanes x @c cufile.lane_bytes for each of its two lane sets) and kept for
+ * the life of the process.  The context takes it when it starts, which is after the
  * memory manager's pools took their share of each GPU; called first, this takes the
- * slots the pool plans for @p gpu_ids while the memory is still free, and the pool
- * then reuses them.  Does nothing unless @c backend is @c cufile with a planned pool
- * (@c cufile_n_reactors == 0).  It reserves the fused-read lane slots the plan budgets
- * when @c cufile.fused_reads is enabled (@c cufile::fused_lane_staging_bytes per GPU,
- * on top of @c cufile.max_staging_bytes_per_device; unregistered slots are accepted in
- * cuFile compatibility mode), then the synchronous staging slots when the plan stages
- * (see @c cufile.staging_mode: on a host without GPUDirect Storage, @c automatic
- * reserves none).
+ * arenas for @p gpu_ids while the memory is still free, and the context then reuses
+ * them.  Does nothing unless @c backend is @c cufile.
  *
  * @param config The scan manager configuration the default context is built from.
  * @param gpu_ids The GPUs Sirius reads into (the default for @c cufile.devices).
- * @param topology The discovered hardware topology.
  */
-void reserve_cufile_staging(scan_manager_config const& config,
-                            std::span<int const> gpu_ids,
-                            cucascade::memory::system_topology_info const& topology);
+void reserve_cufile_arenas(scan_manager_config const& config, std::span<int const> gpu_ids);
 
 }  // namespace sirius::scan_manager

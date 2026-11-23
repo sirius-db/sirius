@@ -36,8 +36,8 @@ namespace sirius::io {
  * The bulk route of @c op::scan::materialize_parquet reads every column chunk of a split's
  * file in ONE vectored device request.  cuCascade lets a backend ask for it with the
  * compile-time @c ioctx::prefers_bulk_io() (REST does: every request is a round trip).  The
- * cuFile backend says no, yet with fused lanes on it wants the whole split in one request too,
- * because it only fuses the slices of one request.  Sirius therefore asks for the route on a
+ * cuFile backend says no, yet it wants the whole split in one request too, because its lanes
+ * only coalesce the slices of one request.  Sirius therefore asks for the route on a
  * context it owns by registering it here (see @c scan_manager.cufile_bulk_read); every reader
  * of the preference goes through @ref prefers_bulk_read, so the route and the decisions keyed
  * off it agree.

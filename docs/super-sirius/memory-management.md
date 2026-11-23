@@ -78,19 +78,18 @@ conversion. That default is process-shared but cached only through a weak pointe
 spaces and in-flight conversions hold strong references, not a static owning singleton or
 a separate reactor pool per mount. An unused DISK space starts no I/O workers.
 
-Automatic selection prefers **cuFile with real GDS**, then **usable io_uring**, then the
-**cuFile POSIX/staging path** when io_uring is unavailable or forbidden. cuFile compatibility
+Automatic selection prefers **cuFile with real GDS**, then **io_uring**; both need a usable
+io_uring (the cuFile context serves host I/O through an io_uring reactor of its own), and
+the factory fails when the process cannot create a ring. cuFile compatibility
 mode alone is not real GDS. The cuCascade DISK factory supports `automatic`, `uring`, and
 `cufile`. These DISK contexts are independent of the scan backend; the removed kvikIO
 backend is not supported for reads or writes.
 
 A uring factory context owns private staging rather than borrowing Sirius's HOST allocator
-(64 MiB of portable pinned staging per reactor). A cuFile one borrows its pinned host
-scratch from the HOST space of the GPU's NUMA node for each transfer and gives it back
-before the transfer settles; device-write bodies on a real GDS host go through registered
-GPU staging slots from the same process-wide pool as scan reads, but each reactor holds
-slots of its own: the default context reserves them when it starts at the first spill,
-after the GPU memory pools exist (see [cuFile staging memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+(64 MiB of portable pinned staging per reactor). A cuFile one needs no host staging: device
+reads and writes go through the lane slots of a registered GPU arena per GPU, which the
+default context takes when it starts at the first spill, after the GPU memory pools exist
+(see [cuFile arena memory](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 Destruction stops/drains reactor
 workers before releasing their staging. The weak default cache does not prolong that
 lifetime; spill representations and contexts must still be released before CUDA/RMM global
@@ -170,6 +169,7 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
   - A configured DISK tier is always a viable target.
   - Without DISK, only a GPU source has a lower tier (HOST). Viability is confirmed by probing each HOST space with a chunk-sized `make_reservation_or_null` (released immediately) — the ground truth for whether downgraded data can actually land, since HOST capacity reflects both live reservations and already-stored downgraded data.
   - If no target is viable (e.g. idle GPU batches whose only lower tier is a full HOST with no DISK configured), the monitor **backs off** for that cycle without enqueuing, warning once per stall episode. The gate is re-evaluated every cycle with no latched state, so the monitor resumes automatically the instant HOST frees space or GPU pressure drops.
+  - A HOST-source request that passes the gate but frees nothing (cache overflow pinned or loading, or pressure from memory no request can move, such as a reservation or IO staging, with or without DISK) delays the next one: the wait starts at `monitor_period` and doubles up to `max(monitor_period, 1 s)`, warning once per stall episode, and resets as soon as a request frees memory.
 - **Worker thread pool** (`exec::bounded_thread_pool`): executes actual data movement concurrently
 
 The monitor sleeps on an interruptible condition-variable wait rather than a plain sleep, so `stop()` wakes it immediately instead of blocking shutdown for up to a full `monitor_period`.

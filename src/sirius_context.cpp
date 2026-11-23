@@ -1056,7 +1056,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
   }
 
-  // cuFile's registered staging lives outside RMM for the life of the process. Take it
+  // cuFile's registered arenas live outside RMM for the life of the process. Take them
   // before the GPU pools claim the devices, rather than from what the pools leave free.
   {
     std::vector<int> gpu_ids;
@@ -1065,8 +1065,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
         gpu_ids.push_back(gpu->device_id);
       }
     }
-    sirius::scan_manager::reserve_cufile_staging(
-      config_.get_scan_manager_config(), gpu_ids, config_.get_hw_topology());
+    sirius::scan_manager::reserve_cufile_arenas(config_.get_scan_manager_config(), gpu_ids);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(

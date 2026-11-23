@@ -121,12 +121,10 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
 
 /// Whether cuFile-backed Parquet scans read each file's column chunks of a split in one
 /// vectored device request (the bulk route of @c materialize_parquet) instead of cuDF's
-/// general reader, which issues one request per contiguous run of chunks.  cuCascade's fused
-/// lanes only fuse the slices of one request, so the bulk route is what lets them fuse.
+/// general reader, which issues one request per contiguous run of chunks.  cuCascade's cuFile
+/// lanes only coalesce the slices of one request, so the bulk route is what lets them coalesce.
 enum class cufile_bulk_read_mode {
-  /// Bulk exactly when @c cufile.fused_reads.enabled (the default).
-  automatic,
-  /// Always bulk for cuFile scans, also without lanes.
+  /// Bulk for cuFile scans (the default).
   on,
   /// Never: cuFile scans keep cuDF's general reader.
   off,
@@ -136,7 +134,7 @@ enum class cufile_bulk_read_mode {
 enum class io_backend {
   /// cuCascade's native IO stack: uring for local paths, REST for @c s3:// URLs.
   native,
-  /// cuFile for local files (with POSIX fallback), REST for @c s3:// URLs.
+  /// cuFile for local files, REST for @c s3:// URLs.
   cufile,
 };
 
@@ -263,8 +261,10 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring reactors for the local-disk IO path (each one worker thread
-  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
+  /// Number of uring read reactors for the local-disk IO path, spread over the GPUs Sirius
+  /// reads into: `max(1, uring_n_reactors / #GPUs)` per GPU (each one worker thread and one
+  /// ring; each allocates its pinned staging at @c ioctx::start()).  Every GPU also gets one
+  /// write reactor, started by its first write.
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
   /// Number of REST reactors for the S3/object-store IO path (each one worker
@@ -295,15 +295,10 @@ struct scan_manager_config {
   /// Independent of the metadata pool's explicit cpu_affinity override.
   std::vector<int> worker_startup_cpus;
 
-  /// Local cuFile reactors.  0 (the default) plans a pinned
-  /// group of @c cufile.reactors_per_device reactors for each GPU in
-  /// @c cufile.devices (see @ref resolved_cufile); a positive count runs one
-  /// flat, unpinned pool of that many reactors instead.
-  std::size_t cufile_n_reactors{0};
-
   /// Read route of cuFile-backed Parquet scans (see @ref cufile_bulk_read_mode and
-  /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c auto | @c on | @c off.
-  cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::automatic};
+  /// @ref reads_cufile_in_bulk).  YAML @c cufile_bulk_read: @c on | @c off (@c auto is
+  /// accepted as @c on).
+  cufile_bulk_read_mode cufile_bulk_read{cufile_bulk_read_mode::on};
 
   /// Scans the readahead scan manager may keep in flight, and the switch that
   /// runs it at all.  Unset (the default) defers to the caching configuration:
@@ -356,16 +351,11 @@ struct scan_manager_config {
   /// splits. Disabled by default.
   memory_prefetcher_config memory_prefetcher{};
 
-  /// Whether cuFile-backed Parquet scans take the bulk route: @ref cufile_bulk_read resolved
-  /// against @c cufile.fused_reads.enabled.  Only meaningful with @c backend: cufile.
+  /// Whether cuFile-backed Parquet scans take the bulk route (see @ref cufile_bulk_read).
+  /// Only meaningful with @c backend: cufile.
   [[nodiscard]] bool reads_cufile_in_bulk() const noexcept
   {
-    switch (cufile_bulk_read) {
-      case cufile_bulk_read_mode::on: return true;
-      case cufile_bulk_read_mode::off: return false;
-      case cufile_bulk_read_mode::automatic: break;
-    }
-    return cufile.fused_reads.enabled;
+    return cufile_bulk_read != cufile_bulk_read_mode::off;
   }
 
   /// Refresh the knobs derived from @ref cache.
@@ -388,8 +378,7 @@ struct scan_manager_config {
     out.uring_n_reactors = uring_n_reactors;
     out.rest_n_reactors  = rest_n_reactors;
 #ifdef CUCASCADE_HAS_CUFILE
-    out.cufile_n_reactors = cufile_n_reactors;
-    out.cufile            = cufile;
+    out.cufile = cufile;
 #endif
     out.uring        = uring;
     out.rest         = rest;
@@ -399,13 +388,12 @@ struct scan_manager_config {
     return out;
   }
 
-  /// The cuFile configuration the default cufile pool is built with: @ref cufile,
+  /// The cuFile configuration the default cufile context is built with: @ref cufile,
   /// with an empty @c devices list narrowed to @p gpu_ids (the GPUs Sirius reads
-  /// into), so the plan spawns reactors and reserves staging only on those.
+  /// into), so a reactor and its arena exist only on those.
   ///
   /// @throws std::invalid_argument when @c cufile.devices names a GPU outside
-  ///         @p gpu_ids: its reactors and staging would serve no read, while reads
-  ///         into Sirius's GPU would have none.
+  ///         @p gpu_ids: its reactor and arena would serve no read.
   [[nodiscard]] cucascade::io::cufile::config resolved_cufile(std::span<int const> gpu_ids) const
   {
     auto out = cufile;
@@ -472,71 +460,15 @@ inline int resolve_scan_manager_num_threads(scan_manager_config const& config, s
   return std::max(workers, static_cast<int>(domains));
 }
 
-/**
- * @brief Check cuCascade's two opt-in cuFile read blocks, @c cufile.fused_reads and
- *        @c cufile.host_batch, and report a failure under its YAML key.
- *
- * The ranges and cross-field rules are cuCascade's (@c fused_read_config::validate,
- * @c host_batch_config::validate), checked only for an enabled block; their messages name the
- * struct field ("fused_reads.slot_bytes must be ...") and are rethrown as
- * "'cufile.fused_reads.slot_bytes': must be ...".  Adds the rule the cuFile reactors enforce at
- * construction: fused reads need the legacy engine (@c async_engine.mode).
- *
- * @throws std::invalid_argument naming the first invalid key.
- */
-inline void validate_cufile_read_blocks(cucascade::io::cufile::config const& cufile)
-{
-  auto const rethrow = [](std::string_view block, std::invalid_argument const& e) {
-    std::string_view const what{e.what()};
-    auto const space = what.find(' ');
-    if (what.starts_with(std::string{block} + ".") && space != std::string_view::npos) {
-      throw std::invalid_argument("'cufile." + std::string{what.substr(0, space)} +
-                                  "': " + std::string{what.substr(space + 1)});
-    }
-    throw std::invalid_argument("'cufile." + std::string{block} + "': " + std::string{what});
-  };
-  try {
-    cufile.fused_reads.validate();
-  } catch (std::invalid_argument const& e) {
-    rethrow("fused_reads", e);
-  }
-  try {
-    cufile.host_batch.validate();
-  } catch (std::invalid_argument const& e) {
-    rethrow("host_batch", e);
-  }
-  if (cufile.fused_reads.enabled &&
-      cufile.async_engine.mode != cucascade::io::cufile::engine_mode::legacy) {
-    throw std::invalid_argument(
-      "'cufile.fused_reads.enabled': requires cufile.async_engine.mode legacy (the async engine "
-      "and the fused lanes would claim the same device reads)");
-  }
-}
-
 // Validate before any pool/reactor starts. Both defaults and explicit C++ overrides use this path.
 inline scan_manager_config validate_scan_manager_config(scan_manager_config config)
 {
   (void)config.preparation.resolve(config.thread_pool.num_threads);
-  if (config.cufile.max_inflight == 0) {
-    throw std::invalid_argument("'cufile.max_inflight': must be positive");
+  if (config.cufile.lanes == 0) { throw std::invalid_argument("'cufile.lanes': must be positive"); }
+  if (config.cufile.lane_bytes == 0 ||
+      config.cufile.lane_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
+    throw std::invalid_argument("'cufile.lane_bytes': must be a positive multiple of 4 KiB");
   }
-  if (config.cufile.max_op_bytes < cucascade::io::IO_BLOCK_SIZE) {
-    throw std::invalid_argument("'cufile.max_op_bytes': must be at least 4 KiB");
-  }
-  if (config.cufile.staging_piece_bytes == 0 ||
-      config.cufile.staging_piece_bytes % cucascade::io::IO_BLOCK_SIZE != 0) {
-    throw std::invalid_argument(
-      "'cufile.staging_piece_bytes': must be a positive multiple of 4 KiB");
-  }
-  if (config.cufile.staging_slots_per_reactor == 0) {
-    throw std::invalid_argument("'cufile.staging_slots_per_reactor': must be positive");
-  }
-  if (!config.cufile.use_odirect &&
-      config.cufile.compat_mode == cucascade::io::cufile::compat::off) {
-    throw std::invalid_argument(
-      "'cufile.use_odirect': false conflicts with cufile.compat_mode=off");
-  }
-  validate_cufile_read_blocks(config.cufile);
   return config;
 }
 }  // namespace sirius::scan_manager

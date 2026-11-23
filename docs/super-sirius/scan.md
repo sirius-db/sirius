@@ -357,7 +357,7 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 
 ### Configuration
 
-`scan_manager_config` (`config.hpp`) tunes the thread pool, the IO backend selector (`backend`), the uring/REST/cuFile reactor counts (`uring_n_reactors` / `rest_n_reactors` / `cufile_n_reactors`, one worker thread each), cuCascade's per-backend and cache configs, and object-store credentials. `to_io_config()` converts it into the `cucascade::io::io_config` the io registry is built from. See [Configuration](configuration.md#scan-manager--io-configuration).
+`scan_manager_config` (`config.hpp`) tunes the thread pool, the IO backend selector (`backend`), the uring/REST reactor counts (`uring_n_reactors` / `rest_n_reactors`, one worker thread each), cuCascade's per-backend and cache configs, and object-store credentials. `to_io_config()` converts it into the `cucascade::io::io_config` the io registry is built from. See [Configuration](configuration.md#scan-manager--io-configuration).
 
 ### Shared scan I/O capacity
 
@@ -645,10 +645,10 @@ Header paths below are relative to `cucascade/include/cucascade/`.
 
 ### Reactor model
 
-The uring and REST contexts are `templated_ioctx`s over a pool of *reactors*. A reactor is one worker thread plus its own backend state and request queue: for uring, one io_uring ring, 64 MiB of pinned staging in whole host blocks (at most 64 slots, at least one block) and a two-tier priority queue; for REST, an io_uring ring driving up to `rest.max_connections` (default 128 with kTLS loaded, 64 without) keep-alive HTTP/1.1 connections, kTLS or user-space TLS for HTTPS endpoints, and a two-tier queue. There is no shared queue across reactors. The cuFile context has its own count-based
-reactor pool and synchronous read scheduler; see [Local cuFile Reads](#local-cufile-reads). The reactors of a REST pool share one non-copyable `rest_reactor::reactor_context` (configuration, authorizer, staging resource), held by `shared_ptr`.
+The uring and REST contexts are `templated_ioctx`s over a pool of *reactors*. A reactor is one worker thread plus its own backend state and request queue: for uring, one io_uring ring, 64 MiB of pinned staging in whole host blocks (at most 64 slots, at least one block) and a two-tier priority queue; for REST, an io_uring ring driving up to `rest.max_connections` (default 128 with kTLS loaded, 64 without) keep-alive HTTP/1.1 connections, kTLS or user-space TLS for HTTPS endpoints, and a two-tier queue. There is no shared queue across reactors. The cuFile context has one reactor per GPU, each with its
+own lane threads; see [Local cuFile Reads](#local-cufile-reads). The reactors of a REST pool share one non-copyable `rest_reactor::reactor_context` (configuration, authorizer, staging resource), held by `shared_ptr`.
 
-- `ioctx::start()` starts each reactor in turn — allocating its staging and launching its worker thread — so a failure such as a pinned staging allocation propagates out of `start()`. `uring_n_reactors` reactors serve uring (default 2 below 32 CPU hardware threads, 4 otherwise) and `rest_n_reactors` serve REST (per routed REST context, i.e. per distinct resolved object-store configuration, shared by all GPUs; unnamed, clamp(T/6, 8, 16) without kTLS and clamp(T/6, 4, 16) with it, or with kTLS one per steered NIC IRQ CPU (at least 4) when there are fewer than 16; `0` sizes each pool from the egress NIC's queue IRQs and pins each reactor to one IRQ CPU when the IRQs are steered to a strict subset of the NIC node's cores — see [`rest_n_reactors`](configuration.md#scan-manager--io-configuration)).
+- `ioctx::start()` starts each reactor in turn — allocating its staging and launching its worker thread — so a failure such as a pinned staging allocation propagates out of `start()`. `uring_n_reactors` read reactors spread over the GPUs (default 2 below 32 CPU hardware threads, 4 otherwise), plus a write reactor per GPU started by its first write, serve uring and `rest_n_reactors` serve REST (per routed REST context, i.e. per distinct resolved object-store configuration, shared by all GPUs; unnamed, clamp(T/6, 8, 16) without kTLS and clamp(T/6, 4, 16) with it, or with kTLS one per steered NIC IRQ CPU (at least 4) when there are fewer than 16; `0` sizes each pool from the egress NIC's queue IRQs and pins each reactor to one IRQ CPU when the IRQs are steered to a strict subset of the NIC node's cores — see [`rest_n_reactors`](configuration.md#scan-manager--io-configuration)).
 - **Routing.** `next_reactor` takes the next starting point of a rotating counter, ranks the reactors by `queued_bytes()` (approximate bytes not yet expanded into physical operations) and returns the least backlogged two (for REST, the least backlogged `rest.fan_out`, default 2); rotation breaks ties so synchronous reads do not stick to reactor zero. A multi-slice read is balanced by bytes across the reactors returned (whole slices), a single-slice read goes to the first.
 - **Per-reactor loop.** A uring reactor takes one request off its queue at a time (high tier first, see below) and works through it in order. Each loop pass it expands at most `slices_per_pass` slices of that request into physical operations, submits them, then waits for completions (a 20 ms poll tick when nothing completes). A future resolves, and its callbacks run, on the reactor thread that completed the request's last operation.
 - **Failure.** A reactor whose loop hits a fatal error closes its admission and fails its in-flight, active and queued requests with that error; it is not restarted, and later requests routed to it are failed as canceled. The other reactors keep serving, but `next_reactor` does not skip the dead one (its near-zero backlog makes it a likely pick), so a share of reads keeps failing until the process restarts. Sirius neither detects nor restarts a dead reactor.
@@ -661,7 +661,7 @@ reactor pool and synchronous read scheduler; see [Local cuFile Reads](#local-cuf
 
 - **Configuration.** `scan_manager_config` embeds cuCascade's config structs (`uring`, `rest`, `cufile`, `cache`, `object_store`); `to_io_config()` copies them and the reactor counts into the `cucascade::io::io_config` the registry is built from, maps `backend` (`native` / `cufile`) onto cuCascade's enum, and applies the cache mode. `uring_n_reactors` defaults to 4 and `uring.slices_per_pass` to 4 in both; `uring.n_max_concurrent_scans` is 0 in both, but `sirius_config` re-defaults it when it resolves a configuration: to the pipeline pool size for uring (an explicit 0 keeps the local readahead off) and to max(8, 2x the pool) for REST. `backend: kvikio` and the `scan_manager.kvikio` block are rejected with an error to use `native`, not loaded as aliases.
 - **Contexts.** The scan manager owns the registry. Its constructor builds and starts the default context — uring for `backend: native`, cuFile for `backend: cufile` — and throws if that fails. Contexts for other backends, such as REST for `s3://`, are built on first use (`ioctx_for_type` / `ioctx_for_path`), started, and then shared by every query and GPU. Each context gets its `fs_cache` when it is built (`init_cache_for`) when `cache.mode` is `cucs` and the backend can use one. cuFile cannot, so it does not run scan readahead even if `cache.mode: cucs` or a positive readahead budget is configured.
-- **Backend failures.** cuCascade's logging is compiled out and its registry reports a throwing factory only as a null context, so Sirius derives the likely cause itself (`explain_ioctx_failure`): for REST, the empty `object_store` fields (a WARN, since REST is then disabled by configuration); for uring, a missing HOST-tier memory space or an invalid `uring.*` setting; for optional cuFile contexts, build support and exposed `cufile.*` read settings. The mandatory local cuFile context instead uses the same public count/config constructor directly, preserving its actual exception text rather than losing it in the registry's noexcept factory. A context built on first use whose factory fails is reported once and its backend then resolves to no context; a `start()` failure is logged and propagated, not cached; the next lookup rebuilds the context. For the default context the cause goes into the thrown exception; explicitly selecting cuFile does not silently switch to an unrelated backend after initialization failure. A requested `fs_cache` that cuCascade declined to build is reported with a WARN.
+- **Backend failures.** cuCascade's logging is compiled out and its registry reports a throwing factory only as a null context, so Sirius derives the likely cause itself (`explain_ioctx_failure`): for REST, the empty `object_store` fields (a WARN, since REST is then disabled by configuration); for uring, a missing HOST-tier memory space or an invalid `uring.*` setting; for optional cuFile contexts, build support and exposed `cufile.*` read settings. The mandatory local cuFile context instead uses the public config constructor directly, preserving its actual exception text rather than losing it in the registry's noexcept factory. A context built on first use whose factory fails is reported once and its backend then resolves to no context; a `start()` failure is logged and propagated, not cached; the next lookup rebuilds the context. For the default context the cause goes into the thrown exception; explicitly selecting cuFile does not silently switch to an unrelated backend after initialization failure. A requested `fs_cache` that cuCascade declined to build is reported with a WARN.
 - **Opening files.** Every Sirius open goes through `sirius::io::open_datasource(io_ctx, path[, hint])` (`src/io/path_utils.hpp`). It normalizes the path with Sirius's own `strip_file_scheme`, which parses a `file:` URI with DuckDB's `Path` (strips the scheme, folds `.`, `..` and empty segments, percent-decodes; any other path comes back byte-identical), and then calls `cucascade::io::open_datasource`. The `fs_cache` generations key on object identity, and the `metadata_store` keys on normalized path and parser profile while checking that identity, so normalization avoids path aliases in the metadata index. cuCascade's own `strip_file_scheme` strips the scheme and percent-decodes but does not fold segments.
 - **`[uring_gauges]` sampler.** When the default context is a `uring_ioctx`, the scan manager owns a `uring_gauges_sampler` (`src/scan_manager/uring_gauges_sampler.hpp`): a thread named `uring_gauges` that wakes every 250 ms and, only while the log sink accepts DEBUG, polls `uring_ioctx::reactor_gauges()` and logs one line per non-idle reactor — `[uring_gauges] reactor=… inflight=… max_inflight=… pending_ops=… active_slices=… queued_requests=… queued_low=… queued_MiB=… started=… preemptions=… MiB_s=…`, then the high-tier (`hq_*`) and low-tier (`lq_*`) queue-delay windows: count, sum and max in ms, and the non-empty log2-µs histogram buckets. Above DEBUG it costs a timed wakeup and does not reset the reactors' gauge windows. The scan manager stops it in `stop()`, before the contexts are released. REST contexts have no gauges. The default context's startup DEBUG line reports `n_reactors`, `slices_per_pass` and `range_batch_slices`.
 
@@ -670,7 +670,7 @@ reactor pool and synchronous read scheduler; see [Local cuFile Reads](#local-cuf
 A scan resolves each file to a context — `split_provider` receives `ioctx_for_path` as a `sirius::io::ioctx_resolver` (`src/io/ioctx_resolver.hpp`) — and opens it with `sirius::io::open_datasource`. The backend creates an `io_object` (a local file's descriptors; for S3 a HEAD, or a suffix GET under the footer-probe hint) and `cucascade::io::open_datasource` wraps it in a `cucascade::io::datasource` bound to the context. Each cuDF read on the datasource forwards to the context:
 
 - With an `fs_cache`, `host_read` / `device_read` ask the cache to classify every requested chunk. Resident pieces are copied from pinned host chunks, loadable pieces become cache-backed `prepared_io_slice`s, and gaps become ordinary prepared slices; the mixed batch is then dispatched through the context's asynchronous backend hook.
-- Without one, the read becomes prepared slices directly. That is the case under `cache.mode: none` (uring reads with `O_DIRECT`), under `cache.mode: os` (uring reads buffered through the OS page cache), and always for cuFile (cuFile's direct-open policy comes from `cufile.use_odirect`). For native reads under `os` the readahead stays enabled by configuration, but it has no pinned cache to fill: `fadvise` does nothing on a context without an `fs_cache`.
+- Without one, the read becomes prepared slices directly. That is the case under `cache.mode: none` (uring reads with `O_DIRECT`), under `cache.mode: os` (uring reads buffered through the OS page cache), and always for cuFile (cuFile registers the file's `O_DIRECT` descriptor when the filesystem gives one, whatever the cache mode). For native reads under `os` the readahead stays enabled by configuration, but it has no pinned cache to fill: `fadvise` does nothing on a context without an `fs_cache`.
 
 One `grouped_coordinator` owns the future of a logical read across all its grouped requests and physical operations. The future resolves, or reports the first error, only after every published operation has settled. A cache fill publishes its chunks when its own operation completes, so a later failure does not discard completed cache data.
 
@@ -678,88 +678,53 @@ One `grouped_coordinator` owns the future of a logical read across all its group
 
 | Backend | Context | Scheme | Notes |
 |---------|---------|--------|-------|
-| io_uring | `uring::uring_ioctx` (a `templated_ioctx<uring_reactor>`) | local files | `uring_n_reactors` reactors, each one worker thread with one ring and a 64 MiB pinned staging budget. A reactor chooses 256 KiB–16 MiB operations; compatible operations use `O_DIRECT`, with buffered fallback for unsupported or misaligned remainders (and buffered reads throughout under `cache.mode: os`). |
+| io_uring | `uring::uring_ioctx` (a `templated_ioctx<uring_reactor>`) | local files | `uring_n_reactors` read reactors spread over the GPUs and one lazily started write reactor per GPU, each one worker thread pinned to the GPU's NUMA node with one ring and a 64 MiB pinned staging budget. A reactor chooses 256 KiB–16 MiB operations; compatible operations use `O_DIRECT`, with buffered fallback for unsupported or misaligned remainders (and buffered reads throughout under `cache.mode: os`). |
 | REST / object store | `rest::rest_ioctx` (a `templated_ioctx<rest_reactor>`) | `s3://` | `rest_n_reactors` reactors (`0` = NIC-sized), each one worker thread with its own io_uring ring and up to `rest.max_connections` HTTP/1.1 connections; physical GETs of 4–16 MiB by default (`rest.min_segment_bytes` / `rest.max_segment_bytes`). See [S3 / Object-Store Backend](#s3--object-store-backend). |
-| cuFile | `cufile::cufile_ioctx` | local regular files | A planned group of `cufile.reactors_per_device` reactors for Sirius's GPU, pinned to its CPUs (`cufile_n_reactors: 0`, the default), or a flat pool of `cufile_n_reactors`. Each worker issues synchronous `cuFileRead` calls, staged through registered GPU slots on a GDS host, with compatibility/POSIX fallback and pinned H2D staging. No `fs_cache` or scan readahead, regardless of cache mode. Single-GPU only. |
+| cuFile | `cufile::cufile_ioctx` | local regular files | One reactor per GPU in `cufile.devices` (default: the GPU Sirius reads into), pinned to the CPUs of the GPU's NUMA node. A reactor has `cufile.lanes` read lanes and as many write lanes; each lane issues synchronous `cuFileRead` / `cuFileWrite` calls through its slot of a registered GPU arena. Host I/O goes through a host-only io_uring reactor. No `fs_cache` or scan readahead, regardless of cache mode. |
 
 A new backend is added in cuCascade (a reactor satisfying its `io_reactor_c` concept, plus a registry entry); on the Sirius side it then needs a case in the switches over `io_context_type`.
 
 ### Local cuFile Reads
 
-`scan_manager.backend: cufile` selects cuCascade's read-only cuFile context for local
+`scan_manager.backend: cufile` selects cuCascade's cuFile context for local
 regular files; it does not replace the native REST backend. S3 reads,
-LIST and globs remain on REST. The existing multi-GPU guard forces non-native
-backends back to `native` with a warning, so this path is single-GPU only.
+LIST and globs remain on REST.
 See [cuFile configuration](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp)
 for a YAML example and all read tunables.
 
-The scan manager builds the context with cuCascade's `cufile::make_cufile_ioctx`.
-With `cufile_n_reactors: 0` (the default) it plans one group of reactors per GPU in
+The scan manager builds a `cufile::cufile_ioctx` with one reactor per GPU in
 `cufile.devices`, which defaults to the GPU Sirius reads into rather than every
-visible GPU. The group has `cufile.reactors_per_device` reactors (auto: 32 on a network
-filesystem, 8 on local NVMe, 16 unknown, judged from `cufile.storage_hint_path`), pinned
-to that GPU's CPUs. Each reactor keeps one synchronous `cuFileRead` in flight, so the
-group size is the GPU's queue depth. A positive `cufile_n_reactors` runs one flat,
-unpinned pool instead. The plan is logged at INFO and the GDS setup problems the planner
-sees at WARN.
+visible GPU. Each GPU has an arena of `2 x cufile.lanes x cufile.lane_bytes` of
+`cudaMalloc` memory registered with cuFile once, and a reactor has two sets of
+`cufile.lanes` lanes, one reading and one writing. A lane is a thread, pinned to the CPUs
+of the GPU's NUMA node, that takes one slot of the arena and blocks in one synchronous
+`cuFileRead` / `cuFileWrite` at a time, so the lane count is the GPU's queue depth. The
+arena lives
+outside RMM for the life of the process; `SiriusContext::initialize` reserves it
+(`reserve_cufile_arenas`) before the GPU memory pools claim the device.
 
-On a host where cuFile reports a GDS mode (or with `staging_mode: always`), a device
-read of a registered file is widened to 4 KiB boundaries, read in pieces of up to
-`staging_piece_bytes` (8 MiB) into registered, aligned GPU slots, and copied
-device-to-device into the destination. Otherwise cuFile reads straight into the
-destination, bouncing unaligned reads through its own buffers (pieces of at most
-`max_op_bytes`). Staging slots live outside RMM for the life of the process. For a
-planned pool, `SiriusContext::initialize` reserves them (`reserve_cufile_staging`)
-before the GPU memory pools claim the device. See
-[cuFile configuration](configuration.md#scan_managercufile--local-cufile-reads-iocufileconfighpp).
-
-Two opt-in blocks change how the pool reads; both are off by default.
-[`cufile.fused_reads`](configuration.md#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in)
-adds *lane reactors* to each GPU's group (8 by default, built before the synchronous ones,
-whose automatic count then drops to 8). Each owns lanes (16 by default), a lane being a
-registered slot plus a CUDA stream. A device read of a registered file is cut on the
-submitting thread into 4 KiB-aligned windows of up to `slot_bytes` (8 MiB), neighbouring
-slices of one request fused, and each window is one `cuFileReadAsync` followed by
-device-to-device copies into the destinations on the lane's stream. Completion stays
-host-observed. The lane slots (1032 MiB per GPU with the defaults) live outside RMM on top of
-the staging cap, and `reserve_cufile_staging` reserves them first.
-[`cufile.host_batch`](configuration.md#cufilehost_batch--host-reads-through-the-cufile-batch-api-opt-in)
-adds batch reactors that serve aligned host reads through `cuFileBatchIOSubmit`. Fusion is
-per request, so `scan_manager.cufile_bulk_read` (default `auto`: on exactly when fused reads
-are) sends cuFile scans down the bulk route of `materialize_parquet`: one vectored
+A device read is cut on the submitting thread into 4 KiB-aligned segments of at most
+`lane_bytes` (8 MiB); the destinations of one request that lie within
+`coalesce_gap_bytes` of each other share a segment. A lane reads the segment into its
+slot and copies each destination's bytes out device-to-device on its own stream.
+Coalescing is per request, so `scan_manager.cufile_bulk_read` (default `on`)
+sends cuFile scans down the bulk route of `materialize_parquet`: one vectored
 `device_read_ranges_async` per file per split, decoded by cuDF's hybrid scan reader, as REST
 scans are. The scan manager registers its cuFile context for that route
 (`sirius::io::bulk_read_registration`), and `sirius::io::prefers_bulk_read` is the one
 decision both `prefers_bulk_materialize` and the Iceberg reader-position eligibility read.
-With the knob `off` (or lanes off) the scan keeps cuDF's general reader, which issues one
-`device_read_async` per contiguous run of column chunks, so runs are split into windows but
-never fused with each other.
+With the knob `off` the scan keeps cuDF's general reader, which issues one
+`device_read_async` per contiguous run of column chunks, so runs are split into segments
+but never coalesced with each other.
 
 A device read is ordered after the work already queued on the caller's stream, through
 an event recorded on the submitting thread. Completion is host-observed: the read future
-settles only when the destination is ready. Host reads, small device reads (default
-threshold 256KiB), and compatibility/failure fallbacks use POSIX reads; device fallback
-stages through pinned host scratch and H2D copies. None of this staging is `fs_cache`,
-and neither cache mode nor an explicit readahead budget enables cuFile scan readahead.
-At shutdown the scan manager logs how many reads and bytes went staged, direct, POSIX
-device and host, plus the cuFile failures (`cufile_ioctx::stats()`), and, when
-`fused_reads` or `host_batch` is enabled, the lane and batch counters.
-
-`compat_mode: auto` permits host/POSIX fallback when cuFile is unavailable for a
-file, including on a compatibility-only host without `nvidia-fs`. `on` forces POSIX;
-`off` refuses an unusable cuFile handle rather than silently falling back at open.
-The cuFile library can itself run in compatibility mode even after successful
-registration, so neither success nor `off` proves direct DMA. A missing
-`nvidia-fs` module alone is not a definitive negative: supported P2PDMA paths exist.
-
-Per-path capability discovery reports filesystem/mount/storage evidence, runtime
-cuFile/driver availability, effective policy and direct-open/registration results.
-A `direct_candidate` is advisory, not proof that a particular transfer used DMA;
-GPU, alignment and cuFile configuration still matter. Unknown evidence is distinct
-from unsupported storage, and the real open/read must still handle errors. This
-report does not change backend selection automatically. To inspect `cufile.log`,
-configure cuFile's JSON logging settings via `CUFILE_ENV_PATH_JSON` before first
-initialization; see the configuration section above.
+settles only when the destination is ready. Host reads go through a host-only io_uring
+reactor the cuFile reactor owns. There is no POSIX fallback for device reads: a file
+cuFile could not register serves host reads only, and its device reads fail. Neither
+cache mode nor an explicit readahead budget enables cuFile scan readahead. To inspect
+`cufile.log`, configure cuFile's JSON logging settings via `CUFILE_ENV_PATH_JSON` before
+first initialization; see the configuration section above.
 
 ### S3 / Object-Store Backend
 

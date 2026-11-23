@@ -273,12 +273,11 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 
 Raw and compressed `.hpln` spills use the DISK space's shared `cucascade::io::ioctx`.
 The default is adopted lazily on first conversion and shared process-wide through a weak
-cache. Automatic selection prefers **real GDS via cuFile**, then **usable io_uring**, then
-**cuFile POSIX/staging** if io_uring is unavailable or forbidden. The context owns its
-reactor teardown and its staging (a cuFile context borrows its pinned host scratch from the
-HOST space per transfer); see [DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
-On a GDS host it also reserves registered GPU staging when it starts, after the GPU memory
-pools exist (see [staging memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
+cache. Automatic selection prefers **real GDS via cuFile**, then **io_uring**. The context
+owns its reactor teardown and its staging; see
+[DISK I/O and ownership](memory-management.md#disk-io-and-ownership).
+On a GDS host it also takes a registered GPU arena when it starts, after the GPU memory
+pools exist (see [arena memory](#scan_managercufile--local-cufile-reads-iocufileconfighpp)).
 
 The existing `disk_id`, `capacity_bytes`, and `downgrade_root_dirs` keys and spill-file
 layouts are unchanged. There are no additional DISK-backend or per-mount reactor YAML
@@ -484,12 +483,11 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 0**) | max(18, eligible NUMA domains) | Shared metadata and Parquet-coalescing worker count. Explicit values must cover all eligible domains. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native`, `cufile` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack: io_uring for local paths and native REST (HTTP/1.1 over io_uring, with kTLS or user-space TLS) for `s3://`; `cufile` uses cuFile with compatibility/POSIX fallback for local regular files and keeps REST for `s3://`. S3 listing and globs always use REST. With several GPUs, cuFile runs one reactor group and one set of staging slots per GPU. `sirius` remains a deprecated alias of `native`. `backend: kvikio` and any `scan_manager.kvikio` block are rejected with an error to use `native`; they are not accepted as aliases. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `uring_n_reactors` | int (**> 0**) | 2 if T < 32, otherwise 4 | Number of uring read reactors, spread over the GPUs Sirius reads into: `max(1, uring_n_reactors / #GPUs)` per GPU. Every GPU also gets one write reactor, started by its first write, so reads never queue behind writes. Each reactor is one worker thread, pinned to the CPUs of the GPU's NUMA node, with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space of that NUMA node when it starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). A device read goes to the least-backlogged read reactor of its GPU; host reads go to the least-backlogged read reactors. |
 | `rest_n_reactors` | int (**>= 0**) | kTLS loaded: one per steered NIC IRQ CPU when there are fewer than 16, else clamp(floor(T/6), 4, 16); no kTLS: clamp(floor(T/6), 8, 16) | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own io_uring ring and HTTP/1.1 connection pool. The count is per routed REST context and shared by all GPUs, not a process total: each distinct resolved object-store configuration (a different endpoint or credentials) builds its own context, so two resident configurations with `rest_n_reactors: 2` and `rest.max_connections: 64` hold 4 reactors and 256 connection slots. `0` sizes each pool from the egress NIC (`rest.interface`, else the default route's interface): when the NIC's queue IRQs are steered to a strict subset of its NUMA node's cores, one reactor per distinct IRQ CPU, each pinned to that CPU (`rest.pin_to_irq_cpus`); otherwise 2 unpinned reactors. A pinned reactor keeps its inherited scheduling priority unless `rest.raise_reactor_priority` is set. Pinning never widens the process's inherited CPU affinity. Unnamed, the count depends on whether cuCascade's topology reports kernel TLS loaded (`system_topology_info::kernel_tls.loaded`: the kernel `tls` module loaded or built in). With kTLS, when the egress NIC's queue IRQs are also steered to a strict subset of its NUMA node's cores on fewer than 16 CPUs, the count is the number of IRQ CPUs, at least 4 (the reactors are pinned round-robin onto those CPUs); otherwise it is clamp(floor(T/6), 4, 16). Without kTLS it is clamp(floor(T/6), 8, 16): user-space TLS costs the reactor threads CPU per byte. A named count, `0` included, is used as written. |
 | `reserve_rest_reactor_cpus` | bool | true | Keep Sirius's own thread pools (GPU pipeline, scan manager, task creator, downgrade) off the CPUs the REST reactors pin to, so those CPUs carry only the NIC's interrupts and the reactors. The CPUs come from cuCascade's `planned_reactor_cpus` at startup; no effect when the reactors run unpinned. A pool whose configured `cpu_affinity` lies entirely on reactor CPUs keeps it, and a GPU pipeline executor whose GPU has no local core left in the pool keeps the pool's CPUs. A REST context first used from a restricted pool thread (e.g. a deferred Puffin read on a metadata worker) is built under the saved rank startup mask, so it pins the same way while preserving the caller's CUDA and thread-local context. |
 | `httpfs_external_file_cache` | bool | false | Whether DuckDB's external file cache (EFC) may keep what DuckDB reads through Sirius's S3 file system: bind-time footer reads, the footer-statistics pass with `sirius_analyze_parquet` and `pin_table`, and the CPU Parquet delete reader. With `false`, DuckDB requests the needed ranges and retains no EFC byte blocks; the probe stash and metadata caches remain separate. With `true`, DuckDB may fetch an object no larger than its remote cache block (`external_file_cache_remote_max_block_size`, 2 MiB by default) whole, which after a footer probe requires another data GET when the whole-file range is not already in the stash, and it can serve a later read of the unchanged object from the cache; without it, a planning that reads an Iceberg Parquet position-delete file through the CPU reader can fetch the same bytes again. ETag and size checks are unaffected, and so is DuckDB's `enable_external_file_cache` for other file systems. Taken when a file is opened: set it in the configuration the database starts with. GPU Parquet column-data reads use cuCascade directly and are not affected. |
-| `cufile_n_reactors` | int (**>= 0**) | 0 | cuFile reactors for local reads, each one worker thread keeping one read in flight. `0` plans a pinned group of `cufile.reactors_per_device` reactors for each GPU in `cufile.devices` (default: the GPU Sirius reads into). A positive count runs one flat, unpinned pool of that many reactors instead. See [`scan_manager.cufile`](#scan_managercufile--local-cufile-reads-iocufileconfighpp). |
-| `cufile_bulk_read` | enum: `auto`, `on`, `off` | `auto` | Parquet read route of cuFile scans. `on`: one vectored device request per file per split (the bulk route REST scans take), which lets `cufile.fused_reads` lanes fuse column chunks; `off`: cuDF's general reader, one request per contiguous run of chunks; `auto`: bulk exactly when `cufile.fused_reads.enabled`, so the default changes nothing without lanes. See [Fusion and Sirius's scan](#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in). No effect on other backends. |
+| `cufile_bulk_read` | enum: `on`, `off` | `on` | Parquet read route of cuFile scans. `on` (`auto` is accepted as a spelling of it): one vectored device request per file per split (the bulk route REST scans take), which lets the cuFile lanes coalesce neighbouring column chunks; `off`: cuDF's general reader, one request per contiguous run of chunks. See [Coalescing and Sirius's scan](#scan_managercufile--local-cufile-reads-iocufileconfighpp). No effect on other backends. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -734,11 +732,15 @@ sirius:
 Select cuFile with the existing `backend` key. The default remains `native`.
 This backend reads local and network-filesystem regular files (for example IBM Storage
 Scale / GPFS) into GPU memory through cuFile (GPUDirect Storage). `s3://` reads, listing
-and globs still use native REST. With several GPUs, the planned pool has one group of
-reactors and one set of staging slots per GPU, and each read is routed by its destination.
+and globs still use native REST. The context has one reactor per GPU, and each device read
+is routed to the reactor of its destination GPU.
 
-The example below is for a GPFS deployment. Point `storage_hint_path` at a file on the
-data filesystem so the pool is sized for network storage:
+A reactor owns two sets of `lanes` lanes, one reading and one writing. A lane is a thread
+that owns a `lane_bytes` slot of registered GPU memory and blocks in one synchronous
+`cuFileRead` / `cuFileWrite` at a time, so `lanes` is the GPU's read depth (and its write
+depth). A device read is cut into 4 KiB-aligned segments of at most one slot; a lane reads
+a segment into its slot and copies the wanted bytes into the destinations device-to-device.
+Host reads go through a host-only io_uring reactor that needs no staging memory.
 
 <!-- scan-cufile-example -->
 ```yaml
@@ -748,119 +750,77 @@ sirius:
   executor:
     scan_manager:
       backend: cufile
-      cufile_n_reactors: 0            # plan a pinned pool per GPU
       cache: { mode: none }
       cufile:
-        storage_hint_path: /gpfs/fs1/warehouse/lineitem/part-0.parquet
-        reactors_per_device: 0        # auto: 32 on GPFS/NFS/Lustre, 8 on local NVMe, 16 unknown
-        staging_mode: automatic
-        staging_piece_bytes: 8MiB
-        staging_slots_per_reactor: 2
-        max_staging_bytes_per_device: 1GiB
-        pin_to_device_cpus: true
-        max_inflight: 32
-        max_op_bytes: 64MiB
-        gds_threshold: 256KiB
-        use_odirect: true
-        compat_mode: auto
+        lanes: 32                     # synchronous cuFile reads in flight per GPU
+        lane_bytes: 8MiB              # the most one cuFile read moves
+        coalesce_gap_bytes: 1MiB
+        coalesce_gap_ratio: 0.15
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `reactors_per_device` | int (**>= 0**) | 0 | Reactors per GPU in a planned pool (`cufile_n_reactors: 0`). Each reactor keeps one synchronous `cuFileRead` in flight, so this is the GPU's queue depth (Little's law: depth ≈ throughput × latency / read size). `0` sizes it from `storage_hint_path`: 32 on a network filesystem (GPFS, NFS, Lustre, ...), 8 on local block storage, 16 when unknown. |
-| `devices` | list of CUDA ordinals | empty | GPUs the planned pool serves, a group of reactors and reserved staging each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and GPUs Sirius reads into; startup fails otherwise. |
-| `storage_hint_path` | string | empty | A file (not a directory) on the storage Sirius mostly reads, used only to size the pool. Empty = unknown storage. |
-| `pin_to_device_cpus` | bool | true | Pin each GPU's reactors to the CPUs local to that GPU (NVML affinity intersected with the process affinity). |
-| `staging_mode` | enum: `automatic`, `always`, `never` | `automatic` | Stage device reads of a cuFile-registered file through registered, aligned GPU slots, then scatter the wanted bytes with a device-to-device copy. `automatic` stages only when cuFile reports a real GDS mode; `always` forces it (tests, diagnostics); `never` reads straight into the destination through cuFile's bounce buffers. |
-| `staging_piece_bytes` | bytes (**> 0, multiple of 4KiB**) | 8MiB | File bytes one staged `cuFileRead` covers. Larger device reads are split into pieces of this size so several reactors read them at once. Capped at cuFile's `max_direct_io_size`. |
-| `staging_slots_per_reactor` | int (**> 0**) | 2 | Staging slots each reactor holds per GPU. With 2, a read can complete into one slot while its caller's stream is still busy; 1 disables those early reads. |
-| `fuse_gap_bytes` | bytes | 0 | Fuse neighbouring small device slices of one vectored read into a single staged `cuFileRead` when the gap between them is at most this many bytes (the gap is read and dropped). `0` disables it. Staged reads only; not applied to device reads while `fused_reads` is enabled (the lanes have their own `fused_reads.fuse_gap_bytes`). |
-| `max_staging_bytes_per_device` | bytes | 1GiB | Cap on registered staging per GPU. `0` = no cap beyond the device limits (half the free BAR1, cuFile's pinned-memory limit). |
-| `max_inflight` | int (**> 0**) | 32 | Per-reactor bound on asynchronous items holding copy resources (staged scatter copies waiting for their stream, H2D copies of fallback reads), not concurrent `cuFileRead` calls. |
-| `max_op_bytes` | bytes (**>= 4KiB**) | 64MiB | Largest direct (unstaged) `cuFileRead` issued by a worker; larger device reads are chunked. |
-| `gds_threshold` | bytes | 256KiB | Device reads below this size use POSIX reads and pinned H2D staging rather than cuFile. `0` is legal. |
-| `use_odirect` | bool | true | Open the direct-I/O descriptor needed for cuFile. `false` skips cuFile registration and uses buffered POSIX reads; it conflicts with `compat_mode: off`. Independent of `cache.mode`. |
-| `compat_mode` | enum: `auto`, `on`, `off` | `auto` | Per-file policy: `auto` tries cuFile and permits POSIX fallback, `on` forces POSIX, `off` requires a usable cuFile handle and fails the open rather than falling back if it cannot be registered. Values are lowercase. |
-| `poll_interval_us` | int (**>= 0**, µs) | 50 | Idle polling interval while copies await completion; not a delay before dispatching ready work. |
-| `low_service_interval` | int (**>= 0**) | 4 | High-priority requests started while low work is waiting before granting the low tier a turn. `0` restores strict priority. |
-| `fused_reads` | block | disabled | Opt-in fused asynchronous device reads on stream lanes. See [`cufile.fused_reads`](#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in). |
-| `host_batch` | block | disabled | Opt-in host reads through cuFile's batch API. See [`cufile.host_batch`](#cufilehost_batch--host-reads-through-the-cufile-batch-api-opt-in). |
+| `lanes` | int (**> 0**) | 32 | Lanes in each of a GPU's two lane sets (one reads, one writes). Each lane keeps one synchronous cuFile call in flight, so this is the GPU's queue depth (Little's law: depth ≈ throughput × latency / read size). |
+| `lane_bytes` | bytes (**> 0, multiple of 4KiB**) | 8MiB | A lane's slot of registered GPU memory: the most one cuFile call moves. Larger device reads are split into segments of this size so several lanes read them at once. Keep it at most cuFile's `max_direct_io_size_kb`. |
+| `coalesce_gap_bytes` | bytes | 1MiB | Neighbouring device slices of one vectored read share one `cuFileRead` when the gap between them is at most this many bytes (the gap is read and dropped). `0` coalesces only contiguous slices. |
+| `coalesce_gap_ratio` | fraction in [0, 1] | 0.15 | Most of such a read that may be gaps. |
+| `devices` | list of CUDA ordinals | empty | GPUs the context serves, one reactor and one arena each. Empty means the GPU Sirius reads into (not every visible GPU). Ids must be non-negative, unique, and GPUs Sirius reads into; startup fails otherwise. |
+
+Unknown keys are rejected, including the keys of the previous cuFile pool
+(`reactors_per_device`, `staging_*`, `max_inflight`, `gds_threshold`, `compat_mode`,
+`fused_reads`, `host_batch`, ...) and `scan_manager.cufile_n_reactors`.
 
 cuFile cannot fill fragmented pinned-cache destinations, so it never arms `fs_cache`
 or scan readahead, **even with `cache.mode: cucs`**. Neither `max_readahead_scans` nor
-`readahead_strategy` enables it. These are read-only settings; no write or
-per-transfer buffer-registration controls are exposed.
+`readahead_strategy` enables it.
 `cufile.n_max_concurrent_scans` is intentionally not a YAML setting: cuFile cannot
-publish a usable cache/readahead budget. Tune read concurrency with
-`cufile.reactors_per_device` (or `cufile_n_reactors` for a flat pool) and
-`cufile.max_inflight` instead.
+publish a usable cache/readahead budget. Tune read concurrency with `cufile.lanes`
+instead.
 
-**Staging memory.** Staging slots are `cudaMalloc`ed outside RMM, registered with cuFile
-once, and kept for the life of the process. With the defaults on GPFS that is about
-32 reactors × 2 slots × (8 MiB + 128 KiB of alignment) ≈ 520 MiB per GPU, capped by
-`max_staging_bytes_per_device`. With [`fused_reads`](#cufilefused_reads--fused-device-reads-on-stream-lanes-opt-in)
-enabled, the lanes add their own registered slots **on top of** that cap:
-`min(reactors_per_device x lanes_per_reactor, max_lanes_per_device) x (slot_bytes + 64 KiB)`
-(cuCascade's `cufile::fused_lane_staging_bytes`), 1032 MiB per GPU with the defaults, so up
-to 2056 MiB per GPU with the default 1 GiB staging cap. For a planned pool, Sirius reserves
-the lane slots and then the staging slots at startup **before** the GPU memory pools are
-created, so they come on top of `sirius.memory.gpu.usage_limit_*`; on a small GPU, lower
-the usage limit, `max_staging_bytes_per_device` or the lane count. A flat pool
-(`cufile_n_reactors > 0`) allocates its slots (lanes included) as its reactors first read,
-from whatever the pools left free. So does the
-[DISK tier's default context](#disk-memory-siriusmemorydisk) on a GDS host: a planned
-cuFile pool with cuCascade's defaults that, when it starts at the first spill, reserves
-16 reactors × 2 slots ≈ 260 MiB on every visible GPU, on top of the scan pool's slots
-(each reactor holds its own), so leave room for it in the `usage_limit_*` headroom. The POSIX
-fallback (small and host reads, and staged writes) stages through pinned host memory
-borrowed per transfer from the HOST space of the reactor's GPU's NUMA node: up to two
-8 MiB slots, counted against that space only while the transfer runs. If a slot
-cannot be allocated or registered, reads (and DISK device writes) go directly through
-cuFile's own bounce buffers and a WARN says so. With `staging_mode: automatic` on a host
-without GDS, nothing is allocated.
+**Arena memory.** Each GPU's lane slots are one arena of `2 × lanes × lane_bytes`
+(512 MiB with the defaults), `cudaMalloc`ed outside RMM, registered with cuFile once and
+kept for the life of the process. Sirius reserves the arena at startup **before** the GPU
+memory pools are created, so it comes on top of `sirius.memory.gpu.usage_limit_*`; on a
+small GPU, lower the usage limit, `lanes` or `lane_bytes`. The
+[DISK tier's default context](#disk-memory-siriusmemorydisk) on a GDS host is a second
+cuFile context with cuCascade's defaults over every visible GPU. An arena belongs to
+the GPU, not to a context: with the default `lanes` and `lane_bytes` here too, both
+contexts share the GPU's arena and its slots. A different `lanes` or `lane_bytes`, or a
+GPU Sirius does not read into, costs the DISK context another arena (512 MiB) when it
+starts at the first spill, from whatever the pools left free, so leave room for it in
+the `usage_limit_*` headroom.
 
-**Plan and counters.** At startup the pool plan (`cufile pool: ...`, with each GPU
-group's reactors, CPUs and staging) is logged at INFO, and each GDS setup problem
-the planner can see (Storage Scale without GDS or without `rdma_dev_addr_list`, no peer
-memory, poll mode, a small `max_direct_io_size`) at WARN. At shutdown the scan manager
-logs which path the reads took (`cufile reads: staged ..., direct ..., posix device ...,
-host ..., cufile failures ...`). On a GDS host, Parquet device reads should land in
-`staged` (or, with `fused_reads` enabled, in the `cufile lanes: reads ...` line that follows);
-growing `posix device` bytes or `cufile failures` mean GPUDirect Storage is not
-serving them. With `fused_reads` or `host_batch` enabled the scan manager also logs
-`cufile lanes: reads N (payload, issued, parts), resubmits, failures, gated, mean lane
-cycle` and `cufile host batch: reads, waves, entries, failures, rejected submits, partial
-status`. Fusion is `parts / reads`, waste `issued / payload`; lane `failures` (re-served
-synchronously) and batch `partial status` (each one poisons its batch reader, logged at
-WARN) should stay 0.
+**Coalescing and Sirius's scan.** Coalescing happens inside one vectored request, so
+`scan_manager.cufile_bulk_read` (default `on`) sends cuFile Parquet scans down the
+bulk route: every column chunk a split reads from a file goes into its own device buffer
+through ONE vectored request, and cuDF's hybrid scan reader decodes from those buffers (the
+route REST scans always take). With `off`, cuDF's general Parquet reader issues one
+`device_read_async` per contiguous run of column chunks; each run is its own request, so
+runs are split into segments but never coalesced with each other. Both routes apply the
+same row filter and return the same rows. Reader-position Iceberg delete filtering needs
+the general route, so scans on the bulk route use interval deletion instead, exactly as
+REST scans do.
 
-**IBM Storage Scale checklist.** cuCascade's
-[cuFile / GPUDirect Storage guide](../../cucascade/docs/io/cufile-gds.md) has the full
-list and the tuning sweep that measures `reactors_per_device`, `staging_piece_bytes` and
-`max_staging_bytes_per_device` on the deployment host. In short:
+**Requirements and failures.** The context needs libcufile with an openable driver
+(cuFile's compatibility mode is enough to run, without GPUDirect transfers) and a usable
+io_uring; otherwise startup fails rather than rerouting to another backend. A file cuFile
+cannot register still opens and serves host reads, but device reads of it fail. There is
+no POSIX fallback for device reads.
+
+**IBM Storage Scale checklist.** On GPFS only the synchronous `cuFileRead` /
+`cuFileWrite` take the RDMA path, which is why the lanes use them.
 
 1. `gdscheck -p` lists IBM Storage Scale with a GDS mode (dmabuf / peermem), not only
    `compat`.
 2. Cluster: `mmchconfig verbsRdma=enable,verbsRdmaSend=yes,verbsGPUDirectStorage=yes`
    and `verbsPorts` naming the client's RDMA ports.
 3. `cufile.json`: a non-empty `rdma_dev_addr_list`, `use_poll_mode: false`, and
-   `max_direct_io_size_kb` at least `staging_piece_bytes`; otherwise the planner shrinks
-   the pieces to it. 16384 (16 MiB) is its maximum and default.
+   `max_direct_io_size_kb` at least `lane_bytes`. 16384 (16 MiB) is its maximum and
+   default.
 4. `nvidia_peermem` is loaded, or DMA-BUF is enabled.
 5. **CPU architecture:** IBM documents Storage Scale GDS clients as x86 only. On an
    aarch64 node (Grace / GB200), confirm support first. Otherwise every GPFS read runs
-   in cuFile compatibility mode (a host bounce) and automatic staging stays off.
-
-**Capability and fallback.** cuFile availability depends on the runtime library, GPU,
-filesystem/mount, storage stack, alignment and cuFile configuration. A per-path
-capability report combines that evidence with direct-open/handle-registration results;
-`direct_candidate` is advisory, **not proof of direct DMA**. Unknown evidence is not
-proof of unsupported storage. Successful registration (including `compat_mode: off`)
-does not prove that cuFile itself avoided compatibility mode. With `auto`, reads can
-remain correct through host/POSIX fallback on a compatibility-only host, including a
-host without `nvidia-fs`; conversely, absence of `nvidia-fs` alone does not rule out
-supported P2PDMA. Small reads and unaligned tails can use host staging. An explicit
-cuFile context initialization failure is reported, not silently rerouted to another backend.
+   in cuFile compatibility mode (a host bounce).
 
 **cuFile logging.** `libcufile` can create `cufile.log` in the working directory.
 Configure its `logging.level` and `logging.dir` in a cuFile JSON file, selected with
@@ -878,194 +838,6 @@ export CUFILE_ENV_PATH_JSON=/absolute/path/to/cufile.json
 
 Use a more verbose level such as `TRACE` only when diagnosing transfer mode; verbose
 logging can affect performance. This is cuFile configuration, not a Sirius YAML setting.
-
-#### `cufile.fused_reads` — fused device reads on stream lanes (opt-in)
-
-Off by default; with it off the pool reads exactly as described above. When enabled, device
-reads of cuFile-registered files are packed on the submitting thread into 4 KiB-aligned
-windows of at most `slot_bytes` and issued as `cuFileReadAsync` on *lanes*: a lane is a
-registered device slot plus a reactor-owned CUDA stream, and a lane reactor keeps one read
-in flight per lane. The callers' ranges are copied out device-to-device on the lane's
-stream; futures stay host-complete, so a resolved read's bytes are in place, as on the
-synchronous path. A read whose caller's stream still has work queued starts its I/O at once
-and only its copies wait (at most `max_gated_lanes` lanes per reactor hold such data).
-Windows below `gds_threshold`, files cuFile did not register, and failed lane reads go to
-the synchronous reactors. cuCascade's
-[fused lanes guide](../../cucascade/docs/io/cufile-fused-lanes.md) explains every knob.
-
-```yaml
-sirius:
-  executor:
-    scan_manager:
-      cufile:
-        fused_reads:
-          enabled: true
-          reactors_per_device: 8      # lane reactors per GPU (planned pool)
-          lanes_per_reactor: 16       # reads in flight per GPU = reactors x lanes
-          max_lanes_per_device: 128   # process-wide ceiling per GPU
-          slot_bytes: 8MiB
-          completion: poll
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | false | Serve eligible device reads on lanes. Requires `async_engine.mode: legacy` (cuCascade's default; not a YAML setting). |
-| `reactors_per_device` | int, 1–64 | 8 | Lane reactors (submitting threads) per GPU in a planned pool (`cufile_n_reactors: 0`). In a flat pool every reactor owns lanes instead. |
-| `lanes_per_reactor` | int, 1–64 | 16 | Lanes each lane reactor owns per GPU. Reads in flight per GPU = `reactors_per_device` x this (128 by default). |
-| `max_lanes_per_device` | int, >= 1 | 128 | Process-wide ceiling on lanes per GPU, over every cuFile context of the process. It guards the storage: 128 asynchronous reads in flight is what was qualified on GPFS. A `reactors_per_device` x `lanes_per_reactor` above it is legal (Sirius warns): the excess lanes never exist. |
-| `slot_bytes` | bytes, multiple of 64KiB in [64KiB, 1GiB] | 8MiB | A lane's registered slot: the largest single read. Keep it at most cuFile's `max_direct_io_size_kb`. |
-| `fuse` | bool | true | Fuse neighbouring slices of one vectored read into one window; `false` only splits at `slot_bytes`, so every slice costs at least one read. |
-| `fuse_gap_bytes` | bytes, < `slot_bytes` | 0 | Largest gap between two slices of one vectored read still fused into one window (the gap is read and dropped). `0` fuses only contiguous slices. On scans it only matters on the bulk route (see `cufile_bulk_read` below). |
-| `register_streams` | bool | true | Register lane streams with cuFile (`cuFileStreamRegister`), which cuts the setup of every read. |
-| `completion` | enum: `poll`, `callback` | `poll` | How a lane's completion reaches its reactor. `poll` queries the busy lanes' events every `poll_interval_us`; `callback` uses a stream callback (less CPU, but slower on GB200 + GPFS, and every lane completion stalls while anything blocks CUDA's host-callback thread). |
-| `max_gated_lanes` | int, <= `lanes_per_reactor` | 0 | Lanes per reactor and GPU that may hold data until a busy caller stream is ready. `0` = half the lanes. |
-| `max_resubmits` | int, >= 0 | 8 | Short-read continuations of one read before it falls back to the synchronous path. |
-| `max_parts_per_read` | int, >= 1 | 256 | Caller pieces one fused read serves at most. |
-| `failure_limit` | int, >= 1 | 8 | Consecutive failed lane reads after which a reactor leaves its lanes unused for `cooldown_s`. A failed read is always re-served synchronously. |
-| `cooldown_s` | int, >= 0 | 30 | Seconds of that cooldown. |
-| `stall_warn_s` | int, >= 0 | 30 | Warn once when a lane read has been in flight this long. `0` = never. |
-
-The ranges in the table are cuCascade's `fused_read_config::validate()`, checked only when
-`enabled: true`; a failure is reported under its key (for example
-`'cufile.fused_reads.slot_bytes': must be a multiple of 64 KiB in [64 KiB, 1 GiB]`). Unknown
-keys are rejected.
-
-**Which knobs apply where.** The top-level `cufile.reactors_per_device`,
-`staging_piece_bytes` and `fuse_gap_bytes` only concern the synchronous path;
-`fused_reads.reactors_per_device`, `slot_bytes` and `fuse_gap_bytes` concern the lanes. With
-fused reads on, an automatic `cufile.reactors_per_device` (0) plans 8 synchronous reactors
-per GPU (they serve writes, small reads and fallbacks) instead of 32 / 8 / 16; an explicit
-count is kept. `gds_threshold` applies to both: a smaller window goes to POSIX.
-`poll_interval_us` also paces `completion: poll`.
-
-**Fusion and Sirius's scan.** Fusion happens inside one vectored request, so Sirius picks the
-Parquet read route of cuFile scans with `scan_manager.cufile_bulk_read` (default `auto`: the
-bulk route exactly when `fused_reads.enabled`):
-
-- **Bulk route** (`auto` with fused reads on, or `on`): every column chunk a split reads from
-  a file goes into its own device buffer through ONE vectored request, and cuDF's hybrid scan
-  reader decodes from those buffers (the route REST scans always take). The lanes then fuse
-  neighbouring chunks of the whole split into `slot_bytes` windows, and bridge gaps up to
-  `fused_reads.fuse_gap_bytes`; the shutdown line shows it as `parts` above `reads`.
-- **General route** (`off`, or `auto` with fused reads off, the previous behaviour): cuDF's
-  general Parquet reader coalesces contiguous column chunks and issues one
-  `device_read_async` per contiguous run, after synchronizing the decode stream. Each run is
-  its own request: a run longer than `slot_bytes` is split into windows, but runs are never
-  fused with each other, and `fused_reads.fuse_gap_bytes` has no effect.
-
-Both routes apply the same row filter and return the same rows. The bulk route reads into
-buffers on the scan's stream without synchronizing it first, so a read whose stream is still
-busy becomes a two-phase lane read (counted in `gated`). Reader-position Iceberg delete
-filtering needs the general route, so scans on the bulk route use interval deletion
-instead, exactly as REST scans do.
-
-**Memory.** Each GPU's lanes hold `lanes x (slot_bytes + 64 KiB)` of registered device
-memory (1032 MiB with the defaults) outside RMM, on top of `max_staging_bytes_per_device`;
-see **Staging memory** above. Half the GPU's free BAR1 and cuFile's
-`max_device_pinned_mem_size` bound the total, and the plan warns when they cut lanes.
-
-**One context per process.** Lane streams stay registered with cuFile until the process
-exits, also after their context shut down (deregistering one synchronizes the device and
-stalls every other cuFile call). Sirius builds one scan cuFile context per engine (database
-instance), so a process that opens and closes many engines with `fused_reads` enabled
-accumulates registered streams; cuCascade warns past 1024.
-
-#### `cufile.host_batch` — host reads through the cuFile batch API (opt-in)
-
-Off by default. When enabled, a host-only read on a cuFile-registered file whose body is
-4 KiB-aligned in file offset, length and destination address (and at least `min_bytes`) is
-cut into entries of at most `max_entry_bytes` and submitted with `cuFileBatchIOSubmit`
-straight into the destination, so one reactor keeps up to `depth` host reads in flight
-instead of one blocking `pread`. Sub-block heads and tails, unaligned destinations and small
-reads keep the synchronous path, and an entry cuFile fails or cuts short is finished
-synchronously. In a planned pool, `reactors` batch reactors serve the host reads of every
-GPU. Sirius's own host reads through the scan context are mostly footers and metadata,
-which rarely qualify, so expect little from it on scans.
-
-```yaml
-sirius:
-  executor:
-    scan_manager:
-      cufile:
-        host_batch:
-          enabled: true
-          reactors: 2
-          depth: 64
-          submit_policy: per_reader
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | false | Serve aligned host-read bodies through the batch API. |
-| `reactors` | int, 1–64 | 2 | Batch reactors of a planned pool, shared by every GPU. In a flat pool every reactor batches. |
-| `depth` | int, 1–1024 | 64 | Entries in flight per reactor (also capped by cuFile's `max_batch_io_size`). |
-| `max_entry_bytes` | bytes, multiple of 4KiB in [4KiB, 1GiB] | 8MiB | Largest entry; a body is cut into entries of at most this. |
-| `max_wave_bytes` | bytes, 0 or a multiple of 4KiB | 1GiB | Most bytes one submitted wave carries (`0` = no cap). Keeps every wave far inside the reader's one-hour wave timeout. |
-| `min_bytes` | bytes | 64KiB | Aligned bodies smaller than this keep the synchronous path. |
-| `poll_us` | int, 1–1000000 | 200 | Longest the reactor worker sleeps with batch work outstanding without a wake-up (bounds a lost wake-up only). |
-| `failure_limit` | int, >= 1 | 4 | Consecutive rejected submits after which a reactor stops batching for good. |
-| `submit_policy` | enum: `per_reader`, `exclusive`, `continuous` | `per_reader` | When a reader submits: `per_reader` whole waves per reader (waves of different readers overlap); `exclusive` whole waves, one in flight per process; `continuous` refills while entries are pending. **`continuous` crashes libcufile 1.17.1 in compatibility mode** (Sirius warns when it is selected); qualify it on the target stack first with cuCascade's hidden test `cucascade_io_tests "[host_batch_quirk]"`. |
-
-As for `fused_reads`, the ranges are cuCascade's `host_batch_config::validate()`, checked
-only when `enabled: true` and reported under their key; unknown keys are rejected.
-
-#### Recipe: IBM Storage Scale (GPFS) over RDMA with fused lanes
-
-<!-- cufile-gpfs-fused-recipe -->
-```yaml
-sirius:
-  executor:
-    scan_manager:
-      backend: cufile
-      cufile_n_reactors: 0             # the planned pool: lane reactors per GPU
-      cache: { mode: none }
-      cufile:
-        storage_hint_path: /path/on/the/gpfs/mount/some.parquet
-        fused_reads:
-          enabled: true                # 8 x 16 lanes of 8 MiB, poll completion: the defaults;
-                                       # cufile_bulk_read: auto then takes the bulk route
-        host_batch:
-          enabled: true                # only if host reads go through this context
-```
-
-Measured by cuCascade on a GB200 GPU over GPFS/RoCE (two 400 Gb/s NICs per GPU) with its
-`gds_chunk_read` benchmark: 20 files x 1000 MiB per pass, chunks cycling 1/2/5 MiB read
-as one vectored call per 15 chunks, GPU 0, median of 5 passes after a warmup, NIC bytes
-1.02x the payload on the GPU's two local NICs. Final build, all rows within the same
-quarter hour:
-
-| Path | Payload |
-|------|---------|
-| **fused lanes, defaults (8 x 16, `poll`)** | **86.6 GiB/s** (NIC ~98 GB/s, line rate; content verified) |
-| raw `cuFileReadAsync` reference (4 threads x 32 streams, fused 8 MiB), 4 minutes later | 84.4 GiB/s |
-| host batch, defaults (2 reactors x 64, `per_reader`) / `exclusive` | 38.9 / 38.5 GiB/s |
-| host reads, synchronous pool (32 reactors) | 41.2–41.5 GiB/s |
-
-Earlier the same day, on previous builds and with the raw reference at 79.0 GiB/s: lanes
-4 x 32 `poll` 79.7, 4 x 32 `callback` 65.1, small chunks (256K/512K/1M, 12.5 pieces per
-read) 77.7, and the synchronous pool with fused reads off 77.5 GiB/s. The raw reference
-ranged 79.0–88.3 GiB/s over two days, so compare rows of the same hour; cuCascade's
-[fused lanes guide](../../cucascade/docs/io/cufile-fused-lanes.md#measured-results) has the
-full tables.
-
-The lanes reach the NICs' line rate with 8 submitting threads per GPU instead of 32, and
-keep their rate when the chunks are small, where a read-per-chunk pool is bound by reads/s x
-chunk size. Host batch reaches about 94% of 32 blocking threads with two reactors. These are
-cuCascade benchmark numbers (one vectored request per 15 chunks), not Sirius query
-throughput; Sirius's cuFile scans issue one vectored request per file per split on the bulk
-route that `cufile_bulk_read: auto` selects with this recipe (see **Fusion and Sirius's
-scan** above).
-
-Operational rules from that host:
-
-- Keep at most 128 device reads in flight per GPU (`max_lanes_per_device`, the default): a
-  deeper run of 1 MiB asynchronous reads crashed the GPFS client there.
-- After a GDS process exits, and especially after one is killed with reads in flight, the
-  node's GDS path can stall for minutes; GPFS logs `VERBS RDMA closed connection ... error
-  733` when a process was killed. Do not kill scans mid-read on that stack, and leave a few
-  minutes between benchmark processes.
-- `cufile.json`: `max_direct_io_size_kb` at least 8192 (the 8 MiB `slot_bytes`),
-  `rdma_dev_addr_list` set to the GPU's RDMA ports, `use_poll_mode` false.
 
 ### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
@@ -1092,8 +864,8 @@ For the native local backend, `mode: none` bypasses every cache (`O_DIRECT`, no
 prefetching cache), `mode: os` reads through the kernel page cache, and `mode: cucs`
 reads `O_DIRECT` into cuCascade's pinned prefetching cache (`fs_cache`). REST can also
 use `fs_cache` under `cucs`. cuFile never attaches `fs_cache` or runs scan
-readahead, regardless of this mode; cuFile's direct-open policy is set by
-`cufile.use_odirect`, not derived from the cache mode.
+readahead, regardless of this mode; cuFile registers the file's `O_DIRECT` descriptor
+when the filesystem gives one, whatever the cache mode.
 
 Sirius enables `mode: cucs` with `eviction: lru` by default, including when no YAML
 file is supplied. Set `cache: { mode: none }` to disable it. Cached chunks use the
