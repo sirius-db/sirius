@@ -352,12 +352,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
   duckdb::vector<duckdb::LogicalType> types;
   duckdb::vector<duckdb::idx_t> masked_columns;
-  // Ordered FIRSTs share one ORDER BY (create_plan refuses a second), so its keys are projected
-  // once.
-  std::optional<duckdb::vector<duckdb::idx_t>> order_columns;
   // Keys borrow immutable heap nodes owned by expressions; moving their unique_ptrs does not move
-  // the nodes. Clear the map before translation drains those owners.
+  // the nodes. Clear the maps before translation drains those owners.
   duckdb::expression_map_t<duckdb::idx_t> masked_inputs;
+  // Equal ORDER BY keys share one projected column, so FIRSTs with equal orders get equal slots.
+  duckdb::expression_map_t<duckdb::idx_t> order_inputs;
   auto project_input = [&](duckdb::unique_ptr<duckdb::Expression> expression, bool masked) {
     bool const shareable = masked && can_share_expression(*expression);
     if (shareable) {
@@ -369,6 +368,13 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     expressions.push_back(std::move(expression));
     if (masked) { masked_columns.push_back(index); }
     if (shareable) { masked_inputs.emplace(*expressions.back(), index); }
+    return index;
+  };
+  auto project_order_key = [&](duckdb::unique_ptr<duckdb::Expression> key) {
+    auto const found = order_inputs.find(*key);
+    if (found != order_inputs.end()) { return found->second; }
+    auto const index = project_input(std::move(key), false);
+    order_inputs.emplace(*expressions[index], index);
     return index;
   };
 
@@ -407,17 +413,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     }
 
     if (auto& order_bys = bound_aggr.GetOrderBysMutable()) {
-      auto& keys = order_bys->orders;
-      if (!order_columns) {
-        order_columns.emplace();
-        for (auto& key : keys) {
-          order_columns->push_back(project_input(std::move(key.expression), false));
-        }
-      }
-      D_ASSERT(order_columns->size() == keys.size());
-      for (std::size_t i = 0; i < keys.size(); ++i) {
-        keys[i].expression = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-          types[(*order_columns)[i]], (*order_columns)[i]);
+      for (auto& key : order_bys->orders) {
+        auto const type  = key.expression->GetReturnType();
+        auto const index = project_order_key(std::move(key.expression));
+        key.expression   = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, index);
       }
     }
 
@@ -442,6 +441,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
     }
   }
   masked_inputs.clear();
+  order_inputs.clear();
   if (expressions.empty()) { return child; }
   child       = project_shared_filter_predicates(std::move(child), expressions, masked_columns);
   auto inputs = translate_expressions(std::move(expressions));
