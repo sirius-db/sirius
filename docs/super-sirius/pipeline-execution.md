@@ -417,6 +417,12 @@ exception (`finalize_error()`), and `sirius_engine::execute()` calls
 `rethrow_finalize_failure()` on the query's pipelines after `retire_query_work()` has waited for
 all work, so the query fails instead of returning its result.
 
+A query that has already failed drops a later finalize error the same way, and the handler's
+error callback, which marks the runtime unavailable after a fatal device error, never sees it.
+So when a failed or cancelled query retires its work, `sirius_engine::quiesce_plan_users()`
+passes every recorded finalize failure to `query_lifecycle_registry::report_failure()` through
+`report_finalize_failures()`.
+
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
 `SiriusContext::retire_query_work(query_id, completed)` closes publication, joins scan producers,

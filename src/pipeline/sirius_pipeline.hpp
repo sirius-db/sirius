@@ -44,6 +44,10 @@ namespace creator {
 class task_creator;
 }  // namespace creator
 
+namespace exec {
+class query_lifecycle_registry;
+}  // namespace exec
+
 namespace telemetry {
 class telemetry_context;
 }  // namespace telemetry
@@ -371,6 +375,13 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
 //! Rethrows the first finalize failure recorded by @p pipelines, if any. Call once no finish
 //! transition can still be running.
 void rethrow_finalize_failure(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines);
+
+//! Reports every finalize failure recorded by @p pipelines to @p lifecycle. A query that had
+//! already completed dropped the report, so without this a fatal device error among them would
+//! not mark the runtime unavailable. Call once no finish transition can still be running.
+void report_finalize_failures(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
+                              exec::query_lifecycle_registry& lifecycle,
+                              query_id_t query_id);
 
 }  // namespace pipeline
 }  // namespace sirius

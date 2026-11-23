@@ -17,6 +17,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include "creator/task_creator.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -368,6 +369,15 @@ void rethrow_finalize_failure(const std::vector<std::shared_ptr<sirius_pipeline>
 {
   for (const auto& pipeline : pipelines) {
     if (auto error = pipeline->finalize_error()) { std::rethrow_exception(error); }
+  }
+}
+
+void report_finalize_failures(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
+                              exec::query_lifecycle_registry& lifecycle,
+                              query_id_t query_id)
+{
+  for (const auto& pipeline : pipelines) {
+    if (auto error = pipeline->finalize_error()) { lifecycle.report_failure(error, query_id); }
   }
 }
 

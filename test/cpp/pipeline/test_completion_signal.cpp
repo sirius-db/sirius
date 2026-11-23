@@ -20,6 +20,8 @@
  */
 
 #include "creator/task_creator.hpp"
+#include "cuda/device_health.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "helper/logical_type.hpp"
 #include "op/input_free_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -34,7 +36,9 @@
 
 #include <catch.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <exception>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -360,14 +364,20 @@ class failing_finalize_operator final : public sirius::op::test_physical_operato
   explicit failing_finalize_operator(bool hold = false)
     : test_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0),
       hold_(hold),
-      release_(release.get_future())
+      release_(release_promise_.get_future())
   {
     operator_id = 0;
   }
 
+  /// Lets a held finalize continue. Safe to call more than once.
+  void release_hold() noexcept
+  {
+    if (!released_.exchange(true)) { release_promise_.set_value(); }
+  }
+
   std::promise<void> entered;
-  std::promise<void> release;
-  int calls = 0;
+  std::exception_ptr error = std::make_exception_ptr(std::runtime_error("finalize failed"));
+  int calls                = 0;
 
  protected:
   void on_finalize_operator() override
@@ -377,12 +387,21 @@ class failing_finalize_operator final : public sirius::op::test_physical_operato
       entered.set_value();
       release_.wait();
     }
-    throw std::runtime_error("finalize failed");
+    std::rethrow_exception(error);
   }
 
  private:
   bool hold_;
+  std::atomic<bool> released_{false};
+  std::promise<void> release_promise_;
   std::future<void> release_;
+};
+
+/// Releases a held finalize at scope exit. Declare it after the std::async future that runs the
+/// finalize, so a failed REQUIRE unblocks the worker before that future's destructor joins it.
+struct release_hold_on_exit {
+  failing_finalize_operator& op;
+  ~release_hold_on_exit() { op.release_hold(); }
 };
 
 /// An inline LIMIT that has already claimed its quota.
@@ -484,10 +503,11 @@ TEST_CASE("A pipeline is not finished while its operators are being finalized",
     } catch (...) {
     }
   });
+  release_hold_on_exit release{op};
   REQUIRE(entered.wait_for(5s) == std::future_status::ready);
   CHECK_FALSE(pipeline->is_pipeline_finished());
 
-  op.release.set_value();
+  op.release_hold();
   finisher.get();
   CHECK_FALSE(pipeline->is_pipeline_finished());
 }
@@ -523,6 +543,7 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
   auto entered   = op.entered.get_future();
   auto destroyer = std::async(std::launch::async,
                               [task = make_task(upstream, handler)]() mutable { task.reset(); });
+  release_hold_on_exit release{op};
   REQUIRE(entered.wait_for(5s) == std::future_status::ready);
 
   // Another thread now tries to finish the terminal pipeline.
@@ -533,7 +554,7 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
     CHECK_FALSE(terminal->is_pipeline_finished());
     CHECK(awaitable.wait_for(0s) == std::future_status::timeout);
 
-    op.release.set_value();
+    op.release_hold();
     destroyer.get();
 
     REQUIRE(awaitable.wait_for(5s) == std::future_status::ready);
@@ -545,7 +566,7 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
     CHECK(terminal->is_pipeline_finished());
     REQUIRE(awaitable.wait_for(0s) == std::future_status::ready);
 
-    op.release.set_value();
+    op.release_hold();
     destroyer.get();
 
     // The task's error report lost to the success; the future cannot carry it.
@@ -556,4 +577,33 @@ TEST_CASE("A terminal pipeline cannot complete the query past a failing upstream
   // What the query thread checks after retiring the query's work, before returning success.
   CHECK_FALSE(upstream->is_pipeline_finished());
   CHECK_THROWS_WITH(sirius::pipeline::rethrow_finalize_failure(pipelines), "finalize failed");
+}
+
+TEST_CASE("A fatal finalize failure after an earlier query error still fails the runtime",
+          "[pipeline][completion][issue-1625]")
+{
+  failing_finalize_operator op;
+  op.error      = std::make_exception_ptr(sirius::fatal_device_error(cudaErrorAssert));
+  auto sink     = make_sink(SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+  auto pipeline = make_finishable_pipeline(sink);
+  sirius_pipeline_build_state{}.add_pipeline_operator(*pipeline, op);
+
+  // As the execution window wires it: the handler's error callback feeds the runtime health.
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto handler = std::make_shared<completion_handler>(
+    [&](std::exception_ptr error) { lifecycle.report_failure(error); });
+  pipeline->set_completion_handler(handler);
+  auto awaitable = handler->get_awaitable();
+  handler->report_error(std::make_exception_ptr(std::runtime_error("earlier failure")));
+
+  auto task = make_task(pipeline, handler);
+  task.reset();
+
+  // The handler keeps its first error, so its callback never sees the device failure.
+  CHECK_THROWS_WITH(awaitable.get(), "earlier failure");
+  CHECK_FALSE(lifecycle.runtime_failed());
+
+  // What the query thread does after retiring the failed query's work.
+  sirius::pipeline::report_finalize_failures({pipeline}, lifecycle, pipeline->get_query_id());
+  CHECK(lifecycle.runtime_failed());
 }

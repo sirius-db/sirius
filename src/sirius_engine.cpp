@@ -166,6 +166,12 @@ void sirius_engine::quiesce_plan_users()
   if (plan_users_quiescent_) return;
   if (auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     ctx->retire_query_work(query_id_, duckdb::SiriusContext::query_retirement_mode::cancelled);
+    // The handler's error callback sees only the query's first error. A finalize that failed
+    // after it may still be a fatal device error, which must mark the runtime unavailable.
+    if (query_) {
+      pipeline::report_finalize_failures(
+        query_->get_pipelines(), ctx->get_query_lifecycle_registry(), query_id_);
+    }
   }
   finish_scan_preparation(sirius_physical_plan.get());
   plan_users_quiescent_ = true;
