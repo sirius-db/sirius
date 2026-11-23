@@ -135,6 +135,9 @@ std::size_t merged_reference_count();
 std::size_t live_statistics_records();
 /// The number of footers read for statistics since the process started.
 std::uint64_t footer_read_count();
+/// The file entries inspected by the footer admission and by the unlimited cache walks that
+/// completed normally in this process, for tests. Includes the entry that exceeds a limit.
+std::uint64_t inspected_file_count();
 /// For tests: replace the capacities, drop what exceeds them and return the previous ones.
 cache_capacities set_cache_capacities_for_testing(cache_capacities replacement);
 /// For tests: drop every cached statistic, merged statistic and row count.

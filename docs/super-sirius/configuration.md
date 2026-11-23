@@ -1054,7 +1054,9 @@ Reading the footers costs planning time in proportion to the number of files, an
 work can require network requests. The two read limits bound it. Before reading, the pass counts
 the footers a scan needs that are not cached for the file's current version, remote and local
 files apart. If either count is over its limit the scan is planned as DuckDB bound it: no footer is
-read and the scan gets neither statistics nor a footer row count. It is all or nothing because the
+read and the scan gets neither statistics nor a footer row count. For local files the count stops
+at the first miss that exceeds the local limit: the admission pass does not check the remaining
+files of such a scan. It is all or nothing because the
 statistics of some files are not statistics of the scan. A remote file named in an explicit list,
 which the listing did not describe, counts as a read even when cached, since checking it takes a
 request. `sirius_analyze_parquet` and `pin_table` are not limited: they process every file. The

@@ -54,6 +54,7 @@ namespace {
 std::atomic<std::size_t> live_records{0};
 std::atomic<std::uint64_t> next_record_id{1};
 std::atomic<std::uint64_t> footers_read{0};
+std::atomic<std::uint64_t> files_inspected{0};
 
 /// What one footer says. Every read makes a record with an id of its own, so equal ids mean the
 /// same statistics.
@@ -302,14 +303,33 @@ struct scan_statistics {
   std::vector<std::size_t> unresolved;
   std::size_t remote_reads = 0;
   std::size_t local_reads  = 0;
+  /// The files looked at: all of them unless the walk stopped over the local limit.
+  std::size_t inspected = 0;
 };
+
+/// Whether no per-file record is dropped for capacity, so that the order of use decides nothing.
+bool statistics_cache_unbounded()
+{
+  std::lock_guard guard(cache_mutex);
+  return capacities.statistics == detail::unbounded;
+}
+
+bool within(std::int64_t limit, std::size_t reads)
+{
+  return limit < 0 || reads <= static_cast<std::size_t>(limit);
+}
 
 /// The cached statistics of \p files, in order, without reading a footer. The rest are counted as
 /// reads. A remote file the listing did not describe is one of them even if it is cached: learning
-/// its version takes a request, which is what the count is there to bound.
+/// its version takes a request, which is what the count is there to bound. Stops at the first
+/// local miss that exceeds \p local_limit: the scan is over that limit whatever follows, and this
+/// avoids a stat for each remaining unlisted local file. With a bounded per-file cache the walk
+/// goes on to the last file instead, because a hit also marks its record as recently used and the
+/// records that stay decide what a later scan has to read.
 scan_statistics cached_statistics(duckdb::ClientContext& context,
                                   std::vector<duckdb::OpenFileInfo> const& files,
-                                  duckdb::ParquetOptions const& options)
+                                  duckdb::ParquetOptions const& options,
+                                  std::int64_t local_limit = -1)
 {
   scan_statistics result;
   result.files.resize(files.size());
@@ -317,7 +337,9 @@ scan_statistics cached_statistics(duckdb::ClientContext& context,
   result.listed.resize(files.size());
   auto const options_identity = op::scan::parquet_options_identity(options);
   auto& fs                    = duckdb::FileSystem::GetFileSystem(context);
+  bool const stop_over_local  = local_limit >= 0 && statistics_cache_unbounded();
   for (std::size_t i = 0; i < files.size(); ++i) {
+    ++result.inspected;
     bool const remote = duckdb::FileSystem::IsRemoteFile(files[i].path);
     result.keys[i]    = cache_key(options_identity, files[i].path);
     result.listed[i]  = listed_metadata(files[i]);
@@ -333,8 +355,10 @@ scan_statistics cached_statistics(duckdb::ClientContext& context,
     if (!result.files[i]) {
       result.unresolved.push_back(i);
       ++(remote ? result.remote_reads : result.local_reads);
+      if (stop_over_local && !remote && !within(local_limit, result.local_reads)) { break; }
     }
   }
+  files_inspected.fetch_add(result.inspected, std::memory_order_relaxed);
   return result;
 }
 
@@ -489,11 +513,6 @@ void remember_merge(std::string const& key,
   merge_references += scan.files.size();
 }
 
-bool within(std::int64_t limit, std::size_t reads)
-{
-  return limit < 0 || reads <= static_cast<std::size_t>(limit);
-}
-
 bool is_parquet_scan(duckdb::LogicalGet const& get)
 {
   auto const& name = get.function.GetName().GetIdentifierName();
@@ -550,16 +569,17 @@ bool add_statistics(duckdb::ClientContext& context,
   if (!reader || !reader->bind_data) { return false; }
   auto const& parquet_options = duckdb::ParquetScanFunction::GetFileOptions(*reader->bind_data);
   auto const all_files        = bind->file_list->GetAllFiles();
-  auto scan                   = cached_statistics(context, all_files, parquet_options);
+  auto scan = cached_statistics(context, all_files, parquet_options, limits.local);
   // All or nothing: the statistics of some files say nothing true about the scan, and the
   // optimizer takes what it is given as fact.
   if (!within(limits.remote, scan.remote_reads) || !within(limits.local, scan.local_reads)) {
     SIRIUS_LOG_DEBUG(
       "No footer statistics or row count for a Parquet scan of {} files: {} remote and {} local "
-      "footers to read, limits {} and {}",
+      "misses in the {} files inspected, limits {} and {}",
       all_files.size(),
       scan.remote_reads,
       scan.local_reads,
+      scan.inspected,
       limits.remote,
       limits.local);
     return false;
@@ -725,6 +745,11 @@ std::size_t detail::live_statistics_records()
 }
 
 std::uint64_t detail::footer_read_count() { return footers_read.load(std::memory_order_relaxed); }
+
+std::uint64_t detail::inspected_file_count()
+{
+  return files_inspected.load(std::memory_order_relaxed);
+}
 
 detail::cache_capacities detail::set_cache_capacities_for_testing(cache_capacities replacement)
 {
